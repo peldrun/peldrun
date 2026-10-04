@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import traceback
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Union
 
@@ -180,9 +181,9 @@ async def check_lmstudio_model_readiness(base_url: str, model_name: str, api_key
     return {"found": False, "is_loaded": False, "unreachable": True}
 
 
-# Legacy monkey-patches: Applied ONLY if legacy OpenManus app module exists on sys.path
+# Legacy monkey-patches for OpenManus
 def apply_legacy_patches_if_available() -> None:
-    """Silently attempt legacy patches without emitting warnings if running in PELDRUN Core mode."""
+    """Attempt legacy OpenManus patches when running in backward compatibility mode."""
     try:
         import app.tool.ask_human as ask_human_module
         if hasattr(ask_human_module, "AskHuman"):
@@ -275,6 +276,10 @@ apply_legacy_patches_if_available()
 # PRIMARY ENGINE: PELDRUN Core Runtime Execution (Native EventEmitter & Contracts)
 # ============================================================================
 
+# ============================================================================
+# PRIMARY ENGINE: PELDRUN Core Runtime Execution (Native EventEmitter & SSE)
+# ============================================================================
+
 async def _run_peldrun_core_agent(
     job_id: str,
     prompt: str,
@@ -286,81 +291,61 @@ async def _run_peldrun_core_agent(
     chat_id: str,
     manifest: Dict[str, Any],
 ) -> None:
-    """Execute autonomous agent workflow natively via peldrun-core package."""
-    print(f"[BRIDGE CORE] Executing job {job_id} using PELDRUN Core native engine.")
+    """Execute autonomous agent workflow natively via peldrun-core package with real-time SSE streaming."""
+    print(f"\n[BRIDGE CORE] >>> Starting Live Run for Job: {job_id} using PELDRUN Core Engine <<<")
 
     from peldrun.events.emitter import EventEmitter
     from peldrun.events.schema import EventType, PeldrunEvent
-    from peldrun.tools.registry import ToolRegistry
-    from peldrun.security.policy import SecurityPolicy
-    from peldrun.tools.builtins.file_ops import FileOpsTool
-    from peldrun.tools.builtins.shell_exec import ShellExecTool
-    from peldrun.tools.builtins.web_search import WebSearchTool
+    from peldrun.tools.collection import ToolCollection
+    from peldrun.tools.builtins.terminate import TerminateTool
+    from peldrun.tools.builtins.str_replace_editor import StrReplaceEditor
     from peldrun.tools.builtins.human_input import HumanInputTool
-    from peldrun.llm.client import LLMConfig
+    from peldrun.llm.client import LLMConfig, AsyncLLMClient
     from peldrun.llm.providers.openai_compat import OpenAICompatProvider
     from peldrun.llm.providers.lmstudio import LMStudioProvider
     from peldrun.llm.providers.ollama import OllamaProvider
-    from peldrun.agents.react_agent import ReActAgent, ReActAgentConfig
-    from peldrun.engine.runner import AgentRunner
+    from peldrun.agents.tool_call_agent import ToolCallAgent
+    from peldrun.agents.base import AgentConfig
+
+    from omweb.adapters.core_adapter import WebToolAdapter
+    from omweb.tools.registry import tool_registry as web_tool_registry
 
     files_baseline: Set[str] = {p.name for p in project_dir.iterdir() if p.is_file()} if project_dir.exists() else set()
     latest_meaningful_thought: str = ""
 
-    # 1. Wire LLM Provider
-    base_url = active_llm.get("base_url") or "http://127.0.0.1:1234/v1"
-    api_key = active_llm.get("api_key") or "EMPTY"
-    p_name_lower = provider_name.lower()
+    # 1. Resolve Contracts
+    max_steps = int(manifest.get("max_steps") or 30)
+    system_prompt = manifest.get("system_prompt", "You are peldrun, an all-around autonomous specialist agent.")
 
-    if "lmstudio" in p_name_lower or "1234" in base_url:
-        provider_kind = "lmstudio"
-    elif "ollama" in p_name_lower or "11434" in base_url:
-        provider_kind = "ollama"
-    else:
-        provider_kind = "openai_compat"
+    # 2. Wire ToolCollection bounded strictly to project workspace
+    collection = ToolCollection()
+    collection.add_tool(TerminateTool(workspace_root=str(project_dir.resolve())))
+    collection.add_tool(StrReplaceEditor(workspace_root=str(project_dir.resolve())))
+    collection.add_tool(HumanInputTool(workspace_root=str(project_dir.resolve())))
 
-    llm_config = LLMConfig(
-        provider=provider_kind,
-        model=model_name,
-        base_url=base_url,
-        api_key=api_key,
-        temperature=float(active_llm.get("temperature", 0.7)),
-        max_tokens=int(active_llm.get("max_tokens", 8192)),
-    )
+    available_web_tools = {t["id"]: t for t in web_tool_registry.list_tools() if t.get("is_enabled", True)}
+    for req_tool in manifest.get("tools", []):
+        if req_tool in available_web_tools:
+            wt = available_web_tools[req_tool]
+            collection.add_tool(
+                WebToolAdapter(
+                    name=req_tool,
+                    description=wt.get("description", ""),
+                    parameters=wt.get("parameters", {}),
+                    executor=wt.get("executor"),
+                    workspace_root=str(project_dir.resolve()),
+                )
+            )
 
-    if provider_kind == "lmstudio":
-        llm_provider = LMStudioProvider(config=llm_config)
-    elif provider_kind == "ollama":
-        llm_provider = OllamaProvider(config=llm_config)
-    else:
-        llm_provider = OpenAICompatProvider(config=llm_config)
-
-    # 2. Wire Security Policy & Tools
-    sec_policy = SecurityPolicy(workspace_root=project_dir)
-    tool_registry = ToolRegistry(workspace_root=str(project_dir))
-
-    tool_registry.register(FileOpsTool(workspace_root=str(project_dir), security_policy=sec_policy))
-    tool_registry.register(ShellExecTool(workspace_root=str(project_dir), security_policy=sec_policy))
-    tool_registry.register(WebSearchTool())
-    tool_registry.register(HumanInputTool())
-
-    # Dynamic MCP server discovery & attachment
-    try:
-        from omweb.extensions.registry import extension_registry
-        active_mcp = extension_registry.get_active_mcp_servers()
-        if active_mcp:
-            print(f"[BRIDGE CORE] Detected {len(active_mcp)} active MCP extensions.")
-    except Exception as ex:
-        print(f"[BRIDGE CORE] MCP registry notice: {ex}")
-
-    # 3. Setup Canonical Event Emitter with SSE Bridge Subscriber
-    emitter = EventEmitter(run_id=job_id)
+    # 3. Setup Direct Real-Time EventEmitter Bridge
+    emitter = EventEmitter()
 
     async def on_core_event(event: PeldrunEvent) -> None:
         nonlocal latest_meaningful_thought
         curr_step = event.step or 1
 
         if event.type == EventType.STEP_START:
+            print(f"[LIVE STREAM] Step {curr_step} Started...")
             await dispatch_event(
                 job_id,
                 SSEEvent(
@@ -370,10 +355,11 @@ async def _run_peldrun_core_agent(
                 )
             )
 
-        elif event.type == EventType.THOUGHT:
+        elif event.type in (EventType.THOUGHT, EventType.STEP_PROGRESS):
             thought_text = str(event.payload.get("thought", "")).strip()
             if thought_text:
                 latest_meaningful_thought = thought_text
+                print(f"[LIVE STREAM] Thought: {thought_text[:80]}...")
                 await dispatch_event(
                     job_id,
                     SSEEvent(
@@ -383,23 +369,11 @@ async def _run_peldrun_core_agent(
                     )
                 )
 
-        elif event.type == EventType.AGENT_ACTIVITY:
-            act_msg = str(event.payload.get("message", ""))
-            act_phase = str(event.payload.get("phase", "general"))
-            latest_meaningful_thought = act_msg
-            await dispatch_event(
-                job_id,
-                SSEEvent(
-                    type=SSEEventType.THOUGHT,
-                    step=curr_step,
-                    data={"thought": f"[{act_phase.upper()}] {act_msg}", "model": model_name}
-                )
-            )
-
-        elif event.type == EventType.TOOL_CALL:
-            tool_name = str(event.payload.get("tool_name", "tool"))
+        elif event.type in (EventType.TOOL_CALL, EventType.TOOL_CALLED):
+            tool_name = str(event.payload.get("tool_name") or event.payload.get("tool") or "tool")
             arguments = event.payload.get("arguments", {})
             raw_args = json.dumps(arguments, ensure_ascii=False) if isinstance(arguments, dict) else str(arguments)
+            print(f"[LIVE STREAM] Tool Call: {tool_name}({raw_args[:60]})")
             await dispatch_event(
                 job_id,
                 SSEEvent(
@@ -409,16 +383,18 @@ async def _run_peldrun_core_agent(
                 )
             )
 
-        elif event.type == EventType.OBSERVATION:
-            obs_out = event.payload.get("output", "")
+        elif event.type in (EventType.OBSERVATION, EventType.TOOL_COMPLETED):
+            obs_out = event.payload.get("output", "") or event.payload.get("error", "")
+            print(f"[LIVE STREAM] Observation: {str(obs_out)[:80]}...")
 
-            # Real-time filesystem artifact detection
+            # Real-time Artifact Detection
             if project_dir.exists():
                 current_files = {p.name for p in project_dir.iterdir() if p.is_file()}
                 new_files = current_files - files_baseline
                 for nf in new_files:
                     if nf not in job_scoped_artifacts[job_id]:
                         job_scoped_artifacts[job_id].append(nf)
+                        print(f"[LIVE STREAM] New Artifact Created: {nf}")
                         await dispatch_event(
                             job_id,
                             SSEEvent(
@@ -439,42 +415,13 @@ async def _run_peldrun_core_agent(
                 SSEEvent(
                     type=SSEEventType.OBSERVATION,
                     step=curr_step,
-                    data={"output": obs_out, "model": model_name}
-                )
-            )
-
-        elif event.type == EventType.ASK_HUMAN:
-            question = str(event.payload.get("question", "Agent requires human feedback."))
-            await dispatch_event(
-                job_id,
-                SSEEvent(
-                    type=SSEEventType.TOOL_CALL,
-                    step=curr_step,
-                    data={"name": "ask_human", "arguments": question, "model": model_name}
-                )
-            )
-
-            wait_event = asyncio.Event()
-            human_answers[job_id] = wait_event
-            try:
-                await asyncio.wait_for(wait_event.wait(), timeout=600.0)
-                user_reply = human_data.pop(job_id, "Approved.")
-            except asyncio.TimeoutError:
-                user_reply = "No user response provided within timeout."
-            finally:
-                human_answers.pop(job_id, None)
-
-            await dispatch_event(
-                job_id,
-                SSEEvent(
-                    type=SSEEventType.OBSERVATION,
-                    step=curr_step,
-                    data={"output": f"User response: {user_reply}", "model": model_name}
+                    data={"output": str(obs_out), "model": model_name}
                 )
             )
 
         elif event.type == EventType.ERROR:
             err_msg = str(event.payload.get("error", "Runtime Error"))
+            print(f"[LIVE STREAM ERROR] {err_msg}")
             await dispatch_event(
                 job_id,
                 SSEEvent(
@@ -486,45 +433,67 @@ async def _run_peldrun_core_agent(
 
     emitter.subscribe_all(on_core_event)
 
-    # 4. Instantiate ReAct Agent & Execution Runner
-    max_steps = int(manifest.get("max_steps") or 15)
-    agent_config = ReActAgentConfig(
+    # 4. Wire LLM Client & Provider
+    base_url = active_llm.get("base_url") or "http://127.0.0.1:1234/v1"
+    api_key = active_llm.get("api_key") or "EMPTY"
+    p_name_lower = provider_name.lower()
+
+    llm_cfg = LLMConfig(
+        provider=p_name_lower,
+        model=model_name,
+        base_url=base_url,
+        api_base=base_url,
+        api_key=api_key,
+        temperature=float(active_llm.get("temperature", 0.7)),
+        max_tokens=int(active_llm.get("max_tokens", 4096)),
+    )
+
+    if "lmstudio" in p_name_lower or "1234" in base_url:
+        llm_provider = LMStudioProvider(config=llm_cfg)
+    elif "ollama" in p_name_lower or "11434" in base_url:
+        llm_provider = OllamaProvider(config=llm_cfg)
+    else:
+        llm_provider = OpenAICompatProvider(config=llm_cfg)
+
+    # 5. Instantiate ToolCallAgent
+    agent_config = AgentConfig(
         name=manifest.get("name") or agent_id,
+        system_prompt=system_prompt,
         max_steps=max_steps,
-        enable_streaming=False,
     )
 
-    agent = ReActAgent(
+    agent = ToolCallAgent(
         config=agent_config,
-        llm_provider=llm_provider,
-        tool_registry=tool_registry,
+        llm=llm_provider,
+        tool_collection=collection,
         emitter=emitter,
+        workspace_dir=str(project_dir.resolve()),
     )
+    agent.set_system_prompt(system_prompt)
 
-    runner = AgentRunner(agent=agent, emitter=emitter)
-
-    # Scoped prompt with explicit workspace deliverables rules
+    # Explicit instruction to prevent premature termination and enforce file creation
     scoped_prompt = (
         f"[PROJECT WORKSPACE RULES]\n"
-        f"1. Working Directory: Your active workspace is: {project_dir.resolve()}\n"
-        f"2. File Deliverables: Save all generated files, code, documents, charts using clean relative names.\n"
-        f"3. Headless Visualization: Never display GUI windows. Save figures directly to disk.\n"
-        f"4. Direct Delivery: Fulfill the user task completely and concisely.\n\n"
+        f"1. Working Directory: Your active directory is: {project_dir.resolve()}\n"
+        f"2. File Deliverables: Save generated files, code, and documents directly inside this directory.\n"
+        f"3. Do NOT call 'terminate' until the required files are actually written and inspected.\n\n"
         f"[USER TASK]\n"
         f"{prompt}"
     )
 
-    orig_cwd = os.getcwd()
-    try:
-        os.chdir(str(project_dir.resolve()))
-        state = await runner.run(task_prompt=scoped_prompt)
-    finally:
-        try:
-            os.chdir(orig_cwd)
-        except Exception:
-            pass
+    # Emit initial live status
+    await dispatch_event(
+        job_id,
+        SSEEvent(
+            type=SSEEventType.STEP_START,
+            step=1,
+            data={"step": 1, "model": model_name, "engine": "peldrun-core", "status": "running"}
+        )
+    )
 
-    # 5. Finalize Deliverables and Complete Job
+    final_answer = await agent.run_task(prompt=scoped_prompt, max_steps=max_steps)
+
+    # 6. Finalize Deliverables and Complete Job
     if project_dir.exists():
         current_files = {p.name for p in project_dir.iterdir() if p.is_file()}
         for f_name in (current_files - files_baseline):
@@ -533,9 +502,7 @@ async def _run_peldrun_core_agent(
 
     new_turn_files = job_scoped_artifacts.get(job_id, [])
 
-    if state and hasattr(state, "final_answer") and state.final_answer:
-        result_text = state.final_answer
-    elif new_turn_files:
+    if new_turn_files:
         file_bullets = "\n".join([f"- `{f}`" for f in new_turn_files])
         result_text = (
             f"### Deliverables Created Successfully\n\n"
@@ -543,17 +510,20 @@ async def _run_peldrun_core_agent(
             f"{file_bullets}\n\n"
             f"You can preview and interact with the application live in the **Preview** panel."
         )
+    elif final_answer:
+        result_text = final_answer
     elif latest_meaningful_thought:
         result_text = latest_meaningful_thought
     else:
         result_text = "Task completed successfully."
 
+    print(f"[BRIDGE CORE] Job {job_id} completed successfully. Produced files: {new_turn_files}")
     job_manager.complete_job(job_id, result_text)
     await dispatch_event(
         job_id,
         SSEEvent(
             type=SSEEventType.FINAL,
-            step=getattr(state, "current_step", 1) if state else 1,
+            step=1,
             data={
                 "result": result_text,
                 "model": model_name,
@@ -562,7 +532,6 @@ async def _run_peldrun_core_agent(
             }
         )
     )
-
 
 # ============================================================================
 # SECONDARY ENGINE: OpenManus Legacy Execution (Fallback / Compatibility)
@@ -852,7 +821,6 @@ async def run_instrumented(
     if not agent_id or not isinstance(agent_id, str):
         agent_id = kwargs.get("agent_id") or "peldrun"
 
-    # Engine selection resolution
     explicit_engine = kwargs.get("engine") or (llm_override.get("engine") if isinstance(llm_override, dict) else None)
     if explicit_engine:
         eng_str = str(explicit_engine).lower().strip()

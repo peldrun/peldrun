@@ -4,6 +4,7 @@ import asyncio
 import mimetypes
 import uuid
 import shutil
+import time
 from pathlib import Path
 from io import BytesIO
 import zipfile
@@ -18,6 +19,7 @@ from omweb.job_manager import job_manager
 from omweb.sse_events import subscribe_events, SSEEventType
 from omweb.agent_bridge import run_instrumented, run_direct_chat, active_tasks, human_answers, human_data, job_scoped_artifacts
 from omweb.project_manager import project_manager
+from peldrun.tools.builtins.human_input import HumanInputRegistry
 
 router = APIRouter()
 
@@ -465,9 +467,9 @@ async def stream_job_events(job_id: str):
     )
 
 
-
 class HumanRespondRequest(BaseModel):
     answer: str
+    request_id: Optional[str] = None
 
 
 @router.post("/jobs/{job_id}/stop")
@@ -523,16 +525,34 @@ async def stop_job(job_id: str):
 
 @router.post("/jobs/{job_id}/respond")
 async def respond_to_human_prompt(job_id: str, req: HumanRespondRequest):
-    """Receive human input response for ask_human tool requests."""
+    """Receive human input response for ask_human tool requests in both Core and Legacy engines."""
     chat, chat_id = resolve_chat(job_id)
     target_job_id = job_id
     if chat and chat.get("job_id"):
         target_job_id = chat.get("job_id")
 
     answer = req.answer.strip()
+    core_resolved = False
+
+    # 1. Resolve PELDRUN Core pending Future if request_id is supplied or if single active request
+    if req.request_id:
+        core_resolved = HumanInputRegistry.resolve_request(req.request_id, answer)
+    elif len(HumanInputRegistry._pending_requests) == 1:
+        single_req_id = list(HumanInputRegistry._pending_requests.keys())[0]
+        core_resolved = HumanInputRegistry.resolve_request(single_req_id, answer)
+
+    # 2. Resolve OpenManus Legacy Event if waiting
+    legacy_event = human_answers.get(target_job_id) or human_answers.get(job_id)
+    if legacy_event and not legacy_event.is_set():
+        human_data[target_job_id] = answer
+        human_data[job_id] = answer
+        legacy_event.set()
+
+    # 3. Append response event to local job timeline
     job_manager.append_event(target_job_id, {
         "type": "human_response",
         "answer": answer,
+        "request_id": req.request_id,
         "timestamp": time.time()
     })
 
@@ -541,5 +561,6 @@ async def respond_to_human_prompt(job_id: str, req: HumanRespondRequest):
         "job_id": target_job_id,
         "chat_id": chat_id,
         "answer": answer,
-        "message": "Response recorded successfully"
+        "core_resolved": core_resolved,
+        "message": "Response recorded and agent unblocked successfully"
     }
