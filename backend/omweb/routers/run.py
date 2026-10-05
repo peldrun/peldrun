@@ -1,30 +1,47 @@
-﻿import os
-import json
+﻿"""
+PELDRUN Universal Run Router.
+Manages job lifecycles, chat associations, real-time SSE streaming, and deliverable downloads.
+"""
+
+from __future__ import annotations
+
 import asyncio
+from io import BytesIO
+import json
 import mimetypes
-import uuid
+import os
+from pathlib import Path
 import shutil
 import time
-from pathlib import Path
-from io import BytesIO
+from typing import Any, Dict, List, Optional, Tuple
+import uuid
 import zipfile
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Query
-from fastapi.responses import StreamingResponse, FileResponse
+
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
-from typing import Optional, List, Dict, Any, Tuple
 
+from omweb.agent_bridge import (
+    active_tasks,
+    human_answers,
+    human_data,
+    job_scoped_artifacts,
+    run_direct_chat,
+    run_instrumented,
+)
 from omweb.config import get_storage_root
 from omweb.job_manager import job_manager
-from omweb.sse_events import subscribe_events, SSEEventType
-from omweb.agent_bridge import run_instrumented, run_direct_chat, active_tasks, human_answers, human_data, job_scoped_artifacts
 from omweb.project_manager import project_manager
+from omweb.sse_events import SSEEventType, subscribe_events
 from peldrun.tools.builtins.human_input import HumanInputRegistry
 
 router = APIRouter()
 
 JOB_TO_CHAT_ID: Dict[str, str] = {}
 ACTIVE_JOB_TASKS: Dict[str, asyncio.Task] = {}
+ACTIVE_JOB_EVENTS: Dict[str, List[Dict[str, Any]]] = {}
+
 
 class RunRequest(BaseModel):
     prompt: str
@@ -40,12 +57,15 @@ class RunRequest(BaseModel):
     api_type: Optional[str] = None
     mode: Optional[str] = "agent"
 
+
 class FileContentPayload(BaseModel):
     path: str
     content: str
 
+
 class HumanResponsePayload(BaseModel):
     answer: str
+
 
 def resolve_chat(identifier: str) -> Tuple[Optional[Dict[str, Any]], str]:
     if not identifier:
@@ -72,6 +92,7 @@ def resolve_chat(identifier: str) -> Tuple[Optional[Dict[str, Any]], str]:
                         return fc, cid
     fallback_id = identifier if identifier.startswith("chat_") else f"chat_{identifier}"
     return None, fallback_id
+
 
 @router.post("")
 @router.post("/")
@@ -162,9 +183,25 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
     except Exception:
         pass
 
+    # Initialize live event tracking for immediate polling availability
+    ACTIVE_JOB_EVENTS[actual_job_id] = []
+    if chat_id:
+        ACTIVE_JOB_EVENTS[chat_id] = ACTIVE_JOB_EVENTS[actual_job_id]
+
     effective_agent = (req.agent_id or "peldrun").strip()
 
-    project_manager.save_chat_session(chat_id=chat_id, project_id=project_id, title=title, job_id=actual_job_id, prompt=prompt, events=[], result="", status="running", agent_id=effective_agent, mode=exec_mode)
+    project_manager.save_chat_session(
+        chat_id=chat_id,
+        project_id=project_id,
+        title=title,
+        job_id=actual_job_id,
+        prompt=prompt,
+        events=[],
+        result="",
+        status="running",
+        agent_id=effective_agent,
+        mode=exec_mode
+    )
 
     try:
         session_file = project_manager.get_chat_dir(chat_id, project_id) / "session.json"
@@ -208,23 +245,54 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
         "agent_id": effective_agent
     }
 
+
 @router.get("/jobs")
 @router.get("/jobs/")
 async def list_jobs():
     return {"jobs": job_manager.list_jobs()}
 
+
 @router.get("/jobs/{job_id}")
 async def get_job_detail(job_id: str):
-    job = job_manager.get_job(job_id)
     chat, chat_id = resolve_chat(job_id)
     chat = chat or {}
 
+    actual_job_id = job_id
+    if chat and chat.get("job_id"):
+        actual_job_id = chat.get("job_id")
+
+    job = job_manager.get_job(job_id) or job_manager.get_job(actual_job_id)
+
+    # Use in-memory live stream events to prevent resetting frontend state during active runs
+    live_events = (
+        ACTIVE_JOB_EVENTS.get(actual_job_id)
+        or ACTIVE_JOB_EVENTS.get(job_id)
+        or (ACTIVE_JOB_EVENTS.get(chat_id) if chat_id else None)
+    )
+
     stored_events = chat.get("events", [])
     memory_events = getattr(job, "events", []) if job else []
-    effective_events = memory_events if memory_events else stored_events
+
+    if live_events and len(live_events) > 0:
+        effective_events = live_events
+    elif memory_events:
+        effective_events = memory_events
+    else:
+        effective_events = stored_events
 
     effective_prompt = (getattr(job, "prompt", "") if job else "") or chat.get("prompt", "")
-    effective_status = (getattr(job, "status", "") if job else "") or chat.get("status", "completed")
+
+    is_actively_running = (
+        job_id in ACTIVE_JOB_TASKS
+        or actual_job_id in ACTIVE_JOB_TASKS
+        or (chat_id and chat_id in ACTIVE_JOB_TASKS)
+    )
+
+    if is_actively_running:
+        effective_status = "running"
+    else:
+        effective_status = (getattr(job, "status", "") if job else "") or chat.get("status", "completed")
+
     effective_result = (getattr(job, "result", None) if job else None) or chat.get("result", "")
 
     if not effective_result and effective_events:
@@ -238,8 +306,15 @@ async def get_job_detail(job_id: str):
                     effective_result = data_part
                 break
 
+    resolved_files = (
+        job_scoped_artifacts.get(job_id)
+        or job_scoped_artifacts.get(actual_job_id)
+        or (job_scoped_artifacts.get(chat_id) if chat_id else [])
+        or []
+    )
+
     return {
-        "id": job_id,
+        "id": actual_job_id,
         "chat_id": chat_id,
         "status": effective_status,
         "prompt": effective_prompt,
@@ -250,8 +325,9 @@ async def get_job_detail(job_id: str):
         "agent_id": chat.get("agent_id", "peldrun"),
         "model": chat.get("model"),
         "mode": chat.get("mode", "agent"),
-        "produced_files": job_scoped_artifacts.get(job_id, [])
+        "produced_files": resolved_files
     }
+
 
 @router.get("/jobs/{job_id}/files")
 async def get_job_files(job_id: str):
@@ -274,19 +350,26 @@ async def get_job_files(job_id: str):
                 "size": p.stat().st_size
             })
 
-    # Strict isolation: filter files produced ONLY in this job if recorded
-    turn_files = job_scoped_artifacts.get(job_id)
+    # Resolve scoped artifact lists across job and chat identifiers
+    actual_job_id = chat.get("job_id") or job_id
+    turn_files = (
+        job_scoped_artifacts.get(job_id)
+        or job_scoped_artifacts.get(actual_job_id)
+        or (job_scoped_artifacts.get(chat_id) if chat_id else None)
+    )
+
     if turn_files is not None:
         scoped_list = [f for f in all_files_list if f["name"] in turn_files]
     else:
         scoped_list = all_files_list
 
     return {
-        "job_id": job_id,
+        "job_id": actual_job_id,
         "chat_id": chat_id,
         "files": scoped_list,
         "all_files": all_files_list
     }
+
 
 @router.get("/jobs/{job_id}/content")
 async def get_job_file_content(job_id: str, path: str = Query(...)):
@@ -305,6 +388,7 @@ async def get_job_file_content(job_id: str, path: str = Query(...)):
         return {"path": path, "content": content}
     except Exception as e:
         return {"path": path, "content": f"Binary content: {str(e)}"}
+
 
 @router.get("/jobs/{job_id}/raw/{filepath:path}")
 async def get_job_raw_file(job_id: str, filepath: str):
@@ -341,6 +425,7 @@ async def get_job_raw_file(job_id: str, filepath: str):
 
     return FileResponse(target, media_type=content_type or "application/octet-stream")
 
+
 @router.get("/jobs/{job_id}/download-zip")
 async def download_job_zip(job_id: str):
     _, chat_id = resolve_chat(job_id)
@@ -367,6 +452,7 @@ async def download_job_zip(job_id: str):
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
+
 @router.get("/jobs/{job_id}/stream")
 async def stream_job_events(job_id: str):
     job = job_manager.get_job(job_id)
@@ -385,8 +471,12 @@ async def stream_job_events(job_id: str):
             yield {"event": "done", "data": json.dumps({"status": job_mem_status})}
         return EventSourceResponse(replay_generator())
 
-    collected_events = []
+    collected_events: List[Dict[str, Any]] = []
     current_step = 1
+
+    ACTIVE_JOB_EVENTS[job_id] = collected_events
+    if chat_id:
+        ACTIVE_JOB_EVENTS[chat_id] = collected_events
 
     async def event_generator():
         nonlocal current_step
@@ -404,16 +494,58 @@ async def stream_job_events(job_id: str):
             else:
                 raw_dict = {"data": getattr(event, "data", {})}
 
+            data_payload = raw_dict.get("data", {})
+            if not isinstance(data_payload, dict):
+                data_payload = {"content": str(data_payload)}
+                raw_dict["data"] = data_payload
+
+            # Flatten all data attributes into top level to guarantee frontend components receive content
+            for k, v in data_payload.items():
+                if k not in raw_dict:
+                    raw_dict[k] = v
+
+            raw_dict["id"] = raw_dict.get("id") or f"evt_{uuid.uuid4().hex[:8]}"
             raw_dict["type"] = str(ev_type)
             raw_dict["step"] = current_step
+
+            content_val = (
+                raw_dict.get("content")
+                or data_payload.get("content")
+                or data_payload.get("thought")
+                or data_payload.get("output")
+                or data_payload.get("arguments")
+                or ""
+            )
+            raw_dict["content"] = str(content_val)
+
+            tool_name_val = (
+                raw_dict.get("toolName")
+                or data_payload.get("toolName")
+                or raw_dict.get("name")
+                or data_payload.get("name")
+                or ""
+            )
+            if tool_name_val:
+                raw_dict["toolName"] = str(tool_name_val)
+
             ev_data_str = json.dumps(raw_dict, ensure_ascii=False)
 
+            event_record = {
+                "id": raw_dict["id"],
+                "type": str(ev_type),
+                "step": current_step,
+                "content": raw_dict["content"],
+                "toolName": raw_dict.get("toolName"),
+                "data": data_payload
+            }
+
             if str(ev_type).lower() not in ["ping"]:
-                collected_events.append({
-                    "type": str(ev_type),
-                    "step": current_step,
-                    "data": raw_dict.get("data", {})
-                })
+                collected_events.append(event_record)
+                if job:
+                    try:
+                        job_manager.append_event(job_id, event_record)
+                    except Exception:
+                        pass
 
             is_term = str(ev_type).lower() in ["final", "error", "done"]
             if is_term:
@@ -423,7 +555,7 @@ async def stream_job_events(job_id: str):
                 if not final_res or final_res == "{}":
                     for e in reversed(collected_events):
                         if e.get("type") == "thought":
-                            t_val = e.get("data", {}).get("thought")
+                            t_val = e.get("data", {}).get("thought") or e.get("content")
                             if t_val:
                                 final_res = t_val
                                 break
@@ -441,14 +573,20 @@ async def stream_job_events(job_id: str):
                     events=collected_events,
                     result=final_res,
                     status=final_status,
-                    agent_id=chat.get("agent_id", "peldrun"), mode=chat.get("mode", "agent"))
+                    agent_id=chat.get("agent_id", "peldrun"),
+                    mode=chat.get("mode", "agent")
+                )
 
                 try:
                     s_file = project_manager.get_chat_dir(chat_id, p_id) / "session.json"
                     if s_file.exists():
                         c_json = json.loads(s_file.read_text(encoding="utf-8"))
                         c_json["turns"] = chat.get("turns", [])
-                        c_json["produced_files"] = job_scoped_artifacts.get(job_id, [])
+                        c_json["produced_files"] = (
+                            job_scoped_artifacts.get(job_id)
+                            or (job_scoped_artifacts.get(chat_id) if chat_id else [])
+                            or []
+                        )
                         s_file.write_text(json.dumps(c_json, indent=2, ensure_ascii=False), encoding="utf-8")
                 except Exception:
                     pass
@@ -481,7 +619,11 @@ async def stop_job(job_id: str):
     if chat and chat.get("job_id"):
         target_job_id = chat.get("job_id")
 
-    task = ACTIVE_JOB_TASKS.get(job_id) or ACTIVE_JOB_TASKS.get(target_job_id) or (ACTIVE_JOB_TASKS.get(chat_id) if chat_id else None)
+    task = (
+        ACTIVE_JOB_TASKS.get(job_id)
+        or ACTIVE_JOB_TASKS.get(target_job_id)
+        or (ACTIVE_JOB_TASKS.get(chat_id) if chat_id else None)
+    )
     task_cancelled = False
     if task and not task.done():
         task.cancel()
@@ -534,21 +676,18 @@ async def respond_to_human_prompt(job_id: str, req: HumanRespondRequest):
     answer = req.answer.strip()
     core_resolved = False
 
-    # 1. Resolve PELDRUN Core pending Future if request_id is supplied or if single active request
     if req.request_id:
         core_resolved = HumanInputRegistry.resolve_request(req.request_id, answer)
     elif len(HumanInputRegistry._pending_requests) == 1:
         single_req_id = list(HumanInputRegistry._pending_requests.keys())[0]
         core_resolved = HumanInputRegistry.resolve_request(single_req_id, answer)
 
-    # 2. Resolve OpenManus Legacy Event if waiting
     legacy_event = human_answers.get(target_job_id) or human_answers.get(job_id)
     if legacy_event and not legacy_event.is_set():
         human_data[target_job_id] = answer
         human_data[job_id] = answer
         legacy_event.set()
 
-    # 3. Append response event to local job timeline
     job_manager.append_event(target_job_id, {
         "type": "human_response",
         "answer": answer,

@@ -1,7 +1,7 @@
 ﻿"use client";
 
 import React, { useState, useEffect, useCallback, useMemo } from "react";
-import { Monitor, RefreshCw, ExternalLink, Code2, Sparkles, FileText, Image as ImageIcon } from "lucide-react";
+import { Monitor, RefreshCw, ExternalLink, Code2, Sparkles, FileText, Image as ImageIcon, AlignLeft } from "lucide-react";
 import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
 
 export interface PreviewTabProps {
@@ -30,9 +30,10 @@ export function PreviewTab({
 
   const lowerFile = (effectiveFile || "").toLowerCase();
   const isMarkdown = lowerFile.endsWith(".md") || lowerFile.endsWith(".markdown");
+  const isTxt = lowerFile.endsWith(".txt") || lowerFile.endsWith(".text");
   const isSvg = lowerFile.endsWith(".svg");
   const isHtml = lowerFile.endsWith(".html") || lowerFile.endsWith(".htm");
-  const isPreviewable = isMarkdown || isSvg || isHtml;
+  const isPreviewable = isMarkdown || isTxt || isSvg || isHtml;
 
   useEffect(() => {
     const handleSaved = (e: Event) => {
@@ -69,6 +70,10 @@ export function PreviewTab({
               data.files.find((f: any) => {
                 const l = f.name.toLowerCase();
                 return l.endsWith(".md") || l.endsWith(".markdown");
+              }) ||
+              data.files.find((f: any) => {
+                const l = f.name.toLowerCase();
+                return l.endsWith(".txt") || l.endsWith(".text");
               }) ||
               data.files.find((f: any) => f.name.toLowerCase().endsWith(".svg"));
 
@@ -149,7 +154,7 @@ export function PreviewTab({
           <div>
             <h3 className="text-sm font-semibold font-heading text-foreground">Sandbox Standby</h3>
             <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
-              Live web applications (.html, .svg) and Markdown documents (.md) will render here in real time.
+              Live web applications (.html, .svg), Markdown documents (.md), and plain text files (.txt) will render here in real time.
             </p>
           </div>
           {loading && (
@@ -170,6 +175,7 @@ export function PreviewTab({
   const renderBadge = () => {
     if (isHtml) return <span className="px-1.5 py-0.5 rounded text-[10px] bg-peldrun-success/15 text-peldrun-success border border-peldrun-success/30 font-mono">HTML App</span>;
     if (isMarkdown) return <span className="px-1.5 py-0.5 rounded text-[10px] bg-primary/15 text-primary border border-primary/30 font-mono">Markdown</span>;
+    if (isTxt) return <span className="px-1.5 py-0.5 rounded text-[10px] bg-peldrun-warning/15 text-peldrun-warning border border-peldrun-warning/30 font-mono">Plain Text</span>;
     if (isSvg) return <span className="px-1.5 py-0.5 rounded text-[10px] bg-peldrun-info/15 text-peldrun-info border border-peldrun-info/30 font-mono">Vector SVG</span>;
     return <span className="px-1.5 py-0.5 rounded text-[10px] bg-muted text-muted-foreground font-mono">Preview</span>;
   };
@@ -180,6 +186,8 @@ export function PreviewTab({
         <div className="flex items-center gap-2 text-foreground min-w-0">
           {isMarkdown ? (
             <FileText className="w-4 h-4 text-primary shrink-0" />
+          ) : isTxt ? (
+            <AlignLeft className="w-4 h-4 text-peldrun-warning shrink-0" />
           ) : isSvg ? (
             <ImageIcon className="w-4 h-4 text-peldrun-info shrink-0" />
           ) : (
@@ -217,6 +225,16 @@ export function PreviewTab({
           <div className="w-full h-full overflow-y-auto p-6 md:p-8 bg-card/40">
             <div className="max-w-3xl mx-auto rounded-sm border border-border/80 bg-card p-6 shadow-peldrun-sm">
               <MarkdownRenderer content={rawContent} />
+            </div>
+          </div>
+        )}
+
+        {isTxt && (
+          <div className="w-full h-full overflow-y-auto p-6 md:p-8 bg-card/40">
+            <div className="max-w-3xl mx-auto rounded-sm border border-border/80 bg-card p-6 shadow-peldrun-sm">
+              <pre className="whitespace-pre-wrap break-words font-mono text-xs md:text-sm leading-relaxed text-foreground/90 select-text">
+                {rawContent}
+              </pre>
             </div>
           </div>
         )}
