@@ -256,7 +256,7 @@ async def _run_peldrun_core_agent(
 
     # Always ensure essential execution tools are present
     requested_tools = list(manifest.get("tools", []))
-    for essential in ("str_replace_editor", "bash", "python_execute", "web_search", "ask_human"):
+    for essential in ("str_replace_editor", "bash", "python_execute", "web_search", "browser_use", "ask_human"):
         if essential not in requested_tools and essential in available_web_tools:
             requested_tools.append(essential)
 
@@ -295,7 +295,6 @@ async def _run_peldrun_core_agent(
     async def _async_on_core_event(event: PeldrunEvent) -> None:
         nonlocal latest_meaningful_thought, current_core_step, is_first_step_start
         
-        # Rigorous step resolution starting at Step 1 and incrementing strictly upon subsequent steps
         explicit_step = _extract_event_step(event)
         if explicit_step is not None:
             current_core_step = explicit_step
@@ -340,18 +339,28 @@ async def _run_peldrun_core_agent(
             tool_name = str(event.payload.get("tool_name") or event.payload.get("tool") or "tool")
             arguments = event.payload.get("arguments", {})
             raw_args = json.dumps(arguments, ensure_ascii=False) if isinstance(arguments, dict) else str(arguments)
+
+            # Special SSE payload decoration for interactive human inquiry
+            is_human_ask = tool_name in ("ask_human", "human_input")
+            tool_call_payload = {
+                "name": tool_name,
+                "toolName": tool_name,
+                "arguments": raw_args,
+                "content": raw_args,
+                "model": model_name,
+                "requires_input": is_human_ask,
+            }
+            if is_human_ask and isinstance(arguments, dict):
+                tool_call_payload["prompt"] = arguments.get("prompt") or arguments.get("query") or ""
+                tool_call_payload["input_type"] = arguments.get("input_type", "text")
+                tool_call_payload["options"] = arguments.get("options", [])
+
             await dispatch_event(
                 job_id,
                 SSEEvent(
                     type=SSEEventType.TOOL_CALL,
                     step=curr_step,
-                    data={
-                        "name": tool_name,
-                        "toolName": tool_name,
-                        "arguments": raw_args,
-                        "content": raw_args,
-                        "model": model_name
-                    }
+                    data=tool_call_payload
                 )
             )
 
@@ -458,9 +467,12 @@ async def _run_peldrun_core_agent(
     scoped_prompt = (
         f"[PROJECT WORKSPACE RULES]\n"
         f"1. Working Directory: Your active directory is: {project_dir.resolve()}\n"
-        f"2. File Deliverables: Use 'python_execute' to reliably create, write, and verify files on this machine.\n"
-        f"3. Tool Invocation Rules: Always provide required parameters (e.g. 'code' for python_execute, 'command' for bash).\n"
-        f"4. Do NOT call 'terminate' until the required files are actually written and inspected.\n\n"
+        f"2. File Deliverables: Use 'python_execute' or 'str_replace_editor' to create, edit, and verify files on disk.\n"
+        f"3. Tool Calling Conventions: Always supply required parameters (e.g. 'query' for web_search, 'url' for browser_use).\n"
+        f"4. Search & Fallback Strategy: First use 'web_search'. If search engines return no snippets, use 'browser_use' to visit authoritative websites directly (e.g. TechCrunch, Reuters, BBC).\n"
+        f"5. Mandatory Human Consultation (ask_human): If you cannot find live articles or need guidance, DO NOT generate outdated answers from memory. You MUST immediately invoke 'ask_human' with a clear prompt, appropriate 'input_type' ('text' | 'confirm' | 'select'), and actionable 'options' (e.g. ['Provide Custom URL', 'Try Different Topic', 'Answer From Knowledge']). The task will pause and wait for the human operator.\n"
+        f"6. Citations & Attribution: When reporting news or technical data, ALWAYS cite direct sources using Markdown links [Title](URL).\n"
+        f"7. Task Completion: Do NOT call 'terminate' until the deliverables are created and verified or the user inquiry is fully satisfied.\n\n"
         f"[USER TASK]\n"
         f"{prompt}"
     )
@@ -617,7 +629,7 @@ async def _run_legacy_openmanus_agent(
     from omweb.tools.registry import tool_registry
 
     all_active_tool_ids = {t["id"].lower() for t in tool_registry.list_tools() if t.get("is_enabled", True)}
-    allowed_tools = [t.lower() for t in manifest.get("tools", []) if t.lower() in all_active_tool_ids or t.lower() in ["mcp", "browser"]]
+    allowed_tools = [t.lower() for t in manifest.get("tools", []) if t.lower() in all_active_tool_ids or t.lower() in ["mcp", "browser", "browser_use"]]
     allowed_tools.extend(["terminate", "ask_human"])
 
     agent = legacy_peldrun_agent()

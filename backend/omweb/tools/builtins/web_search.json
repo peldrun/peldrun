@@ -2,10 +2,24 @@
   "id": "web_search",
   "name": "Web Search",
   "category": "network",
-  "description": "Searches online knowledge databases and indexes real-time results.",
+  "description": "Searches online knowledge databases for real-time news, documentation, and web content. Returns titles, direct URLs, and concise snippets. Always cite sources and include target URLs in your response.",
   "safety_level": "read_only",
   "parameters": {
-    "query": "string"
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "The search query terms to look up on the live web."
+      },
+      "max_results": {
+        "type": "integer",
+        "default": 5,
+        "description": "Maximum number of search results to retrieve (default: 5, min: 1, max: 15)."
+      }
+    },
+    "required": [
+      "query"
+    ]
   },
   "is_builtin": true,
   "read_only": true

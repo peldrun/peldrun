@@ -31,26 +31,15 @@ export default function SettingsPage() {
   const [fetchingModels, setFetchingModels] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
 
+  // Baseline reference string representing the last persisted configuration snapshot
   const initialLoadedRef = useRef<string>("");
 
   const [lmStudioSettings, setLmStudioSettings] = useState<LMStudioSettings>(INITIAL_LMSTUDIO_SETTINGS);
   const [ollamaSettings, setOllamaSettings] = useState<OllamaSettings>(INITIAL_OLLAMA_SETTINGS);
   const [cloudProviders, setCloudProviders] = useState<CloudProviderVaultItem[]>(INITIAL_CLOUD_PROVIDERS);
-  const [customEndpoints, setCustomEndpoints] = useState<CustomEndpoint[]>([
-    {
-      id: "gigachat_1",
-      name: "GigaChat-3-Ultra",
-      providerId: "gigachat-3-ultra",
-      endpointUrl: "http://127.0.0.1:8090/v1",
-      apiMode: "Auto-detect",
-      defaultModel: "GigaChat-3-Ultra",
-      contextWindow: "Auto",
-      apiKey: "",
-      status: "untested",
-      useForNewChats: true,
-      savedModels: []
-    },
-  ]);
+  
+  // Clean dynamic state without hardcoded provider entries
+  const [customEndpoints, setCustomEndpoints] = useState<CustomEndpoint[]>([]);
 
   const [config, setConfig] = useState<FullAppConfig>({
     llm: {
@@ -111,6 +100,7 @@ export default function SettingsPage() {
 
   const [systemInfo, setSystemInfo] = useState<any>(null);
 
+  // Compute live state serialization snapshot and dirty state
   const currentSnapshot = JSON.stringify({ config, lmStudioSettings, ollamaSettings, cloudProviders, customEndpoints });
   const isDirty = initialLoadedRef.current !== "" && initialLoadedRef.current !== currentSnapshot;
 
@@ -138,7 +128,7 @@ export default function SettingsPage() {
       let storedCloud = INITIAL_CLOUD_PROVIDERS;
       let storedLM = INITIAL_LMSTUDIO_SETTINGS;
       let storedOllama = INITIAL_OLLAMA_SETTINGS;
-      let storedCustom = customEndpoints;
+      let storedCustom: CustomEndpoint[] = [];
 
       if (vault.scanned_models && Array.isArray(vault.scanned_models) && vault.scanned_models.length > 0) {
         setAvailableModels(vault.scanned_models);
@@ -176,7 +166,8 @@ export default function SettingsPage() {
         });
       }
 
-      if (vault.custom_endpoints && Array.isArray(vault.custom_endpoints) && vault.custom_endpoints.length > 0) {
+      // Strictly reflect persisted custom endpoints without arbitrary fallbacks
+      if (vault.custom_endpoints && Array.isArray(vault.custom_endpoints)) {
         storedCustom = vault.custom_endpoints;
       }
 
@@ -206,7 +197,7 @@ export default function SettingsPage() {
           chrome_instance_path: cfg.browser?.chrome_instance_path || "",
           cdp_url: cfg.browser?.cdp_url || "http://localhost:9222",
           wss_url: cfg.browser?.wss_url || "",
-          max_content_length: cfg.browser?.max_content_length || 2000,
+          max_content_length: parseInt(String(cfg.browser?.max_content_length), 10) || 2000,
           proxy: {
             server: cfg["browser.proxy"]?.server || cfg.browser?.proxy?.server || "",
             username: cfg["browser.proxy"]?.username || cfg.browser?.proxy?.username || "",
@@ -246,6 +237,8 @@ export default function SettingsPage() {
       setCloudProviders(storedCloud);
       setCustomEndpoints(storedCustom);
       setConfig(loadedConfig);
+
+      // Establish initial baseline snapshot
       initialLoadedRef.current = JSON.stringify({
         config: loadedConfig,
         lmStudioSettings: storedLM,
@@ -289,7 +282,7 @@ export default function SettingsPage() {
       setLmStudioSettings(parsed.lmStudioSettings);
       setOllamaSettings(parsed.ollamaSettings || INITIAL_OLLAMA_SETTINGS);
       setCloudProviders(parsed.cloudProviders);
-      setCustomEndpoints(parsed.customEndpoints);
+      setCustomEndpoints(parsed.customEndpoints || []);
       showToast.info("Changes Reverted", "Restored last saved vault configuration.");
     }
   };
@@ -468,9 +461,11 @@ export default function SettingsPage() {
         activeLlm.provider_name = "Ollama (Local)";
       }
 
+      activeLlm.max_tokens = sanitizeTokens(activeLlm.max_tokens);
+
       const llmDict: any = { ...activeLlm };
       llmDict["vision"] = config.llm_vision;
-      llmDict.max_tokens = sanitizeTokens(activeLlm.max_tokens);
+      llmDict.max_tokens = activeLlm.max_tokens;
 
       const payload = {
         llm: llmDict,
@@ -499,13 +494,11 @@ export default function SettingsPage() {
       if (res.ok) {
         const updatedLM: LMStudioSettings = {
           ...lmStudioSettings,
-          savedModels: availableModels
+          savedModels: availableModels.length > 0 ? availableModels : (lmStudioSettings.savedModels || [])
         };
 
-        const safeOllamaVault = {
-          baseUrl: ollamaSettings.baseUrl,
-          model: ollamaSettings.model,
-          apiKey: "",
+        const safeOllamaVault: OllamaSettings = {
+          ...ollamaSettings,
           savedModels: ollamaSettings.savedModels || []
         };
 
@@ -517,10 +510,25 @@ export default function SettingsPage() {
           scanned_models: availableModels
         });
 
+        // Synchronize React state with the newly persisted data
+        const finalConfig: FullAppConfig = {
+          ...config,
+          llm: activeLlm,
+          browser: {
+            ...config.browser,
+            max_content_length: parseInt(String(config.browser.max_content_length), 10) || 2000
+          }
+        };
+
+        setConfig(finalConfig);
+        setLmStudioSettings(updatedLM);
+        setOllamaSettings(safeOllamaVault);
+
+        // Update baseline snapshot to match synchronized React state
         initialLoadedRef.current = JSON.stringify({
-          config: { ...config, llm: activeLlm },
+          config: finalConfig,
           lmStudioSettings: updatedLM,
-          ollamaSettings,
+          ollamaSettings: safeOllamaVault,
           cloudProviders,
           customEndpoints
         });

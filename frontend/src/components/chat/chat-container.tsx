@@ -355,18 +355,22 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     }
   };
 
-  const handleSendHumanAnswer = async () => {
-    if (!activeJobId || !humanAnswer.trim()) return;
+const handleSendHumanAnswer = async (customAnswer?: string) => {
+    const finalAnswer = (typeof customAnswer === "string" ? customAnswer : humanAnswer).trim();
+    if (!finalAnswer || !activeJobId) return;
+
     try {
-      await fetch(`/api/run/jobs/${activeJobId}/respond`, {
+      const res = await fetch(`/api/run/jobs/${activeJobId}/respond`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ answer: humanAnswer.trim() }),
+        body: JSON.stringify({ answer: finalAnswer }),
       });
-      setHumanQuery(null);
-      setHumanAnswer("");
+      if (res.ok) {
+        setHumanAnswer("");
+        setHumanQuery(null);
+      }
     } catch (e) {
-      console.error("Failed to submit human response", e);
+      console.error("Failed to send human answer:", e);
     }
   };
 
@@ -525,7 +529,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
           activeChatId={activeChatId}
           activeJobId={activeJobId}
           historyTurnsCount={historyTurns.length}
-          status={status}
+          status={status as any}
           tokensUsed={tokensUsed}
           currentStepNum={currentStepNum}
           maxSteps={getAgentMaxSteps(selectedAgentId)}

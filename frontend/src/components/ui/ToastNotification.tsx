@@ -62,7 +62,7 @@ export function ToastContainer() {
           key={t.id}
           className={`pointer-events-auto flex items-start gap-3 p-3.5 rounded-lg border shadow-xl backdrop-blur-md transition-all duration-300 animate-in slide-in-from-top-3 ${
             t.type === "success"
-              ? "bg-emerald-950/85 border-emerald-500/40 text-emerald-100 dark:bg-emerald-950/90"
+              ? "bg-card border-card text-black dark:bg-emerald-950/90"
               : t.type === "error"
               ? "bg-rose-950/85 border-rose-500/40 text-rose-100 dark:bg-rose-950/90"
               : t.type === "warning"

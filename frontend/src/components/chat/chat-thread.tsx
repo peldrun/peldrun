@@ -1,11 +1,11 @@
 ﻿"use client";
 
 import React from "react";
-import { Copy, Check, HelpCircle, Loader2 } from "lucide-react";
+import { Copy, Check, HelpCircle, CheckCircle2, MessageSquare } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ChatTimeline, StepEvent } from "./chat-timeline";
 import { ChatDeliverable } from "./chat-deliverable";
-import AIThinkingLoader from '@/components/AIThinkingLoader';
+import AIThinkingLoader from "@/components/AIThinkingLoader";
 
 export interface ChatTurn {
   id: string;
@@ -28,7 +28,7 @@ interface ChatThreadProps {
   humanQuery: string | null;
   humanAnswer: string;
   setHumanAnswer: (val: string) => void;
-  onSendHumanAnswer: () => void;
+  onSendHumanAnswer: (customAnswer?: string) => void;
   execMode: "agent" | "chat";
   activeGroupedSteps: Record<number, StepEvent[]>;
   currentStepNum: number;
@@ -94,6 +94,40 @@ export function ChatThread({
     .reverse()
     .find((s) => s.type === "thought" && s.content && !s.content.startsWith("Step ") && !s.content.startsWith("terminate("));
 
+  // Inspect active steps to detect interactive human inquiry parameters (prompt, options, input_type)
+  const pendingHumanCall = [...activeStepsList].reverse().find((s) => {
+    return (
+      (s.toolName === "ask_human" || s.toolName === "human_input") &&
+      s.type === "tool_call"
+    );
+  });
+
+  let detectedPrompt = humanQuery;
+  let detectedType = "text";
+  let detectedOptions: string[] = [];
+
+  if (pendingHumanCall && pendingHumanCall.content) {
+    try {
+      const parsedArgs = JSON.parse(pendingHumanCall.content);
+      if (parsedArgs && typeof parsedArgs === "object") {
+        detectedPrompt = parsedArgs.prompt || parsedArgs.query || detectedPrompt;
+        detectedType = (parsedArgs.input_type || "text").toLowerCase();
+        if (Array.isArray(parsedArgs.options) && parsedArgs.options.length > 0) {
+          detectedOptions = parsedArgs.options.map(String);
+        } else if (detectedType === "confirm" || detectedType === "boolean") {
+          detectedOptions = ["Yes", "No"];
+        }
+      }
+    } catch {
+      // Content may be a raw string prompt
+      if (!detectedPrompt) {
+        detectedPrompt = pendingHumanCall.content;
+      }
+    }
+  }
+
+  const isHumanWaiting = Boolean(detectedPrompt && status === "running");
+
   return (
     <div className="flex-1 overflow-y-auto p-4 sm:p-5 font-sans">
       <div className="w-full max-w-[900px] mx-auto space-y-6">
@@ -115,7 +149,7 @@ export function ChatThread({
             <div key={turn.id || `turn-${tIdx}`} className="space-y-4 pb-6 border-b border-border/40">
               {/* User Prompt */}
               <div className="flex flex-col items-end space-y-1">
-                <div className="max-w-[90%]  bg-transparent text-foreground px-4 py-2.5 text-sm sm:text-base leading-relaxed whitespace-pre-wrap font-sans">
+                <div className="max-w-[90%] bg-transparent text-foreground px-4 py-2.5 text-sm sm:text-base leading-relaxed whitespace-pre-wrap font-sans">
                   {turn.prompt}
                 </div>
                 <div className="flex items-center gap-2 px-1 text-[10px] text-muted-foreground font-mono">
@@ -135,7 +169,7 @@ export function ChatThread({
                 </div>
               </div>
 
-              {/* Collapsible Execution Steps (Agent Mode Only) */}
+              {/* Execution Steps */}
               {isAgentTurn && turnGrouped && Object.keys(turnGrouped).length > 0 && (
                 <ChatTimeline
                   prefix={`turn-${tIdx}`}
@@ -148,7 +182,7 @@ export function ChatThread({
                 />
               )}
 
-              {/* Assistant Deliverable Response */}
+              {/* Final Result */}
               {turn.finalResult && (
                 <ChatDeliverable
                   finalResult={turn.finalResult}
@@ -195,37 +229,7 @@ export function ChatThread({
           </div>
         )}
 
-        {/* Human Feedback Box */}
-        {humanQuery && (
-          <div className="p-4 rounded-lg bg-warning/10 border border-warning/30 text-xs space-y-2.5 animate-pulse">
-            <div className="flex items-center gap-2 text-warning font-semibold text-xs">
-              <HelpCircle size={14} className="shrink-0" />
-              <span>Agent Requires Human Input:</span>
-            </div>
-            <div className="p-2.5 rounded-md bg-background border border-border text-foreground">
-              {humanQuery}
-            </div>
-            <div className="flex items-center gap-2">
-              <input
-                type="text"
-                value={humanAnswer}
-                onChange={(e) => setHumanAnswer(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && onSendHumanAnswer()}
-                placeholder="Type your response to the agent..."
-                className="flex-1 bg-background border border-border rounded-md px-3 py-1.5 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
-              />
-              <Button
-                variant="primary"
-                onClick={onSendHumanAnswer}
-                className="text-xs px-3 h-8 rounded-md cursor-pointer"
-              >
-                Submit Answer
-              </Button>
-            </div>
-          </div>
-        )}
-
-        {/* Active Stepper (Agent Mode Only) */}
+        {/* Active Stepper (Agent Mode) */}
         {execMode === "agent" && activeGroupedSteps && Object.keys(activeGroupedSteps).length > 0 && (
           <ChatTimeline
             prefix="active"
@@ -238,19 +242,85 @@ export function ChatThread({
           />
         )}
 
-        {/* Live Running Status */}
-        {status === "running" && (
+        {/* Interactive Human-in-the-Loop Dialog Suspension Card */}
+        {isHumanWaiting && (
+          <div className="p-4 sm:p-5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-xs space-y-3.5 shadow-sm transition-all">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 text-amber-600 dark:text-amber-400 font-semibold text-xs">
+                <HelpCircle size={15} className="shrink-0 animate-bounce" />
+                <span>Agent Paused & Waiting for Your Decision:</span>
+              </div>
+              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/20 font-bold">
+                Action Required
+              </span>
+            </div>
+
+            <div className="p-3 rounded-lg bg-background border border-border text-foreground text-sm font-medium leading-relaxed whitespace-pre-wrap">
+              {detectedPrompt}
+            </div>
+
+            {/* Clickable Quick Action Option Buttons */}
+            {detectedOptions.length > 0 && (
+              <div className="space-y-1.5">
+                <span className="text-[11px] font-medium text-muted-foreground block">
+                  Select an option to proceed:
+                </span>
+                <div className="flex flex-wrap items-center gap-2">
+                  {detectedOptions.map((opt) => (
+                    <button
+                      key={opt}
+                      type="button"
+                      onClick={() => onSendHumanAnswer(opt)}
+                      className="px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-primary text-primary-foreground hover:bg-primary/90 transition-all shadow-xs cursor-pointer flex items-center gap-1.5 active:scale-95"
+                    >
+                      <CheckCircle2 size={13} />
+                      <span>{opt}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Freeform Text Input Response */}
+            <div className="flex items-center gap-2 pt-1">
+              <div className="relative flex-1">
+                <input
+                  type="text"
+                  value={humanAnswer}
+                  onChange={(e) => setHumanAnswer(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && onSendHumanAnswer()}
+                  placeholder={
+                    detectedOptions.length > 0
+                      ? "Or type a custom response to the agent..."
+                      : "Type your response to the agent..."
+                  }
+                  className="w-full bg-background border border-border rounded-lg pl-3 pr-8 py-2 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-primary shadow-xs"
+                />
+                <MessageSquare size={13} className="absolute right-2.5 top-2.5 text-muted-foreground/60 pointer-events-none" />
+              </div>
+              <Button
+                variant="primary"
+                onClick={() => onSendHumanAnswer()}
+                disabled={!humanAnswer.trim()}
+                className="text-xs px-4 h-8.5 rounded-lg cursor-pointer font-medium"
+              >
+                Send
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* Live Running Indicator */}
+        {status === "running" && !isHumanWaiting && (
           <div className="flex items-center justify-between px-3.5 py-2.5 bg-muted/40 text-foreground transition-all">
             <div className="flex items-center gap-2.5 text-xs">
-
-             <AIThinkingLoader
-                  message={getLiveStatusMessage()}
-                  color="blue"
-                  speed={5}
-                  textAnimation="shimmer"
-                  showDots={false}
-                />
-
+              <AIThinkingLoader
+                message={getLiveStatusMessage()}
+                color="blue"
+                speed={5}
+                textAnimation="shimmer"
+                showDots={false}
+              />
             </div>
             <span className="text-[11px] font-mono px-2 py-0.5 rounded-md bg-background border border-border text-muted-foreground">
               {elapsedSeconds}s
@@ -258,7 +328,7 @@ export function ChatThread({
           </div>
         )}
 
-        {/* Current Turn Deliverable */}
+        {/* Current Turn Final Deliverable */}
         {finalResult && (
           <ChatDeliverable
             finalResult={finalResult}

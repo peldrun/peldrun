@@ -1,11 +1,38 @@
 {
   "id": "ask_human",
-  "name": "Human Feedback Inquirer",
+  "name": "Human-in-the-Loop Inquiry",
   "category": "interaction",
-  "description": "Pauses agent autonomy and requests clarification or decision from the user.",
-  "safety_level": "safe",
+  "description": "Pauses agent autonomy and requests input, confirmation (Yes/No), or selection choices from the human operator.",
+  "safety_level": "controlled",
   "parameters": {
-    "question": "string"
+    "type": "object",
+    "properties": {
+      "prompt": {
+        "type": "string",
+        "description": "The exact question, prompt, or clarification requested from the human user."
+      },
+      "input_type": {
+        "type": "string",
+        "enum": ["text", "confirm", "select", "multiple_choice"],
+        "default": "text",
+        "description": "The UI interaction component to render: 'text' (input field), 'confirm' (Yes/No buttons), 'select' (single button choice)."
+      },
+      "options": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "List of button options for the user to click (e.g. ['Yes', 'No'] or custom choices)."
+      },
+      "timeout_seconds": {
+        "type": "integer",
+        "default": 600,
+        "description": "Maximum waiting time in seconds for the user to respond."
+      }
+    },
+    "required": [
+      "prompt"
+    ]
   },
   "is_builtin": true,
   "read_only": true

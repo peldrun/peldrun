@@ -45,6 +45,17 @@ interface LLMTabProps {
   testEndpoint: (baseUrl: string, apiKey: string, model: string, apiType?: string) => Promise<{ ok: boolean; message: string; latency?: number }>;
 }
 
+const EMPTY_ENDPOINT_FORM = {
+  name: "",
+  providerId: "",
+  endpointUrl: "",
+  apiMode: "Auto-detect" as ApiModeType,
+  defaultModel: "",
+  contextWindow: "Auto",
+  apiKey: "",
+  useForNewChats: true,
+};
+
 export function LLMTab({
   config,
   setConfig,
@@ -95,26 +106,8 @@ export function LLMTab({
     isCustom?: boolean;
   } | null>(null);
 
-  // New/Edit Custom Endpoint Form State
-  const [endpointForm, setEndpointForm] = useState<{
-    name: string;
-    providerId: string;
-    endpointUrl: string;
-    apiMode: ApiModeType;
-    defaultModel: string;
-    contextWindow: string;
-    apiKey: string;
-    useForNewChats: boolean;
-  }>({
-    name: "GigaChat-3-Ultra",
-    providerId: "gigachat-3-ultra",
-    endpointUrl: "http://127.0.0.1:8090/v1",
-    apiMode: "Auto-detect",
-    defaultModel: "GigaChat-3-Ultra",
-    contextWindow: "Auto",
-    apiKey: "",
-    useForNewChats: true,
-  });
+  // Clean form state initialized with empty values
+  const [endpointForm, setEndpointForm] = useState(EMPTY_ENDPOINT_FORM);
 
   const [showKeys, setShowKeys] = useState<{ [id: string]: boolean }>({});
 
@@ -208,7 +201,11 @@ export function LLMTab({
   const handleScanOllama = async () => {
     setScanningOllama(true);
     try {
-      const res = await fetch("http://localhost:8088/api/config/fetch-models", {
+      const fetchModelsUrl = typeof window !== "undefined" && (window.location.port === "3088" || window.location.port === "3000")
+        ? "http://localhost:8088/api/config/fetch-models"
+        : "/api/config/fetch-models";
+
+      const res = await fetch(fetchModelsUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -351,7 +348,7 @@ export function LLMTab({
       }
     }
 
-    showToast.success("Models Saved", `Saved ${selectedModels.length} models for${discoveryTarget.name}`);
+    showToast.success("Models Saved", `Saved ${selectedModels.length} models for ${discoveryTarget.name}`);
     setDiscoveryTarget(null);
   };
 
@@ -428,7 +425,7 @@ export function LLMTab({
       endpointUrl: endpointForm.endpointUrl.trim(),
       apiMode: endpointForm.apiMode,
       defaultModel: endpointForm.defaultModel.trim() || "default",
-      contextWindow: endpointForm.contextWindow,
+      contextWindow: endpointForm.contextWindow || "Auto",
       apiKey: endpointForm.apiKey.trim(),
       status: "untested",
       useForNewChats: endpointForm.useForNewChats,
@@ -436,6 +433,7 @@ export function LLMTab({
     };
 
     setCustomEndpoints((prev) => [newEndpoint, ...prev]);
+    setEndpointForm(EMPTY_ENDPOINT_FORM);
     showToast.success("Custom Endpoint Saved", newEndpoint.name);
   };
 
@@ -447,8 +445,8 @@ export function LLMTab({
   return (
     <div className="llm-tab w-full space-y-6 max-auto font-sans pb-6">
       {/* Header */}
-      <div className="border-b border-border w-full pb-0 pt-4  bg-custom ">
-        <div className="flex items-center gap-2  pr-4 pl-4">
+      <div className="border-b border-border w-full pb-0 pt-4 bg-custom">
+        <div className="flex items-center gap-2 pr-4 pl-4">
           <Sparkles size={16} className="text-primary" />
           <h2 className="text-sm font-semibold font-heading text-foreground uppercase tracking-wide">
             Model Hub & Multi-Provider Architecture
@@ -1537,74 +1535,80 @@ export function LLMTab({
           </div>
 
           <div className="space-y-3">
-            {customEndpoints.map((ce) => (
-              <div key={ce.id} className="p-4 rounded-md border border-border bg-card shadow-xs flex items-center justify-between">
-                <div className="space-y-0.5">
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm font-bold text-foreground">{ce.name}</span>
-                    <span className="text-[10px] px-1.5 py-0.2 rounded bg-muted text-muted-foreground font-mono">
-                      {ce.defaultModel}
-                    </span>
-                  </div>
-                  <span className="text-xs text-muted-foreground font-mono block">{ce.endpointUrl}</span>
-                </div>
-
-                <div className="flex items-center gap-2">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => {
-                      setDiscoveryTarget({
-                        id: ce.id,
-                        name: ce.name,
-                        baseUrl: ce.endpointUrl,
-                        apiKey: ce.apiKey || "",
-                        type: "",
-                        savedModels: ce.savedModels || [],
-                        isCustom: true
-                      });
-                    }}
-                    className="h-8 px-2.5 text-xs border-border bg-background hover:bg-muted text-foreground cursor-pointer shadow-xs flex items-center gap-1"
-                    title="Scan available models for this endpoint"
-                  >
-                    <RefreshCw size={11} className="text-primary" />
-                    <span>Scan</span>
-                    {ce.savedModels && ce.savedModels.length > 0 && (
-                      <span className="ml-1 px-1.5 py-0.2 text-[10px] rounded-full bg-primary/15 text-primary font-mono font-bold">
-                        {ce.savedModels.length}
-                      </span>
-                    )}
-                  </Button>
-
-                  <Button
-                    onClick={() =>
-                      activateEngine(ce.providerId, ce.name, ce.defaultModel, ce.endpointUrl, ce.apiKey, "")
-                    }
-                    className="h-8 px-3 text-xs bg-primary text-primary-foreground font-medium flex items-center gap-1.5 cursor-pointer shadow-xs"
-                  >
-                    <Zap size={12} />
-                    <span>Use</span>
-                  </Button>
-
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => handleDeleteCustomEndpoint(ce.id)}
-                    className="h-8 w-8 p-0 text-muted-foreground hover:text-rose-500 cursor-pointer"
-                  >
-                    <Trash2 size={14} />
-                  </Button>
-                </div>
+            {customEndpoints.length === 0 ? (
+              <div className="p-6 rounded-md border border-dashed border-border bg-card text-center text-xs text-muted-foreground">
+                No custom endpoints configured yet. Add your local vLLM, FastChat, or remote custom API servers below.
               </div>
-            ))}
+            ) : (
+              customEndpoints.map((ce) => (
+                <div key={ce.id} className="p-4 rounded-md border border-border bg-card shadow-xs flex items-center justify-between">
+                  <div className="space-y-0.5">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-bold text-foreground">{ce.name}</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-muted text-muted-foreground font-mono">
+                        {ce.defaultModel}
+                      </span>
+                    </div>
+                    <span className="text-xs text-muted-foreground font-mono block">{ce.endpointUrl}</span>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        setDiscoveryTarget({
+                          id: ce.id,
+                          name: ce.name,
+                          baseUrl: ce.endpointUrl,
+                          apiKey: ce.apiKey || "",
+                          type: "",
+                          savedModels: ce.savedModels || [],
+                          isCustom: true
+                        });
+                      }}
+                      className="h-8 px-2.5 text-xs border-border bg-background hover:bg-muted text-foreground cursor-pointer shadow-xs flex items-center gap-1"
+                      title="Scan available models for this endpoint"
+                    >
+                      <RefreshCw size={11} className="text-primary" />
+                      <span>Scan</span>
+                      {ce.savedModels && ce.savedModels.length > 0 && (
+                        <span className="ml-1 px-1.5 py-0.2 text-[10px] rounded-full bg-primary/15 text-primary font-mono font-bold">
+                          {ce.savedModels.length}
+                        </span>
+                      )}
+                    </Button>
+
+                    <Button
+                      onClick={() =>
+                        activateEngine(ce.providerId, ce.name, ce.defaultModel, ce.endpointUrl, ce.apiKey, "")
+                      }
+                      className="h-8 px-3 text-xs bg-primary text-primary-foreground font-medium flex items-center gap-1.5 cursor-pointer shadow-xs"
+                    >
+                      <Zap size={12} />
+                      <span>Use</span>
+                    </Button>
+
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => handleDeleteCustomEndpoint(ce.id)}
+                      className="h-8 w-8 p-0 text-muted-foreground hover:text-rose-500 cursor-pointer"
+                    >
+                      <Trash2 size={14} />
+                    </Button>
+                  </div>
+                </div>
+              ))
+            )}
           </div>
 
           <div className="p-5 rounded-md border border-border bg-card space-y-4 shadow-sm">
             <div className="flex items-center gap-2 pb-2 border-b border-border/60">
               <Plus size={14} className="text-primary" />
               <span className="text-xs font-bold text-foreground uppercase tracking-wider">
-                Edit Endpoint
+                Add Custom Endpoint
               </span>
             </div>
 
@@ -1616,7 +1620,7 @@ export function LLMTab({
                     type="text"
                     value={endpointForm.name}
                     onChange={(e) => setEndpointForm({ ...endpointForm, name: e.target.value })}
-                    placeholder="GigaChat-3-Ultra"
+                    placeholder="e.g. Local vLLM, FastChat, Custom API"
                     className="w-full bg-background border border-border rounded px-3 py-1.5 text-xs text-foreground shadow-xs"
                   />
                 </div>
@@ -1626,7 +1630,7 @@ export function LLMTab({
                     type="text"
                     value={endpointForm.providerId}
                     onChange={(e) => setEndpointForm({ ...endpointForm, providerId: e.target.value })}
-                    placeholder="gigachat-3-ultra"
+                    placeholder="e.g. local-vllm, custom-endpoint"
                     className="w-full bg-background border border-border rounded px-3 py-1.5 text-xs text-foreground shadow-xs font-mono"
                   />
                 </div>
@@ -1638,7 +1642,7 @@ export function LLMTab({
                   type="text"
                   value={endpointForm.endpointUrl}
                   onChange={(e) => setEndpointForm({ ...endpointForm, endpointUrl: e.target.value })}
-                  placeholder="http://127.0.0.1:8090/v1"
+                  placeholder="e.g. http://127.0.0.1:8000/v1"
                   className="w-full bg-background border border-border rounded px-3 py-1.5 text-xs text-foreground shadow-xs font-mono"
                 />
               </div>
@@ -1670,7 +1674,7 @@ export function LLMTab({
                     type="text"
                     value={endpointForm.defaultModel}
                     onChange={(e) => setEndpointForm({ ...endpointForm, defaultModel: e.target.value })}
-                    placeholder="GigaChat-3-Ultra"
+                    placeholder="e.g. meta-llama/Llama-3-8B-Instruct"
                     className="w-full bg-background border border-border rounded px-3 py-1.5 text-xs text-foreground shadow-xs font-mono"
                   />
                 </div>
@@ -1756,7 +1760,3 @@ export function LLMTab({
     </div>
   );
 }
-
-
-
-

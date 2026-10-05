@@ -2,11 +2,29 @@
   "id": "browser_use",
   "name": "Headless Browser Navigation",
   "category": "network",
-  "description": "Navigates websites, clicks, interacts with DOM, and extracts web content.",
+  "description": "Navigates websites, clicks, interacts with DOM, extracts page contents, and inspects web pages.",
   "safety_level": "controlled",
   "parameters": {
-    "url": "string",
-    "action": "string"
+    "type": "object",
+    "properties": {
+      "url": {
+        "type": "string",
+        "description": "The target website URL to visit or inspect."
+      },
+      "action": {
+        "type": "string",
+        "enum": ["navigate", "extract_content", "click", "scroll_down", "screenshot"],
+        "default": "navigate",
+        "description": "The browser operation to perform on the target web page."
+      },
+      "selector": {
+        "type": "string",
+        "description": "Optional CSS selector or keyword to click or target on the page."
+      }
+    },
+    "required": [
+      "url"
+    ]
   },
   "is_builtin": true,
   "read_only": true
