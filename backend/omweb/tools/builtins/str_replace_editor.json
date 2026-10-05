@@ -1,0 +1,50 @@
+{
+  "id": "str_replace_editor",
+  "name": "Str Replace Editor",
+  "description": "Standard file system editor to view, create, and replace text in workspace files.",
+  "category": "system",
+  "safety_level": "safe",
+  "is_builtin": true,
+  "is_enabled": true,
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "command": {
+        "type": "string",
+        "enum": ["view", "create", "str_replace", "insert", "undo_edit"],
+        "description": "The file operation command: 'create' to make a new file, 'view' to read lines, 'str_replace' to modify text."
+      },
+      "path": {
+        "type": "string",
+        "description": "Relative workspace file path (e.g. 'index.html', 'style.css', 'app.js')."
+      },
+      "file_text": {
+        "type": "string",
+        "description": "Content of the file to create (required when command is 'create')."
+      },
+      "old_str": {
+        "type": "string",
+        "description": "Unique exact string snippet to replace (required when command is 'str_replace')."
+      },
+      "new_str": {
+        "type": "string",
+        "description": "Replacement string snippet (optional for 'str_replace', defaults to empty)."
+      },
+      "insert_line": {
+        "type": "integer",
+        "description": "Line number after which new text is inserted (required for 'insert')."
+      },
+      "view_range": {
+        "type": "array",
+        "items": {
+          "type": "integer"
+        },
+        "description": "Line range [start, end] to view in target file."
+      }
+    },
+    "required": [
+      "command",
+      "path"
+    ]
+  }
+}

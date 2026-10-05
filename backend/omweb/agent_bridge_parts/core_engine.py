@@ -3,6 +3,7 @@ PELDRUN Core native engine runner.
 
 Executes an autonomous agent workflow via the ``peldrun-core`` package
 with real-time SSE event streaming to the Web UI.
+Injects platform tools through session-scoped Core ToolRegistry instances.
 """
 
 from __future__ import annotations
@@ -30,28 +31,12 @@ async def _run_peldrun_core_agent(
     chat_id: str,
     manifest: Dict[str, Any],
 ) -> None:
-    """Execute the agent workflow using the PELDRUN Core engine.
-
-    Wires real tools, subscribes to the core EventEmitter, streams
-    STEP_START / THOUGHT / TOOL_CALL / OBSERVATION / ERROR / FINAL
-    events to the web UI as SSE, and completes the job with the result.
-
-    Args:
-        job_id:        Unique job identifier.
-        prompt:        User task prompt.
-        agent_id:      Agent registry identifier.
-        active_llm:    Resolved LLM config (model, base_url, api_key, ...).
-        model_name:    Display name of the active model.
-        provider_name: Display name of the active provider.
-        project_dir:   Workspace directory for the current chat.
-        chat_id:       Chat session identifier.
-        manifest:      Agent manifest (system prompt, tools, max_steps, ...).
-    """
+    """Execute the agent workflow using the PELDRUN Core engine."""
     print(f"\n[BRIDGE CORE] >>> Starting Live Run for Job: {job_id} using PELDRUN Core Engine <<<")
 
-    # Local imports so that the core engine is only required when in use.
     from peldrun.events.emitter import EventEmitter
     from peldrun.events.schema import EventType, PeldrunEvent
+    from peldrun.tools.registry import ToolRegistry as CoreToolRegistry
     from peldrun.tools.collection import ToolCollection
     from peldrun.tools.builtins.terminate import TerminateTool
     from peldrun.llm.client import LLMConfig
@@ -70,20 +55,27 @@ async def _run_peldrun_core_agent(
     ws_path = project_dir.resolve()
     ws_path_str = str(ws_path)
 
-    # 1. Wire Real Executable Tool Collection
-    collection = ToolCollection()
-    collection.add_tool(TerminateTool(workspace_root=ws_path_str))
+    # 1. Wire Session-Scoped Core ToolRegistry
+    core_registry = CoreToolRegistry(workspace_root=ws_path_str)
+    core_registry.register(TerminateTool(workspace_root=ws_path_str))
 
     available_web_tools = {t["id"]: t for t in web_tool_registry.list_tools() if t.get("is_enabled", True)}
 
-    # Always ensure essential execution tools are present
     requested_tools = list(manifest.get("tools", []))
-    for essential in ("str_replace_editor", "bash", "python_execute", "web_search", "browser_use", "ask_human"):
+    essential_tool_ids = (
+        "str_replace_editor",
+        "bash",
+        "python_execute",
+        "web_search",
+        "browser_use",
+        "ask_human",
+    )
+    for essential in essential_tool_ids:
         if essential not in requested_tools and essential in available_web_tools:
             requested_tools.append(essential)
 
     for req_tool in requested_tools:
-        if req_tool in ("terminate",):
+        if req_tool in ("terminate", "file_saver"):
             continue
 
         if req_tool in available_web_tools:
@@ -94,16 +86,17 @@ async def _run_peldrun_core_agent(
                 workspace_root=ws_path,
                 registry=web_tool_registry
             )
-            collection.add_tool(real_adapter)
+            core_registry.register(real_adapter)
 
-    # 2. Setup Real-Time Event Dispatcher to Web UI safely wrapping async loops
+    fallback_collection: ToolCollection = getattr(core_registry, "_collection", ToolCollection(core_registry.list_tools()))
+
+    # 2. Setup Real-Time Event Dispatcher
     emitter = EventEmitter()
     current_core_step = 1
     is_first_step_start = True
     main_loop = asyncio.get_running_loop()
 
     def _extract_event_step(evt: PeldrunEvent) -> Optional[int]:
-        """Extract explicit step integer from event object or event payload."""
         if hasattr(evt, "step") and isinstance(evt.step, int) and evt.step > 0:
             return evt.step
         if hasattr(evt, "payload") and isinstance(evt.payload, dict):
@@ -115,7 +108,6 @@ async def _run_peldrun_core_agent(
         return None
 
     async def _async_on_core_event(event: PeldrunEvent) -> None:
-        """Async handler that maps every core engine event to SSE events."""
         nonlocal latest_meaningful_thought, current_core_step, is_first_step_start
 
         explicit_step = _extract_event_step(event)
@@ -150,11 +142,7 @@ async def _run_peldrun_core_agent(
                     SSEEvent(
                         type=SSEEventType.THOUGHT,
                         step=curr_step,
-                        data={
-                            "thought": thought_text,
-                            "content": thought_text,
-                            "model": model_name
-                        }
+                        data={"thought": thought_text, "content": thought_text, "model": model_name}
                     )
                 )
 
@@ -163,7 +151,6 @@ async def _run_peldrun_core_agent(
             arguments = event.payload.get("arguments", {})
             raw_args = json.dumps(arguments, ensure_ascii=False) if isinstance(arguments, dict) else str(arguments)
 
-            # Special SSE payload decoration for interactive human inquiry
             is_human_ask = tool_name in ("ask_human", "human_input")
             tool_call_payload = {
                 "name": tool_name,
@@ -174,7 +161,7 @@ async def _run_peldrun_core_agent(
                 "requires_input": is_human_ask,
             }
             if is_human_ask and isinstance(arguments, dict):
-                tool_call_payload["prompt"] = arguments.get("prompt") or arguments.get("query") or ""
+                tool_call_payload["prompt"] = arguments.get("prompt") or arguments.get("query") or arguments.get("question") or ""
                 tool_call_payload["input_type"] = arguments.get("input_type", "text")
                 tool_call_payload["options"] = arguments.get("options", [])
 
@@ -191,7 +178,6 @@ async def _run_peldrun_core_agent(
             obs_out = event.payload.get("output", "") or event.payload.get("error", "")
             obs_str = str(obs_out)
 
-            # Real-time artifact detection on disk per step
             if project_dir.exists():
                 current_files = {p.name for p in project_dir.iterdir() if p.is_file()}
                 new_files = current_files - files_baseline
@@ -222,11 +208,7 @@ async def _run_peldrun_core_agent(
                 SSEEvent(
                     type=SSEEventType.OBSERVATION,
                     step=curr_step,
-                    data={
-                        "output": obs_str,
-                        "content": obs_str,
-                        "model": model_name
-                    }
+                    data={"output": obs_str, "content": obs_str, "model": model_name}
                 )
             )
 
@@ -237,16 +219,11 @@ async def _run_peldrun_core_agent(
                 SSEEvent(
                     type=SSEEventType.ERROR,
                     step=curr_step,
-                    data={
-                        "message": err_msg,
-                        "content": err_msg,
-                        "model": model_name
-                    }
+                    data={"message": err_msg, "content": err_msg, "model": model_name}
                 )
             )
 
     def _sync_event_handler(event: PeldrunEvent) -> None:
-        """Synchronous wrapper ensuring async events execute correctly on main loop."""
         try:
             main_loop.create_task(_async_on_core_event(event))
         except Exception as e:
@@ -254,10 +231,11 @@ async def _run_peldrun_core_agent(
 
     emitter.subscribe_all(_sync_event_handler)
 
-    # 3. Universal LLM Client & Provider Configuration
+    # 3. LLM Configuration
     base_url = active_llm.get("base_url") or "http://127.0.0.1:1234/v1"
     api_key = active_llm.get("api_key") or "EMPTY"
     safe_max_tokens = min(int(active_llm.get("max_tokens") or 4096), 4096)
+    llm_timeout = float(active_llm.get("timeout") or 300.0)
 
     llm_cfg = LLMConfig(
         model=model_name,
@@ -265,11 +243,12 @@ async def _run_peldrun_core_agent(
         api_key=api_key,
         temperature=float(active_llm.get("temperature", 0.2)),
         max_tokens=safe_max_tokens,
+        timeout=llm_timeout,
     )
 
     llm_provider = OpenAICompatProvider(config=llm_cfg)
 
-    # 4. Instantiate ToolCallAgent
+    # 4. Instantiate Agent
     agent_config = AgentConfig(
         name=manifest.get("name") or agent_id,
         system_prompt=system_prompt,
@@ -281,7 +260,8 @@ async def _run_peldrun_core_agent(
     agent = ToolCallAgent(
         config=agent_config,
         llm=llm_provider,
-        tool_collection=collection,
+        tool_registry=core_registry,
+        tool_collection=fallback_collection,
         emitter=emitter,
         workspace_dir=ws_path_str,
     )
@@ -290,17 +270,31 @@ async def _run_peldrun_core_agent(
     scoped_prompt = (
         f"[PROJECT WORKSPACE RULES]\n"
         f"1. Working Directory: Your active directory is: {project_dir.resolve()}\n"
-        f"2. File Deliverables: Use 'python_execute' or 'str_replace_editor' to create, edit, and verify files on disk.\n"
-        f"3. Tool Calling Conventions: Always supply required parameters (e.g. 'query' for web_search, 'url' for browser_use).\n"
-        f"4. Search & Fallback Strategy: First use 'web_search'. If search engines return no snippets, use 'browser_use' to visit authoritative websites directly (e.g. TechCrunch, Reuters, BBC).\n"
-        f"5. Mandatory Human Consultation (ask_human): If you cannot find live articles or need guidance, DO NOT generate outdated answers from memory. You MUST immediately invoke 'ask_human' with a clear prompt, appropriate 'input_type' ('text' | 'confirm' | 'select'), and actionable 'options' (e.g. ['Provide Custom URL', 'Try Different Topic', 'Answer From Knowledge']). The task will pause and wait for the human operator.\n"
-        f"6. Citations & Attribution: When reporting news or technical data, ALWAYS cite direct sources using Markdown links [Title](URL).\n"
-        f"7. Task Completion: Do NOT call 'terminate' until the deliverables are created and verified or the user inquiry is fully satisfied.\n\n"
+        f"2. File Deliverables: ALWAYS use 'str_replace_editor' with command='create' to write and save project files directly to disk (e.g. index.html, style.css, app.js). DO NOT run Python scripts via 'python_execute' merely to save or create files.\n"
+        f"3. Execution & Verification: Use 'python_execute' only when you need to run calculations, test execution, or process data. Use 'bash' for terminal environment commands.\n"
+        f"4. Tool Calling Conventions: Always supply required parameters (e.g. 'command' and 'path' for str_replace_editor, 'query' for web_search, 'url' for browser_use).\n"
+        f"5. Search & Web Fallback: Use 'web_search' for search queries and 'browser_use' to visit authoritative websites directly.\n"
+        f"6. Mandatory Human Consultation (ask_human): When you need operator input, preferences, or sequential answers, invoke 'ask_human' with a clear prompt.\n"
+        f"7. Citations & Attribution: Cite direct sources using Markdown links [Title](URL).\n"
+        f"8. Task Completion: Call 'terminate' when project files are created and verified OR when conversational goals/questions are completely finished and you provide the final response.\n\n"
         f"[USER TASK]\n"
         f"{prompt}"
     )
 
-    final_answer = await agent.run_task(prompt=scoped_prompt, max_steps=max_steps)
+    try:
+        final_answer = await agent.run_task(prompt=scoped_prompt, max_steps=max_steps)
+    except Exception as exc:
+        err_msg = f"Task execution interrupted: {exc}"
+        print(f"[BRIDGE CORE ERROR] {err_msg}")
+        await dispatch_event(
+            job_id,
+            SSEEvent(
+                type=SSEEventType.ERROR,
+                step=current_core_step,
+                data={"message": err_msg, "model": model_name}
+            )
+        )
+        final_answer = sanitize_final_result_text("", latest_meaningful_thought) or err_msg
 
     # 5. Finalize Deliverables and Complete Job
     if project_dir.exists():

@@ -2,23 +2,59 @@
 WebToolAdapter: bridges a platform tool manifest to a runtime executor.
 
 The adapter is responsible for:
-  * Normalizing the tool's parameter schema (falling back to canonical).
+  * Implementing the Core ToolRuntime Protocol contract.
+  * Normalizing the tool parameter schema (falling back to canonical schemas).
   * Switching into the workspace directory before invoking the executor.
   * Handling both sync and async executors transparently.
+  * Standardizing raw execution outcomes into strict Core ToolResult instances.
+  * Maintaining 100% backward compatibility with legacy execution callers.
 """
 
 from __future__ import annotations
 
 import inspect
+import logging
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
+
+# Attempt importing Core Runtime Contract and ToolResult models.
+# Fallback definitions guarantee zero import failures in standalone test environments.
+try:
+    from peldrun.tools.base import ToolResult
+    from peldrun.tools.contract import ToolRuntime
+except ImportError:
+    from typing import Protocol, runtime_checkable
+    from pydantic import BaseModel, Field
+
+    class ToolResult(BaseModel):  # type: ignore[no-redef]
+        output: Any = Field(default=None)
+        exit_code: int = Field(default=0)
+        is_error: bool = Field(default=False)
+        artifacts: List[str] = Field(default_factory=list)
+        metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    @runtime_checkable
+    class ToolRuntime(Protocol):  # type: ignore[no-redef]
+        name: str
+        description: str
+
+        def to_openai_schema(self) -> Dict[str, Any]:
+            ...
+
+        async def aexecute(self, **kwargs: Any) -> ToolResult:
+            ...
 
 from .schemas import CANONICAL_TOOL_SCHEMAS
 
+logger = logging.getLogger("omweb.adapters.web_tool_adapter")
+
 
 class WebToolAdapter:
-    """Adapts platform tool manifests and binds them to genuine runtime execution logic."""
+    """
+    Adapts platform tool manifests and binds them to genuine runtime execution logic.
+    Fulfills the Core ToolRuntime protocol while preserving backward-compatible APIs.
+    """
 
     def __init__(
         self,
@@ -33,16 +69,16 @@ class WebToolAdapter:
         Initialize the adapter.
 
         Args:
-            name: Tool identifier (e.g. "bash", "web_search").
-            description: Human-readable description for the LLM.
-            parameters: JSON-schema-shaped parameter definition.  If missing
-                or empty, the canonical schema for `name` is used.
-            executor: The actual callable (sync or async) to invoke.
-            workspace_root: Directory used as CWD during execution.
-            **kwargs: Extra keyword arguments stored for future use.
+            name: Tool identifier (e.g. "bash", "python_execute", "web_search").
+            description: Human-readable description provided to the LLM agent.
+            parameters: JSON-schema parameter definition. If missing or incomplete,
+                canonical schemas are applied as fallback.
+            executor: The underlying callable (sync or async) executing tool logic.
+            workspace_root: Directory used as working context (CWD) during execution.
+            **kwargs: Extra metadata or flags stored for future extension.
         """
-        self.name = name
-        self.description = description
+        self.name: str = name
+        self.description: str = description
 
         resolved_params = parameters
         if not resolved_params or not resolved_params.get("properties"):
@@ -52,14 +88,23 @@ class WebToolAdapter:
             else:
                 resolved_params = {"type": "object", "properties": {}, "required": []}
 
-        self.parameters = resolved_params
-        self.workspace_root = Path(workspace_root).resolve() if workspace_root else Path.cwd()
-        self._executor = executor
-        self.extra_kwargs = kwargs
+        self.parameters: Dict[str, Any] = resolved_params
+        self.workspace_root: Path = Path(workspace_root).resolve() if workspace_root else Path.cwd()
+        self._executor: Optional[Callable[..., Any]] = executor
+        self.extra_kwargs: Dict[str, Any] = kwargs
+
+    def set_workspace_root(self, workspace_root: Union[str, Path]) -> None:
+        """Configure or update the active workspace root path."""
+        self.workspace_root = Path(workspace_root).resolve()
+
+    def set_workspace(self, workspace_root: Union[str, Path]) -> None:
+        """Alias for set_workspace_root ensuring seamless runtime interoperability."""
+        self.set_workspace_root(workspace_root)
 
     def to_param(self) -> Dict[str, Any]:
         """
-        Return the tool in OpenAI / function-calling JSON form.
+        Return the tool in standard OpenAI function-calling JSON format.
+        Preserved for platform compatibility.
         """
         props = self.parameters.get("properties", {}) if isinstance(self.parameters, dict) else {}
         req = self.parameters.get("required", []) if isinstance(self.parameters, dict) else []
@@ -72,25 +117,96 @@ class WebToolAdapter:
                 "parameters": {
                     "type": "object",
                     "properties": props if isinstance(props, dict) else {},
-                    "required": list(req) if isinstance(req, list) else []
-                }
-            }
+                    "required": list(req) if isinstance(req, list) else [],
+                },
+            },
         }
 
     def to_openai_schema(self) -> Dict[str, Any]:
-        """Alias for :meth:`to_param` (kept for API compatibility)."""
+        """
+        Alias for :meth:`to_param` satisfying the Core ToolRuntime Protocol contract.
+        """
         return self.to_param()
+
+    def _standardize_result(self, raw_result: Any) -> ToolResult:
+        """
+        Converts any arbitrary executor outcome into a canonical Core ToolResult.
+        Guarantees schema integrity across built-in, custom, and legacy tools.
+        """
+        if isinstance(raw_result, ToolResult):
+            return raw_result
+
+        if isinstance(raw_result, dict):
+            # Check if dict already carries ToolResult-like attributes
+            if "output" in raw_result:
+                return ToolResult(
+                    output=raw_result.get("output"),
+                    exit_code=int(raw_result.get("exit_code", 0)),
+                    is_error=bool(raw_result.get("is_error", False)),
+                    artifacts=list(raw_result.get("artifacts", [])),
+                    metadata=dict(raw_result.get("metadata", {})),
+                )
+            if "error" in raw_result and raw_result["error"]:
+                return ToolResult(
+                    output=str(raw_result["error"]),
+                    exit_code=1,
+                    is_error=True,
+                    metadata=raw_result,
+                )
+            return ToolResult(
+                output=raw_result,
+                exit_code=0,
+                is_error=False,
+                metadata={"source": "dictionary_payload"},
+            )
+
+        if isinstance(raw_result, str):
+            return ToolResult(
+                output=raw_result,
+                exit_code=0,
+                is_error=False,
+            )
+
+        if raw_result is None:
+            return ToolResult(
+                output=f"Tool '{self.name}' executed successfully with no output.",
+                exit_code=0,
+                is_error=False,
+            )
+
+        return ToolResult(
+            output=raw_result,
+            exit_code=0,
+            is_error=False,
+        )
+
+    async def aexecute(self, **kwargs: Any) -> ToolResult:
+        """
+        Primary asynchronous entrypoint fulfilling the Core ToolRuntime protocol.
+        Safely executes the underlying tool logic and converts the outcome into ToolResult.
+        """
+        try:
+            raw_result = await self.execute(**kwargs)
+            return self._standardize_result(raw_result)
+        except Exception as exc:
+            logger.exception("Execution failed in WebToolAdapter for tool '%s': %s", self.name, exc)
+            return ToolResult(
+                output=f"Tool '{self.name}' execution failed: {str(exc)}",
+                exit_code=1,
+                is_error=True,
+                metadata={"error": str(exc), "tool_name": self.name},
+            )
 
     async def execute(self, **kwargs: Any) -> Any:
         """
         Execute the bound executor inside the workspace directory.
+        Maintains legacy execution behavior and error propagation.
 
         Handles the following edge cases:
-          * Temporarily changes CWD to `workspace_root`, restores it after.
-          * Injects `workspace_root` into the executor if its signature
-            declares that parameter and the caller did not provide it.
-          * Supports both sync and async executors transparently.
-          * If no executor is bound, returns a stub string.
+          * Temporarily changes CWD to `workspace_root`, restores it in a finally block.
+          * Injects `workspace_root` into executor if signature requests it.
+          * Supports synchronous callables, coroutines, and awaitable return objects.
+          * Returns a informative placeholder string if no executor is bound.
         """
         if self._executor is None:
             return f"[Tool '{self.name}' invoked with parameters: {kwargs}]"
@@ -117,3 +233,6 @@ class WebToolAdapter:
                 os.chdir(original_cwd)
             except Exception:
                 pass
+
+
+__all__ = ["WebToolAdapter"]
