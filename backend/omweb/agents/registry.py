@@ -1,19 +1,26 @@
 ﻿"""
+backend/omweb/agents/registry.py
+
 Agent Registry - Persists, scopes, and manages lifecycle statuses of custom and builtin agents.
 
-Enforces authoritative agent lookup and strict fail-fast policies, eliminating
-silent fallback masking across the execution plane.
+Hardened under Phase M1:
+- Treats `builtins/*.json` as the authoritative Single Source of Truth for system agents.
+- Maintains backwards-compatible canonical aliases for legacy shorthand identifiers.
+- Eliminates divergence between hardcoded Python definitions and JSON manifests.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+logger = logging.getLogger(__name__)
+
 
 class AgentNotFoundError(Exception):
-    """Raised when an requested agent identifier is not found in the registry."""
+    """Raised when a requested agent identifier is not found in the registry."""
 
     def __init__(self, agent_id: str):
         super().__init__(f"Agent '{agent_id}' is not registered in the Agent Store.")
@@ -21,19 +28,51 @@ class AgentNotFoundError(Exception):
 
 
 class AgentRegistry:
-    """Registry managing the lifecycle, configuration, and retrieval of agents."""
+    """Authoritative registry managing built-in and user-defined agents."""
 
     def __init__(self) -> None:
-        backend_dir = Path(__file__).resolve().parent.parent.parent
+        self.agents_dir = Path(__file__).resolve().parent
+        self.builtins_dir = self.agents_dir / "builtins"
+        backend_dir = self.agents_dir.parent.parent
+
         self.custom_dir = backend_dir / "storage" / "store" / "agents"
         self.custom_dir.mkdir(parents=True, exist_ok=True)
         self.state_file = self.custom_dir / "agents_state.json"
+
+        # Canonical aliases mapping shorthand names to sovereign persona manifests
+        self._aliases: Dict[str, str] = {
+            "coder": "code_architect",
+            "researcher": "deep_researcher",
+            "analyst": "data_scientist",
+        }
+
         self._builtin_agents: Dict[str, Dict[str, Any]] = self._init_builtin_agents()
 
     def _init_builtin_agents(self) -> Dict[str, Dict[str, Any]]:
-        """Initialize default system built-in agent specifications."""
-        return {
-            "peldrun": {
+        """
+        Load system built-in agent manifests dynamically from `builtins/*.json`.
+        
+        Falls back safely to canonical baseline definitions if manifest files are absent.
+        """
+        agents: Dict[str, Dict[str, Any]] = {}
+
+        if self.builtins_dir.exists() and self.builtins_dir.is_dir():
+            for manifest_file in sorted(self.builtins_dir.glob("*.json")):
+                try:
+                    data = json.loads(manifest_file.read_text(encoding="utf-8"))
+                    aid = data.get("id") or manifest_file.stem
+                    data["id"] = aid
+                    data["is_builtin"] = True
+                    data.setdefault("status", "active")
+                    agents[aid] = data
+                except Exception as exc:
+                    logger.error(
+                        f"[AGENT REGISTRY] Failed loading builtin manifest {manifest_file.name}: {exc}"
+                    )
+
+        # Ensure primary default agent exists even if directory was empty
+        if "peldrun" not in agents:
+            agents["peldrun"] = {
                 "id": "peldrun",
                 "name": "peldrun Generalist",
                 "role": "General Autonomous Specialist",
@@ -52,44 +91,9 @@ class AgentRegistry:
                 "max_steps": 30,
                 "is_builtin": True,
                 "status": "active",
-            },
-            "coder": {
-                "id": "coder",
-                "name": "Software Engineer",
-                "role": "Full-Stack Developer",
-                "icon": "Code2",
-                "description": "Dedicated developer specializing in software architecture, bug fixing, test writing, and clean backend/frontend implementations.",
-                "system_prompt": "You are an expert software developer. Write clean, modular, and production-ready code.",
-                "tools": ["python_execute", "bash", "str_replace_editor"],
-                "max_steps": 30,
-                "is_builtin": True,
-                "status": "active",
-            },
-            "researcher": {
-                "id": "researcher",
-                "name": "Deep Researcher",
-                "role": "Web Intelligence & Synthesis",
-                "icon": "Search",
-                "description": "Gathers multi-source intelligence across the web, cross-references factual data, and creates comprehensive structured briefs.",
-                "system_prompt": "You are a thorough research analyst. Prioritize verified sources and synthesize structured reports.",
-                "tools": ["web_search", "browser_use", "str_replace_editor"],
-                "max_steps": 25,
-                "is_builtin": True,
-                "status": "active",
-            },
-            "analyst": {
-                "id": "analyst",
-                "name": "Data Analyst",
-                "role": "Quantitative & Visual Analytics",
-                "icon": "BarChart3",
-                "description": "Processes data tables, calculates statistics, and builds headless visual charts and graphs using Python.",
-                "system_prompt": "You are a skilled data analyst. Process numerical deliverables and generate publication-quality figures.",
-                "tools": ["python_execute", "str_replace_editor"],
-                "max_steps": 25,
-                "is_builtin": True,
-                "status": "active",
-            },
-        }
+            }
+
+        return agents
 
     def _load_states(self) -> Dict[str, str]:
         """Read agent activation states from persistent storage."""
@@ -115,10 +119,10 @@ class AgentRegistry:
         states = self._load_states()
         results: Dict[str, Dict[str, Any]] = {}
 
-        # 1. Built-in agents
+        # 1. Built-in agents loaded from manifests
         for aid, ameta in self._builtin_agents.items():
             copied = dict(ameta)
-            copied["status"] = states.get(aid, "active")
+            copied["status"] = states.get(aid, copied.get("status", "active"))
             results[aid] = copied
 
         # 2. Custom saved agents
@@ -139,42 +143,45 @@ class AgentRegistry:
         return list(results.values())
 
     def get_agent(self, agent_id: str) -> Dict[str, Any]:
-        """Retrieve an agent manifest by ID.
+        """
+        Retrieve an agent manifest by ID or registered alias.
 
         Enforces strict lookup without silent fallback masking.
-
-        Args:
-            agent_id: The unique identifier of the agent.
-
-        Returns:
-            The agent manifest dictionary.
-
-        Raises:
-            AgentNotFoundError: If the requested agent ID does not exist.
         """
-        agents = {a["id"]: a for a in self.list_agents()}
-        if agent_id not in agents:
+        normalized_id = (agent_id or "").strip().lower()
+        resolved_id = self._aliases.get(normalized_id, normalized_id)
+
+        agents = {a["id"].lower(): a for a in self.list_agents()}
+        if resolved_id not in agents:
             raise AgentNotFoundError(agent_id)
-        return agents[agent_id]
+
+        manifest = dict(agents[resolved_id])
+        # If looked up by alias, expose requested ID for downstream runtime consistency
+        if resolved_id != normalized_id and normalized_id in self._aliases:
+            manifest["alias_id"] = normalized_id
+        return manifest
 
     def toggle_agent_status(self, agent_id: str) -> Dict[str, Any]:
         """Toggle an agent between active and disabled states."""
-        if agent_id == "peldrun":
+        normalized_id = (agent_id or "").strip().lower()
+        resolved_id = self._aliases.get(normalized_id, normalized_id)
+
+        if resolved_id == "peldrun":
             return {"error": "Default primary agent 'peldrun' cannot be disabled."}
 
         try:
-            agent = self.get_agent(agent_id)
+            agent = self.get_agent(resolved_id)
         except AgentNotFoundError:
             return {"error": f"Agent '{agent_id}' not found"}
 
         states = self._load_states()
-        current = states.get(agent_id, agent.get("status", "active"))
+        current = states.get(resolved_id, agent.get("status", "active"))
         new_status = "disabled" if current == "active" else "active"
-        states[agent_id] = new_status
+        states[resolved_id] = new_status
         self._save_states(states)
 
         agent["status"] = new_status
-        custom_file = self.custom_dir / f"{agent_id}.json"
+        custom_file = self.custom_dir / f"{resolved_id}.json"
         if custom_file.exists():
             try:
                 data = json.loads(custom_file.read_text(encoding="utf-8"))

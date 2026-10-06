@@ -1,19 +1,22 @@
 """
+backend/omweb/engines/registry.py
+
 Central Authoritative Execution Engine Registry.
 
 Maintains registered execution engines, enforces strict lookup policies,
-and eliminates silent fallback masking.
+eliminates silent fallback masking, and provides non-blocking concurrent health diagnostics.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import asyncio
+from typing import Any, Dict, List, Optional, Tuple
 
 from .base import ExecutionEngine
 
 
 class EngineNotFoundError(KeyError):
-    """Raised when an requested execution engine is not registered."""
+    """Raised when a requested execution engine is not registered."""
 
     def __init__(self, engine_id: str, available_engines: List[str]):
         super().__init__(
@@ -25,19 +28,14 @@ class EngineNotFoundError(KeyError):
 
 
 class EngineRegistry:
-    """Registry managing the lifecycle and retrieval of ExecutionEngine instances."""
+    """Registry managing the lifecycle, retrieval, and health diagnostics of ExecutionEngines."""
 
     def __init__(self) -> None:
         self._engines: Dict[str, ExecutionEngine] = {}
         self._aliases: Dict[str, str] = {}
 
     def register(self, engine: ExecutionEngine, aliases: Optional[List[str]] = None) -> None:
-        """Register an execution engine with its primary identifier and optional aliases.
-
-        Args:
-            engine: The concrete ExecutionEngine instance.
-            aliases: Optional list of alternate identifiers resolving to this engine.
-        """
+        """Register an execution engine with its primary identifier and optional aliases."""
         primary_id = engine.engine_id.strip().lower()
         self._engines[primary_id] = engine
 
@@ -47,19 +45,7 @@ class EngineRegistry:
                 self._aliases[norm_alias] = primary_id
 
     def get(self, engine_id: str) -> ExecutionEngine:
-        """Resolve and retrieve an engine by ID or alias.
-
-        Enforces authoritative lookup without silent fallbacks.
-
-        Args:
-            engine_id: Identifier or registered alias of the engine.
-
-        Returns:
-            The resolved ExecutionEngine.
-
-        Raises:
-            EngineNotFoundError: If the engine cannot be resolved.
-        """
+        """Resolve and retrieve an engine by ID or alias with strict fail-fast semantics."""
         normalized_id = (engine_id or "").strip().lower()
         resolved_key = self._aliases.get(normalized_id, normalized_id)
 
@@ -80,15 +66,29 @@ class EngineRegistry:
         return sorted(list(self._engines.keys()))
 
     async def health_all(self) -> Dict[str, Dict[str, Any]]:
-        """Query diagnostic health checks across all registered engines concurrently."""
-        results: Dict[str, Dict[str, Any]] = {}
-        for eng_id, eng in self._engines.items():
+        """
+        Query diagnostic health checks across all registered engines concurrently.
+        
+        Uses asyncio.gather to prevent slow or unreachable engines from
+        blocking diagnostic responses sequentially.
+        """
+        async def _check_single(eng_id: str, eng: ExecutionEngine) -> Tuple[str, Dict[str, Any]]:
             try:
-                results[eng_id] = await eng.health()
+                res = await eng.health()
+                return eng_id, res
             except Exception as exc:
-                results[eng_id] = {
+                return eng_id, {
                     "engine_id": eng_id,
                     "available": False,
                     "error": str(exc),
                 }
-        return results
+
+        if not self._engines:
+            return {}
+
+        tasks = [
+            _check_single(eng_id, eng)
+            for eng_id, eng in self._engines.items()
+        ]
+        completed = await asyncio.gather(*tasks)
+        return dict(completed)

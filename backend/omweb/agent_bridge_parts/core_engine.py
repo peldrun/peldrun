@@ -1,23 +1,28 @@
 """
-PELDRUN Core native engine runner.
+backend/omweb/agent_bridge_parts/core_engine.py
 
-Executes an autonomous agent workflow via the ``peldrun-core`` package
-with real-time SSE event streaming to the Web UI.
-Injects platform tools through session-scoped Core ToolRegistry instances.
+PELDRUN Core native execution runtime adapter.
+Hardened under Phases M0, M1, and M2:
+- Strict FIFO event ordering with sequence numbering.
+- Push streaming of Canonical Artifact events (created/updated).
+- Scope-isolated memory management and terminal contract enforcement.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
 from omweb.sse_events import SSEEvent, SSEEventType, dispatch_event
 from omweb.job_manager import job_manager
 
-from .state import job_scoped_artifacts
+from .state import cleanup_job_state, job_scoped_artifacts
 from .text_utils import sanitize_final_result_text
+
+logger = logging.getLogger(__name__)
 
 
 async def _run_peldrun_core_agent(
@@ -31,7 +36,7 @@ async def _run_peldrun_core_agent(
     chat_id: str,
     manifest: Dict[str, Any],
 ) -> None:
-    """Execute the agent workflow using the PELDRUN Core engine."""
+    """Execute an autonomous agent workflow using the PELDRUN Core engine."""
     print(f"\n[BRIDGE CORE] >>> Starting Live Run for Job: {job_id} using PELDRUN Core Engine <<<")
 
     from peldrun.events.emitter import EventEmitter
@@ -43,37 +48,38 @@ async def _run_peldrun_core_agent(
     from peldrun.llm.providers.openai_compat import OpenAICompatProvider
     from peldrun.agents.tool_call_agent import ToolCallAgent
     from peldrun.agents.base import AgentConfig
+    from peldrun.artifacts.manager import ArtifactManager
 
     from omweb.adapters.core_adapter import resolve_tool_runtime
     from omweb.tools.registry import tool_registry as web_tool_registry
 
-    files_baseline: Set[str] = {p.name for p in project_dir.iterdir() if p.is_file()} if project_dir.exists() else set()
-    latest_meaningful_thought: str = ""
-
-    max_steps = int(manifest.get("max_steps") or 30)
-    system_prompt = manifest.get("system_prompt", "You are peldrun, an all-around autonomous specialist agent.")
+    # 1. Initialize Job Workspace and Artifact Infrastructure
     ws_path = project_dir.resolve()
     ws_path_str = str(ws_path)
+    job_scoped_artifacts.setdefault(job_id, [])
+    if chat_id:
+        job_scoped_artifacts.setdefault(chat_id, [])
 
-    # 1. Wire Session-Scoped Core ToolRegistry
+    artifact_mgr = ArtifactManager(ws_path_str)
+    artifact_mgr.snapshot_baseline()
+
+    max_steps = int(manifest.get("max_steps") or 30)
+    system_prompt = manifest.get(
+        "system_prompt",
+        "You are peldrun, an all-around autonomous specialist agent."
+    )
+
+    # 2. Wire Session-Scoped Core ToolRegistry (Store Sovereignty)
     core_registry = CoreToolRegistry(workspace_root=ws_path_str)
     core_registry.register(TerminateTool(workspace_root=ws_path_str))
 
-    available_web_tools = {t["id"]: t for t in web_tool_registry.list_tools() if t.get("is_enabled", True)}
+    available_web_tools = {
+        t["id"]: t
+        for t in web_tool_registry.list_tools()
+        if t.get("is_enabled", True)
+    }
 
     requested_tools = list(manifest.get("tools", []))
-    essential_tool_ids = (
-        "str_replace_editor",
-        "bash",
-        "python_execute",
-        "web_search",
-        "browser_use",
-        "ask_human",
-    )
-    for essential in essential_tool_ids:
-        if essential not in requested_tools and essential in available_web_tools:
-            requested_tools.append(essential)
-
     for req_tool in requested_tools:
         if req_tool in ("terminate", "file_saver"):
             continue
@@ -84,32 +90,87 @@ async def _run_peldrun_core_agent(
                 tool_id=req_tool,
                 tool_meta=t_meta,
                 workspace_root=ws_path,
-                registry=web_tool_registry
+                registry=web_tool_registry,
             )
             core_registry.register(real_adapter)
 
-    fallback_collection: ToolCollection = getattr(core_registry, "_collection", ToolCollection(core_registry.list_tools()))
+    fallback_collection: ToolCollection = getattr(
+        core_registry,
+        "_collection",
+        ToolCollection(core_registry.list_tools()),
+    )
 
-    # 2. Setup Real-Time Event Dispatcher
+    # 3. Setup Ordered FIFO Event Bridge
     emitter = EventEmitter()
-    current_core_step = 1
-    is_first_step_start = True
     main_loop = asyncio.get_running_loop()
+
+    event_queue: asyncio.Queue[Optional[PeldrunEvent]] = asyncio.Queue()
+    event_seq: int = 0
+    current_core_step: int = 1
+    is_first_step_start: bool = True
+    latest_meaningful_thought: str = ""
 
     def _extract_event_step(evt: PeldrunEvent) -> Optional[int]:
         if hasattr(evt, "step") and isinstance(evt.step, int) and evt.step > 0:
             return evt.step
         if hasattr(evt, "payload") and isinstance(evt.payload, dict):
-            p_step = evt.payload.get("step") or evt.payload.get("step_num") or evt.payload.get("current_step")
+            p_step = (
+                evt.payload.get("step")
+                or evt.payload.get("step_num")
+                or evt.payload.get("current_step")
+            )
             if isinstance(p_step, int) and p_step > 0:
                 return p_step
             if isinstance(p_step, str) and p_step.isdigit() and int(p_step) > 0:
                 return int(p_step)
         return None
 
-    async def _async_on_core_event(event: PeldrunEvent) -> None:
-        nonlocal latest_meaningful_thought, current_core_step, is_first_step_start
+    async def _emit_artifact_mutations() -> None:
+        """Scan workspace for changes and push canonical artifact events via SSE."""
+        nonlocal event_seq
+        mutations = await artifact_mgr.scan_mutations()
+        for op, art_ref in mutations:
+            rel = art_ref.relative_path
+            if rel not in job_scoped_artifacts[job_id]:
+                job_scoped_artifacts[job_id].append(rel)
+            if chat_id and rel not in job_scoped_artifacts[chat_id]:
+                job_scoped_artifacts[chat_id].append(rel)
 
+            event_seq += 1
+            sse_type = (
+                SSEEventType.ARTIFACT_CREATED
+                if op == "created"
+                else SSEEventType.ARTIFACT_UPDATED
+            )
+            payload_data = {
+                "artifact_id": art_ref.artifact_id,
+                "name": art_ref.name,
+                "relative_path": rel,
+                "path": rel,
+                "artifact": rel,
+                "operation": op,
+                "mime_type": art_ref.mime_type,
+                "size_bytes": art_ref.size_bytes,
+                "revision": art_ref.revision,
+                "seq": event_seq,
+                "job_id": job_id,
+                "chat_id": chat_id,
+                "model": model_name,
+            }
+            print(f"[BRIDGE CORE M2] Pushing SSE Artifact Event: {op.upper()} -> {rel} (rev {art_ref.revision})")
+            await dispatch_event(
+                job_id,
+                SSEEvent(
+                    type=sse_type,
+                    step=current_core_step,
+                    data=payload_data,
+                ),
+            )
+
+    async def _process_single_core_event(event: PeldrunEvent) -> None:
+        nonlocal latest_meaningful_thought, current_core_step, is_first_step_start, event_seq
+
+        event_seq += 1
         explicit_step = _extract_event_step(event)
         if explicit_step is not None:
             current_core_step = explicit_step
@@ -129,11 +190,20 @@ async def _run_peldrun_core_agent(
                 SSEEvent(
                     type=SSEEventType.STEP_START,
                     step=curr_step,
-                    data={"step": curr_step, "model": model_name, "engine": "peldrun-core", "status": "running"}
-                )
+                    data={
+                        "step": curr_step,
+                        "seq": event_seq,
+                        "model": model_name,
+                        "engine": "peldrun-core",
+                        "status": "running",
+                    },
+                ),
             )
 
-        elif event.type == EventType.THOUGHT or getattr(event.type, "name", "") == "STEP_PROGRESS":
+        elif (
+            event.type == EventType.THOUGHT
+            or getattr(event.type, "name", "") == "STEP_PROGRESS"
+        ):
             thought_text = str(event.payload.get("thought", "")).strip()
             if thought_text:
                 latest_meaningful_thought = thought_text
@@ -142,26 +212,48 @@ async def _run_peldrun_core_agent(
                     SSEEvent(
                         type=SSEEventType.THOUGHT,
                         step=curr_step,
-                        data={"thought": thought_text, "content": thought_text, "model": model_name}
-                    )
+                        data={
+                            "thought": thought_text,
+                            "content": thought_text,
+                            "seq": event_seq,
+                            "model": model_name,
+                        },
+                    ),
                 )
 
-        elif event.type == getattr(EventType, "TOOL_CALL", None) or event.type == getattr(EventType, "TOOL_CALLED", None):
-            tool_name = str(event.payload.get("tool_name") or event.payload.get("tool") or "tool")
+        elif (
+            event.type == getattr(EventType, "TOOL_CALL", None)
+            or event.type == getattr(EventType, "TOOL_CALLED", None)
+        ):
+            tool_name = str(
+                event.payload.get("tool_name")
+                or event.payload.get("tool")
+                or "tool"
+            )
             arguments = event.payload.get("arguments", {})
-            raw_args = json.dumps(arguments, ensure_ascii=False) if isinstance(arguments, dict) else str(arguments)
+            raw_args = (
+                json.dumps(arguments, ensure_ascii=False)
+                if isinstance(arguments, dict)
+                else str(arguments)
+            )
 
             is_human_ask = tool_name in ("ask_human", "human_input")
-            tool_call_payload = {
+            tool_call_payload: Dict[str, Any] = {
                 "name": tool_name,
                 "toolName": tool_name,
                 "arguments": raw_args,
                 "content": raw_args,
+                "seq": event_seq,
                 "model": model_name,
                 "requires_input": is_human_ask,
             }
             if is_human_ask and isinstance(arguments, dict):
-                tool_call_payload["prompt"] = arguments.get("prompt") or arguments.get("query") or arguments.get("question") or ""
+                tool_call_payload["prompt"] = (
+                    arguments.get("prompt")
+                    or arguments.get("query")
+                    or arguments.get("question")
+                    or ""
+                )
                 tool_call_payload["input_type"] = arguments.get("input_type", "text")
                 tool_call_payload["options"] = arguments.get("options", [])
 
@@ -170,47 +262,40 @@ async def _run_peldrun_core_agent(
                 SSEEvent(
                     type=SSEEventType.TOOL_CALL,
                     step=curr_step,
-                    data=tool_call_payload
-                )
+                    data=tool_call_payload,
+                ),
             )
 
-        elif event.type == EventType.OBSERVATION or event.type == getattr(EventType, "TOOL_COMPLETED", None):
+        elif (
+            event.type == EventType.OBSERVATION
+            or event.type == getattr(EventType, "TOOL_COMPLETED", None)
+        ):
             obs_out = event.payload.get("output", "") or event.payload.get("error", "")
             obs_str = str(obs_out)
 
-            if project_dir.exists():
-                current_files = {p.name for p in project_dir.iterdir() if p.is_file()}
-                new_files = current_files - files_baseline
-                for nf in new_files:
-                    if nf not in job_scoped_artifacts[job_id]:
-                        job_scoped_artifacts[job_id].append(nf)
-                        if chat_id and nf not in job_scoped_artifacts.get(chat_id, []):
-                            job_scoped_artifacts.setdefault(chat_id, []).append(nf)
-                        print(f"[BRIDGE CORE] Detected Artifact Created on Disk in Step {curr_step}: {nf}")
-                        await dispatch_event(
-                            job_id,
-                            SSEEvent(
-                                type=SSEEventType.OBSERVATION,
-                                step=curr_step,
-                                data={
-                                    "artifact": nf,
-                                    "path": nf,
-                                    "chat_id": chat_id,
-                                    "event": "artifact_created",
-                                    "content": f"Artifact created: {nf}",
-                                    "model": model_name
-                                }
-                            )
-                        )
+            # Reconcile disk artifacts via push streaming on each observation
+            await _emit_artifact_mutations()
 
             await dispatch_event(
                 job_id,
                 SSEEvent(
                     type=SSEEventType.OBSERVATION,
                     step=curr_step,
-                    data={"output": obs_str, "content": obs_str, "model": model_name}
-                )
+                    data={
+                        "output": obs_str,
+                        "content": obs_str,
+                        "seq": event_seq,
+                        "model": model_name,
+                    },
+                ),
             )
+
+        elif event.type in (
+            EventType.ARTIFACT_CREATED,
+            EventType.ARTIFACT_UPDATED,
+            EventType.ARTIFACT_DELETED,
+        ):
+            await _emit_artifact_mutations()
 
         elif event.type == EventType.ERROR:
             err_msg = str(event.payload.get("error", "Runtime Error"))
@@ -219,19 +304,43 @@ async def _run_peldrun_core_agent(
                 SSEEvent(
                     type=SSEEventType.ERROR,
                     step=curr_step,
-                    data={"message": err_msg, "content": err_msg, "model": model_name}
-                )
+                    data={
+                        "message": err_msg,
+                        "content": err_msg,
+                        "seq": event_seq,
+                        "model": model_name,
+                    },
+                ),
             )
+
+    async def _ordered_event_consumer() -> None:
+        """Dedicated consumer worker guaranteeing strictly ordered event dispatch."""
+        while True:
+            event = await event_queue.get()
+            if event is None:
+                event_queue.task_done()
+                break
+            try:
+                await _process_single_core_event(event)
+            except Exception as ex:
+                logger.error(
+                    f"[BRIDGE ERROR] Exception in ordered event consumer for job {job_id}: {ex}",
+                    exc_info=True,
+                )
+            finally:
+                event_queue.task_done()
+
+    consumer_task = asyncio.create_task(_ordered_event_consumer())
 
     def _sync_event_handler(event: PeldrunEvent) -> None:
         try:
-            main_loop.create_task(_async_on_core_event(event))
-        except Exception as e:
-            print(f"[BRIDGE ERROR] Failed to dispatch core event async: {e}")
+            event_queue.put_nowait(event)
+        except Exception:
+            main_loop.call_soon_threadsafe(event_queue.put_nowait, event)
 
     emitter.subscribe_all(_sync_event_handler)
 
-    # 3. LLM Configuration
+    # 4. LLM Configuration
     base_url = active_llm.get("base_url") or "http://127.0.0.1:1234/v1"
     api_key = active_llm.get("api_key") or "EMPTY"
     safe_max_tokens = min(int(active_llm.get("max_tokens") or 4096), 4096)
@@ -248,7 +357,7 @@ async def _run_peldrun_core_agent(
 
     llm_provider = OpenAICompatProvider(config=llm_cfg)
 
-    # 4. Instantiate Agent
+    # 5. Instantiate Agent
     agent_config = AgentConfig(
         name=manifest.get("name") or agent_id,
         system_prompt=system_prompt,
@@ -269,7 +378,7 @@ async def _run_peldrun_core_agent(
 
     scoped_prompt = (
         f"[PROJECT WORKSPACE RULES]\n"
-        f"1. Working Directory: Your active directory is: {project_dir.resolve()}\n"
+        f"1. Working Directory: Your active directory is: {ws_path}\n"
         f"2. File Deliverables: ALWAYS use 'str_replace_editor' with command='create' to write and save project files directly to disk (e.g. index.html, style.css, app.js). DO NOT run Python scripts via 'python_execute' merely to save or create files.\n"
         f"3. Execution & Verification: Use 'python_execute' only when you need to run calculations, test execution, or process data. Use 'bash' for terminal environment commands.\n"
         f"4. Tool Calling Conventions: Always supply required parameters (e.g. 'command' and 'path' for str_replace_editor, 'query' for web_search, 'url' for browser_use).\n"
@@ -281,30 +390,44 @@ async def _run_peldrun_core_agent(
         f"{prompt}"
     )
 
+    # 6. Primary Execution and Terminal Contract Enforcement
     try:
         final_answer = await agent.run_task(prompt=scoped_prompt, max_steps=max_steps)
+
+        # Final mutation check before terminal state
+        await _emit_artifact_mutations()
+
+        # Gracefully drain and await all pending FIFO events before terminal state
+        await event_queue.put(None)
+        await consumer_task
+
     except Exception as exc:
+        try:
+            await event_queue.put(None)
+            await asyncio.wait_for(consumer_task, timeout=2.0)
+        except Exception:
+            consumer_task.cancel()
+
         err_msg = f"Task execution interrupted: {exc}"
         print(f"[BRIDGE CORE ERROR] {err_msg}")
+
+        job_manager.fail_job(job_id, err_msg)
         await dispatch_event(
             job_id,
             SSEEvent(
                 type=SSEEventType.ERROR,
                 step=current_core_step,
-                data={"message": err_msg, "model": model_name}
-            )
+                data={
+                    "message": err_msg,
+                    "seq": event_seq + 1,
+                    "model": model_name,
+                },
+            ),
         )
-        final_answer = sanitize_final_result_text("", latest_meaningful_thought) or err_msg
+        cleanup_job_state(job_id)
+        return
 
-    # 5. Finalize Deliverables and Complete Job
-    if project_dir.exists():
-        current_files = {p.name for p in project_dir.iterdir() if p.is_file()}
-        for f_name in (current_files - files_baseline):
-            if f_name not in job_scoped_artifacts[job_id]:
-                job_scoped_artifacts[job_id].append(f_name)
-            if chat_id and f_name not in job_scoped_artifacts.get(chat_id, []):
-                job_scoped_artifacts.setdefault(chat_id, []).append(f_name)
-
+    # 7. Finalize Deliverables and Complete Job
     new_turn_files = job_scoped_artifacts.get(job_id, [])
 
     if new_turn_files:
@@ -319,6 +442,7 @@ async def _run_peldrun_core_agent(
         result_text = sanitize_final_result_text(final_answer, latest_meaningful_thought)
 
     print(f"[BRIDGE CORE] Job {job_id} completed successfully. Produced files: {new_turn_files}")
+
     job_manager.complete_job(job_id, result_text)
     await dispatch_event(
         job_id,
@@ -330,6 +454,9 @@ async def _run_peldrun_core_agent(
                 "model": model_name,
                 "engine": "peldrun-core",
                 "produced_files": new_turn_files,
-            }
-        )
+                "seq": event_seq + 1,
+            },
+        ),
     )
+
+    cleanup_job_state(job_id)

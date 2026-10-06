@@ -1,6 +1,11 @@
 ﻿"""
+backend/omweb/routers/run.py
+
 PELDRUN Universal Run Router.
 Manages job lifecycles, chat associations, real-time SSE streaming, and deliverable downloads.
+Hardened under Phase M2 & Defect Resolution:
+- Resilient deliverable resolution: Eliminates ghost 0-byte file shadowing when nested deliverables exist.
+- Intelligent content fallback: Automatically resolves subfolder deliverables if root file is empty or missing.
 """
 
 from __future__ import annotations
@@ -160,7 +165,7 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
                     "status": existing_chat.get("status", "completed"),
                     "created_at": existing_chat.get("updated_at") or existing_chat.get("created_at"),
                     "produced_files": job_scoped_artifacts.get(prev_jid, []),
-                    "model": existing_chat.get("model")
+                    "model": existing_chat.get("model"),
                 })
 
         agent_prompt = prompt
@@ -183,7 +188,6 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
     except Exception:
         pass
 
-    # Initialize live event tracking for immediate polling availability
     ACTIVE_JOB_EVENTS[actual_job_id] = []
     if chat_id:
         ACTIVE_JOB_EVENTS[chat_id] = ACTIVE_JOB_EVENTS[actual_job_id]
@@ -200,7 +204,7 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
         result="",
         status="running",
         agent_id=effective_agent,
-        mode=exec_mode
+        mode=exec_mode,
     )
 
     try:
@@ -242,7 +246,7 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
         "model": llm_override.get("model"),
         "provider": llm_override.get("provider"),
         "provider_name": llm_override.get("provider_name") or llm_override.get("provider"),
-        "agent_id": effective_agent
+        "agent_id": effective_agent,
     }
 
 
@@ -263,7 +267,6 @@ async def get_job_detail(job_id: str):
 
     job = job_manager.get_job(job_id) or job_manager.get_job(actual_job_id)
 
-    # Use in-memory live stream events to prevent resetting frontend state during active runs
     live_events = (
         ACTIVE_JOB_EVENTS.get(actual_job_id)
         or ACTIVE_JOB_EVENTS.get(job_id)
@@ -325,12 +328,16 @@ async def get_job_detail(job_id: str):
         "agent_id": chat.get("agent_id", "peldrun"),
         "model": chat.get("model"),
         "mode": chat.get("mode", "agent"),
-        "produced_files": resolved_files
+        "produced_files": resolved_files,
     }
 
 
 @router.get("/jobs/{job_id}/files")
 async def get_job_files(job_id: str):
+    """
+    Retrieve deliverables list for a job or chat.
+    Intelligently deduplicates 0-byte ghost files if an equivalent nested deliverable exists.
+    """
     _, chat_id = resolve_chat(job_id)
     chat = project_manager.get_chat(chat_id) or {}
     project_id = chat.get("project_id", "default_project")
@@ -347,10 +354,23 @@ async def get_job_files(job_id: str):
             all_files_list.append({
                 "name": f,
                 "path": str(rel).replace("\\", "/"),
-                "size": p.stat().st_size
+                "size": p.stat().st_size,
             })
 
-    # Resolve scoped artifact lists across job and chat identifiers
+    # Find all file names that have non-empty versions in nested subfolders
+    nested_non_empty = {
+        item["name"]
+        for item in all_files_list
+        if "/" in item["path"] and item["size"] > 0
+    }
+
+    # Suppress root 0-byte ghost files that are shadowed by nested deliverables
+    sanitized_files: List[Dict[str, Any]] = []
+    for item in all_files_list:
+        if "/" not in item["path"] and item["size"] == 0 and item["name"] in nested_non_empty:
+            continue
+        sanitized_files.append(item)
+
     actual_job_id = chat.get("job_id") or job_id
     turn_files = (
         job_scoped_artifacts.get(job_id)
@@ -358,17 +378,50 @@ async def get_job_files(job_id: str):
         or (job_scoped_artifacts.get(chat_id) if chat_id else None)
     )
 
-    if turn_files is not None:
-        scoped_list = [f for f in all_files_list if f["name"] in turn_files]
+    if turn_files is not None and len(turn_files) > 0:
+        scoped_list = [
+            f for f in sanitized_files
+            if f["path"] in turn_files or f["name"] in turn_files
+        ]
     else:
-        scoped_list = all_files_list
+        scoped_list = sanitized_files
+
+    # Sort files to prioritize non-empty deliverables
+    scoped_list.sort(key=lambda x: (0 if x["size"] > 0 else 1, x["path"]))
 
     return {
         "job_id": actual_job_id,
         "chat_id": chat_id,
         "files": scoped_list,
-        "all_files": all_files_list
+        "all_files": sanitized_files,
     }
+
+
+def _resolve_physical_file(files_dir: Path, requested_path: str) -> Optional[Path]:
+    """
+    Intelligently resolves requested relative path against files_dir.
+    If the requested path is a 0-byte file in root, checks if a non-empty
+    nested file with the same name exists (e.g. todo-app/index.html).
+    """
+    clean_rel = requested_path.lstrip("/\\")
+    direct_target = (files_dir / clean_rel).resolve()
+
+    # If direct target exists and has content, return it
+    if direct_target.is_relative_to(files_dir) and direct_target.is_file():
+        if direct_target.stat().st_size > 0 or "/" in clean_rel:
+            return direct_target
+
+    # Fallback search: Look for non-empty nested matching file
+    target_name = Path(clean_rel).name
+    for sub_file in files_dir.rglob(target_name):
+        if sub_file.is_file() and sub_file.stat().st_size > 0:
+            return sub_file
+
+    # If direct target exists even if 0-byte, fallback to it
+    if direct_target.is_relative_to(files_dir) and direct_target.is_file():
+        return direct_target
+
+    return None
 
 
 @router.get("/jobs/{job_id}/content")
@@ -378,14 +431,14 @@ async def get_job_file_content(job_id: str, path: str = Query(...)):
     project_id = chat.get("project_id", "default_project")
     files_dir = project_manager.get_chat_files_dir(chat_id, project_id)
 
-    clean_rel = path.lstrip("/\\")
-    target = (files_dir / clean_rel).resolve()
-    if not target.is_relative_to(files_dir) or not target.exists() or not target.is_file():
+    target = _resolve_physical_file(files_dir, path)
+    if not target or not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="File not found in job deliverables")
 
     try:
         content = target.read_text(encoding="utf-8")
-        return {"path": path, "content": content}
+        rel_str = str(target.relative_to(files_dir)).replace("\\", "/")
+        return {"path": rel_str, "content": content}
     except Exception as e:
         return {"path": path, "content": f"Binary content: {str(e)}"}
 
@@ -397,9 +450,8 @@ async def get_job_raw_file(job_id: str, filepath: str):
     project_id = chat.get("project_id", "default_project")
     files_dir = project_manager.get_chat_files_dir(chat_id, project_id)
 
-    clean_rel = filepath.lstrip("/\\")
-    target = (files_dir / clean_rel).resolve()
-    if not target.is_relative_to(files_dir) or not target.exists() or not target.is_file():
+    target = _resolve_physical_file(files_dir, filepath)
+    if not target or not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="File not found in job deliverables")
 
     content_type, _ = mimetypes.guess_type(str(target))
@@ -449,7 +501,7 @@ async def download_job_zip(job_id: str):
     return StreamingResponse(
         zip_buffer,
         media_type="application/zip",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
 
 
@@ -499,7 +551,6 @@ async def stream_job_events(job_id: str):
                 data_payload = {"content": str(data_payload)}
                 raw_dict["data"] = data_payload
 
-            # Flatten all data attributes into top level to guarantee frontend components receive content
             for k, v in data_payload.items():
                 if k not in raw_dict:
                     raw_dict[k] = v
@@ -536,7 +587,7 @@ async def stream_job_events(job_id: str):
                 "step": current_step,
                 "content": raw_dict["content"],
                 "toolName": raw_dict.get("toolName"),
-                "data": data_payload
+                "data": data_payload,
             }
 
             if str(ev_type).lower() not in ["ping"]:
@@ -574,7 +625,7 @@ async def stream_job_events(job_id: str):
                     result=final_res,
                     status=final_status,
                     agent_id=chat.get("agent_id", "peldrun"),
-                    mode=chat.get("mode", "agent")
+                    mode=chat.get("mode", "agent"),
                 )
 
                 try:
@@ -600,8 +651,8 @@ async def stream_job_events(job_id: str):
         headers={
             "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
-            "Connection": "keep-alive"
-        }
+            "Connection": "keep-alive",
+        },
     )
 
 
@@ -650,7 +701,7 @@ async def stop_job(job_id: str):
         from omweb.agent_bridge import dispatch_event
         await dispatch_event(
             target_job_id,
-            SSEEvent(type=SSEEventType.STATUS, data={"status": "stopped", "message": "Task stopped by user"})
+            SSEEvent(type=SSEEventType.STATUS, data={"status": "stopped", "message": "Task stopped by user"}),
         )
     except Exception:
         pass
@@ -661,7 +712,7 @@ async def stop_job(job_id: str):
         "chat_id": chat_id,
         "status": "stopped",
         "task_cancelled": task_cancelled,
-        "message": "Task stopped successfully"
+        "message": "Task stopped successfully",
     }
 
 
@@ -692,7 +743,7 @@ async def respond_to_human_prompt(job_id: str, req: HumanRespondRequest):
         "type": "human_response",
         "answer": answer,
         "request_id": req.request_id,
-        "timestamp": time.time()
+        "timestamp": time.time(),
     })
 
     return {
@@ -701,5 +752,5 @@ async def respond_to_human_prompt(job_id: str, req: HumanRespondRequest):
         "chat_id": chat_id,
         "answer": answer,
         "core_resolved": core_resolved,
-        "message": "Response recorded and agent unblocked successfully"
+        "message": "Response recorded and agent unblocked successfully",
     }

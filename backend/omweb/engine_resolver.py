@@ -1,10 +1,11 @@
 ﻿"""
+backend/omweb/engine_resolver.py
+
 PELDRUN Universal Engine Resolver.
 
 Manages execution engine selection, lifecycle discovery, and runtime resolution.
-Treats PELDRUN Core as a first-class native embedded runtime package and
-OpenManus as an optional secondary external adapter.
-Maintains full backward-compatible interfaces for legacy setup and router callers.
+Treats PELDRUN Core as a first-class native embedded runtime package in `backend/peldrun/`.
+Isolates legacy OpenManus path resolution exclusively to legacy execution contexts.
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ from __future__ import annotations
 from enum import Enum
 import importlib.util
 import json
-import os
 from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional, Set, Union
@@ -36,19 +36,24 @@ def is_valid_core_dir(target_path: Optional[Path]) -> bool:
     """Validate if target path represents a valid PELDRUN Core package directory."""
     if not target_path or not target_path.exists() or not target_path.is_dir():
         return False
-    return (target_path / "__init__.py").is_file() or (target_path / "peldrun" / "__init__.py").is_file()
+    return (
+        (target_path / "__init__.py").is_file()
+        or (target_path / "peldrun" / "__init__.py").is_file()
+    )
 
 
 def is_valid_legacy_dir(target_path: Optional[Path]) -> bool:
     """Validate if directory contains legacy OpenManus source files."""
     if not target_path or not target_path.exists() or not target_path.is_dir():
         return False
-    has_agent = (target_path / "app" / "agent" / "peldrun.py").is_file() or (
-        target_path / "app" / "agent" / "manus.py"
-    ).is_file()
-    has_config = (target_path / "config" / "config.toml").is_file() or (
-        target_path / "config" / "config.example.toml"
-    ).is_file()
+    has_agent = (
+        (target_path / "app" / "agent" / "peldrun.py").is_file()
+        or (target_path / "app" / "agent" / "manus.py").is_file()
+    )
+    has_config = (
+        (target_path / "config" / "config.toml").is_file()
+        or (target_path / "config" / "config.example.toml").is_file()
+    )
     return has_agent and has_config
 
 
@@ -82,6 +87,8 @@ def is_legacy_engine_available() -> bool:
 
     candidates = [
         PROJECT_ROOT / "engine" / "peldrun",
+        PROJECT_ROOT.parent / "OpenManus",
+        PROJECT_ROOT.parent / "openmanus",
         PROJECT_ROOT.parent / "peldrun",
         Path.home() / "peldrun",
     ]
@@ -101,6 +108,10 @@ def get_persisted_engine_config() -> Dict[str, Any]:
 
 def get_persisted_engine_path() -> Optional[Path]:
     """Retrieve persisted custom engine path, defaulting safely to embedded core package."""
+    embedded_core = BACKEND_DIR / "peldrun"
+    if embedded_core.is_dir():
+        return embedded_core
+
     config = get_persisted_engine_config()
     custom_path = config.get("peldrun_path")
     if custom_path:
@@ -108,9 +119,6 @@ def get_persisted_engine_path() -> Optional[Path]:
         if is_valid_peldrun_dir(p):
             return p
 
-    embedded_core = BACKEND_DIR / "peldrun"
-    if embedded_core.is_dir():
-        return embedded_core
     return None
 
 
@@ -166,10 +174,7 @@ def set_active_engine_type(engine_type: Union[EngineType, str]) -> None:
 
 
 def detect_potential_engine_paths() -> List[Dict[str, Any]]:
-    """Probe environment and filesystem for available PELDRUN Core and Legacy installations.
-
-    Guarantees backward compatibility for setup wizards and discovery routers.
-    """
+    """Probe environment and filesystem for available PELDRUN Core and Legacy installations."""
     results: List[Dict[str, Any]] = []
     seen: Set[str] = set()
 
@@ -237,6 +242,7 @@ def resolve_active_engine_path() -> Path:
     legacy_candidates = [
         (PROJECT_ROOT / "engine" / "peldrun").resolve(),
         (PROJECT_ROOT.parent / "OpenManus").resolve(),
+        (PROJECT_ROOT.parent / "openmanus").resolve(),
     ]
     for cand in legacy_candidates:
         if is_valid_legacy_dir(cand):

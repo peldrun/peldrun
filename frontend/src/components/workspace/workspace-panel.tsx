@@ -1,6 +1,17 @@
-﻿"use client";
+﻿/**
+ * frontend/src/components/workspace/workspace-panel.tsx
+ *
+ * Workspace Panel component hardened against frontend freeze and path divergence.
+ * Key enhancements:
+ * - Completely eliminates re-render storms by removing selectedFilePath from fetch effect dependency array.
+ * - Uses authoritative relative paths (f.path) instead of flat filenames (f.name).
+ * - Prioritizes deliverables with size > 0 over empty placeholder files.
+ * - Auto-selects the primary web deliverable once per scope without infinite fetch cascading.
+ */
 
-import React, { useState, useEffect, useCallback } from "react";
+"use client";
+
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   Monitor,
   FolderTree,
@@ -9,6 +20,7 @@ import {
   FileCode2,
   Download,
   Loader2,
+  RefreshCw,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { PreviewTab } from "./preview-tab";
@@ -19,9 +31,15 @@ import { EditorTab } from "./editor-tab";
 
 export type TabId = "preview" | "files" | "artifacts" | "logs" | "editor";
 
-export function getFileCategory(filename: string): "preview" | "artifacts" | "editor" {
-  if (!filename) return "preview";
-  const lower = filename.toLowerCase();
+export interface WorkspaceFileItem {
+  name: string;
+  path: string;
+  size?: number;
+}
+
+export function getFileCategory(filepath: string): "preview" | "artifacts" | "editor" {
+  if (!filepath) return "preview";
+  const lower = filepath.toLowerCase();
   const ext = lower.split(".").pop() || "";
 
   // Web apps, SVGs, and markdown documents belong to Preview
@@ -60,17 +78,22 @@ export function WorkspacePanel({
   const [activeTab, setActiveTab] = useState<TabId>("preview");
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
   const [draftContent, setDraftContent] = useState<string | null>(null);
-  const [jobFiles, setJobFiles] = useState<{ name: string; path: string }[]>([]);
+  const [jobFiles, setJobFiles] = useState<WorkspaceFileItem[]>([]);
+  const [filesLoading, setFilesLoading] = useState<boolean>(false);
   const [exporting, setExporting] = useState<boolean>(false);
 
   const effectiveScopeId = activeChatId || activeJobId || null;
+  const hasAutoSelectedRef = useRef<boolean>(false);
+  const selectedFilePathRef = useRef<string | null>(null);
+  selectedFilePathRef.current = selectedFilePath;
 
-  const handleSelectArtifact = useCallback((filename: string) => {
-    if (!filename) return;
-    setSelectedFilePath(filename);
+  const handleSelectArtifact = useCallback((filePath: string) => {
+    if (!filePath) return;
+    const cleanPath = filePath.replace(/\\/g, "/");
+    setSelectedFilePath(cleanPath);
     setDraftContent(null);
 
-    const category = getFileCategory(filename);
+    const category = getFileCategory(cleanPath);
     if (category === "preview") {
       setActiveTab("preview");
     } else if (category === "artifacts") {
@@ -81,13 +104,85 @@ export function WorkspacePanel({
   }, []);
 
   const handleEditorSaved = (savedPath: string) => {
-    setSelectedFilePath(savedPath);
-    const category = getFileCategory(savedPath);
+    const cleanPath = savedPath.replace(/\\/g, "/");
+    setSelectedFilePath(cleanPath);
+    const category = getFileCategory(cleanPath);
     if (category === "preview") {
       setActiveTab("preview");
     }
   };
 
+  // Reconcile and fetch files without triggering re-render cascades
+  const fetchFiles = useCallback(async () => {
+    if (!effectiveScopeId) {
+      setJobFiles([]);
+      return;
+    }
+
+    try {
+      setFilesLoading(true);
+      let res = await fetch(`/api/chats/${effectiveScopeId}/files?t=${Date.now()}`);
+      if (!res.ok) {
+        res = await fetch(`/api/run/jobs/${effectiveScopeId}/files?t=${Date.now()}`);
+      }
+
+      if (res.ok) {
+        const data = await res.json();
+        const list: WorkspaceFileItem[] = data.files || [];
+        setJobFiles(list);
+
+        // Auto-select once upon initial load if nothing is selected
+        if (!hasAutoSelectedRef.current && !selectedFilePathRef.current && list.length > 0) {
+          // 1. Prefer non-empty HTML files
+          const webAppFile =
+            list.find((f) => f.name.toLowerCase() === "index.html" && (f.size ?? 1) > 0) ||
+            list.find((f) => {
+              const l = f.name.toLowerCase();
+              return (l.endsWith(".html") || l.endsWith(".htm")) && (f.size ?? 1) > 0;
+            }) ||
+            list.find((f) => f.name.toLowerCase() === "index.html") ||
+            list.find((f) => {
+              const l = f.name.toLowerCase();
+              return l.endsWith(".html") || l.endsWith(".htm");
+            });
+
+          if (webAppFile) {
+            hasAutoSelectedRef.current = true;
+            setSelectedFilePath(webAppFile.path);
+            setActiveTab("preview");
+            return;
+          }
+
+          // 2. Media artifact deliverables
+          const mediaFile = list.find((f) => getFileCategory(f.path) === "artifacts");
+          if (mediaFile) {
+            hasAutoSelectedRef.current = true;
+            setSelectedFilePath(mediaFile.path);
+            setActiveTab("artifacts");
+            return;
+          }
+
+          // 3. Fallback to the first available non-empty file
+          hasAutoSelectedRef.current = true;
+          setSelectedFilePath(list[0].path);
+          setActiveTab("editor");
+        }
+      }
+    } catch (err) {
+      console.error("[WorkspacePanel] Failed to fetch workspace files:", err);
+    } finally {
+      setFilesLoading(false);
+    }
+  }, [effectiveScopeId]);
+
+  // Reset auto-select flag and trigger fetch when switching chats/jobs
+  useEffect(() => {
+    hasAutoSelectedRef.current = false;
+    setSelectedFilePath(null);
+    fetchFiles();
+  }, [effectiveScopeId, fetchFiles]);
+
+  // Listen to live push events
   useEffect(() => {
     const handleSwitchTab = (e: Event) => {
       const ce = e as CustomEvent<TabId | { tab: TabId; file?: string }>;
@@ -95,7 +190,7 @@ export function WorkspacePanel({
       const targetFile = typeof ce.detail === "object" ? ce.detail?.file : undefined;
 
       if (targetFile) {
-        setSelectedFilePath(targetFile);
+        setSelectedFilePath(targetFile.replace(/\\/g, "/"));
       }
       if (targetTab && ["preview", "files", "artifacts", "logs", "editor"].includes(targetTab)) {
         setActiveTab(targetTab as TabId);
@@ -103,84 +198,31 @@ export function WorkspacePanel({
     };
 
     const handleArtifactCreated = (e: Event) => {
-      const ce = e as CustomEvent<{ artifact?: string; path?: string }>;
-      const artName = ce.detail?.artifact || ce.detail?.path;
-      if (artName) {
-        setSelectedFilePath(artName);
-        const cat = getFileCategory(artName);
+      const ce = e as CustomEvent<{ artifact?: string; path?: string; relative_path?: string }>;
+      const artPath = (ce.detail?.relative_path || ce.detail?.path || ce.detail?.artifact || "").replace(/\\/g, "/");
+      if (artPath) {
+        setSelectedFilePath(artPath);
+        const cat = getFileCategory(artPath);
         if (cat === "artifacts") {
           setActiveTab("artifacts");
         } else if (cat === "preview") {
           setActiveTab("preview");
         }
+        // Refresh list to display newly discovered artifact
+        fetchFiles();
       }
     };
 
     window.addEventListener("peldrun:switch-tab", handleSwitchTab);
     window.addEventListener("peldrun:artifact-created", handleArtifactCreated);
+    window.addEventListener("peldrun:artifact-updated", handleArtifactCreated);
 
     return () => {
       window.removeEventListener("peldrun:switch-tab", handleSwitchTab);
       window.removeEventListener("peldrun:artifact-created", handleArtifactCreated);
+      window.removeEventListener("peldrun:artifact-updated", handleArtifactCreated);
     };
-  }, []);
-
-  useEffect(() => {
-    if (!effectiveScopeId) {
-      setJobFiles([]);
-      return;
-    }
-
-    const fetchFiles = async () => {
-      try {
-        let res = await fetch(`/api/chats/${effectiveScopeId}/files?t=${Date.now()}`);
-        if (!res.ok) {
-          res = await fetch(`/api/run/jobs/${effectiveScopeId}/files?t=${Date.now()}`);
-        }
-        if (res.ok) {
-          const data = await res.json();
-          const list: { name: string; path: string }[] = data.files || [];
-          setJobFiles(list);
-
-          // Auto-select and navigate on initial load
-          if (!selectedFilePath && list.length > 0) {
-            const webAppFile =
-              list.find((f) => f.name.toLowerCase() === "index.html") ||
-              list.find((f) => {
-                const l = f.name.toLowerCase();
-                return l.endsWith(".html") || l.endsWith(".htm");
-              }) ||
-              list.find((f) => {
-                const l = f.name.toLowerCase();
-                return l.endsWith(".svg") || l.endsWith(".md") || l.endsWith(".markdown");
-              });
-
-            if (webAppFile) {
-              setSelectedFilePath(webAppFile.name);
-              setActiveTab("preview");
-              return;
-            }
-
-            const mediaFile = list.find((f) => getFileCategory(f.name) === "artifacts");
-            if (mediaFile) {
-              setSelectedFilePath(mediaFile.name);
-              setActiveTab("artifacts");
-              return;
-            }
-
-            setSelectedFilePath(list[0].name);
-            setActiveTab("editor");
-          }
-        }
-      } catch (err) {
-        console.error("Failed to fetch workspace files", err);
-      }
-    };
-
-    fetchFiles();
-    const interval = setInterval(fetchFiles, 3500);
-    return () => clearInterval(interval);
-  }, [effectiveScopeId, selectedFilePath]);
+  }, [fetchFiles]);
 
   const handleExportZip = async () => {
     if (!effectiveScopeId) return;
@@ -261,9 +303,22 @@ export function WorkspacePanel({
 
         <div className="flex items-center gap-2 shrink-0">
           {selectedFilePath && (
-            <span className="text-[11px] font-mono text-muted-foreground truncate max-w-[130px] hidden sm:inline">
+            <span className="text-[11px] font-mono text-muted-foreground truncate max-w-[130px] hidden sm:inline" title={selectedFilePath}>
               {selectedFilePath}
             </span>
+          )}
+
+          {effectiveScopeId && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => fetchFiles()}
+              disabled={filesLoading}
+              className="h-7 w-7 p-0 text-muted-foreground hover:text-foreground cursor-pointer"
+              title="Refresh workspace files"
+            >
+              <RefreshCw size={12} className={filesLoading ? "animate-spin text-primary" : ""} />
+            </Button>
           )}
 
           {effectiveScopeId && jobFiles.length > 0 && (
@@ -320,4 +375,3 @@ export function WorkspacePanel({
 }
 
 export default WorkspacePanel;
-

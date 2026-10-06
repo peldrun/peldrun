@@ -1,7 +1,9 @@
 """
+backend/peldrun/artifacts/manifest.py
+
 PELDRUN Core Artifact Manifest Models.
-Defines typed references, classifications, and serializable manifests for deliverables
-produced during agent execution loops.
+Defines typed references, classifications, revisions, and serializable manifests
+for deliverables produced during agent execution loops.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import time
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -25,20 +28,24 @@ class ArtifactType(str, Enum):
 
 
 class ArtifactRef(BaseModel):
-    """Structured descriptor of a single generated artifact."""
+    """Structured descriptor of a single generated artifact with revision tracking."""
     model_config = ConfigDict(extra="allow")
 
+    artifact_id: str = Field(default_factory=lambda: str(uuid4()), description="Unique artifact identifier")
     name: str = Field(..., description="File name of the artifact")
-    relative_path: str = Field(..., description="Relative path from workspace root")
+    relative_path: str = Field(..., description="Canonical relative path from workspace root")
     artifact_type: ArtifactType = Field(default=ArtifactType.FILE, description="Type categorization")
     mime_type: str = Field(default="application/octet-stream", description="Detected MIME type")
     size_bytes: int = Field(default=0, description="Size in bytes")
+    revision: int = Field(default=1, ge=1, description="Monotonically increasing version counter")
+    operation: str = Field(default="created", description="Latest operation: created, updated, deleted, moved")
     created_at: float = Field(default_factory=time.time, description="Creation timestamp")
+    updated_at: float = Field(default_factory=time.time, description="Last update timestamp")
     sha256: Optional[str] = Field(default=None, description="SHA256 content checksum")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Arbitrary auxiliary metrics")
 
     @classmethod
-    def from_path(cls, file_path: Path, workspace_root: Path) -> ArtifactRef:
+    def from_path(cls, file_path: Path, workspace_root: Path, revision: int = 1) -> ArtifactRef:
         """Construct an ArtifactRef directly from a filesystem file path."""
         rel = file_path.resolve().relative_to(workspace_root.resolve())
         rel_str = str(rel).replace("\\", "/")
@@ -68,7 +75,10 @@ class ArtifactRef(BaseModel):
             artifact_type=art_type,
             mime_type=mime,
             size_bytes=stat.st_size,
+            revision=revision,
+            operation="created",
             created_at=stat.st_ctime,
+            updated_at=stat.st_mtime,
         )
 
 
@@ -83,6 +93,13 @@ class ArtifactManifest(BaseModel):
     def get_by_name(self, name: str) -> Optional[ArtifactRef]:
         for art in self.artifacts:
             if art.name == name:
+                return art
+        return None
+
+    def get_by_path(self, relative_path: str) -> Optional[ArtifactRef]:
+        norm = relative_path.replace("\\", "/").strip("/")
+        for art in self.artifacts:
+            if art.relative_path.replace("\\", "/").strip("/") == norm:
                 return art
         return None
 

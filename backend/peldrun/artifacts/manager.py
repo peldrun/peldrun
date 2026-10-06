@@ -1,7 +1,9 @@
 """
+backend/peldrun/artifacts/manager.py
+
 PELDRUN Core Artifact Manager.
-Scans workspace directories, tracks deliverables created during execution runs,
-computes checksums, and exposes formatted manifests for events and memory context.
+Scans workspace directories, tracks deliverables created or modified during execution runs,
+computes checksums, manages revisions, and emits mutation records for live streaming.
 """
 
 from __future__ import annotations
@@ -9,8 +11,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from peldrun.artifacts.manifest import ArtifactManifest, ArtifactRef
 
@@ -18,12 +21,14 @@ logger = logging.getLogger("peldrun.artifacts.manager")
 
 
 class ArtifactManager:
-    """Manages tracking, indexing, and validation of deliverables within an isolated workspace."""
+    """Manages tracking, indexing, revisioning, and validation of workspace deliverables."""
 
     def __init__(self, workspace_root: str):
         self.workspace_root = Path(workspace_root).resolve()
         self._manifest = ArtifactManifest(workspace_root=str(self.workspace_root))
         self._baseline_files: Set[str] = set()
+        self._file_hashes: Dict[str, str] = {}
+        self._revisions: Dict[str, int] = {}
         self._lock = asyncio.Lock()
 
     def snapshot_baseline(self) -> None:
@@ -33,36 +38,74 @@ class ArtifactManager:
         self._baseline_files = {
             str(p.resolve()) for p in self.workspace_root.rglob("*") if p.is_file()
         }
+        for p in self.workspace_root.rglob("*"):
+            if p.is_file() and ".peldrun" not in p.parts:
+                try:
+                    self._file_hashes[str(p.resolve())] = self._calculate_sha256(p)
+                except Exception:
+                    pass
 
-    async def scan_new_artifacts(self, compute_hashes: bool = False) -> List[ArtifactRef]:
+    async def scan_mutations(self) -> List[Tuple[str, ArtifactRef]]:
         """
-        Scan workspace for newly created files since baseline snapshot.
-        Updates internal manifest and returns newly discovered artifacts.
+        Scan workspace for newly created or modified files since the last scan.
+        Returns a list of tuples: (operation, ArtifactRef) where operation is 'created' or 'updated'.
         """
         async with self._lock:
             if not self.workspace_root.exists():
                 return []
 
             current_files = [p for p in self.workspace_root.rglob("*") if p.is_file()]
-            new_refs: List[ArtifactRef] = []
-            existing_paths = {art.relative_path for art in self._manifest.artifacts}
+            mutations: List[Tuple[str, ArtifactRef]] = []
 
             for fpath in current_files:
                 resolved_str = str(fpath.resolve())
-                # Skip baseline or hidden metadata directory
-                if resolved_str in self._baseline_files or ".peldrun" in fpath.parts:
+                if ".peldrun" in fpath.parts:
                     continue
 
-                ref = ArtifactRef.from_path(fpath, self.workspace_root)
-                if ref.relative_path not in existing_paths:
-                    if compute_hashes:
-                        ref.sha256 = await asyncio.to_thread(self._calculate_sha256, fpath)
+                curr_hash = await asyncio.to_thread(self._calculate_sha256, fpath)
+                prev_hash = self._file_hashes.get(resolved_str)
+
+                # 1. Newly created file
+                if prev_hash is None and resolved_str not in self._baseline_files:
+                    rev = 1
+                    self._revisions[resolved_str] = rev
+                    self._file_hashes[resolved_str] = curr_hash
+
+                    ref = ArtifactRef.from_path(fpath, self.workspace_root, revision=rev)
+                    ref.sha256 = curr_hash
+                    ref.operation = "created"
 
                     self._manifest.artifacts.append(ref)
-                    new_refs.append(ref)
-                    logger.debug("Discovered new artifact: %s (%s)", ref.relative_path, ref.artifact_type.value)
+                    mutations.append(("created", ref))
+                    logger.debug("Discovered new artifact: %s", ref.relative_path)
 
-            return new_refs
+                # 2. Existing file modified
+                elif prev_hash is not None and prev_hash != curr_hash:
+                    rev = self._revisions.get(resolved_str, 1) + 1
+                    self._revisions[resolved_str] = rev
+                    self._file_hashes[resolved_str] = curr_hash
+
+                    existing_ref = self._manifest.get_by_path(
+                        str(fpath.relative_to(self.workspace_root)).replace("\\", "/")
+                    )
+                    if existing_ref:
+                        existing_ref.revision = rev
+                        existing_ref.size_bytes = fpath.stat().st_size
+                        existing_ref.sha256 = curr_hash
+                        existing_ref.operation = "updated"
+                        existing_ref.updated_at = time.time()
+                        mutations.append(("updated", existing_ref))
+                    else:
+                        ref = ArtifactRef.from_path(fpath, self.workspace_root, revision=rev)
+                        ref.sha256 = curr_hash
+                        ref.operation = "updated"
+                        self._manifest.artifacts.append(ref)
+                        mutations.append(("updated", ref))
+
+                    logger.debug("Detected updated artifact: %s (rev %d)", fpath.name, rev)
+
+            self._manifest.updated_at = time.time()
+            return mutations
 
     @staticmethod
     def _calculate_sha256(path: Path) -> str:
@@ -84,6 +127,6 @@ class ArtifactManager:
         lines = ["### Deliverables Generated:"]
         for art in self._manifest.artifacts:
             size_kb = round(art.size_bytes / 1024, 2)
-            lines.append(f"- **`{art.relative_path}`** ({art.artifact_type.value.upper()}, {size_kb} KB)")
+            lines.append(f"- **`{art.relative_path}`** ({art.artifact_type.value.upper()}, {size_kb} KB, rev {art.revision})")
 
         return "\n".join(lines)

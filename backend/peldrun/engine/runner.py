@@ -1,6 +1,7 @@
 """
-PELDRUN Core Agent Execution Runner.
+backend/peldrun/engine/runner.py
 
+PELDRUN Core Agent Execution Runner.
 Coordinates agent lifecycle, asynchronous execution loops, checkpointing, and event emission.
 Enforces non-empty message preconditions to prevent upstream LLM provider rejection.
 """
@@ -120,18 +121,20 @@ class AgentRunner:
         if active_agent is None:
             raise ValueError("No executable agent provided to AgentRunner.")
 
+        agent_name = getattr(active_agent, "name", "agent")
+
         # Initialize or link execution state
         if state is None:
             state = ExecutionState(
                 task_prompt=task_prompt,
-                agent_name=active_agent.name,
+                agent_name=agent_name,
                 max_steps=self.config.max_steps,
                 workspace_root=workspace_root,
             )
             state.add_message(role=MessageRole.USER, content=task_prompt)
         else:
             state.task_prompt = task_prompt
-            state.agent_name = active_agent.name
+            state.agent_name = getattr(state, "agent_name", None) or agent_name
             state.max_steps = self.config.max_steps
             if workspace_root:
                 state.workspace_root = workspace_root

@@ -1,6 +1,9 @@
 """
+backend/peldrun/events/schema.py
+
 PELDRUN Core Event Protocol Schemas.
 Implements the strict Canonical Envelope Pattern using Pydantic v2 for the unified runtime lifecycle.
+Includes canonical Artifact lifecycle event models under Phase M2.
 """
 
 from __future__ import annotations
@@ -25,6 +28,12 @@ class EventType(str, Enum):
     FINAL = "final"
     ERROR = "error"
     ASK_HUMAN = "ask_human"
+
+    # Canonical Artifact Lifecycle Events (Phase M2)
+    ARTIFACT_CREATED = "artifact_created"
+    ARTIFACT_UPDATED = "artifact_updated"
+    ARTIFACT_DELETED = "artifact_deleted"
+    ARTIFACT_MOVED = "artifact_moved"
 
 
 # Typed helper payloads for domain modeling and strict event validation
@@ -132,6 +141,24 @@ class AskHumanPayload(BaseModel):
     timeout_seconds: float = 300.0
 
 
+class ArtifactPayload(BaseModel):
+    """Canonical descriptor payload for workspace artifact lifecycle changes."""
+    model_config = ConfigDict(extra="allow")
+    artifact_id: str = Field(default_factory=lambda: str(uuid4()))
+    job_id: Optional[str] = None
+    run_id: Optional[str] = None
+    name: str = Field(..., description="File name")
+    relative_path: str = Field(..., description="Canonical relative path from workspace root")
+    operation: str = Field(default="created", description="Operation type: created, updated, deleted, moved")
+    mime_type: str = Field(default="application/octet-stream")
+    size_bytes: int = Field(default=0)
+    revision: int = Field(default=1, ge=1)
+    sha256: Optional[str] = None
+    source_tool: Optional[str] = None
+    timestamp: float = Field(default_factory=time.time)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
 EVENT_PAYLOAD_MAP: Dict[EventType, type[BaseModel]] = {
     EventType.SNAPSHOT: SnapshotPayload,
     EventType.STEP_START: StepStartPayload,
@@ -143,6 +170,10 @@ EVENT_PAYLOAD_MAP: Dict[EventType, type[BaseModel]] = {
     EventType.FINAL: FinalPayload,
     EventType.ERROR: ErrorPayload,
     EventType.ASK_HUMAN: AskHumanPayload,
+    EventType.ARTIFACT_CREATED: ArtifactPayload,
+    EventType.ARTIFACT_UPDATED: ArtifactPayload,
+    EventType.ARTIFACT_DELETED: ArtifactPayload,
+    EventType.ARTIFACT_MOVED: ArtifactPayload,
 }
 
 
@@ -287,6 +318,22 @@ class AskHumanEvent(PeldrunEvent):
     type: Literal[EventType.ASK_HUMAN] = EventType.ASK_HUMAN
 
 
+class ArtifactCreatedEvent(PeldrunEvent):
+    type: Literal[EventType.ARTIFACT_CREATED] = EventType.ARTIFACT_CREATED
+
+
+class ArtifactUpdatedEvent(PeldrunEvent):
+    type: Literal[EventType.ARTIFACT_UPDATED] = EventType.ARTIFACT_UPDATED
+
+
+class ArtifactDeletedEvent(PeldrunEvent):
+    type: Literal[EventType.ARTIFACT_DELETED] = EventType.ARTIFACT_DELETED
+
+
+class ArtifactMovedEvent(PeldrunEvent):
+    type: Literal[EventType.ARTIFACT_MOVED] = EventType.ARTIFACT_MOVED
+
+
 __all__ = [
     "EventType",
     "PeldrunEvent",
@@ -303,6 +350,7 @@ __all__ = [
     "FinalPayload",
     "ErrorPayload",
     "AskHumanPayload",
+    "ArtifactPayload",
     "SnapshotEvent",
     "StepStartEvent",
     "ThoughtEvent",
@@ -313,4 +361,8 @@ __all__ = [
     "FinalEvent",
     "ErrorEvent",
     "AskHumanEvent",
+    "ArtifactCreatedEvent",
+    "ArtifactUpdatedEvent",
+    "ArtifactDeletedEvent",
+    "ArtifactMovedEvent",
 ]

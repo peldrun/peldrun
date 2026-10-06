@@ -1,14 +1,22 @@
 """
-Public dispatcher entry points for the PELDRUN Universal Agent Bridge.
+backend/omweb/agent_bridge_parts/dispatcher.py
+
+Authoritative dispatcher entry points for the PELDRUN Universal Agent Bridge.
 
 Dispatches execution to registered engines (native embedded PELDRUN Core
 or legacy OpenManus) via the authoritative EngineRegistry abstraction layer.
-Enforces upfront fail-fast resolution for both engines and agents.
+
+Hardened under Phase M0:
+- Eliminates duplicate STEP_START emission by delegating step lifecycle
+  authority entirely to Core AgentRunner when running PELDRUN engine.
+- Enforces strict job isolation with explicit task registration (no global current_job race).
+- Deterministic cleanup of per-job state and synchronization primitives.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import traceback
 from typing import Any, Dict, Optional
 
@@ -28,12 +36,12 @@ from .config_loader import read_active_toml_config
 from .errors import format_smart_error
 from .lmstudio import check_lmstudio_model_readiness
 from .state import (
-    active_tasks,
-    current_active_job_id,
-    human_answers,
-    human_data,
+    cleanup_job_state,
     job_scoped_artifacts,
+    register_job_task,
 )
+
+logger = logging.getLogger(__name__)
 
 
 async def run_instrumented(
@@ -44,7 +52,8 @@ async def run_instrumented(
     llm_override: Optional[Dict[str, Any]] = None,
     **kwargs: Any,
 ) -> None:
-    """Dispatch an agent job using the authoritative execution engine registry.
+    """
+    Dispatch an agent job using the authoritative execution engine registry.
 
     Args:
         job_id: Unique job identifier.
@@ -54,6 +63,11 @@ async def run_instrumented(
         llm_override: Optional runtime LLM configuration overrides.
         **kwargs: Supports 'engine' kwarg to explicitly specify target engine.
     """
+    # 0. Track current task for safe cancellation
+    current_task = asyncio.current_task()
+    if current_task is not None:
+        register_job_task(job_id, current_task)
+
     for arg in args:
         if isinstance(arg, dict) and llm_override is None:
             llm_override = arg
@@ -79,10 +93,9 @@ async def run_instrumented(
         )
 
     print(f"\n[BRIDGE] Initializing job {job_id} using engine: '{target_engine_str}'")
-    current_active_job_id["current"] = job_id
-    job_scoped_artifacts[job_id] = []
+    job_scoped_artifacts.setdefault(job_id, [])
 
-    # 2. Strict Fail-Fast Engine Resolution: Validate engine existence upfront
+    # 2. Strict Fail-Fast Engine Resolution
     try:
         engine = engine_registry.get(target_engine_str)
     except EngineNotFoundError as eng_err:
@@ -97,9 +110,10 @@ async def run_instrumented(
                 data={"message": err_msg, "engine": target_engine_str},
             ),
         )
+        cleanup_job_state(job_id)
         return
 
-    # 3. Strict Fail-Fast Agent Resolution: Validate agent existence in Store upfront
+    # 3. Strict Fail-Fast Agent Resolution
     try:
         manifest = agent_registry.get_agent(agent_id)
     except AgentNotFoundError as agent_err:
@@ -110,6 +124,7 @@ async def run_instrumented(
             job_id,
             SSEEvent(type=SSEEventType.ERROR, step=0, data={"message": err_msg}),
         )
+        cleanup_job_state(job_id)
         return
 
     if manifest.get("status") == "disabled":
@@ -119,6 +134,7 @@ async def run_instrumented(
             job_id,
             SSEEvent(type=SSEEventType.ERROR, step=0, data={"message": err_msg}),
         )
+        cleanup_job_state(job_id)
         return
 
     # 4. Resolve runtime LLM settings
@@ -159,6 +175,7 @@ async def run_instrumented(
                 job_id,
                 SSEEvent(type=SSEEventType.ERROR, step=1, data={"message": err_msg, "model": model_name}),
             )
+            cleanup_job_state(job_id)
             return
 
         if readiness.get("found") and not readiness.get("is_loaded"):
@@ -168,24 +185,48 @@ async def run_instrumented(
                 job_id,
                 SSEEvent(type=SSEEventType.ERROR, step=1, data={"message": err_msg, "model": model_name}),
             )
+            cleanup_job_state(job_id)
             return
 
-    # 6. Dispatch initial STEP_START event
-    await asyncio.sleep(0.05)
-    await dispatch_event(
-        job_id,
-        SSEEvent(
-            type=SSEEventType.STEP_START,
-            step=1,
-            data={
-                "status": "running",
-                "model": model_name,
-                "provider": provider_name,
-                "mode": "agent",
-                "engine": target_engine_str,
-            },
-        ),
-    )
+    # 6. Lifecycle Authority Delegation (Eliminate duplicate STEP_START)
+    is_native_core = target_engine_str in ("peldrun", "peldrun-core", "core")
+
+    if not is_native_core:
+        # Backward compatibility for legacy engines (e.g., OpenManus) that do not emit core lifecycle events
+        await asyncio.sleep(0.05)
+        await dispatch_event(
+            job_id,
+            SSEEvent(
+                type=SSEEventType.STEP_START,
+                step=1,
+                data={
+                    "status": "running",
+                    "model": model_name,
+                    "provider": provider_name,
+                    "mode": "agent",
+                    "engine": target_engine_str,
+                },
+            ),
+        )
+    else:
+        # PELDRUN Core Native: Core AgentRunner owns STEP_START/STEP_END lifecycle.
+        # Dispatcher optionally emits control/status event without competing for execution steps.
+        status_event_type = getattr(SSEEventType, "STATUS", None) or getattr(SSEEventType, "RUN_ACCEPTED", None)
+        if status_event_type is not None:
+            await dispatch_event(
+                job_id,
+                SSEEvent(
+                    type=status_event_type,
+                    step=0,
+                    data={
+                        "status": "accepted",
+                        "model": model_name,
+                        "provider": provider_name,
+                        "mode": "agent",
+                        "engine": target_engine_str,
+                    },
+                ),
+            )
 
     # 7. Prepare project workspace directory
     chat = project_manager.get_chat(job_id) or {}
@@ -210,7 +251,7 @@ async def run_instrumented(
     try:
         await engine.run(context)
     except asyncio.CancelledError:
-        print(f"[BRIDGE] Job was aborted: {job_id}")
+        print(f"[BRIDGE] Job was cancelled/aborted: {job_id}")
     except Exception as err:
         tb = traceback.format_exc()
         print(f"[BRIDGE ERROR] {err}\n{tb}")
@@ -225,11 +266,7 @@ async def run_instrumented(
             ),
         )
     finally:
-        human_answers.pop(job_id, None)
-        human_data.pop(job_id, None)
-        active_tasks.pop(job_id, None)
-        if current_active_job_id.get("current") == job_id:
-            current_active_job_id.pop("current", None)
+        cleanup_job_state(job_id)
 
 
 async def run_direct_chat(
@@ -238,9 +275,12 @@ async def run_direct_chat(
     llm_override: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Dispatch a plain, non-agentic chat completion job."""
+    current_task = asyncio.current_task()
+    if current_task is not None:
+        register_job_task(job_id, current_task)
+
     print(f"\n[BRIDGE DIRECT CHAT] Initializing direct chat for job: {job_id}")
-    current_active_job_id["current"] = job_id
-    job_scoped_artifacts[job_id] = []
+    job_scoped_artifacts.setdefault(job_id, [])
 
     toml_cfg = read_active_toml_config()
     active_llm = dict(toml_cfg.get("llm", {}))
@@ -277,6 +317,7 @@ async def run_direct_chat(
                 job_id,
                 SSEEvent(type=SSEEventType.ERROR, step=1, data={"message": err_msg, "model": model_name}),
             )
+            cleanup_job_state(job_id)
             return
 
         if readiness.get("found") and not readiness.get("is_loaded"):
@@ -286,6 +327,7 @@ async def run_direct_chat(
                 job_id,
                 SSEEvent(type=SSEEventType.ERROR, step=1, data={"message": err_msg, "model": model_name}),
             )
+            cleanup_job_state(job_id)
             return
 
     await asyncio.sleep(0.05)
@@ -383,8 +425,4 @@ async def run_direct_chat(
             ),
         )
     finally:
-        human_answers.pop(job_id, None)
-        human_data.pop(job_id, None)
-        active_tasks.pop(job_id, None)
-        if current_active_job_id.get("current") == job_id:
-            current_active_job_id.pop("current", None)
+        cleanup_job_state(job_id)
