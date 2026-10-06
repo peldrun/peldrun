@@ -3,11 +3,13 @@ PELDRUN Core Asynchronous Event Emitter.
 Dispatches strictly typed lifecycle events to registered subscribers and SSE streams
 with thread-safe and coroutine-safe monotonic sequence numbering, multi-run isolation,
 and bounded historical replay buffer.
+Hardened against non-UUID string identifiers and duplicate terminal dispatches.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from collections import defaultdict, deque
@@ -16,6 +18,8 @@ from uuid import UUID, uuid4
 
 from peldrun.events.schema import EventType, PeldrunEvent
 
+logger = logging.getLogger("peldrun.events.emitter")
+
 EventListener = Callable[[PeldrunEvent], Coroutine[Any, Any, None]]
 
 
@@ -23,7 +27,7 @@ class EventEmitter:
     """Thread-safe and coroutine-safe event broadcaster supporting sequence tracking, replay buffer, and SSE queues."""
 
     def __init__(self, run_id: Optional[Union[UUID, str]] = None, buffer_capacity: int = 1000) -> None:
-        self._run_id: UUID = self._coerce_uuid(run_id) if run_id is not None else uuid4()
+        self._run_id: Union[UUID, str] = self._coerce_run_id(run_id) if run_id is not None else uuid4()
         self._sequence_counter: int = 0
         self._last_emitted_sequence: int = 0
         self._seq_lock = threading.Lock()
@@ -35,24 +39,33 @@ class EventEmitter:
         self._is_terminated: bool = False
 
     @staticmethod
-    def _coerce_uuid(value: Optional[Union[UUID, str]]) -> UUID:
-        """Convert string or UUID instance to strict UUID, generating a new UUID if None."""
+    def _coerce_run_id(value: Optional[Union[UUID, str]]) -> Union[UUID, str]:
+        """Convert string or UUID instance to UUID or canonical string identifier, generating a UUID if None."""
         if value is None:
             return uuid4()
         if isinstance(value, UUID):
             return value
         if isinstance(value, str):
-            return UUID(value)
-        raise ValueError(f"Value must be a valid UUID or UUID string, got {type(value).__name__}")
+            trimmed = value.strip()
+            try:
+                return UUID(trimmed)
+            except ValueError:
+                return trimmed
+        raise ValueError(f"Value must be a valid UUID or run_id string, got {type(value).__name__}")
+
+    @staticmethod
+    def _coerce_uuid(value: Optional[Union[UUID, str]]) -> Union[UUID, str]:
+        """Backward-compatible alias for _coerce_run_id."""
+        return EventEmitter._coerce_run_id(value)
 
     @property
-    def run_id(self) -> UUID:
+    def run_id(self) -> Union[UUID, str]:
         """Active execution or session run identifier."""
         return self._run_id
 
     @run_id.setter
     def run_id(self, val: Optional[Union[UUID, str]]) -> None:
-        self._run_id = self._coerce_uuid(val)
+        self._run_id = self._coerce_run_id(val)
 
     @property
     def current_sequence(self) -> int:
@@ -102,7 +115,7 @@ class EventEmitter:
                 assigned_sequence = self._sequence_counter
 
         resolved_type = EventType(event_type) if not isinstance(event_type, EventType) else event_type
-        target_run_id = self._coerce_uuid(run_id) if run_id is not None else self._run_id
+        target_run_id = self._coerce_run_id(run_id) if run_id is not None else self._run_id
 
         return PeldrunEvent(
             version=1,
@@ -139,8 +152,22 @@ class EventEmitter:
         """
         Publish an event across matching listeners, historical replay buffer, and active SSE queues.
         Guarantees thread-safe and coroutine-safe strictly monotonic sequence allocation.
+        Enforces a single canonical terminal outcome per run.
         """
         async with self._lock:
+            key = event.type.value if hasattr(event.type, "value") else str(event.type)
+
+            # Terminal Guard: Ignore duplicate terminal events
+            if key in (EventType.FINAL.value, EventType.ERROR.value):
+                if self._is_terminated:
+                    logger.warning(
+                        "Ignoring duplicate terminal event '%s' for run '%s' (already terminated).",
+                        key,
+                        self._run_id,
+                    )
+                    return
+                self._is_terminated = True
+
             with self._seq_lock:
                 if event.sequence <= 0:
                     self._sequence_counter += 1
@@ -157,16 +184,11 @@ class EventEmitter:
 
                 self._last_emitted_sequence = max(self._last_emitted_sequence, event.sequence)
 
-            key = event.type.value if hasattr(event.type, "value") else str(event.type)
             targets = list(self._listeners.get(key, [])) + list(self._global_listeners)
             queues = list(self._sse_queues)
 
             # Store in historical replay buffer
             self._replay_buffer.append(event)
-
-            # Detect terminal lifecycle events
-            if key in (EventType.FINAL.value, EventType.ERROR.value):
-                self._is_terminated = True
 
         for listener in targets:
             try:

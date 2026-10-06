@@ -1,18 +1,27 @@
 """
+backend/peldrun/agents/tool_call_agent.py
+
 Autonomous Tool Calling Agent for PELDRUN Core Runtime.
 
 Executes Think-Act cycles with reliable tool dispatching directly on tool instances
 or session-scoped ToolRegistry, maintaining full conversation history and synchronized
 Pydantic ChatMessage lifecycle contracts with ExecutionState.
+Hardened under Phase M2 & ASK_HUMAN Runtime Stabilization:
+- Automatic pre-allocation of request_id for human input interactions.
+- Strictly enforces non-empty canonical tool_call_id to eliminate provider 400 schema rejections.
+- Explicit WAITING_FOR_HUMAN and RUNNING lifecycle transitions.
+- Propagates cancellation and timeout exceptions to enforce terminal states.
 """
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+import uuid
 
 from peldrun.agents.base import AgentConfig, BaseAgent
 from peldrun.engine.state import ChatMessage, ExecutionState, MessageRole
@@ -68,7 +77,6 @@ class ToolCallAgent(BaseAgent):
 
         super().__init__(**base_kwargs)
 
-        # Store name in private attribute to avoid read-only property setter collision
         self._name: str = getattr(config, "name", "ToolCallAgent") if config else "ToolCallAgent"
         if hasattr(self, "config") and self.config and not getattr(self.config, "name", None):
             self.config.name = self._name
@@ -190,7 +198,6 @@ class ToolCallAgent(BaseAgent):
         if state.messages:
             self.messages = [msg.to_llm_dict() for msg in state.messages]
         else:
-            # Seed initial conversation turns if state is currently empty
             self.messages = [
                 {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": state.task_prompt or "Start task."},
@@ -202,7 +209,6 @@ class ToolCallAgent(BaseAgent):
         """Execute cognitive reasoning phase of the ReAct cycle."""
         tools_schema = self._get_tools_schema()
 
-        # Ensure conversation has at least one valid message
         if not self.messages or not any(m.get("role") in ("user", "system") for m in self.messages):
             prompt_text = (self.state.task_prompt if self.state else "") or "Execute assigned task."
             self.messages = [
@@ -276,12 +282,22 @@ class ToolCallAgent(BaseAgent):
 
         for call in tool_calls:
             tool_name = call.name
+            call_id = call.id or f"call_{uuid.uuid4().hex[:12]}"
+            call.id = call_id
+
             args = call.arguments if isinstance(call.arguments, dict) else {}
             if isinstance(call.arguments, str):
                 try:
                     args = json.loads(call.arguments)
                 except Exception:
                     args = {"raw": call.arguments}
+
+            is_human_tool = tool_name in ("ask_human", "human_input")
+            if is_human_tool:
+                if not args.get("request_id"):
+                    args["request_id"] = str(uuid.uuid4())
+                if self.state is not None:
+                    self.state.mark_waiting_for_human()
 
             print(f"[CORE LIVE STREAM] Tool Call: {tool_name}({json.dumps(args, ensure_ascii=False)[:80]})")
             await self._emit(EventType.TOOL_CALL, step=step, payload={"tool_name": tool_name, "arguments": args})
@@ -311,6 +327,9 @@ class ToolCallAgent(BaseAgent):
                             is_error=True,
                         )
 
+                    if is_human_tool and self.state is not None:
+                        self.state.mark_running()
+
                     if isinstance(res, ToolResult):
                         if res.is_error:
                             output_str = res.error or str(res.output) or f"Error executing tool '{tool_name}'"
@@ -321,35 +340,42 @@ class ToolCallAgent(BaseAgent):
                     else:
                         output_str = str(res)
 
+                except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError) as flow_err:
+                    if is_human_tool and self.state is not None:
+                        self.state.mark_error(f"Human interaction aborted: {str(flow_err)}")
+                    raise flow_err
+
                 except Exception as ex:
+                    if is_human_tool and self.state is not None:
+                        self.state.mark_running()
                     output_str = f"Error executing tool '{tool_name}': {str(ex)}"
             else:
+                if is_human_tool and self.state is not None:
+                    self.state.mark_running()
                 output_str = f"Error: Tool '{tool_name}' not found in active collection."
 
             print(f"[CORE LIVE STREAM] Observation: {output_str[:90]}...")
             await self._emit(EventType.OBSERVATION, step=step, payload={"tool_name": tool_name, "output": output_str})
 
-            # Append to internal LLM history
             self.messages.append({
                 "role": "tool",
-                "tool_call_id": call.id,
+                "tool_call_id": call_id,
                 "name": tool_name,
                 "content": output_str,
             })
 
-            # Append to typed ExecutionState if bound (creates ChatMessage instances cleanly)
             if self.state is not None:
                 self.state.add_message(
                     role=MessageRole.TOOL,
                     content=output_str,
                     name=tool_name,
-                    tool_call_id=call.id,
+                    tool_call_id=call_id,
                 )
                 self.state.record_tool_execution(
                     tool_name=tool_name,
                     arguments=args,
                     output=output_str,
-                    tool_call_id=call.id,
+                    tool_call_id=call_id,
                 )
 
             observations.append(output_str)
@@ -357,16 +383,11 @@ class ToolCallAgent(BaseAgent):
         return observations
 
     async def step(self, state: ExecutionState, emitter: EventEmitter) -> bool:
-        """Execute a single ReAct step driving the AgentRunner lifecycle contract.
-
-        Returns:
-            True if task has reached completion; False to continue iterating.
-        """
+        """Execute a single ReAct step driving the AgentRunner lifecycle contract."""
         self.state = state
         self.emitter = emitter
         self.current_step = state.current_step
 
-        # Synchronize conversation messages from state
         self._sync_messages_from_state(state)
 
         response = await self.think(step=self.current_step)
@@ -377,7 +398,11 @@ class ToolCallAgent(BaseAgent):
             state.final_output = self._final_answer
             return True
 
-        # Append assistant response to messages and typed ExecutionState
+        # Pre-assign guaranteed non-empty call IDs to satisfy strict schema validators
+        for tc in response.tool_calls:
+            if not tc.id:
+                tc.id = f"call_{uuid.uuid4().hex[:12]}"
+
         tool_calls_payload = [
             {
                 "id": tc.id,
@@ -419,6 +444,10 @@ class ToolCallAgent(BaseAgent):
         if not response.tool_calls:
             self._final_answer = response.content or response.thought or response.reasoning or "Task completed."
             return False
+
+        for tc in response.tool_calls:
+            if not tc.id:
+                tc.id = f"call_{uuid.uuid4().hex[:12]}"
 
         tool_calls_payload = [
             {

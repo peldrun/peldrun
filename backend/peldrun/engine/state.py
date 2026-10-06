@@ -1,4 +1,6 @@
 """
+backend/peldrun/engine/state.py
+
 PELDRUN Core Execution State and Checkpointing Subsystem.
 Provides strictly typed, immutable-friendly execution state models with Pydantic v2.
 """
@@ -191,6 +193,11 @@ class ExecutionState(BaseModel):
         self.status = ExecutionStatus.RUNNING
         self.updated_at = time.time()
 
+    def mark_waiting_for_human(self) -> None:
+        """Transition into WAITING_FOR_HUMAN and refresh the update timestamp."""
+        self.status = ExecutionStatus.WAITING_FOR_HUMAN
+        self.updated_at = time.time()
+
     def mark_completed(self, output: Optional[str] = None) -> None:
         """Transition into COMPLETED and record the final output (if any)."""
         self.status = ExecutionStatus.COMPLETED
@@ -240,12 +247,7 @@ class ExecutionState(BaseModel):
         tool_call_id: str = "",
         call_id: Optional[str] = None,
     ) -> ToolExecutionRecord:
-        """
-        Log a completed tool execution into the state record.
-
-        Accepts both `tool_call_id` (preferred, used by agents) and the legacy
-        `call_id` keyword for backwards compatibility with older call sites.
-        """
+        """Log a completed tool execution into the state record."""
         actual_id = tool_call_id or call_id or ""
         record = ToolExecutionRecord(
             call_id=actual_id,
@@ -272,10 +274,7 @@ class ExecutionState(BaseModel):
 
     # ----------------------------------------------------------- checkpointing
     def create_checkpoint(self) -> Checkpoint:
-        """
-        Create and append an immutable snapshot of the current state.
-        Omits past checkpoints recursively to prevent exponential bloat.
-        """
+        """Create and append an immutable snapshot of the current state."""
         raw_dump = self.model_dump(mode="json", exclude={"checkpoints"})
         checkpoint = Checkpoint(
             step=self.current_step,
@@ -285,10 +284,7 @@ class ExecutionState(BaseModel):
         return checkpoint
 
     def restore_checkpoint(self, checkpoint_id: str) -> bool:
-        """
-        Revert the active state to the snapshot identified by checkpoint_id.
-        Returns True if successful, False if the checkpoint was not found.
-        """
+        """Revert the active state to the snapshot identified by checkpoint_id."""
         target = next((cp for cp in self.checkpoints if cp.checkpoint_id == checkpoint_id), None)
         if not target:
             return False

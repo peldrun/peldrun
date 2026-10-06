@@ -4,6 +4,7 @@ backend/peldrun/events/schema.py
 PELDRUN Core Event Protocol Schemas.
 Implements the strict Canonical Envelope Pattern using Pydantic v2 for the unified runtime lifecycle.
 Includes canonical Artifact lifecycle event models under Phase M2.
+Hardened to support flexible run_id identifiers (UUID or canonical job/chat string tokens).
 """
 
 from __future__ import annotations
@@ -190,17 +191,44 @@ class PeldrunEvent(BaseModel):
     version: int = Field(default=1, ge=1, description="Protocol envelope schema version")
     event_id: UUID = Field(default_factory=uuid4, description="Unique identifier for the event instance")
     sequence: int = Field(default=0, ge=0, description="Monotonically increasing sequence number within run")
-    run_id: UUID = Field(default_factory=uuid4, description="Unique execution or session identifier")
+    run_id: Union[UUID, str] = Field(default_factory=uuid4, description="Unique execution or session identifier")
     timestamp: float = Field(default_factory=time.time, description="Unix epoch timestamp in UTC seconds")
     step: int = Field(default=0, ge=0, description="Execution step index (0 for direct chat or initialization)")
     type: EventType = Field(..., description="Discriminator event type")
     payload: Dict[str, Any] = Field(default_factory=dict, description="Event-specific payload content")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Contextual tracing and producer metadata")
 
-    @field_validator("event_id", "run_id", mode="before")
+    @field_validator("event_id", mode="before")
+    @classmethod
+    def _validate_event_id(cls, value: Any) -> UUID:
+        """Enforce strict UUID validation for atomic event instance identifier."""
+        if value is None:
+            return uuid4()
+        if isinstance(value, UUID):
+            return value
+        if isinstance(value, str):
+            return UUID(value)
+        raise ValueError(f"Value must be a valid UUID or UUID string, got {type(value).__name__}")
+
+    @field_validator("run_id", mode="before")
+    @classmethod
+    def _validate_run_id(cls, value: Any) -> Union[UUID, str]:
+        """Validate run_id allowing UUID instances, UUID strings, or canonical job/chat string tokens."""
+        if value is None:
+            return uuid4()
+        if isinstance(value, UUID):
+            return value
+        if isinstance(value, str):
+            trimmed = value.strip()
+            try:
+                return UUID(trimmed)
+            except ValueError:
+                return trimmed
+        raise ValueError(f"Value must be a valid UUID or string identifier, got {type(value).__name__}")
+
     @classmethod
     def _validate_uuid(cls, value: Any) -> UUID:
-        """Enforce strict UUID validation without silent fallback while allowing None to generate default."""
+        """Backward-compatible helper ensuring strict UUID coercion."""
         if value is None:
             return uuid4()
         if isinstance(value, UUID):

@@ -3,9 +3,10 @@ backend/omweb/routers/run.py
 
 PELDRUN Universal Run Router.
 Manages job lifecycles, chat associations, real-time SSE streaming, and deliverable downloads.
-Hardened under Phase M2 & Defect Resolution:
-- Resilient deliverable resolution: Eliminates ghost 0-byte file shadowing when nested deliverables exist.
-- Intelligent content fallback: Automatically resolves subfolder deliverables if root file is empty or missing.
+Hardened under Phase M2 & Workspace Stabilization:
+- Full support for nested directories in job deliverables.
+- Native POST /jobs/{job_id}/content endpoint for file editing and persistence.
+- Authoritative request_id resolution for HumanInputRegistry.
 """
 
 from __future__ import annotations
@@ -336,7 +337,7 @@ async def get_job_detail(job_id: str):
 async def get_job_files(job_id: str):
     """
     Retrieve deliverables list for a job or chat.
-    Intelligently deduplicates 0-byte ghost files if an equivalent nested deliverable exists.
+    Preserves all nested directories and deliverable files created within files_dir.
     """
     _, chat_id = resolve_chat(job_id)
     chat = project_manager.get_chat(chat_id) or {}
@@ -346,7 +347,7 @@ async def get_job_files(job_id: str):
     if not files_dir.exists():
         return {"job_id": job_id, "chat_id": chat_id, "files": [], "all_files": []}
 
-    all_files_list = []
+    all_files_list: List[Dict[str, Any]] = []
     for root, dirs, files in os.walk(files_dir):
         for f in files:
             p = Path(root) / f
@@ -357,75 +358,46 @@ async def get_job_files(job_id: str):
                 "size": p.stat().st_size,
             })
 
-    # Find all file names that have non-empty versions in nested subfolders
-    nested_non_empty = {
-        item["name"]
-        for item in all_files_list
-        if "/" in item["path"] and item["size"] > 0
-    }
-
-    # Suppress root 0-byte ghost files that are shadowed by nested deliverables
-    sanitized_files: List[Dict[str, Any]] = []
-    for item in all_files_list:
-        if "/" not in item["path"] and item["size"] == 0 and item["name"] in nested_non_empty:
-            continue
-        sanitized_files.append(item)
+    # Sort files to prioritize non-empty deliverables
+    all_files_list.sort(key=lambda x: (0 if x["size"] > 0 else 1, x["path"]))
 
     actual_job_id = chat.get("job_id") or job_id
-    turn_files = (
-        job_scoped_artifacts.get(job_id)
-        or job_scoped_artifacts.get(actual_job_id)
-        or (job_scoped_artifacts.get(chat_id) if chat_id else None)
-    )
-
-    if turn_files is not None and len(turn_files) > 0:
-        scoped_list = [
-            f for f in sanitized_files
-            if f["path"] in turn_files or f["name"] in turn_files
-        ]
-    else:
-        scoped_list = sanitized_files
-
-    # Sort files to prioritize non-empty deliverables
-    scoped_list.sort(key=lambda x: (0 if x["size"] > 0 else 1, x["path"]))
-
     return {
         "job_id": actual_job_id,
         "chat_id": chat_id,
-        "files": scoped_list,
-        "all_files": sanitized_files,
+        "files": all_files_list,
+        "all_files": all_files_list,
     }
 
 
 def _resolve_physical_file(files_dir: Path, requested_path: str) -> Optional[Path]:
     """
     Intelligently resolves requested relative path against files_dir.
-    If the requested path is a 0-byte file in root, checks if a non-empty
-    nested file with the same name exists (e.g. todo-app/index.html).
+    Safely strips any redundant prefixes and supports nested directory resolution.
     """
-    clean_rel = requested_path.lstrip("/\\")
+    clean_rel = requested_path.lstrip("/\\").replace("\\", "/")
+    if "files/" in clean_rel:
+        clean_rel = clean_rel.split("files/", 1)[1]
+
     direct_target = (files_dir / clean_rel).resolve()
-
-    # If direct target exists and has content, return it
-    if direct_target.is_relative_to(files_dir) and direct_target.is_file():
-        if direct_target.stat().st_size > 0 or "/" in clean_rel:
+    try:
+        direct_target.relative_to(files_dir.resolve())
+        if direct_target.is_file():
             return direct_target
+    except ValueError:
+        pass
 
-    # Fallback search: Look for non-empty nested matching file
     target_name = Path(clean_rel).name
     for sub_file in files_dir.rglob(target_name):
         if sub_file.is_file() and sub_file.stat().st_size > 0:
             return sub_file
-
-    # If direct target exists even if 0-byte, fallback to it
-    if direct_target.is_relative_to(files_dir) and direct_target.is_file():
-        return direct_target
 
     return None
 
 
 @router.get("/jobs/{job_id}/content")
 async def get_job_file_content(job_id: str, path: str = Query(...)):
+    """Retrieve textual content of a workspace deliverable file."""
     _, chat_id = resolve_chat(job_id)
     chat = project_manager.get_chat(chat_id) or {}
     project_id = chat.get("project_id", "default_project")
@@ -441,6 +413,48 @@ async def get_job_file_content(job_id: str, path: str = Query(...)):
         return {"path": rel_str, "content": content}
     except Exception as e:
         return {"path": path, "content": f"Binary content: {str(e)}"}
+
+
+@router.post("/jobs/{job_id}/content")
+async def save_job_file_content(job_id: str, payload: FileContentPayload):
+    """Save or update deliverable file content in job/chat workspace files directory."""
+    _, chat_id = resolve_chat(job_id)
+    chat = project_manager.get_chat(chat_id) or {}
+    project_id = chat.get("project_id", "default_project")
+    files_dir = project_manager.get_chat_files_dir(chat_id, project_id)
+    files_dir.mkdir(parents=True, exist_ok=True)
+
+    clean_rel = payload.path.lstrip("/\\").replace("\\", "/")
+    if "files/" in clean_rel:
+        clean_rel = clean_rel.split("files/", 1)[1]
+
+    target = (files_dir / clean_rel).resolve()
+    try:
+        target.relative_to(files_dir.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Access denied: path outside workspace files directory")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(payload.content, encoding="utf-8")
+
+    actual_job_id = chat.get("job_id") or job_id
+    if actual_job_id not in job_scoped_artifacts:
+        job_scoped_artifacts[actual_job_id] = []
+    if clean_rel not in job_scoped_artifacts[actual_job_id]:
+        job_scoped_artifacts[actual_job_id].append(clean_rel)
+
+    if chat_id:
+        if chat_id not in job_scoped_artifacts:
+            job_scoped_artifacts[chat_id] = []
+        if clean_rel not in job_scoped_artifacts[chat_id]:
+            job_scoped_artifacts[chat_id].append(clean_rel)
+
+    return {
+        "success": True,
+        "path": clean_rel,
+        "size": target.stat().st_size,
+        "message": f"Saved {clean_rel} successfully",
+    }
 
 
 @router.get("/jobs/{job_id}/raw/{filepath:path}")
@@ -718,7 +732,7 @@ async def stop_job(job_id: str):
 
 @router.post("/jobs/{job_id}/respond")
 async def respond_to_human_prompt(job_id: str, req: HumanRespondRequest):
-    """Receive human input response for ask_human tool requests in both Core and Legacy engines."""
+    """Authoritatively receive human input response and unblock suspended Future."""
     chat, chat_id = resolve_chat(job_id)
     target_job_id = job_id
     if chat and chat.get("job_id"):
@@ -727,12 +741,17 @@ async def respond_to_human_prompt(job_id: str, req: HumanRespondRequest):
     answer = req.answer.strip()
     core_resolved = False
 
+    # 1. Authoritative resolution via request_id in HumanInputRegistry
     if req.request_id:
         core_resolved = HumanInputRegistry.resolve_request(req.request_id, answer)
-    elif len(HumanInputRegistry._pending_requests) == 1:
+    elif hasattr(HumanInputRegistry, "_pending_requests") and len(HumanInputRegistry._pending_requests) == 1:
         single_req_id = list(HumanInputRegistry._pending_requests.keys())[0]
         core_resolved = HumanInputRegistry.resolve_request(single_req_id, answer)
+    elif hasattr(HumanInputRegistry, "_pending_requests") and len(HumanInputRegistry._pending_requests) > 0:
+        latest_req_id = list(HumanInputRegistry._pending_requests.keys())[-1]
+        core_resolved = HumanInputRegistry.resolve_request(latest_req_id, answer)
 
+    # 2. Legacy fallback reconciliation
     legacy_event = human_answers.get(target_job_id) or human_answers.get(job_id)
     if legacy_event and not legacy_event.is_set():
         human_data[target_job_id] = answer

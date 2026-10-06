@@ -4,6 +4,9 @@ Concrete executor factories for every PELDRUN built-in tool.
 The single public class :class:`RealToolExecutionFactory` exposes one
 static factory method per tool. Each factory returns an async callable
 bound to a specific workspace directory without global process CWD mutations.
+Hardened under Phase M2 & Bash Sanitization:
+- Intercepts blocking foreground web servers (e.g. python -m http.server) with immediate notices.
+- Cleanses accidental Windows absolute paths in shell commands to prevent backslash escape corruption.
 """
 
 from __future__ import annotations
@@ -48,6 +51,31 @@ class RealToolExecutionFactory:
             cmd = command or kwargs.get("cmd") or kwargs.get("script") or ""
             if not cmd.strip():
                 return "Error: No command provided to bash terminal."
+
+            # 1. Intercept blocking foreground servers to prevent 60-second timeouts
+            if re.search(r"python(?:3)?\s+-m\s+http\.server", cmd, re.IGNORECASE):
+                return (
+                    "[Notice] Local web server command intercepted: In PELDRUN, web deliverables "
+                    "(HTML/CSS/JS) are automatically served and rendered live in the UI Preview panel. "
+                    "A blocking foreground server process is not required and has been safely simulated."
+                )
+
+            # 2. Sanitize accidental absolute Windows workspace paths to prevent backslash stripping
+            ws_str_win = str(workspace_root)
+            ws_str_posix = str(workspace_root).replace("\\", "/")
+            ws_str_escaped = ws_str_win.replace("\\", "\\\\")
+
+            if ws_str_escaped in cmd:
+                cmd = cmd.replace(ws_str_escaped, ".")
+            if ws_str_win in cmd:
+                cmd = cmd.replace(ws_str_win, ".")
+            if ws_str_posix in cmd:
+                cmd = cmd.replace(ws_str_posix, ".")
+
+            # Convert any remaining Windows drive letter backslashes (e.g. C:\ or D:\) to forward slashes
+            if sys.platform == "win32":
+                cmd = re.sub(r"([a-zA-Z]):\\", r"\1:/", cmd)
+                cmd = cmd.replace(".\\", "./")
 
             try:
                 if sys.platform == "win32":

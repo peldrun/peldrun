@@ -3,7 +3,10 @@ backend/peldrun/engine/runner.py
 
 PELDRUN Core Agent Execution Runner.
 Coordinates agent lifecycle, asynchronous execution loops, checkpointing, and event emission.
-Enforces non-empty message preconditions to prevent upstream LLM provider rejection.
+Hardened under Phase M2 & WAITING_FOR_HUMAN Lifecycle Stabilization:
+- Suspends step execution timeout during WAITING_FOR_HUMAN status.
+- Responds instantly to operator cancellation during human interaction.
+- Enforces single canonical terminal outcome.
 """
 
 from __future__ import annotations
@@ -139,7 +142,6 @@ class AgentRunner:
             if workspace_root:
                 state.workspace_root = workspace_root
 
-            # Precondition safeguard: Ensure state has at least one user prompt message
             if not state.messages:
                 state.add_message(role=MessageRole.USER, content=task_prompt)
 
@@ -151,7 +153,6 @@ class AgentRunner:
         self._pause_requested.clear()
         state.status = ExecutionStatus.RUNNING
 
-        # Emit the initial workspace snapshot
         await self.emitter.emit_snapshot(self._build_snapshot_payload(state))
 
         global_start_time = time.time()
@@ -191,15 +192,50 @@ class AgentRunner:
 
                 await self.emitter.emit_step_start(step_number=step_index)
 
-                try:
-                    is_complete = await asyncio.wait_for(
-                        active_agent.step(state=state, emitter=self.emitter),
-                        timeout=self.config.step_timeout_seconds,
-                    )
-                except asyncio.TimeoutError:
-                    raise TimeoutError(
-                        f"Step {step_index} exceeded execution timeout of {self.config.step_timeout_seconds}s."
-                    )
+                # Decoupled step iteration with WAITING_FOR_HUMAN suspension support
+                step_task = asyncio.create_task(
+                    active_agent.step(state=state, emitter=self.emitter)
+                )
+                step_start_time = time.time()
+
+                while not step_task.done():
+                    if self.is_cancelled:
+                        step_task.cancel()
+                        break
+
+                    is_waiting_human = (state.status == ExecutionStatus.WAITING_FOR_HUMAN)
+
+                    try:
+                        await asyncio.wait_for(asyncio.shield(step_task), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        pass
+
+                    if step_task.done():
+                        break
+
+                    # Suspend normal step timeout while waiting for human input
+                    if is_waiting_human:
+                        step_start_time = time.time()
+                    else:
+                        elapsed_step = time.time() - step_start_time
+                        if (
+                            self.config.step_timeout_seconds
+                            and elapsed_step > self.config.step_timeout_seconds
+                        ):
+                            step_task.cancel()
+                            raise TimeoutError(
+                                f"Step {step_index} exceeded execution timeout of {self.config.step_timeout_seconds}s."
+                            )
+
+                if self.is_cancelled:
+                    state.status = ExecutionStatus.PAUSED
+                    break
+
+                is_complete = await step_task
+
+                # Restore running status if agent was unblocked from waiting for human
+                if state.status == ExecutionStatus.WAITING_FOR_HUMAN:
+                    state.status = ExecutionStatus.RUNNING
 
                 if (
                     self.config.enable_checkpointing

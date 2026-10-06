@@ -1,9 +1,19 @@
-﻿import os
+﻿"""
+backend/omweb/routers/files.py
+
+Workspace Files Router.
+Provides file tree scanning, download, deletion, and direct content editing persistence.
+Hardened under Phase M2 & Stabilization:
+- Extended multi-tier lookup (root, workspace, storage/chats) to prevent 404 errors on deliverables.
+"""
+
+import os
 import shutil
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
 router = APIRouter()
 
@@ -18,6 +28,12 @@ for d in [WORKSPACE_DIR, STORAGE_DIR, CHATS_DIR, PROJECTS_DIR]:
 
 SYSTEM_FILES = {"events.json", "session.json", "project.json", ".gitkeep", ".ds_store", "thumbs.db"}
 
+
+class FileContentPayload(BaseModel):
+    path: str
+    content: str
+
+
 def safe_resolve(target_path: str) -> Path:
     target = (PROJECT_ROOT / target_path).resolve()
     try:
@@ -25,6 +41,38 @@ def safe_resolve(target_path: str) -> Path:
     except ValueError:
         raise HTTPException(status_code=403, detail="Access denied: path outside project root")
     return target
+
+
+def find_file_in_storage(filename_or_rel: str) -> Optional[Path]:
+    """Search for deliverable file in workspace or storage hierarchy if not found in root."""
+    clean = filename_or_rel.lstrip("/\\").replace("\\", "/")
+
+    # 1. Direct workspace check
+    candidate = (WORKSPACE_DIR / clean).resolve()
+    if candidate.is_file():
+        return candidate
+
+    # 2. Direct storage path check
+    candidate = (STORAGE_DIR / clean).resolve()
+    if candidate.is_file():
+        return candidate
+
+    # 3. Recursive lookup inside chats files directories
+    target_name = Path(clean).name
+    if CHATS_DIR.exists():
+        for chat_dir in CHATS_DIR.iterdir():
+            if chat_dir.is_dir():
+                files_sub = chat_dir / "files"
+                if files_sub.exists():
+                    target_match = (files_sub / clean).resolve()
+                    if target_match.is_file():
+                        return target_match
+                    for sub_file in files_sub.rglob(target_name):
+                        if sub_file.is_file() and sub_file.stat().st_size > 0:
+                            return sub_file
+
+    return None
+
 
 def detect_file_type(filename: str) -> str:
     ext = Path(filename).suffix.lower()
@@ -42,6 +90,7 @@ def detect_file_type(filename: str) -> str:
         return "code"
     return "file"
 
+
 def is_valid_artifact_path(entry: Path, origin: str) -> bool:
     fname = entry.name.lower()
     if fname in SYSTEM_FILES:
@@ -52,6 +101,7 @@ def is_valid_artifact_path(entry: Path, origin: str) -> bool:
     if origin in ["chats", "projects"]:
         return "files" in parts or "shared_files" in parts
     return False
+
 
 @router.get("")
 @router.get("/")
@@ -91,14 +141,16 @@ async def list_workspace_files():
         "total_count": len(sorted_artifacts)
     }
 
+
 @router.get("/download")
 async def download_file(path: str = Query(...)):
     target = safe_resolve(path)
     if not target.exists() or not target.is_file():
-        target = safe_resolve(f"workspace/{path}")
-        if not target.exists() or not target.is_file():
+        target = find_file_in_storage(path)
+        if not target or not target.is_file():
             raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(path=str(target), filename=target.name, media_type="application/octet-stream")
+
 
 @router.get("/content/{filepath:path}")
 @router.get("/content")
@@ -108,14 +160,40 @@ async def get_file_content(filepath: Optional[str] = None, path: Optional[str] =
         raise HTTPException(status_code=400, detail="Missing file path")
     target = safe_resolve(target_rel)
     if not target.exists() or not target.is_file():
-        target = safe_resolve(f"workspace/{target_rel}")
-        if not target.exists() or not target.is_file():
+        fallback = find_file_in_storage(target_rel)
+        if fallback and fallback.is_file():
+            target = fallback
+        else:
             raise HTTPException(status_code=404, detail="File not found")
     try:
         content = target.read_text(encoding="utf-8", errors="replace")
         return {"content": content, "size": target.stat().st_size, "name": target.name}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/content")
+async def save_file_content(payload: FileContentPayload):
+    """Save or update file content in the project workspace."""
+    target = safe_resolve(payload.path)
+    if not target.parent.exists():
+        fallback = find_file_in_storage(payload.path)
+        if fallback:
+            target = fallback
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        target.write_text(payload.content, encoding="utf-8")
+        rel_path = str(target.relative_to(PROJECT_ROOT)).replace("\\", "/")
+        return {
+            "status": "success",
+            "message": f"Saved {target.name}",
+            "path": rel_path,
+            "size": target.stat().st_size,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
+
 
 @router.get("/raw/{filepath:path}")
 @router.get("/raw")
@@ -125,8 +203,10 @@ async def get_raw_file(filepath: Optional[str] = None, path: Optional[str] = Que
         raise HTTPException(status_code=400, detail="Missing file path")
     target = safe_resolve(target_rel)
     if not target.exists() or not target.is_file():
-        target = safe_resolve(f"workspace/{target_rel}")
-        if not target.exists() or not target.is_file():
+        fallback = find_file_in_storage(target_rel)
+        if fallback and fallback.is_file():
+            target = fallback
+        else:
             raise HTTPException(status_code=404, detail="File not found")
     
     ext = target.suffix.lower()
@@ -154,13 +234,16 @@ async def get_raw_file(filepath: Optional[str] = None, path: Optional[str] = Que
     
     return FileResponse(path=str(target), media_type=media_type)
 
+
 @router.delete("")
 @router.delete("/")
 async def delete_file(path: str = Query(...)):
     target = safe_resolve(path)
     if not target.exists():
-        target = safe_resolve(f"workspace/{path}")
-        if not target.exists():
+        fallback = find_file_in_storage(path)
+        if fallback:
+            target = fallback
+        else:
             raise HTTPException(status_code=404, detail="File or folder not found")
     try:
         if target.is_dir():

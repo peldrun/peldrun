@@ -1,8 +1,8 @@
 """
-resolve_tool_runtime: bind a platform tool id to a real runtime executor.
+backend/omweb/adapters/core_adapter_parts/resolve_tool_runtime.py
 
-Given a tool id / metadata, this module decides which concrete executor
-factory to invoke, then wraps the result inside a :class:`WebToolAdapter`.
+Binds platform tool IDs to concrete runtime executors.
+Directly maps human interaction tools to PELDRUN Core HumanInputTool.
 """
 
 from __future__ import annotations
@@ -24,25 +24,12 @@ def resolve_tool_runtime(
     tool_id: str,
     tool_meta: Dict[str, Any],
     workspace_root: Path,
-    registry: ToolRegistry
+    registry: ToolRegistry,
+    emitter: Optional[Any] = None,
 ) -> WebToolAdapter:
     """
-    Resolves any platform tool into a genuine, executable WebToolAdapter with validated schemas.
-
-    The resolution order is:
-      1. Known built-in tool names mapped to a concrete factory.
-      2. A custom tool registered in `registry`.
-      3. If neither matches, the adapter is created with no executor
-         (returns a stub string when invoked).
-
-    Args:
-        tool_id: Platform tool identifier.
-        tool_meta: Platform metadata dict for the tool.
-        workspace_root: Resolved workspace path.
-        registry: The platform tool registry (for custom tool lookup).
-
-    Returns:
-        WebToolAdapter: Ready-to-execute adapter instance.
+    Resolves platform tool ID to an executable WebToolAdapter with validated schemas.
+    Prefers native PELDRUN Core tools when available.
     """
     name = tool_meta.get("id") or tool_id
     desc = tool_meta.get("description", "")
@@ -64,7 +51,12 @@ def resolve_tool_runtime(
     elif name in ("browser_use", "chrome_browser", "browser"):
         executor = RealToolExecutionFactory.create_browser_executor(workspace_root)
     elif name in ("ask_human", "human_input"):
-        executor = RealToolExecutionFactory.create_human_input_executor()
+        try:
+            from peldrun.tools.builtins.human_input import HumanInputTool
+            core_tool = HumanInputTool(workspace_root=str(workspace_root), emitter=emitter)
+            executor = getattr(core_tool, "aexecute", getattr(core_tool, "_arun", core_tool.execute))
+        except Exception:
+            executor = RealToolExecutionFactory.create_human_input_executor()
 
     if executor is None:
         custom_inst = registry.get_custom_tool_instance(name)
@@ -76,5 +68,5 @@ def resolve_tool_runtime(
         description=desc,
         parameters=params,
         executor=executor,
-        workspace_root=workspace_root
+        workspace_root=workspace_root,
     )

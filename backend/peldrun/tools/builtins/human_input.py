@@ -1,7 +1,12 @@
 """
+backend/peldrun/tools/builtins/human_input.py
+
 PELDRUN Core Human Input & Interactive Dialogue Tool (ask_human).
 Provides suspension for human approval, feedback loops, and multi-choice questionnaires.
-Compatible with CLI, Web API, and Event bus registries.
+Hardened under Phase M2 & Stabilization:
+- Pure asynchronous event-driven suspension via HumanInputRegistry and asyncio.Future.
+- Completely eliminates blocking sys.stdin reads that freeze Web API execution.
+- Strictly raises TimeoutError / CancelledError to enforce canonical terminal boundaries.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ from peldrun.tools.base import BaseTool, ToolResult
 
 class HumanInputRegistry:
     """Centralized pending requests manager for human-in-the-loop approvals."""
+
     _pending_requests: Dict[str, asyncio.Future[str]] = {}
     _request_payloads: Dict[str, Dict[str, Any]] = {}
 
@@ -53,6 +59,7 @@ class HumanInputRegistry:
 
 class HumanInputArgs(BaseModel):
     """Pydantic schema defining arguments for HumanInputTool / ask_human."""
+
     prompt: str = Field(
         ...,
         description="The question or clarification needed from the human operator."
@@ -68,6 +75,10 @@ class HumanInputArgs(BaseModel):
     timeout_seconds: Optional[int] = Field(
         default=600,
         description="Maximum wait time in seconds for operator response (default: 600s)."
+    )
+    request_id: Optional[str] = Field(
+        default=None,
+        description="Optional pre-allocated unique request identifier."
     )
 
     @model_validator(mode="before")
@@ -85,14 +96,11 @@ class HumanInputArgs(BaseModel):
         return data
 
 
-# Backward-compatibility alias
 HumanInputParameters = HumanInputArgs
 
 
 class HumanInputTool(BaseTool):
-    """
-    Tool that suspends agent execution until a response is received from the human user.
-    """
+    """Tool that suspends agent execution until a response is received from the human user."""
 
     name: str = "ask_human"
     description: str = (
@@ -127,14 +135,15 @@ class HumanInputTool(BaseTool):
         input_type: str = "text",
         options: Optional[List[str]] = None,
         timeout_seconds: Optional[int] = 600,
+        request_id: Optional[str] = None,
         **kwargs: Any,
     ) -> ToolResult:
-        request_id = str(uuid.uuid4())
+        req_id = request_id or str(uuid.uuid4())
         timeout_val = float(timeout_seconds) if timeout_seconds else 600.0
         opts = options or []
 
         payload = {
-            "request_id": request_id,
+            "request_id": req_id,
             "prompt": prompt,
             "question": prompt,
             "input_type": input_type,
@@ -142,8 +151,10 @@ class HumanInputTool(BaseTool):
             "timeout_seconds": timeout_val,
         }
 
-        future = HumanInputRegistry.register_request(request_id, payload)
+        # 1. Register future in registry
+        future = HumanInputRegistry.register_request(req_id, payload)
 
+        # 2. Dispatch event to active stream
         if self.emitter is not None:
             try:
                 event_obj = PeldrunEvent(
@@ -162,23 +173,7 @@ class HumanInputTool(BaseTool):
                 except Exception:
                     pass
 
-        # Interactive CLI Fallback if run from a terminal
-        if sys.stdin and sys.stdin.isatty():
-            try:
-                print(f"\n[HUMAN INPUT REQUIRED] {prompt}")
-                if opts:
-                    for idx, opt in enumerate(opts, 1):
-                        print(f"  {idx}. {opt}")
-                    print("Enter your choice or text: ", end="", flush=True)
-                else:
-                    print("Your response: ", end="", flush=True)
-
-                cli_reply = await asyncio.to_thread(sys.stdin.readline)
-                clean_reply = cli_reply.strip()
-                HumanInputRegistry.resolve_request(request_id, clean_reply)
-            except Exception:
-                pass
-
+        # 3. Pure non-blocking asynchronous suspension
         try:
             response = await asyncio.wait_for(future, timeout=timeout_val)
             return ToolResult(
@@ -186,22 +181,17 @@ class HumanInputTool(BaseTool):
                 exit_code=0,
                 is_error=False,
                 metadata={
-                    "request_id": request_id,
+                    "request_id": req_id,
                     "approved": True,
                     "input_type": input_type,
-                    "response": response
+                    "response": response,
                 },
             )
         except asyncio.TimeoutError:
-            HumanInputRegistry.cancel_request(request_id)
-            return ToolResult(
-                output=f"Human response timed out after {timeout_val} seconds.",
-                exit_code=1,
-                is_error=True,
-                metadata={"request_id": request_id, "timeout": True},
-            )
+            HumanInputRegistry.cancel_request(req_id)
+            raise TimeoutError(f"Human input request '{req_id}' timed out after {timeout_val} seconds.")
         except asyncio.CancelledError:
-            HumanInputRegistry.cancel_request(request_id)
+            HumanInputRegistry.cancel_request(req_id)
             raise
 
 
