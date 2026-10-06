@@ -1,14 +1,37 @@
 ﻿export type ServerEventName =
   | "status"
+  | "run_accepted"
+  | "run_started"
   | "step_start"
   | "thought"
   | "tool_call"
+  | "tool_called"
+  | "tool_retry"
   | "observation"
   | "step_end"
+  | "ask_human"
+  | "artifact_created"
+  | "artifact_updated"
+  | "artifact_deleted"
+  | "artifact_moved"
   | "final"
-  | "error";
+  | "error"
+  | "cancelled"
+  | "done"
+  | "ping";
 
-export type RunStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
+export type RunStatus =
+  | "pending"
+  | "queued"
+  | "starting"
+  | "running"
+  | "waiting_for_input"
+  | "retrying"
+  | "paused"
+  | "cancelling"
+  | "cancelled"
+  | "completed"
+  | "failed";
 
 export interface Step {
   id: string;
@@ -18,6 +41,8 @@ export interface Step {
   timestamp: string;
   tool_name?: string;
   tool_args?: Record<string, any>;
+  attempt?: number;
+  status?: string;
 }
 
 export interface ToolPair {
@@ -28,6 +53,14 @@ export interface ToolPair {
   startedAt: number;
   output: string | null;
   durationMs: number | null;
+  attempt?: number;
+  maxAttempts?: number;
+  isError?: boolean;
+  status?: "running" | "retrying" | "completed" | "failed" | "waiting_for_input";
+  error?: string | null;
+  retryDelay?: number;
+  requiresInput?: boolean;
+  requestId?: string;
 }
 
 export interface ThoughtItem {
@@ -37,10 +70,35 @@ export interface ThoughtItem {
   at: number;
 }
 
-export type StepItem = ThoughtItem | ToolPair;
+export interface HumanInputItem {
+  kind: "human_input";
+  id: string;
+  requestId: string;
+  question: string;
+  options: string[];
+  inputType: string;
+  status: "pending" | "answered" | "cancelled";
+  answer?: string | null;
+  at: number;
+}
+
+export interface ArtifactItem {
+  kind: "artifact";
+  id: string;
+  name: string;
+  path: string;
+  operation: "created" | "updated" | "deleted" | "moved";
+  sizeBytes?: number;
+  revision?: number;
+  at: number;
+}
+
+export type StepItem = ThoughtItem | ToolPair | HumanInputItem | ArtifactItem;
 
 export interface StepGroup {
+  id: string;
   step: number;
+  step_id?: string;
   startedAt: number | null;
   finishedAt: number | null;
   durationMs: number | null;
@@ -57,12 +115,20 @@ export interface RunState {
   error: string | null;
   lastEventAt: number;
   droppedEvents: number;
+  lastSequence: number;
+  seenEventIds: string[];
 }
 
 export interface SSEEnvelope {
-  jobId: string;
+  jobId?: string;
+  runId?: string;
+  id?: string;
+  event_id?: string;
   type: ServerEventName;
   step: number;
+  step_id?: string;
+  seq?: number;
+  sequence?: number;
   data: Record<string, any>;
 }
 
