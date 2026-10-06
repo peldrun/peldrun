@@ -1,7 +1,9 @@
 """
+backend/peldrun/tools/base.py
+
 PELDRUN Core Base Tool Architecture.
-Defines abstract tool interfaces, structured invocation results, automatic JSON Schema generation,
-and a resilient synchronous-to-asynchronous execution bridge.
+Defines abstract tool interfaces, schema reflections, and execution adapters.
+Re-exports ToolResult and ToolExecutionPolicy from peldrun.tools.contract.
 """
 
 from __future__ import annotations
@@ -12,57 +14,43 @@ import inspect
 import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Type
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ValidationError
+
+from peldrun.tools.contract import ToolExecutionPolicy, ToolResult
 
 logger = logging.getLogger("peldrun.tools.base")
-
-
-class ToolResult(BaseModel):
-    """Structured execution outcome returned by all PELDRUN tools."""
-    model_config = ConfigDict(extra="allow")
-
-    output: Any = Field(default=None, description="Primary output or response payload produced by tool")
-    exit_code: int = Field(default=0, description="Process status indicator (0 = success, non-zero = failure)")
-    is_error: bool = Field(default=False, description="Flag signaling execution failure")
-    artifacts: List[str] = Field(default_factory=list, description="Relative file paths produced as artifacts")
-    metadata: Dict[str, Any] = Field(default_factory=dict, description="Arbitrary execution telemetry")
-
-    @property
-    def is_success(self) -> bool:
-        """True if execution completed normally without error and exit code 0."""
-        return not self.is_error and self.exit_code == 0
-
-    @property
-    def error(self) -> str:
-        """Retrieve error details if execution failed, or empty string."""
-        if self.is_error:
-            return str(self.output or self.metadata.get("error", "Tool execution failed"))
-        return ""
-
-    def to_observation_dict(self) -> Dict[str, Any]:
-        """Convert result into standard observation payload format."""
-        return {
-            "output": self.output,
-            "exit_code": self.exit_code,
-            "is_error": self.is_error,
-            "artifacts": self.artifacts,
-            "metadata": self.metadata,
-        }
 
 
 class BaseTool(ABC):
     """
     Abstract base class for all native tools executable within PELDRUN agents.
-    Provides schema reflection, parameter validation, and workspace scoping.
+    Provides schema reflection, parameter validation, workspace scoping, and execution policy.
     Satisfies the ToolRuntime Protocol.
     """
 
     name: str = ""
     description: str = ""
     args_schema: Optional[Type[BaseModel]] = None
+    execution_policy: ToolExecutionPolicy = ToolExecutionPolicy()
 
-    def __init__(self, workspace_root: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        workspace_root: Optional[str] = None,
+        execution_policy: Optional[ToolExecutionPolicy] = None,
+    ) -> None:
         self.workspace_root = workspace_root
+        if execution_policy is not None:
+            self.execution_policy = execution_policy
+        elif not hasattr(self, "execution_policy") or self.execution_policy is None:
+            self.execution_policy = ToolExecutionPolicy()
+
+    def get_execution_policy(self) -> ToolExecutionPolicy:
+        """Return the active execution policy governing this tool."""
+        return self.execution_policy
+
+    def set_execution_policy(self, policy: ToolExecutionPolicy) -> None:
+        """Configure or override execution policy parameters for this tool instance."""
+        self.execution_policy = policy
 
     def set_workspace(self, workspace_root: str) -> None:
         """Configure or update the bounded workspace root for this tool instance."""
@@ -121,17 +109,13 @@ class BaseTool(ABC):
         ...
 
     def _run(self, **kwargs: Any) -> ToolResult:
-        """
-        Resilient synchronous fallback bridging to _arun without raising NotImplementedError.
-        Handles event loop resolution across synchronous threads and async contexts.
-        """
+        """Resilient synchronous fallback bridging to _arun safely."""
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
 
         if loop and loop.is_running():
-            # Run in a separate dedicated thread to prevent blocking or event loop conflicts
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(lambda: asyncio.run(self._arun(**kwargs)))
                 return future.result()
@@ -140,12 +124,34 @@ class BaseTool(ABC):
 
     async def aexecute(self, **kwargs: Any) -> ToolResult:
         """
-        Public asynchronous entrypoint for tool invocation.
-        Performs validation and handles unhandled exceptions safely.
+        Public asynchronous entrypoint executing a single attempt bounded by timeout.
+        Exceptions are captured and returned as structured ToolResult records.
         """
+        timeout_val = self.execution_policy.timeout_seconds
         try:
             validated_kwargs = self._validate_arguments(**kwargs)
-            return await self._arun(**validated_kwargs)
+            exec_coro = self._arun(**validated_kwargs)
+            if timeout_val and timeout_val > 0:
+                result = await asyncio.wait_for(exec_coro, timeout=timeout_val)
+            else:
+                result = await exec_coro
+
+            if isinstance(result, ToolResult):
+                return result
+            elif isinstance(result, dict):
+                return ToolResult(**result)
+            else:
+                return ToolResult(output=result, exit_code=0, is_error=False)
+
+        except asyncio.TimeoutError:
+            msg = f"Tool '{self.name}' execution timed out after {timeout_val} seconds."
+            logger.warning(msg)
+            return ToolResult(
+                output=msg,
+                exit_code=124,
+                is_error=True,
+                metadata={"error_type": "TimeoutError", "timeout_seconds": timeout_val},
+            )
         except ValueError as val_err:
             logger.warning("Validation error in tool '%s': %s", self.name, val_err)
             return ToolResult(
@@ -164,10 +170,7 @@ class BaseTool(ABC):
             )
 
     def execute(self, **kwargs: Any) -> ToolResult:
-        """
-        Public synchronous entrypoint for tool invocation.
-        Useful in non-async contexts or legacy script pipelines.
-        """
+        """Public synchronous entrypoint for tool invocation."""
         try:
             validated_kwargs = self._validate_arguments(**kwargs)
             return self._run(**validated_kwargs)

@@ -1,7 +1,9 @@
 """
+backend/peldrun/tools/registry.py
+
 PELDRUN Core Pure Runtime Tool Registry.
-Provides an in-memory execution runtime registry for agent tool dispatch,
-completely decoupled from Web storage, manifests, and platform management.
+Provides an in-memory execution runtime registry for agent tool dispatch
+and execution policy resolution.
 """
 
 from __future__ import annotations
@@ -11,16 +13,15 @@ from typing import Any, Dict, Iterator, List, Optional, Union
 
 from peldrun.tools.base import BaseTool, ToolResult
 from peldrun.tools.collection import ToolCollection
-from peldrun.tools.contract import ToolRuntime
+from peldrun.tools.contract import ToolExecutionPolicy, ToolRuntime
 
 logger = logging.getLogger("peldrun.tools.registry")
 
 
 class ToolRegistry:
     """
-    In-memory Runtime Registry maintaining active ToolRuntime instances
-    injected for agent execution during runtime sessions.
-    Delegates execution directly to ToolCollection as the single source of truth.
+    In-memory Runtime Registry maintaining active ToolRuntime instances.
+    Delegates execution and policy discovery directly to ToolCollection.
     """
 
     def __init__(
@@ -35,10 +36,7 @@ class ToolRegistry:
                 self.register(tool)
 
     def set_workspace_root(self, workspace_root: str) -> None:
-        """
-        Configure or update the active workspace root and propagate
-        it to all registered tools supporting workspace boundaries.
-        """
+        """Propagate active workspace root to all registered tools."""
         self.workspace_root = workspace_root
         for tool in self._collection.list_tools():
             if hasattr(tool, "set_workspace") and callable(tool.set_workspace):
@@ -49,10 +47,7 @@ class ToolRegistry:
                 setattr(tool, "workspace_root", workspace_root)
 
     def register(self, tool: Union[ToolRuntime, BaseTool]) -> None:
-        """
-        Register a tool or adapter instance in the runtime registry.
-        Automatically applies workspace boundaries if configured.
-        """
+        """Register a tool instance and apply workspace boundaries."""
         if self.workspace_root:
             if hasattr(tool, "workspace_root") and getattr(tool, "workspace_root") is None:
                 if hasattr(tool, "set_workspace") and callable(tool.set_workspace):
@@ -73,15 +68,16 @@ class ToolRegistry:
         """Retrieve a registered tool instance by name."""
         return self._collection.get_tool(name)
 
+    def get_tool_policy(self, name: str) -> ToolExecutionPolicy:
+        """Retrieve execution and retry policy for the designated tool."""
+        return self._collection.get_tool_policy(name)
+
     def list_tools(self) -> List[Union[ToolRuntime, BaseTool]]:
         """Return all tools registered in the runtime session."""
         return self._collection.list_tools()
 
     def get_openai_schemas(self) -> List[Dict[str, Any]]:
-        """
-        Export all registered tool definitions as OpenAI-compatible function schemas.
-        Primary schema extraction entrypoint for LLM agent loops.
-        """
+        """Export all registered tool definitions as OpenAI-compatible function schemas."""
         return self._collection.to_openai_schemas()
 
     def to_openai_schemas(self) -> List[Dict[str, Any]]:
@@ -89,10 +85,7 @@ class ToolRegistry:
         return self.get_openai_schemas()
 
     async def aexecute(self, name: str, arguments: Any = None, **kwargs: Any) -> ToolResult:
-        """
-        Asynchronously dispatch tool execution by name.
-        Gracefully accepts either a pre-parsed dictionary/JSON string or raw keyword arguments.
-        """
+        """Asynchronously dispatch tool execution by name."""
         if arguments is not None and not kwargs:
             return await self._collection.execute(name, arguments)
         elif kwargs:

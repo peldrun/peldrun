@@ -3,11 +3,13 @@ backend/peldrun/agents/tool_call_agent.py
 
 Autonomous Tool Calling Agent for PELDRUN Core Runtime.
 Implements the StepExecutableAgent protocol driving atomic reasoning-action steps.
-Hardened under PR 2 (Single Execution Authority):
-- Removes internal standalone execution loops; delegates run_task() and arun() to AgentRunner.
-- Completely removes fake synthetic 'terminate' fallback on LLM failure, ensuring genuine error propagation.
-- Enforces strict canonical tool_call_id generation.
-- Emits atomic THINK and ACT cycles strictly per step.
+Hardened under PR 4 (Centralized Tool Retry & LLM Failure Decoupling):
+- Decouples LLM retries (transient/timeout/compact) from tool retries.
+- Executes tool retry loop centrally governed by ToolExecutionPolicy.
+- Emits canonical EventType.TOOL_RETRY with attempt count and delay.
+- Restricts non-idempotent/destructive operations to single attempt.
+- Records each discrete attempt in ExecutionState.tool_history.
+- Eliminates fake synthetic 'terminate' on unrecoverable failures.
 """
 
 from __future__ import annotations
@@ -21,12 +23,13 @@ from typing import Any, Dict, List, Optional, Union
 import uuid
 
 from peldrun.agents.base import AgentConfig, BaseAgent
-from peldrun.engine.state import ExecutionState, MessageRole
+from peldrun.engine.state import ExecutionState, ExecutionStatus, MessageRole
 from peldrun.events.emitter import EventEmitter
 from peldrun.events.schema import EventType, PeldrunEvent
 from peldrun.llm.client import LLMResponse, ToolCall
 from peldrun.tools.base import ToolResult
 from peldrun.tools.collection import ToolCollection
+from peldrun.tools.contract import ToolExecutionPolicy
 
 logger = logging.getLogger("peldrun.agents.tool_call_agent")
 
@@ -34,8 +37,8 @@ logger = logging.getLogger("peldrun.agents.tool_call_agent")
 class ToolCallAgent(BaseAgent):
     """
     Autonomous ReAct agent executing real tool invocations on concrete tool instances.
-    Maintains full multi-turn conversational state synchronized with ExecutionState
-    and satisfies the StepExecutableAgent protocol contract for AgentRunner.
+    Maintains full conversational state synchronized with ExecutionState and executes
+    centralized retry policies across attempts.
     """
 
     def __init__(
@@ -190,6 +193,22 @@ class ToolCallAgent(BaseAgent):
 
         return None
 
+    def _get_tool_policy(self, tool_name: str) -> ToolExecutionPolicy:
+        """Resolve authoritative ToolExecutionPolicy for target tool."""
+        tools_obj = getattr(self, "tool_registry", None) or getattr(self, "tool_collection", None)
+        if tools_obj and hasattr(tools_obj, "get_tool_policy") and callable(tools_obj.get_tool_policy):
+            return tools_obj.get_tool_policy(tool_name)
+
+        tool_inst = self._resolve_tool_instance(tool_name)
+        if tool_inst is not None:
+            if hasattr(tool_inst, "get_execution_policy") and callable(tool_inst.get_execution_policy):
+                return tool_inst.get_execution_policy()
+            if hasattr(tool_inst, "execution_policy") and isinstance(tool_inst.execution_policy, ToolExecutionPolicy):
+                return tool_inst.execution_policy
+
+        # Default fallback policy: safe 1 attempt, non-retryable
+        return ToolExecutionPolicy(max_attempts=1, retryable=False, side_effects=True)
+
     def _sync_messages_from_state(self, state: ExecutionState) -> None:
         """Synchronize in-memory message history from ExecutionState messages."""
         if state.messages:
@@ -203,7 +222,10 @@ class ToolCallAgent(BaseAgent):
             state.add_message(role=MessageRole.USER, content=state.task_prompt or "Start task.")
 
     async def think(self, step: int) -> LLMResponse:
-        """Execute cognitive reasoning phase of the ReAct cycle."""
+        """
+        Execute cognitive reasoning phase with decoupled transient LLM retries.
+        Never emits fake synthetic terminate when provider fails permanently.
+        """
         tools_schema = self._get_tools_schema()
 
         if not self.messages or not any(m.get("role") in ("user", "system") for m in self.messages):
@@ -240,26 +262,53 @@ class ToolCallAgent(BaseAgent):
             else:
                 raise AttributeError("LLM client does not provide generate or chat_completion interface.")
 
-        try:
-            response = await _call_llm(self.messages)
-        except Exception as exc:
-            err_str = str(exc).lower()
-            if "terminated" in err_str or "context" in err_str or "400" in err_str:
-                logger.warning("Local provider rejected full context (%s). Retrying with compacted context.", exc)
-                compact_msgs = list(self.messages[:2]) + list(self.messages[-6:])
-                while compact_msgs and len(compact_msgs) > 2 and compact_msgs[2].get("role") == "tool":
-                    compact_msgs.pop(2)
+        # Transient LLM retry loop with bounded attempts
+        max_llm_attempts = 3
+        last_llm_exc: Optional[Exception] = None
 
-                if not compact_msgs or not any(m.get("role") == "user" for m in compact_msgs):
-                    compact_msgs = [
-                        {"role": "system", "content": self.system_prompt},
-                        {"role": "user", "content": (self.state.task_prompt if self.state else "") or "Proceed with task."},
-                    ]
+        for llm_attempt in range(1, max_llm_attempts + 1):
+            try:
+                response = await _call_llm(self.messages)
+                break
+            except Exception as exc:
+                last_llm_exc = exc
+                err_str = str(exc).lower()
 
-                # Genuine LLM retry with compacted context; no synthetic termination on secondary failure
-                response = await _call_llm(compact_msgs)
-            else:
-                raise
+                # Context overflow: Compact context and retry immediately
+                if "terminated" in err_str or "context" in err_str or "400" in err_str or "maximum context" in err_str:
+                    logger.warning("Provider rejected full context (%s). Compacting context on attempt %d.", exc, llm_attempt)
+                    compact_msgs = list(self.messages[:2]) + list(self.messages[-6:])
+                    while compact_msgs and len(compact_msgs) > 2 and compact_msgs[2].get("role") == "tool":
+                        compact_msgs.pop(2)
+
+                    if not compact_msgs or not any(m.get("role") == "user" for m in compact_msgs):
+                        compact_msgs = [
+                            {"role": "system", "content": self.system_prompt},
+                            {"role": "user", "content": (self.state.task_prompt if self.state else "") or "Proceed with task."},
+                        ]
+                    try:
+                        response = await _call_llm(compact_msgs)
+                        break
+                    except Exception as compact_exc:
+                        last_llm_exc = compact_exc
+
+                # Transient provider error (RateLimit 429, 503, timeout)
+                is_transient = (
+                    "429" in err_str
+                    or "rate limit" in err_str
+                    or "timeout" in err_str
+                    or "502" in err_str
+                    or "503" in err_str
+                    or "connection" in err_str
+                )
+                if is_transient and llm_attempt < max_llm_attempts:
+                    delay = 1.5 * llm_attempt
+                    logger.warning("Transient LLM error on attempt %d (%s). Retrying in %.1fs...", llm_attempt, exc, delay)
+                    await asyncio.sleep(delay)
+                    continue
+
+                # Permanent failure: re-raise directly, never synthetic complete
+                raise last_llm_exc
 
         thought_val = response.reasoning or response.thought or response.content or ""
         if thought_val:
@@ -268,7 +317,10 @@ class ToolCallAgent(BaseAgent):
         return response
 
     async def act(self, step: int, tool_calls: List[ToolCall]) -> List[str]:
-        """Execute proposed tool calls and record observations into state and message log."""
+        """
+        Execute proposed tool calls driving centralized retry policies across attempts.
+        Records every attempt in state.tool_history and emits TOOL_RETRY events when retrying.
+        """
         observations: List[str] = []
 
         for call in tool_calls:
@@ -286,96 +338,184 @@ class ToolCallAgent(BaseAgent):
             is_human_tool = tool_name in ("ask_human", "human_input")
             if is_human_tool:
                 if not args.get("request_id"):
-                    args["request_id"] = str(uuid.uuid4())
+                    args["request_id"] = f"req_{uuid.uuid4().hex[:12]}"
                 if self.state is not None:
                     self.state.mark_waiting_for_input(reason="Agent invoked interactive human tool")
 
-            await self._emit(
-                EventType.TOOL_CALL,
-                step=step,
-                payload={"tool_name": tool_name, "arguments": args, "tool_call_id": call_id},
-            )
-
-            output_str = ""
+            policy = self._get_tool_policy(tool_name)
             tool_inst = self._resolve_tool_instance(tool_name)
 
-            if tool_inst is not None:
-                try:
-                    res: Any
-                    if hasattr(tool_inst, "aexecute") and callable(tool_inst.aexecute):
-                        res = await tool_inst.aexecute(**args)
-                    elif hasattr(tool_inst, "_arun") and callable(tool_inst._arun):
-                        res = await tool_inst._arun(**args)
-                    elif hasattr(tool_inst, "execute") and callable(tool_inst.execute):
-                        fn = tool_inst.execute
-                        if inspect.iscoroutinefunction(fn):
-                            res = await fn(**args)
+            final_output_str = ""
+            final_attempt = 1
+            is_success = False
+
+            # Centralized Tool Retry Loop
+            for attempt in range(1, policy.max_attempts + 1):
+                final_attempt = attempt
+
+                await self._emit(
+                    EventType.TOOL_CALL,
+                    step=step,
+                    payload={
+                        "tool_name": tool_name,
+                        "arguments": args,
+                        "tool_call_id": call_id,
+                        "attempt": attempt,
+                    },
+                )
+
+                output_str = ""
+                has_error = False
+                attempt_exc: Optional[Exception] = None
+
+                if tool_inst is not None:
+                    try:
+                        timeout_limit = policy.timeout_seconds
+                        res: Any
+
+                        async def _execute_underlying() -> Any:
+                            if hasattr(tool_inst, "aexecute") and callable(tool_inst.aexecute):
+                                return await tool_inst.aexecute(**args)
+                            elif hasattr(tool_inst, "_arun") and callable(tool_inst._arun):
+                                return await tool_inst._arun(**args)
+                            elif hasattr(tool_inst, "execute") and callable(tool_inst.execute):
+                                fn = tool_inst.execute
+                                if inspect.iscoroutinefunction(fn):
+                                    return await fn(**args)
+                                else:
+                                    r = fn(**args)
+                                    return (await r) if inspect.isawaitable(r) else r
+                            else:
+                                return ToolResult(
+                                    output=f"Tool '{tool_name}' has no executable entrypoint.",
+                                    exit_code=1,
+                                    is_error=True,
+                                )
+
+                        if timeout_limit and timeout_limit > 0:
+                            res = await asyncio.wait_for(_execute_underlying(), timeout=timeout_limit)
                         else:
-                            res = fn(**args)
-                            if inspect.isawaitable(res):
-                                res = await res
-                    else:
-                        res = ToolResult(
-                            output=f"Tool '{tool_name}' has no executable entrypoint.",
-                            exit_code=1,
-                            is_error=True,
-                        )
+                            res = await _execute_underlying()
 
-                    if is_human_tool and self.state is not None:
-                        self.state.mark_running(reason="Human response received and processed")
-
-                    if isinstance(res, ToolResult):
-                        if res.is_error:
-                            output_str = res.error or str(res.output) or f"Error executing tool '{tool_name}'"
+                        if isinstance(res, ToolResult):
+                            if res.is_error:
+                                has_error = True
+                                output_str = res.error or str(res.output) or f"Error executing tool '{tool_name}'"
+                            else:
+                                output_str = str(res.output) if res.output is not None else ""
+                        elif isinstance(res, dict) and "output" in res:
+                            output_str = str(res.get("output", ""))
+                            has_error = bool(res.get("is_error", False))
                         else:
-                            output_str = str(res.output) if res.output is not None else ""
-                    elif isinstance(res, dict) and "output" in res:
-                        output_str = str(res.get("output", ""))
-                    else:
-                        output_str = str(res)
+                            output_str = str(res)
 
-                except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError) as flow_err:
-                    if is_human_tool and self.state is not None:
-                        self.state.mark_failed(f"Human interaction aborted: {flow_err}", error_code="FLOW_ABORTED")
-                    raise flow_err
+                    except (asyncio.TimeoutError, TimeoutError) as t_err:
+                        attempt_exc = t_err
+                        has_error = True
+                        output_str = f"Tool '{tool_name}' timed out after {policy.timeout_seconds}s."
 
-                except Exception as ex:
-                    if is_human_tool and self.state is not None:
-                        self.state.mark_running(reason="Error handled during human interaction")
-                    output_str = f"Error executing tool '{tool_name}': {str(ex)}"
-            else:
+                    except asyncio.CancelledError as cancel_err:
+                        if is_human_tool and self.state is not None:
+                            self.state.mark_failed("Human interaction cancelled.", error_code="CANCELLED")
+                        raise cancel_err
+
+                    except Exception as ex:
+                        attempt_exc = ex
+                        has_error = True
+                        output_str = f"Error executing tool '{tool_name}': {str(ex)}"
+                else:
+                    has_error = True
+                    output_str = f"Error: Tool '{tool_name}' not found in active collection."
+
                 if is_human_tool and self.state is not None:
-                    self.state.mark_running(reason="Missing human tool handled")
-                output_str = f"Error: Tool '{tool_name}' not found in active collection."
+                    self.state.mark_running(reason="Human interaction resolved")
 
+                final_output_str = output_str
+
+                # Record current attempt in state history
+                if self.state is not None:
+                    self.state.record_tool_execution(
+                        tool_name=tool_name,
+                        arguments=args,
+                        output=output_str,
+                        exit_code=1 if has_error else 0,
+                        is_error=has_error,
+                        tool_call_id=call_id,
+                        attempt=attempt,
+                    )
+
+                if not has_error:
+                    is_success = True
+                    break
+
+                # Evaluate Retry Policy
+                can_retry = policy.is_retry_permitted(current_attempt=attempt, error=attempt_exc)
+                if can_retry:
+                    delay = policy.compute_delay(attempt + 1)
+                    logger.warning(
+                        "Tool '%s' failed on attempt %d/%d (%s). Retrying in %.1fs...",
+                        tool_name,
+                        attempt,
+                        policy.max_attempts,
+                        output_str[:80],
+                        delay,
+                    )
+
+                    # Emit canonical retry event
+                    await self._emit(
+                        EventType.TOOL_RETRY,
+                        step=step,
+                        payload={
+                            "tool_name": tool_name,
+                            "tool_call_id": call_id,
+                            "attempt": attempt + 1,
+                            "max_attempts": policy.max_attempts,
+                            "error": output_str,
+                            "delay_seconds": delay,
+                        },
+                    )
+
+                    if self.state is not None and self.state.status == ExecutionStatus.RUNNING:
+                        self.state.mark_retrying(reason=f"Retrying tool '{tool_name}' (attempt {attempt + 1})")
+
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+
+                    if self.state is not None and self.state.status == ExecutionStatus.RETRYING:
+                        self.state.mark_running(reason=f"Resumed execution for tool retry (attempt {attempt + 1})")
+                else:
+                    logger.info("Tool '%s' failure on attempt %d is non-retryable. Concluding attempts.", tool_name, attempt)
+                    break
+
+            # Emit canonical final observation after all attempts conclude
             await self._emit(
                 EventType.OBSERVATION,
                 step=step,
-                payload={"tool_name": tool_name, "output": output_str, "tool_call_id": call_id},
+                payload={
+                    "tool_name": tool_name,
+                    "output": final_output_str,
+                    "tool_call_id": call_id,
+                    "attempt": final_attempt,
+                    "is_error": not is_success,
+                },
             )
 
             self.messages.append({
                 "role": "tool",
                 "tool_call_id": call_id,
                 "name": tool_name,
-                "content": output_str,
+                "content": final_output_str,
             })
 
             if self.state is not None:
                 self.state.add_message(
                     role=MessageRole.TOOL,
-                    content=output_str,
+                    content=final_output_str,
                     name=tool_name,
                     tool_call_id=call_id,
                 )
-                self.state.record_tool_execution(
-                    tool_name=tool_name,
-                    arguments=args,
-                    output=output_str,
-                    tool_call_id=call_id,
-                )
 
-            observations.append(output_str)
+            observations.append(final_output_str)
 
         return observations
 
@@ -398,7 +538,6 @@ class ToolCallAgent(BaseAgent):
             state.final_output = self._final_answer
             return True
 
-        # Pre-assign guaranteed non-empty call IDs to satisfy strict schema validators
         for tc in response.tool_calls:
             if not tc.id:
                 tc.id = f"call_{uuid.uuid4().hex[:12]}"
@@ -443,10 +582,7 @@ class ToolCallAgent(BaseAgent):
         return not (await self.step(state=self.state, emitter=self.emitter))
 
     async def run_task(self, prompt: str, max_steps: int = 30) -> str:
-        """
-        Compatibility shim delegating execution directly to canonical AgentRunner.
-        Ensures all executions pass through the unified runtime authority.
-        """
+        """Compatibility shim delegating execution directly to canonical AgentRunner."""
         from peldrun.engine.runner import AgentRunner, RunnerConfig
 
         runner_config = RunnerConfig(max_steps=max_steps)
@@ -455,7 +591,7 @@ class ToolCallAgent(BaseAgent):
         return state.final_output or self._final_answer or "Task execution finished."
 
     async def arun(self, task: str = "", max_steps: Optional[int] = None, **kwargs: Any) -> Any:
-        """Compatibility entrypoint delegating to run_task which executes via AgentRunner."""
+        """Compatibility entrypoint delegating to run_task."""
         prompt_val = task or kwargs.get("prompt", "")
         limit_val = max_steps or getattr(self.config, "max_steps", 30)
         return await self.run_task(prompt=prompt_val, max_steps=limit_val)

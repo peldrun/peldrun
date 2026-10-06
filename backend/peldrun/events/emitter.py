@@ -1,9 +1,15 @@
 """
+backend/peldrun/events/emitter.py
+
 PELDRUN Core Asynchronous Event Emitter.
 Dispatches strictly typed lifecycle events to registered subscribers and SSE streams
-with thread-safe and coroutine-safe monotonic sequence numbering, multi-run isolation,
-and bounded historical replay buffer.
-Hardened against non-UUID string identifiers and duplicate terminal dispatches.
+with thread-safe and coroutine-safe monotonic sequence numbering, durable RunStore persistence,
+and bounded historical replay recovery.
+Hardened under PR 5:
+- Integrates with RunStore for persistent event logging.
+- Supports replay_after querying durable database records.
+- Guarantees strict monotonic sequence allocation.
+- Enforces single terminal outcome per run.
 """
 
 from __future__ import annotations
@@ -152,13 +158,13 @@ class EventEmitter:
         """
         Publish an event across matching listeners, historical replay buffer, and active SSE queues.
         Guarantees thread-safe and coroutine-safe strictly monotonic sequence allocation.
-        Enforces a single canonical terminal outcome per run.
+        Persists event durably into RunStore and enforces a single canonical terminal outcome per run.
         """
         async with self._lock:
             key = event.type.value if hasattr(event.type, "value") else str(event.type)
 
             # Terminal Guard: Ignore duplicate terminal events
-            if key in (EventType.FINAL.value, EventType.ERROR.value):
+            if key in (EventType.FINAL.value, EventType.ERROR.value, getattr(EventType, "CANCELLED", None)):
                 if self._is_terminated:
                     logger.warning(
                         "Ignoring duplicate terminal event '%s' for run '%s' (already terminated).",
@@ -190,20 +196,56 @@ class EventEmitter:
             # Store in historical replay buffer
             self._replay_buffer.append(event)
 
+            # Persist event into durable RunStore
+            try:
+                from peldrun.runtime.store import get_run_store
+
+                store = get_run_store()
+                store._sync_append_event(event)
+            except Exception as store_err:
+                logger.debug("Failed persisting event %s to RunStore: %s", event.event_id, store_err)
+
         for listener in targets:
             try:
                 res = listener(event)
                 if asyncio.iscoroutine(res):
                     await res
             except Exception:
-                # Listener resilience: isolate subscriber faults
                 pass
 
         for q in queues:
             await q.put(event)
 
     async def replay_after(self, after_sequence: int = 0) -> List[PeldrunEvent]:
-        """Fetch previously published events occurring strictly after sequence number."""
+        """
+        Fetch previously published events occurring strictly after sequence number.
+        Queries durable RunStore first for crash-resilient replay, falling back to memory.
+        """
+        try:
+            from peldrun.runtime.store import get_run_store
+
+            store = get_run_store()
+            raw_events = await store.get_events_after(str(self._run_id), sequence=after_sequence)
+            if raw_events:
+                events: List[PeldrunEvent] = []
+                for item in raw_events:
+                    events.append(
+                        PeldrunEvent(
+                            version=1,
+                            event_id=item["event_id"],
+                            run_id=item["run_id"],
+                            sequence=item["sequence"],
+                            step=item["step"],
+                            type=item["type"],
+                            payload=item["payload"],
+                            metadata=item["metadata"],
+                            timestamp=item["timestamp"],
+                        )
+                    )
+                return events
+        except Exception as ex:
+            logger.debug("Failed querying RunStore for emitter replay: %s", ex)
+
         async with self._lock:
             return [ev for ev in self._replay_buffer if ev.sequence > after_sequence]
 
@@ -221,7 +263,8 @@ class EventEmitter:
             while True:
                 event = await q.get()
                 yield event.to_sse()
-                if (event.type.value if hasattr(event.type, "value") else str(event.type)) == EventType.FINAL.value:
+                ev_name = event.type.value if hasattr(event.type, "value") else str(event.type)
+                if ev_name in (EventType.FINAL.value, EventType.ERROR.value):
                     break
         finally:
             self._sse_queues.discard(q)
@@ -257,6 +300,29 @@ class EventEmitter:
     ) -> None:
         payload = {"tool_name": tool_name, "arguments": arguments, "tool_call_id": tool_call_id, **kwargs}
         event = self.create_event(EventType.TOOL_CALL, payload=payload, step=step)
+        await self.emit(event)
+
+    async def emit_tool_retry(
+        self,
+        tool_name: str,
+        tool_call_id: str = "",
+        attempt: int = 1,
+        max_attempts: int = 3,
+        error: str = "",
+        delay_seconds: float = 0.0,
+        step: int = 0,
+        **kwargs: Any,
+    ) -> None:
+        payload = {
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "error": error,
+            "delay_seconds": delay_seconds,
+            **kwargs,
+        }
+        event = self.create_event(EventType.TOOL_RETRY, payload=payload, step=step)
         await self.emit(event)
 
     async def emit_observation(

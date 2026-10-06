@@ -3,11 +3,11 @@ backend/omweb/routers/run.py
 
 PELDRUN Universal Run Router.
 Manages job lifecycles, chat associations, real-time SSE streaming, and deliverable downloads.
-Hardened under PR 3 (Durable HITL & State Persistence):
-- Idempotent human response resolution via durable RunStore.
-- Decouples job_id from request_id and validates request ownership.
-- Resumes runs cleanly across process restarts or memory interruptions.
-- Prevents double execution on duplicate POST /respond calls.
+Hardened under PR 5 (Canonical Event Sequence & SSE Replay):
+- Full support for 'after_sequence' query parameter on GET /jobs/{job_id}/stream.
+- Replays historical events durably from RunStore, then switches smoothly to live tail.
+- Deduplicates events by sequence number to prevent double rendering upon reconnection.
+- Terminates stream strictly on all terminal states (final, error, cancelled, done).
 """
 
 from __future__ import annotations
@@ -136,7 +136,7 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
     if req.provider_name:
         llm_override["provider_name"] = req.provider_name.strip()
     elif req.provider:
-        llm_override["provider_name"] = req.provider.strip()
+        llm_override["provider_name"] = req.provider_name.strip()
     if req.base_url:
         llm_override["base_url"] = req.base_url.strip()
     if req.api_key is not None:
@@ -513,32 +513,100 @@ async def download_job_zip(job_id: str):
 
 
 @router.get("/jobs/{job_id}/stream")
-async def stream_job_events(job_id: str):
+async def stream_job_events(job_id: str, after_sequence: int = Query(0, ge=0)):
+    """
+    Authoritative Server-Sent Events stream for execution monitoring.
+    Supports durable event replay when after_sequence > 0, followed by live events tail.
+    Prevents duplicate frames and closes cleanly on terminal outcomes.
+    """
     job = job_manager.get_job(job_id)
     chat, chat_id = resolve_chat(job_id)
     chat = chat or {}
 
-    job_mem_status = getattr(job, "status", None)
+    actual_job_id = (chat.get("job_id") if chat else None) or job_id
+    store = get_run_store()
 
-    if job and job_mem_status in ["completed", "failed"]:
-        memory_events = getattr(job, "events", [])
-        async def replay_generator():
-            for ev in memory_events:
-                ev_type = ev.get("type", "thought") if isinstance(ev, dict) else "thought"
-                ev_data = json.dumps(ev, ensure_ascii=False) if isinstance(ev, dict) else str(ev)
-                yield {"event": str(ev_type), "data": ev_data}
-            yield {"event": "done", "data": json.dumps({"status": job_mem_status})}
-        return EventSourceResponse(replay_generator())
-
-    collected_events: List[Dict[str, Any]] = []
-    current_step = 1
-
-    ACTIVE_JOB_EVENTS[job_id] = collected_events
-    if chat_id:
-        ACTIVE_JOB_EVENTS[chat_id] = collected_events
+    collected_events: List[Dict[str, Any]] = (
+        ACTIVE_JOB_EVENTS.get(actual_job_id)
+        or ACTIVE_JOB_EVENTS.get(job_id)
+        or []
+    )
+    if not collected_events:
+        ACTIVE_JOB_EVENTS[actual_job_id] = collected_events
+        ACTIVE_JOB_EVENTS[job_id] = collected_events
 
     async def event_generator():
-        nonlocal current_step
+        current_step = 1
+        max_seen_sequence = after_sequence
+
+        # PHASE 1: Replay Historical Events occurring strictly after 'after_sequence'
+        replayed_records: List[Dict[str, Any]] = []
+
+        try:
+            stored_raw = await store.get_events_after(actual_job_id, sequence=after_sequence)
+            if not stored_raw and actual_job_id != job_id:
+                stored_raw = await store.get_events_after(job_id, sequence=after_sequence)
+
+            for item in stored_raw:
+                seq = item["sequence"]
+                ev_type = item["type"]
+                payload = item["payload"]
+                step_val = item["step"] or 1
+                ev_id = item["event_id"]
+
+                content_val = (
+                    payload.get("content")
+                    or payload.get("thought")
+                    or payload.get("output")
+                    or payload.get("arguments")
+                    or ""
+                )
+                tool_val = payload.get("tool_name") or payload.get("tool") or ""
+
+                event_dict = {
+                    "id": ev_id,
+                    "type": str(ev_type),
+                    "step": step_val,
+                    "content": str(content_val),
+                    "toolName": str(tool_val) if tool_val else None,
+                    "data": payload,
+                    "seq": seq,
+                }
+                replayed_records.append(event_dict)
+        except Exception as ex:
+            pass
+
+        # Fallback to in-memory event buffer if store had no records
+        if not replayed_records and collected_events:
+            for ev in collected_events:
+                ev_seq = ev.get("seq") or ev.get("sequence") or 0
+                if ev_seq > after_sequence:
+                    replayed_records.append(ev)
+
+        # Yield all replayed historical events sequentially
+        for rep in replayed_records:
+            seq_val = rep.get("seq", 0)
+            if seq_val > max_seen_sequence:
+                max_seen_sequence = seq_val
+
+            ev_type_str = rep.get("type", "thought")
+            ev_json = json.dumps(rep, ensure_ascii=False)
+            yield {"event": str(ev_type_str), "data": ev_json}
+
+            # Check if historical replay concluded on a terminal event
+            if str(ev_type_str).lower() in ("final", "error", "cancelled", "done"):
+                return
+
+        # PHASE 2: Live Events Tail
+        # If the job is already finished, do not enter live listener loop
+        is_actively_running = (
+            job_id in ACTIVE_JOB_TASKS
+            or actual_job_id in ACTIVE_JOB_TASKS
+            or (chat_id and chat_id in ACTIVE_JOB_TASKS)
+        )
+        if not is_actively_running and replayed_records:
+            return
+
         async for event in subscribe_events(job_id):
             ev_type = event.type.value if hasattr(event.type, "value") else str(event.type)
             ev_step = getattr(event, "step", None)
@@ -561,6 +629,17 @@ async def stream_job_events(job_id: str):
             for k, v in data_payload.items():
                 if k not in raw_dict:
                     raw_dict[k] = v
+
+            live_seq = data_payload.get("seq") or raw_dict.get("seq") or 0
+            if isinstance(live_seq, int) and live_seq > 0:
+                if live_seq <= max_seen_sequence:
+                    continue  # Deduplication: ignore already yielded events
+                max_seen_sequence = live_seq
+            else:
+                max_seen_sequence += 1
+                live_seq = max_seen_sequence
+                raw_dict["seq"] = live_seq
+                data_payload["seq"] = live_seq
 
             raw_dict["id"] = raw_dict.get("id") or f"evt_{uuid.uuid4().hex[:8]}"
             raw_dict["type"] = str(ev_type)
@@ -595,6 +674,7 @@ async def stream_job_events(job_id: str):
                 "content": raw_dict["content"],
                 "toolName": raw_dict.get("toolName"),
                 "data": data_payload,
+                "seq": live_seq,
             }
 
             if str(ev_type).lower() not in ["ping"]:
@@ -605,7 +685,7 @@ async def stream_job_events(job_id: str):
                     except Exception:
                         pass
 
-            is_term = str(ev_type).lower() in ["final", "error", "done"]
+            is_term = str(ev_type).lower() in ["final", "error", "cancelled", "done"]
             if is_term:
                 res_data = raw_dict.get("data", {})
                 final_res = res_data.get("result", "") if isinstance(res_data, dict) else str(res_data)
@@ -701,9 +781,10 @@ async def stop_job(job_id: str):
     try:
         from omweb.sse_events import SSEEvent, SSEEventType
         from omweb.agent_bridge import dispatch_event
+
         await dispatch_event(
             target_job_id,
-            SSEEvent(type=SSEEventType.STATUS, data={"status": "stopped", "message": "Task stopped by user"}),
+            SSEEvent(type=SSEEventType.CANCELLED, data={"status": "stopped", "message": "Task stopped by user"}),
         )
     except Exception:
         pass
@@ -788,7 +869,6 @@ async def respond_to_human_prompt(job_id: str, req: HumanRespondRequest):
         saved_state = await store.load_state(target_job_id)
         if saved_state is not None:
             saved_state.mark_running(reason="Resuming execution following human response")
-            # Update state with human answer
             saved_state.add_message(
                 role="tool",
                 content=answer,
@@ -803,7 +883,6 @@ async def respond_to_human_prompt(job_id: str, req: HumanRespondRequest):
             )
             await store.save_state(target_job_id, saved_state)
 
-            # Re-queue background execution task
             resumed_task = asyncio.create_task(
                 run_instrumented(target_job_id, saved_state.task_prompt)
             )

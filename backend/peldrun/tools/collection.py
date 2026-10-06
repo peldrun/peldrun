@@ -1,7 +1,9 @@
 """
+backend/peldrun/tools/collection.py
+
 PELDRUN Core Tool Collection Architecture.
-Aggregates and executes BaseTool instances and ToolRuntime protocol implementations
-with flexible invocation resilience and standardized outcome mapping.
+Aggregates and dispatches BaseTool instances and ToolRuntime implementations
+with unified execution policies and structured ToolResult conversions.
 """
 
 from __future__ import annotations
@@ -10,7 +12,7 @@ import json
 from typing import Any, Dict, List, Optional, Union
 
 from peldrun.tools.base import BaseTool, ToolResult
-from peldrun.tools.contract import ToolRuntime
+from peldrun.tools.contract import ToolExecutionPolicy, ToolRuntime
 
 
 class ToolCollection:
@@ -29,6 +31,19 @@ class ToolCollection:
     def get_tool(self, name: str) -> Optional[Union[ToolRuntime, BaseTool]]:
         """Retrieve a tool by unique name identifier."""
         return self._tools.get(name)
+
+    def get_tool_policy(self, name: str) -> ToolExecutionPolicy:
+        """
+        Retrieve the execution policy for a specified tool.
+        Defaults to safe one-shot policy if the tool does not declare a custom policy.
+        """
+        tool = self.get_tool(name)
+        if tool is not None:
+            if hasattr(tool, "get_execution_policy") and callable(tool.get_execution_policy):
+                return tool.get_execution_policy()
+            if hasattr(tool, "execution_policy") and isinstance(tool.execution_policy, ToolExecutionPolicy):
+                return tool.execution_policy
+        return ToolExecutionPolicy(max_attempts=1, retryable=False, side_effects=True)
 
     def list_tools(self) -> List[Union[ToolRuntime, BaseTool]]:
         """Return all tools registered in the collection."""
@@ -61,8 +76,8 @@ class ToolCollection:
 
     async def execute(self, name: str, arguments: Any) -> ToolResult:
         """
-        Execute a tool by name, handling argument parsing and calling aexecute, _arun, or execute.
-        Guarantees that the returned object is always an instance of ToolResult.
+        Execute a tool single invocation attempt by name, standardizing arguments
+        and delegating to the tool runtime instance.
         """
         tool = self.get_tool(name)
         if not tool:
@@ -104,7 +119,6 @@ class ToolCollection:
                     is_error=True,
                 )
 
-            # Standardize output into strict ToolResult
             if isinstance(res, ToolResult):
                 return res
             elif isinstance(res, dict):
@@ -117,6 +131,7 @@ class ToolCollection:
                 output=f"Tool '{name}' execution raised an exception: {exc}",
                 exit_code=1,
                 is_error=True,
+                metadata={"error_type": type(exc).__name__},
             )
 
 

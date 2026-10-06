@@ -7,6 +7,7 @@ Provides:
 - Isolated per-job listener queues guaranteeing strict FIFO delivery fan-out.
 - Asynchronous event stream generator with automatic keepalive heartbeat (PING).
 - Deterministic listener registration and cleanup to prevent memory leaks.
+- Full support for TOOL_RETRY and CANCELLED event discriminators.
 """
 
 from __future__ import annotations
@@ -34,6 +35,8 @@ class SSEEventType(str, Enum):
     STEP_END = "step_end"
     THOUGHT = "thought"
     TOOL_CALL = "tool_call"
+    TOOL_CALLED = "tool_called"  # Compatibility alias
+    TOOL_RETRY = "tool_retry"    # Centralized retry event
     OBSERVATION = "observation"
 
     # Artifact Lifecycle Events (Phase M2 Push Streaming)
@@ -141,15 +144,8 @@ async def subscribe_events(
     Asynchronous generator yielding live SSEEvents for a specified job.
 
     Maintains a dedicated listener queue and periodically emits keepalive PING events
-    during idle intervals to prevent HTTP proxy timeouts. Automatically cleans up
-    listener registrations when consumer finishes or connection drops.
-
-    Args:
-        job_id: Target job identifier to stream events for.
-        keepalive_interval: Inactivity ceiling in seconds before dispatching a ping event.
-
-    Yields:
-        Live SSEEvent instances as dispatched from the execution engine.
+    during idle intervals. Automatically cleans up listener registrations when
+    consumer finishes or connection drops.
     """
     queue = await register_job_listener(job_id)
     try:
