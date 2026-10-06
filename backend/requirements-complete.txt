@@ -1,5 +1,5 @@
 ﻿# ============================================================
-# PELDRUN-Web Unified Requirements (Web UI + Core Agent)
+# PELDRUN-Web Unified Requirements (Web UI + Embedded Core)
 # Python 3.12 Compatible
 # ============================================================
 
@@ -32,6 +32,7 @@ duckduckgo-search>=6.1.0
 baidusearch>=1.0.0
 
 # --- Utilities, Sandbox Execution & File Tools ---
+aiofiles>=23.0.0
 pillow>=10.3.0,<12.0.0
 numpy>=1.26.0,<3.0.0
 unidiff>=0.7.5
