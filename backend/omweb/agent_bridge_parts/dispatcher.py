@@ -1,11 +1,9 @@
 """
 Public dispatcher entry points for the PELDRUN Universal Agent Bridge.
 
-This module contains the two top-level async functions that the rest of
-the application calls to start a job:
-
-    - run_instrumented  → dispatch an agent job via core/legacy engine.
-    - run_direct_chat   → dispatch a plain chat completion job.
+Dispatches execution to registered engines (native embedded PELDRUN Core
+or legacy OpenManus) via the authoritative EngineRegistry abstraction layer.
+Enforces upfront fail-fast resolution for both engines and agents.
 """
 
 from __future__ import annotations
@@ -14,27 +12,30 @@ import asyncio
 import traceback
 from typing import Any, Dict, Optional
 
-from omweb.sse_events import SSEEvent, SSEEventType, dispatch_event
-from omweb.job_manager import job_manager
-from omweb.project_manager import project_manager
+from omweb.agents.registry import AgentNotFoundError, agent_registry
+from omweb.engines import (
+    EngineNotFoundError,
+    EngineRunContext,
+    engine_registry,
+)
 from omweb.engine_resolver import (
     EngineType,
     get_active_engine_type,
-    is_core_engine_available,
 )
+from omweb.job_manager import job_manager
+from omweb.project_manager import project_manager
+from omweb.sse_events import SSEEvent, SSEEventType, dispatch_event
 
-from .state import (
-    human_answers,
-    human_data,
-    active_tasks,
-    current_active_job_id,
-    job_scoped_artifacts,
-)
 from .config_loader import read_active_toml_config
 from .errors import format_smart_error
 from .lmstudio import check_lmstudio_model_readiness
-from .core_engine import _run_peldrun_core_agent
-from .legacy_engine import _run_legacy_openmanus_agent
+from .state import (
+    active_tasks,
+    current_active_job_id,
+    human_answers,
+    human_data,
+    job_scoped_artifacts,
+)
 
 
 async def run_instrumented(
@@ -43,25 +44,17 @@ async def run_instrumented(
     *args: Any,
     agent_id: Any = None,
     llm_override: Optional[Dict[str, Any]] = None,
-    **kwargs: Any
+    **kwargs: Any,
 ) -> None:
-    """Dispatch an agent job using the selected engine (core or legacy).
-
-    Accepts flexible positional/keyword arguments for backward compatibility:
-        - A positional dict arg is treated as ``llm_override`` if not supplied.
-        - A positional str arg is treated as ``agent_id`` if not supplied.
-
-    Performs LM Studio readiness checks (when applicable), resolves the
-    active engine type (with optional ``engine`` kwarg or override), and
-    dispatches to either the core or legacy runner.
+    """Dispatch an agent job using the authoritative execution engine registry.
 
     Args:
-        job_id:       Unique job identifier.
-        prompt:       User task prompt.
-        *args:        Optional positional (dict → llm_override / str → agent_id).
-        agent_id:     Agent registry identifier (defaults to "peldrun").
-        llm_override: Optional dict overriding the resolved LLM config.
-        **kwargs:     Supports ``engine`` to force a specific engine.
+        job_id: Unique job identifier.
+        prompt: User task prompt.
+        *args: Optional positional arguments (dict -> llm_override, str -> agent_id).
+        agent_id: Agent identifier (defaults to 'peldrun').
+        llm_override: Optional runtime LLM configuration overrides.
+        **kwargs: Supports 'engine' kwarg to explicitly specify target engine.
     """
     for arg in args:
         if isinstance(arg, dict) and llm_override is None:
@@ -75,17 +68,62 @@ async def run_instrumented(
     if not agent_id or not isinstance(agent_id, str):
         agent_id = kwargs.get("agent_id") or "peldrun"
 
-    explicit_engine = kwargs.get("engine") or (llm_override.get("engine") if isinstance(llm_override, dict) else None)
+    # 1. Resolve target engine identifier
+    explicit_engine = kwargs.get("engine") or (
+        llm_override.get("engine") if isinstance(llm_override, dict) else None
+    )
     if explicit_engine:
-        eng_str = str(explicit_engine).lower().strip()
-        target_engine = EngineType.LEGACY if eng_str in ["openmanus", "legacy", "manus"] else EngineType.CORE
+        target_engine_str = str(explicit_engine).lower().strip()
     else:
-        target_engine = get_active_engine_type()
+        active_type = get_active_engine_type()
+        target_engine_str = (
+            active_type.value if isinstance(active_type, EngineType) else str(active_type)
+        )
 
-    print(f"\n[BRIDGE] Initializing job {job_id} using engine: '{target_engine.value}'")
+    print(f"\n[BRIDGE] Initializing job {job_id} using engine: '{target_engine_str}'")
     current_active_job_id["current"] = job_id
     job_scoped_artifacts[job_id] = []
 
+    # 2. Strict Fail-Fast Engine Resolution: Validate engine existence upfront
+    try:
+        engine = engine_registry.get(target_engine_str)
+    except EngineNotFoundError as eng_err:
+        err_msg = str(eng_err)
+        print(f"[BRIDGE ERROR] {err_msg}")
+        job_manager.fail_job(job_id, err_msg)
+        await dispatch_event(
+            job_id,
+            SSEEvent(
+                type=SSEEventType.ERROR,
+                step=1,
+                data={"message": err_msg, "engine": target_engine_str},
+            ),
+        )
+        return
+
+    # 3. Strict Fail-Fast Agent Resolution: Validate agent existence in Store upfront
+    try:
+        manifest = agent_registry.get_agent(agent_id)
+    except AgentNotFoundError as agent_err:
+        err_msg = str(agent_err)
+        print(f"[BRIDGE ERROR] {err_msg}")
+        job_manager.fail_job(job_id, err_msg)
+        await dispatch_event(
+            job_id,
+            SSEEvent(type=SSEEventType.ERROR, step=0, data={"message": err_msg}),
+        )
+        return
+
+    if manifest.get("status") == "disabled":
+        err_msg = f"Agent '{manifest.get('name', agent_id)}' is currently disabled in the Capability Store. Enable it first to run tasks."
+        job_manager.fail_job(job_id, err_msg)
+        await dispatch_event(
+            job_id,
+            SSEEvent(type=SSEEventType.ERROR, step=0, data={"message": err_msg}),
+        )
+        return
+
+    # 4. Resolve runtime LLM settings
     toml_cfg = read_active_toml_config()
     active_llm = dict(toml_cfg.get("llm", {}))
     if llm_override:
@@ -109,24 +147,32 @@ async def run_instrumented(
             p_cand = active_llm.get("provider") or active_llm.get("model") or "Custom Engine"
     provider_name = p_cand or "Active Primary"
     model_name = active_llm.get("model") or "default"
-    base_url = b_cand or "[http://127.0.0.1:1234/v1](http://127.0.0.1:1234/v1)"
+    base_url = b_cand or "http://127.0.0.1:1234/v1"
 
     print(f"[BRIDGE] Target LLM: [{provider_name}] Model: '{model_name}' | URL: '{base_url}'")
 
+    # 5. Perform LM Studio health check if targeting local endpoint
     if "1234" in base_url or "lmstudio" in provider_name.lower():
         readiness = await check_lmstudio_model_readiness(base_url, model_name, active_llm.get("api_key", ""))
         if readiness.get("unreachable"):
             err_msg = format_smart_error(Exception("Connection refused (Port 1234)"), model_name, provider_name)
             job_manager.fail_job(job_id, err_msg)
-            await dispatch_event(job_id, SSEEvent(type=SSEEventType.ERROR, step=1, data={"message": err_msg, "model": model_name}))
+            await dispatch_event(
+                job_id,
+                SSEEvent(type=SSEEventType.ERROR, step=1, data={"message": err_msg, "model": model_name}),
+            )
             return
 
         if readiness.get("found") and not readiness.get("is_loaded"):
             err_msg = format_smart_error(Exception("failed to load model"), model_name, provider_name)
             job_manager.fail_job(job_id, err_msg)
-            await dispatch_event(job_id, SSEEvent(type=SSEEventType.ERROR, step=1, data={"message": err_msg, "model": model_name}))
+            await dispatch_event(
+                job_id,
+                SSEEvent(type=SSEEventType.ERROR, step=1, data={"message": err_msg, "model": model_name}),
+            )
             return
 
+    # 6. Dispatch initial STEP_START event
     await asyncio.sleep(0.05)
     await dispatch_event(
         job_id,
@@ -138,50 +184,33 @@ async def run_instrumented(
                 "model": model_name,
                 "provider": provider_name,
                 "mode": "agent",
-                "engine": target_engine.value
-            }
-        )
+                "engine": target_engine_str,
+            },
+        ),
     )
 
-    from omweb.agents.registry import agent_registry
-    manifest = agent_registry.get_agent(agent_id)
-    if manifest.get("status") == "disabled":
-        err_msg = f"Agent '{manifest.get('name')}' is currently disabled in the Capability Store. Enable it first to run tasks."
-        job_manager.fail_job(job_id, err_msg)
-        await dispatch_event(job_id, SSEEvent(type=SSEEventType.ERROR, step=0, data={"message": err_msg, "model": model_name}))
-        return
-
+    # 7. Prepare project workspace directory
     chat = project_manager.get_chat(job_id) or {}
     chat_id = chat.get("id", f"chat_{job_id}")
     project_id = chat.get("project_id", "default_project")
     project_dir = project_manager.get_chat_files_dir(chat_id, project_id)
     project_dir.mkdir(parents=True, exist_ok=True)
 
+    # 8. Immutable Context Preparation & Execution
+    context = EngineRunContext(
+        job_id=job_id,
+        prompt=prompt,
+        agent_id=agent_id,
+        active_llm=active_llm,
+        model_name=model_name,
+        provider_name=provider_name,
+        project_dir=project_dir,
+        chat_id=chat_id,
+        manifest=manifest,
+    )
+
     try:
-        if target_engine == EngineType.CORE and is_core_engine_available():
-            await _run_peldrun_core_agent(
-                job_id=job_id,
-                prompt=prompt,
-                agent_id=agent_id,
-                active_llm=active_llm,
-                model_name=model_name,
-                provider_name=provider_name,
-                project_dir=project_dir,
-                chat_id=chat_id,
-                manifest=manifest,
-            )
-        else:
-            await _run_legacy_openmanus_agent(
-                job_id=job_id,
-                prompt=prompt,
-                agent_id=agent_id,
-                active_llm=active_llm,
-                model_name=model_name,
-                provider_name=provider_name,
-                project_dir=project_dir,
-                chat_id=chat_id,
-                manifest=manifest,
-            )
+        await engine.run(context)
     except asyncio.CancelledError:
         print(f"[BRIDGE] Job was aborted: {job_id}")
     except Exception as err:
@@ -194,8 +223,8 @@ async def run_instrumented(
             SSEEvent(
                 type=SSEEventType.ERROR,
                 step=1,
-                data={"message": err_msg, "model": model_name}
-            )
+                data={"message": err_msg, "model": model_name},
+            ),
         )
     finally:
         human_answers.pop(job_id, None)
@@ -208,19 +237,9 @@ async def run_instrumented(
 async def run_direct_chat(
     job_id: str,
     prompt: str,
-    llm_override: Optional[Dict[str, Any]] = None
+    llm_override: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Dispatch a plain, non-agentic chat completion job.
-
-    Sends the last few chat turns + the new prompt directly to the
-    configured OpenAI-compatible endpoint and streams the answer back
-    via a FINAL SSE event.
-
-    Args:
-        job_id:       Unique job identifier.
-        prompt:       User message.
-        llm_override: Optional dict overriding the resolved LLM config.
-    """
+    """Dispatch a plain, non-agentic chat completion job."""
     print(f"\n[BRIDGE DIRECT CHAT] Initializing direct chat for job: {job_id}")
     current_active_job_id["current"] = job_id
     job_scoped_artifacts[job_id] = []
@@ -248,7 +267,7 @@ async def run_direct_chat(
             p_cand = active_llm.get("provider") or active_llm.get("model") or "Custom Engine"
     provider_name = p_cand or "Active Primary"
     model_name = active_llm.get("model") or "default"
-    base_url = b_cand or "[http://127.0.0.1:1234/v1](http://127.0.0.1:1234/v1)"
+    base_url = b_cand or "http://127.0.0.1:1234/v1"
     api_key = active_llm.get("api_key") or "EMPTY"
 
     if "1234" in base_url or "lmstudio" in provider_name.lower():
@@ -256,13 +275,19 @@ async def run_direct_chat(
         if readiness.get("unreachable"):
             err_msg = format_smart_error(Exception("Connection refused (Port 1234)"), model_name, provider_name)
             job_manager.fail_job(job_id, err_msg)
-            await dispatch_event(job_id, SSEEvent(type=SSEEventType.ERROR, step=1, data={"message": err_msg, "model": model_name}))
+            await dispatch_event(
+                job_id,
+                SSEEvent(type=SSEEventType.ERROR, step=1, data={"message": err_msg, "model": model_name}),
+            )
             return
 
         if readiness.get("found") and not readiness.get("is_loaded"):
             err_msg = format_smart_error(Exception("failed to load model"), model_name, provider_name)
             job_manager.fail_job(job_id, err_msg)
-            await dispatch_event(job_id, SSEEvent(type=SSEEventType.ERROR, step=1, data={"message": err_msg, "model": model_name}))
+            await dispatch_event(
+                job_id,
+                SSEEvent(type=SSEEventType.ERROR, step=1, data={"message": err_msg, "model": model_name}),
+            )
             return
 
     await asyncio.sleep(0.05)
@@ -275,13 +300,14 @@ async def run_direct_chat(
                 "status": "running",
                 "model": model_name,
                 "provider": provider_name,
-                "mode": "chat"
-            }
-        )
+                "mode": "chat",
+            },
+        ),
     )
 
     try:
         from openai import AsyncOpenAI
+
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
         chat = project_manager.get_chat(job_id) or {}
@@ -290,7 +316,7 @@ async def run_direct_chat(
         messages = [
             {
                 "role": "system",
-                "content": "You are a helpful, direct, and conversational AI assistant. Respond directly, accurately, and naturally to the user using Markdown."
+                "content": "You are a helpful, direct, and conversational AI assistant. Respond directly, accurately, and naturally to the user using Markdown.",
             }
         ]
 
@@ -316,7 +342,7 @@ async def run_direct_chat(
             messages=messages,
             max_tokens=max_tokens,
             temperature=float(active_llm.get("temperature", 0.7)),
-            stream=False
+            stream=False,
         )
 
         result_text = ""
@@ -338,9 +364,9 @@ async def run_direct_chat(
                     "result": result_text,
                     "model": model_name,
                     "mode": "chat",
-                    "produced_files": []
-                }
-            )
+                    "produced_files": [],
+                },
+            ),
         )
 
     except asyncio.CancelledError:
@@ -355,8 +381,8 @@ async def run_direct_chat(
             SSEEvent(
                 type=SSEEventType.ERROR,
                 step=1,
-                data={"message": err_msg, "model": model_name}
-            )
+                data={"message": err_msg, "model": model_name},
+            ),
         )
     finally:
         human_answers.pop(job_id, None)

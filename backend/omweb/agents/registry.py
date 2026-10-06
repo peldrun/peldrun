@@ -1,22 +1,37 @@
 ﻿"""
 Agent Registry - Persists, scopes, and manages lifecycle statuses of custom and builtin agents.
+
+Enforces authoritative agent lookup and strict fail-fast policies, eliminating
+silent fallback masking across the execution plane.
 """
 
 from __future__ import annotations
+
 import json
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
+
+
+class AgentNotFoundError(Exception):
+    """Raised when an requested agent identifier is not found in the registry."""
+
+    def __init__(self, agent_id: str):
+        super().__init__(f"Agent '{agent_id}' is not registered in the Agent Store.")
+        self.agent_id = agent_id
 
 
 class AgentRegistry:
-    def __init__(self):
+    """Registry managing the lifecycle, configuration, and retrieval of agents."""
+
+    def __init__(self) -> None:
         backend_dir = Path(__file__).resolve().parent.parent.parent
         self.custom_dir = backend_dir / "storage" / "store" / "agents"
         self.custom_dir.mkdir(parents=True, exist_ok=True)
-        self.state_file = backend_dir / "storage" / "store" / "agents" / "agents_state.json"
+        self.state_file = self.custom_dir / "agents_state.json"
         self._builtin_agents: Dict[str, Dict[str, Any]] = self._init_builtin_agents()
 
     def _init_builtin_agents(self) -> Dict[str, Dict[str, Any]]:
+        """Initialize default system built-in agent specifications."""
         return {
             "peldrun": {
                 "id": "peldrun",
@@ -25,10 +40,18 @@ class AgentRegistry:
                 "icon": "Bot",
                 "description": "Full-capability autonomous specialist capable of browsing, data analysis, terminal coding, and delivering complete project solutions.",
                 "system_prompt": "You are peldrun, an all-around autonomous specialist agent.",
-                "tools": ["python_execute", "bash", "str_replace_editor", "web_search", "browser_use", "mcp"],
+                "tools": [
+                    "python_execute",
+                    "bash",
+                    "str_replace_editor",
+                    "web_search",
+                    "browser_use",
+                    "ask_human",
+                    "mcp",
+                ],
                 "max_steps": 30,
                 "is_builtin": True,
-                "status": "active"
+                "status": "active",
             },
             "coder": {
                 "id": "coder",
@@ -40,7 +63,7 @@ class AgentRegistry:
                 "tools": ["python_execute", "bash", "str_replace_editor"],
                 "max_steps": 30,
                 "is_builtin": True,
-                "status": "active"
+                "status": "active",
             },
             "researcher": {
                 "id": "researcher",
@@ -52,7 +75,7 @@ class AgentRegistry:
                 "tools": ["web_search", "browser_use", "str_replace_editor"],
                 "max_steps": 25,
                 "is_builtin": True,
-                "status": "active"
+                "status": "active",
             },
             "analyst": {
                 "id": "analyst",
@@ -64,11 +87,12 @@ class AgentRegistry:
                 "tools": ["python_execute", "str_replace_editor"],
                 "max_steps": 25,
                 "is_builtin": True,
-                "status": "active"
-            }
+                "status": "active",
+            },
         }
 
     def _load_states(self) -> Dict[str, str]:
+        """Read agent activation states from persistent storage."""
         if self.state_file.exists():
             try:
                 return json.loads(self.state_file.read_text(encoding="utf-8"))
@@ -77,12 +101,17 @@ class AgentRegistry:
         return {}
 
     def _save_states(self, states: Dict[str, str]) -> None:
+        """Persist agent activation states to storage."""
         try:
-            self.state_file.write_text(json.dumps(states, indent=2, ensure_ascii=False), encoding="utf-8")
+            self.state_file.write_text(
+                json.dumps(states, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
         except Exception as e:
             print(f"[AGENT REGISTRY ERROR] Could not save agent states: {e}")
 
     def list_agents(self) -> List[Dict[str, Any]]:
+        """List all registered agents merging built-ins with custom definitions."""
         states = self._load_states()
         results: Dict[str, Dict[str, Any]] = {}
 
@@ -110,15 +139,32 @@ class AgentRegistry:
         return list(results.values())
 
     def get_agent(self, agent_id: str) -> Dict[str, Any]:
+        """Retrieve an agent manifest by ID.
+
+        Enforces strict lookup without silent fallback masking.
+
+        Args:
+            agent_id: The unique identifier of the agent.
+
+        Returns:
+            The agent manifest dictionary.
+
+        Raises:
+            AgentNotFoundError: If the requested agent ID does not exist.
+        """
         agents = {a["id"]: a for a in self.list_agents()}
-        return agents.get(agent_id, self._builtin_agents["peldrun"])
+        if agent_id not in agents:
+            raise AgentNotFoundError(agent_id)
+        return agents[agent_id]
 
     def toggle_agent_status(self, agent_id: str) -> Dict[str, Any]:
+        """Toggle an agent between active and disabled states."""
         if agent_id == "peldrun":
             return {"error": "Default primary agent 'peldrun' cannot be disabled."}
 
-        agent = self.get_agent(agent_id)
-        if not agent:
+        try:
+            agent = self.get_agent(agent_id)
+        except AgentNotFoundError:
             return {"error": f"Agent '{agent_id}' not found"}
 
         states = self._load_states()
@@ -128,19 +174,22 @@ class AgentRegistry:
         self._save_states(states)
 
         agent["status"] = new_status
-        # If it is custom agent, update its JSON file as well
         custom_file = self.custom_dir / f"{agent_id}.json"
         if custom_file.exists():
             try:
                 data = json.loads(custom_file.read_text(encoding="utf-8"))
                 data["status"] = new_status
-                custom_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+                custom_file.write_text(
+                    json.dumps(data, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
             except Exception:
                 pass
 
         return agent
 
     def create_custom_agent(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Create and persist a new custom agent manifest."""
         name = data.get("name", "Custom Agent").strip()
         aid = f"custom_{name.lower().replace(' ', '_')}"
         data["id"] = aid
@@ -153,6 +202,7 @@ class AgentRegistry:
         return data
 
     def update_custom_agent(self, agent_id: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Update an existing custom agent manifest."""
         target = self.custom_dir / f"{agent_id}.json"
         if not target.exists():
             return None
@@ -164,6 +214,7 @@ class AgentRegistry:
         return data
 
     def delete_custom_agent(self, agent_id: str) -> bool:
+        """Delete a custom agent from disk."""
         target = self.custom_dir / f"{agent_id}.json"
         if target.exists():
             target.unlink()
@@ -175,3 +226,5 @@ class AgentRegistry:
 
 
 agent_registry = AgentRegistry()
+
+__all__ = ["AgentRegistry", "AgentNotFoundError", "agent_registry"]

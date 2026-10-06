@@ -2,8 +2,8 @@
 Concrete executor factories for every PELDRUN built-in tool.
 
 The single public class :class:`RealToolExecutionFactory` exposes one
-static factory method per tool.  Each factory returns an async callable
-bound to a specific workspace directory.
+static factory method per tool. Each factory returns an async callable
+bound to a specific workspace directory without global process CWD mutations.
 """
 
 from __future__ import annotations
@@ -11,20 +11,25 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+from pathlib import Path
 import re
 import sys
-import urllib.parse
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+import urllib.parse
 
 import httpx
-from bs4 import BeautifulSoup
 
-from .terminal_utils import find_safe_bash_executable, decode_terminal_bytes
+# Resilient optional dependency handling for HTML parsing
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None  # type: ignore[assignment, misc]
+
+from .terminal_utils import decode_terminal_bytes, find_safe_bash_executable
 
 # Optional bridge to the web platform's human-in-the-loop machinery.
 try:
-    from omweb.agent_bridge import human_answers, human_data, current_active_job_id
+    from omweb.agent_bridge import current_active_job_id, human_answers, human_data
 except ImportError:
     human_answers: Dict[str, asyncio.Event] = {}
     human_data: Dict[str, str] = {}
@@ -36,20 +41,7 @@ class RealToolExecutionFactory:
 
     @staticmethod
     def create_bash_executor(workspace_root: Path) -> Callable[..., Any]:
-        """
-        Build an async bash executor bound to `workspace_root`.
-
-        On Windows it prefers a genuine Git Bash binary (found via
-        :func:`find_safe_bash_executable`); if none exists it falls back
-        to PowerShell.  On POSIX systems it uses the default shell.
-
-        The returned callable accepts:
-            command (str, positional or keyword),
-            or `cmd` / `script` as aliases.
-
-        Returns:
-            Async callable returning the stdout (and stderr) as a string.
-        """
+        """Build an async bash executor bound to workspace_root without CWD mutation."""
         safe_bash = find_safe_bash_executable()
 
         async def _execute_bash(command: str = "", **kwargs: Any) -> str:
@@ -66,7 +58,7 @@ class RealToolExecutionFactory:
                             cmd,
                             cwd=str(workspace_root),
                             stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE
+                            stderr=asyncio.subprocess.PIPE,
                         )
                     else:
                         encoded_cmd = f"$OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8; {cmd}"
@@ -78,14 +70,14 @@ class RealToolExecutionFactory:
                             encoded_cmd,
                             cwd=str(workspace_root),
                             stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE
+                            stderr=asyncio.subprocess.PIPE,
                         )
                 else:
                     proc = await asyncio.create_subprocess_shell(
                         cmd,
                         cwd=str(workspace_root),
                         stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
+                        stderr=asyncio.subprocess.PIPE,
                     )
 
                 stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
@@ -111,19 +103,7 @@ class RealToolExecutionFactory:
 
     @staticmethod
     def create_python_executor(workspace_root: Path) -> Callable[..., Any]:
-        """
-        Build an async Python executor that writes the given source to a
-        temporary file inside `workspace_root` and runs it via `sys.executable`.
-
-        The returned callable accepts:
-            code (str, positional or keyword),
-            or `script` / `py_code` as aliases.
-
-        The temporary file is always removed in a `finally` block.
-
-        Returns:
-            Async callable returning stdout (and stderr) as a string.
-        """
+        """Build an async Python executor running strictly within workspace_root."""
         async def _execute_python(code: str = "", **kwargs: Any) -> str:
             py_code = code or kwargs.get("script") or kwargs.get("py_code") or ""
             if not py_code.strip():
@@ -137,7 +117,7 @@ class RealToolExecutionFactory:
                     str(script_file),
                     cwd=str(workspace_root),
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
+                    stderr=asyncio.subprocess.PIPE,
                 )
                 stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
                 out_str = decode_terminal_bytes(stdout)
@@ -158,25 +138,18 @@ class RealToolExecutionFactory:
 
     @staticmethod
     def create_str_replace_editor_executor(workspace_root: Path) -> Callable[..., Any]:
-        """
-        Build an async editor executor.
-
-        First tries to delegate to the PELDRUN core
-        :class:`StrReplaceEditorTool`.  If that import fails, it uses a
-        minimal fallback implementation supporting `create`, `view`, and
-        `str_replace` commands, with strict path-traversal protection.
-
-        Returns:
-            Async callable returning the editor's textual output.
-        """
+        """Build an async editor executor with path traversal protection."""
         try:
             from peldrun.tools.builtins.str_replace_editor import StrReplaceEditorTool
+
             editor = StrReplaceEditorTool(workspace_root=str(workspace_root))
+
             async def _run_core_editor(**kwargs: Any) -> str:
                 res = editor.execute(**kwargs)
                 if inspect.isawaitable(res):
                     res = await res
                 return str(res.output if hasattr(res, "output") else res)
+
             return _run_core_editor
         except Exception:
             async def _fallback_editor(
@@ -185,7 +158,7 @@ class RealToolExecutionFactory:
                 file_text: str = "",
                 old_str: str = "",
                 new_str: str = "",
-                **kwargs: Any
+                **kwargs: Any,
             ) -> str:
                 if not path:
                     return "Error: 'path' parameter is required for editor operations."
@@ -217,16 +190,7 @@ class RealToolExecutionFactory:
 
     @staticmethod
     def create_web_search_executor(workspace_root: Optional[Path] = None) -> Callable[..., Any]:
-        """
-        Executes web search with direct citations and link attribution.
-        First delegates to peldrun-core WebSearchTool, then falls back to resilient multi-engine scraping.
-
-        The returned callable also keeps an internal set of already-seen
-        queries to discourage the LLM from spamming identical searches.
-
-        Returns:
-            Async callable returning a Markdown-formatted list of results.
-        """
+        """Executes web search with direct citations and link attribution."""
         seen_queries: set = set()
 
         async def _execute_search(query: str = "", max_results: int = 5, **kwargs: Any) -> str:
@@ -248,12 +212,21 @@ class RealToolExecutionFactory:
             # 1. Attempt delegation to peldrun-core built-in tool
             try:
                 from peldrun.tools.builtins.web_search import WebSearchTool
+
                 core_search = WebSearchTool(workspace_root=str(workspace_root) if workspace_root else None)
                 res = await core_search.aexecute(query=clean_q, max_results=limit)
                 if res and res.output and "No concise web snippets" not in str(res.output):
                     return str(res.output)
             except Exception:
                 pass
+
+            # Guard against missing beautifulsoup4 dependency
+            if BeautifulSoup is None:
+                return (
+                    f"Search completed for '{clean_q}'. No web snippets were returned. "
+                    "Notice: 'beautifulsoup4' is not installed in the environment. "
+                    "Install it via 'pip install beautifulsoup4' to enable HTML scraping fallback."
+                )
 
             # 2. Resilient DuckDuckGo Lite multi-engine fallback
             headers = {
@@ -294,10 +267,12 @@ class RealToolExecutionFactory:
             if results:
                 lines = [
                     f"### Verified Web Search Results for: '{clean_q}'",
-                    "*(You MUST cite these sources and include their target URLs in your response)*\n"
+                    "*(You MUST cite these sources and include their target URLs in your response)*\n",
                 ]
                 for i, r in enumerate(results, 1):
-                    lines.append(f"**{i}. [{r['title']}]({r['url']})**\n   - **URL:** {r['url']}\n   - **Snippet:** {r['snippet']}\n")
+                    lines.append(
+                        f"**{i}. [{r['title']}]({r['url']})**\n   - **URL:** {r['url']}\n   - **Snippet:** {r['snippet']}\n"
+                    )
                 return "\n".join(lines).strip()
 
             return (
@@ -310,20 +285,12 @@ class RealToolExecutionFactory:
 
     @staticmethod
     def create_browser_executor(workspace_root: Optional[Path] = None) -> Callable[..., Any]:
-        """
-        Executes genuine web page inspection, extracting page titles, article headlines,
-        direct URLs, and clean text content from the target website.
-
-        Returns:
-            Async callable that fetches the target URL and returns a
-            Markdown-formatted report with headline links and truncated
-            body text.
-        """
+        """Executes web page inspection, extracting titles, articles, and text content."""
         async def _execute_browser(
             url: str = "",
             action: str = "extract_content",
             selector: Optional[str] = None,
-            **kwargs: Any
+            **kwargs: Any,
         ) -> str:
             target_url = url or kwargs.get("link") or kwargs.get("href") or ""
             if not target_url.strip():
@@ -331,6 +298,12 @@ class RealToolExecutionFactory:
 
             if not target_url.startswith("http://") and not target_url.startswith("https://"):
                 target_url = f"https://{target_url}"
+
+            if BeautifulSoup is None:
+                return (
+                    f"Error accessing URL '{target_url}': 'beautifulsoup4' is not installed in the environment. "
+                    "Install it via 'pip install beautifulsoup4' to enable web page content extraction."
+                )
 
             headers = {
                 "User-Agent": (
@@ -351,13 +324,11 @@ class RealToolExecutionFactory:
 
                 soup = BeautifulSoup(html_text, "html.parser")
 
-                # Remove non-content noisy tags
                 for element in soup(["script", "style", "nav", "footer", "header", "noscript", "svg", "form"]):
                     element.decompose()
 
                 page_title = soup.title.string.strip() if soup.title and soup.title.string else target_url
 
-                # Extract prominent articles and outbound links
                 extracted_links = []
                 for a_tag in soup.find_all("a", href=True):
                     a_text = a_tag.get_text(separator=" ", strip=True)
@@ -370,7 +341,6 @@ class RealToolExecutionFactory:
                     if len(extracted_links) >= 12:
                         break
 
-                # Extract cleaned body text
                 body_text = soup.get_text(separator="\n", strip=True)
                 body_text = re.sub(r"\n{3,}", "\n\n", body_text)
                 truncated_text = body_text[:3000]
@@ -397,19 +367,7 @@ class RealToolExecutionFactory:
 
     @staticmethod
     def create_human_input_executor() -> Callable[..., Any]:
-        """
-        Executes interactive human suspension. Blocks autonomous agent execution until
-        the human user answers via UI (input field or choice buttons) or API.
-
-        Uses two synchronization channels:
-          1. A job-scoped `asyncio.Event` (from `omweb.agent_bridge`).
-          2. The PELDRUN core `HumanInputRegistry` future (if available).
-
-        Whichever completes first wins.  Both are cleaned up in `finally`.
-
-        Returns:
-            Async callable returning the human's response as a string.
-        """
+        """Executes interactive human suspension blocking until user resolution."""
         async def _execute_human_input(prompt: str = "", **kwargs: Any) -> str:
             question = prompt or kwargs.get("query") or kwargs.get("question") or ""
             input_type = kwargs.get("input_type", "text")
@@ -420,22 +378,20 @@ class RealToolExecutionFactory:
             if not active_job:
                 return f"Human Input Received: {question}"
 
-            # 1. Initialize job-scoped suspension event
             event = asyncio.Event()
             human_answers[active_job] = event
 
-            # 2. Register future in peldrun-core HumanInputRegistry
             future = None
             try:
                 from peldrun.tools.builtins.human_input import HumanInputRegistry
+
                 future = HumanInputRegistry.register_request(
                     active_job,
-                    {"prompt": question, "input_type": input_type, "options": options, "job_id": active_job}
+                    {"prompt": question, "input_type": input_type, "options": options, "job_id": active_job},
                 )
             except Exception:
                 pass
 
-            # 3. Wait asynchronously for user resolution
             try:
                 async def wait_event() -> str:
                     await event.wait()
@@ -448,7 +404,7 @@ class RealToolExecutionFactory:
                 done, pending = await asyncio.wait(
                     waiters,
                     timeout=timeout_val,
-                    return_when=asyncio.FIRST_COMPLETED
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
 
                 for p in pending:
@@ -467,6 +423,7 @@ class RealToolExecutionFactory:
                 human_data.pop(active_job, None)
                 try:
                     from peldrun.tools.builtins.human_input import HumanInputRegistry
+
                     HumanInputRegistry.cancel_request(active_job)
                 except Exception:
                     pass
