@@ -457,7 +457,7 @@ export function LLMTab({
         </p>
 
         {/* 4 Professional Sub-Tabs */}
-        <div className="flex items-center gap-2 mt-4 border-b border-border/60 w-full bg-card">
+        <div className="flex items-center gap-2 mt-4 border-b border-border/60 w-full bg-card m-auto max-auto">
           <button
             type="button"
             onClick={() => setActiveSubTab("overview")}

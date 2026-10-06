@@ -16,7 +16,7 @@ max_content_length = 2000
 
 [search]
 engine = "DuckDuckGo"
-fallback_engines = [ "DuckDuckGo", "Baidu", "Bing",]
+fallback_engines = [ "Baidu", "Bing", "DuckDuckGo", "Google",]
 retry_delay = 60
 max_retries = 3
 lang = "en"

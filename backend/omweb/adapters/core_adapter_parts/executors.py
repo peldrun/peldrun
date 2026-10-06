@@ -1,12 +1,12 @@
 """
-Concrete executor factories for every PELDRUN built-in tool.
+backend/omweb/adapters/core_adapter_parts/executors.py
 
-The single public class :class:`RealToolExecutionFactory` exposes one
-static factory method per tool. Each factory returns an async callable
-bound to a specific workspace directory without global process CWD mutations.
-Hardened under Phase M2 & Bash Sanitization:
-- Intercepts blocking foreground web servers (e.g. python -m http.server) with immediate notices.
-- Cleanses accidental Windows absolute paths in shell commands to prevent backslash escape corruption.
+Concrete executor factories for PELDRUN built-in tools.
+Hardened under PR 3 (Durable HITL & State Persistence):
+- Guarantees job_id != request_id: assigns distinct request_id for human input.
+- Connects human execution directly to RunStore and HumanInputRegistry.
+- Cleanses accidental Windows absolute paths in bash commands.
+- Traversal protection in str_replace_editor and safe terminal output decoding.
 """
 
 from __future__ import annotations
@@ -17,12 +17,13 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 from typing import Any, Callable, Dict, List, Optional
 import urllib.parse
+import uuid
 
 import httpx
 
-# Resilient optional dependency handling for HTML parsing
 try:
     from bs4 import BeautifulSoup
 except ImportError:
@@ -30,7 +31,6 @@ except ImportError:
 
 from .terminal_utils import decode_terminal_bytes, find_safe_bash_executable
 
-# Optional bridge to the web platform's human-in-the-loop machinery.
 try:
     from omweb.agent_bridge import current_active_job_id, human_answers, human_data
 except ImportError:
@@ -52,7 +52,7 @@ class RealToolExecutionFactory:
             if not cmd.strip():
                 return "Error: No command provided to bash terminal."
 
-            # 1. Intercept blocking foreground servers to prevent 60-second timeouts
+            # 1. Intercept blocking foreground servers
             if re.search(r"python(?:3)?\s+-m\s+http\.server", cmd, re.IGNORECASE):
                 return (
                     "[Notice] Local web server command intercepted: In PELDRUN, web deliverables "
@@ -60,7 +60,7 @@ class RealToolExecutionFactory:
                     "A blocking foreground server process is not required and has been safely simulated."
                 )
 
-            # 2. Sanitize accidental absolute Windows workspace paths to prevent backslash stripping
+            # 2. Sanitize accidental absolute Windows workspace paths
             ws_str_win = str(workspace_root)
             ws_str_posix = str(workspace_root).replace("\\", "/")
             ws_str_escaped = ws_str_win.replace("\\", "\\\\")
@@ -72,7 +72,6 @@ class RealToolExecutionFactory:
             if ws_str_posix in cmd:
                 cmd = cmd.replace(ws_str_posix, ".")
 
-            # Convert any remaining Windows drive letter backslashes (e.g. C:\ or D:\) to forward slashes
             if sys.platform == "win32":
                 cmd = re.sub(r"([a-zA-Z]):\\", r"\1:/", cmd)
                 cmd = cmd.replace(".\\", "./")
@@ -237,7 +236,6 @@ class RealToolExecutionFactory:
                 )
             seen_queries.add(norm_q)
 
-            # 1. Attempt delegation to peldrun-core built-in tool
             try:
                 from peldrun.tools.builtins.web_search import WebSearchTool
 
@@ -248,15 +246,12 @@ class RealToolExecutionFactory:
             except Exception:
                 pass
 
-            # Guard against missing beautifulsoup4 dependency
             if BeautifulSoup is None:
                 return (
                     f"Search completed for '{clean_q}'. No web snippets were returned. "
-                    "Notice: 'beautifulsoup4' is not installed in the environment. "
-                    "Install it via 'pip install beautifulsoup4' to enable HTML scraping fallback."
+                    "Notice: 'beautifulsoup4' is not installed in the environment."
                 )
 
-            # 2. Resilient DuckDuckGo Lite multi-engine fallback
             headers = {
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -291,7 +286,6 @@ class RealToolExecutionFactory:
             except Exception:
                 pass
 
-            # 3. Format structured results with full Markdown links
             if results:
                 lines = [
                     f"### Verified Web Search Results for: '{clean_q}'",
@@ -303,11 +297,7 @@ class RealToolExecutionFactory:
                     )
                 return "\n".join(lines).strip()
 
-            return (
-                f"Search completed for '{clean_q}'. No web snippets were returned by search engines at this moment. "
-                "Notice: Do not repeat search queries. Synthesize your final answer with available knowledge, "
-                "or inspect specific URLs directly via 'browser_use'."
-            )
+            return f"Search completed for '{clean_q}'. No web snippets were returned by search engines at this moment."
 
         return _execute_search
 
@@ -329,8 +319,7 @@ class RealToolExecutionFactory:
 
             if BeautifulSoup is None:
                 return (
-                    f"Error accessing URL '{target_url}': 'beautifulsoup4' is not installed in the environment. "
-                    "Install it via 'pip install beautifulsoup4' to enable web page content extraction."
+                    f"Error accessing URL '{target_url}': 'beautifulsoup4' is not installed in the environment."
                 )
 
             headers = {
@@ -395,29 +384,53 @@ class RealToolExecutionFactory:
 
     @staticmethod
     def create_human_input_executor() -> Callable[..., Any]:
-        """Executes interactive human suspension blocking until user resolution."""
+        """
+        Executes interactive human suspension.
+        Decouples request_id from job_id (job_id != request_id) and integrates with RunStore.
+        """
         async def _execute_human_input(prompt: str = "", **kwargs: Any) -> str:
             question = prompt or kwargs.get("query") or kwargs.get("question") or ""
             input_type = kwargs.get("input_type", "text")
             options = kwargs.get("options", [])
             timeout_val = float(kwargs.get("timeout_seconds") or 600)
 
-            active_job = current_active_job_id.get("current", "")
-            if not active_job:
-                return f"Human Input Received: {question}"
+            active_job = current_active_job_id.get("current", "") or kwargs.get("job_id", "default_job")
+            # Strictly decouple request_id from job_id
+            distinct_request_id = kwargs.get("request_id") or f"req_{uuid.uuid4().hex[:12]}"
 
             event = asyncio.Event()
             human_answers[active_job] = event
 
             future = None
             try:
+                from peldrun.runtime.contract import HumanInputRequest, HumanInputStatus
+                from peldrun.runtime.store import get_run_store
                 from peldrun.tools.builtins.human_input import HumanInputRegistry
 
-                future = HumanInputRegistry.register_request(
-                    active_job,
-                    {"prompt": question, "input_type": input_type, "options": options, "job_id": active_job},
+                store = get_run_store()
+                h_req = HumanInputRequest(
+                    request_id=distinct_request_id,
+                    run_id=active_job,
+                    question=question,
+                    input_type=input_type,
+                    options=options,
+                    status=HumanInputStatus.PENDING,
+                    expires_at=time.time() + timeout_val,
                 )
-            except Exception:
+                await store.save_human_request(h_req)
+
+                future = HumanInputRegistry.register_request(
+                    distinct_request_id,
+                    {
+                        "request_id": distinct_request_id,
+                        "prompt": question,
+                        "input_type": input_type,
+                        "options": options,
+                        "job_id": active_job,
+                    },
+                    human_request=h_req,
+                )
+            except Exception as reg_err:
                 pass
 
             try:
@@ -452,7 +465,7 @@ class RealToolExecutionFactory:
                 try:
                     from peldrun.tools.builtins.human_input import HumanInputRegistry
 
-                    HumanInputRegistry.cancel_request(active_job)
+                    HumanInputRegistry.cancel_request(distinct_request_id)
                 except Exception:
                     pass
 

@@ -2,59 +2,105 @@
 backend/peldrun/tools/builtins/human_input.py
 
 PELDRUN Core Human Input & Interactive Dialogue Tool (ask_human).
-Provides suspension for human approval, feedback loops, and multi-choice questionnaires.
-Hardened under Phase M2 & Stabilization:
-- Pure asynchronous event-driven suspension via HumanInputRegistry and asyncio.Future.
-- Completely eliminates blocking sys.stdin reads that freeze Web API execution.
-- Strictly raises TimeoutError / CancelledError to enforce canonical terminal boundaries.
+Provides durable suspension for human approval, feedback loops, and questionnaires.
+Hardened under PR 3 (Durable HITL & State Persistence):
+- Uses RunStore as the primary persistence mechanism for HumanInputRequest.
+- Assigns distinct request_id decoupled from job_id (job_id != request_id).
+- Preserves in-memory Future for immediate single-process unblocking.
+- Supports multi-question flows without request collisions.
+- Enforces idempotent resolution.
 """
 
 from __future__ import annotations
 
 import asyncio
 import inspect
-import sys
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, model_validator
 
 from peldrun.events.schema import EventType, PeldrunEvent
+from peldrun.runtime.contract import HumanInputRequest, HumanInputStatus
+from peldrun.runtime.store import get_run_store
 from peldrun.tools.base import BaseTool, ToolResult
 
 
 class HumanInputRegistry:
-    """Centralized pending requests manager for human-in-the-loop approvals."""
+    """Centralized manager bridging in-memory futures with durable RunStore requests."""
 
     _pending_requests: Dict[str, asyncio.Future[str]] = {}
     _request_payloads: Dict[str, Dict[str, Any]] = {}
 
     @classmethod
-    def register_request(cls, request_id: str, payload: Dict[str, Any]) -> asyncio.Future[str]:
+    def register_request(
+        cls,
+        request_id: str,
+        payload: Dict[str, Any],
+        human_request: Optional[HumanInputRequest] = None,
+    ) -> asyncio.Future[str]:
+        """Register an active request in memory and sync with persistent RunStore."""
         loop = asyncio.get_running_loop()
         future: asyncio.Future[str] = loop.create_future()
         cls._pending_requests[request_id] = future
         cls._request_payloads[request_id] = payload
+
+        store = get_run_store()
+        if human_request is not None:
+            store._sync_save_human_request(human_request)
+
         return future
 
     @classmethod
     def get_pending_request(cls, request_id: str) -> Optional[Dict[str, Any]]:
-        return cls._request_payloads.get(request_id)
+        """Retrieve pending request from in-memory cache or durable storage."""
+        if request_id in cls._request_payloads:
+            return cls._request_payloads[request_id]
+
+        store = get_run_store()
+        stored = store._sync_get_human_request(request_id)
+        if stored and stored.status == HumanInputStatus.PENDING:
+            return {
+                "request_id": stored.request_id,
+                "run_id": stored.run_id,
+                "prompt": stored.question,
+                "input_type": stored.input_type,
+                "options": stored.options,
+            }
+        return None
 
     @classmethod
     def resolve_request(cls, request_id: str, response: str) -> bool:
+        """
+        Atomically and idempotently resolve a human input request.
+        Returns True if newly resolved, False if already resolved or invalid.
+        """
+        store = get_run_store()
+        # 1. Atomic resolution in durable RunStore
+        newly_resolved = store._sync_resolve_human_request(request_id, response)
+
+        # 2. Unblock in-memory coroutine if active in this process
         future = cls._pending_requests.pop(request_id, None)
         cls._request_payloads.pop(request_id, None)
         if future and not future.done():
             future.set_result(response)
             return True
-        return False
+
+        return newly_resolved
 
     @classmethod
     def cancel_request(cls, request_id: str) -> None:
+        """Cancel pending request in both memory and storage."""
         future = cls._pending_requests.pop(request_id, None)
         cls._request_payloads.pop(request_id, None)
         if future and not future.done():
             future.cancel()
+
+        store = get_run_store()
+        req = store._sync_get_human_request(request_id)
+        if req and req.status == HumanInputStatus.PENDING:
+            req.status = HumanInputStatus.CANCELLED
+            store._sync_save_human_request(req)
 
 
 class HumanInputArgs(BaseModel):
@@ -138,12 +184,17 @@ class HumanInputTool(BaseTool):
         request_id: Optional[str] = None,
         **kwargs: Any,
     ) -> ToolResult:
-        req_id = request_id or str(uuid.uuid4())
+        # Guarantee dedicated unique request_id (distinct from job_id)
+        req_id = request_id or f"req_{uuid.uuid4().hex[:12]}"
         timeout_val = float(timeout_seconds) if timeout_seconds else 600.0
         opts = options or []
 
+        # Derive parent run identifier
+        parent_run_id = str(getattr(self.emitter, "run_id", "default_run"))
+
         payload = {
             "request_id": req_id,
+            "run_id": parent_run_id,
             "prompt": prompt,
             "question": prompt,
             "input_type": input_type,
@@ -151,8 +202,24 @@ class HumanInputTool(BaseTool):
             "timeout_seconds": timeout_val,
         }
 
-        # 1. Register future in registry
-        future = HumanInputRegistry.register_request(req_id, payload)
+        # Build formal durable request specification
+        human_req = HumanInputRequest(
+            request_id=req_id,
+            run_id=parent_run_id,
+            question=prompt,
+            input_type=input_type,
+            options=opts,
+            status=HumanInputStatus.PENDING,
+            expires_at=time.time() + timeout_val,
+            metadata=payload,
+        )
+
+        # 1. Register in memory and persist into RunStore
+        future = HumanInputRegistry.register_request(
+            request_id=req_id,
+            payload=payload,
+            human_request=human_req,
+        )
 
         # 2. Dispatch event to active stream
         if self.emitter is not None:
@@ -160,6 +227,7 @@ class HumanInputTool(BaseTool):
                 event_obj = PeldrunEvent(
                     type=EventType.ASK_HUMAN,
                     step=1,
+                    run_id=parent_run_id,
                     payload=payload,
                 )
                 res = self.emitter.emit(event_obj)
@@ -173,7 +241,7 @@ class HumanInputTool(BaseTool):
                 except Exception:
                     pass
 
-        # 3. Pure non-blocking asynchronous suspension
+        # 3. Asynchronous wait with automatic timeout handling
         try:
             response = await asyncio.wait_for(future, timeout=timeout_val)
             return ToolResult(

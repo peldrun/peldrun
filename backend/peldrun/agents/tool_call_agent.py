@@ -2,15 +2,12 @@
 backend/peldrun/agents/tool_call_agent.py
 
 Autonomous Tool Calling Agent for PELDRUN Core Runtime.
-
-Executes Think-Act cycles with reliable tool dispatching directly on tool instances
-or session-scoped ToolRegistry, maintaining full conversation history and synchronized
-Pydantic ChatMessage lifecycle contracts with ExecutionState.
-Hardened under Phase M2 & ASK_HUMAN Runtime Stabilization:
-- Automatic pre-allocation of request_id for human input interactions.
-- Strictly enforces non-empty canonical tool_call_id to eliminate provider 400 schema rejections.
-- Explicit WAITING_FOR_HUMAN and RUNNING lifecycle transitions.
-- Propagates cancellation and timeout exceptions to enforce terminal states.
+Implements the StepExecutableAgent protocol driving atomic reasoning-action steps.
+Hardened under PR 2 (Single Execution Authority):
+- Removes internal standalone execution loops; delegates run_task() and arun() to AgentRunner.
+- Completely removes fake synthetic 'terminate' fallback on LLM failure, ensuring genuine error propagation.
+- Enforces strict canonical tool_call_id generation.
+- Emits atomic THINK and ACT cycles strictly per step.
 """
 
 from __future__ import annotations
@@ -24,7 +21,7 @@ from typing import Any, Dict, List, Optional, Union
 import uuid
 
 from peldrun.agents.base import AgentConfig, BaseAgent
-from peldrun.engine.state import ChatMessage, ExecutionState, MessageRole
+from peldrun.engine.state import ExecutionState, MessageRole
 from peldrun.events.emitter import EventEmitter
 from peldrun.events.schema import EventType, PeldrunEvent
 from peldrun.llm.client import LLMResponse, ToolCall
@@ -35,8 +32,8 @@ logger = logging.getLogger("peldrun.agents.tool_call_agent")
 
 
 class ToolCallAgent(BaseAgent):
-    """Autonomous ReAct agent executing real tool invocations on concrete tool instances.
-
+    """
+    Autonomous ReAct agent executing real tool invocations on concrete tool instances.
     Maintains full multi-turn conversational state synchronized with ExecutionState
     and satisfies the StepExecutableAgent protocol contract for AgentRunner.
     """
@@ -112,7 +109,7 @@ class ToolCallAgent(BaseAgent):
         self.system_prompt = prompt
 
     async def _emit(self, event_type: EventType, step: int, payload: Dict[str, Any]) -> None:
-        """Dispatch typed events to registered listeners safely across async loops."""
+        """Dispatch typed events safely to the registered EventEmitter."""
         if not self.emitter:
             return
         try:
@@ -129,7 +126,7 @@ class ToolCallAgent(BaseAgent):
                 pass
 
     def _get_tools_schema(self) -> List[Dict[str, Any]]:
-        """Extract OpenAI-compatible function calling schemas from active tools container."""
+        """Extract function calling schemas from active tools container."""
         tools_obj = getattr(self, "tool_registry", None) or getattr(self, "tool_collection", None) or getattr(self, "tools", None)
         if tools_obj is None:
             return []
@@ -160,7 +157,7 @@ class ToolCallAgent(BaseAgent):
         return []
 
     def _resolve_tool_instance(self, tool_name: str) -> Optional[Any]:
-        """Locate concrete tool instance from registry, collection, or dictionary map."""
+        """Locate concrete tool instance from registry or collection."""
         tools_obj = getattr(self, "tool_registry", None) or getattr(self, "tool_collection", None) or getattr(self, "tools", None)
         if not tools_obj:
             return None
@@ -194,7 +191,7 @@ class ToolCallAgent(BaseAgent):
         return None
 
     def _sync_messages_from_state(self, state: ExecutionState) -> None:
-        """Synchronize in-memory LLM payload from execution state messages."""
+        """Synchronize in-memory message history from ExecutionState messages."""
         if state.messages:
             self.messages = [msg.to_llm_dict() for msg in state.messages]
         else:
@@ -248,36 +245,30 @@ class ToolCallAgent(BaseAgent):
         except Exception as exc:
             err_str = str(exc).lower()
             if "terminated" in err_str or "context" in err_str or "400" in err_str:
-                logger.warning("Local provider rejected full context (%s). Retrying with emergency fallback.", exc)
-                emergency_msgs = list(self.messages[:2]) + list(self.messages[-6:])
-                while emergency_msgs and len(emergency_msgs) > 2 and emergency_msgs[2].get("role") == "tool":
-                    emergency_msgs.pop(2)
+                logger.warning("Local provider rejected full context (%s). Retrying with compacted context.", exc)
+                compact_msgs = list(self.messages[:2]) + list(self.messages[-6:])
+                while compact_msgs and len(compact_msgs) > 2 and compact_msgs[2].get("role") == "tool":
+                    compact_msgs.pop(2)
 
-                if not emergency_msgs or not any(m.get("role") == "user" for m in emergency_msgs):
-                    emergency_msgs = [
+                if not compact_msgs or not any(m.get("role") == "user" for m in compact_msgs):
+                    compact_msgs = [
                         {"role": "system", "content": self.system_prompt},
                         {"role": "user", "content": (self.state.task_prompt if self.state else "") or "Proceed with task."},
                     ]
 
-                try:
-                    response = await _call_llm(emergency_msgs)
-                except Exception:
-                    return LLMResponse(
-                        content="Concluded task execution based on prior observations.",
-                        tool_calls=[ToolCall(name="terminate", arguments={})],
-                    )
+                # Genuine LLM retry with compacted context; no synthetic termination on secondary failure
+                response = await _call_llm(compact_msgs)
             else:
                 raise
 
         thought_val = response.reasoning or response.thought or response.content or ""
         if thought_val:
-            print(f"[CORE LIVE STREAM] Thought: {thought_val[:90]}...")
             await self._emit(EventType.THOUGHT, step=step, payload={"thought": thought_val})
 
         return response
 
     async def act(self, step: int, tool_calls: List[ToolCall]) -> List[str]:
-        """Execute proposed tool calls and append observation messages."""
+        """Execute proposed tool calls and record observations into state and message log."""
         observations: List[str] = []
 
         for call in tool_calls:
@@ -297,10 +288,13 @@ class ToolCallAgent(BaseAgent):
                 if not args.get("request_id"):
                     args["request_id"] = str(uuid.uuid4())
                 if self.state is not None:
-                    self.state.mark_waiting_for_human()
+                    self.state.mark_waiting_for_input(reason="Agent invoked interactive human tool")
 
-            print(f"[CORE LIVE STREAM] Tool Call: {tool_name}({json.dumps(args, ensure_ascii=False)[:80]})")
-            await self._emit(EventType.TOOL_CALL, step=step, payload={"tool_name": tool_name, "arguments": args})
+            await self._emit(
+                EventType.TOOL_CALL,
+                step=step,
+                payload={"tool_name": tool_name, "arguments": args, "tool_call_id": call_id},
+            )
 
             output_str = ""
             tool_inst = self._resolve_tool_instance(tool_name)
@@ -328,7 +322,7 @@ class ToolCallAgent(BaseAgent):
                         )
 
                     if is_human_tool and self.state is not None:
-                        self.state.mark_running()
+                        self.state.mark_running(reason="Human response received and processed")
 
                     if isinstance(res, ToolResult):
                         if res.is_error:
@@ -342,20 +336,23 @@ class ToolCallAgent(BaseAgent):
 
                 except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError) as flow_err:
                     if is_human_tool and self.state is not None:
-                        self.state.mark_error(f"Human interaction aborted: {str(flow_err)}")
+                        self.state.mark_failed(f"Human interaction aborted: {flow_err}", error_code="FLOW_ABORTED")
                     raise flow_err
 
                 except Exception as ex:
                     if is_human_tool and self.state is not None:
-                        self.state.mark_running()
+                        self.state.mark_running(reason="Error handled during human interaction")
                     output_str = f"Error executing tool '{tool_name}': {str(ex)}"
             else:
                 if is_human_tool and self.state is not None:
-                    self.state.mark_running()
+                    self.state.mark_running(reason="Missing human tool handled")
                 output_str = f"Error: Tool '{tool_name}' not found in active collection."
 
-            print(f"[CORE LIVE STREAM] Observation: {output_str[:90]}...")
-            await self._emit(EventType.OBSERVATION, step=step, payload={"tool_name": tool_name, "output": output_str})
+            await self._emit(
+                EventType.OBSERVATION,
+                step=step,
+                payload={"tool_name": tool_name, "output": output_str, "tool_call_id": call_id},
+            )
 
             self.messages.append({
                 "role": "tool",
@@ -383,7 +380,10 @@ class ToolCallAgent(BaseAgent):
         return observations
 
     async def step(self, state: ExecutionState, emitter: EventEmitter) -> bool:
-        """Execute a single ReAct step driving the AgentRunner lifecycle contract."""
+        """
+        Execute a single ReAct step driving the AgentRunner lifecycle contract.
+        Returns True when the task has concluded, False to request the next iteration.
+        """
         self.state = state
         self.emitter = emitter
         self.current_step = state.current_step
@@ -437,72 +437,25 @@ class ToolCallAgent(BaseAgent):
         return False
 
     async def _astep(self) -> bool:
-        """Backward-compatible internal step implementation for standalone run_task."""
-        step = self.current_step
-        response = await self.think(step=step)
-
-        if not response.tool_calls:
-            self._final_answer = response.content or response.thought or response.reasoning or "Task completed."
-            return False
-
-        for tc in response.tool_calls:
-            if not tc.id:
-                tc.id = f"call_{uuid.uuid4().hex[:12]}"
-
-        tool_calls_payload = [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {
-                    "name": tc.name,
-                    "arguments": json.dumps(tc.arguments, ensure_ascii=False) if isinstance(tc.arguments, dict) else str(tc.arguments),
-                },
-            }
-            for tc in response.tool_calls
-        ]
-        self.messages.append({
-            "role": "assistant",
-            "content": response.content or "",
-            "tool_calls": tool_calls_payload,
-        })
-
-        observations = await self.act(step=step, tool_calls=response.tool_calls)
-
-        has_terminated = any(tc.name.lower() in ("terminate", "done") for tc in response.tool_calls)
-        if has_terminated:
-            self._final_answer = response.content or (observations[-1] if observations else "Task completed via termination tool.")
-            return False
-
-        return True
+        """Internal step delegate for backward compatibility."""
+        if self.state is None:
+            self.state = ExecutionState(task_prompt="Default task", workspace_root=str(self.workspace_dir))
+        return not (await self.step(state=self.state, emitter=self.emitter))
 
     async def run_task(self, prompt: str, max_steps: int = 30) -> str:
-        """Run the ReAct loop until task termination or step limit exhaustion."""
-        self.messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": prompt},
-        ]
-        self._final_answer = ""
+        """
+        Compatibility shim delegating execution directly to canonical AgentRunner.
+        Ensures all executions pass through the unified runtime authority.
+        """
+        from peldrun.engine.runner import AgentRunner, RunnerConfig
 
-        for step in range(1, max_steps + 1):
-            self.current_step = step
-            print(f"[CORE LIVE STREAM] Step {step} Started...")
-            await self._emit(EventType.STEP_START, step=step, payload={"step": step})
-
-            should_continue = await self._astep()
-
-            await self._emit(
-                EventType.STEP_END,
-                step=step,
-                payload={"step": step, "status": "completed" if not should_continue else "progress"},
-            )
-
-            if not should_continue:
-                break
-
-        return self._final_answer or "Task execution finished."
+        runner_config = RunnerConfig(max_steps=max_steps)
+        runner = AgentRunner(agent=self, emitter=self.emitter, config=runner_config)
+        state = await runner.run(task_prompt=prompt, workspace_root=str(self.workspace_dir))
+        return state.final_output or self._final_answer or "Task execution finished."
 
     async def arun(self, task: str = "", max_steps: Optional[int] = None, **kwargs: Any) -> Any:
-        """Unified entrypoint executing agent task asynchronously."""
+        """Compatibility entrypoint delegating to run_task which executes via AgentRunner."""
         prompt_val = task or kwargs.get("prompt", "")
         limit_val = max_steps or getattr(self.config, "max_steps", 30)
         return await self.run_task(prompt=prompt_val, max_steps=limit_val)

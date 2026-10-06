@@ -6,11 +6,10 @@ PELDRUN Native Embedded Execution Engine (Consolidated Architecture).
 Executes agent workflows natively through the consolidated Core lifecycle:
 EngineRunContext -> RunRequest -> AgentRunner -> ExecutionState -> StepExecutableAgent.
 
-Hardened under Phase M2 & Stabilization:
-- Decouples workspace execution: Deliverables are created ONLY when explicitly requested by user directive.
-- Relative CWD Sovereignty: Working directory '.' is already workspace root; absolute Windows paths are forbidden.
-- Strict Question Counting Protocol: Prevents off-by-one step index confusion (e.g. asking all 5 questions).
-- Human interaction via ask_human is strictly enforced without jumping prematurely to task completion.
+Hardened under PR 2 (Single Execution Authority):
+- Enforces strict terminal verification: marks job failed when state is FAILED or CANCELLED.
+- No false 'complete_job' on step exhaustion or operator cancellation.
+- Single source of truth for event consumption, artifact scanning, and terminal dispatch.
 """
 
 from __future__ import annotations
@@ -124,7 +123,7 @@ class PeldrunEngine(ExecutionEngine):
             f"[CRITICAL OPERATIONAL DIRECTIVE]\n"
             f"1. Autonomous Loop Contract: You run inside an automated agent loop. If you need to ask the user questions, gather answers, or wait for input, you MUST invoke the 'ask_human' tool for each individual interaction. DO NOT print questions as plain text, as plain text without tool calls terminates execution.\n"
             f"2. Task Scope Sovereignty: Satisfy the user's overarching objective faithfully. If the user asks for a conversation, questionnaire, or reasoning task, do NOT invent an artificial need to create workspace files or write code unless explicitly commanded.\n"
-            f"3. Strict Counting & Non-Premature Termination: When asked to perform a specific number of interactions (e.g. ask 5 questions sequentially), you must execute all of them completely (Question 1, Question 2, Question 3, Question 4, Question 5) and wait for each answer before concluding. Do not confuse step numbers with question count. Never call 'terminate' until all requested questions have been answered."
+            f"3. Strict Counting & Non-Premature Termination: When asked to perform a specific number of interactions, you must execute all of them completely and wait for each answer before concluding. Never call 'terminate' until all requested questions have been answered."
         )
 
         workspace_ctx = WorkspaceContext(
@@ -483,23 +482,10 @@ class PeldrunEngine(ExecutionEngine):
 
         scoped_prompt = (
             f"[PROJECT EXECUTION RULES]\n"
-            f"1. User Directive Sovereignty: Follow the USER TASK instructions strictly. If the user task asks you to ask questions, interview, or reason, DO NOT create files, folders, or code deliverables unless explicitly requested.\n"
-            f"2. Multi-Question Counting Protocol: When the user asks for N questions (e.g. 5 questions sequentially one at a time):\n"
-            f"   - Question 1: call ask_human -> receive Answer 1\n"
-            f"   - Question 2: call ask_human -> receive Answer 2\n"
-            f"   - Question 3: call ask_human -> receive Answer 3\n"
-            f"   - Question 4: call ask_human -> receive Answer 4\n"
-            f"   - Question 5: call ask_human -> receive Answer 5\n"
-            f"   - AFTER all 5 answers are collected: summarize the answers and call 'terminate'.\n"
-            f"   * CRITICAL: Do NOT stop after Question 4! Step index is NOT questions answered. You must ask all 5 distinct questions.\n"
-            f"3. Workspace Operations (When Relevant): If and ONLY IF the user explicitly requests building files, projects, or apps:\n"
-            f"   - Your current working directory ('.') is ALREADY the isolated workspace root for this task.\n"
-            f"   - ALWAYS use relative paths (e.g., './mini_app/index.html' or 'mini_app/index.html').\n"
-            f"   - NEVER write absolute Windows paths (e.g., 'D:\\...' or 'C:\\...') in shell commands because backslashes will be stripped by bash and corrupt file names.\n"
-            f"   - Web deliverables (HTML/CSS/JS) are rendered live in the UI Preview panel. NEVER execute blocking foreground servers like 'python -m http.server'.\n"
-            f"4. Task Conclusion: Ensure all parts of the user request are satisfied completely before calling 'terminate'.\n\n"
-            f"5. Anti-Premature Termination: If your thoughts state that you need to create or write another file (e.g. app.js), "
-            f"YOU MUST execute the tool call to create that file first. NEVER invoke 'terminate' while uncompleted deliverables remain."
+            f"1. User Directive Sovereignty: Follow USER TASK instructions strictly.\n"
+            f"2. Multi-Question Counting Protocol: Execute all sequential interactions completely before concluding.\n"
+            f"3. Workspace Operations: Current working directory is already workspace root. Use relative paths.\n"
+            f"4. Task Conclusion: Ensure all parts of the user request are satisfied completely before calling 'terminate'.\n"
             f"[USER TASK]\n"
             f"{prompt}"
         )
@@ -587,6 +573,53 @@ class PeldrunEngine(ExecutionEngine):
             for deliv in canonical_deliverables:
                 execution_state.add_deliverable(deliv)
 
+        step_count = execution_state.current_step if execution_state else current_core_step
+
+        # Enforce strict terminal state semantics from PR 1 FSM
+        if execution_state is not None and execution_state.is_failed:
+            err_msg = execution_state.metadata.get("error") or "Execution failed before reaching completion."
+            print(f"[ENGINE PELDRUN] Job {job_id} terminated as FAILED in step {step_count}: {err_msg}")
+            job_manager.fail_job(job_id, err_msg)
+            if not terminal_dispatched:
+                terminal_dispatched = True
+                await dispatch_event(
+                    job_id,
+                    SSEEvent(
+                        type=SSEEventType.ERROR,
+                        step=step_count,
+                        data={
+                            "message": err_msg,
+                            "model": model_name,
+                            "engine": self.engine_id,
+                            "produced_files": canonical_deliverables,
+                            "seq": event_seq + 1,
+                        },
+                    ),
+                )
+            return
+
+        if execution_state is not None and execution_state.is_cancelled:
+            cancel_msg = "Execution was cancelled by operator."
+            print(f"[ENGINE PELDRUN] Job {job_id} terminated as CANCELLED in step {step_count}")
+            job_manager.fail_job(job_id, cancel_msg)
+            if not terminal_dispatched:
+                terminal_dispatched = True
+                await dispatch_event(
+                    job_id,
+                    SSEEvent(
+                        type=SSEEventType.ERROR,
+                        step=step_count,
+                        data={
+                            "message": cancel_msg,
+                            "model": model_name,
+                            "engine": self.engine_id,
+                            "status": "cancelled",
+                            "seq": event_seq + 1,
+                        },
+                    ),
+                )
+            return
+
         if canonical_deliverables:
             file_bullets = "\n".join([f"- `{f}`" for f in canonical_deliverables])
             result_text = (
@@ -598,7 +631,6 @@ class PeldrunEngine(ExecutionEngine):
         else:
             result_text = sanitize_final_result_text(final_answer, latest_meaningful_thought)
 
-        step_count = execution_state.current_step if execution_state else current_core_step
         print(f"[ENGINE PELDRUN] Job {job_id} completed successfully in step {step_count}. Produced files: {canonical_deliverables}")
 
         job_manager.complete_job(job_id, result_text)

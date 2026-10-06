@@ -3,14 +3,11 @@ backend/omweb/agent_bridge_parts/dispatcher.py
 
 Authoritative dispatcher entry points for the PELDRUN Universal Agent Bridge.
 
-Dispatches execution to registered engines (native embedded PELDRUN Core
-or legacy OpenManus) via the authoritative EngineRegistry abstraction layer.
-
-Hardened under Phase M0:
-- Eliminates duplicate STEP_START emission by delegating step lifecycle
-  authority entirely to Core AgentRunner when running PELDRUN engine.
-- Enforces strict job isolation with explicit task registration (no global current_job race).
-- Deterministic cleanup of per-job state and synchronization primitives.
+Dispatches execution to registered engines via the authoritative EngineRegistry abstraction layer.
+Hardened under PR 2 (Single Execution Authority):
+- Enforces single AgentRunner authority by routing all native core runs to PeldrunEngine.
+- Strictly eliminates competing runner initialization or duplicate STEP_START events.
+- Guarantees deterministic task registration and cleanup per job.
 """
 
 from __future__ import annotations
@@ -54,14 +51,7 @@ async def run_instrumented(
 ) -> None:
     """
     Dispatch an agent job using the authoritative execution engine registry.
-
-    Args:
-        job_id: Unique job identifier.
-        prompt: User task prompt.
-        *args: Optional positional arguments (dict -> llm_override, str -> agent_id).
-        agent_id: Agent identifier (defaults to 'peldrun').
-        llm_override: Optional runtime LLM configuration overrides.
-        **kwargs: Supports 'engine' kwarg to explicitly specify target engine.
+    Ensures single runtime authority delegation.
     """
     # 0. Track current task for safe cancellation
     current_task = asyncio.current_task()
@@ -128,7 +118,7 @@ async def run_instrumented(
         return
 
     if manifest.get("status") == "disabled":
-        err_msg = f"Agent '{manifest.get('name', agent_id)}' is currently disabled in the Capability Store. Enable it first to run tasks."
+        err_msg = f"Agent '{manifest.get('name', agent_id)}' is currently disabled in Capability Store. Enable it first."
         job_manager.fail_job(job_id, err_msg)
         await dispatch_event(
             job_id,
@@ -192,7 +182,6 @@ async def run_instrumented(
     is_native_core = target_engine_str in ("peldrun", "peldrun-core", "core")
 
     if not is_native_core:
-        # Backward compatibility for legacy engines (e.g., OpenManus) that do not emit core lifecycle events
         await asyncio.sleep(0.05)
         await dispatch_event(
             job_id,
@@ -209,8 +198,6 @@ async def run_instrumented(
             ),
         )
     else:
-        # PELDRUN Core Native: Core AgentRunner owns STEP_START/STEP_END lifecycle.
-        # Dispatcher optionally emits control/status event without competing for execution steps.
         status_event_type = getattr(SSEEventType, "STATUS", None) or getattr(SSEEventType, "RUN_ACCEPTED", None)
         if status_event_type is not None:
             await dispatch_event(
@@ -235,7 +222,7 @@ async def run_instrumented(
     project_dir = project_manager.get_chat_files_dir(chat_id, project_id)
     project_dir.mkdir(parents=True, exist_ok=True)
 
-    # 8. Immutable Context Preparation & Execution
+    # 8. Execution through Authoritative Engine Interface
     context = EngineRunContext(
         job_id=job_id,
         prompt=prompt,

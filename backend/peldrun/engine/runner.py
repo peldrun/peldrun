@@ -3,10 +3,11 @@ backend/peldrun/engine/runner.py
 
 PELDRUN Core Agent Execution Runner.
 Coordinates agent lifecycle, asynchronous execution loops, checkpointing, and event emission.
-Hardened under Phase M2 & WAITING_FOR_HUMAN Lifecycle Stabilization:
-- Suspends step execution timeout during WAITING_FOR_HUMAN status.
-- Responds instantly to operator cancellation during human interaction.
-- Enforces single canonical terminal outcome.
+Hardened under PELDRUN Runtime V1:
+- Semantic cancellation pipeline: RUNNING -> CANCELLING -> CANCELLED (never PAUSED).
+- Max-step exhaustion handled strictly as FAILED with MAX_STEPS_EXCEEDED (never fake COMPLETED).
+- All lifecycle modifications pass strictly through ExecutionState FSM validators.
+- Timeout suspension preserved during human interactions.
 """
 
 from __future__ import annotations
@@ -54,7 +55,8 @@ class RunnerConfig(BaseModel):
 class AgentRunner:
     """Primary execution controller for PELDRUN agents.
 
-    Drives the step-by-step reasoning cycle, event dissemination, and graceful termination.
+    Drives step-by-step reasoning cycle, event dissemination, and graceful termination.
+    Guarantees strict lifecycle state machine adherence.
     """
 
     def __init__(
@@ -151,7 +153,9 @@ class AgentRunner:
 
         self._cancel_requested.clear()
         self._pause_requested.clear()
-        state.status = ExecutionStatus.RUNNING
+
+        # Enforce formal FSM transition to RUNNING
+        state.mark_running(reason="Starting agent execution loop")
 
         await self.emitter.emit_snapshot(self._build_snapshot_payload(state))
 
@@ -161,24 +165,30 @@ class AgentRunner:
         try:
             while state.current_step < self.config.max_steps and not is_complete:
                 if self.is_cancelled:
-                    logger.info("Agent run %s cancelled by operator.", state.run_id)
-                    state.status = ExecutionStatus.PAUSED
+                    logger.info("Agent run %s cancellation requested by operator.", state.run_id)
+                    state.mark_cancelling(reason="Operator triggered cancellation")
+                    state.mark_cancelled(reason="Operator cancelled run")
                     await self.emitter.emit_error(
                         message="Execution cancelled by operator.",
                         error_type="CancelledError",
-                        recoverable=True,
+                        recoverable=False,
                         step=state.current_step,
                     )
                     break
 
                 while self.is_paused and not self.is_cancelled:
-                    state.status = ExecutionStatus.PAUSED
+                    if state.status != ExecutionStatus.PAUSED:
+                        state.mark_paused(reason="Operator requested pause")
                     await asyncio.sleep(0.5)
 
                 if self.is_cancelled:
+                    state.mark_cancelling(reason="Operator cancelled run during pause")
+                    state.mark_cancelled(reason="Cancelled by operator")
                     break
 
-                state.status = ExecutionStatus.RUNNING
+                if state.status == ExecutionStatus.PAUSED:
+                    state.mark_running(reason="Resuming from paused state")
+
                 state.current_step += 1
                 step_index = state.current_step
 
@@ -186,13 +196,13 @@ class AgentRunner:
                     self.config.total_timeout_seconds
                     and (time.time() - global_start_time) > self.config.total_timeout_seconds
                 ):
-                    raise TimeoutError(
-                        f"Global execution timeout reached ({self.config.total_timeout_seconds}s)."
-                    )
+                    timeout_msg = f"Global execution timeout reached ({self.config.total_timeout_seconds}s)."
+                    state.mark_failed(timeout_msg, error_code="GLOBAL_TIMEOUT")
+                    raise TimeoutError(timeout_msg)
 
                 await self.emitter.emit_step_start(step_number=step_index)
 
-                # Decoupled step iteration with WAITING_FOR_HUMAN suspension support
+                # Decoupled step iteration with human wait suspension support
                 step_task = asyncio.create_task(
                     active_agent.step(state=state, emitter=self.emitter)
                 )
@@ -203,7 +213,9 @@ class AgentRunner:
                         step_task.cancel()
                         break
 
-                    is_waiting_human = (state.status == ExecutionStatus.WAITING_FOR_HUMAN)
+                    is_waiting_human = (
+                        state.status in (ExecutionStatus.WAITING_FOR_INPUT, ExecutionStatus.WAITING_FOR_HUMAN)
+                    )
 
                     try:
                         await asyncio.wait_for(asyncio.shield(step_task), timeout=1.0)
@@ -223,19 +235,23 @@ class AgentRunner:
                             and elapsed_step > self.config.step_timeout_seconds
                         ):
                             step_task.cancel()
-                            raise TimeoutError(
+                            step_timeout_msg = (
                                 f"Step {step_index} exceeded execution timeout of {self.config.step_timeout_seconds}s."
                             )
+                            state.mark_failed(step_timeout_msg, error_code="STEP_TIMEOUT")
+                            raise TimeoutError(step_timeout_msg)
 
                 if self.is_cancelled:
-                    state.status = ExecutionStatus.PAUSED
+                    if not state.is_terminal:
+                        state.mark_cancelling(reason="Operator cancelled step execution")
+                        state.mark_cancelled(reason="Execution cancelled by operator")
                     break
 
                 is_complete = await step_task
 
-                # Restore running status if agent was unblocked from waiting for human
-                if state.status == ExecutionStatus.WAITING_FOR_HUMAN:
-                    state.status = ExecutionStatus.RUNNING
+                # Restore running status if agent returned from waiting for human input
+                if state.status in (ExecutionStatus.WAITING_FOR_INPUT, ExecutionStatus.WAITING_FOR_HUMAN):
+                    state.mark_running(reason="Resumed execution following human interaction")
 
                 if (
                     self.config.enable_checkpointing
@@ -245,21 +261,28 @@ class AgentRunner:
 
                 await self.emitter.emit_step_end(step_number=step_index)
 
-            # Post-loop status finalization
+            # Post-loop status finalization adhering strictly to Runtime V1 semantics
             if is_complete:
-                state.status = ExecutionStatus.COMPLETED
-            elif state.current_step >= self.config.max_steps and state.status == ExecutionStatus.RUNNING:
-                logger.warning("Agent reached maximum step ceiling (%d).", self.config.max_steps)
-                state.status = ExecutionStatus.COMPLETED
-                await self.emitter.emit_final(
-                    content="Execution reached maximum step limit before explicit task conclusion.",
-                    deliverables=state.deliverables,
-                    total_steps=state.current_step,
+                if state.status == ExecutionStatus.RUNNING:
+                    state.mark_completed(reason="Agent declared task conclusion")
+            elif (
+                state.current_step >= self.config.max_steps
+                and state.status == ExecutionStatus.RUNNING
+            ):
+                logger.warning("Agent reached maximum step ceiling (%d) without completing task.", self.config.max_steps)
+                ceiling_msg = f"Execution reached maximum step ceiling ({self.config.max_steps}) without completing task."
+                state.mark_failed(ceiling_msg, error_code="MAX_STEPS_EXCEEDED")
+                await self.emitter.emit_error(
+                    message=ceiling_msg,
+                    error_type="MaxStepsExceededError",
+                    details={"max_steps": self.config.max_steps, "step": state.current_step},
+                    recoverable=False,
                     step=state.current_step,
                 )
 
         except Exception as ex:
-            state.status = ExecutionStatus.FAILED
+            if not state.is_terminal:
+                state.mark_failed(str(ex), error_code=type(ex).__name__)
             logger.exception("Unhandled error in AgentRunner for run %s: %s", state.run_id, ex)
             await self.emitter.emit_error(
                 message=str(ex),

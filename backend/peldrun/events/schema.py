@@ -3,8 +3,8 @@ backend/peldrun/events/schema.py
 
 PELDRUN Core Event Protocol Schemas.
 Implements the strict Canonical Envelope Pattern using Pydantic v2 for the unified runtime lifecycle.
-Includes canonical Artifact lifecycle event models under Phase M2.
-Hardened to support flexible run_id identifiers (UUID or canonical job/chat string tokens).
+Includes canonical Artifact lifecycle and Tool Retry event models under PELDRUN Runtime V1.
+Hardened to support flexible run_id identifiers and full test-suite backward compatibility.
 """
 
 from __future__ import annotations
@@ -30,6 +30,14 @@ class EventType(str, Enum):
     ERROR = "error"
     ASK_HUMAN = "ask_human"
 
+    # Runtime V1 Execution Lifecycle Events
+    RUN_STARTED = "run_started"
+    RUN_STATUS = "run_status"
+    RUN_COMPLETED = "run_completed"  # Compatibility alias
+    RUN_CANCELLED = "run_cancelled"
+    TOOL_RETRY = "tool_retry"
+    TOOL_CALLED = "tool_called"  # Compatibility alias for tool_call
+
     # Canonical Artifact Lifecycle Events (Phase M2)
     ARTIFACT_CREATED = "artifact_created"
     ARTIFACT_UPDATED = "artifact_updated"
@@ -48,6 +56,17 @@ class SnapshotPayload(BaseModel):
     active_tools: List[str] = Field(default_factory=list)
     metadata: Dict[str, Any] = Field(default_factory=dict)
     snapshot: Optional[Dict[str, Any]] = None
+
+
+class RunStatusPayload(BaseModel):
+    """Payload for top-level runtime status transition broadcasts."""
+    model_config = ConfigDict(extra="allow")
+    status: str
+    old_status: Optional[str] = None
+    run_id: Optional[str] = None
+    reason: Optional[str] = None
+    step: int = 0
+    timestamp: float = Field(default_factory=time.time)
 
 
 class StepStartPayload(BaseModel):
@@ -88,6 +107,18 @@ class ToolCallPayload(BaseModel):
     tool_name: str
     arguments: Dict[str, Any] = Field(default_factory=dict)
     tool_call_id: str = ""
+    attempt: int = 1
+
+
+class ToolRetryPayload(BaseModel):
+    """Payload emitted when an idempotent tool fails and initiates a retry loop."""
+    model_config = ConfigDict(extra="allow")
+    tool_name: str
+    tool_call_id: str = ""
+    attempt: int = 1
+    max_attempts: int = 3
+    error: str = ""
+    delay_seconds: float = 0.0
 
 
 class ObservationPayload(BaseModel):
@@ -96,6 +127,7 @@ class ObservationPayload(BaseModel):
     output: Any = ""
     exit_code: int = 0
     is_error: bool = False
+    attempt: int = 1
     artifacts: List[Union[Dict[str, Any], str]] = Field(default_factory=list)
     tool_call_id: str = ""
 
@@ -162,10 +194,16 @@ class ArtifactPayload(BaseModel):
 
 EVENT_PAYLOAD_MAP: Dict[EventType, type[BaseModel]] = {
     EventType.SNAPSHOT: SnapshotPayload,
+    EventType.RUN_STARTED: SnapshotPayload,
+    EventType.RUN_STATUS: RunStatusPayload,
+    EventType.RUN_COMPLETED: FinalPayload,
+    EventType.RUN_CANCELLED: RunStatusPayload,
     EventType.STEP_START: StepStartPayload,
     EventType.THOUGHT: ThoughtPayload,
     EventType.AGENT_ACTIVITY: AgentActivityPayload,
     EventType.TOOL_CALL: ToolCallPayload,
+    EventType.TOOL_CALLED: ToolCallPayload,
+    EventType.TOOL_RETRY: ToolRetryPayload,
     EventType.OBSERVATION: ObservationPayload,
     EventType.STEP_END: StepEndPayload,
     EventType.FINAL: FinalPayload,
@@ -310,6 +348,10 @@ class SnapshotEvent(PeldrunEvent):
     type: Literal[EventType.SNAPSHOT] = EventType.SNAPSHOT
 
 
+class RunStatusEvent(PeldrunEvent):
+    type: Literal[EventType.RUN_STATUS] = EventType.RUN_STATUS
+
+
 class StepStartEvent(PeldrunEvent):
     type: Literal[EventType.STEP_START] = EventType.STEP_START
 
@@ -324,6 +366,10 @@ class AgentActivityEvent(PeldrunEvent):
 
 class ToolCallEvent(PeldrunEvent):
     type: Literal[EventType.TOOL_CALL] = EventType.TOOL_CALL
+
+
+class ToolRetryEvent(PeldrunEvent):
+    type: Literal[EventType.TOOL_RETRY] = EventType.TOOL_RETRY
 
 
 class ObservationEvent(PeldrunEvent):
@@ -369,10 +415,12 @@ __all__ = [
     "AgentEvent",
     "EVENT_PAYLOAD_MAP",
     "SnapshotPayload",
+    "RunStatusPayload",
     "StepStartPayload",
     "ThoughtPayload",
     "AgentActivityPayload",
     "ToolCallPayload",
+    "ToolRetryPayload",
     "ObservationPayload",
     "StepEndPayload",
     "FinalPayload",
@@ -380,10 +428,12 @@ __all__ = [
     "AskHumanPayload",
     "ArtifactPayload",
     "SnapshotEvent",
+    "RunStatusEvent",
     "StepStartEvent",
     "ThoughtEvent",
     "AgentActivityEvent",
     "ToolCallEvent",
+    "ToolRetryEvent",
     "ObservationEvent",
     "StepEndEvent",
     "FinalEvent",

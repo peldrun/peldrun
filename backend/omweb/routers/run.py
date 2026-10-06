@@ -3,10 +3,11 @@ backend/omweb/routers/run.py
 
 PELDRUN Universal Run Router.
 Manages job lifecycles, chat associations, real-time SSE streaming, and deliverable downloads.
-Hardened under Phase M2 & Workspace Stabilization:
-- Full support for nested directories in job deliverables.
-- Native POST /jobs/{job_id}/content endpoint for file editing and persistence.
-- Authoritative request_id resolution for HumanInputRegistry.
+Hardened under PR 3 (Durable HITL & State Persistence):
+- Idempotent human response resolution via durable RunStore.
+- Decouples job_id from request_id and validates request ownership.
+- Resumes runs cleanly across process restarts or memory interruptions.
+- Prevents double execution on duplicate POST /respond calls.
 """
 
 from __future__ import annotations
@@ -40,6 +41,8 @@ from omweb.config import get_storage_root
 from omweb.job_manager import job_manager
 from omweb.project_manager import project_manager
 from omweb.sse_events import SSEEventType, subscribe_events
+from peldrun.runtime.contract import HumanInputStatus
+from peldrun.runtime.store import get_run_store
 from peldrun.tools.builtins.human_input import HumanInputRegistry
 
 router = APIRouter()
@@ -69,8 +72,9 @@ class FileContentPayload(BaseModel):
     content: str
 
 
-class HumanResponsePayload(BaseModel):
+class HumanRespondRequest(BaseModel):
     answer: str
+    request_id: Optional[str] = None
 
 
 def resolve_chat(identifier: str) -> Tuple[Optional[Dict[str, Any]], str]:
@@ -335,10 +339,6 @@ async def get_job_detail(job_id: str):
 
 @router.get("/jobs/{job_id}/files")
 async def get_job_files(job_id: str):
-    """
-    Retrieve deliverables list for a job or chat.
-    Preserves all nested directories and deliverable files created within files_dir.
-    """
     _, chat_id = resolve_chat(job_id)
     chat = project_manager.get_chat(chat_id) or {}
     project_id = chat.get("project_id", "default_project")
@@ -358,7 +358,6 @@ async def get_job_files(job_id: str):
                 "size": p.stat().st_size,
             })
 
-    # Sort files to prioritize non-empty deliverables
     all_files_list.sort(key=lambda x: (0 if x["size"] > 0 else 1, x["path"]))
 
     actual_job_id = chat.get("job_id") or job_id
@@ -371,10 +370,6 @@ async def get_job_files(job_id: str):
 
 
 def _resolve_physical_file(files_dir: Path, requested_path: str) -> Optional[Path]:
-    """
-    Intelligently resolves requested relative path against files_dir.
-    Safely strips any redundant prefixes and supports nested directory resolution.
-    """
     clean_rel = requested_path.lstrip("/\\").replace("\\", "/")
     if "files/" in clean_rel:
         clean_rel = clean_rel.split("files/", 1)[1]
@@ -397,7 +392,6 @@ def _resolve_physical_file(files_dir: Path, requested_path: str) -> Optional[Pat
 
 @router.get("/jobs/{job_id}/content")
 async def get_job_file_content(job_id: str, path: str = Query(...)):
-    """Retrieve textual content of a workspace deliverable file."""
     _, chat_id = resolve_chat(job_id)
     chat = project_manager.get_chat(chat_id) or {}
     project_id = chat.get("project_id", "default_project")
@@ -417,7 +411,6 @@ async def get_job_file_content(job_id: str, path: str = Query(...)):
 
 @router.post("/jobs/{job_id}/content")
 async def save_job_file_content(job_id: str, payload: FileContentPayload):
-    """Save or update deliverable file content in job/chat workspace files directory."""
     _, chat_id = resolve_chat(job_id)
     chat = project_manager.get_chat(chat_id) or {}
     project_id = chat.get("project_id", "default_project")
@@ -670,11 +663,6 @@ async def stream_job_events(job_id: str):
     )
 
 
-class HumanRespondRequest(BaseModel):
-    answer: str
-    request_id: Optional[str] = None
-
-
 @router.post("/jobs/{job_id}/stop")
 @router.post("/jobs/{job_id}/cancel")
 async def stop_job(job_id: str):
@@ -732,26 +720,49 @@ async def stop_job(job_id: str):
 
 @router.post("/jobs/{job_id}/respond")
 async def respond_to_human_prompt(job_id: str, req: HumanRespondRequest):
-    """Authoritatively receive human input response and unblock suspended Future."""
+    """
+    Authoritatively receive human input response and unblock suspended run.
+    Guarantees idempotency and verifies request ownership via RunStore.
+    """
     chat, chat_id = resolve_chat(job_id)
     target_job_id = job_id
     if chat and chat.get("job_id"):
         target_job_id = chat.get("job_id")
 
     answer = req.answer.strip()
-    core_resolved = False
+    store = get_run_store()
 
-    # 1. Authoritative resolution via request_id in HumanInputRegistry
-    if req.request_id:
-        core_resolved = HumanInputRegistry.resolve_request(req.request_id, answer)
-    elif hasattr(HumanInputRegistry, "_pending_requests") and len(HumanInputRegistry._pending_requests) == 1:
-        single_req_id = list(HumanInputRegistry._pending_requests.keys())[0]
-        core_resolved = HumanInputRegistry.resolve_request(single_req_id, answer)
-    elif hasattr(HumanInputRegistry, "_pending_requests") and len(HumanInputRegistry._pending_requests) > 0:
-        latest_req_id = list(HumanInputRegistry._pending_requests.keys())[-1]
-        core_resolved = HumanInputRegistry.resolve_request(latest_req_id, answer)
+    # 1. Resolve target request_id
+    resolved_req_id = req.request_id
+    if not resolved_req_id:
+        pending_requests = await store.list_pending_human_requests(run_id=target_job_id)
+        if not pending_requests and chat_id:
+            pending_requests = await store.list_pending_human_requests(run_id=chat_id)
 
-    # 2. Legacy fallback reconciliation
+        if pending_requests:
+            resolved_req_id = pending_requests[-1].request_id
+
+    if not resolved_req_id and hasattr(HumanInputRegistry, "_pending_requests") and HumanInputRegistry._pending_requests:
+        resolved_req_id = list(HumanInputRegistry._pending_requests.keys())[-1]
+
+    if not resolved_req_id:
+        raise HTTPException(status_code=404, detail=f"No pending human input request found for job '{target_job_id}'.")
+
+    # 2. Verify request existence and enforce idempotency
+    existing_req = await store.get_human_request(resolved_req_id)
+    if existing_req and existing_req.status == HumanInputStatus.ANSWERED:
+        return {
+            "success": True,
+            "job_id": target_job_id,
+            "request_id": resolved_req_id,
+            "already_resolved": True,
+            "message": "Request was already resolved previously.",
+        }
+
+    # 3. Atomically resolve request via HumanInputRegistry and RunStore
+    core_resolved = HumanInputRegistry.resolve_request(resolved_req_id, answer)
+
+    # 4. Reconcile legacy backward-compatibility events
     legacy_event = human_answers.get(target_job_id) or human_answers.get(job_id)
     if legacy_event and not legacy_event.is_set():
         human_data[target_job_id] = answer
@@ -761,15 +772,51 @@ async def respond_to_human_prompt(job_id: str, req: HumanRespondRequest):
     job_manager.append_event(target_job_id, {
         "type": "human_response",
         "answer": answer,
-        "request_id": req.request_id,
+        "request_id": resolved_req_id,
         "timestamp": time.time(),
     })
+
+    # 5. Check if process restarted and resume execution if needed
+    is_actively_running = (
+        target_job_id in ACTIVE_JOB_TASKS
+        or job_id in ACTIVE_JOB_TASKS
+        or (chat_id and chat_id in ACTIVE_JOB_TASKS)
+    )
+
+    resumed_run = False
+    if not is_actively_running:
+        saved_state = await store.load_state(target_job_id)
+        if saved_state is not None:
+            saved_state.mark_running(reason="Resuming execution following human response")
+            # Update state with human answer
+            saved_state.add_message(
+                role="tool",
+                content=answer,
+                name="ask_human",
+                tool_call_id=resolved_req_id,
+            )
+            saved_state.record_tool_execution(
+                tool_name="ask_human",
+                arguments={"answer": answer},
+                output=answer,
+                tool_call_id=resolved_req_id,
+            )
+            await store.save_state(target_job_id, saved_state)
+
+            # Re-queue background execution task
+            resumed_task = asyncio.create_task(
+                run_instrumented(target_job_id, saved_state.task_prompt)
+            )
+            ACTIVE_JOB_TASKS[target_job_id] = resumed_task
+            resumed_run = True
 
     return {
         "success": True,
         "job_id": target_job_id,
         "chat_id": chat_id,
+        "request_id": resolved_req_id,
         "answer": answer,
         "core_resolved": core_resolved,
-        "message": "Response recorded and agent unblocked successfully",
+        "resumed_run": resumed_run,
+        "message": "Response recorded and agent execution progressed successfully",
     }
