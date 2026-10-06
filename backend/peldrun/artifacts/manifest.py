@@ -3,7 +3,7 @@ backend/peldrun/artifacts/manifest.py
 
 PELDRUN Core Artifact Manifest Models.
 Defines typed references, classifications, revisions, and serializable manifests
-for deliverables produced during agent execution loops.
+acting as the primary source of truth for execution deliverables.
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ class ArtifactRef(BaseModel):
     size_bytes: int = Field(default=0, description="Size in bytes")
     revision: int = Field(default=1, ge=1, description="Monotonically increasing version counter")
     operation: str = Field(default="created", description="Latest operation: created, updated, deleted, moved")
+    source_tool: Optional[str] = Field(default=None, description="Tool identifier responsible for this mutation")
     created_at: float = Field(default_factory=time.time, description="Creation timestamp")
     updated_at: float = Field(default_factory=time.time, description="Last update timestamp")
     sha256: Optional[str] = Field(default=None, description="SHA256 content checksum")
@@ -54,7 +55,6 @@ class ArtifactRef(BaseModel):
         mime, _ = mimetypes.guess_type(str(file_path))
         mime = mime or "application/octet-stream"
 
-        # Categorize by extension
         if ext in (".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".json", ".sql", ".sh"):
             art_type = ArtifactType.CODE
         elif ext in (".md", ".txt", ".pdf", ".docx", ".rtf"):
@@ -92,7 +92,7 @@ class ArtifactManifest(BaseModel):
 
     def get_by_name(self, name: str) -> Optional[ArtifactRef]:
         for art in self.artifacts:
-            if art.name == name:
+            if art.name == name and art.operation != "deleted":
                 return art
         return None
 
@@ -103,5 +103,34 @@ class ArtifactManifest(BaseModel):
                 return art
         return None
 
+    def add_or_update(self, artifact_ref: ArtifactRef) -> None:
+        """Add or update an artifact reference inside the manifest."""
+        norm = artifact_ref.relative_path.replace("\\", "/").strip("/")
+        for idx, art in enumerate(self.artifacts):
+            if art.relative_path.replace("\\", "/").strip("/") == norm:
+                self.artifacts[idx] = artifact_ref
+                self.updated_at = time.time()
+                return
+        self.artifacts.append(artifact_ref)
+        self.updated_at = time.time()
+
+    def remove_artifact(self, relative_path: str) -> Optional[ArtifactRef]:
+        """Mark an artifact as deleted inside the manifest."""
+        art = self.get_by_path(relative_path)
+        if art:
+            art.operation = "deleted"
+            art.updated_at = time.time()
+            self.updated_at = time.time()
+            return art
+        return None
+
     def get_relative_paths(self) -> List[str]:
-        return [art.relative_path for art in self.artifacts]
+        """Return list of active, non-deleted artifact relative paths."""
+        return [art.relative_path for art in self.artifacts if art.operation != "deleted"]
+
+
+__all__ = [
+    "ArtifactType",
+    "ArtifactRef",
+    "ArtifactManifest",
+]

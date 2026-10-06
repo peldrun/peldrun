@@ -1,7 +1,12 @@
 """
+backend/peldrun/tools/builtins/file_ops.py
+
 PELDRUN Core Scoped File Operations Tool.
-Provides safe, isolated filesystem interactions strictly bounded within the project workspace
-and governed by the declarative SecurityPolicy engine.
+Provides safe, isolated filesystem interactions strictly bounded within the project workspace.
+Hardened under PR 6 (Workspace Sandbox Containment & Artifact Lifecycle):
+- Enforces strict path containment preventing directory traversal.
+- Declares explicit ToolExecutionPolicy with side_effects=True and max_attempts=1.
+- Populates ToolResult.artifacts with relative paths on write, append, and delete actions.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from peldrun.security.policy import SecurityPolicy, SecurityViolationError
 from peldrun.tools.base import BaseTool, ToolResult
+from peldrun.tools.contract import ToolExecutionPolicy
 
 logger = logging.getLogger("peldrun.tools.builtins.file_ops")
 
@@ -40,10 +46,7 @@ class FileOpsArgs(BaseModel):
 
 
 class FileOpsTool(BaseTool):
-    """
-    Core tool for performing secure, sandboxed file operations.
-    Enforces strict path containment and sensitive file jailing via SecurityPolicy.
-    """
+    """Core tool for performing secure, sandboxed file operations."""
 
     name: str = "file_ops"
     description: str = (
@@ -54,12 +57,20 @@ class FileOpsTool(BaseTool):
     )
     args_schema: Optional[Type[BaseModel]] = FileOpsArgs
 
+    execution_policy = ToolExecutionPolicy(
+        max_attempts=1,
+        timeout_seconds=30.0,
+        retryable=False,
+        idempotent=False,
+        side_effects=True,
+    )
+
     def __init__(
         self,
         workspace_root: Optional[str] = None,
         security_policy: Optional[SecurityPolicy] = None,
     ) -> None:
-        super().__init__(workspace_root=workspace_root)
+        super().__init__(workspace_root=workspace_root, execution_policy=self.execution_policy)
         if security_policy:
             self.security_policy = security_policy
         elif workspace_root:
@@ -68,21 +79,26 @@ class FileOpsTool(BaseTool):
             self.security_policy = SecurityPolicy()
 
     def _resolve_safe_path(self, rel_path: str) -> Path:
-        """
-        Resolve path against workspace root and verify strict containment via SecurityPolicy.
-        Prevents path traversal and sensitive file access attacks.
-        """
+        """Resolve path and verify strict containment within workspace_root."""
         if not self.workspace_root:
             raise PermissionError("Workspace root is not configured. File operations are blocked.")
 
         root = Path(self.workspace_root).resolve()
-        target = (root / rel_path.strip().lstrip("/\\")).resolve()
+        candidate = Path(rel_path.strip())
 
-        # Update policy workspace root if modified
+        if candidate.is_absolute():
+            target = candidate.resolve()
+        else:
+            target = (root / candidate).resolve()
+
+        try:
+            target.relative_to(root)
+        except ValueError:
+            raise PermissionError(f"Access denied: Path '{rel_path}' resolves outside workspace root '{root}'.")
+
         if self.security_policy.workspace_root != root:
             self.security_policy.workspace_root = root
 
-        # Enforce security verification
         return self.security_policy.check_path_access(target)
 
     def _sync_read(self, path: Path, encoding: str) -> ToolResult:
@@ -111,13 +127,13 @@ class FileOpsTool(BaseTool):
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding=encoding)
-            rel_name = os.path.relpath(path, self.workspace_root)
+            rel_name = os.path.relpath(path, self.workspace_root).replace("\\", "/")
             return ToolResult(
                 output=f"Successfully written {len(content)} characters to '{rel_name}'.",
                 exit_code=0,
                 is_error=False,
                 artifacts=[rel_name],
-                metadata={"bytes_written": path.stat().st_size},
+                metadata={"bytes_written": path.stat().st_size, "operation": "created"},
             )
         except Exception as ex:
             return ToolResult(
@@ -131,12 +147,13 @@ class FileOpsTool(BaseTool):
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding=encoding) as f:
                 f.write(content)
-            rel_name = os.path.relpath(path, self.workspace_root)
+            rel_name = os.path.relpath(path, self.workspace_root).replace("\\", "/")
             return ToolResult(
                 output=f"Successfully appended {len(content)} characters to '{rel_name}'.",
                 exit_code=0,
                 is_error=False,
                 artifacts=[rel_name],
+                metadata={"operation": "updated"},
             )
         except Exception as ex:
             return ToolResult(
@@ -190,14 +207,17 @@ class FileOpsTool(BaseTool):
                 is_error=True,
             )
         try:
+            rel_name = os.path.relpath(path, self.workspace_root).replace("\\", "/")
             if path.is_file() or path.is_symlink():
                 path.unlink()
             elif path.is_dir():
                 path.rmdir()
             return ToolResult(
-                output=f"Successfully deleted '{path.name}'.",
+                output=f"Successfully deleted '{rel_name}'.",
                 exit_code=0,
                 is_error=False,
+                artifacts=[rel_name],
+                metadata={"operation": "deleted"},
             )
         except Exception as ex:
             return ToolResult(
@@ -255,3 +275,9 @@ class FileOpsTool(BaseTool):
                 exit_code=1,
                 is_error=True,
             )
+
+
+__all__ = [
+    "FileOpsArgs",
+    "FileOpsTool",
+]
