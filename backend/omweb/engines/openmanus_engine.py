@@ -3,14 +3,13 @@ OpenManus External Legacy Execution Engine Adapter.
 
 Encapsulates execution of the secondary OpenManus engine, providing runtime
 instrumentation, backward compatibility, and clean environment isolation.
+Guarantees resilient health diagnostics without throwing unhandled ModuleNotFoundError.
 """
 
 from __future__ import annotations
 
 import importlib.util
 from typing import Any, Dict
-
-from omweb.agent_bridge_parts.legacy_engine import _run_legacy_openmanus_agent
 
 from .base import EngineRunContext, ExecutionEngine
 
@@ -22,20 +21,46 @@ class OpenManusEngine(ExecutionEngine):
 
     async def health(self) -> Dict[str, Any]:
         """Verify presence of OpenManus agent dependencies without global path pollution."""
-        peldrun_spec = importlib.util.find_spec("app.agent.peldrun")
-        manus_spec = importlib.util.find_spec("app.agent.manus")
-        available = (peldrun_spec is not None) or (manus_spec is not None)
+        available = False
+        entrypoint = "missing"
+
+        try:
+            # Check root package 'app' first to avoid ModuleNotFoundError when resolving submodules
+            app_spec = importlib.util.find_spec("app")
+            if app_spec is not None:
+                peldrun_spec = importlib.util.find_spec("app.agent.peldrun")
+                manus_spec = importlib.util.find_spec("app.agent.manus")
+                if peldrun_spec is not None:
+                    available = True
+                    entrypoint = "app.agent.peldrun"
+                elif manus_spec is not None:
+                    available = True
+                    entrypoint = "app.agent.manus"
+        except (ModuleNotFoundError, ImportError, ValueError, AttributeError):
+            available = False
+            entrypoint = "missing"
 
         return {
             "engine_id": self.engine_id,
             "available": available,
             "is_legacy": True,
-            "entrypoint": "app.agent.peldrun" if peldrun_spec else ("app.agent.manus" if manus_spec else "missing"),
+            "entrypoint": entrypoint,
         }
 
     async def run(self, context: EngineRunContext) -> None:
-        """Dispatch task to legacy OpenManus runner."""
-        print(f"\n[ENGINE OPENMANUS] >>> Executing Job: {context.job_id} via Legacy Engine <<<")
+        """Dispatch task to legacy OpenManus runner.
+
+        Imports the legacy runner lazily at invocation time to avoid circular
+        import cycles between engines and agent_bridge subsystems.
+        """
+        print(
+            f"\n[ENGINE OPENMANUS] >>> Executing Job: {context.job_id} via Legacy Engine <<<"
+        )
+
+        from omweb.agent_bridge_parts.legacy_engine import (
+            _run_legacy_openmanus_agent,
+        )
+
         await _run_legacy_openmanus_agent(
             job_id=context.job_id,
             prompt=context.prompt,

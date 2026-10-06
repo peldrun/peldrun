@@ -1,8 +1,9 @@
 """
-PELDRUN Native Embedded Execution Engine.
+PELDRUN Native Embedded Execution Engine (Consolidated Architecture).
 
-Executes agent workflows using the embedded peldrun runtime package
-with streaming SSE event dispatching, platform tool resolution, and deliverable tracking.
+Executes agent workflows natively through the consolidated Core lifecycle:
+EngineRunContext -> RunRequest -> AgentRunner -> ExecutionState -> StepExecutableAgent.
+Pre-seeds conversation turns with SYSTEM and USER messages to prevent empty-context LLM rejections.
 """
 
 from __future__ import annotations
@@ -12,9 +13,6 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
-from omweb.agent_bridge_parts.state import job_scoped_artifacts
-from omweb.agent_bridge_parts.text_utils import sanitize_final_result_text
-from omweb.job_manager import job_manager
 from omweb.sse_events import SSEEvent, SSEEventType, dispatch_event
 
 from .base import EngineRunContext, ExecutionEngine
@@ -47,7 +45,7 @@ class PeldrunEngine(ExecutionEngine):
             }
 
     async def run(self, context: EngineRunContext) -> None:
-        """Execute autonomous agent workflow using the native embedded Core runtime."""
+        """Execute autonomous agent workflow through the consolidated Core lifecycle."""
         job_id = context.job_id
         prompt = context.prompt
         agent_id = context.agent_id
@@ -57,15 +55,21 @@ class PeldrunEngine(ExecutionEngine):
         chat_id = context.chat_id
         manifest = context.manifest
 
-        print(f"\n[ENGINE PELDRUN] >>> Starting Task Execution for Job: {job_id} <<<")
+        print(f"\n[ENGINE PELDRUN] >>> Starting Consolidated Task Execution for Job: {job_id} <<<")
 
-        # Native embedded package imports
+        from omweb.agent_bridge_parts.state import job_scoped_artifacts
+        from omweb.agent_bridge_parts.text_utils import sanitize_final_result_text
+        from omweb.job_manager import job_manager
+
         from peldrun.agents.base import AgentConfig
         from peldrun.agents.tool_call_agent import ToolCallAgent
+        from peldrun.engine.runner import AgentRunner, RunnerConfig
+        from peldrun.engine.state import ExecutionState, MessageRole
         from peldrun.events.emitter import EventEmitter
         from peldrun.events.schema import EventType, PeldrunEvent
         from peldrun.llm.client import LLMConfig
         from peldrun.llm.providers.openai_compat import OpenAICompatProvider
+        from peldrun.runtime.contract import AgentSpec, RunRequest, WorkspaceContext
         from peldrun.tools.builtins.terminate import TerminateTool
         from peldrun.tools.collection import ToolCollection
         from peldrun.tools.registry import ToolRegistry as CoreToolRegistry
@@ -83,31 +87,42 @@ class PeldrunEngine(ExecutionEngine):
         max_steps = int(manifest.get("max_steps") or 30)
         system_prompt = manifest.get(
             "system_prompt",
-            "You are peldrun, an all-around autonomous specialist agent."
+            "You are peldrun, an all-around autonomous specialist agent.",
         )
         ws_path = project_dir.resolve()
         ws_path_str = str(ws_path)
 
-        # 1. Wire Session-Scoped Core ToolRegistry
+        # 1. Establish Core Runtime Invocation Contracts
+        workspace_ctx = WorkspaceContext(
+            workspace_id=chat_id or job_id,
+            root_path=ws_path_str,
+            chat_id=chat_id,
+            project_id=manifest.get("project_id"),
+        )
+        requested_tools = list(manifest.get("tools", []))
+        agent_spec = AgentSpec(
+            id=agent_id,
+            name=manifest.get("name") or agent_id,
+            system_prompt=system_prompt,
+            tools=requested_tools,
+            max_steps=max_steps,
+            temperature=float(active_llm.get("temperature", 0.2)),
+        )
+        run_request = RunRequest(
+            job_id=job_id,
+            prompt=prompt,
+            agent_spec=agent_spec,
+            workspace=workspace_ctx,
+            llm_config=active_llm,
+        )
+
+        # 2. Wire Session-Scoped Core ToolRegistry
         core_registry = CoreToolRegistry(workspace_root=ws_path_str)
         core_registry.register(TerminateTool(workspace_root=ws_path_str))
 
         available_web_tools = {
             t["id"]: t for t in web_tool_registry.list_tools() if t.get("is_enabled", True)
         }
-
-        requested_tools = list(manifest.get("tools", []))
-        essential_tool_ids = (
-            "str_replace_editor",
-            "bash",
-            "python_execute",
-            "web_search",
-            "browser_use",
-            "ask_human",
-        )
-        for essential in essential_tool_ids:
-            if essential not in requested_tools and essential in available_web_tools:
-                requested_tools.append(essential)
 
         for req_tool in requested_tools:
             if req_tool in ("terminate", "file_saver"):
@@ -126,10 +141,10 @@ class PeldrunEngine(ExecutionEngine):
         fallback_collection: ToolCollection = getattr(
             core_registry,
             "_collection",
-            ToolCollection(core_registry.list_tools())
+            ToolCollection(core_registry.list_tools()),
         )
 
-        # 2. Wire Real-Time Event Dispatcher
+        # 3. Wire Real-Time Event Dispatcher
         emitter = EventEmitter()
         current_core_step = 1
         is_first_step_start = True
@@ -293,7 +308,7 @@ class PeldrunEngine(ExecutionEngine):
 
         emitter.subscribe_all(_sync_event_handler)
 
-        # 3. LLM Configuration
+        # 4. LLM Configuration
         base_url = active_llm.get("base_url") or "http://127.0.0.1:1234/v1"
         api_key = active_llm.get("api_key") or "EMPTY"
         safe_max_tokens = min(int(active_llm.get("max_tokens") or 4096), 4096)
@@ -309,7 +324,7 @@ class PeldrunEngine(ExecutionEngine):
         )
         llm_provider = OpenAICompatProvider(config=llm_cfg)
 
-        # 4. Agent Instantiation
+        # 5. Agent Instantiation
         agent_config = AgentConfig(
             name=manifest.get("name") or agent_id,
             system_prompt=system_prompt,
@@ -327,22 +342,59 @@ class PeldrunEngine(ExecutionEngine):
             workspace_dir=ws_path_str,
         )
         agent.set_system_prompt(system_prompt)
+        agent.name = agent_config.name
 
         scoped_prompt = (
             f"[PROJECT WORKSPACE RULES]\n"
             f"1. Working Directory: Your active directory is: {project_dir.resolve()}\n"
-            f"2. File Deliverables: ALWAYS use 'str_replace_editor' with command='create' to write and save project files directly to disk.\n"
-            f"3. Execution & Verification: Use 'python_execute' only when you need to run calculations, test execution, or process data.\n"
+            f"2. File Deliverables: Use available editor tools to create and update files.\n"
+            f"3. Execution & Verification: Use available tools adhering strictly to assigned capabilities.\n"
             f"4. Tool Calling Conventions: Always supply required parameters.\n"
-            f"5. Search & Web Fallback: Use 'web_search' for search queries and 'browser_use' to visit authoritative websites.\n"
-            f"6. Mandatory Human Consultation (ask_human): When you need operator input or answers, invoke 'ask_human'.\n"
-            f"7. Task Completion: Call 'terminate' when project files are created and verified.\n\n"
+            f"5. Task Completion: Call 'terminate' when objectives are accomplished.\n\n"
             f"[USER TASK]\n"
             f"{prompt}"
         )
 
+        # 6. Pre-seed ExecutionState with initial SYSTEM and USER messages
+        initial_state = ExecutionState(
+            task_prompt=scoped_prompt,
+            agent_name=agent.name,
+            max_steps=max_steps,
+            workspace_root=ws_path_str,
+            metadata={"run_request": run_request.model_dump(mode="json")},
+        )
+        initial_state.add_message(role=MessageRole.SYSTEM, content=system_prompt)
+        initial_state.add_message(role=MessageRole.USER, content=scoped_prompt)
+
+        # Initialize agent's in-memory messages directly from initial state
+        agent.messages = [msg.to_llm_dict() for msg in initial_state.messages]
+
+        # 7. Consolidated Execution via Core AgentRunner & ExecutionState
+        runner_config = RunnerConfig(
+            max_steps=max_steps,
+            step_timeout_seconds=llm_timeout,
+            enable_checkpointing=True,
+            checkpoint_interval=1,
+        )
+        runner = AgentRunner(
+            agent=agent,
+            emitter=emitter,
+            config=runner_config,
+        )
+
+        execution_state: Optional[ExecutionState] = None
         try:
-            final_answer = await agent.run_task(prompt=scoped_prompt, max_steps=max_steps)
+            execution_state = await runner.run(
+                task_prompt=scoped_prompt,
+                state=initial_state,
+                workspace_root=ws_path_str,
+                agent=agent,
+            )
+            final_answer = execution_state.final_output or ""
+        except asyncio.CancelledError:
+            runner.cancel()
+            print(f"[ENGINE PELDRUN] Task cancelled by operator for job: {job_id}")
+            raise
         except Exception as exc:
             err_msg = f"Task execution interrupted: {exc}"
             print(f"[ENGINE PELDRUN ERROR] {err_msg}")
@@ -356,7 +408,7 @@ class PeldrunEngine(ExecutionEngine):
             )
             final_answer = sanitize_final_result_text("", latest_meaningful_thought) or err_msg
 
-        # 5. Finalize Deliverables and Complete Job
+        # 8. Finalize Deliverables and Complete Job
         if project_dir.exists():
             current_files = {p.name for p in project_dir.iterdir() if p.is_file()}
             for f_name in (current_files - files_baseline):
@@ -364,6 +416,12 @@ class PeldrunEngine(ExecutionEngine):
                     job_scoped_artifacts[job_id].append(f_name)
                 if chat_id and f_name not in job_scoped_artifacts.get(chat_id, []):
                     job_scoped_artifacts.setdefault(chat_id, []).append(f_name)
+
+        if execution_state is not None:
+            for deliv in execution_state.deliverables:
+                deliv_name = Path(deliv).name
+                if deliv_name not in job_scoped_artifacts[job_id]:
+                    job_scoped_artifacts[job_id].append(deliv_name)
 
         new_turn_files = job_scoped_artifacts.get(job_id, [])
 
@@ -378,13 +436,14 @@ class PeldrunEngine(ExecutionEngine):
         else:
             result_text = sanitize_final_result_text(final_answer, latest_meaningful_thought)
 
-        print(f"[ENGINE PELDRUN] Job {job_id} completed successfully. Produced files: {new_turn_files}")
+        step_count = execution_state.current_step if execution_state else current_core_step
+        print(f"[ENGINE PELDRUN] Job {job_id} completed successfully in step {step_count}. Produced files: {new_turn_files}")
         job_manager.complete_job(job_id, result_text)
         await dispatch_event(
             job_id,
             SSEEvent(
                 type=SSEEventType.FINAL,
-                step=current_core_step,
+                step=step_count,
                 data={
                     "result": result_text,
                     "model": model_name,

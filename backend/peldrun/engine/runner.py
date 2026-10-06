@@ -1,6 +1,8 @@
 """
 PELDRUN Core Agent Execution Runner.
+
 Coordinates agent lifecycle, asynchronous execution loops, checkpointing, and event emission.
+Enforces non-empty message preconditions to prevent upstream LLM provider rejection.
 """
 
 from __future__ import annotations
@@ -26,8 +28,8 @@ class StepExecutableAgent(Protocol):
     name: str
 
     async def step(self, state: ExecutionState, emitter: EventEmitter) -> bool:
-        """
-        Execute a single reasoning/action iteration.
+        """Execute a single reasoning/action iteration.
+
         Returns True if the task has reached completion, False to continue iterating.
         """
         ...
@@ -35,6 +37,7 @@ class StepExecutableAgent(Protocol):
 
 class RunnerConfig(BaseModel):
     """Runtime configuration parameters for AgentRunner execution."""
+
     model_config = ConfigDict(extra="ignore")
 
     max_steps: int = Field(default=30, description="Maximum allowed reasoning/acting iterations")
@@ -45,8 +48,8 @@ class RunnerConfig(BaseModel):
 
 
 class AgentRunner:
-    """
-    Primary execution controller for PELDRUN agents.
+    """Primary execution controller for PELDRUN agents.
+
     Drives the step-by-step reasoning cycle, event dissemination, and graceful termination.
     """
 
@@ -133,6 +136,10 @@ class AgentRunner:
             if workspace_root:
                 state.workspace_root = workspace_root
 
+            # Precondition safeguard: Ensure state has at least one user prompt message
+            if not state.messages:
+                state.add_message(role=MessageRole.USER, content=task_prompt)
+
         # Attach run_id to emitter if unassigned
         if getattr(self.emitter, "run_id", None) is None:
             self.emitter.run_id = state.run_id
@@ -141,7 +148,7 @@ class AgentRunner:
         self._pause_requested.clear()
         state.status = ExecutionStatus.RUNNING
 
-        # Emit the initial workspace snapshot.
+        # Emit the initial workspace snapshot
         await self.emitter.emit_snapshot(self._build_snapshot_payload(state))
 
         global_start_time = time.time()
@@ -149,7 +156,6 @@ class AgentRunner:
 
         try:
             while state.current_step < self.config.max_steps and not is_complete:
-                # 1. Cancellation check
                 if self.is_cancelled:
                     logger.info("Agent run %s cancelled by operator.", state.run_id)
                     state.status = ExecutionStatus.PAUSED
@@ -161,7 +167,6 @@ class AgentRunner:
                     )
                     break
 
-                # 2. Pause check
                 while self.is_paused and not self.is_cancelled:
                     state.status = ExecutionStatus.PAUSED
                     await asyncio.sleep(0.5)
@@ -172,9 +177,7 @@ class AgentRunner:
                 state.status = ExecutionStatus.RUNNING
                 state.current_step += 1
                 step_index = state.current_step
-                step_start_time = time.time()
 
-                # 3. Global timeout check
                 if (
                     self.config.total_timeout_seconds
                     and (time.time() - global_start_time) > self.config.total_timeout_seconds
@@ -183,10 +186,8 @@ class AgentRunner:
                         f"Global execution timeout reached ({self.config.total_timeout_seconds}s)."
                     )
 
-                # 4. Emit step start (aligned with EventEmitter.emit_step_start contract).
                 await self.emitter.emit_step_start(step_number=step_index)
 
-                # 5. Execute agent step under step-level timeout
                 try:
                     is_complete = await asyncio.wait_for(
                         active_agent.step(state=state, emitter=self.emitter),
@@ -197,14 +198,12 @@ class AgentRunner:
                         f"Step {step_index} exceeded execution timeout of {self.config.step_timeout_seconds}s."
                     )
 
-                # 6. Periodic checkpointing
                 if (
                     self.config.enable_checkpointing
                     and (step_index % self.config.checkpoint_interval == 0)
                 ):
                     state.create_checkpoint()
 
-                # 7. Emit step end (aligned with EventEmitter.emit_step_end contract).
                 await self.emitter.emit_step_end(step_number=step_index)
 
             # Post-loop status finalization
@@ -233,7 +232,6 @@ class AgentRunner:
             raise
 
         finally:
-            # Emit the final status snapshot.
             await self.emitter.emit_snapshot(
                 self._build_snapshot_payload(
                     state,

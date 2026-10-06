@@ -13,15 +13,13 @@ import traceback
 from typing import Any, Dict, Optional
 
 from omweb.agents.registry import AgentNotFoundError, agent_registry
-from omweb.engines import (
-    EngineNotFoundError,
-    EngineRunContext,
-    engine_registry,
-)
 from omweb.engine_resolver import (
     EngineType,
     get_active_engine_type,
 )
+from omweb.engines import engine_registry
+from omweb.engines.base import EngineRunContext
+from omweb.engines.registry import EngineNotFoundError
 from omweb.job_manager import job_manager
 from omweb.project_manager import project_manager
 from omweb.sse_events import SSEEvent, SSEEventType, dispatch_event

@@ -1,7 +1,9 @@
 """
 Autonomous Tool Calling Agent for PELDRUN Core Runtime.
+
 Executes Think-Act cycles with reliable tool dispatching directly on tool instances
-or session-scoped ToolRegistry, preserving full conversation history to prevent amnesia loops.
+or session-scoped ToolRegistry, maintaining full conversation history and synchronized
+Pydantic ChatMessage lifecycle contracts with ExecutionState.
 """
 
 from __future__ import annotations
@@ -13,21 +15,21 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from peldrun.agents.base import AgentConfig, BaseAgent
+from peldrun.engine.state import ChatMessage, ExecutionState, MessageRole
 from peldrun.events.emitter import EventEmitter
 from peldrun.events.schema import EventType, PeldrunEvent
-from peldrun.llm.client import AsyncLLMClient, LLMResponse, ToolCall
+from peldrun.llm.client import LLMResponse, ToolCall
 from peldrun.tools.base import ToolResult
 from peldrun.tools.collection import ToolCollection
-from peldrun.tools.contract import ToolRuntime
 
 logger = logging.getLogger("peldrun.agents.tool_call_agent")
 
 
 class ToolCallAgent(BaseAgent):
-    """
-    Autonomous ReAct agent executing real tool invocations on concrete tool instances
-    or through session-scoped ToolRegistry execution runtimes.
-    Maintains full multi-turn conversational state without arbitrary premature pruning.
+    """Autonomous ReAct agent executing real tool invocations on concrete tool instances.
+
+    Maintains full multi-turn conversational state synchronized with ExecutionState
+    and satisfies the StepExecutableAgent protocol contract for AgentRunner.
     """
 
     def __init__(
@@ -38,7 +40,7 @@ class ToolCallAgent(BaseAgent):
         emitter: Optional[EventEmitter] = None,
         workspace_dir: Optional[Union[str, Path]] = None,
         tool_registry: Optional[Any] = None,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> None:
         active_tools = tool_registry if tool_registry is not None else (tool_collection or ToolCollection())
 
@@ -66,6 +68,11 @@ class ToolCallAgent(BaseAgent):
 
         super().__init__(**base_kwargs)
 
+        # Store name in private attribute to avoid read-only property setter collision
+        self._name: str = getattr(config, "name", "ToolCallAgent") if config else "ToolCallAgent"
+        if hasattr(self, "config") and self.config and not getattr(self.config, "name", None):
+            self.config.name = self._name
+
         self.llm = llm
         self.tool_registry = tool_registry
         self.tool_collection = active_tools
@@ -76,13 +83,28 @@ class ToolCallAgent(BaseAgent):
         self.messages: List[Dict[str, Any]] = []
         self.current_step = 1
         self._final_answer: str = ""
+        self.state: Optional[ExecutionState] = None
+
+    @property
+    def name(self) -> str:
+        """Return agent identifier name from config or internal attribute."""
+        if hasattr(self, "config") and self.config and getattr(self.config, "name", None):
+            return self.config.name
+        return getattr(self, "_name", self.__class__.__name__)
+
+    @name.setter
+    def name(self, value: str) -> None:
+        """Set agent identifier name, synchronizing with config if present."""
+        self._name = value
+        if hasattr(self, "config") and self.config:
+            self.config.name = value
 
     def set_system_prompt(self, prompt: str) -> None:
         """Configure or update the system prompt controlling agent reasoning."""
         self.system_prompt = prompt
 
     async def _emit(self, event_type: EventType, step: int, payload: Dict[str, Any]) -> None:
-        """Dispatches typed events to registered listeners safely across async loops."""
+        """Dispatch typed events to registered listeners safely across async loops."""
         if not self.emitter:
             return
         try:
@@ -99,7 +121,7 @@ class ToolCallAgent(BaseAgent):
                 pass
 
     def _get_tools_schema(self) -> List[Dict[str, Any]]:
-        """Extracts OpenAI-compatible function calling schemas from active tools container."""
+        """Extract OpenAI-compatible function calling schemas from active tools container."""
         tools_obj = getattr(self, "tool_registry", None) or getattr(self, "tool_collection", None) or getattr(self, "tools", None)
         if tools_obj is None:
             return []
@@ -123,14 +145,14 @@ class ToolCallAgent(BaseAgent):
                         "function": {
                             "name": getattr(t, "name", str(t)),
                             "description": getattr(t, "description", ""),
-                            "parameters": getattr(t, "parameters", {})
-                        }
+                            "parameters": getattr(t, "parameters", {}),
+                        },
                     })
             return schemas
         return []
 
     def _resolve_tool_instance(self, tool_name: str) -> Optional[Any]:
-        """Locates the concrete tool instance from registry, collection, or map."""
+        """Locate concrete tool instance from registry, collection, or dictionary map."""
         tools_obj = getattr(self, "tool_registry", None) or getattr(self, "tool_collection", None) or getattr(self, "tools", None)
         if not tools_obj:
             return None
@@ -163,12 +185,33 @@ class ToolCallAgent(BaseAgent):
 
         return None
 
+    def _sync_messages_from_state(self, state: ExecutionState) -> None:
+        """Synchronize in-memory LLM payload from execution state messages."""
+        if state.messages:
+            self.messages = [msg.to_llm_dict() for msg in state.messages]
+        else:
+            # Seed initial conversation turns if state is currently empty
+            self.messages = [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": state.task_prompt or "Start task."},
+            ]
+            state.add_message(role=MessageRole.SYSTEM, content=self.system_prompt)
+            state.add_message(role=MessageRole.USER, content=state.task_prompt or "Start task.")
+
     async def think(self, step: int) -> LLMResponse:
-        """
-        Executes the cognitive reasoning phase of the ReAct cycle.
-        Maintains full context history and gracefully recovers if provider hits physical limits.
-        """
+        """Execute cognitive reasoning phase of the ReAct cycle."""
         tools_schema = self._get_tools_schema()
+
+        # Ensure conversation has at least one valid message
+        if not self.messages or not any(m.get("role") in ("user", "system") for m in self.messages):
+            prompt_text = (self.state.task_prompt if self.state else "") or "Execute assigned task."
+            self.messages = [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": prompt_text},
+            ]
+            if self.state and not self.state.messages:
+                self.state.add_message(role=MessageRole.SYSTEM, content=self.system_prompt)
+                self.state.add_message(role=MessageRole.USER, content=prompt_text)
 
         async def _call_llm(msgs: List[Dict[str, Any]]) -> LLMResponse:
             if hasattr(self.llm, "generate"):
@@ -176,42 +219,46 @@ class ToolCallAgent(BaseAgent):
                     messages=msgs,
                     tools=tools_schema if tools_schema else None,
                     tool_choice="auto",
-                    temperature=0.2
+                    temperature=0.2,
                 )
             elif hasattr(self.llm, "chat_completion"):
                 return await self.llm.chat_completion(
                     messages=msgs,
                     tools=tools_schema if tools_schema else None,
                     tool_choice="auto",
-                    temperature=0.2
+                    temperature=0.2,
                 )
             elif hasattr(self.llm, "chat_complete"):
                 return await self.llm.chat_complete(
                     messages=msgs,
                     tools=tools_schema if tools_schema else None,
-                    temperature=0.2
+                    temperature=0.2,
                 )
             else:
                 raise AttributeError("LLM client does not provide generate or chat_completion interface.")
 
         try:
-            # Preserves full conversation history to prevent amnesia and question repetition
             response = await _call_llm(self.messages)
         except Exception as exc:
             err_str = str(exc).lower()
             if "terminated" in err_str or "context" in err_str or "400" in err_str:
                 logger.warning("Local provider rejected full context (%s). Retrying with emergency fallback.", exc)
-                # Keep system prompt + original task prompt + recent 6 turns only in emergency
                 emergency_msgs = list(self.messages[:2]) + list(self.messages[-6:])
                 while emergency_msgs and len(emergency_msgs) > 2 and emergency_msgs[2].get("role") == "tool":
                     emergency_msgs.pop(2)
+
+                if not emergency_msgs or not any(m.get("role") == "user" for m in emergency_msgs):
+                    emergency_msgs = [
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": (self.state.task_prompt if self.state else "") or "Proceed with task."},
+                    ]
+
                 try:
                     response = await _call_llm(emergency_msgs)
                 except Exception:
-                    # Conclude cleanly instead of dropping task
                     return LLMResponse(
-                        content="Concluded task execution based on prior conversation observations.",
-                        tool_calls=[ToolCall(name="terminate", arguments={})]
+                        content="Concluded task execution based on prior observations.",
+                        tool_calls=[ToolCall(name="terminate", arguments={})],
                     )
             else:
                 raise
@@ -224,7 +271,7 @@ class ToolCallAgent(BaseAgent):
         return response
 
     async def act(self, step: int, tool_calls: List[ToolCall]) -> List[str]:
-        """Executes proposed tool calls and standardizes tool observations into dialogue history."""
+        """Execute proposed tool calls and append observation messages."""
         observations: List[str] = []
 
         for call in tool_calls:
@@ -261,7 +308,7 @@ class ToolCallAgent(BaseAgent):
                         res = ToolResult(
                             output=f"Tool '{tool_name}' has no executable entrypoint.",
                             exit_code=1,
-                            is_error=True
+                            is_error=True,
                         )
 
                     if isinstance(res, ToolResult):
@@ -282,55 +329,116 @@ class ToolCallAgent(BaseAgent):
             print(f"[CORE LIVE STREAM] Observation: {output_str[:90]}...")
             await self._emit(EventType.OBSERVATION, step=step, payload={"tool_name": tool_name, "output": output_str})
 
+            # Append to internal LLM history
             self.messages.append({
                 "role": "tool",
                 "tool_call_id": call.id,
                 "name": tool_name,
-                "content": output_str
+                "content": output_str,
             })
+
+            # Append to typed ExecutionState if bound (creates ChatMessage instances cleanly)
+            if self.state is not None:
+                self.state.add_message(
+                    role=MessageRole.TOOL,
+                    content=output_str,
+                    name=tool_name,
+                    tool_call_id=call.id,
+                )
+                self.state.record_tool_execution(
+                    tool_name=tool_name,
+                    arguments=args,
+                    output=output_str,
+                    tool_call_id=call.id,
+                )
+
             observations.append(output_str)
 
         return observations
 
+    async def step(self, state: ExecutionState, emitter: EventEmitter) -> bool:
+        """Execute a single ReAct step driving the AgentRunner lifecycle contract.
+
+        Returns:
+            True if task has reached completion; False to continue iterating.
+        """
+        self.state = state
+        self.emitter = emitter
+        self.current_step = state.current_step
+
+        # Synchronize conversation messages from state
+        self._sync_messages_from_state(state)
+
+        response = await self.think(step=self.current_step)
+
+        # Stop condition 1: No tool calls emitted
+        if not response.tool_calls:
+            self._final_answer = response.content or response.thought or response.reasoning or "Task completed."
+            state.final_output = self._final_answer
+            return True
+
+        # Append assistant response to messages and typed ExecutionState
+        tool_calls_payload = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.name,
+                    "arguments": json.dumps(tc.arguments, ensure_ascii=False) if isinstance(tc.arguments, dict) else str(tc.arguments),
+                },
+            }
+            for tc in response.tool_calls
+        ]
+        self.messages.append({
+            "role": "assistant",
+            "content": response.content or "",
+            "tool_calls": tool_calls_payload,
+        })
+        state.add_message(
+            role=MessageRole.ASSISTANT,
+            content=response.content or "",
+            tool_calls=tool_calls_payload,
+        )
+
+        observations = await self.act(step=self.current_step, tool_calls=response.tool_calls)
+
+        # Stop condition 2: Terminate tool invoked
+        has_terminated = any(tc.name.lower() in ("terminate", "done") for tc in response.tool_calls)
+        if has_terminated:
+            self._final_answer = response.content or (observations[-1] if observations else "Task completed via termination tool.")
+            state.final_output = self._final_answer
+            return True
+
+        return False
+
     async def _astep(self) -> bool:
-        """Executes a single step cycle: Think -> Act."""
+        """Backward-compatible internal step implementation for standalone run_task."""
         step = self.current_step
-
-        if hasattr(self, "state") and self.state is not None:
-            if hasattr(self.state, "step"):
-                self.state.step = step
-            if hasattr(self.state, "current_step"):
-                self.state.current_step = step
-            if hasattr(self.state, "messages"):
-                self.state.messages = self.messages
-
         response = await self.think(step=step)
 
-        # Stop condition: When model proposes no tool calls, it has finished reasoning
         if not response.tool_calls:
             self._final_answer = response.content or response.thought or response.reasoning or "Task completed."
             return False
 
-        # Record assistant tool calls in conversation history
+        tool_calls_payload = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.name,
+                    "arguments": json.dumps(tc.arguments, ensure_ascii=False) if isinstance(tc.arguments, dict) else str(tc.arguments),
+                },
+            }
+            for tc in response.tool_calls
+        ]
         self.messages.append({
             "role": "assistant",
             "content": response.content or "",
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.name,
-                        "arguments": json.dumps(tc.arguments, ensure_ascii=False) if isinstance(tc.arguments, dict) else str(tc.arguments)
-                    }
-                }
-                for tc in response.tool_calls
-            ]
+            "tool_calls": tool_calls_payload,
         })
 
         observations = await self.act(step=step, tool_calls=response.tool_calls)
 
-        # Stop condition: Terminate tool invoked
         has_terminated = any(tc.name.lower() in ("terminate", "done") for tc in response.tool_calls)
         if has_terminated:
             self._final_answer = response.content or (observations[-1] if observations else "Task completed via termination tool.")
@@ -339,10 +447,10 @@ class ToolCallAgent(BaseAgent):
         return True
 
     async def run_task(self, prompt: str, max_steps: int = 30) -> str:
-        """Runs the ReAct loop until task termination or step limit exhaustion."""
+        """Run the ReAct loop until task termination or step limit exhaustion."""
         self.messages = [
             {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": prompt},
         ]
         self._final_answer = ""
 
@@ -356,7 +464,7 @@ class ToolCallAgent(BaseAgent):
             await self._emit(
                 EventType.STEP_END,
                 step=step,
-                payload={"step": step, "status": "completed" if not should_continue else "progress"}
+                payload={"step": step, "status": "completed" if not should_continue else "progress"},
             )
 
             if not should_continue:
@@ -365,6 +473,7 @@ class ToolCallAgent(BaseAgent):
         return self._final_answer or "Task execution finished."
 
     async def arun(self, task: str = "", max_steps: Optional[int] = None, **kwargs: Any) -> Any:
+        """Unified entrypoint executing agent task asynchronously."""
         prompt_val = task or kwargs.get("prompt", "")
         limit_val = max_steps or getattr(self.config, "max_steps", 30)
         return await self.run_task(prompt=prompt_val, max_steps=limit_val)
