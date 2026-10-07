@@ -146,7 +146,7 @@ export function ChatDeliverable({
       )}
 
       {/* 6. Bottom Action Toolbar with Usage Badges & Copy Button */}
-      <div className="flex items-center justify-between gap-2 pt-2 border-t border-border/40 text-xs">
+      <div className="flex items-center justify-between gap-2 pt-2 text-xs">
         <div className="flex items-center">
           {hasUsage && (
             <UsageBadgeGroup

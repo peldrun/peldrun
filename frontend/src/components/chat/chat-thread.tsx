@@ -7,9 +7,6 @@ import { ChatTimeline, StepEvent } from "./chat-timeline";
 import { ChatDeliverable } from "./chat-deliverable";
 import AIThinkingLoader from "@/components/AIThinkingLoader";
 
-import { UsageBadgeGroup } from "@/components/chat/UsageBadges";
-
-        
 export interface ChatTurn {
   id: string;
   jobId: string;
@@ -57,6 +54,9 @@ interface ChatThreadProps {
   chatScrollBottomRef: React.RefObject<HTMLDivElement | null>;
   activeModelName?: string;
   tokensUsed?: { input: number; output: number; total: number };
+  costUsd?: number | null;
+  latencyMs?: number | null;
+  tokensPerSecond?: number | null;
 }
 
 export function ChatThread({
@@ -85,6 +85,9 @@ export function ChatThread({
   chatScrollBottomRef,
   activeModelName = "Assistant",
   tokensUsed,
+  costUsd,
+  latencyMs,
+  tokensPerSecond,
 }: ChatThreadProps) {
   const groupStepEvents = (evts: StepEvent[]) => {
     return evts.reduce((acc, s) => {
@@ -158,7 +161,7 @@ export function ChatThread({
           const turnGrouped = groupStepEvents(turn.steps);
 
           return (
-            <div key={turn.id || `turn-${tIdx}`} className="space-y-4 pb-6 border-b border-border/40">
+            <div key={turn.id || `turn-${tIdx}`} className="space-y-4 pb-4">
               {/* User Prompt */}
               <div className="flex flex-col items-end space-y-1">
                 <div className="max-w-[90%] bg-transparent text-foreground px-4 py-2.5 text-sm sm:text-base leading-relaxed whitespace-pre-wrap font-sans">
@@ -194,9 +197,7 @@ export function ChatThread({
                 />
               )}
 
-
-
-              {/* Final Result */}
+              {/* Final Result with Historical Telemetry Badges */}
               {turn.finalResult && (
                 <ChatDeliverable
                   finalResult={turn.finalResult}
@@ -219,15 +220,9 @@ export function ChatThread({
                   tokensPerSecond={turn.usage?.tokens_per_second}
                 />
               )}
-              
             </div>
-
-               
-
-           
           );
         })}
-        
 
         {/* Current Active Turn Prompt */}
         {submittedPrompt && (
@@ -352,12 +347,7 @@ export function ChatThread({
           </div>
         )}
 
-
- 
-
-
-
-        {/* Current Turn Final Deliverable */}
+        {/* Current Turn Final Deliverable (Immediate Token & Telemetry Rendering) */}
         {finalResult && (
           <ChatDeliverable
             finalResult={finalResult}
@@ -373,6 +363,10 @@ export function ChatThread({
             setShowRawTrace={setShowRawTrace}
             modelName={activeModelName}
             timestamp={sessionTimestamp}
+            tokensUsed={tokensUsed}
+            costUsd={costUsd}
+            latencyMs={latencyMs}
+            tokensPerSecond={tokensPerSecond}
           />
         )}
 

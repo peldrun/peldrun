@@ -1,6 +1,6 @@
 ﻿"use client";
 
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { WorkspacePanel, getFileCategory } from "@/components/workspace/workspace-panel";
 import { Composer } from "@/components/chat/composer";
@@ -61,6 +61,12 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
 
   const [sandboxDraft, setSandboxDraft] = useState<{ filename: string; content: string } | null>(null);
   const [tokensUsed, setTokensUsed] = useState({ input: 0, output: 0, total: 0 });
+  const [currentUsageMetrics, setCurrentUsageMetrics] = useState<{
+    cost_usd?: number;
+    latency_ms?: number;
+    tokens_per_second?: number;
+  } | null>(null);
+
   const [humanQuery, setHumanQuery] = useState<string | null>(null);
   const [humanAnswer, setHumanAnswer] = useState("");
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -153,7 +159,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
               }))
               .filter((ev: StepEvent) => ev.content.trim() !== "" || Boolean(ev.toolName));
 
-          return {
+            return {
               id: t.job_id || `turn-${idx}`,
               jobId: t.job_id || "",
               prompt: t.prompt || "",
@@ -179,11 +185,13 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
               output: data.usage_summary.output_tokens || 0,
               total: data.usage_summary.total_tokens || 0,
             });
+            setCurrentUsageMetrics({
+              cost_usd: data.usage_summary.total_cost_usd,
+              latency_ms: data.usage_summary.latency_ms,
+              tokens_per_second: data.usage_summary.tokens_per_second,
+            });
           }
-
         }
-
-        
 
         if (data.events && Array.isArray(data.events)) {
           const replayed: StepEvent[] = [];
@@ -288,31 +296,73 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         const resText = payload.data?.result ?? payload.data?.content ?? "Task completed successfully.";
         if (eventType === "final") setFinalResult(safeRender(resText));
         
-        // ✅ التقاط استهلاك التوكين الصادر من حدث FINAL وتحديث شريط الرأس فوراً
+        // Immediate Token Accounting & Telemetry Extraction
         if (payload.data?.usage_summary) {
           setTokensUsed({
             input: payload.data.usage_summary.input_tokens || 0,
             output: payload.data.usage_summary.output_tokens || 0,
             total: payload.data.usage_summary.total_tokens || 0,
           });
+          setCurrentUsageMetrics({
+            cost_usd: payload.data.usage_summary.total_cost_usd,
+            latency_ms: payload.data.usage_summary.latency_ms,
+            tokens_per_second: payload.data.usage_summary.tokens_per_second,
+          });
         } else if (payload.data?.usage) {
+          const u = payload.data.usage;
+          const inTok = u.prompt_tokens ?? u.input_tokens ?? 0;
+          const outTok = u.completion_tokens ?? u.output_tokens ?? 0;
+          const totTok = u.total_tokens ?? (inTok + outTok);
           setTokensUsed((prev) => ({
-            input: prev.input + (payload.data.usage.prompt_tokens || payload.data.usage.input_tokens || 0),
-            output: prev.output + (payload.data.usage.completion_tokens || payload.data.usage.output_tokens || 0),
-            total: prev.total + (payload.data.usage.total_tokens || 0),
+            input: inTok > 0 ? inTok : prev.input,
+            output: outTok > 0 ? outTok : prev.output,
+            total: totTok > 0 ? totTok : (inTok + outTok > 0 ? inTok + outTok : prev.total),
           }));
+          setCurrentUsageMetrics({
+            cost_usd: u.cost_usd,
+            latency_ms: u.latency_ms,
+            tokens_per_second: u.tokens_per_second,
+          });
         }
 
         setStatus("completed");
         setExpandedSteps({});
         fetchJobFiles(jobId);
         es.close();
+
+        // Reactive bridge: notify sidebar immediately that run completed
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(
+            new CustomEvent("omweb:chat-status-changed", {
+              detail: {
+                chatId: activeChatId,
+                jobId: jobId,
+                status: "completed",
+              },
+            })
+          );
+          window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
+        }
       } else if (eventType === "error") {
         const errText = payload.data?.message ?? "Execution error encountered.";
         setFinalResult(safeRender(errText));
         setStatus("failed");
         fetchJobFiles(jobId);
         es.close();
+
+        // Reactive bridge: notify sidebar immediately that run failed
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(
+            new CustomEvent("omweb:chat-status-changed", {
+              detail: {
+                chatId: activeChatId,
+                jobId: jobId,
+                status: "failed",
+              },
+            })
+          );
+          window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
+        }
       }
     };
 
@@ -333,12 +383,11 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     };
   };
 
+  // Timer preservation: keep final elapsed time intact upon task completion
   useEffect(() => {
     let timer: NodeJS.Timeout;
     if (status === "running") {
       timer = setInterval(() => setElapsedSeconds((prev) => prev + 1), 1000);
-    } else {
-      setElapsedSeconds(0);
     }
     return () => clearInterval(timer);
   }, [status]);
@@ -371,8 +420,10 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     setSelectedFileForEditor(null);
     setExpandedSteps({});
     setTokensUsed({ input: 0, output: 0, total: 0 });
+    setCurrentUsageMetrics(null);
     setHumanQuery(null);
     setHumanAnswer("");
+    setElapsedSeconds(0);
     setSessionTimestamp("");
     setShowRightPanel(false);
     router.push("/chat");
@@ -384,12 +435,24 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       await fetch(`/api/run/jobs/${activeJobId}/stop`, { method: "POST" });
       setStatus("failed");
       if (eventSourceRef.current) eventSourceRef.current.close();
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent("omweb:chat-status-changed", {
+            detail: {
+              chatId: activeChatId,
+              jobId: activeJobId,
+              status: "failed",
+            },
+          })
+        );
+        window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
+      }
     } catch (e) {
       console.error("Failed to stop job", e);
     }
   };
 
-const handleSendHumanAnswer = async (customAnswer?: string) => {
+  const handleSendHumanAnswer = async (customAnswer?: string) => {
     const finalAnswer = (typeof customAnswer === "string" ? customAnswer : humanAnswer).trim();
     if (!finalAnswer || !activeJobId) return;
 
@@ -465,14 +528,13 @@ const handleSendHumanAnswer = async (customAnswer?: string) => {
           tokensUsed: { ...tokensUsed },
           producedFiles: [...producedFiles],
           model: activeModelName,
-          // ✅ إرفاق الاستهلاك مع الـ Turn لتظهره شارات الكارت
           usage: tokensUsed.total > 0 ? {
             input_tokens: tokensUsed.input,
             output_tokens: tokensUsed.output,
             total_tokens: tokensUsed.total,
-            cost_usd: 0,
-            latency_ms: elapsedSeconds * 1000,
-            tokens_per_second: elapsedSeconds > 0 ? tokensUsed.output / elapsedSeconds : 0,
+            cost_usd: currentUsageMetrics?.cost_usd ?? 0,
+            latency_ms: currentUsageMetrics?.latency_ms ?? (elapsedSeconds * 1000),
+            tokens_per_second: currentUsageMetrics?.tokens_per_second ?? (elapsedSeconds > 0 ? tokensUsed.output / elapsedSeconds : 0),
             provider: "local",
             model: activeModelName,
           } as any : undefined,
@@ -492,6 +554,8 @@ const handleSendHumanAnswer = async (customAnswer?: string) => {
     setExpandedSteps({ "active-1": true });
     setHumanQuery(null);
     setTokensUsed({ input: 0, output: 0, total: 0 });
+    setCurrentUsageMetrics(null);
+    setElapsedSeconds(0);
     setSessionTimestamp(new Date().toLocaleString());
 
     try {
@@ -529,6 +593,22 @@ const handleSendHumanAnswer = async (customAnswer?: string) => {
         window.history.replaceState(null, "", `/chat/${returnedChatId}`);
       }
       setActiveJobId(jobId);
+
+      // Reactive bridge: notify sidebar immediately that session is running
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent("omweb:chat-status-changed", {
+            detail: {
+              chatId: returnedChatId,
+              jobId: jobId,
+              status: "running",
+              title: finalPrompt.slice(0, 30),
+            },
+          })
+        );
+        window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
+      }
+
       connectStream(jobId);
     } catch (err: any) {
       console.error("Execution error:", err);
@@ -565,11 +645,31 @@ const handleSendHumanAnswer = async (customAnswer?: string) => {
     return "Agent reasoning & executing autonomously...";
   };
 
+  // Derive resolved metrics for the current response
+  const currentCostUsd = useMemo(() => {
+    return currentUsageMetrics?.cost_usd ?? 0;
+  }, [currentUsageMetrics]);
+
+  const currentLatencyMs = useMemo(() => {
+    if (currentUsageMetrics?.latency_ms && currentUsageMetrics.latency_ms > 0) {
+      return currentUsageMetrics.latency_ms;
+    }
+    return elapsedSeconds > 0 ? elapsedSeconds * 1000 : null;
+  }, [currentUsageMetrics, elapsedSeconds]);
+
+  const currentTokensPerSecond = useMemo(() => {
+    if (currentUsageMetrics?.tokens_per_second && currentUsageMetrics.tokens_per_second > 0) {
+      return currentUsageMetrics.tokens_per_second;
+    }
+    if (elapsedSeconds > 0 && tokensUsed.output > 0) {
+      return Number((tokensUsed.output / elapsedSeconds).toFixed(1));
+    }
+    return null;
+  }, [currentUsageMetrics, elapsedSeconds, tokensUsed.output]);
+
   return (
     <div className="flex h-full w-full bg-background text-foreground overflow-hidden font-sans">
       <div className="flex-1 flex flex-col h-full border-r border-border min-w-0 transition-all">
- 
-
         <ChatSubHeader
           isFreshSession={isFreshSession}
           submittedPrompt={submittedPrompt}
@@ -635,11 +735,14 @@ const handleSendHumanAnswer = async (customAnswer?: string) => {
             activeModelName={activeModelName}
             chatScrollBottomRef={chatScrollBottomRef}
             tokensUsed={tokensUsed}
+            costUsd={currentCostUsd}
+            latencyMs={currentLatencyMs}
+            tokensPerSecond={currentTokensPerSecond}
           />
         )}
 
         {!isFreshSession && (
-          <div className="p-3 sm:p-4  bg-background shrink-0">
+          <div className="p-3 sm:p-4 bg-background shrink-0">
             <Composer
               onSend={(textToSend, files, llmOverride) => {
                 handleStartTask(textToSend, llmOverride, files);

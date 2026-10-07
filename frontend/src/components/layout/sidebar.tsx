@@ -10,7 +10,6 @@ import {
   Download,
   Trash2,
   Archive,
-  History,
   ChevronDown,
   Activity
 } from "lucide-react";
@@ -70,6 +69,7 @@ export function Sidebar() {
     fetchData();
   }, [fetchData, pathname]);
 
+  // Reactive listener bridge for live updates and status changes
   useEffect(() => {
     const handleVisibility = () => {
       if (document.visibilityState === "visible") {
@@ -77,16 +77,70 @@ export function Sidebar() {
       }
     };
 
+    const handleChatsUpdated = () => {
+      fetchData(true);
+      // Secondary delayed fetch to synchronize asynchronous backend title summarization
+      const t = setTimeout(() => {
+        fetchData(true);
+      }, 800);
+      return () => clearTimeout(t);
+    };
+
+    const handleChatStatusChanged = (e: Event) => {
+      const customEvent = e as CustomEvent<{
+        chatId?: string;
+        jobId?: string;
+        status?: string;
+        title?: string;
+      }>;
+      if (!customEvent.detail) return;
+      const { chatId, jobId, status: newStatus, title: newTitle } = customEvent.detail;
+
+      // Optimistic instant state mutation for zero-latency status indicator feedback
+      setChats((prev) =>
+        prev.map((c) => {
+          const matches =
+            (chatId && (c.id === chatId || c.job_id === chatId)) ||
+            (jobId && (c.job_id === jobId || c.id === jobId));
+          if (matches) {
+            return {
+              ...c,
+              ...(newStatus ? { status: newStatus as any } : {}),
+              ...(newTitle ? { title: newTitle } : {}),
+            };
+          }
+          return c;
+        })
+      );
+
+      // Trigger server synchronization
+      fetchData(true);
+    };
+
     window.addEventListener("visibilitychange", handleVisibility);
-    window.addEventListener("omweb:refresh-sidebar", () => fetchData(true));
-    window.addEventListener("omweb:chats-updated", () => fetchData(true));
+    window.addEventListener("omweb:refresh-sidebar", handleChatsUpdated);
+    window.addEventListener("omweb:chats-updated", handleChatsUpdated);
+    window.addEventListener("omweb:chat-status-changed", handleChatStatusChanged);
 
     return () => {
       window.removeEventListener("visibilitychange", handleVisibility);
-      window.removeEventListener("omweb:refresh-sidebar", () => fetchData(true));
-      window.removeEventListener("omweb:chats-updated", () => fetchData(true));
+      window.removeEventListener("omweb:refresh-sidebar", handleChatsUpdated);
+      window.removeEventListener("omweb:chats-updated", handleChatsUpdated);
+      window.removeEventListener("omweb:chat-status-changed", handleChatStatusChanged);
     };
   }, [fetchData]);
+
+  // Smart polling fallback: only active while any task is actively running
+  useEffect(() => {
+    const hasRunningSession = chats.some((c) => c.status === "running");
+    if (!hasRunningSession) return;
+
+    const interval = setInterval(() => {
+      fetchData(true);
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [chats, fetchData]);
 
   const handleCreateProject = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -399,15 +453,13 @@ export function Sidebar() {
           </span>
         </Link>
 
-        {/* Right: Live Dynamic Server Status Indicator */}
-          <div className="flex items-center gap-2 shrink-0 p-2.5 border-t border-border flex items-center justify-between text-[11px] text-muted-foreground font-mono hover:bg-muted/70 hover:text-foreground transition-all group cursor-pointer">
-            <ServerStatusIndicator showLatency={true} />
-          </div>
-
-
+        {/* Dynamic Server Status Indicator */}
+        <div className="flex items-center gap-2 shrink-0 p-2.5 border-t border-border flex items-center justify-between text-[11px] text-muted-foreground font-mono hover:bg-muted/70 hover:text-foreground transition-all group cursor-pointer">
+          <ServerStatusIndicator showLatency={true} />
+        </div>
       </aside>
 
-      {/* Standalone Injected Dialog and Toasts (Zero Layout footprint) */}
+      {/* Standalone Injected Dialog and Toasts */}
       <ConfirmDialog />
       <ToastContainer />
     </>
@@ -446,11 +498,13 @@ function SidebarChatRow({
         className="flex items-center gap-2 truncate flex-1 mr-1"
       >
         <span
-          className={`w-2 h-2 rounded-full shrink-0 ${
+          className={`w-2 h-2 rounded-full shrink-0 transition-colors ${
             chat.status === "completed"
               ? "bg-emerald-500"
               : chat.status === "running"
               ? "bg-amber-500 animate-pulse"
+              : chat.status === "failed"
+              ? "bg-rose-500"
               : "bg-muted-foreground/40"
           }`}
         />
