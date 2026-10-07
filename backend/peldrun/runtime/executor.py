@@ -8,6 +8,7 @@ Encapsulates AgentRunner, ToolCallAgent, ExecutionState, and EventEmitter.
 Fully instrumented with P1-05 Structured Diagnostics & Latency Telemetry.
 Persists immutable invocation records into token_ledger via usage_store and pricing_store.
 Adheres strictly to the Runtime V1 contract in peldrun.runtime.contract.
+Faithfully extracts and propagates reasoning_effort control to the agent's LLM provider.
 """
 
 from __future__ import annotations
@@ -87,17 +88,14 @@ class CoreRuntimeExecutor:
         active_tool_calls: Dict[str, str] = {}
 
         def _telemetry_event_interceptor(evt: PeldrunEvent) -> None:
-            # Update step progression
             if hasattr(evt, "step") and isinstance(evt.step, int) and evt.step > 0:
                 diagnostics.set_step(evt.step)
 
-            # Track tool execution start
             if evt.type in (EventType.TOOL_CALL, getattr(EventType, "TOOL_CALLED", None)):
                 t_name = str(evt.payload.get("tool_name") or evt.payload.get("tool") or "tool")
                 call_key = diagnostics.start_tool(tool_name=t_name, step_num=evt.step)
                 active_tool_calls[t_name] = call_key
 
-            # Track tool execution completion
             elif evt.type in (EventType.OBSERVATION, getattr(EventType, "TOOL_COMPLETED", None)):
                 t_name = str(evt.payload.get("tool_name") or evt.payload.get("tool") or "")
                 call_key = active_tool_calls.pop(t_name, None)
@@ -116,7 +114,7 @@ class CoreRuntimeExecutor:
                 if asyncio.iscoroutinefunction(event_listener):
                     asyncio.run_coroutine_threadsafe(event_listener(evt), main_loop)
                 else:
-                    event_listener(evt)  # type: ignore
+                    event_listener(evt)
 
             emitter.subscribe_all(_sync_listener_bridge)
 
@@ -134,13 +132,23 @@ class CoreRuntimeExecutor:
             ToolCollection(registry.list_tools()),
         )
 
-        # 4. Configure LLM Provider & Instrument Invocations
+        # 4. Configure LLM Provider with explicit reasoning effort propagation
         base_url = llm_cfg_dict.get("base_url") or "http://127.0.0.1:1234/v1"
         api_key = llm_cfg_dict.get("api_key") or "EMPTY"
         max_tokens = min(int(llm_cfg_dict.get("max_tokens") or 4096), 4096)
         step_timeout = float(request.step_timeout_seconds or 120.0)
         model_name = llm_cfg_dict.get("model", "default")
         provider_name = llm_cfg_dict.get("provider", "openai")
+
+        # Resolve reasoning effort: normalize 'off' or 'none' strictly to 'none', keep others intact
+        raw_effort = llm_cfg_dict.get("reasoning_effort")
+        resolved_effort: Optional[str] = None
+        if raw_effort:
+            effort_str = str(raw_effort).lower().strip()
+            if effort_str in ("none", "off", "0"):
+                resolved_effort = "none"
+            else:
+                resolved_effort = effort_str
 
         llm_cfg = LLMConfig(
             model=model_name,
@@ -149,10 +157,10 @@ class CoreRuntimeExecutor:
             temperature=float(spec.temperature),
             max_tokens=max_tokens,
             timeout=step_timeout,
+            reasoning_effort=resolved_effort,
         )
         llm_provider = OpenAICompatProvider(config=llm_cfg)
 
-        # Wrap LLM generate to record telemetry and persist accounting fact atomically
         original_generate = llm_provider.generate
         usage_store = get_usage_store()
         pricing_store = get_pricing_store()
@@ -165,7 +173,6 @@ class CoreRuntimeExecutor:
             u = resp.usage
             inv_id = f"inv_{uuid.uuid4().hex[:12]}"
 
-            # Calculate monetary cost in integer Nano-USD
             cost_nano, rule_id = 0, None
             if u:
                 cost_nano, rule_id = await pricing_store.calculate_cost(
@@ -175,7 +182,6 @@ class CoreRuntimeExecutor:
                     base_url=base_url,
                 )
 
-            # Record in Diagnostics Collector
             diagnostics.record_llm_invocation(
                 invocation_id=inv_id,
                 provider=provider_name,
@@ -192,7 +198,6 @@ class CoreRuntimeExecutor:
                 finish_reason=resp.finish_reason,
             )
 
-            # Persist immutable fact into SQLite token_ledger
             if u:
                 record = LLMInvocationRecord(
                     invocation_id=inv_id,
@@ -231,7 +236,7 @@ class CoreRuntimeExecutor:
 
         llm_provider.generate = _instrumented_generate
 
-        # 5. Instantiate Autonomous Agent
+        # 5. Instantiate Autonomous Agent with explicit LLM provider binding
         agent_config = AgentConfig(
             name=spec.name or spec.id,
             system_prompt=spec.system_prompt,
@@ -262,6 +267,7 @@ class CoreRuntimeExecutor:
                 "run_id": run_id_str,
                 "job_id": job_id,
                 "request_metadata": request.metadata,
+                "reasoning_effort": resolved_effort,
             },
         )
         initial_state.add_message(role=MessageRole.SYSTEM, content=spec.system_prompt)
@@ -329,7 +335,6 @@ class CoreRuntimeExecutor:
 
         completed_time = time.time()
 
-        # 9. Assemble Terminal RunResult with Diagnostic Report
         if execution_state is None:
             diag = diagnostics.finalize(status=RunStatus.FAILED, failure_reason="No state produced.")
             return RunResult(

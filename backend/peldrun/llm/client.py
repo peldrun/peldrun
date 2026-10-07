@@ -4,6 +4,8 @@ backend/peldrun/llm/client.py
 Universal LLM Client for PELDRUN Core Runtime.
 Built on official AsyncOpenAI with deep reasoning extraction from model_extra,
 true streaming token generation, TTFT latency accounting, and canonical TokenUsage metering.
+Propagates dynamic reasoning effort control (none, low, medium, high) to both Cloud and Local OpenAI-compatible backends.
+Strictly normalizes 'off' to 'none' ensuring complete compliance with OpenAI API schema standards.
 """
 
 from __future__ import annotations
@@ -79,7 +81,6 @@ class TokenUsage(BaseModel):
         description="Algorithm used for estimation (e.g. bpe_encoding, heuristic)",
     )
 
-    # Backward compatibility properties for legacy consumers
     @property
     def prompt_tokens(self) -> Optional[int]:
         return self.input_tokens
@@ -173,6 +174,7 @@ class LLMConfig:
     max_tokens: Optional[int] = None
     top_p: float = 1.0
     timeout: float = 300.0
+    reasoning_effort: Optional[str] = None
     extra_headers: Dict[str, str] = field(default_factory=dict)
     extra_params: Dict[str, Any] = field(default_factory=dict)
 
@@ -221,7 +223,6 @@ class StreamChunk:
     tool_calls: Optional[List[Any]] = None
 
     def __post_init__(self) -> None:
-        """Synchronize textual content and tool call collections for complete interoperability."""
         if self.content is not None and self.content_delta is None:
             self.content_delta = self.content
         elif self.content_delta is not None and self.content is None:
@@ -325,6 +326,7 @@ class AsyncLLMClient:
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         timeout: float = 300.0,
+        reasoning_effort: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         self.config = config
@@ -332,17 +334,20 @@ class AsyncLLMClient:
         resolved_api_key = "EMPTY"
         resolved_timeout = float(timeout or 300.0)
         self.model = "default"
+        self.reasoning_effort = reasoning_effort
 
         if isinstance(config, dict):
             resolved_base_url = config.get("base_url") or config.get("api_base") or base_url or resolved_base_url
             resolved_api_key = config.get("api_key") or api_key or resolved_api_key
             resolved_timeout = float(config.get("timeout") or resolved_timeout)
             self.model = config.get("model", self.model)
+            self.reasoning_effort = config.get("reasoning_effort") or self.reasoning_effort
         elif config is not None and hasattr(config, "base_url"):
             resolved_base_url = config.base_url or getattr(config, "api_base", None) or base_url or resolved_base_url
             resolved_api_key = config.api_key or api_key or resolved_api_key
             resolved_timeout = float(getattr(config, "timeout", None) or resolved_timeout)
             self.model = getattr(config, "model", self.model)
+            self.reasoning_effort = getattr(config, "reasoning_effort", None) or self.reasoning_effort
         else:
             resolved_base_url = base_url or resolved_base_url
             resolved_api_key = api_key or resolved_api_key
@@ -366,7 +371,6 @@ class AsyncLLMClient:
         if not raw_usage:
             return None
 
-        # 1. Direct dict structure
         if isinstance(raw_usage, dict):
             inp = raw_usage.get("prompt_tokens") or raw_usage.get("input_tokens")
             out = raw_usage.get("completion_tokens") or raw_usage.get("output_tokens")
@@ -393,7 +397,6 @@ class AsyncLLMClient:
                     estimated=False,
                 )
 
-        # 2. OpenAI CompletionUsage object structure
         inp = getattr(raw_usage, "prompt_tokens", None)
         out = getattr(raw_usage, "completion_tokens", None)
         tot = getattr(raw_usage, "total_tokens", None)
@@ -461,6 +464,7 @@ class AsyncLLMClient:
         max_tokens: Optional[int] = None,
         model: Optional[str] = None,
         timeout: Optional[float] = None,
+        reasoning_effort: Optional[str] = None,
         **kwargs: Any,
     ) -> LLMResponse:
         """Executes a chat completion request, normalizes usage metrics, and falls back gracefully."""
@@ -479,6 +483,29 @@ class AsyncLLMClient:
             "temperature": float(temp),
             "stream": False,
         }
+
+        # Resolve reasoning effort hierarchy (arg -> kwargs -> config)
+        effort = (
+            reasoning_effort
+            or kwargs.get("reasoning_effort")
+            or getattr(self.config, "reasoning_effort", None)
+            or self.reasoning_effort
+        )
+        if isinstance(self.config, dict) and not effort:
+            effort = self.config.get("reasoning_effort")
+
+        if effort and str(effort).lower() in ("none", "off", "0", "low", "medium", "high", "minimal", "xhigh"):
+            raw_eff = str(effort).lower().strip()
+            # Canonical OpenAI normalization: 'off' -> 'none' prevents 400 Bad Request
+            norm_effort = "none" if raw_eff in ("none", "off", "0") else raw_eff
+
+            call_kwargs["reasoning_effort"] = norm_effort
+
+            extra_body = kwargs.get("extra_body") or {}
+            if not isinstance(extra_body, dict):
+                extra_body = {}
+            extra_body["reasoning_effort"] = norm_effort
+            call_kwargs["extra_body"] = extra_body
 
         call_timeout = timeout or getattr(self.config, "timeout", None) or self.timeout
         if call_timeout:
@@ -547,7 +574,6 @@ class AsyncLLMClient:
                     )
                 )
 
-        # Normalize usage: Provider Exact -> Tokenizer Fallback
         usage = self._normalize_raw_usage(response.usage)
         if usage is None:
             usage = self._fallback_usage_estimation(
@@ -569,7 +595,7 @@ class AsyncLLMClient:
             model=response.model or chosen_model,
             raw=response,
             latency_ms=total_latency_ms,
-            ttft_ms=total_latency_ms,  # For non-streaming, TTFT equals total latency
+            ttft_ms=total_latency_ms,
         )
 
     async def generate(self, *args: Any, **kwargs: Any) -> LLMResponse:
@@ -587,6 +613,7 @@ class AsyncLLMClient:
         max_tokens: Optional[int] = None,
         model: Optional[str] = None,
         timeout: Optional[float] = None,
+        reasoning_effort: Optional[str] = None,
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
         """
@@ -611,6 +638,27 @@ class AsyncLLMClient:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+
+        effort = (
+            reasoning_effort
+            or kwargs.get("reasoning_effort")
+            or getattr(self.config, "reasoning_effort", None)
+            or self.reasoning_effort
+        )
+        if isinstance(self.config, dict) and not effort:
+            effort = self.config.get("reasoning_effort")
+
+        if effort and str(effort).lower() in ("none", "off", "0", "low", "medium", "high", "minimal", "xhigh"):
+            raw_eff = str(effort).lower().strip()
+            norm_effort = "none" if raw_eff in ("none", "off", "0") else raw_eff
+
+            call_kwargs["reasoning_effort"] = norm_effort
+
+            extra_body = kwargs.get("extra_body") or {}
+            if not isinstance(extra_body, dict):
+                extra_body = {}
+            extra_body["reasoning_effort"] = norm_effort
+            call_kwargs["extra_body"] = extra_body
 
         call_timeout = timeout or getattr(self.config, "timeout", None) or self.timeout
         if call_timeout:
@@ -637,7 +685,6 @@ class AsyncLLMClient:
         async for chunk in stream_resp:
             now = time.time()
 
-            # Capture provider usage emitted in stream metadata
             if hasattr(chunk, "usage") and chunk.usage:
                 captured_usage = self._normalize_raw_usage(chunk.usage)
 
@@ -669,7 +716,6 @@ class AsyncLLMClient:
             if reasoning_delta:
                 accumulated_reasoning.append(reasoning_delta)
 
-            # Process streaming tool call deltas
             tc_deltas: List[DeltaToolCall] = []
             if getattr(delta, "tool_calls", None):
                 for idx, tc in enumerate(delta.tool_calls):
@@ -695,7 +741,6 @@ class AsyncLLMClient:
                 raw=chunk,
             )
 
-        # Fallback usage estimation if stream concluded without provider usage payload
         if captured_usage is None:
             full_out = "".join(accumulated_content)
             full_reas = "".join(accumulated_reasoning)

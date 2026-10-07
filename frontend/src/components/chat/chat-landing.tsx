@@ -1,7 +1,7 @@
 "use client";
 
-import React, { useRef, useState, useEffect } from "react";
-import NeuralLoaderV3 from '@/components/NeuralLoaderV3';
+import React, { useRef, useState, useEffect, useMemo } from "react";
+import NeuralLoaderV3 from "@/components/NeuralLoaderV3";
 import {
   Bot,
   MessageSquare,
@@ -17,13 +17,16 @@ import {
 } from "lucide-react";
 import { AgentSelector } from "./agent-selector";
 import { ActiveToolsModal } from "./active-tools-modal";
+import { ReasoningEffortSelector } from "./reasoning-effort-selector";
+import { useAppStorage } from "@/hooks/use-app-storage";
+import { inferModelCapabilities, fetchServerMetadata } from "@/lib/modelMetadata";
 
 interface QuickPill {
   label: string;
   icon: React.ReactNode;
   prompt: string;
 }
- 
+
 const QUICK_PILLS: QuickPill[] = [
   { label: "Create slides", icon: <Layout size={13} />, prompt: "Create an interactive presentation in HTML with modern slide navigation and CSS styling, then terminate." },
   { label: "Build website", icon: <Globe size={13} />, prompt: "Build a responsive modern single-page website in HTML and Tailwind CSS with a clean hero section and pricing cards, then terminate." },
@@ -53,19 +56,25 @@ export function ChatLanding({
   formatFileSize,
 }: ChatLandingProps) {
   const [isLandingDragging, setIsLandingDragging] = useState(false);
-  const [activeModel, setActiveModel] = useState<string>("qwen3-vl-8b-instruct");
-  const [activeProvider, setActiveProvider] = useState<string>("LM Studio (Local)");
+  const [activeModel, setActiveModel] = useAppStorage("active_model");
+  const [activeProvider, setActiveProvider] = useAppStorage("active_provider");
+  const [reasoningEffort] = useAppStorage("reasoning_effort");
+  const [metadataVault, setMetadataVault] = useState<Record<string, any>>({});
 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const landingFileInputRef = useRef<HTMLInputElement | null>(null);
 
+  // Synchronize server metadata for dynamic capability evaluation
+  useEffect(() => {
+    fetchServerMetadata().then((data) => setMetadataVault(data || {}));
+    const onMetadataUpdate = (e: any) => setMetadataVault(e.detail || {});
+    window.addEventListener("omweb:metadata-updated", onMetadataUpdate);
+    return () => window.removeEventListener("omweb:metadata-updated", onMetadataUpdate);
+  }, []);
+
+  // Listen to live engine and model changes
   useEffect(() => {
     if (typeof window !== "undefined") {
-      const savedModel = localStorage.getItem("omweb_active_model");
-      const savedProvider = localStorage.getItem("omweb_active_provider");
-      if (savedModel) setActiveModel(savedModel);
-      if (savedProvider) setActiveProvider(savedProvider);
-
       const onModelChange = (e: any) => {
         if (e.detail?.model) setActiveModel(e.detail.model);
         if (e.detail?.provider_name) setActiveProvider(e.detail.provider_name);
@@ -74,7 +83,14 @@ export function ChatLanding({
       window.addEventListener("omweb:model-change", onModelChange);
       return () => window.removeEventListener("omweb:model-change", onModelChange);
     }
-  }, []);
+  }, [setActiveModel, setActiveProvider]);
+
+  // Dynamically resolve whether the currently active model supports reasoning
+  const modelCaps = useMemo(() => {
+    return inferModelCapabilities(activeModel, metadataVault[activeModel]);
+  }, [activeModel, metadataVault]);
+
+  const isReasoningSupported = Boolean(modelCaps?.isReasoning);
 
   const handleLandingFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
@@ -85,6 +101,19 @@ export function ChatLanding({
     }
   };
 
+  const handleDispatch = (customPrompt?: string) => {
+    const textToRun = (customPrompt !== undefined ? customPrompt : inputValue).trim();
+    if (!textToRun && landingAttachedFiles.length === 0) return;
+
+    const payloadOverride = {
+      is_reasoning_model: isReasoningSupported,
+      reasoning_effort: isReasoningSupported ? (reasoningEffort || "none") : "none",
+    };
+
+    onStartTask(textToRun, payloadOverride, landingAttachedFiles);
+    setLandingAttachedFiles([]);
+  };
+
   const dynamicPlaceholder =
     execMode === "agent"
       ? `Ask ${activeProvider} (${activeModel}) to execute autonomous tasks...`
@@ -92,13 +121,11 @@ export function ChatLanding({
 
   return (
     <div className="glow-wrapper flex-1 flex flex-col items-center justify-center p-6 text-center max-w-3xl mx-auto w-full font-sans relative">
+      <div className="flex items-center justify-center chatlanding-neuralloader">
+        <NeuralLoaderV3 size={100} color="blue" speed={30} />
+      </div>
 
-      <div className="flex  items-center justify-center chatlanding-neuralloader">
-      <NeuralLoaderV3 size={100} color="blue" speed={30} />
-    </div>
-
-
-      <h1 className="font-serif text-3xl sm:text-5xl font-normal text-black tracking-tight mb-4">
+      <h1 className="font-serif text-3xl sm:text-5xl font-normal text-black dark:text-white tracking-tight mb-4">
         What can I do for you?
       </h1>
 
@@ -125,7 +152,7 @@ export function ChatLanding({
             onClick={() => handleModeChange("chat")}
             className={`flex items-center gap-2 px-4 py-1.5 rounded-full text-xs transition-all duration-300 cursor-pointer ${
               execMode === "chat"
-                ? "bg-card text-emerald-500 border border-emerald-500/50   shadow-[0_0_16px_rgba(14,165,233,0.38)] font-semibold ring-1 ring-emerald-500/30"
+                ? "bg-card text-emerald-500 border border-emerald-500/50 shadow-[0_0_16px_rgba(14,165,233,0.38)] font-semibold ring-1 ring-emerald-500/30"
                 : "text-muted-foreground hover:text-foreground border border-transparent"
             }`}
             title="Direct Chat: fast response, no tools or execution steps"
@@ -133,12 +160,10 @@ export function ChatLanding({
             <MessageSquare size={14} className={execMode === "chat" ? "text-emerald-500 animate-pulse" : ""} />
             <span>Chat</span>
             {execMode === "chat" && (
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500  shadow-[0_0_16px_rgba(14,165,233,0.38)]  animate-pulse" />
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_16px_rgba(14,165,233,0.38)] animate-pulse" />
             )}
           </button>
         </div>
-
-        
       </div>
 
       <input
@@ -159,10 +184,8 @@ export function ChatLanding({
             setLandingAttachedFiles((prev) => [...prev, ...Array.from(e.dataTransfer.files)]);
           }
         }}
-        className={`w-full bg-card rounded-3xl  transition-all p-3.5 peldrun-input-bar ${
-          isLandingDragging
-            ? "ring-2 ring-primary/40 bg-card"
-            : "bg-card"
+        className={`w-full bg-card rounded-3xl transition-all p-3.5 peldrun-input-bar ${
+          isLandingDragging ? "ring-2 ring-primary/40 bg-card" : "bg-card"
         }`}
       >
         {landingAttachedFiles.length > 0 && (
@@ -199,10 +222,7 @@ export function ChatLanding({
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
-              if (inputValue.trim() || landingAttachedFiles.length > 0) {
-                onStartTask(inputValue, undefined, landingAttachedFiles);
-                setLandingAttachedFiles([]);
-              }
+              handleDispatch();
             }
           }}
           rows={3}
@@ -231,31 +251,31 @@ export function ChatLanding({
             <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-muted/60 text-muted-foreground border border-border">
               <Sparkles size={12} className={execMode === "agent" ? "text-emerald-500" : "text-sky-500"} />
               <span className="font-mono text-[11px] font-semibold text-foreground">
-                {execMode === "agent" ? "Agent Autonomous Mode" : "Direct Fast Chat"}
+                {execMode === "agent" ? "Agent Mode" : "Chat Mode"}
               </span>
             </span>
 
-
+            {/* Dynamic Reasoning Effort Selector: Visible whenever active model supports reasoning */}
+            {isReasoningSupported && (
+              <div className="animate-in fade-in zoom-in-95 duration-200">
+                <ReasoningEffortSelector />
+              </div>
+            )}
 
             {/* Agent Selector: Visible ONLY when execMode === 'agent' */}
-        {execMode === "agent" && (
-          <div className="animate-in fade-in duration-150 flex items-center gap-1.5 z-50">
-            <AgentSelector/>
-              <ActiveToolsModal />
-          </div>
-        )}
-
-
+            {execMode === "agent" && (
+              <div className="animate-in fade-in duration-150 flex items-center gap-1.5 z-50">
+                <AgentSelector />
+                <ActiveToolsModal />
+              </div>
+            )}
           </div>
 
           <button
             type="button"
-            onClick={() => {
-              onStartTask(inputValue, undefined, landingAttachedFiles);
-              setLandingAttachedFiles([]);
-            }}
+            onClick={() => handleDispatch()}
             disabled={!inputValue.trim() && landingAttachedFiles.length === 0}
-            className="h-8 w-8 rounded-full bg-black text-primary-foreground flex items-center justify-center transition-all disabled:opacity-90 disabled:cursor-not-allowed shadow-peldrun-xs cursor-pointer hover:bg-primary/90"
+            className="h-8 w-8 rounded-full bg-black dark:bg-white text-white dark:text-black flex items-center justify-center transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-peldrun-xs cursor-pointer hover:opacity-90"
             title="Dispatch Task (Enter)"
           >
             <ArrowUp size={15} />
@@ -268,7 +288,7 @@ export function ChatLanding({
           <button
             key={idx}
             type="button"
-            onClick={() => onStartTask(pill.prompt)}
+            onClick={() => handleDispatch(pill.prompt)}
             className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full border border-border bg-card/60 hover:bg-muted text-xs text-foreground transition-all cursor-pointer shadow-peldrun-xs"
           >
             <span className="text-muted-foreground">{pill.icon}</span>

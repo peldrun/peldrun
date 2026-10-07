@@ -41,6 +41,12 @@ export const storageSchema = {
     defaultValue: "agent",
   },
 
+  reasoning_effort: {
+    tier: "local",
+    schema: z.enum(["none", "low", "medium", "high"]),
+    defaultValue: "none",
+  },
+
   active_model: {
     tier: "local",
     schema: z.string().min(1).max(256),

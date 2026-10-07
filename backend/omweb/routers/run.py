@@ -7,6 +7,7 @@ Hardened under PR 5 and Milestone P1 (Token Accounting Integration):
 - Fully propagates token usage and session summaries upon job termination.
 - Preserves usage accounting facts across historical turns in session.json.
 - Full support for 'after_sequence' SSE stream replay.
+- Seamlessly propagates reasoning_effort and is_reasoning_model across Agent and Chat modes.
 """
 
 from __future__ import annotations
@@ -65,6 +66,8 @@ class RunRequest(BaseModel):
     api_key: Optional[str] = None
     api_type: Optional[str] = None
     mode: Optional[str] = "agent"
+    reasoning_effort: Optional[str] = None
+    is_reasoning_model: Optional[bool] = None
 
 
 class FileContentPayload(BaseModel):
@@ -136,7 +139,7 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
     if req.provider_name:
         llm_override["provider_name"] = req.provider_name.strip()
     elif req.provider:
-        llm_override["provider_name"] = req.provider_name.strip()
+        llm_override["provider_name"] = req.provider.strip()
     if req.base_url:
         llm_override["base_url"] = req.base_url.strip()
     if req.api_key is not None:
@@ -145,6 +148,10 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
         llm_override["api_type"] = req.api_type.strip()
     if req.agent_id:
         llm_override["agent_id"] = req.agent_id.strip()
+    if req.reasoning_effort:
+        llm_override["reasoning_effort"] = req.reasoning_effort.strip()
+    if req.is_reasoning_model is not None:
+        llm_override["is_reasoning_model"] = req.is_reasoning_model
 
     existing_chat = None
     if req.chat_id:
@@ -225,6 +232,8 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
                 s_data["provider"] = llm_override.get("provider")
                 s_data["provider_name"] = llm_override.get("provider_name") or llm_override.get("provider")
                 s_data["agent_id"] = effective_agent
+                if "reasoning_effort" in llm_override:
+                    s_data["reasoning_effort"] = llm_override["reasoning_effort"]
             session_file.write_text(json.dumps(s_data, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
@@ -254,6 +263,7 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
         "provider": llm_override.get("provider"),
         "provider_name": llm_override.get("provider_name") or llm_override.get("provider"),
         "agent_id": effective_agent,
+        "reasoning_effort": llm_override.get("reasoning_effort"),
     }
 
 
@@ -342,10 +352,6 @@ async def get_job_detail(job_id: str):
 
 @router.get("/jobs/{job_id}/stream")
 async def stream_job_events(job_id: str, after_sequence: int = Query(0, ge=0)):
-    """
-    Authoritative Server-Sent Events stream for execution monitoring.
-    Replays historical events durably and streams live tail with token usage payloads.
-    """
     job = job_manager.get_job(job_id)
     chat, chat_id = resolve_chat(job_id)
     chat = chat or {}
@@ -367,7 +373,6 @@ async def stream_job_events(job_id: str, after_sequence: int = Query(0, ge=0)):
         current_step = 1
         max_seen_sequence = after_sequence
 
-        # PHASE 1: Replay Historical Events
         replayed_records: List[Dict[str, Any]] = []
         try:
             stored_raw = await store.get_events_after(actual_job_id, sequence=after_sequence)
@@ -421,7 +426,6 @@ async def stream_job_events(job_id: str, after_sequence: int = Query(0, ge=0)):
             if str(ev_type_str).lower() in ("final", "error", "cancelled", "done"):
                 return
 
-        # PHASE 2: Live Events Tail
         is_actively_running = (
             job_id in ACTIVE_JOB_TASKS
             or actual_job_id in ACTIVE_JOB_TASKS
@@ -525,11 +529,9 @@ async def stream_job_events(job_id: str, after_sequence: int = Query(0, ge=0)):
                 prompt_val = getattr(job, "prompt", None) or chat.get("prompt", "")
                 final_status = "completed" if str(ev_type).lower() in ["final", "done"] else "failed"
 
-                # Pull fresh cumulative usage summary from SQLite ledger facts
                 fresh_summary = await usage_store.get_chat_usage_summary(chat_id)
                 turn_usage = res_data.get("usage") if isinstance(res_data, dict) else None
 
-                # Atomically persist updated session manifest preserving usage facts
                 project_manager.save_chat_session(
                     chat_id=chat_id,
                     project_id=p_id,
@@ -545,7 +547,6 @@ async def stream_job_events(job_id: str, after_sequence: int = Query(0, ge=0)):
                     turns=chat.get("turns", []),
                 )
 
-                # Ensure session.json on disk contains both overall usage_summary and latest turn usage
                 try:
                     s_file = project_manager.get_chat_dir(chat_id, p_id) / "session.json"
                     if s_file.exists():

@@ -1,6 +1,6 @@
 {
   "id": "peldrun",
-  "name": "peldrun Generalist",
+  "name": "Peldrun Generalist",
   "role": "General Autonomous Specialist",
   "icon": "Bot",
   "description": "Comprehensive autonomous agent equipped with terminal, python execution, file management, and browser automation.",
@@ -11,7 +11,8 @@
     "web_search",
     "browser_use",
     "file_saver",
-    "ask_human"
+    "ask_human",
+    "str_replace_editor"
   ],
   "max_steps": 30,
   "is_builtin": true,

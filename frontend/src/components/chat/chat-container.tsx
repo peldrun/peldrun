@@ -11,6 +11,7 @@ import { StepEvent } from "./chat-timeline";
 import { EngineOption } from "./engine-selector";
 import { useChatStore } from "@/stores/chat-store";
 import { useAppStorage } from "@/hooks/use-app-storage";
+import { inferModelCapabilities, fetchServerMetadata } from "@/lib/modelMetadata";
 
 function safeRender(val: any): string {
   if (val === null || val === undefined) return "";
@@ -51,10 +52,12 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   const [expandedSteps, setExpandedSteps] = useState<Record<string, boolean>>({});
   const [copiedSection, setCopiedSection] = useState<string | null>(null);
   const [showRawTrace, setShowRawTrace] = useState(false);
+  const [metadataVault, setMetadataVault] = useState<Record<string, any>>({});
 
   // Unified multi-tier reactive storage
   const [showRightPanel, setShowRightPanel] = useAppStorage("right_panel_open");
   const [execMode, setExecMode] = useAppStorage("exec_mode");
+  const [reasoningEffort] = useAppStorage("reasoning_effort");
   const [selectedEngineId, setSelectedEngineId] = useAppStorage("selected_engine");
   const [activeModelName, setActiveModelName] = useAppStorage("active_model");
   const [activeLlmOverride] = useAppStorage("active_llm_override");
@@ -74,6 +77,13 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
 
   const eventSourceRef = useRef<EventSource | null>(null);
   const chatScrollBottomRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    fetchServerMetadata().then((data) => setMetadataVault(data || {}));
+    const onMetadataUpdate = (e: any) => setMetadataVault(e.detail || {});
+    window.addEventListener("omweb:metadata-updated", onMetadataUpdate);
+    return () => window.removeEventListener("omweb:metadata-updated", onMetadataUpdate);
+  }, []);
 
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -295,8 +305,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       } else if (eventType === "final" || eventType === "done") {
         const resText = payload.data?.result ?? payload.data?.content ?? "Task completed successfully.";
         if (eventType === "final") setFinalResult(safeRender(resText));
-        
-        // Immediate Token Accounting & Telemetry Extraction
+
         if (payload.data?.usage_summary) {
           setTokensUsed({
             input: payload.data.usage_summary.input_tokens || 0,
@@ -330,7 +339,6 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         fetchJobFiles(jobId);
         es.close();
 
-        // Reactive bridge: notify sidebar immediately that run completed
         if (typeof window !== "undefined") {
           window.dispatchEvent(
             new CustomEvent("omweb:chat-status-changed", {
@@ -350,7 +358,6 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         fetchJobFiles(jobId);
         es.close();
 
-        // Reactive bridge: notify sidebar immediately that run failed
         if (typeof window !== "undefined") {
           window.dispatchEvent(
             new CustomEvent("omweb:chat-status-changed", {
@@ -383,7 +390,6 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     };
   };
 
-  // Timer preservation: keep final elapsed time intact upon task completion
   useEffect(() => {
     let timer: NodeJS.Timeout;
     if (status === "running") {
@@ -489,6 +495,16 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
 
     let finalPrompt = rawText;
     const effectiveMode = customOverride?.mode || execMode;
+
+    // Dynamically resolve reasoning capability from metadata vault fallback
+    const activeCaps = inferModelCapabilities(activeModelName, metadataVault[activeModelName]);
+    const isModelReasoning = customOverride?.is_reasoning_model !== undefined
+      ? Boolean(customOverride.is_reasoning_model)
+      : Boolean(activeCaps?.isReasoning);
+
+    const effectiveReasoningEffort = isModelReasoning
+      ? (customOverride?.reasoning_effort || reasoningEffort || "none")
+      : "none";
     const targetChatId = activeChatId || `chat_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 8)}`;
 
     if (filesToUpload && filesToUpload.length > 0) {
@@ -575,6 +591,8 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
           chat_id: targetChatId,
           agent_id: selectedAgentId || "peldrun",
           mode: effectiveMode,
+          reasoning_effort: effectiveReasoningEffort,
+          is_reasoning_model: isModelReasoning,
           ...storedOverride,
           ...(customOverride || {})
         }),
@@ -594,7 +612,6 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       }
       setActiveJobId(jobId);
 
-      // Reactive bridge: notify sidebar immediately that session is running
       if (typeof window !== "undefined") {
         window.dispatchEvent(
           new CustomEvent("omweb:chat-status-changed", {
@@ -645,7 +662,6 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     return "Agent reasoning & executing autonomously...";
   };
 
-  // Derive resolved metrics for the current response
   const currentCostUsd = useMemo(() => {
     return currentUsageMetrics?.cost_usd ?? 0;
   }, [currentUsageMetrics]);

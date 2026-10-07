@@ -9,7 +9,8 @@
     "bash",
     "python_execute",
     "file_saver",
-    "ask_human"
+    "ask_human",
+    "str_replace_editor"
   ],
   "max_steps": 30,
   "is_builtin": true,

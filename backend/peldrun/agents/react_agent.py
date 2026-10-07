@@ -1,7 +1,10 @@
 """
+backend/peldrun/agents/react_agent.py
+
 PELDRUN Core ReAct Autonomous Agent Implementation.
 Executes Think-Act cognitive cycles, extracts thought reasoning traces,
 dispatches tool executions, and satisfies BaseAgent lifecycle contracts.
+Faithfully forwards configured reasoning_effort parameters to the underlying provider.
 """
 
 from __future__ import annotations
@@ -52,17 +55,12 @@ class ReActAgent(BaseAgent):
         workspace_dir: Optional[str] = None,
         **kwargs: Any
     ) -> None:
-        """
-        Initialize the ReActAgent with dual signature compatibility.
-        Supports both modern BaseAgent parameters and legacy framework signatures.
-        """
         resolved_config = config or ReActAgentConfig()
         if workspace_dir and not resolved_config.workspace_root:
             resolved_config.workspace_root = workspace_dir
 
         resolved_llm = llm_provider if llm_provider is not None else llm
 
-        # Normalize tools container to ensure uniform interface
         resolved_tools: Optional[ToolRegistry] = None
         if isinstance(tool_registry, ToolRegistry):
             resolved_tools = tool_registry
@@ -113,16 +111,20 @@ class ReActAgent(BaseAgent):
         budgeted_messages = self.memory.short_term.get_budgeted_messages()
         tool_schemas = self.tools.get_openai_schemas()
 
-        # Query LLM provider
+        effort_val = getattr(getattr(self.llm, "config", None), "reasoning_effort", None)
+        extra_kwargs: Dict[str, Any] = {}
+        if effort_val:
+            extra_kwargs["reasoning_effort"] = effort_val
+
         response = await self.llm.generate(
             messages=budgeted_messages,
             tools=tool_schemas if tool_schemas else None,
+            **extra_kwargs,
         )
 
         raw_content = response.content or ""
         thought, clean_content = self._extract_reasoning_and_content(raw_content)
 
-        # Fallback to model reasoning fields if available
         if not thought:
             thought = getattr(response, "thought", None) or getattr(response, "reasoning", None)
 
@@ -130,7 +132,6 @@ class ReActAgent(BaseAgent):
             await self.emitter.emit_thought(thought=thought)
             self.state.add_message("assistant", f"<think>{thought}</think>")
 
-        # Handle tool execution phase
         if response.tool_calls:
             tool_calls_payload: List[Dict[str, Any]] = []
 
@@ -167,7 +168,6 @@ class ReActAgent(BaseAgent):
 
                 await self.emitter.emit_tool_call(tool_name=t_name, arguments=t_args, tool_call_id=t_id)
 
-                # Execute tool via ToolRegistry
                 result = await self.tools.aexecute(t_name, **t_args)
 
                 self.state.record_tool_execution(
@@ -197,7 +197,6 @@ class ReActAgent(BaseAgent):
                     tool_call_id=t_id,
                 )
 
-            # Record assistant turn with tool calls into dialogue history
             self.memory.short_term.add_message(
                 role="assistant",
                 content=clean_content if clean_content else None,
@@ -205,7 +204,6 @@ class ReActAgent(BaseAgent):
             )
             return True
 
-        # Final answer reached when model proposes no tool calls
         final_text = clean_content if clean_content else raw_content
         if final_text:
             self.state.add_message("assistant", final_text)

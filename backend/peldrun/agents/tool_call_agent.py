@@ -9,7 +9,7 @@ Hardened under PR 4 (Centralized Tool Retry & LLM Failure Decoupling):
 - Emits canonical EventType.TOOL_RETRY with attempt count and delay.
 - Restricts non-idempotent/destructive operations to single attempt.
 - Records each discrete attempt in ExecutionState.tool_history.
-- Eliminates fake synthetic 'terminate' on unrecoverable failures.
+- Propagates dynamic reasoning_effort explicitly in each reasoning step.
 """
 
 from __future__ import annotations
@@ -206,7 +206,6 @@ class ToolCallAgent(BaseAgent):
             if hasattr(tool_inst, "execution_policy") and isinstance(tool_inst.execution_policy, ToolExecutionPolicy):
                 return tool_inst.execution_policy
 
-        # Default fallback policy: safe 1 attempt, non-retryable
         return ToolExecutionPolicy(max_attempts=1, retryable=False, side_effects=True)
 
     def _sync_messages_from_state(self, state: ExecutionState) -> None:
@@ -224,7 +223,7 @@ class ToolCallAgent(BaseAgent):
     async def think(self, step: int) -> LLMResponse:
         """
         Execute cognitive reasoning phase with decoupled transient LLM retries.
-        Never emits fake synthetic terminate when provider fails permanently.
+        Explicitly propagates reasoning_effort from provider configuration to execution loop.
         """
         tools_schema = self._get_tools_schema()
 
@@ -238,6 +237,11 @@ class ToolCallAgent(BaseAgent):
                 self.state.add_message(role=MessageRole.SYSTEM, content=self.system_prompt)
                 self.state.add_message(role=MessageRole.USER, content=prompt_text)
 
+        effort_val = getattr(getattr(self.llm, "config", None), "reasoning_effort", None)
+        extra_call_params: Dict[str, Any] = {}
+        if effort_val:
+            extra_call_params["reasoning_effort"] = effort_val
+
         async def _call_llm(msgs: List[Dict[str, Any]]) -> LLMResponse:
             if hasattr(self.llm, "generate"):
                 return await self.llm.generate(
@@ -245,6 +249,7 @@ class ToolCallAgent(BaseAgent):
                     tools=tools_schema if tools_schema else None,
                     tool_choice="auto",
                     temperature=0.2,
+                    **extra_call_params,
                 )
             elif hasattr(self.llm, "chat_completion"):
                 return await self.llm.chat_completion(
@@ -252,17 +257,18 @@ class ToolCallAgent(BaseAgent):
                     tools=tools_schema if tools_schema else None,
                     tool_choice="auto",
                     temperature=0.2,
+                    **extra_call_params,
                 )
             elif hasattr(self.llm, "chat_complete"):
                 return await self.llm.chat_complete(
                     messages=msgs,
                     tools=tools_schema if tools_schema else None,
                     temperature=0.2,
+                    **extra_call_params,
                 )
             else:
                 raise AttributeError("LLM client does not provide generate or chat_completion interface.")
 
-        # Transient LLM retry loop with bounded attempts
         max_llm_attempts = 3
         last_llm_exc: Optional[Exception] = None
 
@@ -274,7 +280,6 @@ class ToolCallAgent(BaseAgent):
                 last_llm_exc = exc
                 err_str = str(exc).lower()
 
-                # Context overflow: Compact context and retry immediately
                 if "terminated" in err_str or "context" in err_str or "400" in err_str or "maximum context" in err_str:
                     logger.warning("Provider rejected full context (%s). Compacting context on attempt %d.", exc, llm_attempt)
                     compact_msgs = list(self.messages[:2]) + list(self.messages[-6:])
@@ -292,7 +297,6 @@ class ToolCallAgent(BaseAgent):
                     except Exception as compact_exc:
                         last_llm_exc = compact_exc
 
-                # Transient provider error (RateLimit 429, 503, timeout)
                 is_transient = (
                     "429" in err_str
                     or "rate limit" in err_str
@@ -307,7 +311,6 @@ class ToolCallAgent(BaseAgent):
                     await asyncio.sleep(delay)
                     continue
 
-                # Permanent failure: re-raise directly, never synthetic complete
                 raise last_llm_exc
 
         thought_val = response.reasoning or response.thought or response.content or ""
@@ -317,10 +320,6 @@ class ToolCallAgent(BaseAgent):
         return response
 
     async def act(self, step: int, tool_calls: List[ToolCall]) -> List[str]:
-        """
-        Execute proposed tool calls driving centralized retry policies across attempts.
-        Records every attempt in state.tool_history and emits TOOL_RETRY events when retrying.
-        """
         observations: List[str] = []
 
         for call in tool_calls:
@@ -349,7 +348,6 @@ class ToolCallAgent(BaseAgent):
             final_attempt = 1
             is_success = False
 
-            # Centralized Tool Retry Loop
             for attempt in range(1, policy.max_attempts + 1):
                 final_attempt = attempt
 
@@ -432,7 +430,6 @@ class ToolCallAgent(BaseAgent):
 
                 final_output_str = output_str
 
-                # Record current attempt in state history
                 if self.state is not None:
                     self.state.record_tool_execution(
                         tool_name=tool_name,
@@ -448,7 +445,6 @@ class ToolCallAgent(BaseAgent):
                     is_success = True
                     break
 
-                # Evaluate Retry Policy
                 can_retry = policy.is_retry_permitted(current_attempt=attempt, error=attempt_exc)
                 if can_retry:
                     delay = policy.compute_delay(attempt + 1)
@@ -461,7 +457,6 @@ class ToolCallAgent(BaseAgent):
                         delay,
                     )
 
-                    # Emit canonical retry event
                     await self._emit(
                         EventType.TOOL_RETRY,
                         step=step,
@@ -487,7 +482,6 @@ class ToolCallAgent(BaseAgent):
                     logger.info("Tool '%s' failure on attempt %d is non-retryable. Concluding attempts.", tool_name, attempt)
                     break
 
-            # Emit canonical final observation after all attempts conclude
             await self._emit(
                 EventType.OBSERVATION,
                 step=step,
@@ -520,10 +514,6 @@ class ToolCallAgent(BaseAgent):
         return observations
 
     async def step(self, state: ExecutionState, emitter: EventEmitter) -> bool:
-        """
-        Execute a single ReAct step driving the AgentRunner lifecycle contract.
-        Returns True when the task has concluded, False to request the next iteration.
-        """
         self.state = state
         self.emitter = emitter
         self.current_step = state.current_step
@@ -532,7 +522,6 @@ class ToolCallAgent(BaseAgent):
 
         response = await self.think(step=self.current_step)
 
-        # Stop condition 1: No tool calls emitted
         if not response.tool_calls:
             self._final_answer = response.content or response.thought or response.reasoning or "Task completed."
             state.final_output = self._final_answer
@@ -566,7 +555,6 @@ class ToolCallAgent(BaseAgent):
 
         observations = await self.act(step=self.current_step, tool_calls=response.tool_calls)
 
-        # Stop condition 2: Terminate tool invoked
         has_terminated = any(tc.name.lower() in ("terminate", "done") for tc in response.tool_calls)
         if has_terminated:
             self._final_answer = response.content or (observations[-1] if observations else "Task completed via termination tool.")
@@ -576,13 +564,11 @@ class ToolCallAgent(BaseAgent):
         return False
 
     async def _astep(self) -> bool:
-        """Internal step delegate for backward compatibility."""
         if self.state is None:
             self.state = ExecutionState(task_prompt="Default task", workspace_root=str(self.workspace_dir))
         return not (await self.step(state=self.state, emitter=self.emitter))
 
     async def run_task(self, prompt: str, max_steps: int = 30) -> str:
-        """Compatibility shim delegating execution directly to canonical AgentRunner."""
         from peldrun.engine.runner import AgentRunner, RunnerConfig
 
         runner_config = RunnerConfig(max_steps=max_steps)
@@ -591,7 +577,6 @@ class ToolCallAgent(BaseAgent):
         return state.final_output or self._final_answer or "Task execution finished."
 
     async def arun(self, task: str = "", max_steps: Optional[int] = None, **kwargs: Any) -> Any:
-        """Compatibility entrypoint delegating to run_task."""
         prompt_val = task or kwargs.get("prompt", "")
         limit_val = max_steps or getattr(self.config, "max_steps", 30)
         return await self.run_task(prompt=prompt_val, max_steps=limit_val)

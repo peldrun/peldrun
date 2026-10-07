@@ -4,20 +4,24 @@ backend/omweb/agent_bridge_parts/dispatcher.py
 Authoritative dispatcher entry points for the PELDRUN Universal Agent Bridge.
 
 Dispatches execution to registered engines via the authoritative EngineRegistry abstraction layer.
-Hardened under PR 2 (Single Execution Authority) and Milestone P1 (Unified Usage Accounting):
+Hardened under PR 2 (Single Execution Authority), Milestone P1 (Usage Accounting),
+and Hybrid Reasoning Control (2026 Industry Spec):
 - Enforces single AgentRunner authority by routing all native core runs to PeldrunEngine.
 - Strictly unifies the canonical token accounting path between Agent and Direct Chat modes.
 - Direct Chat invocations are fully metered in SQLite token_ledger and projected to session.json.
-- Guarantees deterministic task registration and cleanup per job.
+- Dynamically resolves model reasoning capabilities from caller payload and persistent metadata database.
+- Strictly normalizes 'off' to 'none' for OpenAI-compatible schema compliance without mutating graduated levels.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from pathlib import Path
 import time
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 import uuid
 
 from omweb.agents.registry import AgentNotFoundError, agent_registry
@@ -49,6 +53,111 @@ from .state import (
 logger = logging.getLogger(__name__)
 
 
+def _check_model_metadata_reasoning(model_name: str) -> Optional[bool]:
+    """
+    Check persisted models_metadata.json for explicit reasoning capability.
+    Allows user settings and model discovery metadata to act as source of truth.
+    Safely resolves across working directories and relative paths.
+    """
+    try:
+        module_dir = Path(__file__).resolve().parent
+        candidates = [
+            module_dir.parent.parent / "storage" / "models_metadata.json",
+            Path("storage/models_metadata.json").resolve(),
+            Path("backend/storage/models_metadata.json").resolve(),
+        ]
+        for p in candidates:
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                meta = data.get(model_name)
+                if isinstance(meta, dict):
+                    caps = meta.get("capabilities", {})
+                    if isinstance(caps, dict) and "reasoning" in caps:
+                        return bool(caps["reasoning"])
+                    if "is_reasoning" in meta:
+                        return bool(meta["is_reasoning"])
+                    if "reasoning" in meta:
+                        return bool(meta["reasoning"])
+    except Exception as e:
+        logger.debug(f"Could not load reasoning metadata for {model_name}: {e}")
+    return None
+
+
+def _is_reasoning_model(model_name: str, active_llm: Optional[Dict[str, Any]] = None) -> bool:
+    """
+    Deterministically identify whether the target model is a reasoning-centric model:
+    1. Highest priority: explicit flag passed from caller / frontend metadata.
+    2. Second priority: database record in models_metadata.json.
+    3. Fallback: heuristic pattern matching for known reasoning architectures.
+    """
+    if active_llm:
+        if "is_reasoning_model" in active_llm and active_llm["is_reasoning_model"] is not None:
+            return bool(active_llm["is_reasoning_model"])
+        if "is_reasoning" in active_llm and active_llm["is_reasoning"] is not None:
+            return bool(active_llm["is_reasoning"])
+
+    db_flag = _check_model_metadata_reasoning(model_name)
+    if db_flag is not None:
+        return db_flag
+
+    norm = (model_name or "").lower()
+    return any(
+        sub in norm
+        for sub in (
+            "nemotron",
+            "deepseek-r1",
+            "reasoner",
+            "qwq",
+            "o1-",
+            "o3-",
+            "thought",
+            "thinking",
+        )
+    )
+
+
+def _build_optimized_chat_messages(
+    turns: List[Dict[str, Any]],
+    current_prompt: str,
+    model_name: str,
+    reasoning_effort: str,
+    active_llm: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, str]]:
+    """
+    Construct chat completion messages obeying 2026 reasoning model guidelines:
+    - If model is a reasoning architecture or reasoning effort is off/none, avoid long personas
+      that cause semantic distractions and infinite thought loops.
+    - If reasoning is explicitly requested or model is standard, provide clean concise instructions.
+    """
+    messages: List[Dict[str, str]] = []
+    is_reasoner = _is_reasoning_model(model_name, active_llm=active_llm)
+    norm_effort = (reasoning_effort or "none").lower().strip()
+
+    if is_reasoner and norm_effort in ("none", "off", "0"):
+        pass
+    elif is_reasoner:
+        messages.append({
+            "role": "system",
+            "content": "You are a helpful and concise assistant. Respond naturally and directly.",
+        })
+    else:
+        messages.append({
+            "role": "system",
+            "content": "You are a helpful, direct, and conversational AI assistant. Respond directly and accurately using Markdown.",
+        })
+
+    for t in turns[-6:]:
+        p = t.get("prompt")
+        r = t.get("result")
+        if p:
+            messages.append({"role": "user", "content": p})
+        if r:
+            messages.append({"role": "assistant", "content": r})
+
+    messages.append({"role": "user", "content": current_prompt})
+    return messages
+
+
 async def run_instrumented(
     job_id: str,
     prompt: str,
@@ -59,9 +168,8 @@ async def run_instrumented(
 ) -> None:
     """
     Dispatch an agent job using the authoritative execution engine registry.
-    Ensures single runtime authority delegation.
+    Ensures single runtime authority delegation and preserves reasoning_effort.
     """
-    # 0. Track current task for safe cancellation
     current_task = asyncio.current_task()
     if current_task is not None:
         register_job_task(job_id, current_task)
@@ -78,7 +186,6 @@ async def run_instrumented(
     if not agent_id or not isinstance(agent_id, str):
         agent_id = kwargs.get("agent_id") or "peldrun"
 
-    # 1. Resolve target engine identifier
     explicit_engine = kwargs.get("engine") or (
         llm_override.get("engine") if isinstance(llm_override, dict) else None
     )
@@ -93,7 +200,6 @@ async def run_instrumented(
     print(f"\n[BRIDGE] Initializing job {job_id} using engine: '{target_engine_str}'")
     job_scoped_artifacts.setdefault(job_id, [])
 
-    # 2. Strict Fail-Fast Engine Resolution
     try:
         engine = engine_registry.get(target_engine_str)
     except EngineNotFoundError as eng_err:
@@ -111,7 +217,6 @@ async def run_instrumented(
         cleanup_job_state(job_id)
         return
 
-    # 3. Strict Fail-Fast Agent Resolution
     try:
         manifest = agent_registry.get_agent(agent_id)
     except AgentNotFoundError as agent_err:
@@ -135,12 +240,11 @@ async def run_instrumented(
         cleanup_job_state(job_id)
         return
 
-    # 4. Resolve runtime LLM settings
     toml_cfg = read_active_toml_config()
     active_llm = dict(toml_cfg.get("llm", {}))
     if llm_override:
         for k, v in llm_override.items():
-            if v:
+            if v is not None:
                 active_llm[k] = v
 
         if llm_override.get("provider_name"):
@@ -152,6 +256,12 @@ async def run_instrumented(
                 active_llm["provider_name"] = active_llm.get("provider") or active_llm.get("model")
         active_llm.update(llm_override)
 
+    # Normalize reasoning_effort strictly: 'off' -> 'none'
+    if "reasoning_effort" in active_llm and active_llm["reasoning_effort"]:
+        raw_eff = str(active_llm["reasoning_effort"]).lower().strip()
+        if raw_eff in ("none", "off", "0"):
+            active_llm["reasoning_effort"] = "none"
+
     p_cand = active_llm.get("provider_name") or active_llm.get("provider") or ""
     b_cand = str(active_llm.get("base_url") or "")
     if "1234" not in b_cand and "lmstudio" not in str(active_llm.get("provider") or "").lower():
@@ -161,9 +271,8 @@ async def run_instrumented(
     model_name = active_llm.get("model") or "default"
     base_url = b_cand or "http://127.0.0.1:1234/v1"
 
-    print(f"[BRIDGE] Target LLM: [{provider_name}] Model: '{model_name}' | URL: '{base_url}'")
+    print(f"[BRIDGE] Target LLM: [{provider_name}] Model: '{model_name}' | URL: '{base_url}' | Reasoning: '{active_llm.get('reasoning_effort')}'")
 
-    # 5. Perform LM Studio health check if targeting local endpoint
     if "1234" in base_url or "lmstudio" in provider_name.lower():
         readiness = await check_lmstudio_model_readiness(base_url, model_name, active_llm.get("api_key", ""))
         if readiness.get("unreachable"):
@@ -186,7 +295,6 @@ async def run_instrumented(
             cleanup_job_state(job_id)
             return
 
-    # 6. Lifecycle Authority Delegation (Eliminate duplicate STEP_START)
     is_native_core = target_engine_str in ("peldrun", "peldrun-core", "core")
 
     if not is_native_core:
@@ -223,14 +331,12 @@ async def run_instrumented(
                 ),
             )
 
-    # 7. Prepare project workspace directory
     chat = project_manager.get_chat(job_id) or {}
     chat_id = chat.get("id", f"chat_{job_id}")
     project_id = chat.get("project_id", "default_project")
     project_dir = project_manager.get_chat_files_dir(chat_id, project_id)
     project_dir.mkdir(parents=True, exist_ok=True)
 
-    # 8. Execution through Authoritative Engine Interface
     context = EngineRunContext(
         job_id=job_id,
         prompt=prompt,
@@ -272,6 +378,7 @@ async def run_direct_chat(
     """
     Dispatch a direct, conversational chat completion job.
     Fully integrated into the canonical token accounting and dynamic pricing subsystem.
+    Enforces dynamic reasoning effort control, optimized prompts, and progressive token telemetry.
     """
     current_task = asyncio.current_task()
     if current_task is not None:
@@ -284,7 +391,7 @@ async def run_direct_chat(
     active_llm = dict(toml_cfg.get("llm", {}))
     if llm_override:
         for k, v in llm_override.items():
-            if v:
+            if v is not None:
                 active_llm[k] = v
 
         if llm_override.get("provider_name"):
@@ -305,6 +412,10 @@ async def run_direct_chat(
     model_name = active_llm.get("model") or "default"
     base_url = b_cand or "http://127.0.0.1:1234/v1"
     api_key = active_llm.get("api_key") or "EMPTY"
+
+    is_reasoner = _is_reasoning_model(model_name, active_llm=active_llm)
+    raw_effort = str(active_llm.get("reasoning_effort") or "none").lower().strip() if is_reasoner else "none"
+    reasoning_effort = "none" if raw_effort in ("none", "off", "0") else raw_effort
 
     if "1234" in base_url or "lmstudio" in provider_name.lower():
         readiness = await check_lmstudio_model_readiness(base_url, model_name, api_key)
@@ -339,6 +450,8 @@ async def run_direct_chat(
                 "model": model_name,
                 "provider": provider_name,
                 "mode": "chat",
+                "is_reasoning_model": is_reasoner,
+                "reasoning_effort": reasoning_effort,
             },
         ),
     )
@@ -350,22 +463,13 @@ async def run_direct_chat(
         project_id = chat.get("project_id", "default_project")
         turns = chat.get("turns", [])
 
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a helpful, direct, and conversational AI assistant. Respond directly, accurately, and naturally to the user using Markdown.",
-            }
-        ]
-
-        for t in turns[-6:]:
-            p = t.get("prompt")
-            r = t.get("result")
-            if p:
-                messages.append({"role": "user", "content": p})
-            if r:
-                messages.append({"role": "assistant", "content": r})
-
-        messages.append({"role": "user", "content": prompt})
+        messages = _build_optimized_chat_messages(
+            turns=turns,
+            current_prompt=prompt,
+            model_name=model_name,
+            reasoning_effort=reasoning_effort,
+            active_llm=active_llm,
+        )
 
         max_tokens = active_llm.get("max_tokens") or 8192
         if isinstance(max_tokens, str):
@@ -374,26 +478,40 @@ async def run_direct_chat(
             except Exception:
                 max_tokens = 8192
 
-        # 1. Execute completion through Core AsyncLLMClient (Extracts normalized TokenUsage automatically)
         client = AsyncLLMClient(
             base_url=base_url,
             api_key=api_key,
             timeout=float(active_llm.get("timeout") or 300.0),
         )
 
-        response = await client.chat_completion(
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=float(active_llm.get("temperature", 0.7)),
-            model=model_name,
-        )
+        completion_kwargs: Dict[str, Any] = {
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": float(active_llm.get("temperature", 0.7)),
+            "model": model_name,
+        }
+
+        if is_reasoner and reasoning_effort in ("none", "minimal", "low", "medium", "high", "xhigh"):
+            completion_kwargs["reasoning_effort"] = reasoning_effort
+
+        response = await client.chat_completion(**completion_kwargs)
         completed_time = time.time()
 
         result_text = response.content or ""
         if not result_text:
             result_text = "I received your message, but no content was returned by the model."
 
-        # 2. Dynamic Pricing & Cost Calculation
+        reasoning_thought = getattr(response, "reasoning_content", None)
+        if reasoning_thought and str(reasoning_thought).strip():
+            await dispatch_event(
+                job_id,
+                SSEEvent(
+                    type=SSEEventType.THOUGHT,
+                    step=1,
+                    data={"thought": str(reasoning_thought).strip(), "model": model_name},
+                ),
+            )
+
         pricing_store = get_pricing_store()
         usage_store = get_usage_store()
         usage = response.usage
@@ -410,7 +528,6 @@ async def run_direct_chat(
 
         cost_usd = round(cost_nano_usd / NANO_USD_PER_USD, 6)
 
-        # 3. Persist Immutable Fact into SQLite token_ledger
         inv_id = f"inv_chat_{uuid.uuid4().hex[:10]}"
         turn_id = f"turn_{len(turns) + 1}"
 
@@ -447,7 +564,6 @@ async def run_direct_chat(
             )
             await usage_store.record_invocation(record)
 
-            # 4. Atomically project turn usage and re-aggregate session.json summary
             turn_usage_dict = {
                 "turn_id": turn_id,
                 "prompt_tokens": usage.input_tokens or 0,
@@ -471,7 +587,6 @@ async def run_direct_chat(
         )
         job_manager.complete_job(job_id, result_text)
 
-        # 5. Dispatch Terminal FINAL Event carrying live usage & cost metrics
         await dispatch_event(
             job_id,
             SSEEvent(

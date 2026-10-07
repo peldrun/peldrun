@@ -1,6 +1,6 @@
 ﻿"use client";
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
   Send,
   Paperclip,
@@ -14,8 +14,10 @@ import { Button } from "@/components/ui/button";
 import { AgentSelector } from "./agent-selector";
 import { EngineSelector } from "./engine-selector";
 import { ActiveToolsModal } from "./active-tools-modal";
+import { ReasoningEffortSelector } from "./reasoning-effort-selector";
 import { useChatStore } from "@/stores/chat-store";
 import { useAppStorage } from "@/hooks/use-app-storage";
+import { inferModelCapabilities, fetchServerMetadata } from "@/lib/modelMetadata";
 
 interface ComposerProps {
   onSend: (text: string, files?: File[], llmOverride?: any) => void;
@@ -29,11 +31,13 @@ export function Composer({ onSend, onStop, isRunning, disabled, placeholder }: C
   const [text, setText] = useState("");
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  const [metadataVault, setMetadataVault] = useState<Record<string, any>>({});
 
   // Unified multi-tier reactive storage
   const [activeModel, setActiveModel] = useAppStorage("active_model");
   const [activeProvider, setActiveProvider] = useAppStorage("active_provider");
   const [execMode, setExecMode] = useAppStorage("exec_mode");
+  const [reasoningEffort] = useAppStorage("reasoning_effort");
   const [activeLlmOverride] = useAppStorage("active_llm_override");
 
   const { selectedAgentId } = useChatStore();
@@ -41,6 +45,15 @@ export function Composer({ onSend, onStop, isRunning, disabled, placeholder }: C
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Synchronize server metadata for dynamic model capability resolution
+  useEffect(() => {
+    fetchServerMetadata().then((data) => setMetadataVault(data || {}));
+    const onMetadataUpdate = (e: any) => setMetadataVault(e.detail || {});
+    window.addEventListener("omweb:metadata-updated", onMetadataUpdate);
+    return () => window.removeEventListener("omweb:metadata-updated", onMetadataUpdate);
+  }, []);
+
+  // Listen to live engine and model changes
   useEffect(() => {
     if (typeof window !== "undefined") {
       const onModelChange = (e: any) => {
@@ -53,6 +66,13 @@ export function Composer({ onSend, onStop, isRunning, disabled, placeholder }: C
     }
   }, [setActiveModel, setActiveProvider]);
 
+  // Dynamically resolve whether the currently active model supports reasoning
+  const modelCaps = useMemo(() => {
+    return inferModelCapabilities(activeModel, metadataVault[activeModel]);
+  }, [activeModel, metadataVault]);
+
+  const isReasoningSupported = Boolean(modelCaps?.isReasoning);
+
   const handleModeChange = (mode: "agent" | "chat") => {
     setExecMode(mode);
     if (typeof window !== "undefined") {
@@ -61,6 +81,9 @@ export function Composer({ onSend, onStop, isRunning, disabled, placeholder }: C
   };
 
   const getActivePayload = () => {
+    const isReasoning = isReasoningSupported;
+    const effectiveEffort = isReasoning ? (reasoningEffort || "none") : "none";
+
     let base = {
       model: activeModel,
       provider: activeProvider.toLowerCase().replace(/[^a-z0-9]/g, ""),
@@ -69,13 +92,22 @@ export function Composer({ onSend, onStop, isRunning, disabled, placeholder }: C
       api_key: "",
       api_type: "",
       mode: execMode,
+      reasoning_effort: effectiveEffort,
+      is_reasoning_model: isReasoning,
       agent_id: execMode === "agent" ? (selectedAgentId || "peldrun") : "peldrun"
     };
 
     if (activeLlmOverride) {
       try {
         const parsed = JSON.parse(activeLlmOverride);
-        return { ...base, ...parsed, mode: execMode, agent_id: base.agent_id };
+        return {
+          ...base,
+          ...parsed,
+          mode: execMode,
+          reasoning_effort: effectiveEffort,
+          is_reasoning_model: isReasoning,
+          agent_id: base.agent_id
+        };
       } catch (e) {}
     }
     return base;
@@ -254,12 +286,19 @@ export function Composer({ onSend, onStop, isRunning, disabled, placeholder }: C
                     ? "bg-card text-foreground shadow-xs font-semibold"
                     : "text-muted-foreground hover:text-foreground"
                 }`}
-                title="Direct Chat: fast response, no tools or execution steps"
+                title="Direct Chat: fast response, conversational completion"
               >
                 <MessageSquare size={13} className={execMode === "chat" ? "text-primary" : ""} />
                 <span>Chat</span>
               </button>
             </div>
+
+            {/* Dynamic Reasoning Effort Selector: Appears or hides based on active model reasoning support */}
+            {isReasoningSupported && (
+              <div className="animate-in fade-in zoom-in-95 duration-200">
+                <ReasoningEffortSelector disabled={disabled || isRunning} />
+              </div>
+            )}
 
             {/* Agent Selector & Active Tools Modal: Visible ONLY when execMode === 'agent' */}
             {execMode === "agent" && (
