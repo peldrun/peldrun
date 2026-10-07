@@ -4,9 +4,10 @@ backend/omweb/agent_bridge_parts/dispatcher.py
 Authoritative dispatcher entry points for the PELDRUN Universal Agent Bridge.
 
 Dispatches execution to registered engines via the authoritative EngineRegistry abstraction layer.
-Hardened under PR 2 (Single Execution Authority):
+Hardened under PR 2 (Single Execution Authority) and Milestone P1 (Unified Usage Accounting):
 - Enforces single AgentRunner authority by routing all native core runs to PeldrunEngine.
-- Strictly eliminates competing runner initialization or duplicate STEP_START events.
+- Strictly unifies the canonical token accounting path between Agent and Direct Chat modes.
+- Direct Chat invocations are fully metered in SQLite token_ledger and projected to session.json.
 - Guarantees deterministic task registration and cleanup per job.
 """
 
@@ -14,8 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import traceback
 from typing import Any, Dict, Optional
+import uuid
 
 from omweb.agents.registry import AgentNotFoundError, agent_registry
 from omweb.engine_resolver import (
@@ -28,6 +31,11 @@ from omweb.engines.registry import EngineNotFoundError
 from omweb.job_manager import job_manager
 from omweb.project_manager import project_manager
 from omweb.sse_events import SSEEvent, SSEEventType, dispatch_event
+
+# Public Core LLM & Telemetry Boundary Imports (P1-02 Conformance)
+from peldrun.llm.client import AsyncLLMClient
+from peldrun.runtime.pricing_store import NANO_USD_PER_USD, get_pricing_store
+from peldrun.runtime.usage_store import LLMInvocationRecord, get_usage_store
 
 from .config_loader import read_active_toml_config
 from .errors import format_smart_error
@@ -261,12 +269,15 @@ async def run_direct_chat(
     prompt: str,
     llm_override: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Dispatch a plain, non-agentic chat completion job."""
+    """
+    Dispatch a direct, conversational chat completion job.
+    Fully integrated into the canonical token accounting and dynamic pricing subsystem.
+    """
     current_task = asyncio.current_task()
     if current_task is not None:
         register_job_task(job_id, current_task)
 
-    print(f"\n[BRIDGE DIRECT CHAT] Initializing direct chat for job: {job_id}")
+    print(f"\n[BRIDGE DIRECT CHAT] Initializing metered direct chat for job: {job_id}")
     job_scoped_artifacts.setdefault(job_id, [])
 
     toml_cfg = read_active_toml_config()
@@ -332,12 +343,11 @@ async def run_direct_chat(
         ),
     )
 
+    start_time = time.time()
     try:
-        from openai import AsyncOpenAI
-
-        client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-
         chat = project_manager.get_chat(job_id) or {}
+        chat_id = chat.get("id", f"chat_{job_id}")
+        project_id = chat.get("project_id", "default_project")
         turns = chat.get("turns", [])
 
         messages = [
@@ -364,24 +374,104 @@ async def run_direct_chat(
             except Exception:
                 max_tokens = 8192
 
-        response = await client.chat.completions.create(
-            model=model_name,
+        # 1. Execute completion through Core AsyncLLMClient (Extracts normalized TokenUsage automatically)
+        client = AsyncLLMClient(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=float(active_llm.get("timeout") or 300.0),
+        )
+
+        response = await client.chat_completion(
             messages=messages,
             max_tokens=max_tokens,
             temperature=float(active_llm.get("temperature", 0.7)),
-            stream=False,
+            model=model_name,
         )
+        completed_time = time.time()
 
-        result_text = ""
-        if response.choices and len(response.choices) > 0:
-            msg = response.choices[0].message
-            result_text = getattr(msg, "content", "") or ""
-
+        result_text = response.content or ""
         if not result_text:
             result_text = "I received your message, but no content was returned by the model."
 
-        print(f"[BRIDGE DIRECT CHAT] Completed successfully for job: {job_id}")
+        # 2. Dynamic Pricing & Cost Calculation
+        pricing_store = get_pricing_store()
+        usage_store = get_usage_store()
+        usage = response.usage
+
+        cost_nano_usd = 0
+        pricing_rule_id = None
+        if usage:
+            cost_nano_usd, pricing_rule_id = await pricing_store.calculate_cost(
+                usage=usage,
+                provider=provider_name,
+                model=model_name,
+                base_url=base_url,
+            )
+
+        cost_usd = round(cost_nano_usd / NANO_USD_PER_USD, 6)
+
+        # 3. Persist Immutable Fact into SQLite token_ledger
+        inv_id = f"inv_chat_{uuid.uuid4().hex[:10]}"
+        turn_id = f"turn_{len(turns) + 1}"
+
+        if usage:
+            record = LLMInvocationRecord(
+                invocation_id=inv_id,
+                job_id=job_id,
+                chat_id=chat_id,
+                project_id=project_id,
+                turn_id=turn_id,
+                mode="chat",
+                provider=provider_name,
+                model_requested=model_name,
+                model_returned=response.model or model_name,
+                status="completed",
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                total_tokens=usage.total_tokens,
+                cached_input_tokens=usage.cached_input_tokens,
+                reasoning_output_tokens=usage.reasoning_output_tokens,
+                usage_source=usage.source.value if hasattr(usage.source, "value") else str(usage.source),
+                estimated=usage.estimated,
+                tokenizer_id=usage.tokenizer_id,
+                tokenizer_version=usage.tokenizer_version,
+                estimation_method=usage.estimation_method,
+                started_at=start_time,
+                first_token_at=getattr(response, "first_token_at", None),
+                completed_at=completed_time,
+                latency_ms=round((completed_time - start_time) * 1000.0, 2),
+                ttft_ms=round(response.ttft_ms, 2) if response.ttft_ms is not None else None,
+                finish_reason=response.finish_reason,
+                pricing_version_id=pricing_rule_id,
+                cost_nano_usd=cost_nano_usd,
+            )
+            await usage_store.record_invocation(record)
+
+            # 4. Atomically project turn usage and re-aggregate session.json summary
+            turn_usage_dict = {
+                "turn_id": turn_id,
+                "prompt_tokens": usage.input_tokens or 0,
+                "completion_tokens": usage.output_tokens or 0,
+                "total_tokens": usage.total_tokens or 0,
+                "cost_usd": cost_usd,
+                "cost_nano_usd": cost_nano_usd,
+                "estimated": usage.estimated,
+                "latency_ms": response.latency_ms,
+            }
+            project_manager.record_turn_usage(
+                chat_id=chat_id,
+                turn_id=turn_id,
+                turn_usage=turn_usage_dict,
+                project_id=project_id,
+            )
+
+        print(
+            f"[BRIDGE DIRECT CHAT] Completed for job {job_id} | "
+            f"Tokens: {usage.total_tokens if usage else 0} | Cost: ${cost_usd}"
+        )
         job_manager.complete_job(job_id, result_text)
+
+        # 5. Dispatch Terminal FINAL Event carrying live usage & cost metrics
         await dispatch_event(
             job_id,
             SSEEvent(
@@ -390,8 +480,12 @@ async def run_direct_chat(
                 data={
                     "result": result_text,
                     "model": model_name,
+                    "provider": provider_name,
                     "mode": "chat",
                     "produced_files": [],
+                    "usage": usage.to_dict() if usage else None,
+                    "cost_usd": cost_usd,
+                    "latency_ms": response.latency_ms,
                 },
             ),
         )
@@ -413,3 +507,9 @@ async def run_direct_chat(
         )
     finally:
         cleanup_job_state(job_id)
+
+
+__all__ = [
+    "run_instrumented",
+    "run_direct_chat",
+]

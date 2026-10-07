@@ -1,6 +1,9 @@
 """
+backend/peldrun/llm/tokenizer.py
+
 PELDRUN Core Tokenizer and Context Window Management Subsystem.
-Provides token estimation, message budgeting, and intelligent sliding-window context truncation.
+Provides token estimation, message budgeting, context truncation,
+and fallback estimation for LLM usage accounting.
 """
 
 from __future__ import annotations
@@ -53,11 +56,11 @@ def count_message_tokens(messages: List[Dict[str, Any]], model: str = "gpt-4") -
             elif isinstance(value, list) and key == "tool_calls":
                 for tc in value:
                     total_tokens += 10  # Function call structure baseline
-                    func = tc.get("function", {})
-                    name = func.get("name", "")
-                    args = func.get("arguments", "")
+                    func = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", {})
+                    name = func.get("name", "") if isinstance(func, dict) else getattr(func, "name", "")
+                    args = func.get("arguments", "") if isinstance(func, dict) else getattr(func, "arguments", "")
                     total_tokens += estimate_tokens_from_string(name, model=model)
-                    total_tokens += estimate_tokens_from_string(args, model=model)
+                    total_tokens += estimate_tokens_from_string(str(args), model=model)
             elif key == "name" and isinstance(value, str):
                 total_tokens += estimate_tokens_from_string(value, model=model)
 
@@ -99,7 +102,6 @@ def truncate_messages_sliding_window(
         model=model,
     ) > allowed_tokens:
         if len(remaining_messages) <= 1:
-            # Keep at least the final message
             break
         removed = remaining_messages.pop(0)
         logger.debug("Dropped message with role '%s' to conserve context window.", removed.get("role"))
@@ -137,7 +139,6 @@ class ContextBudgetManager:
 
     def fit_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Fit a list of conversation messages into the calculated token budget."""
-        target_budget = self.get_available_input_tokens()
         return truncate_messages_sliding_window(
             messages=messages,
             max_context_tokens=self.max_context_window,
@@ -150,3 +151,50 @@ class ContextBudgetManager:
         used_tokens = count_message_tokens(messages, model=self.model_name)
         remaining = self.max_context_window - used_tokens - self.safety_margin_tokens
         return max(128, min(self.max_generation_tokens, remaining))
+
+
+def estimate_invocation_usage(
+    messages: List[Dict[str, Any]],
+    output_text: Optional[str] = None,
+    reasoning_text: Optional[str] = None,
+    tool_calls: Optional[List[Any]] = None,
+    model: str = "default",
+) -> Dict[str, Any]:
+    """
+    Calculate fallback token accounting metrics for an LLM invocation when provider usage is absent.
+    Returns normalized metrics dict adhering strictly to the TokenUsage domain contract.
+    """
+    input_tokens = count_message_tokens(messages, model=model)
+
+    output_tokens = 0
+    if output_text:
+        output_tokens += estimate_tokens_from_string(output_text, model=model)
+
+    reasoning_tokens = 0
+    if reasoning_text:
+        reasoning_tokens = estimate_tokens_from_string(reasoning_text, model=model)
+        output_tokens += reasoning_tokens
+
+    if tool_calls:
+        for tc in tool_calls:
+            output_tokens += 10
+            fn_name = getattr(tc, "name", None) or (tc.get("name") if isinstance(tc, dict) else "")
+            fn_args = getattr(tc, "arguments", None) or (tc.get("arguments") if isinstance(tc, dict) else "")
+            output_tokens += estimate_tokens_from_string(str(fn_name), model=model)
+            output_tokens += estimate_tokens_from_string(str(fn_args), model=model)
+
+    tokenizer_id = "tiktoken:cl100k_base" if _TIKTOKEN_AVAILABLE else "heuristic:char_division"
+    estimation_method = "bpe_encoding" if _TIKTOKEN_AVAILABLE else "character_ratio_fallback"
+
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "cached_input_tokens": None,
+        "reasoning_output_tokens": reasoning_tokens if reasoning_tokens > 0 else None,
+        "source": "estimated",
+        "estimated": True,
+        "tokenizer_id": tokenizer_id,
+        "tokenizer_version": getattr(tiktoken, "__version__", "1.0.0") if _TIKTOKEN_AVAILABLE else "fallback",
+        "estimation_method": estimation_method,
+    }

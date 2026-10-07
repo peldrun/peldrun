@@ -1,9 +1,11 @@
 "use client";
 
 import React from "react";
-import { Plus, History, Coins, Square, PanelRightClose, PanelRightOpen } from "lucide-react";
+import { Plus, History, Square, PanelRightClose, PanelRightOpen } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { EngineOption, EngineSelector } from "./engine-selector";
+import { UsageBadgeGroup } from "@/components/chat/UsageBadges";
+import type { ChatUsageSummary } from "@/lib/types";
 
 interface ChatSubHeaderProps {
   isFreshSession: boolean;
@@ -22,34 +24,49 @@ interface ChatSubHeaderProps {
   showRightPanel: boolean;
   onToggleRightPanel: () => void;
 
-    status?: "idle" | "running" | "ready" | "completed" | "error";
-    sessionTitle?: string;
-    stepCount?: number;
+  status?: "idle" | "running" | "ready" | "completed" | "error";
+  sessionTitle?: string;
+  stepCount?: number;
+
+  // Optional telemetry overrides
+  usageSummary?: ChatUsageSummary | null;
+  activeProvider?: string | null;
+  activeModel?: string | null;
+  totalCostUsd?: number | null;
 }
 
 export function ChatSubHeader({
   isFreshSession,
-  submittedPrompt,
-  activeChatId,
-  activeJobId,
   historyTurnsCount,
-   
   tokensUsed,
   currentStepNum,
   maxSteps = 30,
   execMode,
-  selectedEngineId,
-  onSelectEngine,
   onNewSession,
   onStopTask,
   showRightPanel,
   onToggleRightPanel,
-
   status = "idle",
-   stepCount,
+  stepCount,
+  usageSummary,
+  activeProvider,
+  activeModel,
+  totalCostUsd,
 }: ChatSubHeaderProps) {
+  // Safe aggregation: fallback gracefully to tokensUsed if usageSummary is absent
+  const effectiveSummary: ChatUsageSummary | null =
+    usageSummary ||
+    (tokensUsed && tokensUsed.total > 0
+      ? {
+          input_tokens: tokensUsed.input || 0,
+          output_tokens: tokensUsed.output || 0,
+          total_tokens: tokensUsed.total || 0,
+          total_cost_usd: totalCostUsd ?? 0,
+        }
+      : null);
+
   return (
-    <div className="h-12 flex items-center justify-between px-5  bg-transparent backdrop-blur-sm shrink-0 font-sans"> 
+    <div className="h-12 flex items-center justify-between px-5 bg-transparent backdrop-blur-sm shrink-0 font-sans">
       <div className="flex items-center gap-2.5">
         {isFreshSession ? (
           <EngineSelector />
@@ -64,16 +81,23 @@ export function ChatSubHeader({
             <span>New Session</span>
           </button>
         )}
-
       </div>
 
       <div className="flex items-center gap-2.5">
-        {tokensUsed.total > 0 && (
-          <span className="hidden md:flex items-center gap-1 text-[11px] font-mono px-2 py-0.5 rounded-md bg-muted border border-border text-muted-foreground">
-            <Coins size={11} />
-            <span>{tokensUsed.total.toLocaleString()} tokens</span>
-          </span>
-        )}
+
+        {/* Token & Telemetry Badges Cluster */}
+        {/* Single Unified Header Badge */}
+                {tokensUsed && tokensUsed.total > 0 && (
+                  <UsageBadgeGroup
+                    tokensUsed={tokensUsed}
+                    costUsd={totalCostUsd ?? 0}
+                    provider={activeProvider}
+                    model={activeModel}
+                    variant="compact"
+                    showBreakdown={true}
+                  />
+                )}
+
 
         {/* STEP COUNTER: Strict Isolation - Visible ONLY when execMode === 'agent' */}
         {execMode === "agent" && (status === "running" || currentStepNum > 0) && (
@@ -116,8 +140,6 @@ export function ChatSubHeader({
             <span>Stop</span>
           </Button>
         )}
-
-
 
         <button
           type="button"

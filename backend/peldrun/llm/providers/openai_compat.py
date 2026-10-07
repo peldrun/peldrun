@@ -1,12 +1,14 @@
 """
+backend/peldrun/llm/providers/openai_compat.py
+
 OpenAI-compatible universal provider bridge.
-Delegates generation directly to the unified AsyncLLMClient.
+Delegates generation and true streaming directly to the unified AsyncLLMClient.
 """
 
 from __future__ import annotations
 
 from typing import Any, AsyncIterator, Dict, List, Optional
-from peldrun.llm.client import AsyncLLMClient, LLMConfig, LLMResponse, StreamChunk
+from peldrun.llm.client import AsyncLLMClient, LLMConfig, LLMResponse, StreamChunk, TokenUsage, UsageSource
 
 
 class BaseLLMProvider:
@@ -16,12 +18,12 @@ class BaseLLMProvider:
         self,
         config: Optional[LLMConfig] = None,
         client: Optional[AsyncLLMClient] = None,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> None:
         self.config = config or LLMConfig()
         self.client: AsyncLLMClient = client or AsyncLLMClient(
             config=self.config,
-            **kwargs
+            **kwargs,
         )
 
     async def generate(
@@ -29,13 +31,13 @@ class BaseLLMProvider:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: str = "auto",
-        **kwargs: Any
+        **kwargs: Any,
     ) -> LLMResponse:
         return await self.client.generate(
             messages=messages,
             tools=tools,
             tool_choice=tool_choice,
-            **kwargs
+            **kwargs,
         )
 
     async def stream(
@@ -43,13 +45,13 @@ class BaseLLMProvider:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: str = "auto",
-        **kwargs: Any
+        **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
         async for chunk in self.client.stream(
             messages=messages,
             tools=tools,
             tool_choice=tool_choice,
-            **kwargs
+            **kwargs,
         ):
             yield chunk
 
@@ -62,4 +64,8 @@ class BaseLLMProvider:
 
 class OpenAICompatProvider(BaseLLMProvider):
     """Universal provider for standard and local OpenAI-compatible endpoints."""
+
     pass
+
+
+__all__ = ["BaseLLMProvider", "OpenAICompatProvider", "TokenUsage", "UsageSource"]

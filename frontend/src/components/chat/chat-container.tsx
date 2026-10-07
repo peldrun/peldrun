@@ -153,7 +153,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
               }))
               .filter((ev: StepEvent) => ev.content.trim() !== "" || Boolean(ev.toolName));
 
-            return {
+          return {
               id: t.job_id || `turn-${idx}`,
               jobId: t.job_id || "",
               prompt: t.prompt || "",
@@ -163,10 +163,27 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
               status: t.status || "completed",
               model: t.model,
               producedFiles: t.produced_files,
+              usage: t.usage || undefined,
+              tokensUsed: t.usage ? {
+                input: t.usage.prompt_tokens || t.usage.input_tokens || 0,
+                output: t.usage.completion_tokens || t.usage.output_tokens || 0,
+                total: t.usage.total_tokens || 0,
+              } : undefined,
             };
           });
           setHistoryTurns(loadedTurns);
+
+          if (data.usage_summary && data.usage_summary.total_tokens > 0) {
+            setTokensUsed({
+              input: data.usage_summary.input_tokens || 0,
+              output: data.usage_summary.output_tokens || 0,
+              total: data.usage_summary.total_tokens || 0,
+            });
+          }
+
         }
+
+        
 
         if (data.events && Array.isArray(data.events)) {
           const replayed: StepEvent[] = [];
@@ -266,9 +283,26 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
           }
         }
         fetchJobFiles(jobId);
+
       } else if (eventType === "final" || eventType === "done") {
         const resText = payload.data?.result ?? payload.data?.content ?? "Task completed successfully.";
         if (eventType === "final") setFinalResult(safeRender(resText));
+        
+        // ✅ التقاط استهلاك التوكين الصادر من حدث FINAL وتحديث شريط الرأس فوراً
+        if (payload.data?.usage_summary) {
+          setTokensUsed({
+            input: payload.data.usage_summary.input_tokens || 0,
+            output: payload.data.usage_summary.output_tokens || 0,
+            total: payload.data.usage_summary.total_tokens || 0,
+          });
+        } else if (payload.data?.usage) {
+          setTokensUsed((prev) => ({
+            input: prev.input + (payload.data.usage.prompt_tokens || payload.data.usage.input_tokens || 0),
+            output: prev.output + (payload.data.usage.completion_tokens || payload.data.usage.output_tokens || 0),
+            total: prev.total + (payload.data.usage.total_tokens || 0),
+          }));
+        }
+
         setStatus("completed");
         setExpandedSteps({});
         fetchJobFiles(jobId);
@@ -431,6 +465,17 @@ const handleSendHumanAnswer = async (customAnswer?: string) => {
           tokensUsed: { ...tokensUsed },
           producedFiles: [...producedFiles],
           model: activeModelName,
+          // ✅ إرفاق الاستهلاك مع الـ Turn لتظهره شارات الكارت
+          usage: tokensUsed.total > 0 ? {
+            input_tokens: tokensUsed.input,
+            output_tokens: tokensUsed.output,
+            total_tokens: tokensUsed.total,
+            cost_usd: 0,
+            latency_ms: elapsedSeconds * 1000,
+            tokens_per_second: elapsedSeconds > 0 ? tokensUsed.output / elapsedSeconds : 0,
+            provider: "local",
+            model: activeModelName,
+          } as any : undefined,
         },
       ]);
     }
@@ -523,13 +568,14 @@ const handleSendHumanAnswer = async (customAnswer?: string) => {
   return (
     <div className="flex h-full w-full bg-background text-foreground overflow-hidden font-sans">
       <div className="flex-1 flex flex-col h-full border-r border-border min-w-0 transition-all">
+ 
+
         <ChatSubHeader
           isFreshSession={isFreshSession}
           submittedPrompt={submittedPrompt}
           activeChatId={activeChatId}
           activeJobId={activeJobId}
           historyTurnsCount={historyTurns.length}
-          status={status as any}
           tokensUsed={tokensUsed}
           currentStepNum={currentStepNum}
           maxSteps={getAgentMaxSteps(selectedAgentId)}
@@ -540,6 +586,8 @@ const handleSendHumanAnswer = async (customAnswer?: string) => {
           onStopTask={handleStopTask}
           showRightPanel={showRightPanel}
           onToggleRightPanel={() => setShowRightPanel(!showRightPanel)}
+          status={status as any}
+          activeModel={activeModelName}
         />
 
         {isFreshSession ? (
@@ -586,6 +634,7 @@ const handleSendHumanAnswer = async (customAnswer?: string) => {
             getLiveStatusMessage={getLiveStatusMessage}
             activeModelName={activeModelName}
             chatScrollBottomRef={chatScrollBottomRef}
+            tokensUsed={tokensUsed}
           />
         )}
 

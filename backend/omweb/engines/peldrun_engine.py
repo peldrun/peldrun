@@ -1,15 +1,12 @@
 """
 backend/omweb/engines/peldrun_engine.py
 
-PELDRUN Native Embedded Execution Engine (Consolidated Architecture).
+PELDRUN Native Embedded Execution Engine (Isolated Web Adapter - P1-02 & P1-03).
 
-Executes agent workflows natively through the consolidated Core lifecycle:
-EngineRunContext -> RunRequest -> AgentRunner -> ExecutionState -> StepExecutableAgent.
-
-Hardened under PR 2 (Single Execution Authority):
-- Enforces strict terminal verification: marks job failed when state is FAILED or CANCELLED.
-- No false 'complete_job' on step exhaustion or operator cancellation.
-- Single source of truth for event consumption, artifact scanning, and terminal dispatch.
+Executes autonomous workflows by delegating entirely to peldrun-core via
+canonical RunRequest and CoreRuntimeExecutor boundaries.
+Captures invocation usage, projects metrics into session.json and SQLite token_ledger,
+and emits usage payloads in the terminal FINAL SSE event.
 """
 
 from __future__ import annotations
@@ -19,16 +16,33 @@ import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
+import uuid
+import time
 
+from omweb.agent_bridge_parts.state import job_scoped_artifacts
+from omweb.agent_bridge_parts.text_utils import sanitize_final_result_text
+from omweb.job_manager import job_manager
+from omweb.project_manager import project_manager
 from omweb.sse_events import SSEEvent, SSEEventType, dispatch_event
 
 from .base import EngineRunContext, ExecutionEngine
+
+# Core Public Boundary Imports (Strictly Public Contracts Only)
+from peldrun.events.schema import EventType, PeldrunEvent
+from peldrun.runtime.contract import AgentSpec, RunRequest, RunStatus, WorkspaceContext
+from peldrun.runtime.executor import core_executor
+from peldrun.runtime.pricing_store import NANO_USD_PER_USD, get_pricing_store
+from peldrun.runtime.usage_store import get_usage_store
+from peldrun.tools.builtins.human_input import HumanInputRegistry
+
+from omweb.adapters.core_adapter import resolve_tool_runtime
+from omweb.tools.registry import tool_registry as web_tool_registry
 
 logger = logging.getLogger(__name__)
 
 
 class PeldrunEngine(ExecutionEngine):
-    """First-class embedded execution engine powered by local PELDRUN Core."""
+    """Isolated Web execution adapter powered by local PELDRUN Core."""
 
     engine_id: str = "peldrun"
 
@@ -54,38 +68,18 @@ class PeldrunEngine(ExecutionEngine):
             }
 
     async def run(self, context: EngineRunContext) -> None:
-        """Execute autonomous agent workflow through the consolidated Core lifecycle."""
+        """Execute autonomous agent workflow through canonical Core boundaries."""
         job_id = context.job_id
         prompt = context.prompt
         agent_id = context.agent_id
         active_llm = context.active_llm
         model_name = context.model_name
+        provider_name = context.provider_name
         project_dir = context.project_dir
-        chat_id = context.chat_id
+        chat_id = context.chat_id or f"chat_{job_id}"
         manifest = context.manifest
 
-        print(f"\n[ENGINE PELDRUN] >>> Starting Consolidated Task Execution for Job: {job_id} <<<")
-
-        from omweb.agent_bridge_parts.state import job_scoped_artifacts
-        from omweb.agent_bridge_parts.text_utils import sanitize_final_result_text
-        from omweb.job_manager import job_manager
-
-        from peldrun.agents.base import AgentConfig
-        from peldrun.agents.tool_call_agent import ToolCallAgent
-        from peldrun.engine.runner import AgentRunner, RunnerConfig
-        from peldrun.engine.state import ExecutionState, MessageRole
-        from peldrun.events.emitter import EventEmitter
-        from peldrun.events.schema import EventType, PeldrunEvent
-        from peldrun.llm.client import LLMConfig
-        from peldrun.llm.providers.openai_compat import OpenAICompatProvider
-        from peldrun.runtime.contract import AgentSpec, RunRequest, WorkspaceContext
-        from peldrun.tools.builtins.human_input import HumanInputRegistry
-        from peldrun.tools.builtins.terminate import TerminateTool
-        from peldrun.tools.collection import ToolCollection
-        from peldrun.tools.registry import ToolRegistry as CoreToolRegistry
-
-        from omweb.adapters.core_adapter import resolve_tool_runtime
-        from omweb.tools.registry import tool_registry as web_tool_registry
+        print(f"\n[ENGINE PELDRUN] >>> Starting Task Execution for Job: {job_id} <<<")
 
         job_scoped_artifacts.setdefault(job_id, [])
         if chat_id:
@@ -95,7 +89,6 @@ class PeldrunEngine(ExecutionEngine):
         ws_path_str = str(ws_path)
 
         def _scan_workspace_files() -> Dict[str, Path]:
-            """Recursively scan workspace directory for deliverable files."""
             scanned: Dict[str, Path] = {}
             if not project_dir.exists():
                 return scanned
@@ -126,13 +119,44 @@ class PeldrunEngine(ExecutionEngine):
             f"3. Strict Counting & Non-Premature Termination: When asked to perform a specific number of interactions, you must execute all of them completely and wait for each answer before concluding. Never call 'terminate' until all requested questions have been answered."
         )
 
+        scoped_prompt = (
+            f"[PROJECT EXECUTION RULES]\n"
+            f"1. User Directive Sovereignty: Follow USER TASK instructions strictly.\n"
+            f"2. Multi-Question Counting Protocol: Execute all sequential interactions completely before concluding.\n"
+            f"3. Workspace Operations: Current working directory is already workspace root. Use relative paths.\n"
+            f"4. Task Conclusion: Ensure all parts of the user request are satisfied completely before calling 'terminate'.\n"
+            f"[USER TASK]\n"
+            f"{prompt}"
+        )
+
+        # 1. Resolve custom Web tools to adapt into Core tools
+        requested_tools = list(manifest.get("tools", []))
+        available_web_tools = {
+            t["id"]: t for t in web_tool_registry.list_tools() if t.get("is_enabled", True)
+        }
+
+        adapted_core_tools: List[Any] = []
+        for req_tool in requested_tools:
+            if req_tool in ("terminate", "file_saver"):
+                continue
+            if req_tool in available_web_tools:
+                t_meta = available_web_tools[req_tool]
+                adapter = resolve_tool_runtime(
+                    tool_id=req_tool,
+                    tool_meta=t_meta,
+                    workspace_root=ws_path,
+                    registry=web_tool_registry,
+                )
+                adapted_core_tools.append(adapter)
+
+        # 2. Build Canonical RunRequest
         workspace_ctx = WorkspaceContext(
-            workspace_id=chat_id or job_id,
+            workspace_id=chat_id,
             root_path=ws_path_str,
             chat_id=chat_id,
-            project_id=manifest.get("project_id"),
+            project_id=manifest.get("project_id", "default_project"),
+            read_only=False,
         )
-        requested_tools = list(manifest.get("tools", []))
         agent_spec = AgentSpec(
             id=agent_id,
             name=manifest.get("name") or agent_id,
@@ -142,43 +166,17 @@ class PeldrunEngine(ExecutionEngine):
             temperature=float(active_llm.get("temperature", 0.2)),
         )
         run_request = RunRequest(
+            run_id=str(uuid.uuid4()),
             job_id=job_id,
-            prompt=prompt,
+            prompt=scoped_prompt,
             agent_spec=agent_spec,
             workspace=workspace_ctx,
             llm_config=active_llm,
+            metadata={"model_name": model_name, "chat_id": chat_id, "provider": provider_name},
+            step_timeout_seconds=float(active_llm.get("timeout") or 120.0),
         )
 
-        core_registry = CoreToolRegistry(workspace_root=ws_path_str)
-        core_registry.register(TerminateTool(workspace_root=ws_path_str))
-
-        available_web_tools = {
-            t["id"]: t for t in web_tool_registry.list_tools() if t.get("is_enabled", True)
-        }
-
-        for req_tool in requested_tools:
-            if req_tool in ("terminate", "file_saver"):
-                continue
-
-            if req_tool in available_web_tools:
-                t_meta = available_web_tools[req_tool]
-                real_adapter = resolve_tool_runtime(
-                    tool_id=req_tool,
-                    tool_meta=t_meta,
-                    workspace_root=ws_path,
-                    registry=web_tool_registry,
-                )
-                core_registry.register(real_adapter)
-
-        fallback_collection: ToolCollection = getattr(
-            core_registry,
-            "_collection",
-            ToolCollection(core_registry.list_tools()),
-        )
-
-        emitter = EventEmitter(run_id=job_id)
-        main_loop = asyncio.get_running_loop()
-
+        # 3. Setup Async Event Processing Bridge
         event_queue: asyncio.Queue[Optional[PeldrunEvent]] = asyncio.Queue()
         event_seq: int = 0
         current_core_step: int = 1
@@ -234,23 +232,6 @@ class PeldrunEngine(ExecutionEngine):
                                 "size_bytes": file_size,
                                 "chat_id": chat_id,
                                 "job_id": job_id,
-                                "seq": event_seq,
-                                "model": model_name,
-                            },
-                        ),
-                    )
-
-                    await dispatch_event(
-                        job_id,
-                        SSEEvent(
-                            type=SSEEventType.OBSERVATION,
-                            step=step_num,
-                            data={
-                                "artifact": rel_path,
-                                "path": rel_path,
-                                "chat_id": chat_id,
-                                "event": "artifact_created",
-                                "content": f"Artifact created: {rel_path}",
                                 "seq": event_seq,
                                 "model": model_name,
                             },
@@ -429,109 +410,29 @@ class PeldrunEngine(ExecutionEngine):
                 try:
                     await _process_single_core_event(event)
                 except Exception as ex:
-                    logger.error(
-                        f"[ENGINE PELDRUN ERROR] Exception in ordered event consumer for job {job_id}: {ex}",
-                        exc_info=True,
-                    )
+                    logger.error(f"[ENGINE PELDRUN ERROR] Consumer failed for job {job_id}: {ex}", exc_info=True)
                 finally:
                     event_queue.task_done()
 
         consumer_task = asyncio.create_task(_ordered_event_consumer())
 
-        def _sync_event_handler(event: PeldrunEvent) -> None:
-            try:
-                event_queue.put_nowait(event)
-            except Exception:
-                main_loop.call_soon_threadsafe(event_queue.put_nowait, event)
+        async def _on_core_event(evt: PeldrunEvent) -> None:
+            await event_queue.put(evt)
 
-        emitter.subscribe_all(_sync_event_handler)
-
-        base_url = active_llm.get("base_url") or "http://127.0.0.1:1234/v1"
-        api_key = active_llm.get("api_key") or "EMPTY"
-        safe_max_tokens = min(int(active_llm.get("max_tokens") or 4096), 4096)
-        llm_timeout = float(active_llm.get("timeout") or 300.0)
-
-        llm_cfg = LLMConfig(
-            model=model_name,
-            base_url=base_url,
-            api_key=api_key,
-            temperature=float(active_llm.get("temperature", 0.2)),
-            max_tokens=safe_max_tokens,
-            timeout=llm_timeout,
-        )
-        llm_provider = OpenAICompatProvider(config=llm_cfg)
-
-        agent_config = AgentConfig(
-            name=manifest.get("name") or agent_id,
-            system_prompt=system_prompt,
-            max_steps=max_steps,
-        )
-        if hasattr(agent_config, "workspace_root"):
-            agent_config.workspace_root = ws_path_str
-
-        agent = ToolCallAgent(
-            config=agent_config,
-            llm=llm_provider,
-            tool_registry=core_registry,
-            tool_collection=fallback_collection,
-            emitter=emitter,
-            workspace_dir=ws_path_str,
-        )
-        agent.set_system_prompt(system_prompt)
-        agent.name = agent_config.name
-
-        scoped_prompt = (
-            f"[PROJECT EXECUTION RULES]\n"
-            f"1. User Directive Sovereignty: Follow USER TASK instructions strictly.\n"
-            f"2. Multi-Question Counting Protocol: Execute all sequential interactions completely before concluding.\n"
-            f"3. Workspace Operations: Current working directory is already workspace root. Use relative paths.\n"
-            f"4. Task Conclusion: Ensure all parts of the user request are satisfied completely before calling 'terminate'.\n"
-            f"[USER TASK]\n"
-            f"{prompt}"
-        )
-
-        initial_state = ExecutionState(
-            run_id=job_id,
-            task_prompt=scoped_prompt,
-            agent_name=agent.name,
-            max_steps=max_steps,
-            workspace_root=ws_path_str,
-            metadata={"run_request": run_request.model_dump(mode="json")},
-        )
-        initial_state.add_message(role=MessageRole.SYSTEM, content=system_prompt)
-        initial_state.add_message(role=MessageRole.USER, content=scoped_prompt)
-
-        agent.messages = [msg.to_llm_dict() for msg in initial_state.messages]
-
-        runner_config = RunnerConfig(
-            max_steps=max_steps,
-            step_timeout_seconds=llm_timeout,
-            enable_checkpointing=True,
-            checkpoint_interval=1,
-        )
-        runner = AgentRunner(
-            agent=agent,
-            emitter=emitter,
-            config=runner_config,
-        )
-
-        execution_state: Optional[ExecutionState] = None
+        # 4. Delegate Execution to Core Authority
         try:
-            execution_state = await runner.run(
-                task_prompt=scoped_prompt,
-                state=initial_state,
-                workspace_root=ws_path_str,
-                agent=agent,
+            run_result = await core_executor.execute(
+                request=run_request,
+                event_listener=_on_core_event,
+                custom_tools=adapted_core_tools,
             )
-            final_answer = execution_state.final_output or ""
 
-            await _sync_and_dispatch_artifacts(execution_state.current_step)
-
+            await _sync_and_dispatch_artifacts(run_result.total_steps or current_core_step)
             await event_queue.put(None)
             await consumer_task
 
         except asyncio.CancelledError:
-            runner.cancel()
+            core_executor.cancel(job_id)
             try:
                 await event_queue.put(None)
                 await asyncio.wait_for(consumer_task, timeout=1.0)
@@ -566,18 +467,44 @@ class PeldrunEngine(ExecutionEngine):
                 )
             return
 
+        # 5. Extract Telemetry & Usage Metrics from Diagnostics
+        diag_data = run_result.metadata.get("diagnostics", {})
+        inp_tok = int(diag_data.get("total_input_tokens") or 0)
+        out_tok = int(diag_data.get("total_output_tokens") or 0)
+        tot_tok = int(diag_data.get("total_tokens") or (inp_tok + out_tok))
+        cost_nano = int(diag_data.get("total_cost_nano_usd") or 0)
+        cost_usd = round(cost_nano / NANO_USD_PER_USD, 6)
+
+        turn_id = f"turn_{int(time.time())}"
+        turn_usage_dict = {
+            "turn_id": turn_id,
+            "prompt_tokens": inp_tok,
+            "completion_tokens": out_tok,
+            "total_tokens": tot_tok,
+            "cached_input_tokens": diag_data.get("total_cached_tokens"),
+            "reasoning_output_tokens": diag_data.get("total_reasoning_tokens"),
+            "cost_usd": cost_usd,
+            "cost_nano_usd": cost_nano,
+            "latency_ms": diag_data.get("total_duration_ms"),
+            "tokens_per_second": diag_data.get("overall_tokens_per_second"),
+            "model": model_name,
+            "provider": provider_name,
+        }
+
+        # Atomically update session.json with turn usage and re-aggregated summary
+        session_usage_summary = project_manager.record_turn_usage(
+            chat_id=chat_id,
+            turn_id=turn_id,
+            turn_usage=turn_usage_dict,
+            project_id=workspace_ctx.project_id or "default_project",
+        )
+
         all_created = sorted([p for p in known_artifact_paths if p not in files_baseline])
         canonical_deliverables = all_created
+        step_count = run_result.total_steps if run_result.total_steps > 0 else current_core_step
 
-        if execution_state is not None:
-            for deliv in canonical_deliverables:
-                execution_state.add_deliverable(deliv)
-
-        step_count = execution_state.current_step if execution_state else current_core_step
-
-        # Enforce strict terminal state semantics from PR 1 FSM
-        if execution_state is not None and execution_state.is_failed:
-            err_msg = execution_state.metadata.get("error") or "Execution failed before reaching completion."
+        if run_result.status == RunStatus.FAILED:
+            err_msg = run_result.error or "Execution failed before reaching completion."
             print(f"[ENGINE PELDRUN] Job {job_id} terminated as FAILED in step {step_count}: {err_msg}")
             job_manager.fail_job(job_id, err_msg)
             if not terminal_dispatched:
@@ -592,14 +519,16 @@ class PeldrunEngine(ExecutionEngine):
                             "model": model_name,
                             "engine": self.engine_id,
                             "produced_files": canonical_deliverables,
+                            "usage": turn_usage_dict,
+                            "usage_summary": session_usage_summary,
                             "seq": event_seq + 1,
                         },
                     ),
                 )
             return
 
-        if execution_state is not None and execution_state.is_cancelled:
-            cancel_msg = "Execution was cancelled by operator."
+        if run_result.status == RunStatus.CANCELLED:
+            cancel_msg = run_result.error or "Execution was cancelled by operator."
             print(f"[ENGINE PELDRUN] Job {job_id} terminated as CANCELLED in step {step_count}")
             job_manager.fail_job(job_id, cancel_msg)
             if not terminal_dispatched:
@@ -629,9 +558,12 @@ class PeldrunEngine(ExecutionEngine):
                 f"You can preview and interact with the application live in the **Preview** panel."
             )
         else:
-            result_text = sanitize_final_result_text(final_answer, latest_meaningful_thought)
+            result_text = sanitize_final_result_text(run_result.output, latest_meaningful_thought)
 
-        print(f"[ENGINE PELDRUN] Job {job_id} completed successfully in step {step_count}. Produced files: {canonical_deliverables}")
+        print(
+            f"[ENGINE PELDRUN] Job {job_id} completed successfully in step {step_count}. "
+            f"Tokens: {tot_tok} | Cost: ${cost_usd}"
+        )
 
         job_manager.complete_job(job_id, result_text)
         if not terminal_dispatched:
@@ -646,6 +578,9 @@ class PeldrunEngine(ExecutionEngine):
                         "model": model_name,
                         "engine": self.engine_id,
                         "produced_files": canonical_deliverables,
+                        "usage": turn_usage_dict,
+                        "usage_summary": session_usage_summary,
+                        "cost_usd": cost_usd,
                         "seq": event_seq + 1,
                     },
                 ),

@@ -1,8 +1,19 @@
-﻿export type SettingsTab = "llm" | "browser" | "search" | "sandbox" | "mcp" | "system";
+﻿export type SettingsTab =
+  | "llm"
+  | "usage"
+  | "browser"
+  | "search"
+  | "sandbox"
+  | "mcp"
+  | "system";
 
 export type HubSubTab = "overview" | "lmstudio" | "cloud" | "custom";
 
-export type ApiModeType = "Auto-detect" | "Chat Completions" | "Responses API" | "Anthropic Messages";
+export type ApiModeType =
+  | "Auto-detect"
+  | "Chat Completions"
+  | "Responses API"
+  | "Anthropic Messages";
 
 export type ProviderConnectionStatus = "online" | "offline" | "untested";
 
@@ -62,7 +73,7 @@ export const INITIAL_OLLAMA_SETTINGS: OllamaSettings = {
   baseUrl: "http://127.0.0.1:11434",
   model: "",
   status: "untested",
-  savedModels: []
+  savedModels: [],
 };
 
 export const INITIAL_CLOUD_PROVIDERS: CloudProviderVaultItem[] = [
@@ -73,11 +84,16 @@ export const INITIAL_CLOUD_PROVIDERS: CloudProviderVaultItem[] = [
     baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/",
     apiKey: "",
     model: "gemini-2.0-flash",
-    popularModels: ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.5-pro-preview-05-06"],
+    popularModels: [
+      "gemini-2.0-flash",
+      "gemini-1.5-pro",
+      "gemini-1.5-flash",
+      "gemini-2.5-pro-preview-05-06",
+    ],
     badge: "Cloud",
     keyPrefixHint: "Google Gemini keys start with 'AIzaSy...'",
     status: "untested",
-    savedModels: []
+    savedModels: [],
   },
   {
     id: "deepseek",
@@ -90,7 +106,7 @@ export const INITIAL_CLOUD_PROVIDERS: CloudProviderVaultItem[] = [
     badge: "Cloud",
     keyPrefixHint: "DeepSeek keys start with 'sk-'",
     status: "untested",
-    savedModels: []
+    savedModels: [],
   },
   {
     id: "openai",
@@ -103,7 +119,7 @@ export const INITIAL_CLOUD_PROVIDERS: CloudProviderVaultItem[] = [
     badge: "Cloud",
     keyPrefixHint: "OpenAI keys start with 'sk-proj-'",
     status: "untested",
-    savedModels: []
+    savedModels: [],
   },
   {
     id: "anthropic",
@@ -112,12 +128,16 @@ export const INITIAL_CLOUD_PROVIDERS: CloudProviderVaultItem[] = [
     baseUrl: "https://api.anthropic.com/v1",
     apiKey: "",
     model: "claude-3-5-sonnet-20241022",
-    popularModels: ["claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022", "claude-3-opus-20240229"],
+    popularModels: [
+      "claude-3-5-sonnet-20241022",
+      "claude-3-5-haiku-20241022",
+      "claude-3-opus-20240229",
+    ],
     badge: "Cloud",
     keyPrefixHint: "Anthropic keys start with 'sk-ant-'",
     status: "untested",
-    savedModels: []
-  }
+    savedModels: [],
+  },
 ];
 
 export const INITIAL_LMSTUDIO_SETTINGS: LMStudioSettings = {
@@ -126,7 +146,7 @@ export const INITIAL_LMSTUDIO_SETTINGS: LMStudioSettings = {
   apiKey: "",
   model: "qwen3-vl-8b-instruct",
   status: "untested",
-  savedModels: ["qwen3-vl-8b-instruct"]
+  savedModels: ["qwen3-vl-8b-instruct"],
 };
 
 export interface FullAppConfig {
@@ -185,5 +205,3 @@ export interface FullAppConfig {
   mcp: { server_reference: string };
   runflow: { use_data_analysis_agent: boolean };
 }
-
-

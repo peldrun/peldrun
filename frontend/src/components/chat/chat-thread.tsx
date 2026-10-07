@@ -7,6 +7,9 @@ import { ChatTimeline, StepEvent } from "./chat-timeline";
 import { ChatDeliverable } from "./chat-deliverable";
 import AIThinkingLoader from "@/components/AIThinkingLoader";
 
+import { UsageBadgeGroup } from "@/components/chat/UsageBadges";
+
+        
 export interface ChatTurn {
   id: string;
   jobId: string;
@@ -19,6 +22,13 @@ export interface ChatTurn {
   producedFiles?: { name: string; path: string }[];
   model?: string;
   mode?: "agent" | "chat";
+  usage?: {
+    cost_usd: number;
+    latency_ms: number;
+    tokens_per_second: number;
+    provider: string;
+    model: string;
+  };
 }
 
 interface ChatThreadProps {
@@ -46,6 +56,7 @@ interface ChatThreadProps {
   getLiveStatusMessage: () => string;
   chatScrollBottomRef: React.RefObject<HTMLDivElement | null>;
   activeModelName?: string;
+  tokensUsed?: { input: number; output: number; total: number };
 }
 
 export function ChatThread({
@@ -73,6 +84,7 @@ export function ChatThread({
   getLiveStatusMessage,
   chatScrollBottomRef,
   activeModelName = "Assistant",
+  tokensUsed,
 }: ChatThreadProps) {
   const groupStepEvents = (evts: StepEvent[]) => {
     return evts.reduce((acc, s) => {
@@ -182,6 +194,8 @@ export function ChatThread({
                 />
               )}
 
+
+
               {/* Final Result */}
               {turn.finalResult && (
                 <ChatDeliverable
@@ -199,11 +213,21 @@ export function ChatThread({
                   setShowRawTrace={setShowRawTrace}
                   modelName={turn.model || activeModelName}
                   timestamp={turn.timestamp}
+                  tokensUsed={turn.tokensUsed}
+                  costUsd={turn.usage?.cost_usd}
+                  latencyMs={turn.usage?.latency_ms}
+                  tokensPerSecond={turn.usage?.tokens_per_second}
                 />
               )}
+              
             </div>
+
+               
+
+           
           );
         })}
+        
 
         {/* Current Active Turn Prompt */}
         {submittedPrompt && (
@@ -327,6 +351,11 @@ export function ChatThread({
             </span>
           </div>
         )}
+
+
+ 
+
+
 
         {/* Current Turn Final Deliverable */}
         {finalResult && (

@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { Sidebar } from "./setup/Sidebar";
 import { LLMTab } from "./setup/tabs/LLMTab";
+import { UsageTab } from "./setup/tabs/UsageTab";
 import { BrowserTab } from "./setup/tabs/BrowserTab";
 import { SearchTab } from "./setup/tabs/SearchTab";
 import { SandboxTab } from "./setup/tabs/SandboxTab";
@@ -20,7 +21,7 @@ import {
   type LMStudioSettings,
   type OllamaSettings,
   type CustomEndpoint,
-  type FullAppConfig
+  type FullAppConfig,
 } from "./setup/types";
 
 export default function SettingsPage() {
@@ -37,7 +38,7 @@ export default function SettingsPage() {
   const [lmStudioSettings, setLmStudioSettings] = useState<LMStudioSettings>(INITIAL_LMSTUDIO_SETTINGS);
   const [ollamaSettings, setOllamaSettings] = useState<OllamaSettings>(INITIAL_OLLAMA_SETTINGS);
   const [cloudProviders, setCloudProviders] = useState<CloudProviderVaultItem[]>(INITIAL_CLOUD_PROVIDERS);
-  
+
   // Clean dynamic state without hardcoded provider entries
   const [customEndpoints, setCustomEndpoints] = useState<CustomEndpoint[]>([]);
 
@@ -50,7 +51,7 @@ export default function SettingsPage() {
       api_key: "",
       max_tokens: 8192,
       temperature: 0.0,
-      api_type: ""
+      api_type: "",
     },
     llm_vision: {
       provider: "lmstudio",
@@ -59,7 +60,7 @@ export default function SettingsPage() {
       base_url: "http://127.0.0.1:1234/v1",
       api_key: "",
       max_tokens: 8192,
-      temperature: 0.0
+      temperature: 0.0,
     },
     browser: {
       headless: false,
@@ -68,7 +69,7 @@ export default function SettingsPage() {
       cdp_url: "http://localhost:9222",
       wss_url: "",
       max_content_length: 2000,
-      proxy: { server: "", username: "", password: "" }
+      proxy: { server: "", username: "", password: "" },
     },
     search: {
       engine: "Google",
@@ -76,7 +77,7 @@ export default function SettingsPage() {
       retry_delay: 60,
       max_retries: 3,
       lang: "en",
-      country: "us"
+      country: "us",
     },
     sandbox: {
       use_sandbox: false,
@@ -85,17 +86,17 @@ export default function SettingsPage() {
       memory_limit: "1g",
       cpu_limit: 2.0,
       timeout: 300,
-      network_enabled: false
+      network_enabled: false,
     },
     daytona: {
       daytona_api_key: "",
       daytona_server_url: "https://app.daytona.io/api",
       daytona_target: "us",
       sandbox_image_name: "whitezxj/sandbox:0.1.0",
-      VNC_password: ""
+      VNC_password: "",
     },
     mcp: { server_reference: "app.mcp.server" },
-    runflow: { use_data_analysis_agent: false }
+    runflow: { use_data_analysis_agent: false },
   });
 
   const [systemInfo, setSystemInfo] = useState<any>(null);
@@ -149,13 +150,19 @@ export default function SettingsPage() {
         const cleanCloud = vault.cloud_vault
           .filter((p: any) => p.id !== "ollama")
           .map((p: any) => {
-            if (p.id === "deepseek" && (p.baseUrl?.includes("ppinfra") || p.name?.includes("PPIO") || p.model?.includes("ppinfra") || p.model?.includes("0324"))) {
+            if (
+              p.id === "deepseek" &&
+              (p.baseUrl?.includes("ppinfra") ||
+                p.name?.includes("PPIO") ||
+                p.model?.includes("ppinfra") ||
+                p.model?.includes("0324"))
+            ) {
               return {
                 ...p,
                 name: "DeepSeek",
                 baseUrl: "https://api.deepseek.com",
                 model: "deepseek-chat",
-                popularModels: ["deepseek-chat", "deepseek-reasoner"]
+                popularModels: ["deepseek-chat", "deepseek-reasoner"],
               };
             }
             return p;
@@ -166,7 +173,6 @@ export default function SettingsPage() {
         });
       }
 
-      // Strictly reflect persisted custom endpoints without arbitrary fallbacks
       if (vault.custom_endpoints && Array.isArray(vault.custom_endpoints)) {
         storedCustom = vault.custom_endpoints;
       }
@@ -180,7 +186,7 @@ export default function SettingsPage() {
           api_key: cfg.llm?.api_key || storedLM.apiKey || "",
           max_tokens: sanitizeTokens(cfg.llm?.max_tokens || 8192),
           temperature: cfg.llm?.temperature ?? 0.0,
-          api_type: cfg.llm?.api_type || ""
+          api_type: cfg.llm?.api_type || "",
         },
         llm_vision: {
           provider: cfg["llm.vision"]?.provider || "lmstudio",
@@ -189,7 +195,7 @@ export default function SettingsPage() {
           base_url: cfg["llm.vision"]?.base_url || cfg.llm_vision?.base_url || storedLM.baseUrl,
           api_key: cfg["llm.vision"]?.api_key || cfg.llm_vision?.api_key || "",
           max_tokens: sanitizeTokens(cfg["llm.vision"]?.max_tokens || 8192),
-          temperature: cfg["llm.vision"]?.temperature ?? 0.0
+          temperature: cfg["llm.vision"]?.temperature ?? 0.0,
         },
         browser: {
           headless: cfg.browser?.headless ?? false,
@@ -201,35 +207,37 @@ export default function SettingsPage() {
           proxy: {
             server: cfg["browser.proxy"]?.server || cfg.browser?.proxy?.server || "",
             username: cfg["browser.proxy"]?.username || cfg.browser?.proxy?.username || "",
-            password: cfg["browser.proxy"]?.password || cfg.browser?.proxy?.password || ""
-          }
+            password: cfg["browser.proxy"]?.password || cfg.browser?.proxy?.password || "",
+          },
         },
         search: {
           engine: cfg.search?.engine || "Google",
-          fallback_engines: Array.isArray(cfg.search?.fallback_engines) ? cfg.search.fallback_engines : ["DuckDuckGo", "Baidu", "Bing"],
+          fallback_engines: Array.isArray(cfg.search?.fallback_engines)
+            ? cfg.search.fallback_engines
+            : ["DuckDuckGo", "Baidu", "Bing"],
           retry_delay: cfg.search?.retry_delay ?? 60,
           max_retries: cfg.search?.max_retries ?? 3,
           lang: cfg.search?.lang || "en",
-          country: cfg.search?.country || "us"
+          country: cfg.search?.country || "us",
         },
         sandbox: {
           use_sandbox: cfg.sandbox?.use_sandbox ?? false,
           image: cfg.sandbox?.image || "python:3.12-slim",
-          work_dir: cfg.sandbox?.work_dir || "/workspace",
+          work_dir: "/workspace",
           memory_limit: cfg.sandbox?.memory_limit || "1g",
           cpu_limit: cfg.sandbox?.cpu_limit ?? 2.0,
           timeout: cfg.sandbox?.timeout ?? 300,
-          network_enabled: cfg.sandbox?.network_enabled ?? false
+          network_enabled: cfg.sandbox?.network_enabled ?? false,
         },
         daytona: {
           daytona_api_key: cfg.daytona?.daytona_api_key || "",
           daytona_server_url: cfg.daytona?.daytona_server_url || "https://app.daytona.io/api",
           daytona_target: cfg.daytona?.daytona_target || "us",
           sandbox_image_name: cfg.daytona?.sandbox_image_name || "whitezxj/sandbox:0.1.0",
-          VNC_password: cfg.daytona?.VNC_password || ""
+          VNC_password: cfg.daytona?.VNC_password || "",
         },
         mcp: { server_reference: cfg.mcp?.server_reference || "app.mcp.server" },
-        runflow: { use_data_analysis_agent: cfg.runflow?.use_data_analysis_agent ?? false }
+        runflow: { use_data_analysis_agent: cfg.runflow?.use_data_analysis_agent ?? false },
       };
 
       setLmStudioSettings(storedLM);
@@ -238,13 +246,12 @@ export default function SettingsPage() {
       setCustomEndpoints(storedCustom);
       setConfig(loadedConfig);
 
-      // Establish initial baseline snapshot
       initialLoadedRef.current = JSON.stringify({
         config: loadedConfig,
         lmStudioSettings: storedLM,
         ollamaSettings: storedOllama,
         cloudProviders: storedCloud,
-        customEndpoints: storedCustom
+        customEndpoints: storedCustom,
       });
 
       if (typeof window !== "undefined") {
@@ -287,7 +294,14 @@ export default function SettingsPage() {
     }
   };
 
-  const activateEngine = (providerId: string, providerName: string, model: string, baseUrl: string, apiKey: string, apiType: string) => {
+  const activateEngine = (
+    providerId: string,
+    providerName: string,
+    model: string,
+    baseUrl: string,
+    apiKey: string,
+    apiType: string
+  ) => {
     setConfig((prev) => ({
       ...prev,
       llm: {
@@ -298,8 +312,8 @@ export default function SettingsPage() {
         base_url: baseUrl,
         api_key: apiKey,
         api_type: apiType || "",
-        max_tokens: 8192
-      }
+        max_tokens: 8192,
+      },
     }));
 
     if (providerId === "lmstudio") {
@@ -311,24 +325,36 @@ export default function SettingsPage() {
     if (typeof window !== "undefined") {
       localStorage.setItem("omweb_active_model", model);
       localStorage.setItem("omweb_active_provider", providerName);
-      localStorage.setItem("omweb_active_llm_override", JSON.stringify({
-        model,
-        provider: providerId,
-        provider_name: providerName,
-        base_url: baseUrl,
-        api_key: apiKey,
-        api_type: apiType || ""
-      }));
-      window.dispatchEvent(new CustomEvent("omweb:model-change", {
-        detail: { model, provider_name: providerName }
-      }));
+      localStorage.setItem(
+        "omweb_active_llm_override",
+        JSON.stringify({
+          model,
+          provider: providerId,
+          provider_name: providerName,
+          base_url: baseUrl,
+          api_key: apiKey,
+          api_type: apiType || "",
+        })
+      );
+      window.dispatchEvent(
+        new CustomEvent("omweb:model-change", {
+          detail: { model, provider_name: providerName },
+        })
+      );
     }
 
     showToast.success("Active Engine Set", `${providerName} (${model}) is now primary.`);
   };
 
   const deactivateToDefault = () => {
-    activateEngine("lmstudio", "LM Studio (Local)", lmStudioSettings.model, lmStudioSettings.baseUrl, lmStudioSettings.apiKey, "");
+    activateEngine(
+      "lmstudio",
+      "LM Studio (Local)",
+      lmStudioSettings.model,
+      lmStudioSettings.baseUrl,
+      lmStudioSettings.apiKey,
+      ""
+    );
     showToast.info("Reverted to Local Engine", "LM Studio (Local GPU) is now active primary.");
   };
 
@@ -340,7 +366,11 @@ export default function SettingsPage() {
         body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, model, api_type: apiType || "" }),
       });
       const data = await res.json();
-      return { ok: Boolean(data.ok), message: data.message || (data.ok ? "Connected" : "Rejected"), latency: data.latency_ms };
+      return {
+        ok: Boolean(data.ok),
+        message: data.message || (data.ok ? "Connected" : "Rejected"),
+        latency: data.latency_ms,
+      };
     } catch (e: any) {
       return { ok: false, message: e.message || "Endpoint unreachable" };
     }
@@ -356,7 +386,7 @@ export default function SettingsPage() {
         body: JSON.stringify({
           base_url: lmStudioSettings.baseUrl,
           api_key: lmStudioSettings.apiKey,
-          provider_id: "lmstudio"
+          provider_id: "lmstudio",
         }),
       });
       const data = await res.json();
@@ -365,13 +395,13 @@ export default function SettingsPage() {
         setAvailableModels(data.models);
         const updatedVaultLM: LMStudioSettings = {
           ...lmStudioSettings,
-          savedModels: data.models
+          savedModels: data.models,
         };
         setLmStudioSettings(updatedVaultLM);
 
         void saveVaultToBackend({
           scanned_models: data.models,
-          lmstudio_vault: updatedVaultLM
+          lmstudio_vault: updatedVaultLM,
         });
 
         showToast.success("Models Detected", `Retrieved ${data.models.length} local GPU models!`);
@@ -398,34 +428,39 @@ export default function SettingsPage() {
           model: modelName,
           provider: "lmstudio",
           provider_name: "LM Studio (Local)",
-          base_url: lmStudioSettings.baseUrl
-        }
+          base_url: lmStudioSettings.baseUrl,
+        },
       }));
       const updatedLM: LMStudioSettings = {
         ...lmStudioSettings,
         model: modelName,
-        savedModels: lmStudioSettings.savedModels || availableModels || [modelName]
+        savedModels: lmStudioSettings.savedModels || availableModels || [modelName],
       };
       setLmStudioSettings(updatedLM);
 
       void saveVaultToBackend({
-        lmstudio_vault: updatedLM
+        lmstudio_vault: updatedLM,
       });
 
       if (typeof window !== "undefined") {
         localStorage.setItem("omweb_active_model", modelName);
         localStorage.setItem("omweb_active_provider", "LM Studio (Local)");
-        localStorage.setItem("omweb_active_llm_override", JSON.stringify({
-          model: modelName,
-          provider: "lmstudio",
-          provider_name: "LM Studio (Local)",
-          base_url: lmStudioSettings.baseUrl,
-          api_key: lmStudioSettings.apiKey,
-          api_type: ""
-        }));
-        window.dispatchEvent(new CustomEvent("omweb:model-change", {
-          detail: { model: modelName, provider_name: "LM Studio (Local)" }
-        }));
+        localStorage.setItem(
+          "omweb_active_llm_override",
+          JSON.stringify({
+            model: modelName,
+            provider: "lmstudio",
+            provider_name: "LM Studio (Local)",
+            base_url: lmStudioSettings.baseUrl,
+            api_key: lmStudioSettings.apiKey,
+            api_type: "",
+          })
+        );
+        window.dispatchEvent(
+          new CustomEvent("omweb:model-change", {
+            detail: { model: modelName, provider_name: "LM Studio (Local)" },
+          })
+        );
       }
       showToast.success("Primary Model Set", modelName);
     } else {
@@ -436,8 +471,8 @@ export default function SettingsPage() {
           model: modelName,
           provider: "lmstudio",
           provider_name: "LM Studio (Local)",
-          base_url: lmStudioSettings.baseUrl
-        }
+          base_url: lmStudioSettings.baseUrl,
+        },
       }));
       showToast.info("Vision Model Set", modelName);
     }
@@ -476,13 +511,13 @@ export default function SettingsPage() {
           cdp_url: config.browser.cdp_url || null,
           wss_url: config.browser.wss_url || null,
           max_content_length: parseInt(String(config.browser.max_content_length), 10) || 2000,
-          proxy: config.browser.proxy
+          proxy: config.browser.proxy,
         },
         search: config.search,
         sandbox: config.sandbox,
         daytona: config.daytona,
         mcp: config.mcp,
-        runflow: config.runflow
+        runflow: config.runflow,
       };
 
       const res = await fetch(getApiUrl("/api/config"), {
@@ -494,12 +529,12 @@ export default function SettingsPage() {
       if (res.ok) {
         const updatedLM: LMStudioSettings = {
           ...lmStudioSettings,
-          savedModels: availableModels.length > 0 ? availableModels : (lmStudioSettings.savedModels || [])
+          savedModels: availableModels.length > 0 ? availableModels : lmStudioSettings.savedModels || [],
         };
 
         const safeOllamaVault: OllamaSettings = {
           ...ollamaSettings,
-          savedModels: ollamaSettings.savedModels || []
+          savedModels: ollamaSettings.savedModels || [],
         };
 
         await saveVaultToBackend({
@@ -507,30 +542,28 @@ export default function SettingsPage() {
           custom_endpoints: customEndpoints,
           lmstudio_vault: updatedLM,
           ollama_vault: safeOllamaVault,
-          scanned_models: availableModels
+          scanned_models: availableModels,
         });
 
-        // Synchronize React state with the newly persisted data
         const finalConfig: FullAppConfig = {
           ...config,
           llm: activeLlm,
           browser: {
             ...config.browser,
-            max_content_length: parseInt(String(config.browser.max_content_length), 10) || 2000
-          }
+            max_content_length: parseInt(String(config.browser.max_content_length), 10) || 2000,
+          },
         };
 
         setConfig(finalConfig);
         setLmStudioSettings(updatedLM);
         setOllamaSettings(safeOllamaVault);
 
-        // Update baseline snapshot to match synchronized React state
         initialLoadedRef.current = JSON.stringify({
           config: finalConfig,
           lmStudioSettings: updatedLM,
           ollamaSettings: safeOllamaVault,
           cloudProviders,
-          customEndpoints
+          customEndpoints,
         });
 
         setSaveStatus({ ok: true, message: "Configuration & Vault permanently saved!" });
@@ -539,17 +572,22 @@ export default function SettingsPage() {
         if (typeof window !== "undefined") {
           localStorage.setItem("omweb_active_model", activeLlm.model);
           localStorage.setItem("omweb_active_provider", activeLlm.provider_name);
-          localStorage.setItem("omweb_active_llm_override", JSON.stringify({
-            model: activeLlm.model,
-            provider: activeLlm.provider,
-            provider_name: activeLlm.provider_name,
-            base_url: activeLlm.base_url,
-            api_key: activeLlm.api_key,
-            api_type: activeLlm.api_type || ""
-          }));
-          window.dispatchEvent(new CustomEvent("omweb:model-change", {
-            detail: { model: activeLlm.model, provider_name: activeLlm.provider_name }
-          }));
+          localStorage.setItem(
+            "omweb_active_llm_override",
+            JSON.stringify({
+              model: activeLlm.model,
+              provider: activeLlm.provider,
+              provider_name: activeLlm.provider_name,
+              base_url: activeLlm.base_url,
+              api_key: activeLlm.api_key,
+              api_type: activeLlm.api_type || "",
+            })
+          );
+          window.dispatchEvent(
+            new CustomEvent("omweb:model-change", {
+              detail: { model: activeLlm.model, provider_name: activeLlm.provider_name },
+            })
+          );
         }
 
         setTimeout(() => setSaveStatus(null), 4000);
@@ -605,7 +643,8 @@ export default function SettingsPage() {
             testEndpoint={testEndpoint}
           />
         )}
-         
+
+        {activeTab === "usage" && <UsageTab />}
         {activeTab === "browser" && <BrowserTab config={config} setConfig={setConfig} />}
         {activeTab === "search" && <SearchTab config={config} setConfig={setConfig} />}
         {activeTab === "sandbox" && <SandboxTab config={config} setConfig={setConfig} />}

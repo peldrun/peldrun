@@ -3,11 +3,10 @@ backend/omweb/routers/run.py
 
 PELDRUN Universal Run Router.
 Manages job lifecycles, chat associations, real-time SSE streaming, and deliverable downloads.
-Hardened under PR 5 (Canonical Event Sequence & SSE Replay):
-- Full support for 'after_sequence' query parameter on GET /jobs/{job_id}/stream.
-- Replays historical events durably from RunStore, then switches smoothly to live tail.
-- Deduplicates events by sequence number to prevent double rendering upon reconnection.
-- Terminates stream strictly on all terminal states (final, error, cancelled, done).
+Hardened under PR 5 and Milestone P1 (Token Accounting Integration):
+- Fully propagates token usage and session summaries upon job termination.
+- Preserves usage accounting facts across historical turns in session.json.
+- Full support for 'after_sequence' SSE stream replay.
 """
 
 from __future__ import annotations
@@ -43,6 +42,7 @@ from omweb.project_manager import project_manager
 from omweb.sse_events import SSEEventType, subscribe_events
 from peldrun.runtime.contract import HumanInputStatus
 from peldrun.runtime.store import get_run_store
+from peldrun.runtime.usage_store import get_usage_store
 from peldrun.tools.builtins.human_input import HumanInputRegistry
 
 router = APIRouter()
@@ -171,6 +171,7 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
                     "created_at": existing_chat.get("updated_at") or existing_chat.get("created_at"),
                     "produced_files": job_scoped_artifacts.get(prev_jid, []),
                     "model": existing_chat.get("model"),
+                    "usage": existing_chat.get("usage"),
                 })
 
         agent_prompt = prompt
@@ -210,6 +211,7 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
         status="running",
         agent_id=effective_agent,
         mode=exec_mode,
+        turns=turns,
     )
 
     try:
@@ -329,12 +331,249 @@ async def get_job_detail(job_id: str):
         "result": effective_result,
         "events": effective_events,
         "turns": chat.get("turns", []),
+        "usage_summary": chat.get("usage_summary", {}),
         "created_at": chat.get("created_at"),
         "agent_id": chat.get("agent_id", "peldrun"),
         "model": chat.get("model"),
         "mode": chat.get("mode", "agent"),
         "produced_files": resolved_files,
     }
+
+
+@router.get("/jobs/{job_id}/stream")
+async def stream_job_events(job_id: str, after_sequence: int = Query(0, ge=0)):
+    """
+    Authoritative Server-Sent Events stream for execution monitoring.
+    Replays historical events durably and streams live tail with token usage payloads.
+    """
+    job = job_manager.get_job(job_id)
+    chat, chat_id = resolve_chat(job_id)
+    chat = chat or {}
+
+    actual_job_id = (chat.get("job_id") if chat else None) or job_id
+    store = get_run_store()
+    usage_store = get_usage_store()
+
+    collected_events: List[Dict[str, Any]] = (
+        ACTIVE_JOB_EVENTS.get(actual_job_id)
+        or ACTIVE_JOB_EVENTS.get(job_id)
+        or []
+    )
+    if not collected_events:
+        ACTIVE_JOB_EVENTS[actual_job_id] = collected_events
+        ACTIVE_JOB_EVENTS[job_id] = collected_events
+
+    async def event_generator():
+        current_step = 1
+        max_seen_sequence = after_sequence
+
+        # PHASE 1: Replay Historical Events
+        replayed_records: List[Dict[str, Any]] = []
+        try:
+            stored_raw = await store.get_events_after(actual_job_id, sequence=after_sequence)
+            if not stored_raw and actual_job_id != job_id:
+                stored_raw = await store.get_events_after(job_id, sequence=after_sequence)
+
+            for item in stored_raw:
+                seq = item["sequence"]
+                ev_type = item["type"]
+                payload = item["payload"]
+                step_val = item["step"] or 1
+                ev_id = item["event_id"]
+
+                content_val = (
+                    payload.get("content")
+                    or payload.get("thought")
+                    or payload.get("output")
+                    or payload.get("arguments")
+                    or ""
+                )
+                tool_val = payload.get("tool_name") or payload.get("tool") or ""
+
+                event_dict = {
+                    "id": ev_id,
+                    "type": str(ev_type),
+                    "step": step_val,
+                    "content": str(content_val),
+                    "toolName": str(tool_val) if tool_val else None,
+                    "data": payload,
+                    "seq": seq,
+                }
+                replayed_records.append(event_dict)
+        except Exception:
+            pass
+
+        if not replayed_records and collected_events:
+            for ev in collected_events:
+                ev_seq = ev.get("seq") or ev.get("sequence") or 0
+                if ev_seq > after_sequence:
+                    replayed_records.append(ev)
+
+        for rep in replayed_records:
+            seq_val = rep.get("seq", 0)
+            if seq_val > max_seen_sequence:
+                max_seen_sequence = seq_val
+
+            ev_type_str = rep.get("type", "thought")
+            ev_json = json.dumps(rep, ensure_ascii=False)
+            yield {"event": str(ev_type_str), "data": ev_json}
+
+            if str(ev_type_str).lower() in ("final", "error", "cancelled", "done"):
+                return
+
+        # PHASE 2: Live Events Tail
+        is_actively_running = (
+            job_id in ACTIVE_JOB_TASKS
+            or actual_job_id in ACTIVE_JOB_TASKS
+            or (chat_id and chat_id in ACTIVE_JOB_TASKS)
+        )
+        if not is_actively_running and replayed_records:
+            return
+
+        async for event in subscribe_events(job_id):
+            ev_type = event.type.value if hasattr(event.type, "value") else str(event.type)
+            ev_step = getattr(event, "step", None)
+            if ev_step:
+                current_step = ev_step
+
+            if hasattr(event, "to_json"):
+                try:
+                    raw_dict = json.loads(event.to_json())
+                except Exception:
+                    raw_dict = {"data": getattr(event, "data", {})}
+            else:
+                raw_dict = {"data": getattr(event, "data", {})}
+
+            data_payload = raw_dict.get("data", {})
+            if not isinstance(data_payload, dict):
+                data_payload = {"content": str(data_payload)}
+                raw_dict["data"] = data_payload
+
+            for k, v in data_payload.items():
+                if k not in raw_dict:
+                    raw_dict[k] = v
+
+            live_seq = data_payload.get("seq") or raw_dict.get("seq") or 0
+            if isinstance(live_seq, int) and live_seq > 0:
+                if live_seq <= max_seen_sequence:
+                    continue
+                max_seen_sequence = live_seq
+            else:
+                max_seen_sequence += 1
+                live_seq = max_seen_sequence
+                raw_dict["seq"] = live_seq
+                data_payload["seq"] = live_seq
+
+            raw_dict["id"] = raw_dict.get("id") or f"evt_{uuid.uuid4().hex[:8]}"
+            raw_dict["type"] = str(ev_type)
+            raw_dict["step"] = current_step
+
+            content_val = (
+                raw_dict.get("content")
+                or data_payload.get("content")
+                or data_payload.get("thought")
+                or data_payload.get("output")
+                or data_payload.get("arguments")
+                or ""
+            )
+            raw_dict["content"] = str(content_val)
+
+            tool_name_val = (
+                raw_dict.get("toolName")
+                or data_payload.get("toolName")
+                or raw_dict.get("name")
+                or data_payload.get("name")
+                or ""
+            )
+            if tool_name_val:
+                raw_dict["toolName"] = str(tool_name_val)
+
+            ev_data_str = json.dumps(raw_dict, ensure_ascii=False)
+
+            event_record = {
+                "id": raw_dict["id"],
+                "type": str(ev_type),
+                "step": current_step,
+                "content": raw_dict["content"],
+                "toolName": raw_dict.get("toolName"),
+                "data": data_payload,
+                "seq": live_seq,
+            }
+
+            if str(ev_type).lower() not in ["ping"]:
+                collected_events.append(event_record)
+                if job:
+                    try:
+                        job_manager.append_event(job_id, event_record)
+                    except Exception:
+                        pass
+
+            is_term = str(ev_type).lower() in ["final", "error", "cancelled", "done"]
+            if is_term:
+                res_data = raw_dict.get("data", {})
+                final_res = res_data.get("result", "") if isinstance(res_data, dict) else str(res_data)
+
+                if not final_res or final_res == "{}":
+                    for e in reversed(collected_events):
+                        if e.get("type") == "thought":
+                            t_val = e.get("data", {}).get("thought") or e.get("content")
+                            if t_val:
+                                final_res = t_val
+                                break
+
+                p_id = chat.get("project_id", "default_project")
+                prompt_val = getattr(job, "prompt", None) or chat.get("prompt", "")
+                final_status = "completed" if str(ev_type).lower() in ["final", "done"] else "failed"
+
+                # Pull fresh cumulative usage summary from SQLite ledger facts
+                fresh_summary = await usage_store.get_chat_usage_summary(chat_id)
+                turn_usage = res_data.get("usage") if isinstance(res_data, dict) else None
+
+                # Atomically persist updated session manifest preserving usage facts
+                project_manager.save_chat_session(
+                    chat_id=chat_id,
+                    project_id=p_id,
+                    title=prompt_val[:40] if prompt_val else chat_id,
+                    job_id=job_id,
+                    prompt=prompt_val,
+                    events=collected_events,
+                    result=final_res,
+                    status=final_status,
+                    agent_id=chat.get("agent_id", "peldrun"),
+                    mode=chat.get("mode", "agent"),
+                    usage_summary=fresh_summary,
+                    turns=chat.get("turns", []),
+                )
+
+                # Ensure session.json on disk contains both overall usage_summary and latest turn usage
+                try:
+                    s_file = project_manager.get_chat_dir(chat_id, p_id) / "session.json"
+                    if s_file.exists():
+                        s_data = json.loads(s_file.read_text(encoding="utf-8"))
+                        if fresh_summary and fresh_summary.get("total_tokens", 0) > 0:
+                            s_data["usage_summary"] = fresh_summary
+                        if turn_usage:
+                            s_data["usage"] = turn_usage
+                            turns_list = s_data.get("turns", [])
+                            if turns_list:
+                                turns_list[-1]["usage"] = turn_usage
+                            s_data["turns"] = turns_list
+                        s_file.write_text(json.dumps(s_data, indent=2, ensure_ascii=False), encoding="utf-8")
+                except Exception:
+                    pass
+
+            yield {"event": str(ev_type), "data": ev_data_str}
+            if is_term:
+                break
+
+    return EventSourceResponse(
+        event_generator(),
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @router.get("/jobs/{job_id}/files")
@@ -512,237 +751,6 @@ async def download_job_zip(job_id: str):
     )
 
 
-@router.get("/jobs/{job_id}/stream")
-async def stream_job_events(job_id: str, after_sequence: int = Query(0, ge=0)):
-    """
-    Authoritative Server-Sent Events stream for execution monitoring.
-    Supports durable event replay when after_sequence > 0, followed by live events tail.
-    Prevents duplicate frames and closes cleanly on terminal outcomes.
-    """
-    job = job_manager.get_job(job_id)
-    chat, chat_id = resolve_chat(job_id)
-    chat = chat or {}
-
-    actual_job_id = (chat.get("job_id") if chat else None) or job_id
-    store = get_run_store()
-
-    collected_events: List[Dict[str, Any]] = (
-        ACTIVE_JOB_EVENTS.get(actual_job_id)
-        or ACTIVE_JOB_EVENTS.get(job_id)
-        or []
-    )
-    if not collected_events:
-        ACTIVE_JOB_EVENTS[actual_job_id] = collected_events
-        ACTIVE_JOB_EVENTS[job_id] = collected_events
-
-    async def event_generator():
-        current_step = 1
-        max_seen_sequence = after_sequence
-
-        # PHASE 1: Replay Historical Events occurring strictly after 'after_sequence'
-        replayed_records: List[Dict[str, Any]] = []
-
-        try:
-            stored_raw = await store.get_events_after(actual_job_id, sequence=after_sequence)
-            if not stored_raw and actual_job_id != job_id:
-                stored_raw = await store.get_events_after(job_id, sequence=after_sequence)
-
-            for item in stored_raw:
-                seq = item["sequence"]
-                ev_type = item["type"]
-                payload = item["payload"]
-                step_val = item["step"] or 1
-                ev_id = item["event_id"]
-
-                content_val = (
-                    payload.get("content")
-                    or payload.get("thought")
-                    or payload.get("output")
-                    or payload.get("arguments")
-                    or ""
-                )
-                tool_val = payload.get("tool_name") or payload.get("tool") or ""
-
-                event_dict = {
-                    "id": ev_id,
-                    "type": str(ev_type),
-                    "step": step_val,
-                    "content": str(content_val),
-                    "toolName": str(tool_val) if tool_val else None,
-                    "data": payload,
-                    "seq": seq,
-                }
-                replayed_records.append(event_dict)
-        except Exception as ex:
-            pass
-
-        # Fallback to in-memory event buffer if store had no records
-        if not replayed_records and collected_events:
-            for ev in collected_events:
-                ev_seq = ev.get("seq") or ev.get("sequence") or 0
-                if ev_seq > after_sequence:
-                    replayed_records.append(ev)
-
-        # Yield all replayed historical events sequentially
-        for rep in replayed_records:
-            seq_val = rep.get("seq", 0)
-            if seq_val > max_seen_sequence:
-                max_seen_sequence = seq_val
-
-            ev_type_str = rep.get("type", "thought")
-            ev_json = json.dumps(rep, ensure_ascii=False)
-            yield {"event": str(ev_type_str), "data": ev_json}
-
-            # Check if historical replay concluded on a terminal event
-            if str(ev_type_str).lower() in ("final", "error", "cancelled", "done"):
-                return
-
-        # PHASE 2: Live Events Tail
-        # If the job is already finished, do not enter live listener loop
-        is_actively_running = (
-            job_id in ACTIVE_JOB_TASKS
-            or actual_job_id in ACTIVE_JOB_TASKS
-            or (chat_id and chat_id in ACTIVE_JOB_TASKS)
-        )
-        if not is_actively_running and replayed_records:
-            return
-
-        async for event in subscribe_events(job_id):
-            ev_type = event.type.value if hasattr(event.type, "value") else str(event.type)
-            ev_step = getattr(event, "step", None)
-            if ev_step:
-                current_step = ev_step
-
-            if hasattr(event, "to_json"):
-                try:
-                    raw_dict = json.loads(event.to_json())
-                except Exception:
-                    raw_dict = {"data": getattr(event, "data", {})}
-            else:
-                raw_dict = {"data": getattr(event, "data", {})}
-
-            data_payload = raw_dict.get("data", {})
-            if not isinstance(data_payload, dict):
-                data_payload = {"content": str(data_payload)}
-                raw_dict["data"] = data_payload
-
-            for k, v in data_payload.items():
-                if k not in raw_dict:
-                    raw_dict[k] = v
-
-            live_seq = data_payload.get("seq") or raw_dict.get("seq") or 0
-            if isinstance(live_seq, int) and live_seq > 0:
-                if live_seq <= max_seen_sequence:
-                    continue  # Deduplication: ignore already yielded events
-                max_seen_sequence = live_seq
-            else:
-                max_seen_sequence += 1
-                live_seq = max_seen_sequence
-                raw_dict["seq"] = live_seq
-                data_payload["seq"] = live_seq
-
-            raw_dict["id"] = raw_dict.get("id") or f"evt_{uuid.uuid4().hex[:8]}"
-            raw_dict["type"] = str(ev_type)
-            raw_dict["step"] = current_step
-
-            content_val = (
-                raw_dict.get("content")
-                or data_payload.get("content")
-                or data_payload.get("thought")
-                or data_payload.get("output")
-                or data_payload.get("arguments")
-                or ""
-            )
-            raw_dict["content"] = str(content_val)
-
-            tool_name_val = (
-                raw_dict.get("toolName")
-                or data_payload.get("toolName")
-                or raw_dict.get("name")
-                or data_payload.get("name")
-                or ""
-            )
-            if tool_name_val:
-                raw_dict["toolName"] = str(tool_name_val)
-
-            ev_data_str = json.dumps(raw_dict, ensure_ascii=False)
-
-            event_record = {
-                "id": raw_dict["id"],
-                "type": str(ev_type),
-                "step": current_step,
-                "content": raw_dict["content"],
-                "toolName": raw_dict.get("toolName"),
-                "data": data_payload,
-                "seq": live_seq,
-            }
-
-            if str(ev_type).lower() not in ["ping"]:
-                collected_events.append(event_record)
-                if job:
-                    try:
-                        job_manager.append_event(job_id, event_record)
-                    except Exception:
-                        pass
-
-            is_term = str(ev_type).lower() in ["final", "error", "cancelled", "done"]
-            if is_term:
-                res_data = raw_dict.get("data", {})
-                final_res = res_data.get("result", "") if isinstance(res_data, dict) else str(res_data)
-
-                if not final_res or final_res == "{}":
-                    for e in reversed(collected_events):
-                        if e.get("type") == "thought":
-                            t_val = e.get("data", {}).get("thought") or e.get("content")
-                            if t_val:
-                                final_res = t_val
-                                break
-
-                p_id = chat.get("project_id", "default_project")
-                prompt_val = getattr(job, "prompt", None) or chat.get("prompt", "")
-                final_status = "completed" if str(ev_type).lower() in ["final", "done"] else "failed"
-
-                project_manager.save_chat_session(
-                    chat_id=chat_id,
-                    project_id=p_id,
-                    title=prompt_val[:40] if prompt_val else chat_id,
-                    job_id=job_id,
-                    prompt=prompt_val,
-                    events=collected_events,
-                    result=final_res,
-                    status=final_status,
-                    agent_id=chat.get("agent_id", "peldrun"),
-                    mode=chat.get("mode", "agent"),
-                )
-
-                try:
-                    s_file = project_manager.get_chat_dir(chat_id, p_id) / "session.json"
-                    if s_file.exists():
-                        c_json = json.loads(s_file.read_text(encoding="utf-8"))
-                        c_json["turns"] = chat.get("turns", [])
-                        c_json["produced_files"] = (
-                            job_scoped_artifacts.get(job_id)
-                            or (job_scoped_artifacts.get(chat_id) if chat_id else [])
-                            or []
-                        )
-                        s_file.write_text(json.dumps(c_json, indent=2, ensure_ascii=False), encoding="utf-8")
-                except Exception:
-                    pass
-
-            yield {"event": str(ev_type), "data": ev_data_str}
-            if is_term:
-                break
-
-    return EventSourceResponse(
-        event_generator(),
-        headers={
-            "Cache-Control": "no-cache, no-transform",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
-    )
-
-
 @router.post("/jobs/{job_id}/stop")
 @router.post("/jobs/{job_id}/cancel")
 async def stop_job(job_id: str):
@@ -813,7 +821,6 @@ async def respond_to_human_prompt(job_id: str, req: HumanRespondRequest):
     answer = req.answer.strip()
     store = get_run_store()
 
-    # 1. Resolve target request_id
     resolved_req_id = req.request_id
     if not resolved_req_id:
         pending_requests = await store.list_pending_human_requests(run_id=target_job_id)
@@ -829,7 +836,6 @@ async def respond_to_human_prompt(job_id: str, req: HumanRespondRequest):
     if not resolved_req_id:
         raise HTTPException(status_code=404, detail=f"No pending human input request found for job '{target_job_id}'.")
 
-    # 2. Verify request existence and enforce idempotency
     existing_req = await store.get_human_request(resolved_req_id)
     if existing_req and existing_req.status == HumanInputStatus.ANSWERED:
         return {
@@ -840,10 +846,8 @@ async def respond_to_human_prompt(job_id: str, req: HumanRespondRequest):
             "message": "Request was already resolved previously.",
         }
 
-    # 3. Atomically resolve request via HumanInputRegistry and RunStore
     core_resolved = HumanInputRegistry.resolve_request(resolved_req_id, answer)
 
-    # 4. Reconcile legacy backward-compatibility events
     legacy_event = human_answers.get(target_job_id) or human_answers.get(job_id)
     if legacy_event and not legacy_event.is_set():
         human_data[target_job_id] = answer
@@ -857,7 +861,6 @@ async def respond_to_human_prompt(job_id: str, req: HumanRespondRequest):
         "timestamp": time.time(),
     })
 
-    # 5. Check if process restarted and resume execution if needed
     is_actively_running = (
         target_job_id in ACTIVE_JOB_TASKS
         or job_id in ACTIVE_JOB_TASKS

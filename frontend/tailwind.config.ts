@@ -23,6 +23,7 @@ const config: Config = {
         mono: ["var(--font-mono)", "monospace"],
       },
      fontSize: {
+        'xxs':   ['0.775rem',  { lineHeight: '1.5' }],   // 14px
         'xs':   ['0.875rem',  { lineHeight: '1.5' }],   // 14px
         'sm':   ['1rem',      { lineHeight: '1.6' }],   // 16px
         'base': ['1.125rem',  { lineHeight: '1.7' }],   // 18px

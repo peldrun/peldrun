@@ -3,6 +3,7 @@
 import React from "react";
 import { FileText, ExternalLink, Activity, Check, Copy, Bot, AlertCircle } from "lucide-react";
 import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
+import { UsageBadgeGroup } from "@/components/chat/UsageBadges";
 
 interface ChatDeliverableProps {
   finalResult: string;
@@ -19,6 +20,10 @@ interface ChatDeliverableProps {
   setShowRawTrace: (show: boolean) => void;
   modelName?: string;
   timestamp?: string;
+  tokensUsed?: { input?: number; output?: number; total?: number };
+  costUsd?: number | null;
+  latencyMs?: number | null;
+  tokensPerSecond?: number | null;
 }
 
 export function ChatDeliverable({
@@ -36,11 +41,15 @@ export function ChatDeliverable({
   setShowRawTrace,
   modelName = "Assistant",
   timestamp,
+  tokensUsed,
+  costUsd,
+  latencyMs,
+  tokensPerSecond,
 }: ChatDeliverableProps) {
   const copyId = typeof turnIndex === "number" ? `turn-res-${turnIndex}` : "final-result";
   const hasFiles = producedFiles && producedFiles.length > 0;
 
-  // Synthesize clean message if finalResult is just raw execution logs
+  // Synthesize clean presentation if finalResult contains raw diagnostic execution traces
   let displayContent = finalResult;
   if (isTurnRawTrace) {
     if (lastThoughtContent && lastThoughtContent.trim()) {
@@ -51,6 +60,8 @@ export function ChatDeliverable({
       displayContent = "Task completed successfully.";
     }
   }
+
+  const hasUsage = Boolean(tokensUsed && tokensUsed.total && tokensUsed.total > 0);
 
   return (
     <div className="space-y-3 font-sans">
@@ -69,7 +80,7 @@ export function ChatDeliverable({
       </div>
 
       {/* 2. Primary Markdown Response */}
-      <div className="p-4 rounded-md bg-card/40   text-foreground text-sm leading-relaxed">
+      <div className="p-4 rounded-md bg-card/40 text-foreground text-sm leading-relaxed">
         <MarkdownRenderer content={displayContent} />
       </div>
 
@@ -79,7 +90,7 @@ export function ChatDeliverable({
           <button
             type="button"
             onClick={() => setShowRawTrace(!showRawTrace)}
-            className="w-full flex items-center justify-between px-3 py-1.5 text-muted-foreground hover:text-foreground text-[11px] font-mono cursor-pointer"
+            className="w-full flex items-center justify-between px-3.5 py-1.5 text-muted-foreground hover:text-foreground text-[11px] font-mono cursor-pointer"
           >
             <span className="flex items-center gap-1.5">
               <Activity size={13} className="shrink-0" />
@@ -108,7 +119,7 @@ export function ChatDeliverable({
         </div>
       )}
 
-      {/* 5. Adaptive Deliverable Box: Generated Files (Strictly rendered ONLY when files exist) */}
+      {/* 5. Adaptive Deliverable Box: Generated Files */}
       {execMode === "agent" && status === "completed" && hasFiles && (
         <div className="p-3.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-xs space-y-2.5">
           <div className="flex items-center justify-between">
@@ -134,8 +145,21 @@ export function ChatDeliverable({
         </div>
       )}
 
-      {/* 6. Bottom Action Toolbar with Copy Button */}
-      <div className="flex items-center justify-end gap-2 pt-1 text-xs">
+      {/* 6. Bottom Action Toolbar with Usage Badges & Copy Button */}
+      <div className="flex items-center justify-between gap-2 pt-2 border-t border-border/40 text-xs">
+        <div className="flex items-center">
+          {hasUsage && (
+            <UsageBadgeGroup
+              tokensUsed={tokensUsed}
+              costUsd={costUsd ?? 0}
+              latencyMs={latencyMs}
+              tokensPerSecond={tokensPerSecond}
+              model={modelName}
+              variant="card"
+            />
+          )}
+        </div>
+
         <button
           type="button"
           onClick={() => onCopy(displayContent, copyId)}

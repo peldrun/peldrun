@@ -215,3 +215,49 @@ export interface ModelMetadata {
   capabilities?: ModelCapabilities | null;
   description?: string | null;
 }
+
+// ==========================================
+// Token Accounting & Telemetry Domain Models (P1-03)
+// ==========================================
+export type TokenUsageSource = "provider" | "estimated" | "unknown";
+
+export interface TokenUsageInfo {
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  total_tokens?: number | null;
+  cached_input_tokens?: number | null;
+  reasoning_output_tokens?: number | null;
+  source?: TokenUsageSource;
+  estimated?: boolean;
+  tokenizer_id?: string | null;
+  tokenizer_version?: string | null;
+  estimation_method?: string | null;
+  prompt_tokens?: number | null;
+  completion_tokens?: number | null;
+}
+
+export interface TurnUsage {
+  turn_id: string;
+  timestamp: number;
+  usage?: TokenUsageInfo;
+  cost_usd?: number | null;
+  cost_nano_usd?: number | null;
+  latency_ms?: number | null;
+  ttft_ms?: number | null;
+  tokens_per_second?: number | null;
+  model?: string | null;
+  provider?: string | null;
+}
+
+export interface ChatUsageSummary {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cached_input_tokens?: number;
+  reasoning_output_tokens?: number;
+  estimated_tokens?: number;
+  total_cost_usd: number;
+  cost_nano_usd?: number;
+  llm_call_count?: number;
+  turn_count?: number;
+}
