@@ -46,3 +46,8 @@ backend/test_sse_*.json*
 *.bak
 backend/data/models_vault.json
 backend/data/*.tmp
+
+*.db
+*.db-wal
+*.db-shm
+backend/storage/
