@@ -36,10 +36,16 @@ from omweb.job_manager import job_manager
 from omweb.project_manager import project_manager
 from omweb.sse_events import SSEEvent, SSEEventType, dispatch_event
 
+
 # Public Core LLM & Telemetry Boundary Imports (P1-02 Conformance)
 from peldrun.llm.client import AsyncLLMClient
 from peldrun.runtime.pricing_store import NANO_USD_PER_USD, get_pricing_store
 from peldrun.runtime.usage_store import LLMInvocationRecord, get_usage_store
+
+# Context Management & Sidecar Integration
+from omweb.chat_storage_engine import chat_storage_engine
+from peldrun.context.builder import ContextManager
+from peldrun.context.sidecar import build_context_sidecar, load_context_sidecar
 
 from .config_loader import read_active_toml_config
 from .errors import format_smart_error
@@ -463,12 +469,25 @@ async def run_direct_chat(
         project_id = chat.get("project_id", "default_project")
         turns = chat.get("turns", [])
 
-        messages = _build_optimized_chat_messages(
-            turns=turns,
-            current_prompt=prompt,
-            model_name=model_name,
-            reasoning_effort=reasoning_effort,
-            active_llm=active_llm,
+        # Resolve Context Sidecar and apply dynamic user token budget
+        session_dir = project_manager.chats_dir / chat_id
+        sidecar = load_context_sidecar(session_dir)
+        if not sidecar:
+            sidecar = build_context_sidecar(
+                session_id=chat_id,
+                session_data=chat,
+                model_id=model_name,
+                storage_root=project_manager.storage_dir,
+            )
+
+        context_mgr = ContextManager()
+        messages, budget_usage = context_mgr.build_messages(
+            sidecar=sidecar,
+            current_user_message=prompt,
+        )
+        print(
+            f"[CONTEXT BUDGET] Enforced limits for {model_name} | "
+            f"Active: {budget_usage.get('total_tokens', 0)} / {budget_usage.get('effective_limit', 0)} tokens"
         )
 
         max_tokens = active_llm.get("max_tokens") or 8192
@@ -586,6 +605,12 @@ async def run_direct_chat(
             f"Tokens: {usage.total_tokens if usage else 0} | Cost: ${cost_usd}"
         )
         job_manager.complete_job(job_id, result_text)
+
+        # Automatically update session.context.json with the new conversation turn
+        try:
+            chat_storage_engine.sync_sidecar(chat_id, model_id=model_name)
+        except Exception as sidecar_err:
+            logger.debug(f"[BRIDGE DIRECT CHAT] Sidecar sync notice: {sidecar_err}")
 
         await dispatch_event(
             job_id,

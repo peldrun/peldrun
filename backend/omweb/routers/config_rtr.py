@@ -30,7 +30,7 @@ CONFIG_PATH = PROJECT_ROOT / "config" / "config.toml"
 CONFIG_EXAMPLE_PATH = PROJECT_ROOT / "config" / "config.example.toml"
 BACKUP_PATH = PROJECT_ROOT / "config" / "config.toml.bak"
 METADATA_CACHE = STORAGE_ROOT / "models_metadata.json"
-
+BUDGET_CACHE = STORAGE_ROOT / "models_budget.json"
 
 def read_raw_config() -> dict:
     """Read raw TOML configuration with automatic UTF-8 BOM stripping."""
@@ -123,7 +123,7 @@ def save_metadata_cache(new_meta: dict) -> None:
 @router.get("")
 @router.get("/")
 async def get_config():
-    """Retrieve active system configuration with masked credentials."""
+    """Retrieve active system configuration with masked credentials and budget limits."""
     raw = read_raw_config()
     custom_models = []
     if "llm" in raw and isinstance(raw["llm"], dict):
@@ -136,6 +136,8 @@ async def get_config():
                     "base_url": sub_val.get("base_url", ""),
                     "api_key": sub_val.get("api_key", ""),
                     "max_tokens": sub_val.get("max_tokens", 8192),
+                    "context_window": sub_val.get("context_window", sub_val.get("max_tokens", 8192)),
+                    "max_output_tokens": sub_val.get("max_output_tokens", 1500),
                     "temperature": sub_val.get("temperature", 0.0),
                     "api_type": sub_val.get("api_type", ""),
                 })
@@ -243,7 +245,7 @@ class FetchModelsRequest(BaseModel):
 
 @router.post("/fetch-models")
 async def fetch_available_models(payload: FetchModelsRequest):
-    """Query endpoint for dynamically discovered model identifiers."""
+    """Query endpoint for dynamically discovered model identifiers and metadata."""
     api_key = (payload.api_key or "").strip()
     if "••••" in api_key or "****" in api_key or "***" in api_key:
         current = read_raw_config()
@@ -287,6 +289,7 @@ async def fetch_available_models(payload: FetchModelsRequest):
                                         "key": mid_str,
                                         "type": m.get("type", "llm"),
                                         "display_name": m.get("display_name", mid_str),
+                                        "max_context_length": m.get("max_context_length") or m.get("context_length") or 8192,
                                         "capabilities": {"vision": True, "trained_for_tool_use": True},
                                     }
                             save_metadata_cache(metadata)
@@ -381,3 +384,49 @@ async def save_models_vault(payload: dict = Body(...)):
             current[key] = payload[key]
     save_vault_to_disk(current)
     return {"status": "success", "vault": current}
+
+# ============================================================
+# Per-Model Context Window & Token Budget Management
+# ============================================================
+
+def load_model_budgets_from_disk() -> dict:
+    """Read saved per-model token budget configurations from disk."""
+    if BUDGET_CACHE.exists():
+        try:
+            with open(BUDGET_CACHE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[BUDGET] Error loading budget cache: {e}")
+    return {}
+
+
+def save_model_budgets_to_disk(budgets_data: dict) -> None:
+    """Safely persist per-model token budget configurations."""
+    try:
+        BUDGET_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = BUDGET_CACHE.with_suffix(".tmp")
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(budgets_data, f, indent=2, ensure_ascii=False)
+        temp_file.replace(BUDGET_CACHE)
+    except Exception as e:
+        print(f"[BUDGET] Error writing budget cache: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/model-budgets")
+async def get_model_budgets():
+    """Retrieve all per-model context windows and output limits."""
+    return {"ok": True, "budgets": load_model_budgets_from_disk()}
+
+
+class SaveModelBudgetsRequest(BaseModel):
+    budgets: Dict[str, Dict[str, Any]]
+
+
+@router.post("/model-budgets")
+async def save_model_budgets(payload: SaveModelBudgetsRequest):
+    """Save or update per-model context windows and token budgets."""
+    current = load_model_budgets_from_disk()
+    current.update(payload.budgets)
+    save_model_budgets_to_disk(current)
+    return {"ok": True, "message": "Model budgets saved successfully", "budgets": current}

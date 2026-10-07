@@ -25,6 +25,8 @@ from omweb.job_manager import job_manager
 from omweb.project_manager import project_manager
 from omweb.sse_events import SSEEvent, SSEEventType, dispatch_event
 
+from omweb.chat_storage_engine import chat_storage_engine
+
 from .base import EngineRunContext, ExecutionEngine
 
 # Core Public Boundary Imports (Strictly Public Contracts Only)
@@ -119,7 +121,29 @@ class PeldrunEngine(ExecutionEngine):
             f"3. Strict Counting & Non-Premature Termination: When asked to perform a specific number of interactions, you must execute all of them completely and wait for each answer before concluding. Never call 'terminate' until all requested questions have been answered."
         )
 
+        # Resolve historical context from session sidecar if continuing a multi-turn chat
+        previous_context_block = ""
+        try:
+            from peldrun.context.sidecar import load_context_sidecar
+            sidecar = load_context_sidecar(project_manager.chats_dir / chat_id)
+            if sidecar:
+                ctx_parts = []
+                if sidecar.summary and sidecar.summary.content.strip():
+                    ctx_parts.append(f"Historical Summary: {sidecar.summary.content.strip()}")
+                if sidecar.conversation:
+                    # Provide recent conversational deliverables context
+                    recent_dialogue = [
+                        f"{m.role.capitalize()}: {m.content[:160]}"
+                        for m in sidecar.conversation[-4:]
+                    ]
+                    ctx_parts.append("Recent Conversation:\n" + "\n".join(recent_dialogue))
+                if ctx_parts:
+                    previous_context_block = "[PREVIOUS SESSION CONTEXT]\n" + "\n\n".join(ctx_parts) + "\n\n"
+        except Exception as sidecar_read_err:
+            logger.debug(f"[ENGINE PELDRUN] Sidecar context injection notice: {sidecar_read_err}")
+
         scoped_prompt = (
+            f"{previous_context_block}"
             f"[PROJECT EXECUTION RULES]\n"
             f"1. User Directive Sovereignty: Follow USER TASK instructions strictly.\n"
             f"2. Multi-Question Counting Protocol: Execute all sequential interactions completely before concluding.\n"
@@ -566,6 +590,13 @@ class PeldrunEngine(ExecutionEngine):
         )
 
         job_manager.complete_job(job_id, result_text)
+
+        # Synchronize session.context.json with the completed agent run artifacts & telemetry
+        try:
+            chat_storage_engine.sync_sidecar(chat_id, model_id=model_name)
+        except Exception as sidecar_err:
+            logger.debug(f"[ENGINE PELDRUN] Sidecar synchronization notice: {sidecar_err}")
+            
         if not terminal_dispatched:
             terminal_dispatched = True
             await dispatch_event(

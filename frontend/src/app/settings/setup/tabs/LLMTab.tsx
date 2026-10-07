@@ -6,13 +6,16 @@ import {
   Zap, Bot, Plus, ArrowUpCircle, Trash2, Eye, EyeOff, Sliders,
   Search, CheckCircle2, ShieldCheck, KeyRound, Globe, Server, Radio,
   HelpCircle, XCircle, ShieldAlert, Cpu, Cloud, Terminal, RotateCcw,
-  X, CheckSquare
+  X, CheckSquare, Gauge
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { showToast } from "@/components/ui/ToastNotification";
 import { ModelDiscoveryModal } from "../ModelDiscoveryModal";
 import { ModelInfoModal } from "@/components/models/ModelInfoModal";
 import { inferModelCapabilities, saveLocalMetadataVault, fetchServerMetadata } from "@/lib/modelMetadata";
+
+import { ModelBudgetsTab } from "./ModelBudgetsTab";
+
 import type {
   HubSubTab,
   CustomEndpoint,
@@ -115,11 +118,34 @@ export function LLMTab({
     setShowKeys((prev) => ({ ...prev, [id]: !prev[id] }));
   };
 
-  const sanitizeTokenInput = (raw: any): number => {
+  const sanitizeTokenInput = (raw: any, fallback: number = 8192): number => {
     const clean = parseInt(String(raw).replace(/[^0-9]/g, ""), 10);
-    if (isNaN(clean) || clean <= 0) return 8192;
-    if (clean > 2000000) return 8192;
+    if (isNaN(clean) || clean <= 0) return fallback;
+    if (clean > 2000000) return 2000000;
     return clean;
+  };
+
+  // Dynamic context and output limits resolution
+  const effectiveContextWindow = config.llm.context_window || config.llm.max_tokens || 8192;
+  const effectiveMaxOutput = config.llm.max_output_tokens || 1500;
+  const effectiveInputBudget = Math.max(100, effectiveContextWindow - effectiveMaxOutput);
+
+  const autoDetectActiveModelLimit = () => {
+    const meta = metadataVault[config.llm.model];
+    if (meta && meta.max_context_length) {
+      const detected = sanitizeTokenInput(meta.max_context_length, 8192);
+      setConfig({
+        ...config,
+        llm: {
+          ...config.llm,
+          context_window: detected,
+          max_tokens: detected,
+        },
+      });
+      showToast.success("Auto-Detected Context Window", `${config.llm.model}: ${detected.toLocaleString()} tokens`);
+    } else {
+      showToast.info("No Metadata Found", "Using fallback default limit for active model.");
+    }
   };
 
   // ---------------- LM Studio Handlers ----------------
@@ -509,6 +535,22 @@ export function LLMTab({
             <Terminal size={13} />
             <span>Custom Endpoints</span>
           </button>
+
+
+            <button
+              type="button"
+              onClick={() => setActiveSubTab("budgets")}
+              className={`flex items-center gap-1.5 px-3 py-2 text-xs font-semibold border-b-2 transition-all cursor-pointer ${
+                activeSubTab === "budgets"
+                  ? "border-primary text-primary"
+                  : "border-transparent text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              <Sliders size={13} />
+              <span>Model Budgets & Context</span>
+            </button>
+
+
         </div>
       </div>
 
@@ -762,30 +804,126 @@ export function LLMTab({
             </div>
           </div>
 
-          {/* Hyperparameters */}
-          <div className="p-4 rounded-md border border-border bg-card grid grid-cols-1 md:grid-cols-2 gap-4 shadow-xs">
-            <div>
-              <label className="text-[11px] font-medium text-muted-foreground block mb-1">Context Window (max_tokens)</label>
-              <input
-                type="number"
-                value={sanitizeTokenInput(config.llm.max_tokens)}
-                onChange={(e) => setConfig({ ...config, llm: { ...config.llm, max_tokens: sanitizeTokenInput(e.target.value) } })}
-                className="w-full bg-background border border-border rounded px-3 py-1.5 text-xs text-foreground font-mono shadow-xs"
-              />
+          {/* Hyperparameters & Context Budget Panel */}
+          <div className="p-5 rounded-md border border-border bg-card space-y-4 shadow-xs">
+            <div className="flex items-center justify-between border-b border-border/60 pb-3">
+              <div className="flex items-center gap-2">
+                <Gauge size={16} className="text-primary" />
+                <span className="text-xs font-bold text-foreground uppercase tracking-wider">
+                  Context Window & Token Budget Architecture
+                </span>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={autoDetectActiveModelLimit}
+                className="h-6 text-[11px] border-border bg-background hover:bg-muted text-foreground cursor-pointer shadow-xs flex items-center gap-1.5"
+              >
+                <Sparkles size={11} className="text-amber-500" />
+                <span>Auto-detect from Model</span>
+              </Button>
             </div>
-            <div>
-              <label className="text-[11px] font-medium text-muted-foreground block mb-1">
-                Temperature: {Number(config.llm.temperature).toFixed(2)}
-              </label>
-              <input
-                type="range"
-                min="0.0"
-                max="1.5"
-                step="0.05"
-                value={config.llm.temperature}
-                onChange={(e) => setConfig({ ...config, llm: { ...config.llm, temperature: parseFloat(e.target.value) || 0 } })}
-                className="w-full accent-primary cursor-pointer mt-1"
-              />
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <label className="text-[11px] font-medium text-muted-foreground block mb-1">
+                  Context Window (Total Capacity)
+                </label>
+                <input
+                  type="number"
+                  value={effectiveContextWindow}
+                  onChange={(e) => {
+                    const val = sanitizeTokenInput(e.target.value, 8192);
+                    setConfig({
+                      ...config,
+                      llm: { ...config.llm, context_window: val, max_tokens: val }
+                    });
+                  }}
+                  className="w-full bg-background border border-border rounded px-3 py-1.5 text-xs text-foreground font-mono shadow-xs"
+                />
+                <span className="text-[10px] text-muted-foreground mt-0.5 block">
+                  Total available token window (Inputs + Outputs)
+                </span>
+              </div>
+
+              <div>
+                <label className="text-[11px] font-medium text-muted-foreground block mb-1">
+                  Max Output Tokens (Completion Budget)
+                </label>
+                <input
+                  type="number"
+                  value={effectiveMaxOutput}
+                  onChange={(e) => {
+                    const val = sanitizeTokenInput(e.target.value, 1500);
+                    setConfig({
+                      ...config,
+                      llm: { ...config.llm, max_output_tokens: val }
+                    });
+                  }}
+                  className="w-full bg-background border border-border rounded px-3 py-1.5 text-xs text-foreground font-mono shadow-xs"
+                />
+                <span className="text-[10px] text-muted-foreground mt-0.5 block">
+                  Reserved token buffer strictly for LLM generation
+                </span>
+              </div>
+
+              <div>
+                <label className="text-[11px] font-medium text-muted-foreground block mb-1">
+                  Temperature: {Number(config.llm.temperature).toFixed(2)}
+                </label>
+                <input
+                  type="range"
+                  min="0.0"
+                  max="1.5"
+                  step="0.05"
+                  value={config.llm.temperature}
+                  onChange={(e) => setConfig({ ...config, llm: { ...config.llm, temperature: parseFloat(e.target.value) || 0 } })}
+                  className="w-full accent-primary cursor-pointer mt-2"
+                />
+                <span className="text-[10px] text-muted-foreground mt-0.5 block">
+                  Deterministic (0.0) to Creative (1.5)
+                </span>
+              </div>
+            </div>
+
+            {/* Live Effective Context Budget Calculation Card */}
+            <div className="p-3.5 rounded-lg border border-border/80 bg-background/50 space-y-2.5">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-semibold text-foreground flex items-center gap-1.5">
+                  <Sliders size={13} className="text-primary" /> Effective Context Input Budget:
+                </span>
+                <span className="font-mono font-bold text-primary">
+                  {effectiveInputBudget.toLocaleString()} tokens
+                </span>
+              </div>
+
+              {/* Proportional Budget Bar */}
+              <div className="w-full h-3 rounded bg-muted overflow-hidden flex shadow-inner">
+                <div style={{ width: "10%" }} className="bg-sky-500" title="System Prompt: 10%" />
+                <div style={{ width: "15%" }} className="bg-amber-500" title="Summary: 15%" />
+                <div style={{ width: "50%" }} className="bg-emerald-500" title="Recent Turns: 50%" />
+                <div style={{ width: "15%" }} className="bg-violet-500" title="Execution State: 15%" />
+                <div style={{ width: "10%" }} className="bg-rose-500" title="Current Prompt: 10%" />
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between text-[10px] text-muted-foreground font-mono gap-1 pt-0.5">
+                <span className="flex items-center gap-1">
+                  <span className="h-2 w-2 rounded-full bg-sky-500" /> System (10%): {Math.round(effectiveInputBudget * 0.1)}
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="h-2 w-2 rounded-full bg-amber-500" /> Summary (15%): {Math.round(effectiveInputBudget * 0.15)}
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="h-2 w-2 rounded-full bg-emerald-500" /> Recent (50%): {Math.round(effectiveInputBudget * 0.5)}
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="h-2 w-2 rounded-full bg-violet-500" /> Exec (15%): {Math.round(effectiveInputBudget * 0.15)}
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="h-2 w-2 rounded-full bg-rose-500" /> Current (10%): {Math.round(effectiveInputBudget * 0.1)}
+                </span>
+              </div>
             </div>
           </div>
         </div>
@@ -1740,6 +1878,19 @@ export function LLMTab({
             </div>
           </div>
         </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* SUB-TAB: PER-MODEL BUDGETS & CONTEXT */}
+      {/* ========================================================================= */}
+      {activeSubTab === "budgets" && (
+        <ModelBudgetsTab
+          availableModels={availableModels}
+          lmStudioSettings={lmStudioSettings}
+          ollamaSettings={ollamaSettings}
+          cloudProviders={cloudProviders}
+          customEndpoints={customEndpoints}
+        />
       )}
 
       {/* Model Discovery Modal */}

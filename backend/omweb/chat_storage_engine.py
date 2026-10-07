@@ -1,17 +1,40 @@
 ﻿"""
 Sovereign Chat Storage & Disk Governance Engine.
-Synchronizes with root storage/index.json, purges backend/jobs.json, and governs sessions.
+
+Synchronizes with root storage/index.json, purges backend/jobs.json, governs sessions,
+and maintains the non-destructive session.context.json Sidecar for LLM context optimization.
 """
 
 from __future__ import annotations
-import os
-import shutil
+
 import json
+import os
 from pathlib import Path
+import shutil
+import sys
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 from omweb.project_manager import project_manager
+
+# Ensure backend root is accessible for peldrun package imports
+BACKEND_ROOT = Path(__file__).resolve().parent.parent
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
+try:
+    from peldrun.context.sidecar import (
+        build_context_sidecar,
+        load_context_sidecar,
+        save_context_sidecar,
+        get_sidecar_path,
+    )
+except ImportError:
+    # Graceful fallback if peldrun is located under core or sibling structure
+    build_context_sidecar = None
+    load_context_sidecar = None
+    save_context_sidecar = None
+    get_sidecar_path = None
 
 
 class ChatStorageEngine:
@@ -85,6 +108,151 @@ class ChatStorageEngine:
             pass
 
         return purged_count
+
+    # =========================================================================
+    # Context Sidecar Management & Synchronization Hooks (Stage 1)
+    # =========================================================================
+
+    def sync_sidecar(
+        self,
+        chat_id: str,
+        model_id: Optional[str] = None,
+        events: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Path]:
+        """
+        Build or refresh 'session.context.json' alongside 'session.json'.
+
+        Extracts clean conversational dialogue, isolates active execution telemetry,
+        and applies dynamic per-model token budget allocations.
+        Guarantees zero side-effects on existing frontend storage.
+        """
+        if not build_context_sidecar or not save_context_sidecar:
+            return None
+
+        session_dir = self.chats_dir / chat_id
+        session_file = session_dir / "session.json"
+        if not session_file.exists():
+            return None
+
+        try:
+            session_raw = session_file.read_text(encoding="utf-8")
+            session_data = json.loads(session_raw)
+            if not isinstance(session_data, dict):
+                return None
+
+            # Look for existing events file if events list not provided directly
+            events_data = events
+            if events_data is None:
+                events_file = session_dir / "events.json"
+                if events_file.exists():
+                    try:
+                        raw_ev = events_file.read_text(encoding="utf-8")
+                        events_data = json.loads(raw_ev)
+                    except Exception:
+                        events_data = None
+
+            existing_sidecar = None
+            if load_context_sidecar:
+                existing_sidecar = load_context_sidecar(session_dir)
+
+            sidecar = build_context_sidecar(
+                session_id=chat_id,
+                session_data=session_data,
+                events_data=events_data,
+                existing_sidecar=existing_sidecar,
+                model_id=model_id or session_data.get("model"),
+                storage_root=self.storage_dir,
+            )
+
+            saved_path = save_context_sidecar(session_dir, sidecar)
+            return saved_path
+        except Exception as err:
+            print(f"[STORAGE ENGINE] Warning: Failed to synchronize context sidecar for {chat_id}: {err}")
+            return None
+
+    def get_sidecar_data(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve active context sidecar dictionary for a chat session."""
+        session_dir = self.chats_dir / chat_id
+        if load_context_sidecar:
+            sidecar_obj = load_context_sidecar(session_dir)
+            if sidecar_obj:
+                return sidecar_obj.model_dump() if hasattr(sidecar_obj, "model_dump") else sidecar_obj.dict()
+
+        # Fallback raw read
+        sidecar_file = session_dir / "session.context.json"
+        if sidecar_file.exists():
+            try:
+                return json.loads(sidecar_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return None
+
+    def record_turn_and_sync(
+        self,
+        chat_id: str,
+        user_message: str,
+        assistant_response: str,
+        model_id: Optional[str] = None,
+        steps: Optional[List[Dict[str, Any]]] = None,
+        artifacts: Optional[List[str]] = None,
+    ) -> Optional[Path]:
+        """
+        Record a completed conversation turn to session.json and automatically
+        synchronize the session.context.json Sidecar file.
+        """
+        session_dir = self.chats_dir / chat_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+        session_file = session_dir / "session.json"
+
+        session_data: Dict[str, Any] = {
+            "id": chat_id,
+            "created_at": self._now_iso(),
+            "updated_at": self._now_iso(),
+            "turns": [],
+            "messages": [],
+        }
+
+        if session_file.exists():
+            try:
+                session_data = json.loads(session_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        turn_index = len(session_data.get("turns", [])) + 1
+        turn_id = f"turn_{turn_index}_{int(datetime.now().timestamp())}"
+
+        turn_entry = {
+            "id": turn_id,
+            "user": user_message,
+            "assistant": assistant_response,
+            "timestamp": self._now_iso(),
+            "steps": steps or [],
+            "artifacts": artifacts or [],
+        }
+
+        turns = session_data.setdefault("turns", [])
+        turns.append(turn_entry)
+
+        # Mirror in flat messages array for legacy backward compatibility
+        messages = session_data.setdefault("messages", [])
+        messages.append({"role": "user", "content": user_message, "timestamp": self._now_iso()})
+        messages.append({"role": "assistant", "content": assistant_response, "timestamp": self._now_iso()})
+
+        session_data["updated_at"] = self._now_iso()
+        if model_id:
+            session_data["model"] = model_id
+
+        # Write presentation session.json atomically
+        tmp_session = session_file.with_suffix(".tmp")
+        tmp_session.write_text(json.dumps(session_data, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp_session.replace(session_file)
+
+        # Synchronize sidecar alongside session.json
+        return self.sync_sidecar(chat_id, model_id=model_id)
+
+    # =========================================================================
+    # Standard Chat Storage Management
+    # =========================================================================
 
     def list_chats(
         self,
@@ -234,6 +402,7 @@ class ChatStorageEngine:
         return target_chat
 
     def deep_delete_chat(self, chat_id: str) -> Dict[str, Any]:
+        """Deep delete: wipes chat directory (including session.json and session.context.json)."""
         idx = project_manager._read_index()
         target_chat = None
 

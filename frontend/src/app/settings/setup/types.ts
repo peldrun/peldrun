@@ -7,7 +7,7 @@
   | "mcp"
   | "system";
 
-export type HubSubTab = "overview" | "lmstudio" | "cloud" | "custom";
+export type HubSubTab = "overview" | "budgets" | "lmstudio" | "cloud" | "custom";
 
 export type ApiModeType =
   | "Auto-detect"
@@ -25,6 +25,7 @@ export interface CustomEndpoint {
   apiMode: ApiModeType;
   defaultModel: string;
   contextWindow: number | string;
+  maxOutputTokens?: number;
   apiKey: string;
   status: ProviderConnectionStatus;
   latency?: number;
@@ -47,6 +48,8 @@ export interface CloudProviderVaultItem {
   latency?: number;
   lastError?: string;
   savedModels?: string[];
+  contextWindow?: number;
+  maxOutputTokens?: number;
 }
 
 export interface LMStudioSettings {
@@ -157,6 +160,8 @@ export interface FullAppConfig {
     base_url: string;
     api_key: string;
     max_tokens: number;
+    context_window?: number;
+    max_output_tokens?: number;
     temperature: number;
     api_type: string;
   };
@@ -167,6 +172,8 @@ export interface FullAppConfig {
     base_url: string;
     api_key: string;
     max_tokens: number;
+    context_window?: number;
+    max_output_tokens?: number;
     temperature: number;
   };
   browser: {
@@ -205,3 +212,13 @@ export interface FullAppConfig {
   mcp: { server_reference: string };
   runflow: { use_data_analysis_agent: boolean };
 }
+
+
+export interface ModelBudgetItemConfig {
+  context_window: number;
+  max_output_tokens: number;
+  provider?: string;
+  provider_name?: string;
+}
+
+export type ModelBudgetsMap = Record<string, ModelBudgetItemConfig>;
