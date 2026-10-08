@@ -1,15 +1,9 @@
-﻿<div align="center">
-<img src="assets/image/peldrun-logo.svg" alt="PELDRUN" width="190">
-
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/image/peldrun-logo-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="assets/image/peldrun-logo-light.svg">
-    <img src="assets/image/peldrun-logo-light.svg" alt="PELDRUN" width="190">
-  </picture>
+﻿<p align="center">
+  <img src="assets/image/peldrun-logo-dark.svg#gh-dark-mode-only" alt="PELDRUN" width="190">
+  <img src="assets/image/peldrun-logo-light.svg#gh-light-mode-only" alt="PELDRUN" width="190">
 </p>
 
+<div align="center">
 
 # PELDRUN
 
