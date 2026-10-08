@@ -1,8 +1,8 @@
 ﻿<p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/image/peldrun-logo-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="assets/image/peldrun-logo-light.svg">
-    <img src="assets/image/peldrun-logo-light.svg" alt="PELDRUN" width="190">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/image/peldrun-logo-light.svg">
+    <source media="(prefers-color-scheme: light)" srcset=" assets/image/peldrun-logo-dark.svg">
+    <img src="assets/image/peldrun-logo-dark.svg" alt="PELDRUN" width="190">
   </picture>
 </p>
 <div align="center">
