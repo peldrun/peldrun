@@ -1,16 +1,25 @@
-﻿@tailwind base;
+﻿/* Path: frontend/src/app/globals.css */
+
+/*
+ * Critical: Next.js 16 Turbopack strictly requires all @import rules
+ * to precede all other style rules and CSS directives.
+ */
+@import url('../../public/css/glow.css');
+
+@tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-@import url('../../public/css/glow.css');
 @layer base {
 
-  :root {
+  :root { 
     /* peldrun Light Mode (Official Brand Palette) */
-    --background: 60 6.67% 97.06%;             /* #f8f8f7 */
+    --background: 0 0 98.82%;             /* #fcfcfc */
     --foreground: 0 0% 6.27%;             /* #101010 */
     --card: 0 0% 100%;                  /* #ffffff */
     --card-foreground: 43 7% 19%;        /* #34322D */
+    
+    --sidebackground-foreground: 60 6.67% 97.06%;    /* #f8f8f7 */
     --popover: 0 0% 100%;                /* #FFFFFF */
     --popover-foreground: 43 7% 19%;     /* #34322D */
     --primary: 43 7% 19%;                /* #34322D */
@@ -23,7 +32,8 @@
     --accent-foreground: 0 0% 100%;
     --destructive: 0 84% 60%;           /* #EF4444 */
     --black: 0 0% 0%;
-    --black-foreground: 0 0% 100%;;
+    --black-foreground: 0 0% 100%;
+
     --destructive-foreground: 0 0% 100%;
     --border: 0 0% 90%;                  /* #E5E5E5 */
     --input: 0 0% 90%;                   /* #E5E5E5 */
@@ -37,6 +47,7 @@
     --status-info: 217 91% 60%;          /* #3B82F6 */
 
     --custom-color: #f0f0f0;
+    --sidebg: #f8f8f7;  
 
     --font-sans: 'DM Sans', sans-serif;
     --font-serif: 'Libre Baskerville', serif;
@@ -47,6 +58,7 @@
     /* peldrun Dark Mode (Deep Charcoal Canvas) */
     --background: 60 4% 6%;              /* #0F0F0E */
     --foreground: 60 5% 96%;             /* #F5F5F4 */
+    
     --card: 30 6% 10%;                   /* #1A1918 */
     --card-foreground: 60 5% 96%;        /* #F5F5F4 */
     --popover: 30 5% 14%;                /* #242321 */
@@ -75,6 +87,7 @@
     --status-info: 217 91% 60%;
 
     --custom-color: #000000;
+    --sidebg: #101010;
     
   }
 }

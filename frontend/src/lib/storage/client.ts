@@ -1,4 +1,5 @@
-﻿"use client";
+﻿// Path: frontend/src/lib/storage/client.ts
+"use client";
 
 import type {
   StorageKey,
@@ -78,6 +79,9 @@ function parse<K extends StorageKey>(
   raw: string | null
 ): StorageValue<K> {
   const definition = getDefinition(key);
+  if (!definition) {
+    return undefined as StorageValue<K>;
+  }
   if (raw === null) {
     return definition.defaultValue as StorageValue<K>;
   }
@@ -113,6 +117,9 @@ function serialize<K extends StorageKey>(
   value: StorageValue<K>
 ): string {
   const definition = getDefinition(key);
+  if (!definition) {
+    return typeof value === "string" ? value : JSON.stringify(value);
+  }
   const result = definition.schema.safeParse(value);
   if (!result.success) {
     throw new TypeError(
@@ -156,6 +163,7 @@ function initialize(): void {
       if (!(key in storageSchema)) return;
 
       const definition = getDefinition(key);
+      if (!definition) return;
       const parsed = definition.schema.safeParse(envelope.value);
       if (!parsed.success) return;
 
@@ -166,7 +174,8 @@ function initialize(): void {
   window.addEventListener("storage", (event: StorageEvent) => {
     if (!event.key || !(event.key in storageSchema)) return;
     const key = event.key as StorageKey;
-    if (getDefinition(key).tier !== "local") return;
+    const def = getDefinition(key);
+    if (!def || def.tier !== "local") return;
 
     const value = parse(key, event.newValue);
     notify(key, value, "external");
@@ -194,13 +203,15 @@ function broadcast<K extends StorageKey>(
 
 function getLocal<K extends StorageKey>(key: K): StorageValue<K> {
   initialize();
+  const definition = getDefinition(key);
+  if (!definition) return undefined as StorageValue<K>;
   if (!isStorageAvailable()) {
-    return getDefinition(key).defaultValue as StorageValue<K>;
+    return definition.defaultValue as StorageValue<K>;
   }
   try {
     return parse(key, window.localStorage.getItem(key));
   } catch {
-    return getDefinition(key).defaultValue as StorageValue<K>;
+    return definition.defaultValue as StorageValue<K>;
   }
 }
 
@@ -229,12 +240,16 @@ type CookieWriter = <K extends StorageKey>(
 let cookieWriter: CookieWriter | null = null;
 
 export function configureCookieWriter(writer: CookieWriter): void {
+  if (!isBrowser()) return;
   cookieWriter = writer;
 }
 
 export const storage = {
   get<K extends StorageKey>(key: K): StorageValue<K> {
     const definition = getDefinition(key);
+    if (!definition) {
+      return undefined as StorageValue<K>;
+    }
     if (definition.tier === "local") {
       return getLocal(key);
     }
@@ -248,29 +263,50 @@ export const storage = {
   },
 
   set<K extends StorageKey>(key: K, value: StorageValue<K>): void {
+    if (!isBrowser()) {
+      return;
+    }
+
     const definition = getDefinition(key);
+    if (!definition) return;
+
     if (definition.tier === "local") {
       setLocal(key, value);
       return;
     }
 
     if (definition.tier === "cookie") {
-      if (isBrowser()) {
-        const strVal = typeof value === "string" ? value : JSON.stringify(value);
-        document.cookie = `${key}=${strVal}; path=/; max-age=31536000; SameSite=Lax`;
-      }
+      const strVal = typeof value === "string" ? value : JSON.stringify(value);
+      document.cookie = `${key}=${strVal}; path=/; max-age=31536000; SameSite=Lax`;
+
       notify(key, value, "cookie");
       broadcast(key, value);
+
+      // Decouple Server Action persistence to macro-task queue via setTimeout.
+      // Guarantees that router state mutations never execute inside React render phases.
       if (cookieWriter) {
-        void cookieWriter(key, value).catch((error) => {
-          console.error(`[storage] Cookie persistence failed for "${key}".`, error);
-        });
+        setTimeout(() => {
+          if (cookieWriter) {
+            void cookieWriter(key, value).catch((error) => {
+              if (process.env.NODE_ENV !== "production") {
+                console.warn(
+                  `[storage] Deferred cookie synchronization skipped for "${String(key)}":`,
+                  error
+                );
+              }
+            });
+          }
+        }, 0);
       }
     }
   },
 
   remove<K extends StorageKey>(key: K): void {
+    if (!isBrowser()) return;
+
     const definition = getDefinition(key);
+    if (!definition) return;
+
     if (definition.tier === "local" && isStorageAvailable()) {
       try {
         window.localStorage.removeItem(key);
@@ -278,6 +314,14 @@ export const storage = {
         notify(key, defaultValue, "local");
         broadcast(key, defaultValue);
       } catch {}
+      return;
+    }
+
+    if (definition.tier === "cookie") {
+      document.cookie = `${key}=; path=/; max-age=0; SameSite=Lax`;
+      const defaultValue = definition.defaultValue as StorageValue<K>;
+      notify(key, defaultValue, "cookie");
+      broadcast(key, defaultValue);
     }
   },
 
@@ -309,7 +353,8 @@ export const storage = {
   },
 
   getDefault<K extends StorageKey>(key: K): StorageValue<K> {
-    return getDefinition(key).defaultValue as StorageValue<K>;
+    const definition = getDefinition(key);
+    return definition ? (definition.defaultValue as StorageValue<K>) : (undefined as StorageValue<K>);
   },
 
   isAvailable(): boolean {

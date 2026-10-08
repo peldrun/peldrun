@@ -264,7 +264,7 @@ export function Sidebar() {
 
   return (
     <>
-      <aside className="w-[260px] border-r border-border bg-card backdrop-blur-md flex flex-col h-screen select-none shrink-0 font-sans transition-all duration-200">
+      <aside className="w-[260px] border-r border-border bg-sidebg   backdrop-blur-md flex flex-col h-screen select-none shrink-0 font-sans transition-all duration-200">
         {/* Workspace Header */}
         <div className="h-14 flex items-center justify-between px-4 border-b border-border">
           <span className="font-heading font-semibold text-xs tracking-wider text-muted-foreground uppercase">

@@ -1,6 +1,6 @@
-﻿{
+{
   "app": {
-    "title": "peldrun Web",
+    "title": "PELDRUN",
     "status": {
       "running": "Agent running",
       "idle": "Ready",

@@ -77,10 +77,13 @@ const config: Config = {
           DEFAULT: "hsl(var(--black))",
           foreground: "hsl(var(--black-foreground))",
         },
+        
+        
 
         
 
         custom: "var(--custom-color)",
+        sidebg: "var(--sidebg)",
         
         peldrun: {
           black: "#34322D",

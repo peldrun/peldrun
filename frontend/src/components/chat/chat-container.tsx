@@ -1,4 +1,5 @@
-﻿/**
+﻿// Path: frontend/src/components/chat/chat-container.tsx
+/**
  * frontend/src/components/chat/chat-container.tsx
  *
  * Core Chat & Autonomous Agent Execution Container.
@@ -8,7 +9,7 @@
 
 "use client";
 
-import React, { useState, useRef, useEffect, useMemo } from "react";
+import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { WorkspacePanel, getFileCategory } from "@/components/workspace/workspace-panel";
 import { Composer } from "@/components/chat/composer";
@@ -21,6 +22,12 @@ import { useChatStore } from "@/stores/chat-store";
 import { useAppStorage } from "@/hooks/use-app-storage";
 import { inferModelCapabilities, fetchServerMetadata } from "@/lib/modelMetadata";
 
+/**
+ * Safely normalizes arbitrary object payloads into readable string representations.
+ *
+ * @param val - The raw value to convert
+ * @returns Serialized or sanitized string representation
+ */
 function safeRender(val: any): string {
   if (val === null || val === undefined) return "";
   if (typeof val === "string") {
@@ -103,17 +110,31 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     }
   }, [setActiveModelName]);
 
-  const handleModeChange = (newMode: "agent" | "chat") => {
-    setExecMode(newMode);
-    if (typeof window !== "undefined") {
-      window.dispatchEvent(new CustomEvent("omweb:mode-change", { detail: newMode }));
-    }
-  };
+  /**
+   * Memoized execution mode switcher to maintain strict referential equality across renders.
+   */
+  const handleModeChange = useCallback(
+    (newMode: "agent" | "chat") => {
+      setExecMode(newMode);
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent("omweb:mode-change", { detail: newMode })
+        );
+      }
+    },
+    [setExecMode]
+  );
 
-  const handleSelectEngine = (engine: EngineOption) => {
-    setSelectedEngineId(engine.id);
-    handleModeChange(engine.mode);
-  };
+  /**
+   * Memoized engine selector handler to prevent cascading render mutations.
+   */
+  const handleSelectEngine = useCallback(
+    (engine: EngineOption) => {
+      setSelectedEngineId(engine.id);
+      handleModeChange(engine.mode);
+    },
+    [setSelectedEngineId, handleModeChange]
+  );
 
   useEffect(() => {
     if (status === "running" || steps.length > 0) {

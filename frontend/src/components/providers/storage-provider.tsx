@@ -1,8 +1,10 @@
-﻿"use client";
+﻿// Path: frontend/src/components/providers/storage-provider.tsx
+"use client";
 
 import {
   createContext,
   useContext,
+  useEffect,
   useMemo,
   type ReactNode,
 } from "react";
@@ -26,11 +28,20 @@ interface StorageProviderProps {
   cookieSnapshot: CookieSnapshot;
 }
 
+/**
+ * StorageProvider initializes application storage context and bridges
+ * cookie snapshots between SSR and client-side reactive subscribers.
+ *
+ * Registration of the cookie persistence writer is strictly isolated
+ * inside useEffect to prevent any render-phase side effects or premature
+ * Server Action invocations during hydration.
+ */
 export function StorageProvider({
   children,
   cookieSnapshot,
 }: StorageProviderProps) {
-  useMemo(() => {
+  useEffect(() => {
+    // Register the server action bridge exclusively after client hydration completes
     configureCookieWriter(
       async <K extends StorageKey>(
         key: K,

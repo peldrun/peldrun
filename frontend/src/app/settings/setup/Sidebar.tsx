@@ -50,7 +50,7 @@ export function Sidebar({
   ];
 
   return (
-    <div className="w-60 border-r border-border bg-custom flex flex-col p-0 pt-4 pb-4 space-y-1 shrink-0 select-none">
+    <div className="w-60 border-r border-card bg-sidebg flex flex-col p-0 pt-4 pb-4 space-y-1 shrink-0 select-none">
       <div className="flex items-center justify-between px-3 py-2">
         <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">
           Configuration
