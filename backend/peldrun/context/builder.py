@@ -20,10 +20,11 @@ class ContextManagerProtocol(Protocol):
 
     def build_messages(
         self,
-        sidecar: ContextSidecar,
-        current_user_message: str,
+        sidecar: Optional[ContextSidecar] = None,
+        current_user_message: str = "",
         system_prompt: Optional[str] = None,
         project_rules: Optional[str] = None,
+        include_execution: bool = True,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         ...
 
@@ -33,13 +34,15 @@ class ContextManager:
     Central orchestrator for LLM context assembly.
     Extracts sanitized dialogue from Sidecar and ensures older execution telemetry
     is completely isolated from subsequent LLM turns.
+
+    Architecture Note:
+    ContextManager is an agnostic assembly engine. It does not enforce a hardcoded
+    agent identity by default, allowing callers (Chat or Agent) to pass their
+    respective system directives explicitly.
     """
 
     def __init__(self, default_system_prompt: Optional[str] = None):
-        self.default_system_prompt = (
-            default_system_prompt
-            or "You are peldrun, an autonomous and precise software engineering agent."
-        )
+        self.default_system_prompt = default_system_prompt
 
     def _format_execution_telemetry(self, execution: Optional[CurrentExecution]) -> str:
         """
@@ -73,32 +76,41 @@ class ContextManager:
 
     def build_messages(
         self,
-        sidecar: ContextSidecar,
-        current_user_message: str,
+        sidecar: Optional[ContextSidecar] = None,
+        current_user_message: str = "",
         system_prompt: Optional[str] = None,
         project_rules: Optional[str] = None,
+        include_execution: bool = True,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         """
-        Assemble the 5 architectural context tiers in exact order:
-        1. System Instructions & Rules (System slice)
+        Assemble the architectural context tiers in deterministic sequence:
+        1. Unified System Directive (System instructions + Project rules)
         2. Compacted Context Summary (Summary slice)
         3. Sanitized Recent Dialogue (Recent slice)
-        4. Ongoing Execution Telemetry (Execution slice)
+        4. Ongoing Execution Telemetry (Execution slice - omitted for conversational chat)
         5. Current User Input (Current slice)
         """
-        # Tier 1: System Instructions
-        effective_system = system_prompt or self.default_system_prompt
-        system_msgs: List[Dict[str, Any]] = [
-            {"role": "system", "content": effective_system}
-        ]
+        # Tier 1: Consolidate System Instructions and Project Rules into a unified block
+        effective_system = (
+            system_prompt
+            if system_prompt is not None
+            else self.default_system_prompt
+        )
+
+        system_blocks: List[str] = []
+        if effective_system and effective_system.strip():
+            system_blocks.append(effective_system.strip())
+
         if project_rules and project_rules.strip():
-            system_msgs.append(
-                {"role": "system", "content": f"[Project Rules]\n{project_rules.strip()}"}
-            )
+            system_blocks.append(f"[Project Rules]\n{project_rules.strip()}")
+
+        system_msgs: List[Dict[str, Any]] = []
+        if system_blocks:
+            system_msgs.append({"role": "system", "content": "\n\n".join(system_blocks)})
 
         # Tier 2: Compacted Context Summary
         summary_msgs: List[Dict[str, Any]] = []
-        if sidecar.summary and sidecar.summary.content.strip():
+        if sidecar and sidecar.summary and sidecar.summary.content.strip():
             summary_content = (
                 f"[Previous Context Summary]\n{sidecar.summary.content.strip()}"
             )
@@ -106,23 +118,26 @@ class ContextManager:
 
         # Tier 3: Recent Conversation (Sanitized dialogue without historical tool dumps)
         recent_msgs: List[Dict[str, Any]] = []
-        for msg in sidecar.conversation:
-            if msg.role in ("user", "assistant"):
-                recent_msgs.append({"role": msg.role, "content": msg.content})
+        if sidecar and sidecar.conversation:
+            for msg in sidecar.conversation:
+                if msg.role in ("user", "assistant"):
+                    recent_msgs.append({"role": msg.role, "content": msg.content})
 
-        # Tier 4: Execution State (belongs only to the active ongoing turn)
+        # Tier 4: Execution State (belongs only to the active ongoing turn in Agent workflows)
         exec_msgs: List[Dict[str, Any]] = []
-        formatted_exec = self._format_execution_telemetry(sidecar.current_execution)
-        if formatted_exec:
-            exec_msgs.append({"role": "system", "content": formatted_exec})
+        if include_execution and sidecar and sidecar.current_execution:
+            formatted_exec = self._format_execution_telemetry(sidecar.current_execution)
+            if formatted_exec:
+                exec_msgs.append({"role": "system", "content": formatted_exec})
 
         # Tier 5: Current User Message
-        current_msgs: List[Dict[str, Any]] = [
-            {"role": "user", "content": current_user_message}
-        ]
+        current_msgs: List[Dict[str, Any]] = []
+        if current_user_message:
+            current_msgs.append({"role": "user", "content": current_user_message})
 
         # Apply Token Budget Controller and fit into limits
-        controller = TokenBudgetController(sidecar.budget)
+        budget_spec = sidecar.budget if sidecar else None
+        controller = TokenBudgetController(budget_spec)
         fitted_messages, usage = controller.fit_all(
             system_msgs=system_msgs,
             summary_msgs=summary_msgs,

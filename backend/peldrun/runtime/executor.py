@@ -4,7 +4,7 @@ backend/peldrun/runtime/executor.py
 PELDRUN Core Runtime Executor.
 
 Authoritative execution gateway inside peldrun-core.
-Encapsulates AgentRunner, ToolCallAgent, ExecutionState, and EventEmitter.
+Encapsulates AgentRunner, ToolCallAgent, ExecutionState, ContextManager, and EventEmitter.
 Fully instrumented with P1-05 Structured Diagnostics & Latency Telemetry.
 Persists immutable invocation records into token_ledger via usage_store and pricing_store.
 Adheres strictly to the Runtime V1 contract in peldrun.runtime.contract.
@@ -15,12 +15,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 import uuid
 
 from peldrun.agents.base import AgentConfig
 from peldrun.agents.tool_call_agent import ToolCallAgent
+from peldrun.context.builder import ContextManager
+from peldrun.context.sidecar import load_context_sidecar
 from peldrun.engine.runner import AgentRunner, RunnerConfig
 from peldrun.engine.state import ExecutionState, MessageRole
 from peldrun.events.emitter import EventEmitter
@@ -63,7 +66,7 @@ class CoreRuntimeExecutor:
     ) -> RunResult:
         """
         Execute an autonomous agent task adhering strictly to canonical RunRequest.
-        Orchestrates LLM client, tool execution, telemetry tracking, and durable token persistence.
+        Orchestrates ContextManager assembly, LLM client, tool execution, telemetry, and durable token persistence.
         """
         job_id = request.job_id
         run_id_str = str(request.run_id)
@@ -256,7 +259,44 @@ class CoreRuntimeExecutor:
         agent.set_system_prompt(spec.system_prompt)
         agent.name = agent_config.name
 
-        # 6. Initialize Execution State
+        # 6. Assemble Context & Initialize Execution State via ContextManager
+        sidecar = getattr(request, "context_sidecar", None)
+        if sidecar is None and isinstance(request.metadata, dict):
+            sidecar = request.metadata.get("context_sidecar") or request.metadata.get("sidecar")
+
+        if sidecar is None and chat_id:
+            try:
+                session_dir_cand = (
+                    request.metadata.get("session_dir")
+                    if isinstance(request.metadata, dict)
+                    else None
+                )
+                if session_dir_cand and Path(session_dir_cand).exists():
+                    sidecar = load_context_sidecar(Path(session_dir_cand))
+            except Exception as sidecar_err:
+                logger.debug("Core executor sidecar auto-resolution notice: %s", sidecar_err)
+
+        project_rules = getattr(request, "project_rules", None)
+        if not project_rules and isinstance(request.metadata, dict):
+            project_rules = request.metadata.get("project_rules")
+
+        context_mgr = ContextManager()
+        assembled_messages, budget_usage = context_mgr.build_messages(
+            sidecar=sidecar,
+            current_user_message=request.prompt,
+            system_prompt=spec.system_prompt,
+            project_rules=project_rules,
+            include_execution=True,
+        )
+
+        logger.info(
+            "Context assembled for agent job %s | model: %s | active tokens: %s / %s",
+            job_id,
+            model_name,
+            budget_usage.get("total_tokens", 0),
+            budget_usage.get("effective_limit", 0),
+        )
+
         initial_state = ExecutionState(
             run_id=job_id,
             task_prompt=request.prompt,
@@ -268,11 +308,22 @@ class CoreRuntimeExecutor:
                 "job_id": job_id,
                 "request_metadata": request.metadata,
                 "reasoning_effort": resolved_effort,
+                "context_budget": budget_usage,
             },
         )
-        initial_state.add_message(role=MessageRole.SYSTEM, content=spec.system_prompt)
-        initial_state.add_message(role=MessageRole.USER, content=request.prompt)
-        agent.messages = [msg.to_llm_dict() for msg in initial_state.messages]
+
+        # Populate ExecutionState messages from the assembled context tiers
+        for msg in assembled_messages:
+            role_str = str(msg.get("role", "user")).lower()
+            if role_str == "system":
+                role_enum = MessageRole.SYSTEM
+            elif role_str == "assistant":
+                role_enum = MessageRole.ASSISTANT
+            else:
+                role_enum = MessageRole.USER
+            initial_state.add_message(role=role_enum, content=str(msg.get("content", "")))
+
+        agent.messages = [dict(m) for m in assembled_messages]
 
         # 7. Configure Runner Lifecycle
         runner_config = RunnerConfig(

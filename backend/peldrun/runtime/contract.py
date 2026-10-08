@@ -9,9 +9,10 @@ Adheres strictly to the PELDRUN Runtime V1 Durable Execution specification.
 from __future__ import annotations
 
 import time
-import uuid
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
+import uuid
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
@@ -117,6 +118,8 @@ class RunRequest(BaseModel):
     llm_config: Dict[str, Any] = Field(default_factory=dict, description="Provider credentials and model hyperparams")
     active_mcp_servers: List[Dict[str, Any]] = Field(default_factory=list, description="External MCP endpoints")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Arbitrary tracing and telemetry headers")
+    context_sidecar: Optional[Any] = Field(default=None, description="Context sidecar for multi-turn history assembly")
+    project_rules: Optional[str] = Field(default=None, description="Explicit project execution rules")
     step_timeout_seconds: Optional[float] = Field(default=120.0, description="Per-step execution deadline")
     total_timeout_seconds: Optional[float] = Field(default=None, description="Global execution deadline ceiling")
 

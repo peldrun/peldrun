@@ -15,21 +15,21 @@ import asyncio
 import json
 import logging
 from pathlib import Path
+import time
 from typing import Any, Dict, List, Optional, Set
 import uuid
-import time
 
 from omweb.agent_bridge_parts.state import job_scoped_artifacts
 from omweb.agent_bridge_parts.text_utils import sanitize_final_result_text
+from omweb.chat_storage_engine import chat_storage_engine
 from omweb.job_manager import job_manager
 from omweb.project_manager import project_manager
 from omweb.sse_events import SSEEvent, SSEEventType, dispatch_event
 
-from omweb.chat_storage_engine import chat_storage_engine
-
 from .base import EngineRunContext, ExecutionEngine
 
 # Core Public Boundary Imports (Strictly Public Contracts Only)
+from peldrun.context.sidecar import build_context_sidecar, load_context_sidecar
 from peldrun.events.schema import EventType, PeldrunEvent
 from peldrun.runtime.contract import AgentSpec, RunRequest, RunStatus, WorkspaceContext
 from peldrun.runtime.executor import core_executor
@@ -121,36 +121,23 @@ class PeldrunEngine(ExecutionEngine):
             f"3. Strict Counting & Non-Premature Termination: When asked to perform a specific number of interactions, you must execute all of them completely and wait for each answer before concluding. Never call 'terminate' until all requested questions have been answered."
         )
 
-        # Resolve historical context from session sidecar if continuing a multi-turn chat
-        previous_context_block = ""
-        try:
-            from peldrun.context.sidecar import load_context_sidecar
-            sidecar = load_context_sidecar(project_manager.chats_dir / chat_id)
-            if sidecar:
-                ctx_parts = []
-                if sidecar.summary and sidecar.summary.content.strip():
-                    ctx_parts.append(f"Historical Summary: {sidecar.summary.content.strip()}")
-                if sidecar.conversation:
-                    # Provide recent conversational deliverables context
-                    recent_dialogue = [
-                        f"{m.role.capitalize()}: {m.content[:160]}"
-                        for m in sidecar.conversation[-4:]
-                    ]
-                    ctx_parts.append("Recent Conversation:\n" + "\n".join(recent_dialogue))
-                if ctx_parts:
-                    previous_context_block = "[PREVIOUS SESSION CONTEXT]\n" + "\n\n".join(ctx_parts) + "\n\n"
-        except Exception as sidecar_read_err:
-            logger.debug(f"[ENGINE PELDRUN] Sidecar context injection notice: {sidecar_read_err}")
+        # Resolve Context Sidecar and project execution rules
+        session_dir = project_manager.chats_dir / chat_id
+        sidecar = load_context_sidecar(session_dir)
+        if not sidecar:
+            chat_data = project_manager.get_chat(job_id) or {}
+            sidecar = build_context_sidecar(
+                session_id=chat_id,
+                session_data=chat_data,
+                model_id=model_name,
+                storage_root=project_manager.storage_dir,
+            )
 
-        scoped_prompt = (
-            f"{previous_context_block}"
-            f"[PROJECT EXECUTION RULES]\n"
-            f"1. User Directive Sovereignty: Follow USER TASK instructions strictly.\n"
-            f"2. Multi-Question Counting Protocol: Execute all sequential interactions completely before concluding.\n"
-            f"3. Workspace Operations: Current working directory is already workspace root. Use relative paths.\n"
-            f"4. Task Conclusion: Ensure all parts of the user request are satisfied completely before calling 'terminate'.\n"
-            f"[USER TASK]\n"
-            f"{prompt}"
+        project_rules = (
+            "1. User Directive Sovereignty: Follow USER TASK instructions strictly.\n"
+            "2. Multi-Question Counting Protocol: Execute all sequential interactions completely before concluding.\n"
+            "3. Workspace Operations: Current working directory is already workspace root. Use relative paths.\n"
+            "4. Task Conclusion: Ensure all parts of the user request are satisfied completely before calling 'terminate'."
         )
 
         # 1. Resolve custom Web tools to adapt into Core tools
@@ -173,7 +160,7 @@ class PeldrunEngine(ExecutionEngine):
                 )
                 adapted_core_tools.append(adapter)
 
-        # 2. Build Canonical RunRequest
+        # 2. Build Canonical RunRequest delegating context assembly entirely to Core
         workspace_ctx = WorkspaceContext(
             workspace_id=chat_id,
             root_path=ws_path_str,
@@ -192,11 +179,20 @@ class PeldrunEngine(ExecutionEngine):
         run_request = RunRequest(
             run_id=str(uuid.uuid4()),
             job_id=job_id,
-            prompt=scoped_prompt,
+            prompt=prompt,
             agent_spec=agent_spec,
             workspace=workspace_ctx,
             llm_config=active_llm,
-            metadata={"model_name": model_name, "chat_id": chat_id, "provider": provider_name},
+            metadata={
+                "model_name": model_name,
+                "chat_id": chat_id,
+                "provider": provider_name,
+                "session_dir": str(session_dir),
+                "project_rules": project_rules,
+                "sidecar": sidecar,
+            },
+            context_sidecar=sidecar,
+            project_rules=project_rules,
             step_timeout_seconds=float(active_llm.get("timeout") or 120.0),
         )
 
@@ -596,7 +592,7 @@ class PeldrunEngine(ExecutionEngine):
             chat_storage_engine.sync_sidecar(chat_id, model_id=model_name)
         except Exception as sidecar_err:
             logger.debug(f"[ENGINE PELDRUN] Sidecar synchronization notice: {sidecar_err}")
-            
+
         if not terminal_dispatched:
             terminal_dispatched = True
             await dispatch_event(

@@ -6,6 +6,7 @@ Built on official AsyncOpenAI with deep reasoning extraction from model_extra,
 true streaming token generation, TTFT latency accounting, and canonical TokenUsage metering.
 Propagates dynamic reasoning effort control (none, low, medium, high) to both Cloud and Local OpenAI-compatible backends.
 Strictly normalizes 'off' to 'none' ensuring complete compliance with OpenAI API schema standards.
+Includes model-aware prompt compatibility normalization (e.g. Gemma chat template constraints).
 """
 
 from __future__ import annotations
@@ -313,6 +314,52 @@ def sanitize_tools_for_openai(tools: Optional[List[Dict[str, Any]]]) -> Optional
     return cleaned_tools
 
 
+def normalize_messages_for_target_model(
+    messages: List[Dict[str, Any]],
+    model_name: str,
+) -> List[Dict[str, Any]]:
+    """
+    Normalizes message sequences based on target model template restrictions.
+    For models that reject 'system' roles in their Jinja templates (such as Google Gemma),
+    system directives are seamlessly folded into the initial 'user' turn.
+    """
+    if not messages:
+        return []
+
+    norm_model = (model_name or "").lower()
+    is_gemma = "gemma" in norm_model
+
+    if not is_gemma:
+        return list(messages)
+
+    # Collect system instructions and dialogue messages
+    system_parts: List[str] = []
+    dialogue: List[Dict[str, Any]] = []
+
+    for msg in messages:
+        role = str(msg.get("role", "user")).lower()
+        content = str(msg.get("content", ""))
+        if role == "system":
+            if content.strip():
+                system_parts.append(content.strip())
+        else:
+            dialogue.append(dict(msg))
+
+    if not system_parts:
+        return dialogue
+
+    combined_system_text = "\n\n".join(system_parts)
+
+    # Prepend system instruction to the first user turn
+    if dialogue and str(dialogue[0].get("role", "")).lower() == "user":
+        first_user_content = str(dialogue[0].get("content", ""))
+        dialogue[0]["content"] = f"{combined_system_text}\n\n{first_user_content}"
+    else:
+        dialogue.insert(0, {"role": "user", "content": combined_system_text})
+
+    return dialogue
+
+
 class AsyncLLMClient:
     """
     Universal asynchronous client utilizing official AsyncOpenAI.
@@ -477,9 +524,11 @@ class AsyncLLMClient:
         if isinstance(self.config, dict):
             temp = self.config.get("temperature", temp)
 
+        effective_messages = normalize_messages_for_target_model(messages, chosen_model)
+
         call_kwargs: Dict[str, Any] = {
             "model": chosen_model,
-            "messages": messages,
+            "messages": effective_messages,
             "temperature": float(temp),
             "stream": False,
         }
@@ -531,7 +580,7 @@ class AsyncLLMClient:
                 content="",
                 raw=response,
                 latency_ms=total_latency_ms,
-                usage=self._fallback_usage_estimation(messages=messages, model=chosen_model),
+                usage=self._fallback_usage_estimation(messages=effective_messages, model=chosen_model),
             )
 
         first_choice = response.choices[0]
@@ -577,7 +626,7 @@ class AsyncLLMClient:
         usage = self._normalize_raw_usage(response.usage)
         if usage is None:
             usage = self._fallback_usage_estimation(
-                messages=messages,
+                messages=effective_messages,
                 output_text=content,
                 reasoning_text=reasoning,
                 tool_calls=parsed_tool_calls,
@@ -631,9 +680,11 @@ class AsyncLLMClient:
         if isinstance(self.config, dict):
             temp = self.config.get("temperature", temp)
 
+        effective_messages = normalize_messages_for_target_model(messages, chosen_model)
+
         call_kwargs: Dict[str, Any] = {
             "model": chosen_model,
-            "messages": messages,
+            "messages": effective_messages,
             "temperature": float(temp),
             "stream": True,
             "stream_options": {"include_usage": True},
@@ -745,7 +796,7 @@ class AsyncLLMClient:
             full_out = "".join(accumulated_content)
             full_reas = "".join(accumulated_reasoning)
             final_usage = self._fallback_usage_estimation(
-                messages=messages,
+                messages=effective_messages,
                 output_text=full_out,
                 reasoning_text=full_reas,
                 model=chosen_model,

@@ -11,6 +11,7 @@ and Hybrid Reasoning Control (2026 Industry Spec):
 - Direct Chat invocations are fully metered in SQLite token_ledger and projected to session.json.
 - Dynamically resolves model reasoning capabilities from caller payload and persistent metadata database.
 - Strictly normalizes 'off' to 'none' for OpenAI-compatible schema compliance without mutating graduated levels.
+- Isolates Conversational Chat prompts from Agent identities during Context Sidecar assembly.
 """
 
 from __future__ import annotations
@@ -35,7 +36,6 @@ from omweb.engines.registry import EngineNotFoundError
 from omweb.job_manager import job_manager
 from omweb.project_manager import project_manager
 from omweb.sse_events import SSEEvent, SSEEventType, dispatch_event
-
 
 # Public Core LLM & Telemetry Boundary Imports (P1-02 Conformance)
 from peldrun.llm.client import AsyncLLMClient
@@ -122,6 +122,29 @@ def _is_reasoning_model(model_name: str, active_llm: Optional[Dict[str, Any]] = 
     )
 
 
+def _resolve_chat_system_prompt(
+    model_name: str,
+    reasoning_effort: str,
+    active_llm: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """
+    Resolve chat system instructions following the 2026 reasoning model specification:
+    - If model is a reasoning architecture and reasoning effort is off/none, omit system persona
+      to prevent semantic distractions and infinite thought loops.
+    - If reasoning is explicitly requested or active, provide concise conversational guidance.
+    - If model is standard, provide full conversational markdown assistant instructions.
+    """
+    is_reasoner = _is_reasoning_model(model_name, active_llm=active_llm)
+    norm_effort = (reasoning_effort or "none").lower().strip()
+
+    if is_reasoner and norm_effort in ("none", "off", "0"):
+        return None
+    elif is_reasoner:
+        return "You are a helpful and concise assistant. Respond naturally and directly."
+    else:
+        return "You are a helpful, direct, and conversational AI assistant. Respond directly and accurately using Markdown."
+
+
 def _build_optimized_chat_messages(
     turns: List[Dict[str, Any]],
     current_prompt: str,
@@ -130,27 +153,17 @@ def _build_optimized_chat_messages(
     active_llm: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, str]]:
     """
-    Construct chat completion messages obeying 2026 reasoning model guidelines:
-    - If model is a reasoning architecture or reasoning effort is off/none, avoid long personas
-      that cause semantic distractions and infinite thought loops.
-    - If reasoning is explicitly requested or model is standard, provide clean concise instructions.
+    Construct chat completion messages for standalone or fallback pipelines.
+    Delegates system instruction resolution to _resolve_chat_system_prompt to prevent divergence.
     """
     messages: List[Dict[str, str]] = []
-    is_reasoner = _is_reasoning_model(model_name, active_llm=active_llm)
-    norm_effort = (reasoning_effort or "none").lower().strip()
-
-    if is_reasoner and norm_effort in ("none", "off", "0"):
-        pass
-    elif is_reasoner:
-        messages.append({
-            "role": "system",
-            "content": "You are a helpful and concise assistant. Respond naturally and directly.",
-        })
-    else:
-        messages.append({
-            "role": "system",
-            "content": "You are a helpful, direct, and conversational AI assistant. Respond directly and accurately using Markdown.",
-        })
+    sys_prompt = _resolve_chat_system_prompt(
+        model_name=model_name,
+        reasoning_effort=reasoning_effort,
+        active_llm=active_llm,
+    )
+    if sys_prompt:
+        messages.append({"role": "system", "content": sys_prompt})
 
     for t in turns[-6:]:
         p = t.get("prompt")
@@ -530,10 +543,19 @@ async def run_direct_chat(
                 storage_root=project_manager.storage_dir,
             )
 
+        # Resolve conversational chat system instructions (strictly isolates Chat from Agent identity)
+        chat_system_prompt = _resolve_chat_system_prompt(
+            model_name=model_name,
+            reasoning_effort=reasoning_effort,
+            active_llm=active_llm,
+        )
+
         context_mgr = ContextManager()
         messages, budget_usage = context_mgr.build_messages(
             sidecar=sidecar,
             current_user_message=prompt,
+            system_prompt=chat_system_prompt,
+            include_execution=False,
         )
         print(
             f"[CONTEXT BUDGET] Enforced limits for {model_name} | "

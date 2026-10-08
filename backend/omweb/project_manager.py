@@ -4,6 +4,9 @@ backend/omweb/project_manager.py
 PELDRUN Project and Chat Session Workspace Manager.
 Provides resilient workspace storage with atomic file writes (.tmp -> os.replace),
 auto-discovery, and dual-layer token usage projection into session.json.
+Hardened under Milestone P1:
+- Defensively guards token metric aggregation against NoneType and corrupted turns.
+- Preserves full atomic writing semantics across all session and index updates.
 """
 
 from __future__ import annotations
@@ -302,7 +305,7 @@ class ProjectManager:
         Preserves and projects usage accounting structures without data loss.
         """
         existing = self.get_chat(job_id) or self.get_chat(chat_id)
-        if existing:
+        if existing and isinstance(existing, dict):
             prev_pid = existing.get("project_id")
             if prev_pid and prev_pid != "default_project" and (not project_id or project_id == "default_project"):
                 project_id = prev_pid
@@ -332,20 +335,21 @@ class ProjectManager:
         if session_file.exists():
             try:
                 old = json.loads(session_file.read_text(encoding="utf-8"))
-                created_at = old.get("created_at", now_str)
-                if not result and old.get("result"):
-                    result = old.get("result")
-                if not agent_id or agent_id == "peldrun":
-                    agent_id = old.get("agent_id", "peldrun")
-                if old.get("mode"):
-                    mode = old.get("mode")
-                if old.get("status") in ["completed", "failed"] and status == "running":
-                    status = old.get("status")
-                # Preserve existing usage if not explicitly overwritten
-                if not usage_summary and "usage_summary" in old:
-                    existing_usage_summary = old["usage_summary"]
-                if not turns and "turns" in old:
-                    existing_turns = old["turns"]
+                if isinstance(old, dict):
+                    created_at = old.get("created_at", now_str)
+                    if not result and old.get("result"):
+                        result = old.get("result")
+                    if not agent_id or agent_id == "peldrun":
+                        agent_id = old.get("agent_id", "peldrun")
+                    if old.get("mode"):
+                        mode = old.get("mode")
+                    if old.get("status") in ["completed", "failed"] and status == "running":
+                        status = old.get("status")
+                    # Preserve existing usage if not explicitly overwritten
+                    if not usage_summary and "usage_summary" in old:
+                        existing_usage_summary = old["usage_summary"]
+                    if not turns and "turns" in old:
+                        existing_turns = old["turns"]
             except Exception:
                 pass
 
@@ -372,7 +376,7 @@ class ProjectManager:
 
         index = self._read_index()
         chats = index.get("chats", [])
-        chats = [c for c in chats if c.get("id") != chat_id and c.get("job_id") != job_id]
+        chats = [c for c in chats if isinstance(c, dict) and c.get("id") != chat_id and c.get("job_id") != job_id]
         chats.insert(0, {
             "id": chat_id,
             "job_id": job_id,
@@ -398,21 +402,28 @@ class ProjectManager:
     ) -> Dict[str, Any]:
         """
         Record turn-level token metrics and atomically re-project session summary.
-        Can be safely called after each chat message or agent cycle.
+        Defensively handles corrupted turns and missing/None usage keys.
         """
         chat = self.get_chat(chat_id)
-        resolved_pid = (chat.get("project_id") if chat else None) or project_id or "default_project"
+        resolved_pid = (
+            chat.get("project_id") if isinstance(chat, dict) else None
+        ) or project_id or "default_project"
+
         chat_dir = self.get_chat_dir(chat_id, resolved_pid)
         session_file = chat_dir / "session.json"
 
         session_data: Dict[str, Any] = {}
         if session_file.exists():
             try:
-                session_data = json.loads(session_file.read_text(encoding="utf-8"))
+                loaded = json.loads(session_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    session_data = loaded
             except Exception:
                 session_data = {}
 
-        turns = session_data.get("turns", [])
+        raw_turns = session_data.get("turns", [])
+        turns: List[Dict[str, Any]] = [t for t in raw_turns if isinstance(t, dict)]
+
         turn_found = False
         for t in turns:
             if t.get("turn_id") == turn_id:
@@ -427,11 +438,40 @@ class ProjectManager:
                 "usage": turn_usage,
             })
 
-        # Re-aggregate usage_summary from turns
-        tot_inp = sum(int(t.get("usage", {}).get("prompt_tokens") or t.get("usage", {}).get("input_tokens") or 0) for t in turns)
-        tot_out = sum(int(t.get("usage", {}).get("completion_tokens") or t.get("usage", {}).get("output_tokens") or 0) for t in turns)
-        tot_cost = sum(float(t.get("usage", {}).get("cost_usd") or 0.0) for t in turns)
-        tot_est = sum(int(t.get("usage", {}).get("estimated_tokens") or 0) for t in turns)
+        # Re-aggregate usage_summary defensively to prevent NoneType attribute access
+        tot_inp = 0
+        tot_out = 0
+        tot_cost = 0.0
+        tot_est = 0
+
+        for t in turns:
+            usage_dict = t.get("usage")
+            if not isinstance(usage_dict, dict):
+                continue
+
+            try:
+                inp_val = usage_dict.get("prompt_tokens") or usage_dict.get("input_tokens") or 0
+                tot_inp += int(inp_val)
+            except (ValueError, TypeError):
+                pass
+
+            try:
+                out_val = usage_dict.get("completion_tokens") or usage_dict.get("output_tokens") or 0
+                tot_out += int(out_val)
+            except (ValueError, TypeError):
+                pass
+
+            try:
+                cost_val = usage_dict.get("cost_usd") or 0.0
+                tot_cost += float(cost_val)
+            except (ValueError, TypeError):
+                pass
+
+            try:
+                est_val = usage_dict.get("estimated_tokens") or 0
+                tot_est += int(est_val)
+            except (ValueError, TypeError):
+                pass
 
         usage_summary = {
             "input_tokens": tot_inp,
@@ -475,11 +515,12 @@ class ProjectManager:
             if sfile.exists():
                 try:
                     sdata = json.loads(sfile.read_text(encoding="utf-8"))
-                    efile = cdir / "events.json"
-                    sdata["events"] = json.loads(efile.read_text(encoding="utf-8")) if efile.exists() else []
-                    if sdata.get("status") == "running" and sdata.get("result"):
-                        sdata["status"] = "completed"
-                    return sdata
+                    if isinstance(sdata, dict):
+                        efile = cdir / "events.json"
+                        sdata["events"] = json.loads(efile.read_text(encoding="utf-8")) if efile.exists() else []
+                        if sdata.get("status") == "running" and sdata.get("result"):
+                            sdata["status"] = "completed"
+                        return sdata
                 except Exception:
                     pass
 
@@ -505,7 +546,7 @@ class ProjectManager:
                     "status": "completed",
                 })
         if project_id:
-            chats = [c for c in chats if c.get("project_id") == project_id]
+            chats = [c for c in chats if isinstance(c, dict) and c.get("project_id") == project_id]
         return chats
 
     def delete_chat(self, chat_id: str) -> bool:
@@ -579,7 +620,7 @@ class ProjectManager:
 
     def get_project(self, project_id: str) -> Optional[Dict[str, Any]]:
         for p in self.list_projects():
-            if p.get("id") == project_id:
+            if isinstance(p, dict) and p.get("id") == project_id:
                 return p
         return None
 
