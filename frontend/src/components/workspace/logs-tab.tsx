@@ -1,4 +1,11 @@
-﻿"use client";
+﻿/**
+ * frontend/src/components/workspace/logs-tab.tsx
+ *
+ * Terminal Log Viewer component with dual streaming and disk log capabilities.
+ * Hardened to support real-time execution broadcast and session log persistence.
+ */
+
+"use client";
 
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
@@ -6,10 +13,8 @@ import {
   Download,
   Copy,
   Check,
-  RotateCcw,
   ArrowDownCircle,
   Search,
-  Filter,
   RefreshCw,
 } from "lucide-react";
 import { useStreamStore } from "@/stores/stream-store";
@@ -32,17 +37,19 @@ export function LogsTab({ activeJobId, chatId }: LogsTabProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [autoScroll, setAutoScroll] = useState(true);
   const [copied, setCopied] = useState(false);
+  const [liveLogs, setLiveLogs] = useState<string[]>([]);
   const [historicalLogs, setHistoricalLogs] = useState<string[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
-  // 1. Read live run from Zustand stream-store
+  // 1. Resolve unified scope ID for disk and streaming queries
+  const effectiveChatId = chatId || activeJobId || null;
+
+  // 2. Read live run from Zustand stream-store if available
   const activeRun = useStreamStore((s) => (activeJobId ? s.runs[activeJobId] : null));
 
-  // 2. Fetch persisted disk chat.log if chatId exists
-  const effectiveChatId = chatId || (activeJobId?.startsWith("chat_") ? activeJobId : null);
-
+  // 3. Fetch persisted disk chat.log from the backend
   const fetchHistoricalLog = async () => {
     if (!effectiveChatId) return;
     setLoadingHistory(true);
@@ -55,7 +62,8 @@ export function LogsTab({ activeJobId, chatId }: LogsTabProps) {
           setHistoricalLogs(lines);
         }
       }
-    } catch {
+    } catch (err) {
+      console.debug("[LogsTab] Failed to fetch disk log:", err);
     } finally {
       setLoadingHistory(false);
     }
@@ -65,7 +73,36 @@ export function LogsTab({ activeJobId, chatId }: LogsTabProps) {
     fetchHistoricalLog();
   }, [effectiveChatId]);
 
-  // 3. Compile live stream items into unified structured log entries
+  // 4. Capture real-time live execution logs emitted during the task
+  useEffect(() => {
+    const handleLiveLog = (e: Event) => {
+      const ce = e as CustomEvent<{ line?: string; type?: string; message?: string }>;
+      if (ce.detail?.line) {
+        setLiveLogs((prev) => [...prev, ce.detail!.line!]);
+      } else if (ce.detail?.message) {
+        const ts = new Date().toLocaleTimeString();
+        const typeStr = (ce.detail.type || "SYSTEM").toUpperCase();
+        setLiveLogs((prev) => [...prev, `[${ts}] [${typeStr}] ${ce.detail!.message}`]);
+      }
+    };
+
+    const handleRunFinished = () => {
+      // Re-fetch authoritative disk log once the run finishes
+      setTimeout(() => {
+        fetchHistoricalLog();
+      }, 500);
+    };
+
+    window.addEventListener("peldrun:log-entry", handleLiveLog);
+    window.addEventListener("peldrun:run-completed", handleRunFinished);
+
+    return () => {
+      window.removeEventListener("peldrun:log-entry", handleLiveLog);
+      window.removeEventListener("peldrun:run-completed", handleRunFinished);
+    };
+  }, [effectiveChatId]);
+
+  // 5. Compile Zustand stream items if populated
   const streamEntries: LogEntry[] = useMemo(() => {
     if (!activeRun || !activeRun.steps) return [];
     const entries: LogEntry[] = [];
@@ -144,11 +181,14 @@ export function LogsTab({ activeJobId, chatId }: LogsTabProps) {
 
   // Combine live stream or fallback to persisted disk lines
   const displayLogs = useMemo(() => {
+    if (liveLogs.length > 0) {
+      return liveLogs;
+    }
     if (streamEntries.length > 0) {
       return streamEntries.map((e) => `[${e.timestamp || "LIVE"}] [${e.type.toUpperCase()}] ${e.message}`);
     }
     return historicalLogs;
-  }, [streamEntries, historicalLogs]);
+  }, [liveLogs, streamEntries, historicalLogs]);
 
   const filteredLogs = useMemo(() => {
     let result = displayLogs;
@@ -194,12 +234,12 @@ export function LogsTab({ activeJobId, chatId }: LogsTabProps) {
           <span className="font-semibold text-xs tracking-wider text-slate-200 uppercase font-sans">
             Agent Execution Logs
           </span>
-          {activeRun && (
+          {(liveLogs.length > 0 || activeRun) && (
             <span className="px-1.5 py-0.2 rounded text-[10px] bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 flex items-center gap-1">
               <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" /> Live Stream
             </span>
           )}
-          {!activeRun && historicalLogs.length > 0 && (
+          {!activeRun && liveLogs.length === 0 && historicalLogs.length > 0 && (
             <span className="px-1.5 py-0.2 rounded text-[10px] bg-sky-500/20 text-sky-400 border border-sky-500/30">
               Session Log
             </span>

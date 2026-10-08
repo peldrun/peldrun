@@ -164,6 +164,39 @@ def _build_optimized_chat_messages(
     return messages
 
 
+def _append_session_log(chat_id: str, project_id: str, log_type: str, message: Any) -> None:
+    """
+    Append a structured line to chat.log on disk for the active session.
+    Persists operational logs permanently so /api/chats/{chat_id}/log can read them.
+    """
+    if not chat_id or not message:
+        return
+    try:
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        clean_msg = str(message).strip().replace("\r\n", " ").replace("\n", " ")
+        line = f"[{ts}] [{str(log_type).upper()}] {clean_msg}\n"
+
+        target_dirs = []
+        try:
+            target_dirs.append(project_manager.get_chat_dir(chat_id, project_id))
+        except Exception:
+            pass
+
+        target_dirs.append(project_manager.chats_dir / chat_id)
+
+        for d in target_dirs:
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+                log_file = d / "chat.log"
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except Exception as e:
+                logger.debug(f"Failed writing chat.log in {d}: {e}")
+    except Exception as exc:
+        logger.debug(f"Failed to record session log for chat {chat_id}: {exc}")
+
+
 async def run_instrumented(
     job_id: str,
     prompt: str,
@@ -343,6 +376,19 @@ async def run_instrumented(
     project_dir = project_manager.get_chat_files_dir(chat_id, project_id)
     project_dir.mkdir(parents=True, exist_ok=True)
 
+    _append_session_log(
+        chat_id,
+        project_id,
+        "SYSTEM",
+        f"Execution initialized. Engine: '{target_engine_str}', Agent: '{agent_id}'",
+    )
+    _append_session_log(
+        chat_id,
+        project_id,
+        "STEP",
+        f"Task started: {prompt[:120]}",
+    )
+
     context = EngineRunContext(
         job_id=job_id,
         prompt=prompt,
@@ -357,13 +403,16 @@ async def run_instrumented(
 
     try:
         await engine.run(context)
+        _append_session_log(chat_id, project_id, "FINAL", "Execution completed successfully.")
     except asyncio.CancelledError:
         print(f"[BRIDGE] Job was cancelled/aborted: {job_id}")
+        _append_session_log(chat_id, project_id, "SYSTEM", "Execution cancelled by user.")
     except Exception as err:
         tb = traceback.format_exc()
         print(f"[BRIDGE ERROR] {err}\n{tb}")
         err_msg = format_smart_error(err, model_name, provider_name)
         job_manager.fail_job(job_id, err_msg)
+        _append_session_log(chat_id, project_id, "ERROR", err_msg)
         await dispatch_event(
             job_id,
             SSEEvent(
@@ -468,6 +517,7 @@ async def run_direct_chat(
         chat_id = chat.get("id", f"chat_{job_id}")
         project_id = chat.get("project_id", "default_project")
         turns = chat.get("turns", [])
+        _append_session_log(chat_id, project_id, "SYSTEM", f"User: {prompt}")
 
         # Resolve Context Sidecar and apply dynamic user token budget
         session_dir = project_manager.chats_dir / chat_id
@@ -522,6 +572,7 @@ async def run_direct_chat(
 
         reasoning_thought = getattr(response, "reasoning_content", None)
         if reasoning_thought and str(reasoning_thought).strip():
+            _append_session_log(chat_id, project_id, "THOUGHT", str(reasoning_thought).strip())
             await dispatch_event(
                 job_id,
                 SSEEvent(
@@ -605,6 +656,7 @@ async def run_direct_chat(
             f"Tokens: {usage.total_tokens if usage else 0} | Cost: ${cost_usd}"
         )
         job_manager.complete_job(job_id, result_text)
+        _append_session_log(chat_id, project_id, "FINAL", result_text)
 
         # Automatically update session.context.json with the new conversation turn
         try:
@@ -632,11 +684,13 @@ async def run_direct_chat(
 
     except asyncio.CancelledError:
         print(f"[BRIDGE DIRECT CHAT] Job was cancelled: {job_id}")
+        _append_session_log(chat_id, project_id, "SYSTEM", "Direct chat cancelled by user.")
     except Exception as err:
         tb = traceback.format_exc()
         print(f"[BRIDGE DIRECT CHAT ERROR] {err}\n{tb}")
         err_msg = format_smart_error(err, model_name, provider_name)
         job_manager.fail_job(job_id, err_msg)
+        _append_session_log(chat_id, project_id, "ERROR", err_msg)
         await dispatch_event(
             job_id,
             SSEEvent(

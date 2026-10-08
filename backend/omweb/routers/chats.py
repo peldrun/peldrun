@@ -1,14 +1,17 @@
 ﻿"""
+backend/omweb/routers/chats.py
+
 Chats & Project Router - Integrated with ChatStorageEngine for disk governance.
 All static routes (/projects, /storage, /all) are strictly declared before /{chat_id}
 to avoid FastAPI path parameter shadowing and 404 collisions.
+Enhanced with resilient session log discovery and synthesized replay.
 """
 
 import os
 import mimetypes
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 
@@ -197,13 +200,47 @@ async def get_chat_raw_file(chat_id: str, filepath: str):
 
 @router.get("/{chat_id}/log")
 async def get_chat_log(chat_id: str):
+    """Retrieve execution log file or synthesize from session records."""
     try:
         chat = project_manager.get_chat(chat_id)
         project_id = chat.get("project_id", "default_project") if chat else "default_project"
         chat_dir = project_manager.get_chat_dir(chat_id, project_id)
-        log_file = chat_dir / "chat.log"
-        if log_file.exists():
-            return {"chat_id": chat_id, "log": log_file.read_text(encoding="utf-8", errors="replace")}
+        
+        candidate_paths = [
+            chat_dir / "chat.log",
+            chat_storage_engine.chats_dir / chat_id / "chat.log",
+        ]
+        if chat and chat.get("id"):
+            candidate_paths.append(chat_storage_engine.chats_dir / str(chat["id"]) / "chat.log")
+            candidate_paths.append(project_manager.get_chat_dir(str(chat["id"]), project_id) / "chat.log")
+        if chat and chat.get("job_id"):
+            candidate_paths.append(chat_storage_engine.chats_dir / str(chat["job_id"]) / "chat.log")
+
+        for p in candidate_paths:
+            if p.exists() and p.is_file():
+                return {"chat_id": chat_id, "log": p.read_text(encoding="utf-8", errors="replace")}
+
+        # Fallback: Synthesize log lines from session records if log file not yet flushed
+        if chat:
+            synthesized_lines: List[str] = []
+            turns = chat.get("turns", [])
+            for t in turns:
+                t_ts = t.get("timestamp") or ""
+                p_text = t.get("prompt") or t.get("user") or ""
+                if p_text:
+                    synthesized_lines.append(f"[{t_ts}] [SYSTEM] User Prompt: {p_text}")
+                for ev in (t.get("steps") or t.get("events") or []):
+                    ev_type = str(ev.get("type", "step")).upper()
+                    ev_content = ev.get("content") or ev.get("thought") or ev.get("output") or ev.get("data") or ""
+                    if ev_content:
+                        synthesized_lines.append(f"[{ev.get('timestamp') or t_ts}] [{ev_type}] {ev_content}")
+                res = t.get("result") or t.get("assistant") or ""
+                if res:
+                    synthesized_lines.append(f"[{t_ts}] [FINAL] {res}")
+
+            if synthesized_lines:
+                return {"chat_id": chat_id, "log": "\n".join(synthesized_lines)}
+
         return {"chat_id": chat_id, "log": ""}
     except Exception as e:
         return {"chat_id": chat_id, "log": f"[Error reading session log: {str(e)}]"}
@@ -211,16 +248,37 @@ async def get_chat_log(chat_id: str):
 
 @router.get("/{chat_id}/log/download")
 async def download_chat_log(chat_id: str):
+    """Download session log file directly as plain text."""
     chat = project_manager.get_chat(chat_id)
     project_id = chat.get("project_id", "default_project") if chat else "default_project"
     chat_dir = project_manager.get_chat_dir(chat_id, project_id)
-    log_file = chat_dir / "chat.log"
-    if log_file.exists():
-        return FileResponse(
-            path=log_file,
-            filename=f"chat_{chat_id}.log",
-            media_type="text/plain; charset=utf-8"
+
+    candidate_paths = [
+        chat_dir / "chat.log",
+        chat_storage_engine.chats_dir / chat_id / "chat.log",
+    ]
+    if chat and chat.get("id"):
+        candidate_paths.append(chat_storage_engine.chats_dir / str(chat["id"]) / "chat.log")
+        candidate_paths.append(project_manager.get_chat_dir(str(chat["id"]), project_id) / "chat.log")
+
+    for log_file in candidate_paths:
+        if log_file.exists() and log_file.is_file():
+            return FileResponse(
+                path=log_file,
+                filename=f"chat_{chat_id}.log",
+                media_type="text/plain; charset=utf-8"
+            )
+
+    # Fallback to synthesized log download
+    log_detail = await get_chat_log(chat_id)
+    log_text = log_detail.get("log", "")
+    if log_text:
+        return Response(
+            content=log_text,
+            media_type="text/plain; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename=chat_{chat_id}.log"}
         )
+
     return PlainTextResponse(f"No log file found for chat {chat_id}", status_code=404)
 
 

@@ -1,4 +1,12 @@
-﻿"use client";
+﻿/**
+ * frontend/src/components/chat/chat-container.tsx
+ *
+ * Core Chat & Autonomous Agent Execution Container.
+ * Enhanced with automated workspace drawer opening upon file creation
+ * and integrated live telemetry logging.
+ */
+
+"use client";
 
 import React, { useState, useRef, useEffect, useMemo } from "react";
 import { useRouter } from "next/navigation";
@@ -124,7 +132,12 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         });
       }
     };
-    const handleArtifactEvent = () => {
+    const handleArtifactEvent = (e: Event) => {
+      const ce = e as CustomEvent<{ artifact?: string; path?: string; file?: string }>;
+      const artName = ce.detail?.path || ce.detail?.file || ce.detail?.artifact;
+      if (artName) {
+        setSelectedFileForEditor(artName);
+      }
       setShowRightPanel(true);
     };
     window.addEventListener("peldrun:artifact-created", handleArtifactEvent);
@@ -270,11 +283,28 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         setActiveModelName(payload.data.model);
       }
 
-      if (eventType === "thought") {
+      const logTimestamp = new Date().toLocaleTimeString();
+
+      if (eventType === "step_start") {
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(
+            new CustomEvent("peldrun:log-entry", {
+              detail: { line: `[${logTimestamp}] [STEP] Step ${step} started` },
+            })
+          );
+        }
+      } else if (eventType === "thought") {
         const raw = payload.data?.thought ?? payload.data?.content ?? payload.data;
         if (safeRender(raw).trim() !== "") {
           appendStep("thought", raw, step);
           setExpandedSteps((prev) => ({ ...prev, [`active-${step}`]: true }));
+          if (typeof window !== "undefined") {
+            window.dispatchEvent(
+              new CustomEvent("peldrun:log-entry", {
+                detail: { line: `[${logTimestamp}] [THOUGHT] ${safeRender(raw)}` },
+              })
+            );
+          }
         }
         if (payload.data?.tokens) setTokensUsed(payload.data.tokens);
       } else if (eventType === "tool_call") {
@@ -285,18 +315,47 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         }
         appendStep("tool_call", args, step, name);
         setExpandedSteps((prev) => ({ ...prev, [`active-${step}`]: true }));
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(
+            new CustomEvent("peldrun:log-entry", {
+              detail: { line: `[${logTimestamp}] [TOOL_CALL] ${name || "tool"}(${typeof args === "string" ? args : JSON.stringify(args)})` },
+            })
+          );
+        }
       } else if (eventType === "observation") {
         const raw = payload.data?.output ?? "Execution completed.";
         appendStep("observation", raw, step);
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(
+            new CustomEvent("peldrun:log-entry", {
+              detail: { line: `[${logTimestamp}] [OBSERVATION] ${safeRender(raw)}` },
+            })
+          );
+        }
 
         // Smart Artifact Auto-Routing
-        if (payload.data?.event === "artifact_created" || payload.data?.artifact) {
+        const artName = payload.data?.artifact || payload.data?.path || payload.data?.file || "";
+        if (payload.data?.event === "artifact_created" || artName) {
           setShowRightPanel(true);
-          const artName = payload.data?.artifact || payload.data?.path || "";
-          const targetTab = getFileCategory(artName);
+          if (artName) {
+            setSelectedFileForEditor(artName);
+            const targetTab = getFileCategory(artName);
+            if (typeof window !== "undefined") {
+              window.dispatchEvent(new CustomEvent("peldrun:artifact-created", { detail: { ...payload.data, file: artName } }));
+              window.dispatchEvent(new CustomEvent("peldrun:switch-tab", { detail: { tab: targetTab, file: artName } }));
+            }
+          }
+        }
+        fetchJobFiles(jobId);
 
+      } else if (eventType === "artifact_created" || eventType === "artifact") {
+        const artName = payload.data?.artifact || payload.data?.path || payload.data?.file || "";
+        if (artName) {
+          setShowRightPanel(true);
+          setSelectedFileForEditor(artName);
+          const targetTab = getFileCategory(artName);
           if (typeof window !== "undefined") {
-            window.dispatchEvent(new CustomEvent("peldrun:artifact-created", { detail: payload.data }));
+            window.dispatchEvent(new CustomEvent("peldrun:artifact-created", { detail: { ...payload.data, file: artName } }));
             window.dispatchEvent(new CustomEvent("peldrun:switch-tab", { detail: { tab: targetTab, file: artName } }));
           }
         }
@@ -305,6 +364,15 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       } else if (eventType === "final" || eventType === "done") {
         const resText = payload.data?.result ?? payload.data?.content ?? "Task completed successfully.";
         if (eventType === "final") setFinalResult(safeRender(resText));
+
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(
+            new CustomEvent("peldrun:log-entry", {
+              detail: { line: `[${logTimestamp}] [FINAL] ${safeRender(resText)}` },
+            })
+          );
+          window.dispatchEvent(new CustomEvent("peldrun:run-completed"));
+        }
 
         if (payload.data?.usage_summary) {
           setTokensUsed({
@@ -355,6 +423,14 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         const errText = payload.data?.message ?? "Execution error encountered.";
         setFinalResult(safeRender(errText));
         setStatus("failed");
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(
+            new CustomEvent("peldrun:log-entry", {
+              detail: { line: `[${logTimestamp}] [ERROR] ${safeRender(errText)}` },
+            })
+          );
+          window.dispatchEvent(new CustomEvent("peldrun:run-completed"));
+        }
         fetchJobFiles(jobId);
         es.close();
 
@@ -383,7 +459,18 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       });
     };
 
-    ["step_start", "thought", "tool_call", "observation", "final", "done", "error"].forEach(bindEvt);
+    [
+      "step_start",
+      "thought",
+      "tool_call",
+      "observation",
+      "artifact_created",
+      "artifact",
+      "final",
+      "done",
+      "error",
+    ].forEach(bindEvt);
+
     es.onerror = () => {
       es.close();
       fetchJobFiles(jobId);
@@ -482,7 +569,24 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       const res = await fetch(`/api/run/jobs/${jobId}/files`);
       if (res.ok) {
         const data = await res.json();
-        setProducedFiles(data.files || []);
+        const incomingFiles = data.files || [];
+        setProducedFiles((prev) => {
+          // If new files were detected that were not previously in state
+          if (incomingFiles.length > prev.length && incomingFiles.length > 0) {
+            const newest = incomingFiles[incomingFiles.length - 1];
+            if (newest?.path) {
+              setShowRightPanel(true);
+              setSelectedFileForEditor(newest.path);
+              const targetTab = getFileCategory(newest.path);
+              if (typeof window !== "undefined") {
+                window.dispatchEvent(
+                  new CustomEvent("peldrun:switch-tab", { detail: { tab: targetTab, file: newest.path } })
+                );
+              }
+            }
+          }
+          return incomingFiles;
+        });
       }
     } catch (e) {
       console.error("Error fetching job files", e);

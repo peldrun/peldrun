@@ -2,7 +2,8 @@
 Sovereign Chat Storage & Disk Governance Engine.
 
 Synchronizes with root storage/index.json, purges backend/jobs.json, governs sessions,
-and maintains the non-destructive session.context.json Sidecar for LLM context optimization.
+maintains the session execution logs (chat.log), and maintains the non-destructive
+session.context.json Sidecar for LLM context optimization.
 """
 
 from __future__ import annotations
@@ -72,6 +73,45 @@ class ChatStorageEngine:
                 except Exception:
                     pass
         return 0.0
+
+    def format_log_line(self, log_type: str, message: Any) -> str:
+        """Format a single log entry adhering to the canonical standard."""
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        clean_msg = str(message).strip().replace("\r\n", " ").replace("\n", " ")
+        return f"[{ts}] [{str(log_type).upper()}] {clean_msg}"
+
+    def append_chat_log(
+        self,
+        chat_id: str,
+        entry: str,
+        project_id: str = "default_project"
+    ) -> None:
+        """
+        Append a structured log line to chat.log on disk.
+        Writes directly to project chat directory and mirrors to sovereign chats_dir.
+        """
+        if not chat_id or not entry:
+            return
+
+        line = entry.strip() + "\n"
+        target_dirs: List[Path] = []
+
+        try:
+            p_dir = project_manager.get_chat_dir(chat_id, project_id)
+            target_dirs.append(p_dir)
+        except Exception:
+            pass
+
+        target_dirs.append(self.chats_dir / chat_id)
+
+        for d in target_dirs:
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+                log_file = d / "chat.log"
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except Exception as e:
+                print(f"[STORAGE ENGINE] Warning: Failed writing chat.log in {d}: {e}")
 
     def _purge_from_jobs_json(self, target_ids: Set[str]) -> int:
         """Purge entries matching chat_id or job_id from backend/jobs.json."""
@@ -197,8 +237,8 @@ class ChatStorageEngine:
         artifacts: Optional[List[str]] = None,
     ) -> Optional[Path]:
         """
-        Record a completed conversation turn to session.json and automatically
-        synchronize the session.context.json Sidecar file.
+        Record a completed conversation turn to session.json, persist log entries
+        to chat.log, and automatically synchronize the session.context.json Sidecar file.
         """
         session_dir = self.chats_dir / chat_id
         session_dir.mkdir(parents=True, exist_ok=True)
@@ -246,6 +286,19 @@ class ChatStorageEngine:
         tmp_session = session_file.with_suffix(".tmp")
         tmp_session.write_text(json.dumps(session_data, indent=2, ensure_ascii=False), encoding="utf-8")
         tmp_session.replace(session_file)
+
+        # Write execution trace to chat.log on disk
+        self.append_chat_log(chat_id, self.format_log_line("SYSTEM", f"User: {user_message}"))
+        if steps:
+            for s in steps:
+                s_type = s.get("type", "step")
+                s_content = s.get("content") or s.get("thought") or s.get("output") or ""
+                if s_content:
+                    self.append_chat_log(chat_id, self.format_log_line(s_type, s_content))
+        if artifacts:
+            for art in artifacts:
+                self.append_chat_log(chat_id, self.format_log_line("ARTIFACT", f"Deliverable created: {art}"))
+        self.append_chat_log(chat_id, self.format_log_line("FINAL", assistant_response))
 
         # Synchronize sidecar alongside session.json
         return self.sync_sidecar(chat_id, model_id=model_id)

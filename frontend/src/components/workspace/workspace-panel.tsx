@@ -7,6 +7,7 @@
  * - Uses authoritative relative paths (f.path) instead of flat filenames (f.name).
  * - Prioritizes deliverables with size > 0 over empty placeholder files.
  * - Auto-selects the primary web deliverable once per scope without infinite fetch cascading.
+ * - Seamlessly routes newly created artifacts to their dedicated tab (preview, artifacts, or editor).
  */
 
 "use client";
@@ -190,24 +191,17 @@ export function WorkspacePanel({
       const targetFile = typeof ce.detail === "object" ? ce.detail?.file : undefined;
 
       if (targetFile) {
-        setSelectedFilePath(targetFile.replace(/\\/g, "/"));
-      }
-      if (targetTab && ["preview", "files", "artifacts", "logs", "editor"].includes(targetTab)) {
+        handleSelectArtifact(targetFile);
+      } else if (targetTab && ["preview", "files", "artifacts", "logs", "editor"].includes(targetTab)) {
         setActiveTab(targetTab as TabId);
       }
     };
 
     const handleArtifactCreated = (e: Event) => {
-      const ce = e as CustomEvent<{ artifact?: string; path?: string; relative_path?: string }>;
-      const artPath = (ce.detail?.relative_path || ce.detail?.path || ce.detail?.artifact || "").replace(/\\/g, "/");
+      const ce = e as CustomEvent<{ artifact?: string; path?: string; relative_path?: string; file?: string }>;
+      const artPath = (ce.detail?.relative_path || ce.detail?.path || ce.detail?.artifact || ce.detail?.file || "").replace(/\\/g, "/");
       if (artPath) {
-        setSelectedFilePath(artPath);
-        const cat = getFileCategory(artPath);
-        if (cat === "artifacts") {
-          setActiveTab("artifacts");
-        } else if (cat === "preview") {
-          setActiveTab("preview");
-        }
+        handleSelectArtifact(artPath);
         // Refresh list to display newly discovered artifact
         fetchFiles();
       }
@@ -222,7 +216,7 @@ export function WorkspacePanel({
       window.removeEventListener("peldrun:artifact-created", handleArtifactCreated);
       window.removeEventListener("peldrun:artifact-updated", handleArtifactCreated);
     };
-  }, [fetchFiles]);
+  }, [fetchFiles, handleSelectArtifact]);
 
   const handleExportZip = async () => {
     if (!effectiveScopeId) return;
@@ -360,7 +354,12 @@ export function WorkspacePanel({
             selectedFile={selectedFilePath}
           />
         )}
-        {activeTab === "logs" && <LogsTab activeJobId={effectiveScopeId} chatId={activeChatId} />}
+        {activeTab === "logs" && (
+          <LogsTab
+            activeJobId={activeJobId || effectiveScopeId}
+            chatId={activeChatId || effectiveScopeId}
+          />
+        )}
         {activeTab === "editor" && (
           <EditorTab
             filePath={selectedFilePath}
