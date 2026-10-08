@@ -1,8 +1,10 @@
 ﻿<div align="center">
 <img src="assets/image/peldrun-logo.svg" alt="PELDRUN" width="190">
 
-# Peldrun
+# PELDRUN
+
 <br>
+
 ## 👋 — Professional AI Agent
 
 ### An AI that can work on the task — not just talk about it.
@@ -18,7 +20,7 @@
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=for-the-badge\&logo=react)](https://react.dev/)
 [![Backend](https://img.shields.io/badge/Backend-FastAPI-009688?style=for-the-badge\&logo=fastapi)](https://fastapi.tiangolo.com/)
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?style=for-the-badge\&logo=python)](https://www.python.org/)
-[![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache--2.0-yellow?style=for-the-badge)](LICENSE)
 
 <br>
 
@@ -29,7 +31,9 @@
 ---
 
 <a id="table-of-contents"></a>
+
 <a id="top"></a>
+
 # Table of Contents
 
 ### For Everyone
