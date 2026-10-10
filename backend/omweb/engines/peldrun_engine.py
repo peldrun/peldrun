@@ -1,12 +1,10 @@
 """
 backend/omweb/engines/peldrun_engine.py
 
-PELDRUN Native Embedded Execution Engine (Isolated Web Adapter - P1-02 & P1-03).
-
-Executes autonomous workflows by delegating entirely to peldrun-core via
-canonical RunRequest and CoreRuntimeExecutor boundaries.
-Captures invocation usage, projects metrics into session.json and SQLite token_ledger,
-and emits usage payloads in the terminal FINAL SSE event.
+PELDRUN Native Embedded Execution Engine (Hardened Context Architecture).
+Executes autonomous workflows by delegating to peldrun-core via RunRequest.
+Integrates ContextManager to enforce strict isolation between persistent history
+and LLM context, guaranteeing zero execution telemetry leakage across turns.
 """
 
 from __future__ import annotations
@@ -28,7 +26,8 @@ from omweb.sse_events import SSEEvent, SSEEventType, dispatch_event
 
 from .base import EngineRunContext, ExecutionEngine
 
-# Core Public Boundary Imports (Strictly Public Contracts Only)
+# Core Public Boundary Imports
+from peldrun.context.builder import ContextManager
 from peldrun.context.sidecar import build_context_sidecar, load_context_sidecar
 from peldrun.events.schema import EventType, PeldrunEvent
 from peldrun.runtime.contract import AgentSpec, RunRequest, RunStatus, WorkspaceContext
@@ -81,7 +80,7 @@ class PeldrunEngine(ExecutionEngine):
         chat_id = context.chat_id or f"chat_{job_id}"
         manifest = context.manifest
 
-        print(f"\n[ENGINE PELDRUN] >>> Starting Task Execution for Job: {job_id} <<<")
+        print(f"\n[ENGINE PELDRUN] >>> Starting Task Execution for Job: {job_id} (Chat: {chat_id}) <<<")
 
         job_scoped_artifacts.setdefault(job_id, [])
         if chat_id:
@@ -121,18 +120,6 @@ class PeldrunEngine(ExecutionEngine):
             f"3. Strict Counting & Non-Premature Termination: When asked to perform a specific number of interactions, you must execute all of them completely and wait for each answer before concluding. Never call 'terminate' until all requested questions have been answered."
         )
 
-        # Resolve Context Sidecar and project execution rules
-        session_dir = project_manager.chats_dir / chat_id
-        sidecar = load_context_sidecar(session_dir)
-        if not sidecar:
-            chat_data = project_manager.get_chat(job_id) or {}
-            sidecar = build_context_sidecar(
-                session_id=chat_id,
-                session_data=chat_data,
-                model_id=model_name,
-                storage_root=project_manager.storage_dir,
-            )
-
         project_rules = (
             "1. User Directive Sovereignty: Follow USER TASK instructions strictly.\n"
             "2. Multi-Question Counting Protocol: Execute all sequential interactions completely before concluding.\n"
@@ -140,7 +127,36 @@ class PeldrunEngine(ExecutionEngine):
             "4. Task Conclusion: Ensure all parts of the user request are satisfied completely before calling 'terminate'."
         )
 
-        # 1. Resolve custom Web tools to adapt into Core tools
+        # 1. Resolve & Refresh Context Sidecar from disk
+        session_dir = project_manager.chats_dir / chat_id
+        sidecar = chat_storage_engine.get_sidecar_object(chat_id)
+        if not sidecar:
+            chat_data = project_manager.get_chat(chat_id) or project_manager.get_chat(job_id) or {}
+            sidecar = build_context_sidecar(
+                session_id=chat_id,
+                session_data=chat_data,
+                model_id=model_name,
+                storage_root=project_manager.storage_dir,
+            )
+
+        # 2. Assemble Sanitized Prompt Context via ContextManager
+        context_mgr = ContextManager(default_system_prompt=system_prompt)
+        context_messages, context_usage = context_mgr.build_messages(
+            sidecar=sidecar,
+            current_user_message=prompt,
+            system_prompt=system_prompt,
+            project_rules=project_rules,
+            include_execution=False,  # Clean initial state for new task turn
+        )
+
+        logger.info(
+            "[CONTEXT HARDENING] Assembled %d context messages for job %s (Tokens: %s)",
+            len(context_messages),
+            job_id,
+            context_usage.get("total", 0),
+        )
+
+        # 3. Resolve custom Web tools to adapt into Core tools
         requested_tools = list(manifest.get("tools", []))
         available_web_tools = {
             t["id"]: t for t in web_tool_registry.list_tools() if t.get("is_enabled", True)
@@ -160,7 +176,7 @@ class PeldrunEngine(ExecutionEngine):
                 )
                 adapted_core_tools.append(adapter)
 
-        # 2. Build Canonical RunRequest delegating context assembly entirely to Core
+        # 4. Build Canonical RunRequest with contextual message payload
         workspace_ctx = WorkspaceContext(
             workspace_id=chat_id,
             root_path=ws_path_str,
@@ -190,13 +206,15 @@ class PeldrunEngine(ExecutionEngine):
                 "session_dir": str(session_dir),
                 "project_rules": project_rules,
                 "sidecar": sidecar,
+                "context_messages": context_messages,
+                "context_usage": context_usage,
             },
             context_sidecar=sidecar,
             project_rules=project_rules,
             step_timeout_seconds=float(active_llm.get("timeout") or 120.0),
         )
 
-        # 3. Setup Async Event Processing Bridge
+        # 5. Setup Async Event Processing Bridge
         event_queue: asyncio.Queue[Optional[PeldrunEvent]] = asyncio.Queue()
         event_seq: int = 0
         current_core_step: int = 1
@@ -439,7 +457,7 @@ class PeldrunEngine(ExecutionEngine):
         async def _on_core_event(evt: PeldrunEvent) -> None:
             await event_queue.put(evt)
 
-        # 4. Delegate Execution to Core Authority
+        # 6. Delegate Execution to Core Authority
         try:
             run_result = await core_executor.execute(
                 request=run_request,
@@ -487,7 +505,7 @@ class PeldrunEngine(ExecutionEngine):
                 )
             return
 
-        # 5. Extract Telemetry & Usage Metrics from Diagnostics
+        # 7. Extract Telemetry & Usage Metrics
         diag_data = run_result.metadata.get("diagnostics", {})
         inp_tok = int(diag_data.get("total_input_tokens") or 0)
         out_tok = int(diag_data.get("total_output_tokens") or 0)
@@ -511,7 +529,6 @@ class PeldrunEngine(ExecutionEngine):
             "provider": provider_name,
         }
 
-        # Atomically update session.json with turn usage and re-aggregated summary
         session_usage_summary = project_manager.record_turn_usage(
             chat_id=chat_id,
             turn_id=turn_id,
@@ -587,7 +604,7 @@ class PeldrunEngine(ExecutionEngine):
 
         job_manager.complete_job(job_id, result_text)
 
-        # Synchronize session.context.json with the completed agent run artifacts & telemetry
+        # 8. Atomically Synchronize Context Sidecar after task conclusion
         try:
             chat_storage_engine.sync_sidecar(chat_id, model_id=model_name)
         except Exception as sidecar_err:

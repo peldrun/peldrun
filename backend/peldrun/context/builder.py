@@ -1,6 +1,7 @@
 """
-Context Assembly and Prompt Synthesis Engine for peldrun-core.
+backend/peldrun/context/builder.py
 
+Context Assembly and Prompt Synthesis Engine for peldrun-core.
 Implements the Microsoft Context Contract and RFC-609 Separation Policy:
 Constructs structured LLM prompt messages from session.context.json, enforcing
 strict architectural isolation between persistent history and LLM active context.
@@ -9,10 +10,13 @@ strict architectural isolation between persistent history and LLM active context
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+import logging
+from typing import Any, Dict, List, Optional, Protocol, Set, Tuple
 
 from peldrun.context.budget import TokenBudgetController
 from peldrun.context.schema import ContextSidecar, CurrentExecution
+
+logger = logging.getLogger("peldrun.context.builder")
 
 
 class ContextManagerProtocol(Protocol):
@@ -34,11 +38,6 @@ class ContextManager:
     Central orchestrator for LLM context assembly.
     Extracts sanitized dialogue from Sidecar and ensures older execution telemetry
     is completely isolated from subsequent LLM turns.
-
-    Architecture Note:
-    ContextManager is an agnostic assembly engine. It does not enforce a hardcoded
-    agent identity by default, allowing callers (Chat or Agent) to pass their
-    respective system directives explicitly.
     """
 
     def __init__(self, default_system_prompt: Optional[str] = None):
@@ -80,17 +79,17 @@ class ContextManager:
         current_user_message: str = "",
         system_prompt: Optional[str] = None,
         project_rules: Optional[str] = None,
-        include_execution: bool = True,
+        include_execution: bool = False,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         """
         Assemble the architectural context tiers in deterministic sequence:
         1. Unified System Directive (System instructions + Project rules)
         2. Compacted Context Summary (Summary slice)
-        3. Sanitized Recent Dialogue (Recent slice)
-        4. Ongoing Execution Telemetry (Execution slice - omitted for conversational chat)
+        3. Sanitized Recent Dialogue (Filtered to prevent duplicating summary or current prompt)
+        4. Ongoing Execution Telemetry (Omitted for new turns, included only when actively stepping)
         5. Current User Input (Current slice)
         """
-        # Tier 1: Consolidate System Instructions and Project Rules into a unified block
+        # Tier 1: Unified System Directive
         effective_system = (
             system_prompt
             if system_prompt is not None
@@ -108,22 +107,36 @@ class ContextManager:
         if system_blocks:
             system_msgs.append({"role": "system", "content": "\n\n".join(system_blocks)})
 
-        # Tier 2: Compacted Context Summary
+        # Tier 2: Compacted Context Summary & Covered Turns Identification
         summary_msgs: List[Dict[str, Any]] = []
+        covered_turn_ids: Set[str] = set()
+
         if sidecar and sidecar.summary and sidecar.summary.content.strip():
             summary_content = (
                 f"[Previous Context Summary]\n{sidecar.summary.content.strip()}"
             )
             summary_msgs.append({"role": "system", "content": summary_content})
+            if sidecar.summary.covers_turns:
+                covered_turn_ids = set(sidecar.summary.covers_turns)
 
-        # Tier 3: Recent Conversation (Sanitized dialogue without historical tool dumps)
+        # Tier 3: Recent Sanitized Conversation
         recent_msgs: List[Dict[str, Any]] = []
+        clean_current_input = current_user_message.strip()
+
         if sidecar and sidecar.conversation:
             for msg in sidecar.conversation:
+                # Exclude turns already compressed inside the summary tier
+                if msg.turn_id and msg.turn_id in covered_turn_ids:
+                    continue
+
                 if msg.role in ("user", "assistant"):
+                    clean_content = msg.content.strip()
+                    # Defensive: Avoid duplicating the current user prompt if already present in history
+                    if msg.role == "user" and clean_current_input and clean_content == clean_current_input:
+                        continue
                     recent_msgs.append({"role": msg.role, "content": msg.content})
 
-        # Tier 4: Execution State (belongs only to the active ongoing turn in Agent workflows)
+        # Tier 4: Execution State (Only for ongoing active turns)
         exec_msgs: List[Dict[str, Any]] = []
         if include_execution and sidecar and sidecar.current_execution:
             formatted_exec = self._format_execution_telemetry(sidecar.current_execution)
@@ -132,10 +145,10 @@ class ContextManager:
 
         # Tier 5: Current User Message
         current_msgs: List[Dict[str, Any]] = []
-        if current_user_message:
-            current_msgs.append({"role": "user", "content": current_user_message})
+        if clean_current_input:
+            current_msgs.append({"role": "user", "content": clean_current_input})
 
-        # Apply Token Budget Controller and fit into limits
+        # Apply Token Budget Controller
         budget_spec = sidecar.budget if sidecar else None
         controller = TokenBudgetController(budget_spec)
         fitted_messages, usage = controller.fit_all(

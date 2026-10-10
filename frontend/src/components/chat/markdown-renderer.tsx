@@ -1,4 +1,6 @@
-﻿"use client";
+﻿// Path: frontend/src/components/chat/markdown-renderer.tsx
+
+"use client";
 
 import React from "react";
 import ReactMarkdown from "react-markdown";
@@ -17,7 +19,7 @@ export function MarkdownRenderer({ content, className = "" }: MarkdownRendererPr
   if (!content) return null;
 
   return (
-    <div className={`prose prose-sm dark:prose-invert max-w-none break-words leading-relaxed text-foreground   ${className}`}>
+    <div className={`prose prose-sm dark:prose-invert max-w-none break-words leading-relaxed text-foreground ${className}`}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[rehypeKatex]}
@@ -90,15 +92,62 @@ export function MarkdownRenderer({ content, className = "" }: MarkdownRendererPr
               </blockquote>
             );
           },
-          a({ href, children }: any) {
+          // Smart link shortener with domain Favicon
+          a({ href, children, ...props }: any) {
+            if (!href) return <a {...props}>{children}</a>;
+
+            let hostname = "";
+            let displayLabel = children;
+            const textContent = typeof children === "string" ? children : "";
+
+            try {
+              const parsedUrl = new URL(href);
+              hostname = parsedUrl.hostname;
+
+              // If the inner text is the raw URL itself, shorten it cleanly
+              if (
+                textContent.startsWith("http://") ||
+                textContent.startsWith("https://") ||
+                textContent === href
+              ) {
+                displayLabel = (parsedUrl.hostname + parsedUrl.pathname + parsedUrl.search).replace(/\/$/, "");
+              }
+            } catch {
+              return (
+                <a
+                  href={href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-primary hover:underline font-medium transition-all"
+                  {...props}
+                >
+                  {children}
+                </a>
+              );
+            }
+
+            const faviconUrl = `https://www.google.com/s2/favicons?domain=${hostname}&sz=32`;
+
             return (
               <a
                 href={href}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="text-primary hover:underline font-medium transition-all"
+                className="inline-flex items-center gap-1.5 px-2 py-0.5 my-0.5 rounded-md bg-muted/60 hover:bg-muted text-primary hover:underline font-mono text-xs font-medium transition-all border border-border/50 align-baseline max-w-full"
+                title={href}
+                {...props}
               >
-                {children}
+                <img
+                  src={faviconUrl}
+                  alt=""
+                  width={13}
+                  height={13}
+                  className="w-3.5 h-3.5 shrink-0 rounded-xs inline-block"
+                  onError={(e) => {
+                    (e.currentTarget as HTMLElement).style.display = "none";
+                  }}
+                />
+                <span className="truncate max-w-[280px]">{displayLabel}</span>
               </a>
             );
           },

@@ -1,15 +1,18 @@
 """
-Sidecar Builder and Persistence Engine for peldrun-core.
+backend/peldrun/context/sidecar.py
 
-Implements the non-destructive Sidecar Pattern:
+Sidecar Builder and Persistence Engine for peldrun-core.
+Implements the non-destructive Sidecar Pattern under RFC-609:
 Constructs, updates, and atomically persists 'session.context.json' alongside
 the presentation-tier 'session.json' without mutating existing frontend records.
+Guarantees strict isolation between historical execution telemetry and active LLM context.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -23,6 +26,8 @@ from peldrun.context.schema import (
     ExecutionStep,
     SummaryState,
 )
+
+logger = logging.getLogger("peldrun.context.sidecar")
 
 SIDECAR_FILENAME = "session.context.json"
 SESSION_FILENAME = "session.json"
@@ -40,7 +45,6 @@ def resolve_model_budget_profile(
 ) -> Tuple[int, int, BudgetRatios]:
     """
     Resolve context_window, max_output_tokens, and section ratios for a model.
-
     Reads persisted configurations from models_budget.json, falling back
     gracefully to standard defaults if the profile is not yet configured.
     """
@@ -51,12 +55,10 @@ def resolve_model_budget_profile(
     if not model_id:
         return default_context, default_output, default_ratios
 
-    # Search for models_budget.json in known paths
     candidate_paths: List[Path] = []
     if storage_root:
         candidate_paths.append(storage_root / "models_budget.json")
 
-    # Default backend locations
     backend_root = Path(__file__).resolve().parent.parent.parent
     candidate_paths.append(backend_root / "storage" / "models_budget.json")
     candidate_paths.append(backend_root / "data" / "models_budget.json")
@@ -84,10 +86,10 @@ def resolve_model_budget_profile(
                             ratios = default_ratios
 
                         return c_win, m_out, ratios
-            except Exception:
-                pass
+            except Exception as err:
+                logger.debug("Failed reading model budget from %s: %s", path, err)
 
-    # Model family fallbacks
+    # Model family heuristic fallbacks
     mid = model_id.lower()
     if "gemini" in mid:
         return 1048576, 8192, default_ratios
@@ -140,6 +142,10 @@ def extract_conversation_and_execution(
     """
     Separate high-level conversation messages from granular execution steps.
     Seamlessly supports PELDRUN schema ('prompt'/'result' as well as 'user'/'assistant').
+
+    Guarantees Architectural Invariant:
+    Completed turns NEVER leak their historical tool steps into CurrentExecution.
+    Only active, ongoing turns retain an execution slice.
     """
     messages: List[ConversationMessage] = []
     current_exec: Optional[CurrentExecution] = None
@@ -153,7 +159,6 @@ def extract_conversation_and_execution(
                 continue
             turn_id = str(turn.get("id") or turn.get("turn_id") or turn.get("job_id") or f"t_{idx + 1}")
 
-            # PELDRUN standard: 'prompt' or 'user' or 'query'
             user_msg = turn.get("prompt") or turn.get("user") or turn.get("query")
             if user_msg:
                 messages.append(
@@ -165,9 +170,15 @@ def extract_conversation_and_execution(
                     )
                 )
 
-            # PELDRUN standard: 'result' or 'assistant' or 'response' or 'content'
-            assistant_msg = turn.get("result") or turn.get("assistant") or turn.get("response") or turn.get("content")
-            if assistant_msg:
+            assistant_msg = (
+                turn.get("result")
+                or turn.get("assistant")
+                or turn.get("response")
+                or turn.get("content")
+            )
+            is_turn_completed = bool(assistant_msg and str(assistant_msg).strip())
+
+            if is_turn_completed:
                 messages.append(
                     ConversationMessage(
                         turn_id=turn_id,
@@ -177,16 +188,21 @@ def extract_conversation_and_execution(
                     )
                 )
 
-            # Extract execution steps if embedded in the latest turn
+            # Strict Invariant: Only capture current_execution if the turn is INCOMPLETE
             is_latest_turn = idx == len(raw_turns) - 1
-            if is_latest_turn and (turn.get("steps") or turn.get("tool_calls") or turn.get("events")):
+            if is_latest_turn and not is_turn_completed:
                 turn_steps = turn.get("steps") or turn.get("events") or []
                 steps: List[ExecutionStep] = []
                 for step in turn_steps:
                     if isinstance(step, dict):
                         st_type = step.get("type", "tool_call")
                         s_data = step.get("data") if isinstance(step.get("data"), dict) else {}
-                        st_name = step.get("toolName") or step.get("name") or s_data.get("toolName") or s_data.get("name")
+                        st_name = (
+                            step.get("toolName")
+                            or step.get("name")
+                            or s_data.get("toolName")
+                            or s_data.get("name")
+                        )
                         st_args = step.get("args") or s_data.get("arguments") or step.get("content")
                         if isinstance(st_args, str) and st_args.startswith("{"):
                             try:
@@ -230,56 +246,73 @@ def extract_conversation_and_execution(
                     )
                 )
 
-    # Process events.json telemetry with true PELDRUN event schema
+    # Process events.json ONLY if representing an ongoing execution
     if events_data and isinstance(events_data, list):
-        latest_turn_id = messages[-1].turn_id if messages else "turn_active"
-        if not current_exec:
-            current_exec = CurrentExecution(turn_id=latest_turn_id, steps=[], artifacts=[])
+        has_terminal_event = any(
+            isinstance(ev, dict) and ev.get("type") in ("final", "done", "error")
+            for ev in events_data
+        )
+        last_msg_is_assistant = bool(messages and messages[-1].role == "assistant")
 
-        for ev in events_data:
-            if not isinstance(ev, dict):
-                continue
-            ev_type = ev.get("type", "observation")
-            ev_data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        if not has_terminal_event and not last_msg_is_assistant:
+            latest_turn_id = messages[-1].turn_id if messages else "turn_active"
+            if not current_exec:
+                current_exec = CurrentExecution(turn_id=latest_turn_id, steps=[], artifacts=[])
 
-            if ev_type in ("tool_call", "tool_called"):
-                tool_name = ev.get("toolName") or ev.get("name") or ev_data.get("toolName") or ev_data.get("name")
-                raw_args = ev.get("args") or ev_data.get("arguments") or ev.get("content")
-                parsed_args = None
-                if isinstance(raw_args, dict):
-                    parsed_args = raw_args
-                elif isinstance(raw_args, str) and raw_args.strip().startswith("{"):
-                    try:
-                        parsed_args = json.loads(raw_args)
-                    except Exception:
-                        parsed_args = {"raw": raw_args}
-                elif raw_args:
-                    parsed_args = {"raw": str(raw_args)}
+            for ev in events_data:
+                if not isinstance(ev, dict):
+                    continue
+                ev_type = ev.get("type", "observation")
+                ev_data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
 
-                current_exec.steps.append(
-                    ExecutionStep(
-                        type="tool_call",
-                        name=tool_name,
-                        args=parsed_args,
-                        result=None,
-                        error=None,
+                if ev_type in ("tool_call", "tool_called"):
+                    tool_name = (
+                        ev.get("toolName")
+                        or ev.get("name")
+                        or ev_data.get("toolName")
+                        or ev_data.get("name")
                     )
-                )
-            elif ev_type in ("observation", "tool_completed"):
-                obs_result = ev.get("content") or ev.get("result") or ev_data.get("output") or ev_data.get("content")
-                current_exec.steps.append(
-                    ExecutionStep(
-                        type="observation",
-                        name=None,
-                        args=None,
-                        result=str(obs_result) if obs_result is not None else "",
-                        error=ev.get("error") or ev_data.get("error"),
+                    raw_args = ev.get("args") or ev_data.get("arguments") or ev.get("content")
+                    parsed_args = None
+                    if isinstance(raw_args, dict):
+                        parsed_args = raw_args
+                    elif isinstance(raw_args, str) and raw_args.strip().startswith("{"):
+                        try:
+                            parsed_args = json.loads(raw_args)
+                        except Exception:
+                            parsed_args = {"raw": raw_args}
+                    elif raw_args:
+                        parsed_args = {"raw": str(raw_args)}
+
+                    current_exec.steps.append(
+                        ExecutionStep(
+                            type="tool_call",
+                            name=tool_name,
+                            args=parsed_args,
+                            result=None,
+                            error=None,
+                        )
                     )
-                )
-            elif ev_type == "artifact_created":
-                artifact_name = ev_data.get("artifact") or ev_data.get("path") or ev.get("toolName")
-                if artifact_name and artifact_name not in current_exec.artifacts:
-                    current_exec.artifacts.append(str(artifact_name))
+                elif ev_type in ("observation", "tool_completed"):
+                    obs_result = (
+                        ev.get("content")
+                        or ev.get("result")
+                        or ev_data.get("output")
+                        or ev_data.get("content")
+                    )
+                    current_exec.steps.append(
+                        ExecutionStep(
+                            type="observation",
+                            name=None,
+                            args=None,
+                            result=str(obs_result) if obs_result is not None else "",
+                            error=ev.get("error") or ev_data.get("error"),
+                        )
+                    )
+                elif ev_type == "artifact_created":
+                    artifact_name = ev_data.get("artifact") or ev_data.get("path") or ev.get("toolName")
+                    if artifact_name and artifact_name not in current_exec.artifacts:
+                        current_exec.artifacts.append(str(artifact_name))
 
     return messages, current_exec
 
@@ -294,12 +327,10 @@ def build_context_sidecar(
 ) -> ContextSidecar:
     """
     Construct a complete ContextSidecar instance from raw session and events data.
-
     Respects existing compaction summaries and resolves per-model token limits.
     """
     target_model = model_id or session_data.get("model") or (existing_sidecar.model_id if existing_sidecar else None)
 
-    # 1. Resolve limits and dynamic ratios
     context_window, max_output_tokens, ratios = resolve_model_budget_profile(
         target_model, storage_root=storage_root
     )
@@ -307,15 +338,12 @@ def build_context_sidecar(
         context_window, max_output_tokens, ratios
     )
 
-    # 2. Extract separated conversation and execution state
     conversation, current_exec = extract_conversation_and_execution(
         session_data, events_data
     )
 
-    # 3. Preserve or initialize summary state
     summary = existing_sidecar.summary if existing_sidecar else SummaryState()
 
-    # 4. Calculate total prompt tokens currently consumed
     total_tokens = summary.tokens
     for msg in conversation:
         total_tokens += estimate_string_tokens(msg.content)
@@ -324,7 +352,6 @@ def build_context_sidecar(
             if st.result:
                 total_tokens += estimate_string_tokens(st.result)
 
-    # 5. Assemble budget metadata
     budget = BudgetMetadata(
         total_tokens=total_tokens,
         context_window=context_window,
@@ -357,7 +384,7 @@ def load_context_sidecar(session_dir: Union[str, Path]) -> Optional[ContextSidec
             data = json.load(f)
             return ContextSidecar(**data)
     except Exception as err:
-        print(f"[Sidecar] Error loading sidecar at {sidecar_path}: {err}")
+        logger.warning("Error loading sidecar at %s: %s", sidecar_path, err)
         return None
 
 
@@ -367,7 +394,6 @@ def save_context_sidecar(
 ) -> Path:
     """
     Persist the ContextSidecar to disk atomically via a temporary file.
-
     Guarantees no partial reads by concurrent threads or processes.
     """
     target_dir = Path(session_dir)

@@ -1,6 +1,9 @@
-﻿"use client";
+﻿// Path: frontend/src/components/chat/composer.tsx
+
+"use client";
 
 import React, { useState, useEffect, useRef, useMemo } from "react";
+import { useParams } from "next/navigation";
 import {
   Send,
   Paperclip,
@@ -8,7 +11,9 @@ import {
   Bot,
   MessageSquare,
   FileText,
-  X
+  X,
+  Maximize2,
+  Minimize2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AgentSelector } from "./agent-selector";
@@ -18,6 +23,9 @@ import { ReasoningEffortSelector } from "./reasoning-effort-selector";
 import { useChatStore } from "@/stores/chat-store";
 import { useAppStorage } from "@/hooks/use-app-storage";
 import { inferModelCapabilities, fetchServerMetadata } from "@/lib/modelMetadata";
+import { LexicalEditorComponent } from "./composer/lexical-editor";
+import { LexicalEditorHandle } from "./composer/types";
+import { commandRegistry } from "./composer/registry/command-registry";
 
 interface ComposerProps {
   onSend: (text: string, files?: File[], llmOverride?: any) => void;
@@ -25,13 +33,26 @@ interface ComposerProps {
   isRunning?: boolean;
   disabled?: boolean;
   placeholder?: string;
+  chatId?: string;
 }
 
-export function Composer({ onSend, onStop, isRunning, disabled, placeholder }: ComposerProps) {
+export function Composer({
+  onSend,
+  onStop,
+  isRunning,
+  disabled,
+  placeholder,
+  chatId,
+}: ComposerProps) {
+  const params = useParams();
+  const urlChatId = (params?.id as string) || (params?.chatId as string) || undefined;
+  const activeSessionId = chatId || urlChatId;
+
   const [text, setText] = useState("");
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [metadataVault, setMetadataVault] = useState<Record<string, any>>({});
+  const [isExpanded, setIsExpanded] = useState(false);
 
   // Unified multi-tier reactive storage
   const [activeModel, setActiveModel] = useAppStorage("active_model");
@@ -42,10 +63,25 @@ export function Composer({ onSend, onStop, isRunning, disabled, placeholder }: C
 
   const { selectedAgentId } = useChatStore();
 
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const editorRef = useRef<LexicalEditorHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Synchronize server metadata for dynamic model capability resolution
+  // Register built-in agent mention
+  useEffect(() => {
+    const unregisterPeldrun = commandRegistry.registerMentionItem({
+      id: "agent-peldrun",
+      label: "@peldrun",
+      description: "Autonomous Master Agent",
+      category: "agent",
+      insertText: "@peldrun ",
+    });
+
+    return () => {
+      unregisterPeldrun();
+    };
+  }, []);
+
+  // Synchronize server metadata for dynamic capability resolution
   useEffect(() => {
     fetchServerMetadata().then((data) => setMetadataVault(data || {}));
     const onMetadataUpdate = (e: any) => setMetadataVault(e.detail || {});
@@ -66,7 +102,6 @@ export function Composer({ onSend, onStop, isRunning, disabled, placeholder }: C
     }
   }, [setActiveModel, setActiveProvider]);
 
-  // Dynamically resolve whether the currently active model supports reasoning
   const modelCaps = useMemo(() => {
     return inferModelCapabilities(activeModel, metadataVault[activeModel]);
   }, [activeModel, metadataVault]);
@@ -94,7 +129,7 @@ export function Composer({ onSend, onStop, isRunning, disabled, placeholder }: C
       mode: execMode,
       reasoning_effort: effectiveEffort,
       is_reasoning_model: isReasoning,
-      agent_id: execMode === "agent" ? (selectedAgentId || "peldrun") : "peldrun"
+      agent_id: execMode === "agent" ? (selectedAgentId || "peldrun") : "peldrun",
     };
 
     if (activeLlmOverride) {
@@ -106,7 +141,7 @@ export function Composer({ onSend, onStop, isRunning, disabled, placeholder }: C
           mode: execMode,
           reasoning_effort: effectiveEffort,
           is_reasoning_model: isReasoning,
-          agent_id: base.agent_id
+          agent_id: base.agent_id,
         };
       } catch (e) {}
     }
@@ -146,22 +181,14 @@ export function Composer({ onSend, onStop, isRunning, disabled, placeholder }: C
     setIsDragging(false);
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
-  };
-
   const handleSend = () => {
-    if ((!text.trim() && attachedFiles.length === 0) || isRunning || disabled) return;
+    const rawText = editorRef.current ? editorRef.current.getText() : text;
+    if ((!rawText.trim() && attachedFiles.length === 0) || isRunning || disabled) return;
     const currentPayload = getActivePayload();
-    onSend(text.trim(), attachedFiles.length > 0 ? attachedFiles : undefined, currentPayload);
+    onSend(rawText.trim(), attachedFiles.length > 0 ? attachedFiles : undefined, currentPayload);
+    editorRef.current?.clear();
     setText("");
     setAttachedFiles([]);
-    if (textareaRef.current) {
-      textareaRef.current.style.height = "auto";
-    }
   };
 
   const formatFileSize = (bytes: number) => {
@@ -178,7 +205,6 @@ export function Composer({ onSend, onStop, isRunning, disabled, placeholder }: C
 
   return (
     <div className="relative w-full max-w-[1000px] mx-auto font-sans">
-      {/* Hidden File Input */}
       <input
         type="file"
         multiple
@@ -187,13 +213,13 @@ export function Composer({ onSend, onStop, isRunning, disabled, placeholder }: C
         className="hidden"
       />
 
-      {/* Top Model & Engine Switcher Bar */}
       <div className="flex items-center justify-between mb-1.5 px-1">
         <EngineSelector direction="up" />
-        <span className="text-[10px] text-muted-foreground">Press Enter to send, Shift+Enter for new line</span>
+        <span className="text-[10px] text-muted-foreground">
+          Press Enter to send, Shift+Enter for new line
+        </span>
       </div>
 
-      {/* Floating Omnibar Input Box with Drag & Drop */}
       <div
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
@@ -204,7 +230,6 @@ export function Composer({ onSend, onStop, isRunning, disabled, placeholder }: C
             : "border-border focus-within:ring-1 focus-within:ring-muted focus-within:border-muted "
         }`}
       >
-        {/* Attached Files Badges Container */}
         {attachedFiles.length > 0 && (
           <div className="flex flex-wrap gap-2 p-2.5 pb-1 border-b border-border/40 bg-muted/20">
             {attachedFiles.map((file, idx) => (
@@ -232,19 +257,22 @@ export function Composer({ onSend, onStop, isRunning, disabled, placeholder }: C
           </div>
         )}
 
-        <textarea
-          ref={textareaRef}
-          value={text}
-          onChange={(e) => {
-            setText(e.target.value);
-            e.target.style.height = "auto";
-            e.target.style.height = `${Math.min(e.target.scrollHeight, 220)}px`;
-          }}
-          onKeyDown={handleKeyDown}
+        <LexicalEditorComponent
+          ref={editorRef}
+          chatId={activeSessionId}
           placeholder={attachedFiles.length > 0 ? "Add instructions for attached files..." : dynamicPlaceholder}
-          rows={1}
-          disabled={disabled}
-          className="w-full resize-none bg-transparent px-4 py-3 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none max-h-[220px] font-sans"
+          disabled={disabled || isRunning}
+          onSubmit={handleSend}
+          onChange={(val) => setText(val)}
+          contentClassName={
+            isExpanded
+              ? "min-h-[220px] max-h-[460px] px-4 py-3"
+              : "min-h-[44px] max-h-[220px] px-4 py-3"
+          }
+          onClearEditor={() => {
+            editorRef.current?.clear();
+            setText("");
+          }}
         />
 
         <div className="flex items-center justify-between px-3 pb-2.5 pt-1">
@@ -263,7 +291,6 @@ export function Composer({ onSend, onStop, isRunning, disabled, placeholder }: C
               )}
             </Button>
 
-            {/* Mode Toggle Control */}
             <div className="flex items-center bg-muted/60 p-0.5 rounded-lg border border-border/60 text-[11px]">
               <button
                 type="button"
@@ -293,14 +320,12 @@ export function Composer({ onSend, onStop, isRunning, disabled, placeholder }: C
               </button>
             </div>
 
-            {/* Dynamic Reasoning Effort Selector: Appears or hides based on active model reasoning support */}
             {isReasoningSupported && (
               <div className="animate-in fade-in zoom-in-95 duration-200">
                 <ReasoningEffortSelector disabled={disabled || isRunning} />
               </div>
             )}
 
-            {/* Agent Selector & Active Tools Modal: Visible ONLY when execMode === 'agent' */}
             {execMode === "agent" && (
               <div className="animate-in fade-in duration-150 flex items-center gap-1.5">
                 <AgentSelector disabled={disabled || isRunning} />
@@ -310,6 +335,17 @@ export function Composer({ onSend, onStop, isRunning, disabled, placeholder }: C
           </div>
 
           <div className="flex items-center gap-2">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => setIsExpanded(!isExpanded)}
+              className="h-8 w-8 p-0 text-muted-foreground hover:text-foreground cursor-pointer hover:bg-muted"
+              title={isExpanded ? "Collapse Editor" : "Expand Editor"}
+            >
+              {isExpanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+            </Button>
+
             {isRunning ? (
               <Button
                 type="button"

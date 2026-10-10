@@ -1,14 +1,16 @@
 ﻿"""
-Sovereign Chat Storage & Disk Governance Engine.
+backend/omweb/chat_storage_engine.py
 
-Synchronizes with root storage/index.json, purges backend/jobs.json, governs sessions,
-maintains the session execution logs (chat.log), and maintains the non-destructive
+Sovereign Chat Storage & Disk Governance Engine.
+Synchronizes with root storage/index.json, governs sessions,
+maintains session execution logs (chat.log), and maintains the non-destructive
 session.context.json Sidecar for LLM context optimization.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -18,7 +20,8 @@ from typing import Any, Dict, List, Optional, Set
 
 from omweb.project_manager import project_manager
 
-# Ensure backend root is accessible for peldrun package imports
+logger = logging.getLogger("omweb.chat_storage_engine")
+
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
@@ -31,7 +34,6 @@ try:
         get_sidecar_path,
     )
 except ImportError:
-    # Graceful fallback if peldrun is located under core or sibling structure
     build_context_sidecar = None
     load_context_sidecar = None
     save_context_sidecar = None
@@ -40,7 +42,6 @@ except ImportError:
 
 class ChatStorageEngine:
     def __init__(self):
-        # Bound directly to the real storage directory used by project_manager
         self.storage_dir = project_manager.storage_dir
         self.root_dir = self.storage_dir.parent
         self.chats_dir = project_manager.chats_dir
@@ -86,10 +87,7 @@ class ChatStorageEngine:
         entry: str,
         project_id: str = "default_project"
     ) -> None:
-        """
-        Append a structured log line to chat.log on disk.
-        Writes directly to project chat directory and mirrors to sovereign chats_dir.
-        """
+        """Append a structured log line to chat.log on disk."""
         if not chat_id or not entry:
             return
 
@@ -111,7 +109,7 @@ class ChatStorageEngine:
                 with open(log_file, "a", encoding="utf-8") as f:
                     f.write(line)
             except Exception as e:
-                print(f"[STORAGE ENGINE] Warning: Failed writing chat.log in {d}: {e}")
+                logger.warning("Failed writing chat.log in %s: %s", d, e)
 
     def _purge_from_jobs_json(self, target_ids: Set[str]) -> int:
         """Purge entries matching chat_id or job_id from backend/jobs.json."""
@@ -136,9 +134,8 @@ class ChatStorageEngine:
                         encoding="utf-8"
                     )
         except Exception as e:
-            print(f"[STORAGE ENGINE] Failed to purge from jobs.json: {e}")
+            logger.warning("Failed to purge from jobs.json: %s", e)
 
-        # In-memory cleanup
         try:
             from omweb.job_manager import job_manager
             for tid in target_ids:
@@ -150,7 +147,7 @@ class ChatStorageEngine:
         return purged_count
 
     # =========================================================================
-    # Context Sidecar Management & Synchronization Hooks (Stage 1)
+    # Context Sidecar Management & Synchronization Hooks
     # =========================================================================
 
     def sync_sidecar(
@@ -161,10 +158,8 @@ class ChatStorageEngine:
     ) -> Optional[Path]:
         """
         Build or refresh 'session.context.json' alongside 'session.json'.
-
         Extracts clean conversational dialogue, isolates active execution telemetry,
         and applies dynamic per-model token budget allocations.
-        Guarantees zero side-effects on existing frontend storage.
         """
         if not build_context_sidecar or not save_context_sidecar:
             return None
@@ -180,7 +175,6 @@ class ChatStorageEngine:
             if not isinstance(session_data, dict):
                 return None
 
-            # Look for existing events file if events list not provided directly
             events_data = events
             if events_data is None:
                 events_file = session_dir / "events.json"
@@ -207,18 +201,23 @@ class ChatStorageEngine:
             saved_path = save_context_sidecar(session_dir, sidecar)
             return saved_path
         except Exception as err:
-            print(f"[STORAGE ENGINE] Warning: Failed to synchronize context sidecar for {chat_id}: {err}")
+            logger.warning("Failed to synchronize context sidecar for %s: %s", chat_id, err)
             return None
+
+    def get_sidecar_object(self, chat_id: str) -> Optional[Any]:
+        """Retrieve active ContextSidecar strongly-typed object for a chat session."""
+        session_dir = self.chats_dir / chat_id
+        if load_context_sidecar:
+            return load_context_sidecar(session_dir)
+        return None
 
     def get_sidecar_data(self, chat_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve active context sidecar dictionary for a chat session."""
-        session_dir = self.chats_dir / chat_id
-        if load_context_sidecar:
-            sidecar_obj = load_context_sidecar(session_dir)
-            if sidecar_obj:
-                return sidecar_obj.model_dump() if hasattr(sidecar_obj, "model_dump") else sidecar_obj.dict()
+        sidecar_obj = self.get_sidecar_object(chat_id)
+        if sidecar_obj:
+            return sidecar_obj.model_dump() if hasattr(sidecar_obj, "model_dump") else sidecar_obj.dict()
 
-        # Fallback raw read
+        session_dir = self.chats_dir / chat_id
         sidecar_file = session_dir / "session.context.json"
         if sidecar_file.exists():
             try:
@@ -273,7 +272,6 @@ class ChatStorageEngine:
         turns = session_data.setdefault("turns", [])
         turns.append(turn_entry)
 
-        # Mirror in flat messages array for legacy backward compatibility
         messages = session_data.setdefault("messages", [])
         messages.append({"role": "user", "content": user_message, "timestamp": self._now_iso()})
         messages.append({"role": "assistant", "content": assistant_response, "timestamp": self._now_iso()})
@@ -282,12 +280,10 @@ class ChatStorageEngine:
         if model_id:
             session_data["model"] = model_id
 
-        # Write presentation session.json atomically
         tmp_session = session_file.with_suffix(".tmp")
         tmp_session.write_text(json.dumps(session_data, indent=2, ensure_ascii=False), encoding="utf-8")
         tmp_session.replace(session_file)
 
-        # Write execution trace to chat.log on disk
         self.append_chat_log(chat_id, self.format_log_line("SYSTEM", f"User: {user_message}"))
         if steps:
             for s in steps:
@@ -300,7 +296,6 @@ class ChatStorageEngine:
                 self.append_chat_log(chat_id, self.format_log_line("ARTIFACT", f"Deliverable created: {art}"))
         self.append_chat_log(chat_id, self.format_log_line("FINAL", assistant_response))
 
-        # Synchronize sidecar alongside session.json
         return self.sync_sidecar(chat_id, model_id=model_id)
 
     # =========================================================================
@@ -345,7 +340,6 @@ class ChatStorageEngine:
 
             results.append(c)
 
-        # Sort: pinned first, then chronological descending
         results.sort(
             key=lambda x: (
                 1 if (x.get("is_pinned") or x.get("pinned")) else 0,
@@ -528,8 +522,7 @@ class ChatStorageEngine:
         }
 
     def delete_all_chats(self) -> Dict[str, Any]:
-        """Deep purge: deletes all chats, project chat references, workspace artifacts,
-        and completely empties backend/jobs.json."""
+        """Deep purge: deletes all chats, project chat references, and workspace artifacts."""
         idx = project_manager._read_index()
         all_chats = idx.get("chats", [])
         target_ids: Set[str] = set()
@@ -543,7 +536,6 @@ class ChatStorageEngine:
 
         freed_bytes = 0
 
-        # 1. Clear chats folder
         if self.chats_dir.exists():
             for item in self.chats_dir.iterdir():
                 try:
@@ -559,7 +551,6 @@ class ChatStorageEngine:
                 except Exception:
                     pass
 
-        # 2. Clear all workspace folders
         for ws_root in [self.workspace_dir, self.backend_dir / "workspace"]:
             if ws_root.exists():
                 for item in ws_root.iterdir():
@@ -576,7 +567,6 @@ class ChatStorageEngine:
                     except Exception:
                         pass
 
-        # 3. Clear chats inside project folders
         if self.projects_dir.exists():
             for p_dir in self.projects_dir.iterdir():
                 if p_dir.is_dir():
@@ -585,14 +575,12 @@ class ChatStorageEngine:
                         shutil.rmtree(p_chats, ignore_errors=True)
                         p_chats.mkdir(parents=True, exist_ok=True)
 
-        # 4. Reset index.json chats array
         idx["chats"] = []
         for p in idx.get("projects", []):
             if isinstance(p, dict) and "chat_ids" in p:
                 p["chat_ids"] = []
         project_manager._write_index(idx)
 
-        # 5. Empty backend/jobs.json
         purged_jobs_count = self._purge_from_jobs_json(target_ids)
         if self.jobs_json_path.exists():
             try:
@@ -600,14 +588,12 @@ class ChatStorageEngine:
             except Exception:
                 pass
 
-        # 6. Clear in-memory jobs
         try:
             from omweb.job_manager import job_manager
             job_manager._jobs.clear()
         except Exception:
             pass
 
-        # 7. Sweep any residual orphans
         sweep_rep = self.sweep_orphaned_storage()
 
         return {

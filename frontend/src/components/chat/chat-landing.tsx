@@ -1,3 +1,5 @@
+// Path: frontend/src/components/chat/chat-landing.tsx
+
 "use client";
 
 import React, { useRef, useState, useEffect, useMemo } from "react";
@@ -13,13 +15,18 @@ import {
   Palette,
   Gamepad2,
   FileText,
-  X
+  X,
+  Maximize2,
+  Minimize2,
 } from "lucide-react";
 import { AgentSelector } from "./agent-selector";
 import { ActiveToolsModal } from "./active-tools-modal";
 import { ReasoningEffortSelector } from "./reasoning-effort-selector";
 import { useAppStorage } from "@/hooks/use-app-storage";
 import { inferModelCapabilities, fetchServerMetadata } from "@/lib/modelMetadata";
+import { LexicalEditorComponent } from "./composer/lexical-editor";
+import { LexicalEditorHandle } from "./composer/types";
+import { commandRegistry } from "./composer/registry/command-registry";
 
 interface QuickPill {
   label: string;
@@ -28,10 +35,30 @@ interface QuickPill {
 }
 
 const QUICK_PILLS: QuickPill[] = [
-  { label: "Create slides", icon: <Layout size={13} />, prompt: "Create an interactive presentation in HTML with modern slide navigation and CSS styling, then terminate." },
-  { label: "Build website", icon: <Globe size={13} />, prompt: "Build a responsive modern single-page website in HTML and Tailwind CSS with a clean hero section and pricing cards, then terminate." },
-  { label: "Design", icon: <Palette size={13} />, prompt: "In workspace, create an animated SVG dashboard widget with modern cards and dark mode styling, then terminate." },
-  { label: "Create games", icon: <Gamepad2 size={13} />, prompt: "Create a playable HTML5 canvas retro game with keyboard controls, sound effects, and score tracking, then terminate." },
+  {
+    label: "Create slides",
+    icon: <Layout size={13} />,
+    prompt:
+      "Create an interactive presentation in HTML with modern slide navigation and CSS styling, then terminate.",
+  },
+  {
+    label: "Build website",
+    icon: <Globe size={13} />,
+    prompt:
+      "Build a responsive modern single-page website in HTML and Tailwind CSS with a clean hero section and pricing cards, then terminate.",
+  },
+  {
+    label: "Design",
+    icon: <Palette size={13} />,
+    prompt:
+      "In workspace, create an animated SVG dashboard widget with modern cards and dark mode styling, then terminate.",
+  },
+  {
+    label: "Create games",
+    icon: <Gamepad2 size={13} />,
+    prompt:
+      "Create a playable HTML5 canvas retro game with keyboard controls, sound effects, and score tracking, then terminate.",
+  },
 ];
 
 interface ChatLandingProps {
@@ -56,13 +83,31 @@ export function ChatLanding({
   formatFileSize,
 }: ChatLandingProps) {
   const [isLandingDragging, setIsLandingDragging] = useState(false);
+  const [isExpanded, setIsExpanded] = useState(false);
+
+  // Multi-tier storage state synchronization
   const [activeModel, setActiveModel] = useAppStorage("active_model");
   const [activeProvider, setActiveProvider] = useAppStorage("active_provider");
   const [reasoningEffort] = useAppStorage("reasoning_effort");
   const [metadataVault, setMetadataVault] = useState<Record<string, any>>({});
 
-  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const landingEditorRef = useRef<LexicalEditorHandle | null>(null);
   const landingFileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Dynamically register active built-in agent mentions for autocomplete
+  useEffect(() => {
+    const unregisterPeldrun = commandRegistry.registerMentionItem({
+      id: "agent-peldrun",
+      label: "@peldrun",
+      description: "Autonomous Master Agent",
+      category: "agent",
+      insertText: "@peldrun ",
+    });
+
+    return () => {
+      unregisterPeldrun();
+    };
+  }, []);
 
   // Synchronize server metadata for dynamic capability evaluation
   useEffect(() => {
@@ -102,7 +147,10 @@ export function ChatLanding({
   };
 
   const handleDispatch = (customPrompt?: string) => {
-    const textToRun = (customPrompt !== undefined ? customPrompt : inputValue).trim();
+    const rawText = landingEditorRef.current
+      ? landingEditorRef.current.getText()
+      : inputValue;
+    const textToRun = (customPrompt !== undefined ? customPrompt : rawText).trim();
     if (!textToRun && landingAttachedFiles.length === 0) return;
 
     const payloadOverride = {
@@ -111,6 +159,8 @@ export function ChatLanding({
     };
 
     onStartTask(textToRun, payloadOverride, landingAttachedFiles);
+    landingEditorRef.current?.clear();
+    setInputValue("");
     setLandingAttachedFiles([]);
   };
 
@@ -166,6 +216,7 @@ export function ChatLanding({
         </div>
       </div>
 
+      {/* Hidden File Input */}
       <input
         type="file"
         multiple
@@ -174,9 +225,16 @@ export function ChatLanding({
         className="hidden"
       />
 
+      {/* Omnibar Input Box with Drag & Drop */}
       <div
-        onDragOver={(e) => { e.preventDefault(); setIsLandingDragging(true); }}
-        onDragLeave={(e) => { e.preventDefault(); setIsLandingDragging(false); }}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setIsLandingDragging(true);
+        }}
+        onDragLeave={(e) => {
+          e.preventDefault();
+          setIsLandingDragging(false);
+        }}
         onDrop={(e) => {
           e.preventDefault();
           setIsLandingDragging(false);
@@ -184,10 +242,11 @@ export function ChatLanding({
             setLandingAttachedFiles((prev) => [...prev, ...Array.from(e.dataTransfer.files)]);
           }
         }}
-        className={`w-full bg-card rounded-3xl transition-all p-3.5 peldrun-input-bar ${
+        className={`w-full bg-card rounded-3xl transition-all p-3.5 peldrun-input-bar text-start ${
           isLandingDragging ? "ring-2 ring-primary/40 bg-card" : "bg-card"
         }`}
       >
+        {/* Attached Files Badges Container */}
         {landingAttachedFiles.length > 0 && (
           <div className="flex flex-wrap gap-2 mb-2 pb-2 border-b border-border/40">
             {landingAttachedFiles.map((file, idx) => (
@@ -204,7 +263,9 @@ export function ChatLanding({
                 </span>
                 <button
                   type="button"
-                  onClick={() => setLandingAttachedFiles((prev) => prev.filter((_, i) => i !== idx))}
+                  onClick={() =>
+                    setLandingAttachedFiles((prev) => prev.filter((_, i) => i !== idx))
+                  }
                   className="p-0.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer ml-1"
                   title="Remove file"
                 >
@@ -215,25 +276,33 @@ export function ChatLanding({
           </div>
         )}
 
-        <textarea
-          ref={textareaRef}
-          value={inputValue}
-          onChange={(e) => setInputValue(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              handleDispatch();
+        {/* Lexical Omnibar Editor */}
+        <div className="w-full">
+          <LexicalEditorComponent
+            ref={landingEditorRef}
+            placeholder={
+              landingAttachedFiles.length > 0
+                ? "Add instructions for attached files..."
+                : dynamicPlaceholder
             }
-          }}
-          rows={3}
-          placeholder={
-            landingAttachedFiles.length > 0
-              ? "Add instructions for attached files..."
-              : dynamicPlaceholder
-          }
-          className="w-full bg-transparent border-0 outline-none text-sm text-foreground placeholder:text-muted-foreground resize-none leading-relaxed"
-        />
+            onSubmit={() => handleDispatch()}
+            onChange={(val) => setInputValue(val)}
+            contentClassName={
+              isExpanded
+                ? "min-h-[220px] max-h-[480px] px-2 py-2 leading-relaxed"
+                : "min-h-[72px] max-h-[220px] px-1 py-1 leading-relaxed"
+            }
 
+            placeholderClassName={isExpanded ? "px-2 py-2" : "px-1 py-1"}
+            className="w-full bg-card"
+            onClearEditor={() => {
+              landingEditorRef.current?.clear();
+              setInputValue("");
+            }}
+          />
+        </div>
+
+        {/* Omnibar Bottom Action Bar */}
         <div className="flex items-center justify-between pt-2 border-t border-border/50 mt-1">
           <div className="flex items-center gap-2">
             <button
@@ -249,20 +318,23 @@ export function ChatLanding({
             </button>
 
             <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-muted/60 text-muted-foreground border border-border">
-              <Sparkles size={12} className={execMode === "agent" ? "text-emerald-500" : "text-sky-500"} />
+              <Sparkles
+                size={12}
+                className={execMode === "agent" ? "text-emerald-500" : "text-sky-500"}
+              />
               <span className="font-mono text-[11px] font-semibold text-foreground">
                 {execMode === "agent" ? "Agent Mode" : "Chat Mode"}
               </span>
             </span>
 
-            {/* Dynamic Reasoning Effort Selector: Visible whenever active model supports reasoning */}
+            {/* Dynamic Reasoning Effort Selector */}
             {isReasoningSupported && (
               <div className="animate-in fade-in zoom-in-95 duration-200">
                 <ReasoningEffortSelector />
               </div>
             )}
 
-            {/* Agent Selector: Visible ONLY when execMode === 'agent' */}
+            {/* Agent Selector & Active Tools Modal: Visible ONLY when execMode === 'agent' */}
             {execMode === "agent" && (
               <div className="animate-in fade-in duration-150 flex items-center gap-1.5 z-50">
                 <AgentSelector />
@@ -271,18 +343,32 @@ export function ChatLanding({
             )}
           </div>
 
-          <button
-            type="button"
-            onClick={() => handleDispatch()}
-            disabled={!inputValue.trim() && landingAttachedFiles.length === 0}
-            className="h-8 w-8 rounded-full bg-black dark:bg-white text-white dark:text-black flex items-center justify-center transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-peldrun-xs cursor-pointer hover:opacity-90"
-            title="Dispatch Task (Enter)"
-          >
-            <ArrowUp size={15} />
-          </button>
+          <div className="flex items-center gap-1.5">
+            {/* Expand / Collapse Omnibar Button */}
+            <button
+              type="button"
+              onClick={() => setIsExpanded(!isExpanded)}
+              className="h-8 w-8 rounded-full hover:bg-muted text-muted-foreground hover:text-foreground flex items-center justify-center transition-all cursor-pointer"
+              title={isExpanded ? "Collapse Editor" : "Expand Editor"}
+            >
+              {isExpanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+            </button>
+
+            {/* Dispatch Task Button */}
+            <button
+              type="button"
+              onClick={() => handleDispatch()}
+              disabled={!inputValue.trim() && landingAttachedFiles.length === 0}
+              className="h-8 w-8 rounded-full bg-black dark:bg-white text-white dark:text-black flex items-center justify-center transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-peldrun-xs cursor-pointer hover:opacity-90"
+              title="Dispatch Task (Enter)"
+            >
+              <ArrowUp size={15} />
+            </button>
+          </div>
         </div>
       </div>
 
+      {/* Quick Pills Container */}
       <div className="flex flex-wrap items-center justify-center gap-2 mt-6 -z-1">
         {QUICK_PILLS.map((pill, idx) => (
           <button
