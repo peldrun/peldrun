@@ -6,12 +6,13 @@ import { useEffect } from 'react';
 import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext';
 import {
   $createParagraphNode,
-  $createTextNode,
   $getSelection,
+  $isElementNode,
   $isRangeSelection,
   $isTextNode,
-  COMMAND_PRIORITY_CRITICAL,
+  COMMAND_PRIORITY_LOW,
   KEY_ENTER_COMMAND,
+  LexicalNode,
 } from 'lexical';
 
 interface SubmitCommandPluginProps {
@@ -26,6 +27,7 @@ export function SubmitCommandPlugin({
   const [editor] = useLexicalComposerContext();
 
   useEffect(() => {
+    // Registered at LOW priority so Typeahead and auto-complete plugins intercept Enter first
     return editor.registerCommand(
       KEY_ENTER_COMMAND,
       (event: KeyboardEvent | null) => {
@@ -38,13 +40,17 @@ export function SubmitCommandPlugin({
           return false;
         }
 
-        // Shift + Enter: Explicitly breaks out of Heading/Quote blocks into a regular ParagraphNode
+        // Shift + Enter: Safely splits line, preserving siblings and breaking into clean ParagraphNode
         if (event.shiftKey) {
           event.preventDefault();
           editor.update(() => {
             const selection = $getSelection();
             if (!$isRangeSelection(selection)) {
               return;
+            }
+
+            if (!selection.isCollapsed()) {
+              selection.removeText();
             }
 
             const anchor = selection.anchor;
@@ -54,18 +60,42 @@ export function SubmitCommandPlugin({
                 ? anchorNode
                 : anchorNode.getTopLevelElementOrThrow();
 
-            let afterText = '';
-            if ($isTextNode(anchorNode)) {
-              const fullText = anchorNode.getTextContent();
-              const offset = anchor.offset;
-              anchorNode.setTextContent(fullText.slice(0, offset));
-              afterText = fullText.slice(offset);
+            if (topElement.getTextContent().trim() === '') {
+              const emptyParagraph = $createParagraphNode();
+              topElement.replace(emptyParagraph);
+              emptyParagraph.select(0, 0);
+              return;
             }
 
-            // Always create a clean ParagraphNode so line 2 is regular text and never a heading
+            const afterNodes: LexicalNode[] = [];
+
+            if ($isTextNode(anchorNode)) {
+              const textLength = anchorNode.getTextContentSize();
+              const offset = anchor.offset;
+
+              if (offset > 0 && offset < textLength) {
+                const splitNodes = anchorNode.splitText(offset);
+                afterNodes.push(splitNodes[1]);
+              } else if (offset === 0) {
+                afterNodes.push(anchorNode);
+              }
+
+              let nextSibling: LexicalNode | null = anchorNode.getNextSibling();
+              while (nextSibling) {
+                const next: LexicalNode | null = nextSibling.getNextSibling();
+                afterNodes.push(nextSibling);
+                nextSibling = next;
+              }
+            } else if ($isElementNode(anchorNode)) {
+              const children = anchorNode.getChildren();
+              for (let i = anchor.offset; i < children.length; i++) {
+                afterNodes.push(children[i]);
+              }
+            }
+
             const newParagraph = $createParagraphNode();
-            if (afterText.length > 0) {
-              newParagraph.append($createTextNode(afterText));
+            for (const node of afterNodes) {
+              newParagraph.append(node);
             }
 
             topElement.insertAfter(newParagraph);
@@ -74,14 +104,14 @@ export function SubmitCommandPlugin({
           return true;
         }
 
-        // Plain Enter triggers prompt submission
+        // Plain Enter triggers prompt submission only when no higher-priority plugin handled it
         event.preventDefault();
         if (!disabled) {
           onSubmit();
         }
         return true;
       },
-      COMMAND_PRIORITY_CRITICAL
+      COMMAND_PRIORITY_LOW
     );
   }, [editor, onSubmit, disabled]);
 

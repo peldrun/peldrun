@@ -1,8 +1,6 @@
 // Path: frontend/src/components/chat/composer/registry/command-registry.ts
 
-import { useEffect, useState } from 'react';
-
-export type CommandCategory = 'system' | 'agent' | 'tool' | 'custom';
+export type CommandCategory = 'system' | 'agent' | 'tool' | 'skill' | 'custom';
 
 export interface SlashCommandExecutionContext {
   clearEditor: () => void;
@@ -20,7 +18,7 @@ export interface SlashCommandItem {
   execute: (context: SlashCommandExecutionContext) => void | Promise<void>;
 }
 
-export type MentionCategory = 'agent' | 'file' | 'tool' | 'custom';
+export type MentionCategory = 'agent' | 'tool' | 'skill' | 'file' | 'custom';
 
 export interface MentionItem {
   id: string;
@@ -42,10 +40,7 @@ export type DynamicMentionProvider = (
 ) => Promise<MentionItem[]> | MentionItem[];
 
 /**
- * Strict Client-side Files Filter:
- * Does NOT require modifying backend files.py.
- * Purely filters out external storage directories, limiting autocomplete
- * strictly to the active workspace folder or the active chat session's deliverables.
+ * Client-side Workspace Files Provider.
  */
 async function sessionWorkspaceFilesProvider(
   query = '',
@@ -67,13 +62,11 @@ async function sessionWorkspaceFilesProvider(
     const filtered = filesList.filter((f) => {
       const normalizedPath = (f.path || f.rel_root || '').replace(/\\/g, '/');
 
-      // 1. If an active chat exists, allow its specific files folder OR workspace root
       if (targetChatId) {
         const isThisChatFile = normalizedPath.includes(`chats/${targetChatId}/files/`);
         const isWorkspaceFile = f.origin === 'workspace' || normalizedPath.startsWith('workspace/');
         if (!isThisChatFile && !isWorkspaceFile) return false;
       } else {
-        // 2. Otherwise strictly restrict to workspace files only, completely hiding internal storage/chats
         const isWorkspaceFile = f.origin === 'workspace' || normalizedPath.startsWith('workspace/');
         if (!isWorkspaceFile) return false;
       }
@@ -95,6 +88,104 @@ async function sessionWorkspaceFilesProvider(
   }
 }
 
+/**
+ * Dynamic Store & Core Agents Provider:
+ * Automatically loads built-in agents and store-installed agents into the @ selector.
+ */
+async function storeAgentsProvider(query = ''): Promise<MentionItem[]> {
+  if (typeof window === 'undefined') return [];
+
+  try {
+    let agentsList: any[] = [];
+    const res = await fetch('/api/agents');
+    if (res.ok) {
+      const data = await res.json();
+      agentsList = Array.isArray(data) ? data : data.agents || [];
+    } else {
+      const fallbackRes = await fetch('/api/store/agents');
+      if (fallbackRes.ok) {
+        const fallbackData = await fallbackRes.json();
+        agentsList = Array.isArray(fallbackData) ? fallbackData : fallbackData.agents || [];
+      }
+    }
+
+    const lower = query.toLowerCase();
+    const filtered = agentsList.filter((a) => {
+      const id = String(a.id || '').toLowerCase();
+      const name = String(a.name || '').toLowerCase();
+      return !lower || id.includes(lower) || name.includes(lower);
+    });
+
+    return filtered.map((a) => ({
+      id: `agent-${a.id}`,
+      label: `@${a.id}`,
+      description: a.name ? `${a.name} —${a.description || 'Agent'}` : a.description || 'Agent',
+      category: 'agent' as MentionCategory,
+      insertText: `@${a.id} `,
+      icon: 'Bot',
+      metadata: {
+        agentId: a.id,
+        name: a.name,
+        systemPrompt: a.system_prompt,
+        tools: a.tools,
+      },
+    }));
+  } catch (err) {
+    console.debug('[CommandRegistry] Notice: Could not load store agents:', err);
+    return [];
+  }
+}
+
+/**
+ * Dynamic Store & Tools/MCP Provider:
+ * Automatically queries active tools, plugins, and MCP capabilities.
+ */
+async function storeToolsProvider(query = ''): Promise<MentionItem[]> {
+  if (typeof window === 'undefined') return [];
+
+  try {
+    let toolsList: any[] = [];
+    const res = await fetch('/api/tools');
+    if (res.ok) {
+      const data = await res.json();
+      toolsList = Array.isArray(data) ? data : data.tools || [];
+    } else {
+      const storeRes = await fetch('/api/store/tools');
+      if (storeRes.ok) {
+        const storeData = await storeRes.json();
+        toolsList = Array.isArray(storeData) ? storeData : storeData.tools || [];
+      }
+    }
+
+    const lower = query.toLowerCase();
+    const filtered = toolsList.filter((t) => {
+      const id = String(t.id || t.name || '').toLowerCase();
+      const desc = String(t.description || '').toLowerCase();
+      return !lower || id.includes(lower) || desc.includes(lower);
+    });
+
+    return filtered.map((t) => {
+      const toolId = t.id || t.name;
+      return {
+        id: `tool-${toolId}`,
+        label: `@${toolId}`,
+        description: t.description || 'Callable tool capability',
+        category: 'tool' as MentionCategory,
+        insertText: `@${toolId} `,
+        icon: 'Wrench',
+        metadata: {
+          toolId: toolId,
+          name: t.name,
+          parameters: t.parameters,
+        },
+      };
+    });
+  } catch (err) {
+    console.debug('[CommandRegistry] Notice: Could not load store tools:', err);
+    return [];
+  }
+}
+
 class CommandRegistryStore {
   private slashCommands: Map<string, SlashCommandItem> = new Map();
   private staticMentions: Map<string, MentionItem> = new Map();
@@ -104,6 +195,8 @@ class CommandRegistryStore {
   constructor() {
     this.registerDefaultCommands();
     this.registerMentionProvider(sessionWorkspaceFilesProvider);
+    this.registerMentionProvider(storeAgentsProvider);
+    this.registerMentionProvider(storeToolsProvider);
     this.setupExternalEventListener();
   }
 
@@ -156,7 +249,8 @@ class CommandRegistryStore {
       description: 'Switch execution mode to Autonomous Agent',
       category: 'system',
       icon: 'Bot',
-      execute: ({ dispatchCustomEvent }) => {
+      execute: ({ clearEditor, dispatchCustomEvent }) => {
+        clearEditor();
         dispatchCustomEvent('omweb:mode-change', 'agent');
       },
     });
@@ -168,7 +262,8 @@ class CommandRegistryStore {
       description: 'Switch execution mode to Direct Chat',
       category: 'system',
       icon: 'MessageSquare',
-      execute: ({ dispatchCustomEvent }) => {
+      execute: ({ clearEditor, dispatchCustomEvent }) => {
+        clearEditor();
         dispatchCustomEvent('omweb:mode-change', 'chat');
       },
     });
@@ -234,7 +329,7 @@ class CommandRegistryStore {
       try {
         return await provider(query, context);
       } catch (err) {
-        console.error('[CommandRegistry] Error in dynamic mention provider:', err);
+        console.debug('[CommandRegistry] Dynamic mention provider exception:', err);
         return [];
       }
     });
@@ -263,3 +358,29 @@ class CommandRegistryStore {
 }
 
 export const commandRegistry = new CommandRegistryStore();
+
+/**
+ * Utility to extract operational directives (@agent and @tool) from the prompt text
+ * to inject directly into the execution engine payload.
+ */
+export function parsePromptDirectives(text: string): {
+  targetAgentId?: string;
+  requestedTools: string[];
+} {
+  const agentMatches = text.match(/@([a-zA-Z0-9_-]+)/g) || [];
+  const requestedTools: string[] = [];
+  let targetAgentId: string | undefined = undefined;
+
+  for (const match of agentMatches) {
+    const id = match.slice(1);
+    if (['peldrun', 'code_architect', 'data_scientist', 'deep_researcher'].includes(id)) {
+      targetAgentId = id;
+    } else if (
+      ['bash', 'browser_use', 'web_search', 'str_replace_editor', 'file_saver', 'python_execute'].includes(id)
+    ) {
+      requestedTools.push(id);
+    }
+  }
+
+  return { targetAgentId, requestedTools };
+}

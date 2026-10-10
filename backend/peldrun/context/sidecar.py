@@ -1,12 +1,4 @@
-"""
-backend/peldrun/context/sidecar.py
-
-Sidecar Builder and Persistence Engine for peldrun-core.
-Implements the non-destructive Sidecar Pattern under RFC-609:
-Constructs, updates, and atomically persists 'session.context.json' alongside
-the presentation-tier 'session.json' without mutating existing frontend records.
-Guarantees strict isolation between historical execution telemetry and active LLM context.
-"""
+# Path: backend/peldrun/context/sidecar.py
 
 from __future__ import annotations
 
@@ -145,7 +137,7 @@ def extract_conversation_and_execution(
 
     Guarantees Architectural Invariant:
     Completed turns NEVER leak their historical tool steps into CurrentExecution.
-    Only active, ongoing turns retain an execution slice.
+    Only the active/latest turn retains an execution slice.
     """
     messages: List[ConversationMessage] = []
     current_exec: Optional[CurrentExecution] = None
@@ -188,45 +180,48 @@ def extract_conversation_and_execution(
                     )
                 )
 
-            # Strict Invariant: Only capture current_execution if the turn is INCOMPLETE
+            # Capture execution telemetry for the latest turn only
             is_latest_turn = idx == len(raw_turns) - 1
-            if is_latest_turn and not is_turn_completed:
+            if is_latest_turn:
                 turn_steps = turn.get("steps") or turn.get("events") or []
-                steps: List[ExecutionStep] = []
-                for step in turn_steps:
-                    if isinstance(step, dict):
-                        st_type = step.get("type", "tool_call")
-                        s_data = step.get("data") if isinstance(step.get("data"), dict) else {}
-                        st_name = (
-                            step.get("toolName")
-                            or step.get("name")
-                            or s_data.get("toolName")
-                            or s_data.get("name")
-                        )
-                        st_args = step.get("args") or s_data.get("arguments") or step.get("content")
-                        if isinstance(st_args, str) and st_args.startswith("{"):
-                            try:
-                                st_args = json.loads(st_args)
-                            except Exception:
-                                st_args = {"raw": st_args}
-                        elif not isinstance(st_args, dict):
-                            st_args = {"raw": str(st_args)} if st_args else None
+                turn_artifacts = turn.get("artifacts") or turn.get("produced_files") or []
 
-                        st_res = step.get("result") or s_data.get("output") or step.get("content")
-                        steps.append(
-                            ExecutionStep(
-                                type=st_type if st_type in ("tool_call", "observation", "status") else "status",
-                                name=st_name,
-                                args=st_args,
-                                result=str(st_res) if st_res is not None else None,
-                                error=step.get("error") or s_data.get("error"),
+                if turn_steps or turn_artifacts:
+                    steps: List[ExecutionStep] = []
+                    for step in turn_steps:
+                        if isinstance(step, dict):
+                            st_type = step.get("type", "tool_call")
+                            s_data = step.get("data") if isinstance(step.get("data"), dict) else {}
+                            st_name = (
+                                step.get("toolName")
+                                or step.get("name")
+                                or s_data.get("toolName")
+                                or s_data.get("name")
                             )
-                        )
-                current_exec = CurrentExecution(
-                    turn_id=turn_id,
-                    steps=steps,
-                    artifacts=turn.get("artifacts") or turn.get("produced_files") or [],
-                )
+                            st_args = step.get("args") or s_data.get("arguments") or step.get("content")
+                            if isinstance(st_args, str) and st_args.startswith("{"):
+                                try:
+                                    st_args = json.loads(st_args)
+                                except Exception:
+                                    st_args = {"raw": st_args}
+                            elif not isinstance(st_args, dict):
+                                st_args = {"raw": str(st_args)} if st_args else None
+
+                            st_res = step.get("result") or s_data.get("output") or step.get("content")
+                            steps.append(
+                                ExecutionStep(
+                                    type=st_type if st_type in ("tool_call", "observation", "status") else "status",
+                                    name=st_name,
+                                    args=st_args,
+                                    result=str(st_res) if st_res is not None else None,
+                                    error=step.get("error") or s_data.get("error"),
+                                )
+                            )
+                    current_exec = CurrentExecution(
+                        turn_id=turn_id,
+                        steps=steps,
+                        artifacts=turn_artifacts,
+                    )
 
     elif raw_messages and isinstance(raw_messages, list):
         for idx, msg in enumerate(raw_messages):

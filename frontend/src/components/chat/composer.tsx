@@ -2,7 +2,7 @@
 
 "use client";
 
-import React, { useState, useEffect, useRef, useMemo } from "react";
+import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { useParams } from "next/navigation";
 import {
   Send,
@@ -14,6 +14,8 @@ import {
   X,
   Maximize2,
   Minimize2,
+  RotateCcw,
+  AlertCircle,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AgentSelector } from "./agent-selector";
@@ -25,10 +27,10 @@ import { useAppStorage } from "@/hooks/use-app-storage";
 import { inferModelCapabilities, fetchServerMetadata } from "@/lib/modelMetadata";
 import { LexicalEditorComponent } from "./composer/lexical-editor";
 import { LexicalEditorHandle } from "./composer/types";
-import { commandRegistry } from "./composer/registry/command-registry";
+import { commandRegistry, parsePromptDirectives, MentionItem } from "./composer/registry/command-registry";
 
 interface ComposerProps {
-  onSend: (text: string, files?: File[], llmOverride?: any) => void;
+  onSend: (text: string, files?: File[], llmOverride?: any) => Promise<void> | void;
   onStop?: () => void;
   isRunning?: boolean;
   disabled?: boolean;
@@ -53,35 +55,80 @@ export function Composer({
   const [isDragging, setIsDragging] = useState(false);
   const [metadataVault, setMetadataVault] = useState<Record<string, any>>({});
   const [isExpanded, setIsExpanded] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
-  // Unified multi-tier reactive storage
+  const [failedDraft, setFailedDraft] = useState<{
+    text: string;
+    files: File[];
+  } | null>(null);
+  const backupDraftRef = useRef<{
+    text: string;
+    files: File[];
+  } | null>(null);
+
+  const draftStorageKey = useMemo(
+    () => `peldrun_composer_draft_${activeSessionId || "default"}`,
+    [activeSessionId]
+  );
+
   const [activeModel, setActiveModel] = useAppStorage("active_model");
   const [activeProvider, setActiveProvider] = useAppStorage("active_provider");
   const [execMode, setExecMode] = useAppStorage("exec_mode");
   const [reasoningEffort] = useAppStorage("reasoning_effort");
   const [activeLlmOverride] = useAppStorage("active_llm_override");
 
-  const { selectedAgentId } = useChatStore();
+  const { selectedAgentId, setSelectedAgentId } = useChatStore();
 
   const editorRef = useRef<LexicalEditorHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Register built-in agent mention
+  // Dynamic Mention Selection Listener: automatically activates referenced agent
   useEffect(() => {
-    const unregisterPeldrun = commandRegistry.registerMentionItem({
-      id: "agent-peldrun",
-      label: "@peldrun",
-      description: "Autonomous Master Agent",
-      category: "agent",
-      insertText: "@peldrun ",
-    });
-
-    return () => {
-      unregisterPeldrun();
+    const handleMentionSelect = (e: CustomEvent<MentionItem>) => {
+      const item = e.detail;
+      if (item && item.category === "agent" && item.metadata?.agentId) {
+        setSelectedAgentId(String(item.metadata.agentId));
+        setExecMode("agent");
+      }
     };
-  }, []);
 
-  // Synchronize server metadata for dynamic capability resolution
+    window.addEventListener("peldrun:mention-selected", handleMentionSelect as EventListener);
+    return () => {
+      window.removeEventListener("peldrun:mention-selected", handleMentionSelect as EventListener);
+    };
+  }, [setSelectedAgentId, setExecMode]);
+
+  // Restore uncommitted draft from sessionStorage on session mount
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const saved = sessionStorage.getItem(draftStorageKey);
+      if (saved) {
+        const timer = setTimeout(() => {
+          if (editorRef.current && !editorRef.current.getText()) {
+            editorRef.current.setText(saved);
+            setText(saved);
+          }
+        }, 50);
+        return () => clearTimeout(timer);
+      }
+    } catch {}
+  }, [draftStorageKey]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const onJobFailed = () => {
+      const currentEditorText = editorRef.current ? editorRef.current.getText() : text;
+      if (!currentEditorText.trim() && backupDraftRef.current) {
+        setFailedDraft(backupDraftRef.current);
+      }
+    };
+
+    window.addEventListener("omweb:job-error", onJobFailed);
+    return () => window.removeEventListener("omweb:job-error", onJobFailed);
+  }, [text]);
+
   useEffect(() => {
     fetchServerMetadata().then((data) => setMetadataVault(data || {}));
     const onMetadataUpdate = (e: any) => setMetadataVault(e.detail || {});
@@ -89,7 +136,6 @@ export function Composer({
     return () => window.removeEventListener("omweb:metadata-updated", onMetadataUpdate);
   }, []);
 
-  // Listen to live engine and model changes
   useEffect(() => {
     if (typeof window !== "undefined") {
       const onModelChange = (e: any) => {
@@ -115,22 +161,30 @@ export function Composer({
     }
   };
 
-  const getActivePayload = () => {
+  const getActivePayload = (inputText = "") => {
     const isReasoning = isReasoningSupported;
     const effectiveEffort = isReasoning ? (reasoningEffort || "none") : "none";
 
-    let base = {
+    // Extract runtime directives from mentions in the prompt text
+    const { targetAgentId, requestedTools } = parsePromptDirectives(inputText);
+    const effectiveAgentId = targetAgentId || selectedAgentId || "peldrun";
+
+    let base: Record<string, any> = {
       model: activeModel,
       provider: activeProvider.toLowerCase().replace(/[^a-z0-9]/g, ""),
       provider_name: activeProvider,
       base_url: "http://127.0.0.1:1234/v1",
       api_key: "",
       api_type: "",
-      mode: execMode,
+      mode: targetAgentId ? "agent" : execMode,
       reasoning_effort: effectiveEffort,
       is_reasoning_model: isReasoning,
-      agent_id: execMode === "agent" ? (selectedAgentId || "peldrun") : "peldrun",
+      agent_id: execMode === "agent" || targetAgentId ? effectiveAgentId : "peldrun",
     };
+
+    if (requestedTools.length > 0) {
+      base.tools = requestedTools;
+    }
 
     if (activeLlmOverride) {
       try {
@@ -138,7 +192,7 @@ export function Composer({
         return {
           ...base,
           ...parsed,
-          mode: execMode,
+          mode: base.mode,
           reasoning_effort: effectiveEffort,
           is_reasoning_model: isReasoning,
           agent_id: base.agent_id,
@@ -181,14 +235,92 @@ export function Composer({
     setIsDragging(false);
   };
 
-  const handleSend = () => {
+  const handleEditorChange = useCallback(
+    (val: string) => {
+      setText(val);
+      if (typeof window !== "undefined") {
+        try {
+          if (val.trim()) {
+            sessionStorage.setItem(draftStorageKey, val);
+          } else {
+            sessionStorage.removeItem(draftStorageKey);
+          }
+        } catch {}
+      }
+    },
+    [draftStorageKey]
+  );
+
+  const handleRestoreDraft = () => {
+    if (!failedDraft) return;
+    if (editorRef.current) {
+      editorRef.current.setText(failedDraft.text);
+    }
+    setText(failedDraft.text);
+    setAttachedFiles(failedDraft.files);
+    setFailedDraft(null);
+  };
+
+  const handleSend = async () => {
     const rawText = editorRef.current ? editorRef.current.getText() : text;
-    if ((!rawText.trim() && attachedFiles.length === 0) || isRunning || disabled) return;
-    const currentPayload = getActivePayload();
-    onSend(rawText.trim(), attachedFiles.length > 0 ? attachedFiles : undefined, currentPayload);
-    editorRef.current?.clear();
-    setText("");
-    setAttachedFiles([]);
+    const trimmedText = rawText.trim();
+
+    if (
+      (!trimmedText && attachedFiles.length === 0) ||
+      isRunning ||
+      disabled ||
+      isSubmitting
+    ) {
+      return;
+    }
+
+    const currentFiles = [...attachedFiles];
+    const currentPayload = getActivePayload(trimmedText);
+
+    backupDraftRef.current = {
+      text: trimmedText,
+      files: currentFiles,
+    };
+
+    try {
+      setIsSubmitting(true);
+
+      const sendResult = onSend(
+        trimmedText,
+        currentFiles.length > 0 ? currentFiles : undefined,
+        currentPayload
+      );
+
+      if (sendResult && typeof (sendResult as any).then === "function") {
+        await sendResult;
+      }
+
+      editorRef.current?.clear();
+      setText("");
+      setAttachedFiles([]);
+      setFailedDraft(null);
+
+      if (typeof window !== "undefined") {
+        try {
+          sessionStorage.removeItem(draftStorageKey);
+        } catch {}
+      }
+    } catch (error) {
+      console.error("[Composer] Message dispatch failed:", error);
+
+      setFailedDraft({
+        text: trimmedText,
+        files: currentFiles,
+      });
+
+      if (editorRef.current) {
+        editorRef.current.setText(trimmedText);
+      }
+      setText(trimmedText);
+      setAttachedFiles(currentFiles);
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   const formatFileSize = (bytes: number) => {
@@ -197,11 +329,13 @@ export function Composer({
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
 
-  const dynamicPlaceholder = placeholder || (
-    execMode === "agent"
+  const dynamicPlaceholder =
+    placeholder ||
+    (execMode === "agent"
       ? `Ask ${activeProvider} (${activeModel}) to execute autonomous tasks...`
-      : `Chat directly with ${activeProvider} (${activeModel})...`
-  );
+      : `Chat directly with ${activeProvider} (${activeModel})...`);
+
+  const isInputEmpty = !text.trim() && attachedFiles.length === 0;
 
   return (
     <div className="relative w-full max-w-[1000px] mx-auto font-sans">
@@ -212,6 +346,33 @@ export function Composer({
         onChange={handleFileChange}
         className="hidden"
       />
+
+      {failedDraft && (
+        <div className="flex items-center justify-between mb-2 px-3 py-1.5 rounded-lg bg-destructive/10 border border-destructive/20 text-xs text-destructive animate-in fade-in slide-in-from-top-1">
+          <div className="flex items-center gap-2">
+            <AlertCircle size={14} className="shrink-0" />
+            <span>Message dispatch failed. Your draft has been preserved.</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleRestoreDraft}
+              className="font-medium underline hover:opacity-80 flex items-center gap-1 cursor-pointer"
+            >
+              <RotateCcw size={12} />
+              <span>Restore Draft</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setFailedDraft(null)}
+              className="p-0.5 rounded hover:bg-destructive/10 text-muted-foreground hover:text-foreground cursor-pointer"
+              title="Dismiss"
+            >
+              <X size={12} />
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="flex items-center justify-between mb-1.5 px-1">
         <EngineSelector direction="up" />
@@ -260,10 +421,14 @@ export function Composer({
         <LexicalEditorComponent
           ref={editorRef}
           chatId={activeSessionId}
-          placeholder={attachedFiles.length > 0 ? "Add instructions for attached files..." : dynamicPlaceholder}
-          disabled={disabled || isRunning}
+          placeholder={
+            attachedFiles.length > 0
+              ? "Add instructions for attached files..."
+              : dynamicPlaceholder
+          }
+          disabled={disabled || isRunning || isSubmitting}
           onSubmit={handleSend}
-          onChange={(val) => setText(val)}
+          onChange={handleEditorChange}
           contentClassName={
             isExpanded
               ? "min-h-[220px] max-h-[460px] px-4 py-3"
@@ -272,6 +437,11 @@ export function Composer({
           onClearEditor={() => {
             editorRef.current?.clear();
             setText("");
+            if (typeof window !== "undefined") {
+              try {
+                sessionStorage.removeItem(draftStorageKey);
+              } catch {}
+            }
           }}
         />
 
@@ -282,7 +452,8 @@ export function Composer({
               variant="ghost"
               size="sm"
               onClick={() => fileInputRef.current?.click()}
-              className="h-8 w-8 p-0 text-muted-foreground hover:text-foreground cursor-pointer hover:bg-muted relative"
+              disabled={disabled || isRunning || isSubmitting}
+              className="h-8 w-8 p-0 text-muted-foreground hover:text-foreground cursor-pointer hover:bg-muted relative disabled:opacity-40"
               title="Attach files or images"
             >
               <Paperclip size={15} />
@@ -295,7 +466,8 @@ export function Composer({
               <button
                 type="button"
                 onClick={() => handleModeChange("agent")}
-                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md transition-all font-medium cursor-pointer ${
+                disabled={disabled || isRunning || isSubmitting}
+                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md transition-all font-medium cursor-pointer disabled:opacity-40 ${
                   execMode === "agent"
                     ? "bg-card text-foreground shadow-xs font-semibold"
                     : "text-muted-foreground hover:text-foreground"
@@ -308,7 +480,8 @@ export function Composer({
               <button
                 type="button"
                 onClick={() => handleModeChange("chat")}
-                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md transition-all font-medium cursor-pointer ${
+                disabled={disabled || isRunning || isSubmitting}
+                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md transition-all font-medium cursor-pointer disabled:opacity-40 ${
                   execMode === "chat"
                     ? "bg-card text-foreground shadow-xs font-semibold"
                     : "text-muted-foreground hover:text-foreground"
@@ -322,13 +495,13 @@ export function Composer({
 
             {isReasoningSupported && (
               <div className="animate-in fade-in zoom-in-95 duration-200">
-                <ReasoningEffortSelector disabled={disabled || isRunning} />
+                <ReasoningEffortSelector disabled={disabled || isRunning || isSubmitting} />
               </div>
             )}
 
             {execMode === "agent" && (
               <div className="animate-in fade-in duration-150 flex items-center gap-1.5">
-                <AgentSelector disabled={disabled || isRunning} />
+                <AgentSelector disabled={disabled || isRunning || isSubmitting} />
                 <ActiveToolsModal />
               </div>
             )}
@@ -360,11 +533,11 @@ export function Composer({
               <Button
                 type="button"
                 onClick={handleSend}
-                disabled={(!text.trim() && attachedFiles.length === 0) || disabled}
+                disabled={isInputEmpty || disabled || isSubmitting}
                 size="sm"
                 className="h-8 px-3.5 text-xs bg-primary text-primary-foreground hover:opacity-90 flex items-center gap-1.5 cursor-pointer shadow-xs disabled:opacity-40"
               >
-                <span>Send</span>
+                <span>{isSubmitting ? "Sending..." : "Send"}</span>
                 <Send size={13} />
               </Button>
             )}

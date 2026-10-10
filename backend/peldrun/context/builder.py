@@ -1,11 +1,4 @@
-"""
-backend/peldrun/context/builder.py
-
-Context Assembly and Prompt Synthesis Engine for peldrun-core.
-Implements the Microsoft Context Contract and RFC-609 Separation Policy:
-Constructs structured LLM prompt messages from session.context.json, enforcing
-strict architectural isolation between persistent history and LLM active context.
-"""
+# Path: backend/peldrun/context/builder.py
 
 from __future__ import annotations
 
@@ -79,33 +72,34 @@ class ContextManager:
         current_user_message: str = "",
         system_prompt: Optional[str] = None,
         project_rules: Optional[str] = None,
-        include_execution: bool = False,
+        include_execution: bool = True,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         """
         Assemble the architectural context tiers in deterministic sequence:
-        1. Unified System Directive (System instructions + Project rules)
-        2. Compacted Context Summary (Summary slice)
-        3. Sanitized Recent Dialogue (Filtered to prevent duplicating summary or current prompt)
-        4. Ongoing Execution Telemetry (Omitted for new turns, included only when actively stepping)
-        5. Current User Input (Current slice)
+        1. System Directive (Tier 1A)
+        2. Project Rules (Tier 1B)
+        3. Compacted Context Summary (Tier 2)
+        4. Sanitized Recent Dialogue (Tier 3)
+        5. Ongoing Execution Telemetry (Tier 4)
+        6. Current User Input (Tier 5)
         """
-        # Tier 1: Unified System Directive
+        system_msgs: List[Dict[str, Any]] = []
+
+        # Tier 1A: Base System Directive
         effective_system = (
             system_prompt
             if system_prompt is not None
             else self.default_system_prompt
         )
-
-        system_blocks: List[str] = []
         if effective_system and effective_system.strip():
-            system_blocks.append(effective_system.strip())
+            system_msgs.append({"role": "system", "content": effective_system.strip()})
 
+        # Tier 1B: Explicit Project Rules Block
         if project_rules and project_rules.strip():
-            system_blocks.append(f"[Project Rules]\n{project_rules.strip()}")
-
-        system_msgs: List[Dict[str, Any]] = []
-        if system_blocks:
-            system_msgs.append({"role": "system", "content": "\n\n".join(system_blocks)})
+            rules_content = project_rules.strip()
+            if not rules_content.startswith("[Project Rules]"):
+                rules_content = f"[Project Rules]\n{rules_content}"
+            system_msgs.append({"role": "system", "content": rules_content})
 
         # Tier 2: Compacted Context Summary & Covered Turns Identification
         summary_msgs: List[Dict[str, Any]] = []
@@ -136,7 +130,7 @@ class ContextManager:
                         continue
                     recent_msgs.append({"role": msg.role, "content": msg.content})
 
-        # Tier 4: Execution State (Only for ongoing active turns)
+        # Tier 4: Execution State (Only included when actively requested or stepping)
         exec_msgs: List[Dict[str, Any]] = []
         if include_execution and sidecar and sidecar.current_execution:
             formatted_exec = self._format_execution_telemetry(sidecar.current_execution)

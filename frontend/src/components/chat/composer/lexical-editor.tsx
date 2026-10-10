@@ -17,14 +17,19 @@ import { HistoryPlugin } from '@lexical/react/LexicalHistoryPlugin';
 import { OnChangePlugin } from '@lexical/react/LexicalOnChangePlugin';
 import { LexicalErrorBoundary } from '@lexical/react/LexicalErrorBoundary';
 import { MarkdownShortcutPlugin } from '@lexical/react/LexicalMarkdownShortcutPlugin';
+import { LinkPlugin } from '@lexical/react/LexicalLinkPlugin';
+import { AutoLinkPlugin, LinkMatcher } from '@lexical/react/LexicalAutoLinkPlugin';
 import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext';
 import { HeadingNode, QuoteNode } from '@lexical/rich-text';
+import { AutoLinkNode, LinkNode } from '@lexical/link';
 import {
   $createParagraphNode,
-  $createTextNode,$getRoot,
+  $createTextNode,
+  $getRoot,
   EditorState,
   LexicalEditor,
 } from 'lexical';
+import { $convertFromMarkdownString } from '@lexical/markdown';
 
 import { SubmitCommandPlugin } from './submit-command-plugin';
 import { TypeaheadMenuPlugin } from './plugins/typeahead-menu-plugin';
@@ -32,6 +37,20 @@ import { MarkdownClipboardPlugin } from './plugins/markdown-clipboard-plugin';
 import { FloatingToolbarPlugin } from './plugins/floating-toolbar-plugin';
 import { COMPOSER_TRANSFORMERS, extractCleanText } from './serialization';
 import { LexicalEditorHandle, LexicalEditorProps } from './types';
+
+const URL_MATCHER: LinkMatcher = (text: string) => {
+  const match = /(?:https?:\/\/|www\.)[^\s<]+[^\s`!()\[\]{};:'".,<>?«»“”‘’]/i.exec(text);
+  if (!match) return null;
+  const fullUrl = match[0];
+  return {
+    index: match.index,
+    length: fullUrl.length,
+    text: fullUrl,
+    url: fullUrl.startsWith('http') ? fullUrl : `https://${fullUrl}`,
+  };
+};
+
+const MATCHERS: LinkMatcher[] = [URL_MATCHER];
 
 interface EditorRefPluginProps {
   onEditorReady: (editor: LexicalEditor) => void;
@@ -118,11 +137,23 @@ export const LexicalEditorComponent = forwardRef<
           editorInstanceRef.current.update(() => {
             const root = $getRoot();
             root.clear();
-            const paragraph = $createParagraphNode();
-            if (newText) {
-              paragraph.append($createTextNode(newText));
+            if (!newText || !newText.trim()) {
+              const paragraph = $createParagraphNode();
+              root.append(paragraph);
+              return;
             }
-            root.append(paragraph);
+
+            try {
+              $convertFromMarkdownString(newText, COMPOSER_TRANSFORMERS);
+            } catch {
+              const paragraph = $createParagraphNode();
+              paragraph.append($createTextNode(newText));
+              root.append(paragraph);
+            }
+
+            if (root.isEmpty()) {
+              root.append($createParagraphNode());
+            }
           });
         }
       },
@@ -137,8 +168,8 @@ export const LexicalEditorComponent = forwardRef<
   const handleChange = useCallback(
     (_editorState: EditorState, editor: LexicalEditor) => {
       if (!onChange) return;
-      const text = extractCleanText(editor);
-      onChange(text);
+      const currentMarkdown = extractCleanText(editor);
+      onChange(currentMarkdown);
     },
     [onChange]
   );
@@ -146,7 +177,7 @@ export const LexicalEditorComponent = forwardRef<
   const initialConfig = useMemo(
     () => ({
       namespace: 'PeldrunComposer',
-      nodes: [HeadingNode, QuoteNode],
+      nodes: [HeadingNode, QuoteNode, LinkNode, AutoLinkNode],
       editable: !disabled,
       theme: {
         paragraph: 'mb-0 leading-normal text-start text-foreground',
@@ -156,6 +187,7 @@ export const LexicalEditorComponent = forwardRef<
           h3: 'text-lg font-semibold mb-1 mt-0.5 text-start text-foreground',
         },
         quote: 'border-s-2 border-border ps-3 text-muted-foreground italic my-1',
+        link: 'peldrun-editor-link',
         text: {
           bold: 'font-bold text-foreground',
           italic: 'italic text-foreground',
@@ -170,7 +202,7 @@ export const LexicalEditorComponent = forwardRef<
   );
 
   return (
-    <div className="relative w-full text-start">
+    <div className="relative w-full text-start peldrun-composer-root">
       <LexicalComposer initialConfig={initialConfig}>
         <EditorRefPlugin
           onEditorReady={handleEditorReady}
@@ -197,10 +229,13 @@ export const LexicalEditorComponent = forwardRef<
         <HistoryPlugin />
         <OnChangePlugin onChange={handleChange} />
         <MarkdownShortcutPlugin transformers={COMPOSER_TRANSFORMERS} />
+        <LinkPlugin />
+        <AutoLinkPlugin matchers={MATCHERS} />
         <MarkdownClipboardPlugin />
         <FloatingToolbarPlugin />
-        <SubmitCommandPlugin onSubmit={handleSubmit} disabled={disabled} />
+        {/* Typeahead is registered before Submit to ensure menu capture on Enter */}
         <TypeaheadMenuPlugin onClearEditor={onClearEditor} chatId={chatId} />
+        <SubmitCommandPlugin onSubmit={handleSubmit} disabled={disabled} />
       </LexicalComposer>
     </div>
   );

@@ -5,9 +5,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext';
 import {
-  $createParagraphNode,$getRoot,
-  $getSelection,$isElementNode,
-  $isRangeSelection,$isTextNode,
+  $createParagraphNode,
+  $getRoot,
+  $getSelection,
+  $isElementNode,
+  $isRangeSelection,
+  $isTextNode,
   COMMAND_PRIORITY_CRITICAL,
   KEY_ARROW_DOWN_COMMAND,
   KEY_ARROW_UP_COMMAND,
@@ -16,7 +19,7 @@ import {
   KEY_TAB_COMMAND,
   LexicalEditor,
 } from 'lexical';
-import { Bot, FileText, MessageSquare, Sparkles, Terminal, Wrench } from 'lucide-react';
+import { Bot, FileText, Sparkles, Terminal, Wrench } from 'lucide-react';
 import { commandRegistry, MentionItem, SlashCommandItem } from '../registry/command-registry';
 
 interface TypeaheadMenuPluginProps {
@@ -34,7 +37,9 @@ function getTextBeforeCaret(editor: LexicalEditor): string {
     const anchor = selection.anchor;
     const anchorNode = anchor.getNode();
 
-    if ($isTextNode(anchorNode)) {       textBeforeCaret = anchorNode.getTextContent().slice(0, anchor.offset);     } else if ($isElementNode(anchorNode)) {
+    if ($isTextNode(anchorNode)) {
+      textBeforeCaret = anchorNode.getTextContent().slice(0, anchor.offset);
+    } else if ($isElementNode(anchorNode)) {
       const children = anchorNode.getChildren();
       let accumulated = '';
       const childIndex = anchor.offset;
@@ -124,15 +129,25 @@ export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPlug
       const selectedItem: SlashCommandItem | undefined = slashResults[selectedIndex];
       if (!selectedItem) return false;
 
+      // Cleanly remove the slash trigger command from the editor state
       editor.update(() => {
         const selection = $getSelection();
         if ($isRangeSelection(selection)) {
           const anchorNode = selection.anchor.getNode();
           if ($isTextNode(anchorNode)) {
             const text = anchorNode.getTextContent();
-            const newText = text.replace(new RegExp(`/${queryString}$`), '');
+            const pattern = new RegExp(`\\/${queryString}$`);
+            const newText = text.replace(pattern, '');
             anchorNode.setTextContent(newText);
-            anchorNode.select();
+            if (newText.trim() === '') {
+              const root = $getRoot();
+              root.clear();
+              const p = $createParagraphNode();
+              root.append(p);
+              p.select(0, 0);
+            } else {
+              anchorNode.select();
+            }
           }
         }
       });
@@ -178,12 +193,20 @@ export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPlug
           const anchorNode = selection.anchor.getNode();
           if ($isTextNode(anchorNode)) {
             const text = anchorNode.getTextContent();
-            const newText = text.replace(new RegExp(`@${queryString}$`), selectedItem.insertText);
+            const pattern = new RegExp(`@${queryString}$`);
+            const newText = text.replace(pattern, selectedItem.insertText);
             anchorNode.setTextContent(newText);
             anchorNode.select();
           }
         }
       });
+
+      // Notify host composer about referenced entity selection
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(
+          new CustomEvent('peldrun:mention-selected', { detail: selectedItem })
+        );
+      }
 
       setIsOpen(false);
       return true;
@@ -283,18 +306,18 @@ export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPlug
       className="absolute bottom-full mb-2 start-0 z-[9999] w-80 max-h-64 overflow-y-auto rounded-xl border border-border/80 bg-popover/95 p-1 text-popover-foreground shadow-2xl backdrop-blur-md animate-in fade-in zoom-in-95 duration-150 font-sans"
     >
       <div className="px-2 py-1 text-[10px] font-semibold tracking-wider text-muted-foreground uppercase flex items-center justify-between border-b border-border/40 mb-1">
-        <span>{triggerType === 'slash' ? 'Slash Commands' : 'Context Mentions'}</span>
+        <span>{triggerType === 'slash' ? 'Slash Commands' : 'Context & Store Mentions'}</span>
         <span className="font-mono text-[9px]">Tab / Enter to select</span>
       </div>
 
       {isLoading ? (
         <div className="flex items-center justify-center gap-2 py-4 text-xs text-muted-foreground">
           <Sparkles size={14} className="animate-spin text-primary" />
-          <span>Searching items...</span>
+          <span>Querying available capabilities...</span>
         </div>
       ) : activeResultsCount === 0 ? (
         <div className="py-4 text-center text-xs text-muted-foreground">
-          No {triggerType === 'slash' ? 'commands' : 'chat files'} found
+          No {triggerType === 'slash' ? 'commands' : 'matching items'} found
         </div>
       ) : (
         <div className="flex flex-col gap-0.5">
@@ -305,8 +328,12 @@ export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPlug
                 <button
                   key={item.id}
                   type="button"
+                  onMouseDown={(e) => e.preventDefault()}
                   onMouseEnter={() => setSelectedIndex(index)}
-                  onClick={handleExecuteSelection}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    handleExecuteSelection();
+                  }}
                   className={`flex items-center gap-2.5 w-full px-2.5 py-1.5 rounded-lg text-start text-xs transition-colors cursor-pointer ${
                     isSelected
                       ? 'bg-primary text-primary-foreground font-medium'
@@ -347,8 +374,12 @@ export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPlug
                 <button
                   key={item.id}
                   type="button"
+                  onMouseDown={(e) => e.preventDefault()}
                   onMouseEnter={() => setSelectedIndex(index)}
-                  onClick={handleExecuteSelection}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    handleExecuteSelection();
+                  }}
                   className={`flex items-center gap-2.5 w-full px-2.5 py-1.5 rounded-lg text-start text-xs transition-colors cursor-pointer ${
                     isSelected
                       ? 'bg-primary text-primary-foreground font-medium'
@@ -362,6 +393,8 @@ export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPlug
                   >
                     {item.category === 'agent' ? (
                       <Bot size={13} />
+                    ) : item.category === 'tool' ? (
+                      <Wrench size={13} />
                     ) : item.category === 'file' ? (
                       <FileText size={13} />
                     ) : (
@@ -369,7 +402,12 @@ export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPlug
                     )}
                   </div>
                   <div className="flex flex-col min-w-0 flex-1">
-                    <span className="font-mono font-medium truncate">{item.label}</span>
+                    <div className="flex items-center gap-1.5">
+                      <span className="font-mono font-medium truncate">{item.label}</span>
+                      <span className="text-[9px] uppercase px-1 py-0.2 rounded bg-muted/80 text-muted-foreground font-mono">
+                        {item.category}
+                      </span>
+                    </div>
                     {item.description && (
                       <span
                         className={`text-[10px] truncate ${

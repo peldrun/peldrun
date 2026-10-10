@@ -139,7 +139,7 @@ class PeldrunEngine(ExecutionEngine):
                 storage_root=project_manager.storage_dir,
             )
 
-        # 2. Assemble Sanitized Prompt Context via ContextManager
+         # 2. Assemble Sanitized Prompt Context via ContextManager
         context_mgr = ContextManager(default_system_prompt=system_prompt)
         context_messages, context_usage = context_mgr.build_messages(
             sidecar=sidecar,
@@ -149,11 +149,13 @@ class PeldrunEngine(ExecutionEngine):
             include_execution=False,  # Clean initial state for new task turn
         )
 
+        effective_context_tokens = context_usage.get("total_tokens", context_usage.get("total", 0))
+
         logger.info(
             "[CONTEXT HARDENING] Assembled %d context messages for job %s (Tokens: %s)",
             len(context_messages),
             job_id,
-            context_usage.get("total", 0),
+            effective_context_tokens,
         )
 
         # 3. Resolve custom Web tools to adapt into Core tools
