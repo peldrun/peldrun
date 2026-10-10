@@ -130,12 +130,14 @@ class ContextManager:
                         continue
                     recent_msgs.append({"role": msg.role, "content": msg.content})
 
-        # Tier 4: Execution State (Only included when actively requested or stepping)
+        # Tier 4: Execution State (Only included when actively requested AND in non-terminal state)
         exec_msgs: List[Dict[str, Any]] = []
         if include_execution and sidecar and sidecar.current_execution:
-            formatted_exec = self._format_execution_telemetry(sidecar.current_execution)
-            if formatted_exec:
-                exec_msgs.append({"role": "system", "content": formatted_exec})
+            exec_status = getattr(sidecar.current_execution, "status", "running")
+            if exec_status in ("running", "waiting_for_user"):
+                formatted_exec = self._format_execution_telemetry(sidecar.current_execution)
+                if formatted_exec:
+                    exec_msgs.append({"role": "system", "content": formatted_exec})
 
         # Tier 5: Current User Message
         current_msgs: List[Dict[str, Any]] = []

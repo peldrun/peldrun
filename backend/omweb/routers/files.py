@@ -1,9 +1,9 @@
-﻿"""
-backend/omweb/routers/files.py
-
+﻿# Path: backend/omweb/routers/files.py
+"""
 Workspace Files Router.
-Provides file tree scanning, download, deletion, and direct content editing persistence.
-Hardened under Phase M2 & Stabilization:
+Provides file tree scanning, upload, download, deletion, and direct content editing persistence.
+Hardened under Phase M2 & Release Bug Fixes:
+- Added canonical multi-file upload endpoint supporting dual-tier persistence (workspace & chat session).
 - Extended multi-tier lookup (root, workspace, storage/chats) to prevent 404 errors on deliverables.
 """
 
@@ -11,7 +11,7 @@ import os
 import shutil
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -112,7 +112,7 @@ async def list_workspace_files():
         ("chats", CHATS_DIR),
         ("projects", PROJECTS_DIR)
     ]
-    
+
     for origin, base_path in dirs_to_scan:
         if base_path.exists():
             for entry in base_path.rglob("*"):
@@ -139,6 +139,64 @@ async def list_workspace_files():
         "storage": str(STORAGE_DIR),
         "files": sorted_artifacts,
         "total_count": len(sorted_artifacts)
+    }
+
+
+@router.post("/upload")
+async def upload_workspace_files(
+    files: List[UploadFile] = File(...),
+    chat_id: Optional[str] = Form(None),
+    job_id: Optional[str] = Form(None),
+):
+    """
+    Upload and persist user attachments into the agent workspace and chat storage.
+    Enforces dual-tier storage for seamless immediate tool inspection and historical archiving.
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided for upload")
+
+    uploaded_records: List[Dict[str, Any]] = []
+
+    for file in files:
+        raw_name = file.filename or "uploaded_attachment"
+        clean_filename = Path(raw_name).name
+
+        if not clean_filename:
+            continue
+
+        try:
+            content = await file.read()
+
+            # 1. Primary write to workspace root so agent tools can inspect immediately
+            workspace_target = WORKSPACE_DIR / clean_filename
+            workspace_target.write_bytes(content)
+
+            # 2. Secondary write to chat session storage for historical durability
+            if chat_id:
+                chat_files_dir = CHATS_DIR / chat_id / "files"
+                chat_files_dir.mkdir(parents=True, exist_ok=True)
+                chat_target = chat_files_dir / clean_filename
+                chat_target.write_bytes(content)
+
+            rel_workspace_path = str(workspace_target.relative_to(PROJECT_ROOT)).replace("\\", "/")
+
+            uploaded_records.append({
+                "name": clean_filename,
+                "path": rel_workspace_path,
+                "size": len(content),
+                "type": detect_file_type(clean_filename),
+            })
+        except Exception as upload_err:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to save uploaded file '{clean_filename}': {upload_err}"
+            )
+
+    return {
+        "status": "success",
+        "message": f"Successfully uploaded {len(uploaded_records)} file(s)",
+        "files": uploaded_records,
+        "total_count": len(uploaded_records),
     }
 
 
@@ -208,7 +266,7 @@ async def get_raw_file(filepath: Optional[str] = None, path: Optional[str] = Que
             target = fallback
         else:
             raise HTTPException(status_code=404, detail="File not found")
-    
+
     ext = target.suffix.lower()
     media_type = "text/plain"
     if ext in [".png"]:
@@ -231,7 +289,7 @@ async def get_raw_file(filepath: Optional[str] = None, path: Optional[str] = Que
         media_type = "application/json"
     elif ext in [".pdf"]:
         media_type = "application/pdf"
-    
+
     return FileResponse(path=str(target), media_type=media_type)
 
 

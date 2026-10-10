@@ -39,6 +39,76 @@ export type DynamicMentionProvider = (
   context?: MentionContext
 ) => Promise<MentionItem[]> | MentionItem[];
 
+export interface ExecutionDirectives {
+  agentId?: string;
+  toolIds: string[];
+}
+
+/**
+ * Extracts the canonical runtime execution identifier from a mention item.
+ * Strictly uses source metadata identifiers rather than UI labels or descriptions.
+ */
+export function getMentionId(item: MentionItem): string | undefined {
+  if (item.category === 'agent') {
+    const id = item.metadata?.agentId;
+    if (typeof id === 'string' && id.trim()) {
+      return id.trim();
+    }
+    if (typeof item.id === 'string' && item.id.startsWith('agent-')) {
+      return item.id.replace(/^agent-/, '');
+    }
+    return undefined;
+  }
+
+  if (item.category === 'tool') {
+    const id = item.metadata?.toolId;
+    if (typeof id === 'string' && id.trim()) {
+      return id.trim();
+    }
+    if (typeof item.id === 'string' && item.id.startsWith('tool-')) {
+      return item.id.replace(/^tool-/, '');
+    }
+    return undefined;
+  }
+
+  return undefined;
+}
+
+/**
+ * Checks whether the draft prompt text currently contains the mention token.
+ */
+export function containsMention(text: string, item: MentionItem): boolean {
+  const token = item.insertText.trim();
+  if (!token) return false;
+
+  return text.split(/\s+/).includes(token);
+}
+
+/**
+ * Resolves verified execution directives from active user selections still present in the text.
+ * Enforces single target agent policy (latest selected) and deduplicated tools.
+ */
+export function resolveExecutionDirectives(
+  text: string,
+  mentions: MentionItem[]
+): ExecutionDirectives {
+  const active = mentions.filter((item) => containsMention(text, item));
+
+  const agents = active.filter((item) => item.category === 'agent');
+
+  const tools = active
+    .filter((item) => item.category === 'tool')
+    .map((item) => getMentionId(item))
+    .filter((id): id is string => Boolean(id));
+
+  const lastAgent = agents.at(-1);
+
+  return {
+    agentId: lastAgent ? getMentionId(lastAgent) : undefined,
+    toolIds: [...new Set(tools)],
+  };
+}
+
 /**
  * Client-side Workspace Files Provider.
  */
@@ -119,12 +189,12 @@ async function storeAgentsProvider(query = ''): Promise<MentionItem[]> {
     return filtered.map((a) => ({
       id: `agent-${a.id}`,
       label: `@${a.id}`,
-      description: a.name ? `${a.name} —${a.description || 'Agent'}` : a.description || 'Agent',
+      description: a.name ? `${a.name} — ${a.description || 'Agent'}` : a.description || 'Agent',
       category: 'agent' as MentionCategory,
       insertText: `@${a.id} `,
       icon: 'Bot',
       metadata: {
-        agentId: a.id,
+        agentId: String(a.id),
         name: a.name,
         systemPrompt: a.system_prompt,
         tools: a.tools,
@@ -165,7 +235,7 @@ async function storeToolsProvider(query = ''): Promise<MentionItem[]> {
     });
 
     return filtered.map((t) => {
-      const toolId = t.id || t.name;
+      const toolId = String(t.id || t.name || '');
       return {
         id: `tool-${toolId}`,
         label: `@${toolId}`,
@@ -358,29 +428,3 @@ class CommandRegistryStore {
 }
 
 export const commandRegistry = new CommandRegistryStore();
-
-/**
- * Utility to extract operational directives (@agent and @tool) from the prompt text
- * to inject directly into the execution engine payload.
- */
-export function parsePromptDirectives(text: string): {
-  targetAgentId?: string;
-  requestedTools: string[];
-} {
-  const agentMatches = text.match(/@([a-zA-Z0-9_-]+)/g) || [];
-  const requestedTools: string[] = [];
-  let targetAgentId: string | undefined = undefined;
-
-  for (const match of agentMatches) {
-    const id = match.slice(1);
-    if (['peldrun', 'code_architect', 'data_scientist', 'deep_researcher'].includes(id)) {
-      targetAgentId = id;
-    } else if (
-      ['bash', 'browser_use', 'web_search', 'str_replace_editor', 'file_saver', 'python_execute'].includes(id)
-    ) {
-      requestedTools.push(id);
-    }
-  }
-
-  return { targetAgentId, requestedTools };
-}

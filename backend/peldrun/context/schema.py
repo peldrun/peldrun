@@ -1,15 +1,28 @@
-"""
-Context Management Data Contracts and Schemas for peldrun-core.
-
-Defines Pydantic models for the Sidecar pattern (session.context.json),
-representing decoupled conversation history, execution state, and token budget allocations.
-"""
+# Path: backend/peldrun/context/schema.py
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
+
+ExecutionStatus = Literal[
+    "queued",
+    "running",
+    "waiting_for_user",
+    "succeeded",
+    "failed",
+    "cancelled",
+]
+
+
+class TurnExecutionState(BaseModel):
+    """Explicit turn execution lifecycle state model."""
+
+    turn_id: str = Field(..., description="Unique turn identifier.")
+    status: ExecutionStatus = Field(
+        default="running", description="Current execution lifecycle status."
+    )
 
 
 class SummaryState(BaseModel):
@@ -73,6 +86,10 @@ class CurrentExecution(BaseModel):
 
     turn_id: str = Field(
         default="", description="Turn identifier currently executing."
+    )
+    status: ExecutionStatus = Field(
+        default="running",
+        description="Lifecycle status of this active execution.",
     )
     steps: List[ExecutionStep] = Field(
         default_factory=list,

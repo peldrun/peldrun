@@ -3,8 +3,7 @@
  * frontend/src/components/chat/chat-container.tsx
  *
  * Core Chat & Autonomous Agent Execution Container.
- * Enhanced with automated workspace drawer opening upon file creation
- * and integrated live telemetry logging.
+ * Enhanced with verified submission handshake and resilient error propagation.
  */
 
 "use client";
@@ -22,12 +21,6 @@ import { useChatStore } from "@/stores/chat-store";
 import { useAppStorage } from "@/hooks/use-app-storage";
 import { inferModelCapabilities, fetchServerMetadata } from "@/lib/modelMetadata";
 
-/**
- * Safely normalizes arbitrary object payloads into readable string representations.
- *
- * @param val - The raw value to convert
- * @returns Serialized or sanitized string representation
- */
 function safeRender(val: any): string {
   if (val === null || val === undefined) return "";
   if (typeof val === "string") {
@@ -69,7 +62,6 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   const [showRawTrace, setShowRawTrace] = useState(false);
   const [metadataVault, setMetadataVault] = useState<Record<string, any>>({});
 
-  // Unified multi-tier reactive storage
   const [showRightPanel, setShowRightPanel] = useAppStorage("right_panel_open");
   const [execMode, setExecMode] = useAppStorage("exec_mode");
   const [reasoningEffort] = useAppStorage("reasoning_effort");
@@ -110,9 +102,6 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     }
   }, [setActiveModelName]);
 
-  /**
-   * Memoized execution mode switcher to maintain strict referential equality across renders.
-   */
   const handleModeChange = useCallback(
     (newMode: "agent" | "chat") => {
       setExecMode(newMode);
@@ -125,9 +114,6 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     [setExecMode]
   );
 
-  /**
-   * Memoized engine selector handler to prevent cascading render mutations.
-   */
   const handleSelectEngine = useCallback(
     (engine: EngineOption) => {
       setSelectedEngineId(engine.id);
@@ -354,7 +340,6 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
           );
         }
 
-        // Smart Artifact Auto-Routing
         const artName = payload.data?.artifact || payload.data?.path || payload.data?.file || "";
         if (payload.data?.event === "artifact_created" || artName) {
           setShowRightPanel(true);
@@ -592,7 +577,6 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         const data = await res.json();
         const incomingFiles = data.files || [];
         setProducedFiles((prev) => {
-          // If new files were detected that were not previously in state
           if (incomingFiles.length > prev.length && incomingFiles.length > 0) {
             const newest = incomingFiles[incomingFiles.length - 1];
             if (newest?.path) {
@@ -614,14 +598,19 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     }
   };
 
-  const handleStartTask = async (customPrompt?: string, customOverride?: any, filesToUpload?: File[]) => {
+  const handleStartTask = async (
+    customPrompt?: string,
+    customOverride?: any,
+    filesToUpload?: File[]
+  ): Promise<{ accepted: true; jobId: string; chatId: string }> => {
     const rawText = (customPrompt !== undefined ? customPrompt : inputValue).trim();
-    if ((!rawText && (!filesToUpload || filesToUpload.length === 0)) || status === "running") return;
+    if ((!rawText && (!filesToUpload || filesToUpload.length === 0)) || status === "running") {
+      throw new Error("Task cannot be started with empty input or during ongoing run.");
+    }
 
     let finalPrompt = rawText;
     const effectiveMode = customOverride?.mode || execMode;
 
-    // Dynamically resolve reasoning capability from metadata vault fallback
     const activeCaps = inferModelCapabilities(activeModelName, metadataVault[activeModelName]);
     const isModelReasoning = customOverride?.is_reasoning_model !== undefined
       ? Boolean(customOverride.is_reasoning_model)
@@ -640,18 +629,22 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         if (activeJobId) formData.append("job_id", activeJobId);
 
         const uploadRes = await fetch("/api/files/upload", { method: "POST", body: formData });
-        if (uploadRes.ok) {
-          const uploadData = await uploadRes.json();
-          const uploadedList: { name: string; path: string }[] = uploadData.files || [];
-          if (uploadedList.length > 0) {
-            const filesSummary = uploadedList.map((f) => `- ${f.name} (in workspace directory)`).join("\n");
-            finalPrompt = rawText
-              ? `${rawText}\n\n[Uploaded Files]:\n${filesSummary}`
-              : `Inspect workspace files:\n${filesSummary}`;
-          }
+        if (!uploadRes.ok) {
+          const uploadErrData = await uploadRes.json().catch(() => ({}));
+          throw new Error(uploadErrData.detail || "Failed to upload attached files");
+        }
+
+        const uploadData = await uploadRes.json();
+        const uploadedList: { name: string; path: string }[] = uploadData.files || [];
+        if (uploadedList.length > 0) {
+          const filesSummary = uploadedList.map((f) => `- ${f.name} (in workspace directory)`).join("\n");
+          finalPrompt = rawText
+            ? `${rawText}\n\n[Uploaded Files]:\n${filesSummary}`
+            : `Inspect workspace files:\n${filesSummary}`;
         }
       } catch (uploadErr) {
-        console.error("Failed to upload files:", uploadErr);
+        console.error("[ChatContainer] Failed to upload files:", uploadErr);
+        throw uploadErr;
       }
     }
 
@@ -752,10 +745,12 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       }
 
       connectStream(jobId);
+      return { accepted: true, jobId, chatId: returnedChatId };
     } catch (err: any) {
-      console.error("Execution error:", err);
+      console.error("[ChatContainer] Execution dispatch error:", err);
       setStatus("failed");
       setFinalResult(err?.message || "Execution error encountered.");
+      throw err;
     }
   };
 
@@ -885,9 +880,10 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         {!isFreshSession && (
           <div className="p-3 sm:p-4 bg-background shrink-0">
             <Composer
-              onSend={(textToSend, files, llmOverride) => {
-                handleStartTask(textToSend, llmOverride, files);
-              }}
+              chatId={activeChatId || undefined}
+              onSend={(textToSend, files, llmOverride) =>
+                handleStartTask(textToSend, llmOverride, files)
+              }
               onStop={handleStopTask}
               isRunning={status === "running"}
               disabled={status === "running"}

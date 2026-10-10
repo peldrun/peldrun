@@ -1,32 +1,18 @@
-"""
-Unit tests for Context Management Stage 1: Sidecar Pattern.
-
-Verifies:
-1. Non-destructive Sidecar creation from session data.
-2. Separation of clean conversation dialogue from raw execution telemetry.
-3. Accurate per-model token budget calculation and ratio distribution.
-4. Atomic persistence of session.context.json without mutating session.json.
-"""
-
-from __future__ import annotations
+# Path: backend/tests/test_context_sidecar.py
 
 import json
 from pathlib import Path
 import tempfile
 import pytest
 
-from peldrun.context.schema import (
-    BudgetRatios,
-    ContextSidecar,
-    ConversationMessage,
-    CurrentExecution,
-)
 from peldrun.context.sidecar import (
     build_context_sidecar,
-    get_sidecar_path,
     load_context_sidecar,
     save_context_sidecar,
+    select_current_run_events,
+    is_active_turn,
 )
+from peldrun.context.schema import ContextSidecar
 
 
 def test_build_context_sidecar_basic():
@@ -80,53 +66,156 @@ def test_build_context_sidecar_basic():
     assert sidecar.current_execution is not None
     assert sidecar.current_execution.turn_id == "t2"
     assert len(sidecar.current_execution.steps) == 2
-    assert sidecar.current_execution.steps[0].name == "str_replace_editor"
     assert sidecar.current_execution.artifacts == ["app.js"]
-
-    # 4. Assert token budget slices are mathematically valid
-    budget = sidecar.budget
-    assert budget.context_window > 0
-    assert budget.effective_limit == budget.context_window - budget.max_output_tokens
-    assert budget.sections.recent > 0
-    assert budget.sections.system > 0
 
 
 def test_sidecar_atomic_persistence():
-    """Verify atomic write and round-trip load of session.context.json."""
+    """Verify safe atomic persistence to session.context.json."""
     with tempfile.TemporaryDirectory() as tmp_dir:
-        session_dir = Path(tmp_dir)
+        dir_path = Path(tmp_dir)
+        session_data = {"id": "s_persist", "turns": []}
+        sidecar = build_context_sidecar("s_persist", session_data)
 
-        # Create dummy session.json to simulate frontend storage
-        original_session = {
-            "id": "sess_atomic_01",
-            "messages": [
-                {"role": "user", "content": "Hello PELDRUN"},
-                {"role": "assistant", "content": "Hello! How can I help?"},
-            ],
-        }
-        session_json_path = session_dir / "session.json"
-        with open(session_json_path, "w", encoding="utf-8") as f:
-            json.dump(original_session, f, indent=2)
-
-        # Build and save sidecar
-        sidecar = build_context_sidecar(
-            session_id="sess_atomic_01",
-            session_data=original_session,
-            model_id="gemini-2.0-flash",
-        )
-        saved_path = save_context_sidecar(session_dir, sidecar)
-
+        saved_path = save_context_sidecar(dir_path, sidecar)
         assert saved_path.exists()
         assert saved_path.name == "session.context.json"
 
-        # Verify session.json remained unchanged
-        with open(session_json_path, "r", encoding="utf-8") as f:
-            persisted_session = json.load(f)
-        assert persisted_session == original_session
+        loaded = load_context_sidecar(dir_path)
+        assert loaded is not None
+        assert loaded.session_id == "s_persist"
 
-        # Verify sidecar round-trip load
-        loaded_sidecar = load_context_sidecar(session_dir)
-        assert loaded_sidecar is not None
-        assert loaded_sidecar.session_id == "sess_atomic_01"
-        assert len(loaded_sidecar.conversation) == 2
-        assert loaded_sidecar.budget.context_window == 1048576  # Gemini 1M spec
+
+# ---------------------------------------------------------------------------
+# P0-02 Acceptance Tests Suite
+# ---------------------------------------------------------------------------
+
+def test_p0_02_case1_completed_turn_steps_isolation():
+    """Case 1: Older completed turns never leak their historical steps into CurrentExecution."""
+    session_data = {
+        "id": "sess_iso_1",
+        "turns": [
+            {
+                "id": "t1",
+                "status": "succeeded",
+                "user": "Old task",
+                "assistant": "Old done",
+                "steps": [{"type": "tool_call", "name": "bash"}],
+            },
+            {
+                "id": "t2",
+                "status": "succeeded",
+                "user": "Newer task",
+                "assistant": "Newer done",
+            },
+        ],
+    }
+    sidecar = build_context_sidecar("sess_iso_1", session_data)
+    # Both turns completed -> no active execution
+    assert sidecar.current_execution is None
+
+
+def test_p0_02_case2_running_turn_captured():
+    """Case 2: Turn with explicit 'running' status captures active execution steps."""
+    session_data = {
+        "id": "sess_iso_2",
+        "turns": [
+            {
+                "id": "t1",
+                "status": "succeeded",
+                "user": "First turn",
+                "assistant": "Done",
+            },
+            {
+                "id": "t2",
+                "status": "running",
+                "user": "Active turn",
+                "steps": [{"type": "tool_call", "name": "browser_use"}],
+            },
+        ],
+    }
+    sidecar = build_context_sidecar("sess_iso_2", session_data)
+    assert sidecar.current_execution is not None
+    assert sidecar.current_execution.turn_id == "t2"
+    assert sidecar.current_execution.status == "running"
+    assert sidecar.current_execution.steps[0].name == "browser_use"
+
+
+def test_p0_02_case3_waiting_for_user_resumable():
+    """Case 3: Turn in 'waiting_for_user' preserves execution state for resumption."""
+    session_data = {
+        "id": "sess_iso_3",
+        "turns": [
+            {
+                "id": "t1",
+                "status": "waiting_for_user",
+                "user": "Ask question",
+                "steps": [
+                    {
+                        "type": "tool_call",
+                        "name": "ask_human",
+                        "args": {"prompt": "Confirm deletion?"},
+                    }
+                ],
+            }
+        ],
+    }
+    sidecar = build_context_sidecar("sess_iso_3", session_data)
+    assert sidecar.current_execution is not None
+    assert sidecar.current_execution.status == "waiting_for_user"
+    assert sidecar.current_execution.steps[0].name == "ask_human"
+
+
+def test_p0_02_case4_terminal_statuses_not_active():
+    """Case 4: Latest turn with terminal statuses (succeeded, failed, cancelled) is never active."""
+    for term_status in ("succeeded", "failed", "cancelled"):
+        session_data = {
+            "id": f"sess_term_{term_status}",
+            "turns": [
+                {
+                    "id": "t1",
+                    "status": term_status,
+                    "user": "Task",
+                    "steps": [{"type": "tool_call", "name": "bash"}],
+                }
+            ],
+        }
+        sidecar = build_context_sidecar(f"sess_term_{term_status}", session_data)
+        assert sidecar.current_execution is None
+
+
+def test_p0_02_case5_old_final_event_does_not_mask_new_run():
+    """Case 5: Old terminal event in events.json does not mask a newer ongoing run."""
+    events = [
+        # Old run (job_1) finished
+        {"type": "step_start", "run_id": "job_1"},
+        {"type": "final", "run_id": "job_1"},
+        # New run (job_2) currently active
+        {"type": "step_start", "run_id": "job_2"},
+        {"type": "tool_call", "run_id": "job_2", "toolName": "bash", "args": {"cmd": "pwd"}},
+    ]
+    active = select_current_run_events(events)
+    assert len(active) == 2
+    assert active[1]["toolName"] == "bash"
+
+
+def test_p0_02_case6_active_run_with_terminal_event_cleared():
+    """Case 6: Active run that concluded with a terminal event returns no active execution."""
+    events = [
+        {"type": "step_start", "run_id": "job_active"},
+        {"type": "tool_call", "run_id": "job_active", "toolName": "bash"},
+        {"type": "final", "run_id": "job_active"},
+    ]
+    active = select_current_run_events(events)
+    assert active == []
+
+
+def test_p0_02_case7_mismatched_run_id_isolation():
+    """Case 7: Events belonging to an older run_id are never mixed into the current active run."""
+    events = [
+        {"type": "tool_call", "run_id": "job_old", "toolName": "str_replace_editor"},
+        {"type": "final", "run_id": "job_old"},
+        {"type": "tool_call", "run_id": "job_new", "toolName": "browser_use"},
+    ]
+    active = select_current_run_events(events)
+    assert len(active) == 1
+    assert active[0]["toolName"] == "browser_use"

@@ -16,6 +16,7 @@ import {
   Minimize2,
   RotateCcw,
   AlertCircle,
+  Info,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AgentSelector } from "./agent-selector";
@@ -27,10 +28,80 @@ import { useAppStorage } from "@/hooks/use-app-storage";
 import { inferModelCapabilities, fetchServerMetadata } from "@/lib/modelMetadata";
 import { LexicalEditorComponent } from "./composer/lexical-editor";
 import { LexicalEditorHandle } from "./composer/types";
-import { commandRegistry, parsePromptDirectives, MentionItem } from "./composer/registry/command-registry";
+import {
+  commandRegistry,
+  getMentionId,
+  resolveExecutionDirectives,
+  MentionItem,
+} from "./composer/registry/command-registry";
+
+export interface SubmissionAccepted {
+  accepted: boolean;
+  jobId?: string;
+  chatId?: string;
+}
+
+export interface ComposerDraft {
+  version: 1;
+  text: string;
+  updatedAt: number;
+}
+
+export function saveDraft(key: string, text: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (text.trim()) {
+      const draft: ComposerDraft = {
+        version: 1,
+        text,
+        updatedAt: Date.now(),
+      };
+      sessionStorage.setItem(key, JSON.stringify(draft));
+    } else {
+      sessionStorage.removeItem(key);
+    }
+  } catch (error) {
+    console.error("[Composer] Could not persist draft:", error);
+  }
+}
+
+export function loadDraft(key: string): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = sessionStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      parsed.version === 1 &&
+      typeof parsed.text === "string"
+    ) {
+      return parsed.text;
+    }
+    if (typeof parsed === "string") return parsed;
+    return null;
+  } catch (error) {
+    console.error("[Composer] Could not load draft:", error);
+    return null;
+  }
+}
+
+export function clearDraft(key: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    sessionStorage.removeItem(key);
+  } catch (error) {
+    console.error("[Composer] Could not clear draft:", error);
+  }
+}
 
 interface ComposerProps {
-  onSend: (text: string, files?: File[], llmOverride?: any) => Promise<void> | void;
+  onSend: (
+    text: string,
+    files?: File[],
+    llmOverride?: any
+  ) => Promise<SubmissionAccepted | void> | SubmissionAccepted | void;
   onStop?: () => void;
   isRunning?: boolean;
   disabled?: boolean;
@@ -52,6 +123,7 @@ export function Composer({
 
   const [text, setText] = useState("");
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
+  const [selectedMentions, setSelectedMentions] = useState<MentionItem[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [metadataVault, setMetadataVault] = useState<Record<string, any>>({});
   const [isExpanded, setIsExpanded] = useState(false);
@@ -82,12 +154,42 @@ export function Composer({
   const editorRef = useRef<LexicalEditorHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Dynamic Mention Selection Listener: automatically activates referenced agent
   useEffect(() => {
-    const handleMentionSelect = (e: CustomEvent<MentionItem>) => {
-      const item = e.detail;
-      if (item && item.category === "agent" && item.metadata?.agentId) {
-        setSelectedAgentId(String(item.metadata.agentId));
+    const unregisterPeldrun = commandRegistry.registerMentionItem({
+      id: "agent-peldrun",
+      label: "@peldrun",
+      description: "Autonomous Master Agent",
+      category: "agent",
+      insertText: "@peldrun ",
+      metadata: {
+        agentId: "peldrun",
+      },
+    });
+
+    return () => {
+      unregisterPeldrun();
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleMentionSelect = (event: Event) => {
+      const item = (event as CustomEvent<MentionItem>).detail;
+      if (!item) return;
+
+      if (item.category !== "agent" && item.category !== "tool") {
+        return;
+      }
+
+      const id = getMentionId(item);
+      if (!id) return;
+
+      setSelectedMentions((previous) => {
+        const withoutSameItem = previous.filter((existing) => existing.id !== item.id);
+        return [...withoutSameItem, item];
+      });
+
+      if (item.category === "agent") {
+        setSelectedAgentId(id);
         setExecMode("agent");
       }
     };
@@ -98,36 +200,19 @@ export function Composer({
     };
   }, [setSelectedAgentId, setExecMode]);
 
-  // Restore uncommitted draft from sessionStorage on session mount
   useEffect(() => {
     if (typeof window === "undefined") return;
-    try {
-      const saved = sessionStorage.getItem(draftStorageKey);
-      if (saved) {
-        const timer = setTimeout(() => {
-          if (editorRef.current && !editorRef.current.getText()) {
-            editorRef.current.setText(saved);
-            setText(saved);
-          }
-        }, 50);
-        return () => clearTimeout(timer);
-      }
-    } catch {}
+    const saved = loadDraft(draftStorageKey);
+    if (saved) {
+      const timer = setTimeout(() => {
+        if (editorRef.current && !editorRef.current.getText()) {
+          editorRef.current.setText(saved);
+          setText(saved);
+        }
+      }, 50);
+      return () => clearTimeout(timer);
+    }
   }, [draftStorageKey]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-
-    const onJobFailed = () => {
-      const currentEditorText = editorRef.current ? editorRef.current.getText() : text;
-      if (!currentEditorText.trim() && backupDraftRef.current) {
-        setFailedDraft(backupDraftRef.current);
-      }
-    };
-
-    window.addEventListener("omweb:job-error", onJobFailed);
-    return () => window.removeEventListener("omweb:job-error", onJobFailed);
-  }, [text]);
 
   useEffect(() => {
     fetchServerMetadata().then((data) => setMetadataVault(data || {}));
@@ -165,9 +250,8 @@ export function Composer({
     const isReasoning = isReasoningSupported;
     const effectiveEffort = isReasoning ? (reasoningEffort || "none") : "none";
 
-    // Extract runtime directives from mentions in the prompt text
-    const { targetAgentId, requestedTools } = parsePromptDirectives(inputText);
-    const effectiveAgentId = targetAgentId || selectedAgentId || "peldrun";
+    const directives = resolveExecutionDirectives(inputText, selectedMentions);
+    const effectiveAgentId = directives.agentId || selectedAgentId || "peldrun";
 
     let base: Record<string, any> = {
       model: activeModel,
@@ -176,14 +260,14 @@ export function Composer({
       base_url: "http://127.0.0.1:1234/v1",
       api_key: "",
       api_type: "",
-      mode: targetAgentId ? "agent" : execMode,
+      mode: directives.agentId ? "agent" : execMode,
       reasoning_effort: effectiveEffort,
       is_reasoning_model: isReasoning,
-      agent_id: execMode === "agent" || targetAgentId ? effectiveAgentId : "peldrun",
+      agent_id: execMode === "agent" || directives.agentId ? effectiveAgentId : "peldrun",
     };
 
-    if (requestedTools.length > 0) {
-      base.tools = requestedTools;
+    if (directives.toolIds.length > 0) {
+      base.tools = directives.toolIds;
     }
 
     if (activeLlmOverride) {
@@ -196,6 +280,7 @@ export function Composer({
           reasoning_effort: effectiveEffort,
           is_reasoning_model: isReasoning,
           agent_id: base.agent_id,
+          tools: base.tools || parsed.tools,
         };
       } catch (e) {}
     }
@@ -238,15 +323,7 @@ export function Composer({
   const handleEditorChange = useCallback(
     (val: string) => {
       setText(val);
-      if (typeof window !== "undefined") {
-        try {
-          if (val.trim()) {
-            sessionStorage.setItem(draftStorageKey, val);
-          } else {
-            sessionStorage.removeItem(draftStorageKey);
-          }
-        } catch {}
-      }
+      saveDraft(draftStorageKey, val);
     },
     [draftStorageKey]
   );
@@ -258,6 +335,7 @@ export function Composer({
     }
     setText(failedDraft.text);
     setAttachedFiles(failedDraft.files);
+    saveDraft(draftStorageKey, failedDraft.text);
     setFailedDraft(null);
   };
 
@@ -291,20 +369,28 @@ export function Composer({
         currentPayload
       );
 
+      let acceptedResponse: any = sendResult;
       if (sendResult && typeof (sendResult as any).then === "function") {
-        await sendResult;
+        acceptedResponse = await sendResult;
+      }
+
+      if (
+        acceptedResponse &&
+        typeof acceptedResponse === "object" &&
+        "accepted" in acceptedResponse
+      ) {
+        if (!acceptedResponse.accepted || !acceptedResponse.jobId) {
+          throw new Error("Job submission was not confirmed by the execution engine");
+        }
       }
 
       editorRef.current?.clear();
       setText("");
       setAttachedFiles([]);
+      setSelectedMentions([]);
       setFailedDraft(null);
-
-      if (typeof window !== "undefined") {
-        try {
-          sessionStorage.removeItem(draftStorageKey);
-        } catch {}
-      }
+      backupDraftRef.current = null;
+      clearDraft(draftStorageKey);
     } catch (error) {
       console.error("[Composer] Message dispatch failed:", error);
 
@@ -351,7 +437,7 @@ export function Composer({
         <div className="flex items-center justify-between mb-2 px-3 py-1.5 rounded-lg bg-destructive/10 border border-destructive/20 text-xs text-destructive animate-in fade-in slide-in-from-top-1">
           <div className="flex items-center gap-2">
             <AlertCircle size={14} className="shrink-0" />
-            <span>Message dispatch failed. Your draft has been preserved.</span>
+            <span>Message dispatch failed. Your draft and files have been preserved.</span>
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -392,29 +478,35 @@ export function Composer({
         }`}
       >
         {attachedFiles.length > 0 && (
-          <div className="flex flex-wrap gap-2 p-2.5 pb-1 border-b border-border/40 bg-muted/20">
-            {attachedFiles.map((file, idx) => (
-              <div
-                key={`${file.name}-${idx}`}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs bg-card border border-border shadow-xs text-foreground animate-in fade-in"
-              >
-                <FileText size={13} className="text-primary shrink-0" />
-                <span className="font-medium truncate max-w-[160px]" title={file.name}>
-                  {file.name}
-                </span>
-                <span className="text-[10px] text-muted-foreground font-mono">
-                  ({formatFileSize(file.size)})
-                </span>
-                <button
-                  type="button"
-                  onClick={() => handleRemoveFile(idx)}
-                  className="p-0.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer ml-1"
-                  title="Remove file"
+          <div className="flex flex-col border-b border-border/40 bg-muted/20">
+            <div className="flex flex-wrap gap-2 p-2.5 pb-1">
+              {attachedFiles.map((file, idx) => (
+                <div
+                  key={`${file.name}-${idx}`}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs bg-card border border-border shadow-xs text-foreground animate-in fade-in"
                 >
-                  <X size={12} />
-                </button>
-              </div>
-            ))}
+                  <FileText size={13} className="text-primary shrink-0" />
+                  <span className="font-medium truncate max-w-[160px]" title={file.name}>
+                    {file.name}
+                  </span>
+                  <span className="text-[10px] text-muted-foreground font-mono">
+                    ({formatFileSize(file.size)})
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveFile(idx)}
+                    className="p-0.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer ml-1"
+                    title="Remove file"
+                  >
+                    <X size={12} />
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div className="px-2.5 pb-1.5 text-[10px] text-muted-foreground/70 flex items-center gap-1">
+              <Info size={10} className="shrink-0" />
+              <span>Unsent attachments are held in memory and upload upon confirmed task submission.</span>
+            </div>
           </div>
         )}
 
@@ -437,11 +529,8 @@ export function Composer({
           onClearEditor={() => {
             editorRef.current?.clear();
             setText("");
-            if (typeof window !== "undefined") {
-              try {
-                sessionStorage.removeItem(draftStorageKey);
-              } catch {}
-            }
+            setSelectedMentions([]);
+            clearDraft(draftStorageKey);
           }}
         />
 

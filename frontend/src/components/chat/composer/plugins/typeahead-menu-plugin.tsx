@@ -5,12 +5,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext';
 import {
-  $createParagraphNode,
-  $getRoot,
-  $getSelection,
-  $isElementNode,
-  $isRangeSelection,
-  $isTextNode,
+  $createParagraphNode,$getRoot,
+  $getSelection,$isElementNode,
+  $isRangeSelection,$isTextNode,
   COMMAND_PRIORITY_CRITICAL,
   KEY_ARROW_DOWN_COMMAND,
   KEY_ARROW_UP_COMMAND,
@@ -37,9 +34,7 @@ function getTextBeforeCaret(editor: LexicalEditor): string {
     const anchor = selection.anchor;
     const anchorNode = anchor.getNode();
 
-    if ($isTextNode(anchorNode)) {
-      textBeforeCaret = anchorNode.getTextContent().slice(0, anchor.offset);
-    } else if ($isElementNode(anchorNode)) {
+    if ($isTextNode(anchorNode)) {       textBeforeCaret = anchorNode.getTextContent().slice(0, anchor.offset);     } else if ($isElementNode(anchorNode)) {
       const children = anchorNode.getChildren();
       let accumulated = '';
       const childIndex = anchor.offset;
@@ -122,108 +117,111 @@ export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPlug
     });
   }, [editor]);
 
-  const handleExecuteSelection = useCallback(() => {
-    if (!isOpen || activeResultsCount === 0) return false;
+  const handleExecuteSelection = useCallback(
+    (targetIndex?: number) => {
+      if (!isOpen || activeResultsCount === 0) return false;
+      const indexToExecute = typeof targetIndex === 'number' ? targetIndex : selectedIndex;
 
-    if (triggerType === 'slash') {
-      const selectedItem: SlashCommandItem | undefined = slashResults[selectedIndex];
-      if (!selectedItem) return false;
+      if (triggerType === 'slash') {
+        const selectedItem: SlashCommandItem | undefined = slashResults[indexToExecute];
+        if (!selectedItem) return false;
 
-      // Cleanly remove the slash trigger command from the editor state
-      editor.update(() => {
-        const selection = $getSelection();
-        if ($isRangeSelection(selection)) {
-          const anchorNode = selection.anchor.getNode();
-          if ($isTextNode(anchorNode)) {
-            const text = anchorNode.getTextContent();
-            const pattern = new RegExp(`\\/${queryString}$`);
-            const newText = text.replace(pattern, '');
-            anchorNode.setTextContent(newText);
-            if (newText.trim() === '') {
-              const root = $getRoot();
-              root.clear();
-              const p = $createParagraphNode();
-              root.append(p);
-              p.select(0, 0);
+        editor.update(() => {
+          const selection = $getSelection();
+          if ($isRangeSelection(selection)) {
+            const anchorNode = selection.anchor.getNode();
+            if ($isTextNode(anchorNode)) {
+              const text = anchorNode.getTextContent();
+              const pattern = new RegExp(`\\/${queryString}$`);
+              const newText = text.replace(pattern, '');
+              anchorNode.setTextContent(newText);
+              if (newText.trim() === '') {
+                const root = $getRoot();
+                root.clear();
+                const p = $createParagraphNode();
+                root.append(p);
+                p.select(0, 0);
+              } else {
+                anchorNode.select();
+              }
+            }
+          }
+        });
+
+        selectedItem.execute({
+          clearEditor: () => {
+            if (onClearEditor) {
+              onClearEditor();
             } else {
+              editor.update(() => {
+                const root = $getRoot();
+                root.clear();
+                root.append($createParagraphNode());
+              });
+            }
+          },
+          insertText: (textToInsert: string) => {
+            editor.update(() => {
+              const selection = $getSelection();
+              if ($isRangeSelection(selection)) {
+                selection.insertText(textToInsert);
+              }
+            });
+          },
+          dispatchCustomEvent: (name, detail) => {
+            if (typeof window !== 'undefined') {
+              window.dispatchEvent(new CustomEvent(name, { detail }));
+            }
+          },
+        });
+
+        setIsOpen(false);
+        return true;
+      }
+
+      if (triggerType === 'mention') {
+        const selectedItem: MentionItem | undefined = dynamicMentions[indexToExecute];
+        if (!selectedItem) return false;
+
+        editor.update(() => {
+          const selection = $getSelection();
+          if ($isRangeSelection(selection)) {
+            const anchorNode = selection.anchor.getNode();
+            if ($isTextNode(anchorNode)) {
+              const text = anchorNode.getTextContent();
+              const pattern = new RegExp(`@${queryString}$`);
+              const newText = text.replace(pattern, selectedItem.insertText);
+              anchorNode.setTextContent(newText);
               anchorNode.select();
             }
           }
+        });
+
+        // Emit verified selection with metadata as source of truth
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(
+            new CustomEvent('peldrun:mention-selected', { detail: selectedItem })
+          );
         }
-      });
 
-      selectedItem.execute({
-        clearEditor: () => {
-          if (onClearEditor) {
-            onClearEditor();
-          } else {
-            editor.update(() => {
-              const root = $getRoot();
-              root.clear();
-              root.append($createParagraphNode());
-            });
-          }
-        },
-        insertText: (textToInsert: string) => {
-          editor.update(() => {
-            const selection = $getSelection();
-            if ($isRangeSelection(selection)) {
-              selection.insertText(textToInsert);
-            }
-          });
-        },
-        dispatchCustomEvent: (name, detail) => {
-          if (typeof window !== 'undefined') {
-            window.dispatchEvent(new CustomEvent(name, { detail }));
-          }
-        },
-      });
-
-      setIsOpen(false);
-      return true;
-    }
-
-    if (triggerType === 'mention') {
-      const selectedItem: MentionItem | undefined = dynamicMentions[selectedIndex];
-      if (!selectedItem) return false;
-
-      editor.update(() => {
-        const selection = $getSelection();
-        if ($isRangeSelection(selection)) {
-          const anchorNode = selection.anchor.getNode();
-          if ($isTextNode(anchorNode)) {
-            const text = anchorNode.getTextContent();
-            const pattern = new RegExp(`@${queryString}$`);
-            const newText = text.replace(pattern, selectedItem.insertText);
-            anchorNode.setTextContent(newText);
-            anchorNode.select();
-          }
-        }
-      });
-
-      // Notify host composer about referenced entity selection
-      if (typeof window !== 'undefined') {
-        window.dispatchEvent(
-          new CustomEvent('peldrun:mention-selected', { detail: selectedItem })
-        );
+        setIsOpen(false);
+        return true;
       }
 
-      setIsOpen(false);
-      return true;
-    }
-
-    return false;
-  }, [
-    isOpen,
-    activeResultsCount,
-    triggerType,
-    slashResults,
-    dynamicMentions,
-    selectedIndex,
-    editor,
-    queryString,
-    onClearEditor,
-  ]);
+      return false;
+    },
+    [
+      isOpen,
+      activeResultsCount,
+      triggerType,
+      slashResults,
+      dynamicMentions,
+      selectedIndex,
+      editor,
+      queryString,
+      onClearEditor,
+    ]
+  );
 
   useEffect(() => {
     const unregisterEnter = editor.registerCommand(
@@ -332,7 +330,7 @@ export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPlug
                   onMouseEnter={() => setSelectedIndex(index)}
                   onClick={(e) => {
                     e.preventDefault();
-                    handleExecuteSelection();
+                    handleExecuteSelection(index);
                   }}
                   className={`flex items-center gap-2.5 w-full px-2.5 py-1.5 rounded-lg text-start text-xs transition-colors cursor-pointer ${
                     isSelected
@@ -378,7 +376,7 @@ export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPlug
                   onMouseEnter={() => setSelectedIndex(index)}
                   onClick={(e) => {
                     e.preventDefault();
-                    handleExecuteSelection();
+                    handleExecuteSelection(index);
                   }}
                   className={`flex items-center gap-2.5 w-full px-2.5 py-1.5 rounded-lg text-start text-xs transition-colors cursor-pointer ${
                     isSelected

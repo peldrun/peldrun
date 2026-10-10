@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from peldrun.context.schema import (
     BudgetMetadata,
@@ -15,6 +15,7 @@ from peldrun.context.schema import (
     ContextSidecar,
     ConversationMessage,
     CurrentExecution,
+    ExecutionStatus,
     ExecutionStep,
     SummaryState,
 )
@@ -24,6 +25,10 @@ logger = logging.getLogger("peldrun.context.sidecar")
 SIDECAR_FILENAME = "session.context.json"
 SESSION_FILENAME = "session.json"
 EVENTS_FILENAME = "events.json"
+
+ACTIVE_STATUSES: Set[str] = {"running", "waiting_for_user"}
+TERMINAL_STATUSES: Set[str] = {"succeeded", "failed", "cancelled"}
+TERMINAL_EVENT_TYPES: Set[str] = {"final", "done", "error"}
 
 
 def get_sidecar_path(session_dir: Union[str, Path]) -> Path:
@@ -127,6 +132,78 @@ def estimate_string_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def is_active_turn(turn: Dict[str, Any]) -> bool:
+    """
+    Determines whether a turn represents an ongoing, active execution.
+    Prioritizes explicit status attribute when provided.
+    Maintains backward compatibility for legacy records lacking status fields.
+    """
+    status = turn.get("status")
+    if status is not None:
+        return str(status).lower() in ACTIVE_STATUSES
+
+    # Legacy compatibility fallback: If no explicit status exists,
+    # a turn with recorded steps/artifacts is treated as active only if
+    # it is not explicitly marked completed via terminal flags.
+    if turn.get("completed") is True:
+        return False
+
+    return True
+
+
+def event_run_id(event: Dict[str, Any]) -> Optional[str]:
+    """Extract run or job identifier from an event wrapper."""
+    val = event.get("run_id") or event.get("job_id")
+    if val is not None:
+        return str(val)
+    payload = event.get("data")
+    if isinstance(payload, dict):
+        p_val = payload.get("run_id") or payload.get("job_id")
+        if p_val is not None:
+            return str(p_val)
+    return None
+
+
+def select_current_run_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Filters events to represent only the active execution run.
+    Ensures older terminal executions do not mask a newer ongoing run.
+    """
+    if not events:
+        return []
+
+    # 1. Inspect run_id of the latest recorded event
+    latest_run_id: Optional[str] = None
+    for ev in reversed(events):
+        if isinstance(ev, dict):
+            rid = event_run_id(ev)
+            if rid:
+                latest_run_id = rid
+                break
+
+    if latest_run_id:
+        scoped = [
+            ev for ev in events
+            if isinstance(ev, dict) and event_run_id(ev) == latest_run_id
+        ]
+        # If this scoped run already has a terminal event, it is not active
+        if any(ev.get("type") in TERMINAL_EVENT_TYPES for ev in scoped):
+            return []
+        return scoped
+
+    # 2. Legacy fallback: slice events following the last terminal event
+    last_term_idx = -1
+    for idx, ev in enumerate(events):
+        if isinstance(ev, dict) and ev.get("type") in TERMINAL_EVENT_TYPES:
+            last_term_idx = idx
+
+    if last_term_idx >= 0:
+        trailing = events[last_term_idx + 1:]
+        return [ev for ev in trailing if isinstance(ev, dict)]
+
+    return [ev for ev in events if isinstance(ev, dict)]
+
+
 def extract_conversation_and_execution(
     session_data: Dict[str, Any],
     events_data: Optional[List[Dict[str, Any]]] = None,
@@ -135,9 +212,9 @@ def extract_conversation_and_execution(
     Separate high-level conversation messages from granular execution steps.
     Seamlessly supports PELDRUN schema ('prompt'/'result' as well as 'user'/'assistant').
 
-    Guarantees Architectural Invariant:
+    Guarantees Architectural Invariant (RFC-609):
     Completed turns NEVER leak their historical tool steps into CurrentExecution.
-    Only the active/latest turn retains an execution slice.
+    Only active, ongoing turns retain an execution slice.
     """
     messages: List[ConversationMessage] = []
     current_exec: Optional[CurrentExecution] = None
@@ -180,9 +257,9 @@ def extract_conversation_and_execution(
                     )
                 )
 
-            # Capture execution telemetry for the latest turn only
+            # Capture execution telemetry ONLY if this is the latest turn AND it is active
             is_latest_turn = idx == len(raw_turns) - 1
-            if is_latest_turn:
+            if is_latest_turn and is_active_turn(turn):
                 turn_steps = turn.get("steps") or turn.get("events") or []
                 turn_artifacts = turn.get("artifacts") or turn.get("produced_files") or []
 
@@ -217,8 +294,13 @@ def extract_conversation_and_execution(
                                     error=step.get("error") or s_data.get("error"),
                                 )
                             )
+                    raw_status = str(turn.get("status") or "running").lower()
+                    eff_status: ExecutionStatus = (
+                        raw_status if raw_status in ACTIVE_STATUSES else "running"  # type: ignore
+                    )
                     current_exec = CurrentExecution(
                         turn_id=turn_id,
+                        status=eff_status,
                         steps=steps,
                         artifacts=turn_artifacts,
                     )
@@ -241,22 +323,20 @@ def extract_conversation_and_execution(
                     )
                 )
 
-    # Process events.json ONLY if representing an ongoing execution
+    # Process events.json ONLY if representing an active ongoing execution run
     if events_data and isinstance(events_data, list):
-        has_terminal_event = any(
-            isinstance(ev, dict) and ev.get("type") in ("final", "done", "error")
-            for ev in events_data
-        )
-        last_msg_is_assistant = bool(messages and messages[-1].role == "assistant")
-
-        if not has_terminal_event and not last_msg_is_assistant:
+        active_events = select_current_run_events(events_data)
+        if active_events:
             latest_turn_id = messages[-1].turn_id if messages else "turn_active"
             if not current_exec:
-                current_exec = CurrentExecution(turn_id=latest_turn_id, steps=[], artifacts=[])
+                current_exec = CurrentExecution(
+                    turn_id=latest_turn_id,
+                    status="running",
+                    steps=[],
+                    artifacts=[],
+                )
 
-            for ev in events_data:
-                if not isinstance(ev, dict):
-                    continue
+            for ev in active_events:
                 ev_type = ev.get("type", "observation")
                 ev_data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
 
