@@ -37,10 +37,11 @@ const PRESET_COMPONENTS: Record<GenerativeUIPreset, string[]> = {
 export const useGenerativeUIStore = create<GenerativeUIState>()(
   persist(
     (set) => ({
-      enabled: false,
-      preset: "balanced",
-      allowedComponents: PRESET_COMPONENTS.balanced,
-      maxOutputTokens: 1024,
+      // Enabled by default so that <openui> tags are translated immediately out-of-the-box
+      enabled: true,
+      preset: "full",
+      allowedComponents: PRESET_COMPONENTS.full,
+      maxOutputTokens: 2048,
       maxRetries: 1,
       telemetry: {
         totalInvocations: 0,

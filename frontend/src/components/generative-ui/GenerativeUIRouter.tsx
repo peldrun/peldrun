@@ -1,7 +1,7 @@
 // frontend/src/components/generative-ui/GenerativeUIRouter.tsx
 "use client";
 
-import React from "react";
+import React, { useState, useEffect } from "react";
 import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
 import { useGenerativeUIStore } from "./store";
 import { OpenUIRenderer } from "./OpenUIRenderer";
@@ -11,28 +11,37 @@ interface GenerativeUIRouterProps {
   content: string;
 }
 
-const OPENUI_BLOCK_REGEX = /<openui(?:-lang)?[\s\S]*?>([\s\S]*?)<\/openui(?:-lang)?>/i;
+// Resilient regex that matches <openui>, <openui-lang>, or <ui>, even when wrapped in markdown code blocks
+const OPENUI_BLOCK_REGEX = /(?:```(?:xml|html|openui|markdown)?\s*)?<(?:openui(?:-lang)?|ui)[\s\S]*?>([\s\S]*?)<\/(?:openui(?:-lang)?|ui)>(?:\s*```)?/i;
 
-export const GenerativeUIRouter: React.FC<GenerativeUIRouterProps> = ({ content }) => {
+export function GenerativeUIRouter({ content }: GenerativeUIRouterProps): React.JSX.Element {
+  const [mounted, setMounted] = useState(false);
   const isEnabled = useGenerativeUIStore((s) => s.enabled);
 
-  // Invariant 1: If disabled in settings, return MarkdownRenderer directly (Zero Overhead)
-  if (!isEnabled) {
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  // Only disable if explicitly mounted and toggled off by user in Settings
+  if (mounted && !isEnabled) {
     return <MarkdownRenderer content={content} />;
   }
 
-  // Invariant 2: If no OpenUI tags found, return standard MarkdownRenderer
+  // Intercept generative UI block
   const match = content.match(OPENUI_BLOCK_REGEX);
   if (!match) {
     return <MarkdownRenderer content={content} />;
   }
 
   const dslContent = match[1].trim();
-  const beforeBlock = content.slice(0, match.index).trim();
-  const afterBlock = content.slice((match.index || 0) + match[0].length).trim();
+  const matchIndex = match.index ?? 0;
+
+  // Clean surrounding markdown text
+  const beforeBlock = content.slice(0, matchIndex).trim();
+  const afterBlock = content.slice(matchIndex + match[0].length).trim();
 
   return (
-    <div className="space-y-2">
+    <div className="space-y-3">
       {beforeBlock && <MarkdownRenderer content={beforeBlock} />}
       <GenerativeUIErrorBoundary fallbackContent={content}>
         <OpenUIRenderer dslContent={dslContent} />
@@ -40,4 +49,4 @@ export const GenerativeUIRouter: React.FC<GenerativeUIRouterProps> = ({ content 
       {afterBlock && <MarkdownRenderer content={afterBlock} />}
     </div>
   );
-};
+}

@@ -50,7 +50,6 @@ export function ChatDeliverable({
   const copyId = typeof turnIndex === "number" ? `turn-res-${turnIndex}` : "final-result";
   const hasFiles = producedFiles && producedFiles.length > 0;
 
-  // Synthesize clean presentation if finalResult contains raw diagnostic execution traces
   let displayContent = finalResult;
   if (isTurnRawTrace) {
     if (lastThoughtContent && lastThoughtContent.trim()) {
@@ -80,12 +79,12 @@ export function ChatDeliverable({
         </div>
       </div>
 
-      {/* 2. Primary Response with Isolated Generative UI Router */}
+      {/* 2. Primary Response rendered via GenerativeUIRouter */}
       <div className="p-4 rounded-md bg-card/40 text-foreground text-sm leading-relaxed">
         <GenerativeUIRouter content={displayContent} />
       </div>
 
-      {/* 3. Diagnostic Trace Toggle (Keeps raw command logs isolated) */}
+      {/* 3. Diagnostic Trace Toggle */}
       {isTurnRawTrace && (
         <div className="border border-border/60 rounded-lg overflow-hidden bg-background/40">
           <button
@@ -159,7 +158,7 @@ export function ChatDeliverable({
         </div>
       )}
 
-      {/* 6. Bottom Action Toolbar with Usage Badges & Copy Button */}
+      {/* 6. Bottom Action Toolbar */}
       <div className="flex items-center justify-between gap-2 pt-2 text-xs">
         <div className="flex items-center">
           {hasUsage && (
