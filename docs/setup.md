@@ -1,75 +1,73 @@
-# peldrun Web – Installation & Operation Guide
+# PELDRUN Web – Installation & Operation Guide
 
-[![peldrun Core](https://img.shields.io/badge/peldrun-Core-blue?style=for-the-badge&logo=github)](https://github.com/FoundationAgents/peldrun)
-[![FastAPI](https://img.shields.io/badge/Backend-FastAPI%202.0-009688?style=for-the-badge&logo=fastapi)](https://fastapi.tiangolo.com)
-[![Next.js](https://img.shields.io/badge/Frontend-Next.js%2015-000000?style=for-the-badge&logo=next.js)](https://nextjs.org)
+[![PELDRUN Core](https://img.shields.io/badge/PELDRUN-Core%200.2.0-blue?style=for-the-badge&logo=github)](https://github.com/peldrun/peldrun)
+[![FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688?style=for-the-badge&logo=fastapi)](https://fastapi.tiangolo.com)
+[![Next.js](https://img.shields.io/badge/Frontend-Next.js%2016-000000?style=for-the-badge&logo=next.js)](https://nextjs.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
 
-A complete web dashboard for the **peldrun** AI agent. Visual execution, live streaming, and full file & settings management.
-
- 
+A complete web dashboard and runtime control plane for the **PELDRUN** AI agent. Visual execution, live streaming, and full workspace, deliverables, and settings management.
 
 ---
 
 ## ✨ Key Features
 
-- **Split‑View Interface** – Chat and live telemetry side by side.
-- **Live Streaming (SSE)** – Real‑time thoughts and tool calls.
-- **Zero‑Config Setup Wizard** – Auto‑detect existing peldrun or install embedded with one click.
-- **Secure File Explorer** – File tree, code editor, downloads, path‑traversal protection.
-- **Task History & Replay** – Persistent task storage with one‑click re‑run.
+- **Split-View Interface** – Chat and live telemetry side by side.
+- **Live Streaming (SSE)** – Real-time thoughts, tool calls, and observations.
+- **Embedded PELDRUN Core** – Single authoritative execution engine running directly within `backend/peldrun/`.
+- **Secure File Explorer** – File tree, code editor, downloads, and path-traversal protection.
+- **Task History & Replay** – Persistent session storage with token usage and cost accounting.
 - **Bilingual Support** – Arabic and English with full RTL/LTR.
-- **Advanced Security** – Path traversal guard, safe deletion, secret isolation.
-- **One‑Click Launch** – PowerShell scripts to start both servers.
+- **Advanced Security** – Workspace boundary enforcement, safe file deletion, and secret isolation.
+- **One-Click Launch** – PowerShell scripts to start both backend and frontend servers.
 
 ---
 
-## 🏗️ Architecture (Simplified)
+## 🏗️ Architecture
 
-```
+```text
 Browser (localhost:3088)
       │ HTTP + SSE
       ▼
-Frontend (Next.js 15) ── /api/* proxy → Backend (FastAPI 2.0) on port 8088
-      │
-      ▼
-peldrun Core Engine (embedded or external)
+Frontend (Next.js 16) ── /api/* proxy ──► Backend Control Plane (FastAPI) on port 8088
+                                                   │
+                                                   ▼
+                                        Embedded PELDRUN Core
+                                          (backend/peldrun/)
+
 ```
 
 ---
 
 ## 📂 Project Structure
 
-```
-PELDRUN-Web/
+```text
+peldrun/
 ├─ start-all.ps1
 ├─ start-backend.ps1
 ├─ start-frontend.ps1
-├─ engine/                 # Embedded peldrun (Git ignored)
-│  └─ peldrun/
 ├─ backend/
 │  ├─ .venv/
 │  ├─ requirements.txt
-│  └─ omweb/
-└─ frontend/
-   ├─ package.json
-   └─ src/
-```
+│  ├─ omweb/             # Web application & control plane layer
+│  ├─ peldrun/           # Embedded PELDRUN Core runtime engine
+│  └─ tests/
+├─ frontend/
+│  ├─ package.json
+│  └─ src/
+└─ storage/              # Persistent chats, projects, and runtime database
 
-> **Note:** `start-frontend.py` and `start_frontend.bat` are **not used** by the project. They can be safely deleted.
+```
 
 ---
 
 ## 🛠️ Prerequisites
 
 | Requirement | Recommended Version | Notes |
-|-------------|---------------------|-------|
-| **Python** | 3.12+ | Backend and peldrun engine |
+| --- | --- | --- |
+| **Python** | 3.12+ | Backend Control Plane & Embedded PELDRUN Core |
 | **Node.js** | 18+ | Next.js frontend |
-| **Git** | Latest | Cloning repositories |
-| **PowerShell** | 5.1+ | Windows launch scripts (optional) |
-
-> **Note:** If you don't have peldrun installed, the setup wizard will install an embedded copy automatically.
+| **Git** | Latest | Version control |
+| **PowerShell** | 5.1+ | Windows launch scripts |
 
 ---
 
@@ -78,8 +76,9 @@ PELDRUN-Web/
 ### Step 1 – Clone the Repository
 
 ```bash
-git clone https://github.com/mtaman/PELDRUN-Web.git
-cd PELDRUN-Web
+git clone [https://github.com/peldrun/peldrun.git](https://github.com/peldrun/peldrun.git)
+cd peldrun
+
 ```
 
 ### Step 2 – Backend Setup
@@ -88,71 +87,44 @@ cd PELDRUN-Web
 cd backend
 python -m venv .venv
 
-# Activate the virtual environment
+# Activate virtual environment
 # Windows:
 .venv\Scripts\activate
 # macOS/Linux:
 source .venv/bin/activate
 
 pip install -r requirements.txt
-```
 
-> **Important:** The `backend/requirements.txt` file should already be present in the repository. If not, create it manually from the project's documentation.
+```
 
 ### Step 3 – Frontend Setup
 
 ```bash
 cd ../frontend
 npm install
+
 ```
 
-### Step 4 – Configure the peldrun Engine
+### Step 4 – Embedded Core Runtime Verification
 
-You have two options:
-
-#### 🔹 Option A – Embedded Engine (Recommended for New Users)
-
-1. Start the backend and frontend (see Step 5).
-2. Open `http://localhost:3088/setup`.
-3. Click **"Install Embedded Engine"**.
-4. The system clones peldrun into `engine/peldrun`, creates `config.toml`, and initialises the sandbox.
-
-#### 🔹 Option B – Link an Existing peldrun Installation
-
-1. Open the `/setup` page.
-2. The system will list detected paths. Select one and click **"Connect"**, or enter a custom path manually.
-3. Ensure the path points to a valid peldrun directory containing `config.toml`.
+PELDRUN Core is shipped directly embedded inside the repository under `backend/peldrun/`. No external engine cloning, downloading, or manual directory linking is needed.
 
 ---
 
 ## 🏃 Running the Application
 
-### ⚠️ Important Note About PowerShell Scripts
+### Option A – Automated Launch (Windows)
 
-The provided `start-all.ps1`, `start-backend.ps1`, and `start-frontend.ps1` scripts contain **absolute paths** such as `D:\AI\peldrun\`.  
-**They will not work on your machine unless you edit these paths.**
-
-You can either:
-
-- Edit the scripts to match your project location, **or**
-- Use the manual commands below (recommended for cross‑platform compatibility).
-
-#### Making the Scripts Portable (Optional)
-
-Replace absolute paths with relative ones. Example for `start-all.ps1`:
+From the project root:
 
 ```powershell
-$root = Split-Path -Parent $MyInvocation.MyCommand.Definition
-Start-Process powershell -ArgumentList "-NoExit", "-File", "$root\start-backend.ps1"
-Start-Sleep -Seconds 2
-Start-Process powershell -ArgumentList "-NoExit", "-File", "$root\start-frontend.ps1"
+.\start-all.ps1
+
 ```
 
-Apply similar changes to `start-backend.ps1` and `start-frontend.ps1`.
+This starts both the FastAPI backend and Next.js frontend in separate PowerShell windows.
 
----
-
-### Manual Launch (Works on Windows, macOS, Linux)
+### Option B – Manual Launch (Cross-Platform)
 
 Open **two terminals** from the project root.
 
@@ -160,13 +132,14 @@ Open **two terminals** from the project root.
 
 ```bash
 cd backend
-# Activate virtual environment first (see Step 2)
-
-# Windows (ensure Windows Proactor loop for Playwright):
-python -c "import sys, asyncio, uvicorn; asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy()) if sys.platform == 'win32' else None; uvicorn.run('omweb.main:app', host='0.0.0.0', port=8088)"
+# Windows:
+.venv\Scripts\activate
+python -c "import sys, asyncio, uvicorn; asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy()) if sys.platform == 'win32' else None; uvicorn.run('omweb.main:app', host='127.0.0.1', port=8088)"
 
 # macOS / Linux:
-uvicorn omweb.main:app --host 0.0.0.0 --port 8088
+source .venv/bin/activate
+uvicorn omweb.main:app --host 127.0.0.1 --port 8088
+
 ```
 
 **Terminal 2 – Frontend (Next.js)**
@@ -174,108 +147,60 @@ uvicorn omweb.main:app --host 0.0.0.0 --port 8088
 ```bash
 cd frontend
 npm run dev -- -p 3088
+
 ```
 
 ---
 
-### One‑Click Launch (Windows Only, after editing scripts)
-
-```powershell
-.\start-all.ps1
-```
-
-This opens two PowerShell windows and starts both servers.
-
----
-
-## 🌐 Accessing the Dashboard
+## 🌐 Endpoints
 
 | Service | URL |
-|---------|-----|
-| Dashboard UI | `http://localhost:3088` |
-| Setup Wizard | `http://localhost:3088/setup` |
-| Backend Health Check | `http://localhost:8088/api/status` |
-
-After starting both servers, open your browser and navigate to `http://localhost:3088`.  
-Go to `/setup` to configure the engine. Once the status shows **"READY & SYNCHRONIZED"**, you can start using the dashboard.
+| --- | --- |
+| PELDRUN UI | `http://localhost:3088` |
+| Backend API | `http://localhost:8088/api/` |
+| Health Check | `http://localhost:8088/api/status/health` |
+| API Docs | `http://localhost:8088/docs` |
 
 ---
 
 ## ⚙️ Configuration
 
-### API Keys
+Configure your LLM provider (OpenAI, DeepSeek, LM Studio, Ollama, etc.) either via:
 
-Configure your LLM provider (OpenAI, DeepSeek, Ollama, etc.) either via:
-
-1. **Settings UI** at `/settings`.
-2. **`config.toml`** inside the peldrun engine folder:
+1. **Settings UI** at `http://localhost:3088/settings`.
+2. **`config/config.toml`** in the project root:
 
 ```toml
 [llm]
 model = "gpt-4o"
-base_url = "https://api.openai.com/v1"
+base_url = "[https://api.openai.com/v1](https://api.openai.com/v1)"
 api_key = "sk-your-api-key-here"
 max_tokens = 4096
-temperature = 0.0
+temperature = 0.7
+
 ```
 
-### Ports
-
-| Service | Default Port | Changeable |
-|---------|--------------|------------|
-| Frontend (Next.js) | 3088 | Yes – via `next.config.mjs` or CLI |
-| Backend (FastAPI) | 8088 | Yes – via environment variables |
-
----
-
-## 🧭 Basic Usage
-
-- **Chat** (`/chat`) – Send commands, watch live streaming, see results.
-- **Files** (`/files`) – Browse, edit, download, and safely delete files.
-- **History** (`/history`) – View past tasks and re‑run them.
-- **Settings** (`/settings`) – Manage API keys and UI preferences.
+Local endpoints (e.g., LM Studio: `http://127.0.0.1:1234/v1`, Ollama: `http://127.0.0.1:11434/v1`) are detected and supported directly.
 
 ---
 
 ## 🔒 Security
 
-- **Path Traversal Guard** – All file operations validated with `Path.resolve()` and `is_relative_to(WORKSPACE_ROOT)`.
-- **Safe Deletion** – Files moved to `.trash/` instead of permanent removal.
-- **Secret Isolation** – Keys and runtime files are `.gitignore`d.
-- **Read‑Only Core** – peldrun engine is treated as an immutable external module.
+* **Workspace Boundary Guard** – All file operations are constrained to authorized storage directories.
+* **Safe File Deletion** – Workspace files are securely quarantined to `.trash/`.
+* **Secret Isolation** – API keys and runtime files are excluded via `.gitignore`.
+* **Native Embedded Authority** – Execution runs strictly through embedded PELDRUN Core contracts.
 
 ---
 
 ## 🧪 Troubleshooting
 
 | Issue | Solution |
-|-------|----------|
-| Backend not starting | Ensure `.venv` is activated and dependencies installed. |
-| Frontend not loading | Run `npm install`; check port 3088 is free. |
-| peldrun not found | Use `/setup` to install embedded or link existing path. |
-| Invalid API key | Check `config.toml` or `/settings`. |
-| SSE streaming issues | Ensure port 8088 is not blocked by firewall. |
+| --- | --- |
+| Backend not starting | Ensure `.venv` is activated and dependencies installed via `pip install -r requirements.txt`. |
+| Frontend not loading | Run `npm install` inside `frontend/` and ensure port 3088 is available. |
+| Core engine missing | Ensure `backend/peldrun/` contains `__init__.py`. |
+| Invalid API key or model unreachable | Verify model settings in UI or check port (e.g. 1234 for LM Studio). |
+| SSE streaming issues | Ensure port 8088 is not blocked by local security software. |
 
 ---
-
-## 📜 License
-
-This project is licensed under the **MIT License**. See the `LICENSE` file for details.
-
----
-
-## 🔗 Important Links
-
-| Resource | Link |
-|----------|------|
-| peldrun Official Repository | [https://github.com/FoundationAgents/peldrun](https://github.com/FoundationAgents/peldrun) |
-| peldrun Web Repository | [https://github.com/mtaman/PELDRUN-Web](https://github.com/mtaman/PELDRUN-Web) |
-| FoundationAgents Organization | [https://github.com/FoundationAgents](https://github.com/FoundationAgents) |
-
----
-
-<div align="center">
-
-**Made with ❤️ for the peldrun community worldwide**
-
-</div>

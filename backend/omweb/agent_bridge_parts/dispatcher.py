@@ -3,15 +3,11 @@ backend/omweb/agent_bridge_parts/dispatcher.py
 
 Authoritative dispatcher entry points for the PELDRUN Universal Agent Bridge.
 
-Dispatches execution to registered engines via the authoritative EngineRegistry abstraction layer.
-Hardened under PR 2 (Single Execution Authority), Milestone P1 (Usage Accounting),
-and Hybrid Reasoning Control (2026 Industry Spec):
-- Enforces single AgentRunner authority by routing all native core runs to PeldrunEngine.
-- Strictly unifies the canonical token accounting path between Agent and Direct Chat modes.
-- Direct Chat invocations are fully metered in SQLite token_ledger and projected to session.json.
-- Dynamically resolves model reasoning capabilities from caller payload and persistent metadata database.
-- Strictly normalizes 'off' to 'none' for OpenAI-compatible schema compliance without mutating graduated levels.
-- Isolates Conversational Chat prompts from Agent identities during Context Sidecar assembly.
+Dispatches execution strictly to PELDRUN Core via the authoritative EngineRegistry.
+Hardened under PR 1 (Single Execution Authority & OpenManus Decoupling):
+- Rejects legacy OpenManus engine identifiers explicitly (openmanus, legacy, manus).
+- Enforces PELDRUN Core as the sole execution engine for all agent tasks.
+- Unifies token accounting, dynamic pricing, and Sidecar context management.
 """
 
 from __future__ import annotations
@@ -26,10 +22,6 @@ from typing import Any, Dict, List, Optional
 import uuid
 
 from omweb.agents.registry import AgentNotFoundError, agent_registry
-from omweb.engine_resolver import (
-    EngineType,
-    get_active_engine_type,
-)
 from omweb.engines import engine_registry
 from omweb.engines.base import EngineRunContext
 from omweb.engines.registry import EngineNotFoundError
@@ -37,7 +29,7 @@ from omweb.job_manager import job_manager
 from omweb.project_manager import project_manager
 from omweb.sse_events import SSEEvent, SSEEventType, dispatch_event
 
-# Public Core LLM & Telemetry Boundary Imports (P1-02 Conformance)
+# Public Core LLM & Telemetry Boundary Imports
 from peldrun.llm.client import AsyncLLMClient
 from peldrun.runtime.pricing_store import NANO_USD_PER_USD, get_pricing_store
 from peldrun.runtime.usage_store import LLMInvocationRecord, get_usage_store
@@ -57,6 +49,34 @@ from .state import (
 )
 
 logger = logging.getLogger(__name__)
+
+SUPPORTED_ENGINE = "peldrun"
+LEGACY_ENGINE_IDS = {"openmanus", "legacy", "manus"}
+VALID_CORE_ALIASES = {"peldrun", "peldrun-core", "core"}
+
+
+def validate_requested_engine(value: Optional[str]) -> str:
+    """
+    Validate engine identifier during runtime dispatch.
+    Explicitly rejects OpenManus identifiers and validates against supported core aliases.
+    Returns the canonical engine identifier 'peldrun'.
+    """
+    if not value or not str(value).strip():
+        return SUPPORTED_ENGINE
+
+    engine_id = str(value).strip().lower()
+
+    if engine_id in LEGACY_ENGINE_IDS:
+        raise ValueError(
+            "OpenManus is no longer supported. PELDRUN Core is the only execution engine."
+        )
+
+    if engine_id not in VALID_CORE_ALIASES:
+        raise ValueError(
+            f"Unsupported execution engine: '{value}'. PELDRUN Core is the only execution engine."
+        )
+
+    return SUPPORTED_ENGINE
 
 
 def _check_model_metadata_reasoning(model_name: str) -> Optional[bool]:
@@ -91,10 +111,7 @@ def _check_model_metadata_reasoning(model_name: str) -> Optional[bool]:
 
 def _is_reasoning_model(model_name: str, active_llm: Optional[Dict[str, Any]] = None) -> bool:
     """
-    Deterministically identify whether the target model is a reasoning-centric model:
-    1. Highest priority: explicit flag passed from caller / frontend metadata.
-    2. Second priority: database record in models_metadata.json.
-    3. Fallback: heuristic pattern matching for known reasoning architectures.
+    Deterministically identify whether the target model is a reasoning-centric model.
     """
     if active_llm:
         if "is_reasoning_model" in active_llm and active_llm["is_reasoning_model"] is not None:
@@ -128,11 +145,7 @@ def _resolve_chat_system_prompt(
     active_llm: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """
-    Resolve chat system instructions following the 2026 reasoning model specification:
-    - If model is a reasoning architecture and reasoning effort is off/none, omit system persona
-      to prevent semantic distractions and infinite thought loops.
-    - If reasoning is explicitly requested or active, provide concise conversational guidance.
-    - If model is standard, provide full conversational markdown assistant instructions.
+    Resolve chat system instructions following reasoning specifications.
     """
     is_reasoner = _is_reasoning_model(model_name, active_llm=active_llm)
     norm_effort = (reasoning_effort or "none").lower().strip()
@@ -153,8 +166,7 @@ def _build_optimized_chat_messages(
     active_llm: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, str]]:
     """
-    Construct chat completion messages for standalone or fallback pipelines.
-    Delegates system instruction resolution to _resolve_chat_system_prompt to prevent divergence.
+    Construct chat completion messages for conversational pipelines.
     """
     messages: List[Dict[str, str]] = []
     sys_prompt = _resolve_chat_system_prompt(
@@ -180,7 +192,6 @@ def _build_optimized_chat_messages(
 def _append_session_log(chat_id: str, project_id: str, log_type: str, message: Any) -> None:
     """
     Append a structured line to chat.log on disk for the active session.
-    Persists operational logs permanently so /api/chats/{chat_id}/log can read them.
     """
     if not chat_id or not message:
         return
@@ -219,8 +230,8 @@ async def run_instrumented(
     **kwargs: Any,
 ) -> None:
     """
-    Dispatch an agent job using the authoritative execution engine registry.
-    Ensures single runtime authority delegation and preserves reasoning_effort.
+    Dispatch an agent job using PELDRUN Core as the single execution authority.
+    Explicitly rejects legacy OpenManus engine identifiers.
     """
     current_task = asyncio.current_task()
     if current_task is not None:
@@ -241,15 +252,25 @@ async def run_instrumented(
     explicit_engine = kwargs.get("engine") or (
         llm_override.get("engine") if isinstance(llm_override, dict) else None
     )
-    if explicit_engine:
-        target_engine_str = str(explicit_engine).lower().strip()
-    else:
-        active_type = get_active_engine_type()
-        target_engine_str = (
-            active_type.value if isinstance(active_type, EngineType) else str(active_type)
-        )
 
-    print(f"\n[BRIDGE] Initializing job {job_id} using engine: '{target_engine_str}'")
+    try:
+        target_engine_str = validate_requested_engine(explicit_engine)
+    except ValueError as val_err:
+        err_msg = str(val_err)
+        print(f"[BRIDGE ERROR] {err_msg}")
+        job_manager.fail_job(job_id, err_msg)
+        await dispatch_event(
+            job_id,
+            SSEEvent(
+                type=SSEEventType.ERROR,
+                step=0,
+                data={"message": err_msg, "engine": str(explicit_engine)},
+            ),
+        )
+        cleanup_job_state(job_id)
+        return
+
+    print(f"\n[BRIDGE] Initializing job {job_id} using authoritative engine: '{target_engine_str}'")
     job_scoped_artifacts.setdefault(job_id, [])
 
     try:
@@ -347,17 +368,16 @@ async def run_instrumented(
             cleanup_job_state(job_id)
             return
 
-    is_native_core = target_engine_str in ("peldrun", "peldrun-core", "core")
-
-    if not is_native_core:
-        await asyncio.sleep(0.05)
+    # Dispatch native PELDRUN run acceptance event
+    status_event_type = getattr(SSEEventType, "STATUS", None) or getattr(SSEEventType, "RUN_ACCEPTED", None)
+    if status_event_type is not None:
         await dispatch_event(
             job_id,
             SSEEvent(
-                type=SSEEventType.STEP_START,
-                step=1,
+                type=status_event_type,
+                step=0,
                 data={
-                    "status": "running",
+                    "status": "accepted",
                     "model": model_name,
                     "provider": provider_name,
                     "mode": "agent",
@@ -365,23 +385,6 @@ async def run_instrumented(
                 },
             ),
         )
-    else:
-        status_event_type = getattr(SSEEventType, "STATUS", None) or getattr(SSEEventType, "RUN_ACCEPTED", None)
-        if status_event_type is not None:
-            await dispatch_event(
-                job_id,
-                SSEEvent(
-                    type=status_event_type,
-                    step=0,
-                    data={
-                        "status": "accepted",
-                        "model": model_name,
-                        "provider": provider_name,
-                        "mode": "agent",
-                        "engine": target_engine_str,
-                    },
-                ),
-            )
 
     chat = project_manager.get_chat(job_id) or {}
     chat_id = chat.get("id", f"chat_{job_id}")
@@ -445,8 +448,7 @@ async def run_direct_chat(
 ) -> None:
     """
     Dispatch a direct, conversational chat completion job.
-    Fully integrated into the canonical token accounting and dynamic pricing subsystem.
-    Enforces dynamic reasoning effort control, optimized prompts, and progressive token telemetry.
+    Fully integrated into canonical token accounting and dynamic pricing subsystem.
     """
     current_task = asyncio.current_task()
     if current_task is not None:
@@ -532,7 +534,6 @@ async def run_direct_chat(
         turns = chat.get("turns", [])
         _append_session_log(chat_id, project_id, "SYSTEM", f"User: {prompt}")
 
-        # Resolve Context Sidecar and apply dynamic user token budget
         session_dir = project_manager.chats_dir / chat_id
         sidecar = load_context_sidecar(session_dir)
         if not sidecar:
@@ -543,7 +544,6 @@ async def run_direct_chat(
                 storage_root=project_manager.storage_dir,
             )
 
-        # Resolve conversational chat system instructions (strictly isolates Chat from Agent identity)
         chat_system_prompt = _resolve_chat_system_prompt(
             model_name=model_name,
             reasoning_effort=reasoning_effort,
@@ -680,7 +680,6 @@ async def run_direct_chat(
         job_manager.complete_job(job_id, result_text)
         _append_session_log(chat_id, project_id, "FINAL", result_text)
 
-        # Automatically update session.context.json with the new conversation turn
         try:
             chat_storage_engine.sync_sidecar(chat_id, model_id=model_name)
         except Exception as sidecar_err:
@@ -728,4 +727,5 @@ async def run_direct_chat(
 __all__ = [
     "run_instrumented",
     "run_direct_chat",
+    "validate_requested_engine",
 ]

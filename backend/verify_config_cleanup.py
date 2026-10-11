@@ -1,24 +1,26 @@
 """
-Automated Verification Suite for PR 5 (Configuration & Diagnostics Cleanup).
+backend/verify_config_cleanup.py
+
+Automated Verification Suite for PELDRUN Single-Engine Architecture & Configuration Cleanup.
 
 Validates:
-1. engine_config.json contains NO 'peldrun_path' and specifies engine_type 'peldrun'.
+1. engine_config.json is completely eliminated from the repository.
 2. engine_resolver:
-   - is_core_engine_available() evaluates natively to True without external path probing.
+   - is_core_engine_available() evaluates natively to True.
+   - is_legacy_engine_available() evaluates strictly to False.
    - resolve_active_engine_path() resolves locally to embedded package.
-   - get_engine_status() accurately reports embedded status.
-   - inject_engine_to_syspath() injects zero external core paths.
+   - get_engine_status() accurately reports embedded status with zero legacy availability.
+   - inject_engine_to_syspath() injects zero external paths.
 3. status router:
    - resolve_active_core_path('peldrun') points to local embedded directory.
    - check_core_linkage('peldrun', ...) returns True.
    - get_git_commit(..., 'peldrun') returns upstream baseline commit (0755669).
    - get_system_status() and get_health_status() report peldrun_linked: True and embedded: True.
 4. config_rtr:
-   - write_raw_config() executes without attempting external core synchronization.
+   - write_raw_config() executes cleanly with zero external synchronization.
 """
 
 import asyncio
-import json
 import os
 from pathlib import Path
 import sys
@@ -30,43 +32,27 @@ def main() -> int:
         sys.path.insert(0, str(backend_dir))
 
     print("=" * 70)
-    print("PELDRUN CONFIGURATION & DIAGNOSTICS CLEANUP VERIFICATION (PR 5)")
+    print("PELDRUN SINGLE ENGINE CONFIGURATION & DIAGNOSTICS VERIFICATION (PR 4)")
     print(f"Working Directory: {backend_dir}")
     print("=" * 70)
 
-    # 1. Verify engine_config.json
-    print("\n[TEST 1] Verifying engine_config.json cleanliness...")
+    # 1. Verify engine_config.json elimination
+    print("\n[TEST 1] Verifying engine_config.json complete elimination...")
     config_file = backend_dir / "engine_config.json"
-    if not config_file.is_file():
-        print(f"  [FAIL] {config_file} not found!")
+    if config_file.exists():
+        print(f"  [FAIL] Obsolete {config_file} still exists! It must be removed.")
         return 1
-
-    try:
-        cfg = json.loads(config_file.read_text(encoding="utf-8"))
-        print(f"  [*] Loaded engine_config: {cfg}")
-    except Exception as e:
-        print(f"  [FAIL] Malformed JSON in engine_config.json: {e}")
-        return 1
-
-    if "peldrun_path" in cfg:
-        print(f"  [FAIL] Obsolete 'peldrun_path' still exists in engine_config.json: {cfg['peldrun_path']}")
-        return 1
-    print("  [OK] Confirmed: 'peldrun_path' completely eliminated from engine_config.json.")
-
-    engine_type_val = cfg.get("engine_type", "")
-    if engine_type_val not in ["peldrun", "peldrun-core"]:
-        print(f"  [FAIL] Unexpected engine_type: '{engine_type_val}'")
-        return 1
-    print(f"  [OK] engine_type configured cleanly: '{engine_type_val}'")
+    print("  [OK] Confirmed: engine_config.json is completely eliminated from backend.")
 
     # 2. Verify engine_resolver
-    print("\n[TEST 2] Verifying engine_resolver native embedded resolution...")
+    print("\n[TEST 2] Verifying engine_resolver single-engine authority...")
     from omweb.engine_resolver import (
         get_active_engine_name,
         get_active_engine_type,
         get_engine_status,
         inject_engine_to_syspath,
         is_core_engine_available,
+        is_legacy_engine_available,
         resolve_active_engine_path,
     )
 
@@ -74,6 +60,11 @@ def main() -> int:
         print("  [FAIL] is_core_engine_available() returned False for embedded core!")
         return 1
     print("  [OK] is_core_engine_available() evaluates natively to True.")
+
+    if is_legacy_engine_available():
+        print("  [FAIL] is_legacy_engine_available() returned True! Legacy must be disabled.")
+        return 1
+    print("  [OK] is_legacy_engine_available() strictly evaluates to False.")
 
     active_path = resolve_active_engine_path()
     expected_embedded_path = (backend_dir / "peldrun").resolve()
@@ -87,9 +78,11 @@ def main() -> int:
     if not status_data.get("core_available") or not status_data.get("core_embedded"):
         print("  [FAIL] Engine status missing core_available or core_embedded flag!")
         return 1
-    print("  [OK] get_engine_status() confirms embedded core health.")
+    if status_data.get("legacy_available") is not False:
+        print("  [FAIL] Engine status indicates legacy_available is not False!")
+        return 1
+    print("  [OK] get_engine_status() confirms embedded core health and zero legacy presence.")
 
-    # Test that inject_engine_to_syspath() injects nothing for embedded core
     external_core_marker = os.path.join("peldrun-core", "peldrun")
     inject_engine_to_syspath()
     active_external_paths = [p for p in sys.path if external_core_marker in p.lower()]
@@ -113,7 +106,7 @@ def main() -> int:
     if core_dir.resolve() != expected_embedded_path:
         print(f"  [FAIL] status.resolve_active_core_path() returned {core_dir}, expected: {expected_embedded_path}")
         return 1
-    print(f"  [OK] status.resolve_active_core_path('peldrun') points to embedded core.")
+    print("  [OK] status.resolve_active_core_path('peldrun') points to embedded core.")
 
     if not check_core_linkage("peldrun", core_dir):
         print("  [FAIL] status.check_core_linkage() returned False for embedded core!")
@@ -138,6 +131,7 @@ def main() -> int:
         assert sys_status["peldrun_linked"] is True
         assert sys_status["core_linked"] is True
         assert sys_status["embedded"] is True
+        assert sys_status["active_engine"] == "peldrun"
 
         print(f"  [*] GET /api/status/health -> status={health_status['status']}, peldrun_linked={health_status['peldrun_linked']}")
         assert health_status["peldrun_linked"] is True
@@ -161,7 +155,7 @@ def main() -> int:
     print("  [OK] write_raw_config() executed cleanly with zero external synchronization side-effects.")
 
     print("\n" + "=" * 70)
-    print("PR 5 VERIFICATION RESULT: ALL CHECKS PASSED (100% READY)")
+    print("PR 4 VERIFICATION RESULT: ALL CHECKS PASSED (100% READY)")
     print("=" * 70)
     return 0
 

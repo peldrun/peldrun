@@ -5,6 +5,7 @@ PELDRUN Native Embedded Execution Engine (Hardened Context Architecture).
 Executes autonomous workflows by delegating to peldrun-core via RunRequest.
 Integrates ContextManager to enforce strict isolation between persistent history
 and LLM context, guaranteeing zero execution telemetry leakage across turns.
+Hardened under PR 2: Zero circular import cycles with agent_bridge subsystems.
 """
 
 from __future__ import annotations
@@ -17,27 +18,16 @@ import time
 from typing import Any, Dict, List, Optional, Set
 import uuid
 
-from omweb.agent_bridge_parts.state import job_scoped_artifacts
-from omweb.agent_bridge_parts.text_utils import sanitize_final_result_text
-from omweb.chat_storage_engine import chat_storage_engine
-from omweb.job_manager import job_manager
-from omweb.project_manager import project_manager
-from omweb.sse_events import SSEEvent, SSEEventType, dispatch_event
-
 from .base import EngineRunContext, ExecutionEngine
 
 # Core Public Boundary Imports
 from peldrun.context.builder import ContextManager
-from peldrun.context.sidecar import build_context_sidecar, load_context_sidecar
+from peldrun.context.sidecar import build_context_sidecar
 from peldrun.events.schema import EventType, PeldrunEvent
 from peldrun.runtime.contract import AgentSpec, RunRequest, RunStatus, WorkspaceContext
 from peldrun.runtime.executor import core_executor
-from peldrun.runtime.pricing_store import NANO_USD_PER_USD, get_pricing_store
-from peldrun.runtime.usage_store import get_usage_store
+from peldrun.runtime.pricing_store import NANO_USD_PER_USD
 from peldrun.tools.builtins.human_input import HumanInputRegistry
-
-from omweb.adapters.core_adapter import resolve_tool_runtime
-from omweb.tools.registry import tool_registry as web_tool_registry
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +60,16 @@ class PeldrunEngine(ExecutionEngine):
 
     async def run(self, context: EngineRunContext) -> None:
         """Execute autonomous agent workflow through canonical Core boundaries."""
+        # Lazy imports of Web layer dependencies to guarantee zero circular import cycles
+        from omweb.adapters.core_adapter import resolve_tool_runtime
+        from omweb.agent_bridge_parts.state import job_scoped_artifacts
+        from omweb.agent_bridge_parts.text_utils import sanitize_final_result_text
+        from omweb.chat_storage_engine import chat_storage_engine
+        from omweb.job_manager import job_manager
+        from omweb.project_manager import project_manager
+        from omweb.sse_events import SSEEvent, SSEEventType, dispatch_event
+        from omweb.tools.registry import tool_registry as web_tool_registry
+
         job_id = context.job_id
         prompt = context.prompt
         agent_id = context.agent_id
@@ -139,14 +139,14 @@ class PeldrunEngine(ExecutionEngine):
                 storage_root=project_manager.storage_dir,
             )
 
-         # 2. Assemble Sanitized Prompt Context via ContextManager
+        # 2. Assemble Sanitized Prompt Context via ContextManager
         context_mgr = ContextManager(default_system_prompt=system_prompt)
         context_messages, context_usage = context_mgr.build_messages(
             sidecar=sidecar,
             current_user_message=prompt,
             system_prompt=system_prompt,
             project_rules=project_rules,
-            include_execution=False,  # Clean initial state for new task turn
+            include_execution=False,
         )
 
         effective_context_tokens = context_usage.get("total_tokens", context_usage.get("total", 0))

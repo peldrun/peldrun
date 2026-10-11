@@ -1,15 +1,16 @@
 ﻿"""
+backend/omweb/routers/status.py
+
 PELDRUN Web System Status and Diagnostics Router.
 
-Provides real-time system health checks, memory telemetry, and engine linkage
-diagnostics, natively reflecting embedded PELDRUN Core status.
+Provides real-time system health checks, memory telemetry, and runtime diagnostics,
+natively reflecting embedded PELDRUN Core as the sole authority.
+Hardened under PR 3: Completely stripped of OpenManus heuristics and external checks.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import importlib.util
-import json
 import os
 from pathlib import Path
 import platform
@@ -18,80 +19,36 @@ from typing import Any, Dict
 import winreg
 
 from fastapi import APIRouter
-from omweb.config import BACKEND_DIR, peldrun_ROOT
+from omweb.config import BACKEND_DIR
 
 router = APIRouter()
 
 FALLBACK_COMMITS = {
     "peldrun": "0755669",
-    "openmanus": "3309bf4",
 }
 
 
 def get_active_engine_name() -> str:
-    """Detect the currently selected execution engine from resolver or config."""
-    try:
-        from omweb.engine_resolver import get_active_engine_name as resolve_name
-
-        return resolve_name().lower()
-    except Exception:
-        pass
-
-    engine_cfg_path = BACKEND_DIR / "engine_config.json"
-    if engine_cfg_path.is_file():
-        try:
-            cfg_data = json.loads(engine_cfg_path.read_text(encoding="utf-8"))
-            active = cfg_data.get("engine_type") or cfg_data.get("active_engine") or cfg_data.get("engine")
-            if active and isinstance(active, str):
-                norm = active.strip().lower()
-                return "peldrun" if norm in ["peldrun", "peldrun-core", "core"] else norm
-        except Exception:
-            pass
-
+    """Return authoritative execution engine name string."""
     return "peldrun"
 
 
-def resolve_active_core_path(engine_name: str) -> Path:
-    """Resolve the physical filesystem directory of the active engine."""
-    if engine_name in ["peldrun", "peldrun-core", "core"]:
-        embedded_core = BACKEND_DIR / "peldrun"
-        if embedded_core.is_dir():
-            return embedded_core
-        return BACKEND_DIR
-
-    # Legacy OpenManus path candidates
-    workspace_root = BACKEND_DIR.parent.parent
-    candidates = [
-        workspace_root / "OpenManus",
-        workspace_root / "openmanus",
-        workspace_root / "app",
-        BACKEND_DIR.parent / "openmanus",
-        peldrun_ROOT,
-    ]
-    for candidate in candidates:
-        if candidate.is_dir() and ((candidate / "app").is_dir() or (candidate / "config").is_dir()):
-            return candidate
-
-    return peldrun_ROOT
+def resolve_active_core_path(engine_name: str = "peldrun") -> Path:
+    """Resolve the physical filesystem directory of embedded PELDRUN Core."""
+    embedded_core = BACKEND_DIR / "peldrun"
+    if embedded_core.is_dir():
+        return embedded_core
+    return BACKEND_DIR
 
 
 def check_core_linkage(engine_name: str, core_path: Path) -> bool:
-    """Determine whether the active engine runtime is healthy and importable."""
-    if engine_name in ["peldrun", "peldrun-core", "core"]:
-        try:
-            import peldrun
+    """Determine whether the PELDRUN Core runtime is healthy and importable."""
+    try:
+        import peldrun
 
-            return getattr(peldrun, "__is_embedded__", False) or (core_path / "__init__.py").is_file()
-        except Exception:
-            return (core_path / "__init__.py").is_file()
-
-    if engine_name in ["openmanus", "legacy", "manus"]:
-        try:
-            return importlib.util.find_spec("app") is not None
-        except Exception:
-            return (core_path / "app").is_dir()
-
-    return False
+        return bool(getattr(peldrun, "__is_embedded__", False)) or (core_path / "__init__.py").is_file()
+    except Exception:
+        return (core_path / "__init__.py").is_file()
 
 
 def get_clean_cpu_name() -> str:
@@ -113,15 +70,14 @@ def get_clean_cpu_name() -> str:
 
 def get_git_commit(repo_path: Path, engine_name: str = "peldrun") -> str:
     """Safely inspect HEAD commit hash or retrieve embedded upstream commit metadata."""
-    if engine_name in ["peldrun", "peldrun-core", "core"]:
-        try:
-            import peldrun
+    try:
+        import peldrun
 
-            upstream_commit = getattr(peldrun, "__upstream_commit__", "")
-            if upstream_commit:
-                return str(upstream_commit)[:7]
-        except Exception:
-            pass
+        upstream_commit = getattr(peldrun, "__upstream_commit__", "")
+        if upstream_commit:
+            return str(upstream_commit)[:7]
+    except Exception:
+        pass
 
     fallback = FALLBACK_COMMITS.get(engine_name, "0755669")
     try:
@@ -230,12 +186,11 @@ def resolve_llm_configuration(core_path: Path) -> bool:
 
 
 @router.get("")
-async def get_system_status():
+async def get_system_status() -> Dict[str, Any]:
     """Lightweight health check endpoint providing engine and runtime linkage status."""
     active_engine = get_active_engine_name()
     core_path = resolve_active_core_path(active_engine)
     is_linked = check_core_linkage(active_engine, core_path)
-    is_embedded = active_engine in ["peldrun", "peldrun-core", "core"]
 
     return {
         "status": "online",
@@ -244,17 +199,16 @@ async def get_system_status():
         "platform": platform.platform(),
         "peldrun_linked": is_linked,
         "core_linked": is_linked,
-        "embedded": is_embedded,
+        "embedded": True,
     }
 
 
 @router.get("/health")
-async def get_health_status():
+async def get_health_status() -> Dict[str, Any]:
     """Comprehensive watchdog endpoint ensuring engine health and host limits."""
     active_engine = get_active_engine_name()
     core_path = resolve_active_core_path(active_engine)
     core_linked = check_core_linkage(active_engine, core_path)
-    is_embedded = active_engine in ["peldrun", "peldrun-core", "core"]
 
     workspaces_writable = False
     try:
@@ -282,7 +236,7 @@ async def get_health_status():
         "active_engine": active_engine,
         "peldrun_linked": core_linked,
         "core_linked": core_linked,
-        "embedded": is_embedded,
+        "embedded": True,
         "workspaces_writable": workspaces_writable,
         "llm_configured": llm_configured,
         "memory_usage_percent": mem_usage,
@@ -293,24 +247,22 @@ async def get_health_status():
 
 
 @router.get("/system-info")
-async def get_detailed_system_info():
-    """System and repository diagnostics reporting active engine and web versions."""
+async def get_detailed_system_info() -> Dict[str, Any]:
+    """System and repository diagnostics reporting PELDRUN Core and web versions."""
     active_engine = get_active_engine_name()
     core_path = resolve_active_core_path(active_engine)
     core_commit = get_git_commit(core_path, active_engine)
     web_commit = get_git_commit(BACKEND_DIR.parent, "peldrun")
     cpu_name = get_clean_cpu_name()
     memory_info = get_system_memory()
-    is_embedded = active_engine in ["peldrun", "peldrun-core", "core"]
 
     core_version = "0.2.0"
-    if is_embedded:
-        try:
-            import peldrun
+    try:
+        import peldrun
 
-            core_version = getattr(peldrun, "__version__", "0.2.0")
-        except Exception:
-            pass
+        core_version = getattr(peldrun, "__version__", "0.2.0")
+    except Exception:
+        pass
 
     return {
         "os": {
@@ -330,7 +282,7 @@ async def get_detailed_system_info():
         "repositories": {
             "peldrun": {
                 "engine": active_engine,
-                "embedded": is_embedded,
+                "embedded": True,
                 "path": str(core_path),
                 "commit": core_commit,
                 "target_commit": core_commit,

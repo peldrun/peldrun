@@ -6,6 +6,7 @@ Ensures adapters only consume canonical public runtime contracts and prevents
 unauthorized internal coupling or leaks.
 """
 
+import asyncio
 from pathlib import Path
 import pytest
 
@@ -96,11 +97,13 @@ def test_canonical_run_contracts(tmp_path: Path):
     assert res_failed.status.is_terminal is True
 
 
-@pytest.mark.asyncio
-async def test_core_executor_cancellation(tmp_path: Path):
+def test_core_executor_cancellation(tmp_path: Path):
     """Verify that CoreRuntimeExecutor handles cancellation requests properly."""
-    from peldrun.runtime.executor import CoreRuntimeExecutor
+    async def _test():
+        from peldrun.runtime.executor import CoreRuntimeExecutor
 
-    executor = CoreRuntimeExecutor()
-    result = executor.cancel("non_existent_run_id")
-    assert result in (False, True, None)
+        executor = CoreRuntimeExecutor()
+        result = executor.cancel("non_existent_run_id")
+        assert result in (False, True, None)
+
+    asyncio.run(_test())

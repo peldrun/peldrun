@@ -1,9 +1,11 @@
 ﻿"""
+backend/omweb/config.py
+
 PELDRUN Web Central System and Storage Configuration.
 
 Manages persistent storage paths, workspace anchoring, and execution engine roots.
-Natively prioritizes embedded PELDRUN Core while maintaining backward-compatible
-interfaces for existing storage and router consumers.
+Natively anchors embedded PELDRUN Core as the authoritative execution runtime.
+Hardened under PR 3: Completely decoupled from engine_config.json and legacy resolver logic.
 """
 
 from __future__ import annotations
@@ -11,14 +13,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from omweb.engine_resolver import (
-    BACKEND_DIR,
-    PROJECT_ROOT,
-    get_persisted_engine_path,
-    is_valid_peldrun_dir,
-)
+# Core directory anchors established centrally
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = BACKEND_DIR.parent
 
 STORAGE_ROOT = (PROJECT_ROOT / "storage").resolve()
 CHATS_DIR = STORAGE_ROOT / "chats"
@@ -31,21 +30,27 @@ PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def is_valid_peldrun_dir(target_path: Optional[Path]) -> bool:
+    """Validate if target path represents a valid PELDRUN Core package directory."""
+    if not target_path or not target_path.exists() or not target_path.is_dir():
+        return False
+    return (
+        (target_path / "__init__.py").is_file()
+        or (target_path / "peldrun" / "__init__.py").is_file()
+    )
+
+
 def resolve_peldrun_root() -> Path:
     """Resolve active engine root prioritizing local embedded package directory."""
     embedded_dir = (BACKEND_DIR / "peldrun").resolve()
     if embedded_dir.is_dir() and (embedded_dir / "__init__.py").is_file():
         return embedded_dir
 
-    persisted = get_persisted_engine_path()
-    if persisted and is_valid_peldrun_dir(persisted):
-        return persisted
-
     adjacent_dir = (PROJECT_ROOT.parent / "peldrun").resolve()
-    if is_valid_peldrun_dir(adjacent_dir):
+    if adjacent_dir.is_dir() and (adjacent_dir / "__init__.py").is_file():
         return adjacent_dir
 
-    return PROJECT_ROOT
+    return BACKEND_DIR
 
 
 peldrun_ROOT = resolve_peldrun_root()
@@ -91,6 +96,7 @@ __all__ = [
     "PROJECTS_DIR",
     "CONFIG_DIR",
     "peldrun_ROOT",
+    "is_valid_peldrun_dir",
     "resolve_peldrun_root",
     "get_workspace_root",
     "get_storage_root",

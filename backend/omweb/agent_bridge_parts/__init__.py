@@ -1,8 +1,10 @@
 """
+backend/omweb/agent_bridge_parts/__init__.py
+
 PELDRUN Universal Agent Bridge — Modular Package.
 
-Dual-Engine dispatcher package delegating agent execution to native embedded
-PELDRUN Core or legacy OpenManus via the omweb.engines abstraction layer.
+Dispatcher package delegating agent execution strictly to PELDRUN Core.
+Legacy OpenManus runners removed under PR 2.
 """
 
 # ─────────────────────────────────────────────────────────────────────
@@ -24,13 +26,12 @@ _os.environ["QT_QPA_PLATFORM"] = "offscreen"
 # ─────────────────────────────────────────────────────────────────────
 from .config_loader import read_active_toml_config
 from .core_engine import _run_peldrun_core_agent
-from .dispatcher import run_direct_chat, run_instrumented
-from .errors import format_smart_error
-from .legacy_engine import (
-    _run_legacy_openmanus_agent,
-    inject_legacy_runtime_llm,
-    scope_legacy_mcp_servers,
+from .dispatcher import (
+    run_direct_chat,
+    run_instrumented,
+    validate_requested_engine,
 )
+from .errors import format_smart_error
 from .lmstudio import check_lmstudio_model_readiness
 from .state import (
     active_tasks,
@@ -42,19 +43,17 @@ from .state import (
 from .text_utils import sanitize_final_result_text
 
 __all__ = [
-    # Public entry points
+    # Public entry points & validation
     "run_instrumented",
     "run_direct_chat",
+    "validate_requested_engine",
     # Utility functions
     "read_active_toml_config",
     "format_smart_error",
     "check_lmstudio_model_readiness",
     "sanitize_final_result_text",
-    # Legacy engine runners (kept for internal backward compatibility)
+    # Core engine runners
     "_run_peldrun_core_agent",
-    "_run_legacy_openmanus_agent",
-    "scope_legacy_mcp_servers",
-    "inject_legacy_runtime_llm",
     # Global state
     "human_answers",
     "human_data",
