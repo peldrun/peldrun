@@ -11,8 +11,8 @@ interface GenerativeUIRouterProps {
   content: string;
 }
 
-// Resilient regex that matches <openui>, <openui-lang>, or <ui>, even when wrapped in markdown code blocks
-const OPENUI_BLOCK_REGEX = /(?:```(?:xml|html|openui|markdown)?\s*)?<(?:openui(?:-lang)?|ui)[\s\S]*?>([\s\S]*?)<\/(?:openui(?:-lang)?|ui)>(?:\s*```)?/i;
+// Resilient Regex: Matches raw <openui>/<ui> blocks OR blocks enclosed in markdown code fences (```xml ... ```)
+const OPENUI_BLOCK_REGEX = /(?:```(?:xml|html|openui|markdown)?\s*)?(<(?:openui(?:-lang)?|ui)\b[\s\S]*?>([\s\S]*?)<\/(?:openui(?:-lang)?|ui)>)(?:\s*```)?/i;
 
 export function GenerativeUIRouter({ content }: GenerativeUIRouterProps): React.JSX.Element {
   const [mounted, setMounted] = useState(false);
@@ -22,21 +22,18 @@ export function GenerativeUIRouter({ content }: GenerativeUIRouterProps): React.
     setMounted(true);
   }, []);
 
-  // Only disable if explicitly mounted and toggled off by user in Settings
   if (mounted && !isEnabled) {
     return <MarkdownRenderer content={content} />;
   }
 
-  // Intercept generative UI block
   const match = content.match(OPENUI_BLOCK_REGEX);
   if (!match) {
     return <MarkdownRenderer content={content} />;
   }
 
-  const dslContent = match[1].trim();
+  const dslContent = (match[2] || "").trim();
   const matchIndex = match.index ?? 0;
 
-  // Clean surrounding markdown text
   const beforeBlock = content.slice(0, matchIndex).trim();
   const afterBlock = content.slice(matchIndex + match[0].length).trim();
 

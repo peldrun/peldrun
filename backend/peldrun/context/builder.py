@@ -58,9 +58,9 @@ class ContextManager:
             return ""
 
         component_specs: Dict[str, str] = {
-            "Card": "Card: <Title>\\n<Description or items>",
+            "Card": "Card: <Title>\\n<Executive or status summary text>",
             "Metric": "Metric: <Label> | <Value> | <Change> | <up|down|neutral>",
-            "Badge": "Badge: <Label> | <info|success|warning|error|neutral>",
+            "Badge": "Badge: <Label> | <success|warning|error|neutral>",
             "Alert": "Alert [<info|success|warning|error>]: <Message>",
             "Progress": "Progress: <Label> | <Percentage 0-100>",
             "Table": "Table: Header1, Header2 | Row1Col1, Row1Col2 (Max 15 rows)",
@@ -81,16 +81,24 @@ class ContextManager:
 
         specs_str = "\n".join(active_lines)
         return (
-            "[Generative UI Mode Active]\n"
-            "When responding with interactive dashboards, metrics, forms, tables, or actionable summaries, "
-            "output OpenUI Lang DSL enclosed strictly inside <openui>...</openui> tags.\n"
-            "Plain explanations and analysis must remain outside <openui> as standard text or Markdown.\n"
-            "Allowed components catalog:\n"
-            f"{specs_str}\n"
-            "Rules & Guardrails:\n"
-            "- Do not use any component outside the allowed list above.\n"
-            "- Limit Tables to 15 rows and Charts to 30 points. For large datasets, save the full data via file tools "
-            "and render an executive summary Card inside <openui>."
+            "[AUTONOMOUS GENERATIVE UI CAPABILITY ACTIVE]\n"
+            "You possess the native capability to render interactive user interfaces.\n"
+            "AUTONOMOUS TRIGGER RULE: Whenever the user's inquiry naturally involves operational status, metrics, "
+            "comparisons, testing outcomes, workflows, or configuration setups—even if they do not explicitly request a UI—"
+            "you MUST accompany your plain-text answer with an interactive dashboard enclosed inside <openui>...</openui> tags.\n"
+            "Plain conversational thoughts and explanations MUST remain outside <openui> as standard text.\n\n"
+            "ALLOWED COMPONENTS CATALOG:\n"
+            f"{specs_str}\n\n"
+            "STRICT SYNTAX RULES:\n"
+            "1. Output <openui> directly as raw text. NEVER enclose <openui> inside markdown code fences (``` or ```xml).\n"
+            "2. Keep data bounded (Tables <= 15 rows, Charts <= 30 points). For larger datasets, save files and provide a summary Card.\n\n"
+            "1-SHOT EXAMPLE FORMAT:\n"
+            "<openui>\n"
+            "Card: System Health Overview\n"
+            "Core services operating within optimal parameters.\n"
+            "Metric: CPU Utilization | 42% | -6.5% | down\n"
+            "Badge: Primary Gateway | success\n"
+            "</openui>"
         )
 
     def _format_execution_telemetry(self, execution: Optional[CurrentExecution]) -> str:

@@ -556,6 +556,7 @@ async def run_direct_chat(
             current_user_message=prompt,
             system_prompt=chat_system_prompt,
             include_execution=False,
+            generative_ui=active_llm.get("generative_ui"),
         )
         print(
             f"[CONTEXT BUDGET] Enforced limits for {model_name} | "
