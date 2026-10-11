@@ -25,19 +25,33 @@ export const ALL_SUPPORTED_COMPONENTS = [
   "TestResults",
   "Accordion",
   "ActionButton",
+  "Diagram",
+  "Carousel",
+  "MathPlot",
 ];
 
 const PRESET_COMPONENTS: Record<GenerativeUIPreset, string[]> = {
   economic: ["Card", "Badge", "ActionButton"],
-  balanced: ["Card", "Metric", "Badge", "Alert", "Progress", "Table", "TestResults", "ActionButton"],
+  balanced: [
+    "Card",
+    "Metric",
+    "Badge",
+    "Alert",
+    "Progress",
+    "Table",
+    "Chart",
+    "TestResults",
+    "ActionButton",
+    "Diagram",
+    "Carousel",
+  ],
   full: [...ALL_SUPPORTED_COMPONENTS],
-  custom: ["Card", "Metric", "Table", "ActionButton"],
+  custom: ["Card", "Metric", "Table", "ActionButton", "Diagram", "Chart"],
 };
 
 export const useGenerativeUIStore = create<GenerativeUIState>()(
   persist(
     (set) => ({
-      // Enabled by default so that <openui> tags are translated immediately out-of-the-box
       enabled: true,
       preset: "full",
       allowedComponents: PRESET_COMPONENTS.full,

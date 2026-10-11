@@ -9,15 +9,51 @@ import {
   BarChart3,
   RotateCcw,
   CheckCircle2,
-  AlertCircle,
   Clock,
   Coins,
+  Activity,
+  Table as TableIcon,
+  GitFork,
+  Sigma,
+  MousePointerClick,
+  SlidersHorizontal,
 } from "lucide-react";
 import {
   useGenerativeUIStore,
   ALL_SUPPORTED_COMPONENTS,
 } from "@/components/generative-ui/store";
 import type { GenerativeUIPreset } from "@/components/generative-ui/types";
+
+interface ComponentMeta {
+  name: string;
+  desc: string;
+  tokens: string;
+  category: "kpi" | "data" | "visuals" | "scientific";
+}
+
+const CATALOG_METADATA: ComponentMeta[] = [
+  // Core Status & KPIs
+  { name: "Card", desc: "Executive summaries & structured containers", tokens: "~20 tok", category: "kpi" },
+  { name: "Metric", desc: "KPI numbers with trend arrows and deltas", tokens: "~15 tok", category: "kpi" },
+  { name: "Badge", desc: "Service health & status pills", tokens: "~10 tok", category: "kpi" },
+  { name: "Alert", desc: "Warning, error, and info callout banners", tokens: "~15 tok", category: "kpi" },
+  { name: "Progress", desc: "Percentage task completion bars", tokens: "~12 tok", category: "kpi" },
+  { name: "ActionButton", desc: "Interactive triggers for confirmed agent actions", tokens: "~10 tok", category: "kpi" },
+
+  // Structured Data & Testing
+  { name: "Table", desc: "Bounded responsive comparison tables (max 15 rows)", tokens: "~35 tok", category: "data" },
+  { name: "TestResults", desc: "CI/CD pass/fail suites with auto percentages", tokens: "~25 tok", category: "data" },
+  { name: "Accordion", desc: "Collapsible disclosure items for diagnostics", tokens: "~20 tok", category: "data" },
+
+  // Advanced Visuals & Flows
+  { name: "Chart", desc: "Shadcn Area, Bar, Line, and Donut analytics", tokens: "~45 tok", category: "visuals" },
+  { name: "Diagram", desc: "Mermaid.js workflow, flowchart & agent DAGs", tokens: "~40 tok", category: "visuals" },
+  { name: "Carousel", desc: "Multi-card horizontal slider & feature showcase", tokens: "~30 tok", category: "visuals" },
+
+  // Scientific & Forms
+  { name: "Form", desc: "Interactive parameter configuration inputs", tokens: "~35 tok", category: "scientific" },
+  { name: "MathPlot", desc: "KaTeX LaTeX equations & 2D function curves", tokens: "~35 tok", category: "scientific" },
+];
 
 export function GenerativeUITab(): React.JSX.Element {
   const {
@@ -34,35 +70,84 @@ export function GenerativeUITab(): React.JSX.Element {
     setMaxRetries,
   } = useGenerativeUIStore();
 
-  const presets: { id: GenerativeUIPreset; title: string; desc: string }[] = [
+  const presets: { id: GenerativeUIPreset; title: string; desc: string; tokenEst: string }[] = [
     {
       id: "economic",
-      title: "Economic (Min Tokens)",
-      desc: "Strictly limited to Cards and Action Buttons (~120 prompt tokens).",
+      title: "Economic (Minimal Tokens)",
+      desc: "Restricted to Cards, Badges, and Action Buttons.",
+      tokenEst: "~120 prompt tokens",
     },
     {
       id: "balanced",
       title: "Balanced (Recommended)",
-      desc: "Adds Tables, Metrics, Alerts, and Test Results (~220 prompt tokens).",
+      desc: "Adds Metrics, Tables, Alerts, Test Results, Diagrams, and Carousels.",
+      tokenEst: "~260 prompt tokens",
     },
     {
       id: "full",
-      title: "Full Power",
-      desc: "Enables all 11 catalog components including Charts and Forms (~350 prompt tokens).",
+      title: "Full Power (All 14)",
+      desc: "Enables all 14 components including Shadcn Charts, Forms, and Math Plots.",
+      tokenEst: "~390 prompt tokens",
     },
     {
       id: "custom",
       title: "Custom Selection",
-      desc: "Manually toggle individual components to match your exact workflow.",
+      desc: "Manually toggle individual components to tailor prompt budget.",
+      tokenEst: "Variable",
     },
   ];
 
   const successRate =
     telemetry.totalInvocations > 0
-      ? Math.round(
-          (telemetry.successfulRenders / telemetry.totalInvocations) * 100
-        )
+      ? Math.round((telemetry.successfulRenders / telemetry.totalInvocations) * 100)
       : 100;
+
+  const renderCategoryGroup = (
+    title: string,
+    categoryKey: ComponentMeta["category"],
+    icon: React.ReactNode
+  ) => {
+    const items = CATALOG_METADATA.filter((c) => c.category === categoryKey);
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+          {icon}
+          <span>{title}</span>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2.5">
+          {items.map((comp) => {
+            const isChecked = allowedComponents.includes(comp.name);
+            return (
+              <label
+                key={comp.name}
+                className={`flex items-start gap-2.5 p-3 rounded-xl border text-xs cursor-pointer transition-all ${
+                  isChecked
+                    ? "border-primary/60 bg-primary/5 text-foreground shadow-xs"
+                    : "border-border/60 bg-muted/20 text-muted-foreground hover:bg-muted/40"
+                }`}
+              >
+                <input
+                  type="checkbox"
+                  checked={isChecked}
+                  onChange={() => toggleComponent(comp.name)}
+                  className="rounded text-primary focus:ring-primary w-4 h-4 cursor-pointer mt-0.5 shrink-0"
+                />
+                <div className="space-y-0.5 min-w-0">
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="font-mono font-bold text-[12px]">{comp.name}</span>
+                    <span className="text-[10px] text-muted-foreground font-mono">{comp.tokens}</span>
+                  </div>
+                  <p className="text-[11px] opacity-80 leading-snug line-clamp-2">
+                    {comp.desc}
+                  </p>
+                </div>
+              </label>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="space-y-6 max-w-4xl text-foreground font-sans">
@@ -72,16 +157,16 @@ export function GenerativeUITab(): React.JSX.Element {
           <div className="flex items-center gap-2">
             <Sparkles className="h-5 w-5 text-primary" />
             <h2 className="text-base font-semibold tracking-tight">
-              Generative UI & OpenUI Engine
+              Generative UI & Visual Canvas Architecture
             </h2>
           </div>
           <p className="text-xs text-muted-foreground leading-relaxed">
-            Configure dynamic interactive canvas components and manage strict token boundaries.
+            Configure autonomous UI generation, catalog component boundaries, and strict LLM token consumption.
           </p>
         </div>
 
         {/* Master Kill-Switch Toggle */}
-        <label className="flex items-center gap-2.5 cursor-pointer bg-muted/40 px-3 py-1.5 rounded-xl border border-border/60 hover:bg-muted/60 transition-colors">
+        <label className="flex items-center gap-2.5 cursor-pointer bg-muted/40 px-3.5 py-1.5 rounded-xl border border-border/60 hover:bg-muted/60 transition-colors">
           <input
             type="checkbox"
             checked={enabled}
@@ -89,13 +174,13 @@ export function GenerativeUITab(): React.JSX.Element {
             className="w-4 h-4 rounded text-primary focus:ring-primary cursor-pointer"
           />
           <span className="text-xs font-semibold">
-            {enabled ? "Feature Enabled" : "Feature Disabled"}
+            {enabled ? "Engine Active" : "Engine Disabled"}
           </span>
         </label>
       </div>
 
       {/* Main Settings Sections */}
-      <div className={enabled ? "space-y-6" : "space-y-6 opacity-50 pointer-events-none"}>
+      <div className={enabled ? "space-y-6" : "space-y-6 opacity-40 pointer-events-none select-none"}>
         {/* Preset Profiles */}
         <div className="space-y-3">
           <label className="text-xs font-semibold flex items-center gap-2 text-foreground">
@@ -127,40 +212,34 @@ export function GenerativeUITab(): React.JSX.Element {
                   <p className="text-[11px] text-muted-foreground leading-relaxed">
                     {p.desc}
                   </p>
+                  <div className="text-[10px] font-mono text-primary/80 pt-1">
+                    {p.tokenEst}
+                  </div>
                 </button>
               );
             })}
           </div>
         </div>
 
-        {/* Allowed Components Catalog Selection */}
-        <div className="space-y-3">
-          <label className="text-xs font-semibold flex items-center gap-2 text-foreground">
-            <Cpu className="h-4 w-4 text-primary" />
-            <span>Active Catalog Components ({allowedComponents.length} of {ALL_SUPPORTED_COMPONENTS.length})</span>
-          </label>
-          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2.5">
-            {ALL_SUPPORTED_COMPONENTS.map((comp) => {
-              const isChecked = allowedComponents.includes(comp);
-              return (
-                <label
-                  key={comp}
-                  className={`flex items-center gap-2 p-2.5 rounded-lg border text-xs cursor-pointer transition-colors ${
-                    isChecked
-                      ? "border-primary/50 bg-primary/5 text-foreground font-medium"
-                      : "border-border/60 bg-muted/20 text-muted-foreground hover:bg-muted/40"
-                  }`}
-                >
-                  <input
-                    type="checkbox"
-                    checked={isChecked}
-                    onChange={() => toggleComponent(comp)}
-                    className="rounded text-primary focus:ring-primary w-3.5 h-3.5 cursor-pointer"
-                  />
-                  <span className="font-mono text-[11px]">{comp}</span>
-                </label>
-              );
-            })}
+        {/* Allowed Components Catalog Selection (Categorized) */}
+        <div className="space-y-4 pt-1">
+          <div className="flex items-center justify-between">
+            <label className="text-xs font-semibold flex items-center gap-2 text-foreground">
+              <Cpu className="h-4 w-4 text-primary" />
+              <span>
+                Active Component Catalog ({allowedComponents.length} of {ALL_SUPPORTED_COMPONENTS.length} Active)
+              </span>
+            </label>
+            <span className="text-[11px] text-muted-foreground">
+              Disabled components are completely removed from system prompt
+            </span>
+          </div>
+
+          <div className="space-y-5 rounded-2xl border border-border/70 bg-card/30 p-4">
+            {renderCategoryGroup("Core Status & KPIs", "kpi", <Activity size={13} className="text-primary" />)}
+            {renderCategoryGroup("Structured Data & Testing", "data", <TableIcon size={13} className="text-emerald-500" />)}
+            {renderCategoryGroup("Advanced Visuals & Flows", "visuals", <GitFork size={13} className="text-blue-500" />)}
+            {renderCategoryGroup("Forms & Scientific", "scientific", <Sigma size={13} className="text-purple-500" />)}
           </div>
         </div>
 
@@ -186,7 +265,7 @@ export function GenerativeUITab(): React.JSX.Element {
               onChange={(e) => setMaxOutputTokens(Number(e.target.value))}
               className="w-full h-1.5 bg-muted rounded-lg appearance-none cursor-pointer accent-primary"
             />
-            <p className="text-[10px] text-muted-foreground">
+            <p className="text-[10px] text-muted-foreground leading-relaxed">
               Caps generative UI completion tokens per attempt to prevent budget runaway.
             </p>
           </div>
@@ -211,13 +290,13 @@ export function GenerativeUITab(): React.JSX.Element {
               onChange={(e) => setMaxRetries(Number(e.target.value))}
               className="w-full h-1.5 bg-muted rounded-lg appearance-none cursor-pointer accent-primary"
             />
-            <p className="text-[10px] text-muted-foreground">
-              Maximum retry attempts if syntax validation fails before falling back to Markdown.
+            <p className="text-[10px] text-muted-foreground leading-relaxed">
+              Maximum retry attempts if syntax validation fails before falling back to standard Markdown.
             </p>
           </div>
         </div>
 
-        {/* Live Telemetry & Accounting Panel */}
+        {/* Live Telemetry & Observability Panel */}
         <div className="p-4 rounded-xl border border-border/70 bg-muted/20 space-y-3">
           <div className="flex items-center justify-between">
             <span className="text-xs font-semibold flex items-center gap-1.5 text-foreground">

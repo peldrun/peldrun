@@ -64,8 +64,9 @@ export interface ChartDataPoint {
 
 export interface PeldrunChartProps {
   title?: string;
-  type?: "bar" | "line";
+  type?: "area" | "bar" | "line" | "donut" | "pie";
   data: ChartDataPoint[];
+  unit?: string;
 }
 
 export interface FormFieldDefinition {
@@ -120,4 +121,27 @@ export interface PeldrunActionButtonProps {
   variant?: "primary" | "secondary" | "danger";
   disabled?: boolean;
   onExecute?: (action: PeldrunActionPayload) => void;
+}
+
+export interface PeldrunDiagramProps {
+  code: string;
+  title?: string;
+}
+
+export interface CarouselSlide {
+  title?: string;
+  description?: string;
+  content: string;
+}
+
+export interface PeldrunCarouselProps {
+  slides: CarouselSlide[];
+  title?: string;
+}
+
+export interface PeldrunMathPlotProps {
+  equation?: string;
+  functionFormula?: string;
+  rangeX?: [number, number];
+  title?: string;
 }

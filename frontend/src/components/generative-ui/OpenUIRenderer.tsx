@@ -10,10 +10,14 @@ import { PeldrunMetric } from "./catalog/PeldrunMetric";
 import { PeldrunBadge } from "./catalog/PeldrunBadge";
 import { PeldrunAlert } from "./catalog/PeldrunAlert";
 import { PeldrunProgress } from "./catalog/PeldrunProgress";
-import { PeldrunChart } from "./catalog/PeldrunChart";
 import { PeldrunForm } from "./catalog/PeldrunForm";
 import { PeldrunTestResults } from "./catalog/PeldrunTestResults";
 import { PeldrunAccordion } from "./catalog/PeldrunAccordion";
+import { PeldrunMotionWrapper } from "./catalog/PeldrunMotionWrapper";
+import { PeldrunDiagram } from "./catalog/PeldrunDiagram";
+import { PeldrunShadcnChart, type ChartVariant } from "./catalog/PeldrunShadcnChart";
+import { PeldrunCarousel, type CarouselSlide } from "./catalog/PeldrunCarousel";
+import { PeldrunMathPlot } from "./catalog/PeldrunMathPlot";
 import type { FormFieldDefinition } from "./types";
 
 interface OpenUIRendererProps {
@@ -37,6 +41,16 @@ interface AccordionBuffer {
   items: { title: string; content: string }[];
 }
 
+interface DiagramBuffer {
+  title?: string;
+  codeLines: string[];
+}
+
+interface CarouselBuffer {
+  title?: string;
+  slides: CarouselSlide[];
+}
+
 function isMarkdownDividerCell(cell: string): boolean {
   const sanitized = cell.replace(/\s+/g, "").replace(/-/g, "").replace(/:/g, "");
   return sanitized.length === 0;
@@ -55,6 +69,7 @@ function parseXmlAttributes(attrString: string): Record<string, string> {
 }
 
 function extractNumericValue(raw: string): number {
+  if (!raw) return 0;
   const match = raw.match(/-?\d+(?:\.\d+)?/);
   if (!match) return 0;
   let val = parseFloat(match[0]);
@@ -72,21 +87,26 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
     let currentCard: CardBuffer | null = null;
     let currentForm: FormBuffer | null = null;
     let currentAccordion: AccordionBuffer | null = null;
+    let currentDiagram: DiagramBuffer | null = null;
+    let currentCarousel: CarouselBuffer | null = null;
     let metricGroup: React.JSX.Element[] = [];
     let badgeGroup: React.JSX.Element[] = [];
     let tableLines: string[] = [];
+    let inTableContext = false;
 
     const flushCard = () => {
       if (currentCard !== null) {
         const c = currentCard;
         elements.push(
-          <PeldrunCard key={`card-${elements.length}`} title={c.title} description={c.desc}>
-            {c.items.map((it, i) => (
-              <div key={`ci-${i}`} className="text-muted-foreground text-xs leading-relaxed">
-                {it}
-              </div>
-            ))}
-          </PeldrunCard>
+          <PeldrunMotionWrapper key={`card-${elements.length}`}>
+            <PeldrunCard title={c.title} description={c.desc}>
+              {c.items.map((it, i) => (
+                <div key={`ci-${i}`} className="text-muted-foreground text-xs leading-relaxed">
+                  {it}
+                </div>
+              ))}
+            </PeldrunCard>
+          </PeldrunMotionWrapper>
         );
         currentCard = null;
       }
@@ -97,13 +117,14 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
         const f = currentForm;
         const validFields = f.fields.length > 0 ? f.fields : [{ name: "input", label: "Input" }];
         elements.push(
-          <PeldrunForm
-            key={`form-${elements.length}`}
-            title={f.title}
-            description={f.description}
-            fields={validFields}
-            submitLabel={f.submitLabel || "Submit"}
-          />
+          <PeldrunMotionWrapper key={`form-${elements.length}`}>
+            <PeldrunForm
+              title={f.title}
+              description={f.description}
+              fields={validFields}
+              submitLabel={f.submitLabel || "Submit"}
+            />
+          </PeldrunMotionWrapper>
         );
         currentForm = null;
       }
@@ -112,21 +133,51 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
     const flushAccordion = () => {
       if (currentAccordion !== null && currentAccordion.items.length > 0) {
         elements.push(
-          <PeldrunAccordion key={`accordion-${elements.length}`} items={currentAccordion.items} />
+          <PeldrunMotionWrapper key={`accordion-${elements.length}`}>
+            <PeldrunAccordion items={currentAccordion.items} />
+          </PeldrunMotionWrapper>
         );
         currentAccordion = null;
+      }
+    };
+
+    const flushDiagram = () => {
+      if (currentDiagram !== null && currentDiagram.codeLines.length > 0) {
+        const dCode = currentDiagram.codeLines.join("\n").trim();
+        if (dCode) {
+          elements.push(
+            <PeldrunDiagram
+              key={`diag-${elements.length}`}
+              title={currentDiagram.title}
+              code={dCode}
+            />
+          );
+        }
+        currentDiagram = null;
+      }
+    };
+
+    const flushCarousel = () => {
+      if (currentCarousel !== null && currentCarousel.slides.length > 0) {
+        elements.push(
+          <PeldrunCarousel
+            key={`caro-${elements.length}`}
+            title={currentCarousel.title}
+            slides={currentCarousel.slides}
+          />
+        );
+        currentCarousel = null;
       }
     };
 
     const flushMetrics = () => {
       if (metricGroup.length > 0) {
         elements.push(
-          <div
-            key={`metrics-grid-${elements.length}`}
-            className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 my-2"
-          >
-            {[...metricGroup]}
-          </div>
+          <PeldrunMotionWrapper key={`metrics-grid-${elements.length}`}>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 my-2">
+              {[...metricGroup]}
+            </div>
+          </PeldrunMotionWrapper>
         );
         metricGroup = [];
       }
@@ -135,12 +186,11 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
     const flushBadges = () => {
       if (badgeGroup.length > 0) {
         elements.push(
-          <div
-            key={`badges-row-${elements.length}`}
-            className="flex flex-wrap items-center gap-2 my-2"
-          >
-            {[...badgeGroup]}
-          </div>
+          <PeldrunMotionWrapper key={`badges-row-${elements.length}`}>
+            <div className="flex flex-wrap items-center gap-2 my-2">
+              {[...badgeGroup]}
+            </div>
+          </PeldrunMotionWrapper>
         );
         badgeGroup = [];
       }
@@ -149,25 +199,33 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
     const flushTable = () => {
       if (tableLines.length > 0) {
         if (allowedComponents.includes("Table")) {
-          const rawRows = tableLines
-            .map((r) =>
-              r
+          const rawRows = tableLines.map((r) => {
+            if (r.includes("|")) {
+              return r
                 .split("|")
                 .map((c) => c.trim())
-                .filter((_, idx, arr) => idx > 0 && idx < arr.length - 1)
-            )
-            .filter((r) => r.length > 0);
+                .filter((c, idx, arr) => {
+                  if ((idx === 0 || idx === arr.length - 1) && c === "") return false;
+                  return true;
+                });
+            } else {
+              return r.split(",").map((c) => c.trim());
+            }
+          }).filter((r) => r.length > 0);
 
           const contentRows = rawRows.filter((r) => !r.every(isMarkdownDividerCell));
           if (contentRows.length > 0) {
-            const headers = contentRows[0] || ["Key", "Value"];
+            const headers = contentRows[0] || ["Item", "Details"];
             const rows = contentRows.slice(1);
             elements.push(
-              <PeldrunTable key={`tbl-md-${elements.length}`} headers={headers} rows={rows} />
+              <PeldrunMotionWrapper key={`tbl-md-${elements.length}`}>
+                <PeldrunTable headers={headers} rows={rows} />
+              </PeldrunMotionWrapper>
             );
           }
         }
         tableLines = [];
+        inTableContext = false;
       }
     };
 
@@ -175,6 +233,8 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
       flushCard();
       flushForm();
       flushAccordion();
+      flushDiagram();
+      flushCarousel();
       flushMetrics();
       flushBadges();
       flushTable();
@@ -247,13 +307,27 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
     for (let index = 0; index < rawLines.length; index++) {
       const line = rawLines[index];
 
-      // Markdown Table Lines Accumulator
-      if (line.startsWith("|") && line.endsWith("|")) {
+      // --- 1. Resilient Table Detection (Standard markdown, relaxed pipes, or lines under Table:) ---
+      const hasMultiplePipes = (line.match(/\|/g) || []).length >= 1;
+      const isTableDivider = /^[|\s:-]+$/.test(line) && line.includes("-");
+      const isExplicitTableHeader = /^Table(?::|\s)/i.test(line);
+
+      if (isExplicitTableHeader) {
+        flushAllBuffers();
+        inTableContext = true;
+        const inlineContent = line.replace(/^Table(?::|\s)*/i, "").trim();
+        if (inlineContent.includes("|") && inlineContent.length > 3) {
+          tableLines.push(inlineContent);
+        }
+        continue;
+      }
+
+      if (hasMultiplePipes || isTableDivider || (inTableContext && line.includes(","))) {
         flushMetrics();
         flushBadges();
         tableLines.push(line);
         continue;
-      } else {
+      } else if (tableLines.length > 0) {
         flushTable();
       }
 
@@ -269,7 +343,195 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
         continue;
       }
 
-      // 1. XML / JSX Tag Handling
+      // --- 2. Mermaid Diagram Handling ---
+      const isMermaidKeyword = /^(?:graph|flowchart|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|pie|gitGraph)\b/i.test(cleanLine);
+      const isDiagramHeader = /^(?:Diagram|Workflow|Architecture)(?::|\s)/i.test(cleanLine) || /<Diagram\b/i.test(cleanLine);
+
+      if ((isDiagramHeader || isMermaidKeyword) && allowedComponents.includes("Diagram")) {
+        if (isDiagramHeader) {
+          flushAllBuffers();
+          const title = cleanLine
+            .replace(/<Diagram\b[^>]*>/i, "")
+            .replace(/^(?:Diagram|Workflow|Architecture)(?::|\s)*/i, "")
+            .trim();
+          currentDiagram = { title: title || "Workflow Diagram", codeLines: [] };
+          continue;
+        } else if (currentDiagram === null) {
+          flushAllBuffers();
+          currentDiagram = { title: "Workflow & Execution Flow", codeLines: [cleanLine] };
+          continue;
+        }
+      }
+
+      if (currentDiagram !== null) {
+        if (/<\/Diagram>/i.test(cleanLine)) {
+          flushDiagram();
+          continue;
+        }
+        if (
+          cleanLine.includes("-->") ||
+          cleanLine.includes("---") ||
+          cleanLine.includes("->>") ||
+          cleanLine.includes("[") ||
+          cleanLine.includes("(") ||
+          isMermaidKeyword ||
+          cleanLine.startsWith("subgraph") ||
+          cleanLine.startsWith("end")
+        ) {
+          currentDiagram.codeLines.push(cleanLine);
+          continue;
+        } else {
+          flushDiagram();
+        }
+      }
+
+      // --- 3. Carousel Component Handling ---
+      const isCarouselHeader = /^Carousel(?::|\s)/i.test(cleanLine) || /<Carousel\b/i.test(cleanLine);
+      if (isCarouselHeader && allowedComponents.includes("Carousel")) {
+        flushAllBuffers();
+        const title = cleanLine.replace(/<Carousel\b[^>]*>/i, "").replace(/^Carousel(?::|\s)*/i, "").trim();
+        currentCarousel = { title: title || "Feature Showcase", slides: [] };
+        continue;
+      }
+
+      const isSlideLine = /^Slide(?::|\s)/i.test(cleanLine) || /<Slide\b/i.test(cleanLine);
+      if (isSlideLine && allowedComponents.includes("Carousel")) {
+        if (currentCarousel === null) {
+          flushAllBuffers();
+          currentCarousel = { title: "Comparative Showcase", slides: [] };
+        }
+        const slideRaw = cleanLine.replace(/<Slide\b[^>]*>/i, "").replace(/<\/Slide>/i, "").replace(/^Slide(?::|\s)*/i, "").trim();
+        const parts = slideRaw.split("|").map((p) => p.trim());
+        currentCarousel.slides.push({
+          title: parts[0] || `Item ${currentCarousel.slides.length + 1}`,
+          description: parts.length > 2 ? parts[1] : undefined,
+          content: parts.length > 2 ? parts.slice(2).join(" | ") : (parts[1] || parts[0]),
+        });
+        continue;
+      }
+
+      if (/<\/Carousel>/i.test(cleanLine)) {
+        flushCarousel();
+        continue;
+      }
+
+      // --- 4. Mathematical Plots & Equations ---
+      const isMathPlot = /^(?:MathPlot|Plot|Equation)(?::|\s)/i.test(cleanLine) || /<MathPlot\b/i.test(cleanLine);
+      if (isMathPlot && allowedComponents.includes("MathPlot")) {
+        flushAllBuffers();
+        const rawContent = cleanLine
+          .replace(/<MathPlot\b[^>]*>/i, "")
+          .replace(/<\/MathPlot>/i, "")
+          .replace(/^(?:MathPlot|Plot|Equation)(?::|\s)*/i, "")
+          .trim();
+
+        let eq: string | undefined = undefined;
+        let fn: string | undefined = undefined;
+        let range: [number, number] = [-10, 10];
+        let title: string | undefined = undefined;
+
+        if (cleanLine.toLowerCase().startsWith("equation:") || cleanLine.toLowerCase().startsWith("math:")) {
+          eq = rawContent;
+          title = "Mathematical Equation";
+        } else {
+          const parts = rawContent.split("|").map((p) => p.trim());
+          fn = parts[0]?.replace(/^[yf]\([x]\)\s*=\s*/i, "").trim();
+          for (let pIdx = 1; pIdx < parts.length; pIdx++) {
+            const p = parts[pIdx];
+            if (/range/i.test(p)) {
+              const nums = p.match(/-?\d+/g);
+              if (nums && nums.length >= 2) {
+                range = [parseInt(nums[0], 10), parseInt(nums[1], 10)];
+              }
+            } else if (/title/i.test(p)) {
+              title = p.replace(/^title[:\s]*/i, "").trim();
+            }
+          }
+        }
+
+        elements.push(
+          <PeldrunMathPlot
+            key={`math-${elements.length}`}
+            title={title}
+            equation={eq}
+            functionFormula={fn}
+            rangeX={range}
+          />
+        );
+        continue;
+      }
+
+      // --- 5. Advanced Shadcn Chart Component (Robust Data Extraction) ---
+      if (/(?:^Chart|<Chart\b)/i.test(cleanLine) && allowedComponents.includes("Chart")) {
+        flushAllBuffers();
+        const lowerLine = cleanLine.toLowerCase();
+        let chartType: ChartVariant = "area";
+        if (lowerLine.includes("bar")) chartType = "bar";
+        else if (lowerLine.includes("line")) chartType = "line";
+        else if (lowerLine.includes("donut") || lowerLine.includes("pie")) chartType = "donut";
+
+        let chartTitle = "Performance Analytics";
+        let chartUnit = "";
+        let rawDataSegment = "";
+
+        const metaParts = cleanLine.split("|").map((p) => p.trim());
+        for (const part of metaParts) {
+          if (/^title[:\s]*/i.test(part)) {
+            chartTitle = part.replace(/^title[:\s]*/i, "").trim();
+          } else if (/^unit[:\s]*/i.test(part)) {
+            chartUnit = part.replace(/^unit[:\s]*/i, "").trim();
+          } else if (/^values?[:\s]*/i.test(part)) {
+            rawDataSegment = part.replace(/^values?[:\s]*/i, "").trim();
+          } else if (!rawDataSegment && (part.includes(":") || part.includes(","))) {
+            const cleaned = part
+              .replace(/<Chart\b[^>]*>/i, "")
+              .replace(/^Chart(?:\s*\[.*?\])?(?::|\s)*/i, "")
+              .trim();
+            if (cleaned) rawDataSegment = cleaned;
+          }
+        }
+
+        const dataPoints: { label: string; value: number }[] = [];
+
+        // Check if rawDataSegment is a list of numbers: "180, 260, 420..."
+        if (rawDataSegment.includes(",") && !rawDataSegment.includes(":")) {
+          const defaultLabels = ["10am", "11am", "12pm", "1pm", "2pm", "3pm", "4pm", "5pm"];
+          const values = rawDataSegment.split(",").map((v) => extractNumericValue(v.trim()));
+          values.forEach((val, idx) => {
+            dataPoints.push({
+              label: defaultLabels[idx] || `Point ${idx + 1}`,
+              value: val,
+            });
+          });
+        } else {
+          // Standard pairs: "Label1:Val1, Label2:Val2"
+          const pairs = rawDataSegment.split(",").map((p) => p.trim()).filter(Boolean);
+          pairs.forEach((pair, idx) => {
+            const pParts = pair.split(":");
+            const rawLabel = (pParts[0] || "").replace(/\[.*?\]/g, "").replace(/^label\s*/i, "").trim();
+            const rawVal = pParts[1] || "";
+            dataPoints.push({
+              label: rawLabel || `Point ${idx + 1}`,
+              value: extractNumericValue(rawVal),
+            });
+          });
+        }
+
+        if (dataPoints.length > 0) {
+          elements.push(
+            <PeldrunShadcnChart
+              key={`chart-${index}`}
+              title={chartTitle}
+              type={chartType}
+              data={dataPoints}
+              unit={chartUnit}
+            />
+          );
+        }
+        continue;
+      }
+
+      // --- 6. XML / JSX Tag Handling (<Card>, <Metric />, <Badge />, <Alert />) ---
       const xmlCardMatch = cleanLine.match(/<Card\b([^>]*)>/i);
       if (xmlCardMatch && allowedComponents.includes("Card")) {
         flushAllBuffers();
@@ -345,7 +607,7 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
         continue;
       }
 
-      // 2. TestResults Detection (XML & Line formats)
+      // --- 7. TestResults Detection ---
       const xmlTestMatch = cleanLine.match(/<TestResults\b([^>]*)>(.*?)<\/TestResults>/i) || cleanLine.match(/<TestResults\b([^>]*)\/?>/i);
       const isLineTest = /^TestResults(?::|\s)/i.test(cleanLine);
 
@@ -366,17 +628,18 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
         if (skipMatch) skipped = parseInt(skipMatch[1], 10);
 
         elements.push(
-          <PeldrunTestResults
-            key={`tests-${index}`}
-            passedCount={passed}
-            failedCount={failed}
-            skippedCount={skipped}
-          />
+          <PeldrunMotionWrapper key={`tests-${index}`}>
+            <PeldrunTestResults
+              passedCount={passed}
+              failedCount={failed}
+              skippedCount={skipped}
+            />
+          </PeldrunMotionWrapper>
         );
         continue;
       }
 
-      // 3. Alert Component (Checked BEFORE Badge)
+      // --- 8. Alert Component ---
       const isXmlAlert = cleanLine.match(/<Alert\b([^>]*)>(.*?)<\/Alert>/i);
       const isLineAlert = /^Alert(?:\s*\[|\s*\(|\s*:|\s+warning|\s+error|\s+info|\s+success)/i.test(cleanLine);
 
@@ -396,11 +659,15 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
           message = match?.[4] || cleanLine;
         }
 
-        elements.push(<PeldrunAlert key={`alert-${index}`} message={message} type={alertType} />);
+        elements.push(
+          <PeldrunMotionWrapper key={`alert-${index}`}>
+            <PeldrunAlert message={message} type={alertType} />
+          </PeldrunMotionWrapper>
+        );
         continue;
       }
 
-      // 4. Form Component (Buffered multi-line fields support)
+      // --- 9. Form Component ---
       const xmlFormMatch = cleanLine.match(/<Form\b([^>]*)>/i);
       const isLineForm = /^Form(?::|\s)/i.test(cleanLine);
 
@@ -431,7 +698,6 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
         continue;
       }
 
-      // Collect Field into active Form Buffer
       const xmlFieldMatch = cleanLine.match(/<Field\b([^>]*)\/?>/i);
       const isLineField = /^Field(?::|\s)/i.test(cleanLine);
 
@@ -457,7 +723,7 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
         continue;
       }
 
-      // 5. Line Card Detection
+      // --- 10. Line Card Detection ---
       if (
         /^(?:Card|Executive\s*Summary\s*Card|Server\s*Status\s*Card)(?::|\s)/i.test(cleanLine) &&
         allowedComponents.includes("Card")
@@ -470,7 +736,7 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
         continue;
       }
 
-      // 6. Multi-Metric Single-Line Detection
+      // --- 11. Multi-Metric Single-Line Detection ---
       const pipeSegments = cleanLine.split("|").map((s) => s.trim());
       const isMultiMetricLine =
         pipeSegments.length > 1 &&
@@ -486,7 +752,7 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
         continue;
       }
 
-      // 7. Single Metric Detection
+      // --- 12. Single Metric Detection ---
       const isExplicitMetric = /^Metric(?:\s*\d+)?(?::|\s)/i.test(cleanLine);
       const isNamedMetric =
         /^(?:CPU|RAM|VRAM|P95|Latency|Memory|Disk|Throughput)\b/i.test(cleanLine) &&
@@ -505,7 +771,7 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
         flushMetrics();
       }
 
-      // 8. Badge Detection
+      // --- 13. Badge Detection ---
       const isExplicitBadge = /^Badge(?:\s*\d+)?(?::|\s)/i.test(cleanLine);
       const isStatusItem =
         !cleanLine.toLowerCase().startsWith("alert") &&
@@ -565,63 +831,21 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
         flushBadges();
       }
 
-      // 9. Progress Component
+      // --- 14. Progress Component ---
       if (/^Progress(?::|\s)/i.test(cleanLine) && allowedComponents.includes("Progress")) {
         flushAllBuffers();
         const parts = cleanLine.replace(/^Progress(?::|\s)*/i, "").split("|").map((p) => p.trim());
         const label = parts[0] || "";
         const pct = extractNumericValue(parts[1] || parts[0] || "0");
         elements.push(
-          <PeldrunProgress key={`progress-${index}`} label={label} percentage={pct} />
+          <PeldrunMotionWrapper key={`progress-${index}`}>
+            <PeldrunProgress label={label} percentage={pct} />
+          </PeldrunMotionWrapper>
         );
         continue;
       }
 
-      // 10. Table DSL Component (Avoids empty ghost headers)
-      if (/^Table(?::|\s)/i.test(cleanLine) && allowedComponents.includes("Table")) {
-        const raw = cleanLine.replace(/^Table(?::|\s)*/i, "").trim();
-        if (raw.includes("|")) {
-          flushAllBuffers();
-          const parts = raw.split("|").map((p) => p.trim());
-          const headers = parts[0] ? parts[0].split(",").map((h) => h.trim()) : ["Key", "Value"];
-          const rows = parts.slice(1).map((r) => r.split(",").map((c) => c.trim()));
-          elements.push(<PeldrunTable key={`tbl-${index}`} headers={headers} rows={rows} />);
-        }
-        // If it was just "Table:" with no columns, silently ignore it; markdown table below will parse it
-        continue;
-      }
-
-      // 11. Chart Component (Resilient Number & Prefix Extraction)
-      if (/(?:^Chart|<Chart\b)/i.test(cleanLine) && allowedComponents.includes("Chart")) {
-        flushAllBuffers();
-        const isLine = /line/i.test(cleanLine);
-        const chartType: "bar" | "line" = isLine ? "line" : "bar";
-
-        // Clean prefixes, XML tags, and bracket indicators
-        const cleanedData = cleanLine
-          .replace(/<Chart\b[^>]*>/i, "")
-          .replace(/<\/Chart>/i, "")
-          .replace(/^Chart(?:\s*\[(?:bar\vert{}line)\])?(?:\s*\((?:bar\vert{}line)\))?[:\s]*/i, "")
-          .replace(/^\[(?:bar\vert{}line)\][:\s]*/i, "")
-          .trim();
-
-        const dataPoints = cleanedData.split(",").map((pair) => {
-          const parts = pair.split(":");
-          const rawLabel = (parts[0] || "").replace(/\[(?:bar\vert{}line)\]/gi, "").trim();
-          const rawVal = parts[1] || "";
-          return {
-            label: rawLabel || "Point",
-            value: extractNumericValue(rawVal),
-          };
-        }).filter((dp) => dp.label && dp.value >= 0);
-
-        if (dataPoints.length > 0) {
-          elements.push(<PeldrunChart key={`chart-${index}`} type={chartType} data={dataPoints} />);
-        }
-        continue;
-      }
-
-      // 12. Accordion Component
+      // --- 15. Accordion Component ---
       if (/^Accordion(?::|\s)/i.test(cleanLine) && allowedComponents.includes("Accordion")) {
         flushAllBuffers();
         const raw = cleanLine.replace(/^Accordion(?::|\s)*/i, "").trim();
@@ -634,7 +858,7 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
         continue;
       }
 
-      // 13. Action Button
+      // --- 16. Action Button ---
       if (
         /^(?:Action|ActionButton)(?::|\s)/i.test(cleanLine) &&
         allowedComponents.includes("ActionButton")
@@ -646,15 +870,17 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
         } else {
           flushAllBuffers();
           elements.push(
-            <div key={`act-${index}`} className="my-1.5 flex gap-2">
-              <PeldrunActionButton key={`act-btn-${index}`} label={actionLabel} actionId={`act_${index}`} />
-            </div>
+            <PeldrunMotionWrapper key={`act-wrapper-${index}`}>
+              <div className="my-1.5 flex gap-2">
+                <PeldrunActionButton key={`act-btn-${index}`} label={actionLabel} actionId={`act_${index}`} />
+              </div>
+            </PeldrunMotionWrapper>
           );
         }
         continue;
       }
 
-      // Fallback: Attach plain text or HTML list item to active Card or render as clean paragraph
+      // Fallback
       const strippedHtmlLine = cleanLine.replace(/<\/?(?:p|b|i|span|ul|li)[^>]*>/gi, "").trim();
       if (strippedHtmlLine) {
         if (currentCard !== null) {

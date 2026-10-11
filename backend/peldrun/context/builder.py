@@ -40,9 +40,11 @@ class ContextManager:
     @staticmethod
     def _format_generative_ui_prompt(generative_ui: Optional[Dict[str, Any]]) -> str:
         """
-        Assemble concise, token-economical system instructions for Generative UI.
-        Strict rule: Only include component specifications for components that are explicitly allowed.
-        If disabled or no allowed components, returns an empty string (0 tokens added).
+        Synthesizes a completely dynamic, zero-contradiction system directive for Generative UI.
+        - Strict Rule 1: If disabled or no allowed components, returns an empty string (0 tokens).
+        - Strict Rule 2: Trigger domains are dynamically constructed strictly from enabled components.
+        - Strict Rule 3: Explicit negative fallback rule enforces standard Markdown for disabled items.
+        - Strict Rule 4: The 1-Shot example is synthesized ON-THE-FLY using ONLY active components.
         """
         if not generative_ui or not generative_ui.get("enabled"):
             return ""
@@ -57,47 +59,116 @@ class ContextManager:
         if not allowed:
             return ""
 
+        # 1. Full Component Specifications Registry
         component_specs: Dict[str, str] = {
-            "Card": "Card: <Title>\\n<Executive or status summary text>",
+            "Card": "Card: <Title>\\n<Executive summary or description text>",
             "Metric": "Metric: <Label> | <Value> | <Change> | <up|down|neutral>",
             "Badge": "Badge: <Label> | <success|warning|error|neutral>",
             "Alert": "Alert [<info|success|warning|error>]: <Message>",
             "Progress": "Progress: <Label> | <Percentage 0-100>",
-            "Table": "Table: Header1, Header2 | Row1Col1, Row1Col2 (Max 15 rows)",
-            "Chart": "Chart [<bar|line>]: Label1:Val1, Label2:Val2 (Max 30 points)",
-            "Form": "Form: <Title> | Field1, Field2 (Max 8 fields)",
+            "Table": "Table:\\nHeader1 | Header2 | Header3\\nRow1Col1 | Row1Col2 | Row1Col3 (Max 15 rows)",
+            "Chart": "Chart [<area|bar|line|donut>]: Label1:Number1, Label2:Number2 | Title: <Title> | Unit: <Unit>",
+            "Diagram": "Diagram: <Title>\\ngraph TD\\n  A[Node1] --> B[Node2]",
+            "Carousel": "Carousel: <Title>\\nSlide: Title1 | Desc1 | Content1\\nSlide: Title2 | Desc2 | Content2",
             "TestResults": "TestResults: Passed:<N>, Failed:<N>, Skipped:<N>",
             "Accordion": "Accordion: Title1:Content1 | Title2:Content2",
+            "Form": "Form: <Title>\\nField: Field1\\nField: Field2",
+            "MathPlot": "Plot: <y = f(x)> | range=[min, max]  OR  Equation: <LaTeX string>",
             "ActionButton": "Action: <Action Label>",
         }
 
-        active_lines: List[str] = []
+        # 2. Extract active specs
+        active_specs: List[str] = []
         for comp_name, spec in component_specs.items():
             if comp_name in allowed:
-                active_lines.append(f"- {spec}")
+                active_specs.append(f"- {spec}")
 
-        if not active_lines:
+        if not active_specs:
             return ""
 
-        specs_str = "\n".join(active_lines)
+        specs_str = "\n".join(active_specs)
+
+        # 3. Dynamically build Trigger Domains
+        trigger_domains: List[str] = []
+        if "Card" in allowed:
+            trigger_domains.append("executive summaries")
+        if "Metric" in allowed:
+            trigger_domains.append("key performance indicators & metrics")
+        if "Badge" in allowed:
+            trigger_domains.append("service health states")
+        if "Table" in allowed:
+            trigger_domains.append("tabular comparisons")
+        if "Chart" in allowed:
+            trigger_domains.append("trend analytics & visual charts")
+        if "Diagram" in allowed:
+            trigger_domains.append("process workflows & architectural flowcharts")
+        if "Carousel" in allowed:
+            trigger_domains.append("multi-option showcases & sliders")
+        if "TestResults" in allowed:
+            trigger_domains.append("test suite outcomes")
+        if "Form" in allowed:
+            trigger_domains.append("parameter configuration forms")
+        if "MathPlot" in allowed:
+            trigger_domains.append("mathematical curves & equations")
+
+        trigger_clause = (
+            ", ".join(trigger_domains)
+            if trigger_domains
+            else "structured executive summaries"
+        )
+
+        # 4. Synthesize Dynamic 1-Shot Example (strictly using ONLY active components)
+        example_lines: List[str] = []
+
+        if "Card" in allowed:
+            example_lines.append("Card: Operational Overview")
+            example_lines.append("All primary systems operating within nominal boundaries.")
+
+        if "Metric" in allowed:
+            example_lines.append("Metric: CPU Utilization | 42% | -6.5% | down")
+        elif "Progress" in allowed:
+            example_lines.append("Progress: Task Velocity | 85")
+
+        if "Badge" in allowed:
+            example_lines.append("Badge: Primary Gateway | success")
+
+        if "Table" in allowed and "Metric" not in allowed:
+            example_lines.append("Table:\nEngine | Latency | Type\nRedis | 0.8ms | In-Memory\nPostgres | 4.2ms | Disk")
+
+        if "Chart" in allowed and "Metric" not in allowed and "Table" not in allowed:
+            example_lines.append("Chart [bar]: 10am:180, 11am:260, 12pm:420 | Title: Hourly Throughput | Unit: MB/s")
+
+        if "Diagram" in allowed and len(example_lines) < 3:
+            example_lines.append("Diagram: Flow Logic\ngraph LR\n  A[Input] --> B[Output]")
+
+        if "ActionButton" in allowed:
+            example_lines.append("Action: Confirm Deployment")
+
+        if not example_lines:
+            first_active = next(iter(allowed))
+            if first_active in component_specs:
+                example_lines.append(component_specs[first_active].replace("<Title>", "Summary").replace("<Label>", "Status"))
+
+        example_str = "\n".join(example_lines)
+
         return (
-            "[AUTONOMOUS GENERATIVE UI CAPABILITY ACTIVE]\n"
+            "[AUTONOMOUS GENERATIVE UI ENGINE: ACTIVE]\n"
             "You possess the native capability to render interactive user interfaces.\n"
-            "AUTONOMOUS TRIGGER RULE: Whenever the user's inquiry naturally involves operational status, metrics, "
-            "comparisons, testing outcomes, workflows, or configuration setups—even if they do not explicitly request a UI—"
-            "you MUST accompany your plain-text answer with an interactive dashboard enclosed inside <openui>...</openui> tags.\n"
-            "Plain conversational thoughts and explanations MUST remain outside <openui> as standard text.\n\n"
+            f"AUTONOMOUS TRIGGER RULE: Whenever the user's inquiry naturally involves {trigger_clause}—even if they do not explicitly request a UI—"
+            "you MUST accompany your plain conversational answer with an interactive dashboard enclosed inside <openui>...</openui> tags.\n"
+            "Conversational reasoning and explanations MUST remain outside <openui> as standard markdown text.\n\n"
             "ALLOWED COMPONENTS CATALOG:\n"
             f"{specs_str}\n\n"
-            "STRICT SYNTAX RULES:\n"
-            "1. Output <openui> directly as raw text. NEVER enclose <openui> inside markdown code fences (``` or ```xml).\n"
-            "2. Keep data bounded (Tables <= 15 rows, Charts <= 30 points). For larger datasets, save files and provide a summary Card.\n\n"
-            "1-SHOT EXAMPLE FORMAT:\n"
+            "STRICT NEGATIVE CONSTRAINT & FALLBACK RULES:\n"
+            "1. ONLY components listed under the ALLOWED CATALOG above exist. If the user asks for a visual layout "
+            "(such as a chart, table, diagram, or metric) that is NOT listed in the allowed catalog, you MUST format "
+            "that data as standard Markdown text/tables/lists OUTSIDE <openui>. NEVER invent tags or emit disabled components inside <openui>.\n"
+            "2. For Charts, values MUST be numerical numbers (e.g. '10am:180, 11am:260' or 'Qdrant:15, Milvus:8'). NEVER use words as values.\n"
+            "3. Output <openui> directly as raw text. NEVER enclose <openui> inside markdown code fences (``` or ```xml).\n"
+            "4. Keep data bounded (Tables <= 15 rows, Charts <= 30 points).\n\n"
+            "1-SHOT EXAMPLE (SYNCHRONIZED WITH YOUR ACTIVE CATALOG):\n"
             "<openui>\n"
-            "Card: System Health Overview\n"
-            "Core services operating within optimal parameters.\n"
-            "Metric: CPU Utilization | 42% | -6.5% | down\n"
-            "Badge: Primary Gateway | success\n"
+            f"{example_str}\n"
             "</openui>"
         )
 
@@ -110,7 +181,7 @@ class ContextManager:
             return ""
 
         lines = ["[Current Turn Execution State]"]
-        for idx, step in enumerate(execution.steps[-6:], 1):  # Keep latest 6 steps
+        for idx, step in enumerate(execution.steps[-6:], 1):
             step_type = step.type
             name = step.name or "unknown"
             if step_type == "tool_call":
@@ -144,7 +215,7 @@ class ContextManager:
         Assemble the architectural context tiers in deterministic sequence:
         1. System Directive (Tier 1A)
         2. Project Rules (Tier 1B)
-        3. Generative UI Instructions (Tier 1C - Conditional)
+        3. Generative UI Instructions (Tier 1C - Conditional & Adaptive)
         4. Compacted Context Summary (Tier 2)
         5. Sanitized Recent Dialogue (Tier 3)
         6. Ongoing Execution Telemetry (Tier 4)
@@ -192,13 +263,11 @@ class ContextManager:
 
         if sidecar and sidecar.conversation:
             for msg in sidecar.conversation:
-                # Exclude turns already compressed inside the summary tier
                 if msg.turn_id and msg.turn_id in covered_turn_ids:
                     continue
 
                 if msg.role in ("user", "assistant"):
                     clean_content = msg.content.strip()
-                    # Defensive: Avoid duplicating the current user prompt if already present in history
                     if msg.role == "user" and clean_current_input and clean_content == clean_current_input:
                         continue
                     recent_msgs.append({"role": msg.role, "content": msg.content})
