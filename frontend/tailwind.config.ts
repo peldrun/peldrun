@@ -86,6 +86,8 @@ const config: Config = {
         sidebg: "var(--sidebg)",
         user_message: "var(--user-message)",
         t_user_message: "var(--t-user-message)",
+        gigbg: "var(--gigbg)",
+
 
 
 

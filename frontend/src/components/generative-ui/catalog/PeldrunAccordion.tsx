@@ -3,6 +3,7 @@
 
 import React, { useState } from "react";
 import { ChevronDown, ChevronUp } from "lucide-react";
+import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
 import type { PeldrunAccordionProps } from "../types";
 
 export function PeldrunAccordion({
@@ -30,7 +31,7 @@ export function PeldrunAccordion({
             </button>
             {isExpanded && (
               <div className="p-3 pt-0 text-xs text-muted-foreground leading-relaxed">
-                {item.content}
+                <MarkdownRenderer content={item.content} />
               </div>
             )}
           </div>
@@ -39,3 +40,5 @@ export function PeldrunAccordion({
     </div>
   );
 }
+
+export default PeldrunAccordion;

@@ -2,6 +2,7 @@
 "use client";
 
 import React from "react";
+import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
 import type { PeldrunTableProps } from "../types";
 
 const MAX_DISPLAY_ROWS = 15;
@@ -15,27 +16,43 @@ export function PeldrunTable({
   const isTruncated = rows.length > MAX_DISPLAY_ROWS;
 
   return (
-    <div className="my-2 space-y-1.5">
-      {caption && <div className="text-[11px] font-medium text-muted-foreground px-1">{caption}</div>}
-      <div className="overflow-x-auto rounded-lg border border-border/70 bg-background/50">
+    <div className="my-2.5 space-y-1.5 font-sans">
+      {caption && (
+        <div className="text-[11px] font-semibold text-muted-foreground px-1 tracking-tight">
+          {caption}
+        </div>
+      )}
+      <div className="overflow-x-auto rounded-xl border border-border/80 bg-card/50 shadow-xs">
         <table className="w-full text-left text-xs border-collapse">
           <thead>
-            <tr className="border-b border-border bg-muted/40 text-muted-foreground font-mono text-[11px]">
+            <tr className="border-b border-border/80 bg-muted/50 text-foreground font-mono text-[11px]">
               {headers.map((h, idx) => (
-                <th key={idx} className="py-2 px-3 font-semibold">
-                  {h}
+                <th key={`th-${idx}`} className="py-2.5 px-3 font-semibold tracking-tight">
+                  <MarkdownRenderer
+                    content={h}
+                    className="[&_p]:mb-0 [&_p]:text-xs [&_p]:font-semibold [&_p]:text-foreground"
+                  />
                 </th>
               ))}
             </tr>
           </thead>
           <tbody className="divide-y divide-border/40">
             {displayedRows.map((row, rIdx) => (
-              <tr key={rIdx} className="hover:bg-muted/20 transition-colors">
-                {row.map((cell, cIdx) => (
-                  <td key={cIdx} className="py-2 px-3 text-foreground whitespace-nowrap">
-                    {String(cell)}
-                  </td>
-                ))}
+              <tr key={`tr-${rIdx}`} className="hover:bg-muted/20 transition-colors">
+                {headers.map((_, cIdx) => {
+                  const cell = row[cIdx] !== undefined ? String(row[cIdx]) : "";
+                  return (
+                    <td
+                      key={`td-${rIdx}-${cIdx}`}
+                      className="py-2.5 px-3 text-foreground align-top text-xs leading-relaxed break-words"
+                    >
+                      <MarkdownRenderer
+                        content={cell}
+                        className="[&_p]:mb-0 [&_p]:text-xs [&_p]:leading-relaxed"
+                      />
+                    </td>
+                  );
+                })}
               </tr>
             ))}
           </tbody>
@@ -49,3 +66,5 @@ export function PeldrunTable({
     </div>
   );
 }
+
+export default PeldrunTable;

@@ -51,6 +51,7 @@
     --sidebg: #f8f8f7;
     --user-message: #e8f3fe;
     --t-user-message:#0c274a;
+    --gigbg: #f5f5f5;
 
     --font-sans: 'DM Sans', sans-serif;
     --font-serif: 'Libre Baskerville', serif;
@@ -93,6 +94,7 @@
     --sidebg: #101010;
     --user-message: #101010;
     --t-user-message:#fff;
+    --gigbg: #191919;
 
   }
 }

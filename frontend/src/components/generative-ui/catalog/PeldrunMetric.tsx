@@ -19,7 +19,7 @@ export function PeldrunMetric({
   };
 
   return (
-    <div className="p-3 rounded-xl border border-border/70 bg-card/50 shadow-xs space-y-1">
+    <div className="p-3 rounded-xl border border-card/70 bg-muted/50 shadow-md inset-shadow-xs space-y-1">
       <div className="text-[11px] font-medium text-muted-foreground truncate">{label}</div>
       <div className="flex items-baseline gap-2">
         <span className="text-lg font-bold text-foreground tracking-tight font-mono">{value}</span>

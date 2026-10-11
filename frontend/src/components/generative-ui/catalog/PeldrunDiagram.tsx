@@ -3,7 +3,7 @@
 
 import React, { useEffect, useRef, useState, useId } from "react";
 import mermaid from "mermaid";
-import { GitFork, AlertCircle, Copy, Check, Maximize2 } from "lucide-react";
+import { GitFork, AlertCircle, Copy, Check } from "lucide-react";
 import { PeldrunMotionWrapper } from "./PeldrunMotionWrapper";
 
 interface PeldrunDiagramProps {
@@ -21,13 +21,28 @@ export function PeldrunDiagram({ code, title }: PeldrunDiagramProps): React.JSX.
   useEffect(() => {
     let isMounted = true;
 
+    // Remove any leftover error elements injected by mermaid into document.body
+    const cleanupGlobalMermaidErrors = () => {
+      if (typeof document === "undefined") return;
+      const danglingErrors = document.querySelectorAll(
+        `div[id^="dmermaid_svg_"], div.mermaid-error, svg[id^="mermaid-svg-"][aria-roledescription="error"]`
+      );
+      danglingErrors.forEach((el) => {
+        if (el.parentNode === document.body) {
+          el.remove();
+        }
+      });
+    };
+
     async function renderMermaid() {
       if (!code.trim()) return;
 
       try {
         const isDark = document.documentElement.classList.contains("dark");
+
         mermaid.initialize({
           startOnLoad: false,
+          suppressErrorRendering: true, // PREVENTS MERMAID FROM INJECTING THE BOMB INTO THE DOM
           theme: isDark ? "dark" : "neutral",
           securityLevel: "loose",
           fontFamily: "ui-sans-serif, system-ui, sans-serif",
@@ -40,6 +55,14 @@ export function PeldrunDiagram({ code, title }: PeldrunDiagramProps): React.JSX.
           },
         });
 
+        // Override parseError to silence global DOM error injection
+        mermaid.parseError = (err: any) => {
+          if (isMounted) {
+            setError(typeof err === "string" ? err : err?.message || "Invalid diagram syntax.");
+          }
+          cleanupGlobalMermaidErrors();
+        };
+
         const cleanCode = code
           .replace(/^```(?:mermaid)?/i, "")
           .replace(/```$/i, "")
@@ -48,13 +71,15 @@ export function PeldrunDiagram({ code, title }: PeldrunDiagramProps): React.JSX.
         const renderId = `mermaid_svg_${uniqueId}_${Date.now().toString(36)}`;
         const { svg } = await mermaid.render(renderId, cleanCode);
 
+        cleanupGlobalMermaidErrors();
+
         if (isMounted) {
           setSvgHtml(svg);
           setError(null);
         }
       } catch (err: any) {
+        cleanupGlobalMermaidErrors();
         if (isMounted) {
-          console.warn("[PeldrunDiagram] Mermaid parse failure:", err);
           setError(err?.message || "Failed to render diagram syntax.");
         }
       }
@@ -64,6 +89,7 @@ export function PeldrunDiagram({ code, title }: PeldrunDiagramProps): React.JSX.
 
     return () => {
       isMounted = false;
+      cleanupGlobalMermaidErrors();
     };
   }, [code, uniqueId]);
 
@@ -123,3 +149,5 @@ export function PeldrunDiagram({ code, title }: PeldrunDiagramProps): React.JSX.
     </PeldrunMotionWrapper>
   );
 }
+
+export default PeldrunDiagram;
