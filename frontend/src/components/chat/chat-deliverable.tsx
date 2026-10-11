@@ -13,7 +13,7 @@ interface ChatDeliverableProps {
   turnIndex?: number;
   isTurnRawTrace?: boolean;
   lastThoughtContent?: string;
-  producedFiles?: { name: string; path: string }[];
+  producedFiles?: { name: string; path: string; action?: string; status?: string }[];
   onSelectFile: (fileName: string) => void;
   copiedSection: string | null;
   onCopy: (text: string, identifier: string) => void;
@@ -122,6 +122,7 @@ export function ChatDeliverable({
       )}
 
       {/* 5. Adaptive Deliverable Box: Generated Files */}
+
       {execMode === "agent" && status === "completed" && hasFiles && (
         <div className="p-3.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-xs space-y-2.5">
           <div className="flex items-center justify-between">
@@ -130,19 +131,32 @@ export function ChatDeliverable({
             </span>
           </div>
           <div className="flex flex-wrap gap-2">
-            {producedFiles.map((f, idx) => (
-              <button
-                key={`${f.path || f.name || "file"}-${idx}`}
-                type="button"
-                onClick={() => onSelectFile(f.name)}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-card hover:bg-muted text-foreground border border-border text-xs cursor-pointer shadow-xs transition-all"
-                title="Preview file in Workspace"
-              >
-                <FileText size={13} className="text-primary shrink-0" />
-                <span className="font-medium font-mono">{f.name}</span>
-                <ExternalLink size={10} className="opacity-60 shrink-0" />
-              </button>
-            ))}
+            {producedFiles.map((f, idx) => {
+              const isModified = f.action === "modified" || f.status === "modified";
+              const targetPath = f.path || f.name;
+              return (
+                <button
+                  key={`${targetPath}-${idx}`}
+                  type="button"
+                  onClick={() => onSelectFile(targetPath)}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-card hover:bg-muted text-foreground border border-border text-xs cursor-pointer shadow-xs transition-all"
+                  title={`Preview ${targetPath} in Workspace`}
+                >
+                  <FileText size={13} className="text-primary shrink-0" />
+                  <span className="font-medium font-mono truncate max-w-[200px]">{targetPath}</span>
+                  {isModified ? (
+                    <span className="text-[9px] px-1 py-0.2 rounded bg-amber-500/20 text-amber-600 dark:text-amber-400 font-mono font-semibold">
+                      Modified
+                    </span>
+                  ) : (
+                    <span className="text-[9px] px-1 py-0.2 rounded bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 font-mono font-semibold">
+                      New
+                    </span>
+                  )}
+                  <ExternalLink size={10} className="opacity-60 shrink-0" />
+                </button>
+              );
+            })}
           </div>
         </div>
       )}

@@ -23,6 +23,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
 import zipfile
+import urllib.parse
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
@@ -51,6 +52,48 @@ router = APIRouter()
 JOB_TO_CHAT_ID: Dict[str, str] = {}
 ACTIVE_JOB_TASKS: Dict[str, asyncio.Task] = {}
 ACTIVE_JOB_EVENTS: Dict[str, List[Dict[str, Any]]] = {}
+
+JOB_PRE_SNAPSHOTS: Dict[str, Dict[str, Tuple[float, int]]] = {}
+JOB_DELTA_ARTIFACTS: Dict[str, List[Dict[str, Any]]] = {}
+
+
+def compute_job_delta_files(job_id: str, files_dir: Path) -> List[Dict[str, Any]]:
+    """Compute files created or modified specifically during this job execution."""
+    pre_snap = JOB_PRE_SNAPSHOTS.get(job_id, {})
+    delta_list: List[Dict[str, Any]] = []
+
+    if not files_dir.exists():
+        return delta_list
+
+    for root, dirs, f_names in os.walk(files_dir):
+        for f in f_names:
+            p = Path(root) / f
+            try:
+                rel = str(p.relative_to(files_dir)).replace("\\", "/")
+                st = p.stat()
+                curr_stat = (st.st_mtime, st.st_size)
+
+                if rel not in pre_snap:
+                    delta_list.append({
+                        "name": f,
+                        "path": rel,
+                        "size": st.st_size,
+                        "action": "created",
+                        "status": "created",
+                    })
+                elif curr_stat != pre_snap[rel]:
+                    delta_list.append({
+                        "name": f,
+                        "path": rel,
+                        "size": st.st_size,
+                        "action": "modified",
+                        "status": "modified",
+                    })
+            except Exception:
+                pass
+
+    delta_list.sort(key=lambda x: (0 if x["size"] > 0 else 1, x["path"]))
+    return delta_list
 
 
 class RunRequest(BaseModel):
@@ -195,6 +238,20 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
     files_dir = project_manager.get_chat_files_dir(chat_id, project_id)
     files_dir.mkdir(parents=True, exist_ok=True)
 
+    # Take baseline snapshot of files prior to agent execution
+    pre_snap: Dict[str, Tuple[float, int]] = {}
+    if files_dir.exists():
+        for root, dirs, f_names in os.walk(files_dir):
+            for f in f_names:
+                p = Path(root) / f
+                try:
+                    rel_p = str(p.relative_to(files_dir)).replace("\\", "/")
+                    st = p.stat()
+                    pre_snap[rel_p] = (st.st_mtime, st.st_size)
+                except Exception:
+                    pass
+    JOB_PRE_SNAPSHOTS[actual_job_id] = pre_snap
+
     JOB_TO_CHAT_ID[actual_job_id] = chat_id
     try:
         setattr(job, "chat_id", chat_id)
@@ -206,6 +263,7 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
         ACTIVE_JOB_EVENTS[chat_id] = ACTIVE_JOB_EVENTS[actual_job_id]
 
     effective_agent = (req.agent_id or "peldrun").strip()
+
 
     project_manager.save_chat_session(
         chat_id=chat_id,
@@ -532,6 +590,13 @@ async def stream_job_events(job_id: str, after_sequence: int = Query(0, ge=0)):
                 fresh_summary = await usage_store.get_chat_usage_summary(chat_id)
                 turn_usage = res_data.get("usage") if isinstance(res_data, dict) else None
 
+                # Calculate turn-specific file delta (created or modified during this job)
+                files_dir_for_delta = project_manager.get_chat_files_dir(chat_id, p_id)
+                calculated_delta = compute_job_delta_files(job_id, files_dir_for_delta)
+                JOB_DELTA_ARTIFACTS[job_id] = calculated_delta
+                job_scoped_artifacts[job_id] = calculated_delta
+
+
                 project_manager.save_chat_session(
                     chat_id=chat_id,
                     project_id=p_id,
@@ -585,7 +650,13 @@ async def get_job_files(job_id: str):
     files_dir = project_manager.get_chat_files_dir(chat_id, project_id)
 
     if not files_dir.exists():
-        return {"job_id": job_id, "chat_id": chat_id, "files": [], "all_files": []}
+        return {
+            "job_id": job_id,
+            "chat_id": chat_id,
+            "files": [],
+            "all_files": [],
+            "delta_files": [],
+        }
 
     all_files_list: List[Dict[str, Any]] = []
     for root, dirs, files in os.walk(files_dir):
@@ -601,16 +672,21 @@ async def get_job_files(job_id: str):
     all_files_list.sort(key=lambda x: (0 if x["size"] > 0 else 1, x["path"]))
 
     actual_job_id = chat.get("job_id") or job_id
+    delta_files = compute_job_delta_files(actual_job_id, files_dir)
+    JOB_DELTA_ARTIFACTS[actual_job_id] = delta_files
+
     return {
         "job_id": actual_job_id,
         "chat_id": chat_id,
         "files": all_files_list,
         "all_files": all_files_list,
+        "delta_files": delta_files,
     }
 
 
 def _resolve_physical_file(files_dir: Path, requested_path: str) -> Optional[Path]:
-    clean_rel = requested_path.lstrip("/\\").replace("\\", "/")
+    decoded = urllib.parse.unquote(requested_path)
+    clean_rel = decoded.lstrip("/\\").replace("\\", "/")
     if "files/" in clean_rel:
         clean_rel = clean_rel.split("files/", 1)[1]
 
@@ -622,10 +698,12 @@ def _resolve_physical_file(files_dir: Path, requested_path: str) -> Optional[Pat
     except ValueError:
         pass
 
+    # Fallback to searching by filename ONLY if no directory path was specified
     target_name = Path(clean_rel).name
-    for sub_file in files_dir.rglob(target_name):
-        if sub_file.is_file() and sub_file.stat().st_size > 0:
-            return sub_file
+    if "/" not in clean_rel:
+        for sub_file in files_dir.rglob(target_name):
+            if sub_file.is_file() and sub_file.stat().st_size > 0:
+                return sub_file
 
     return None
 
@@ -657,7 +735,8 @@ async def save_job_file_content(job_id: str, payload: FileContentPayload):
     files_dir = project_manager.get_chat_files_dir(chat_id, project_id)
     files_dir.mkdir(parents=True, exist_ok=True)
 
-    clean_rel = payload.path.lstrip("/\\").replace("\\", "/")
+    decoded = urllib.parse.unquote(payload.path)
+    clean_rel = decoded.lstrip("/\\").replace("\\", "/")
     if "files/" in clean_rel:
         clean_rel = clean_rel.split("files/", 1)[1]
 

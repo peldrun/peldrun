@@ -585,8 +585,9 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       const res = await fetch(`/api/run/jobs/${jobId}/files`);
       if (res.ok) {
         const data = await res.json();
-        const incomingFiles: { name: string; path: string }[] = data.files || [];
-        setProducedFiles(incomingFiles);
+        const turnFiles: { name: string; path: string; action?: string; status?: string }[] =
+          data.delta_files !== undefined ? data.delta_files : (data.files || []);
+        setProducedFiles(turnFiles);
       }
     } catch (e) {
       console.error("Error fetching job files", e);

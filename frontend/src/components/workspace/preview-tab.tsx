@@ -90,8 +90,11 @@ useEffect(() => {
               }) ||
               data.files.find((f: any) => f.name.toLowerCase().endsWith(".svg"));
 
-            if (bestFile && bestFile.name !== autoFile) {
-              setAutoFile(bestFile.name);
+            if (bestFile) {
+              const targetPath = bestFile.path || bestFile.name;
+              if (targetPath !== autoFile) {
+                setAutoFile(targetPath);
+              }
             }
           }
         })
@@ -146,8 +149,16 @@ useEffect(() => {
   }, [fetchContent]);
 
   const sandboxedHtml = useMemo(() => {
-    if (!rawContent || !isHtml) return "";
-    const baseHref = effectiveJobId ? `/api/run/jobs/${effectiveJobId}/raw/` : `/api/files/raw/`;
+    if (!rawContent || !isHtml || !effectiveFile) return "";
+
+    // Dynamically scope base href to the deliverable's parent folder (e.g., "my site/")
+    const fileDir = effectiveFile.includes("/")
+      ? effectiveFile.substring(0, effectiveFile.lastIndexOf("/") + 1)
+      : "";
+    const encodedDir = fileDir ? encodeURI(fileDir) : "";
+    const baseHref = effectiveJobId
+      ? `/api/run/jobs/${effectiveJobId}/raw/${encodedDir}`
+      : `/api/files/raw/${encodedDir}`;
     const baseTag = `<base href="${baseHref}">`;
 
     // Cache-bust relative CSS and JS assets so modifications reload live in the iframe
@@ -171,7 +182,7 @@ useEffect(() => {
       return processed.replace("<head>", `<head>${baseTag}`);
     }
     return `${baseTag}${processed}`;
-  }, [rawContent, isHtml, effectiveJobId, refreshKey]);
+  }, [rawContent, isHtml, effectiveFile, effectiveJobId, refreshKey]);
 
   if (!effectiveFile || !isPreviewable || (!rawContent && !loading)) {
     return (
@@ -199,8 +210,8 @@ useEffect(() => {
   }
 
   const rawUrl = effectiveJobId
-    ? `/api/run/jobs/${effectiveJobId}/raw/${effectiveFile}`
-    : `/api/files/raw/${effectiveFile}`;
+    ? `/api/run/jobs/${effectiveJobId}/raw/${encodeURI(effectiveFile)}`
+    : `/api/files/raw/${encodeURI(effectiveFile)}`;
 
   const renderBadge = () => {
     if (isHtml) return <span className="px-1.5 py-0.5 rounded text-[10px] bg-peldrun-success/15 text-peldrun-success border border-peldrun-success/30 font-mono">HTML App</span>;
