@@ -9,10 +9,11 @@ Persists immutable invocation records into token_ledger via usage_store and pric
 Adheres strictly to the Runtime V1 contract in peldrun.runtime.contract.
 Faithfully extracts and propagates reasoning_effort control to the agent's LLM provider.
 
-Hardened under Phase M3 (PR 5):
+Hardened under Phase M3 (PR 7 Refinement):
+- Scoped Budget Enforcement: enforces child delegation budget ceilings strictly on child subtasks.
+  Allows root primary agent runs to operate smoothly across their configured max_steps.
 - Complete Event Queue Draining: guarantees all bridged async events drain prior to terminal result emission.
-- Cumulative Budget Enforcement: halts execution immediately if cumulative tokens or cost exceed ceilings.
-- Cascading and Independent Cancellation: parent cancellation terminates all active children; child cancellation is isolated.
+- Cascading and Independent Cancellation: parent cancellation terminates active children; child cancellation is isolated.
 - Complete Lineage Accounting: persists parent_run_id and root_run_id in ledger invocation records.
 """
 
@@ -44,7 +45,6 @@ from peldrun.tools.builtins.delegate_tool import DelegateTool
 from peldrun.tools.builtins.terminate import TerminateTool
 from peldrun.tools.collection import ToolCollection
 from peldrun.tools.registry import ToolRegistry
-
 
 logger = logging.getLogger("peldrun.runtime.executor")
 
@@ -206,7 +206,7 @@ class CoreRuntimeExecutor:
             ToolCollection(registry.list_tools()),
         )
 
-        # 4. Configure LLM Provider with Cumulative Budget Enforcement
+        # 4. Configure LLM Provider with Scoped Budget Enforcement
         base_url = llm_cfg_dict.get("base_url") or "http://127.0.0.1:1234/v1"
         api_key = llm_cfg_dict.get("api_key") or "EMPTY"
         max_tokens = min(int(llm_cfg_dict.get("max_tokens") or 4096), 4096)
@@ -242,22 +242,36 @@ class CoreRuntimeExecutor:
         cumulative_cost_nano = 0
         budget = request.budget
 
+        # Scope budget enforcement: apply subtask token/cost limits strictly to delegated children.
+        # Root primary agent runs execute across their configured max_steps without premature token choking,
+        # unless an explicit token/cost limit is requested via metadata.
+        is_delegated_subrun = bool(parent_run_id) or (delegation_depth > 0)
+        token_ceiling: Optional[int] = None
+        cost_ceiling: Optional[int] = None
+
+        if is_delegated_subrun and budget:
+            token_ceiling = budget.max_total_tokens
+            cost_ceiling = budget.max_cost_nano_usd
+        elif not is_delegated_subrun and isinstance(request.metadata, dict):
+            token_ceiling = request.metadata.get("max_total_tokens") or request.metadata.get("root_token_budget")
+            cost_ceiling = request.metadata.get("max_cost_nano_usd") or request.metadata.get("root_cost_budget")
+
         async def _instrumented_generate(*args: Any, **kwargs: Any):
             nonlocal cumulative_tokens, cumulative_cost_nano
 
-            if budget and budget.max_total_tokens is not None and cumulative_tokens >= budget.max_total_tokens:
+            if token_ceiling is not None and cumulative_tokens >= token_ceiling:
                 raise BudgetExceededError(
-                    f"Cumulative token budget exhausted: {cumulative_tokens} >= {budget.max_total_tokens}",
+                    f"Cumulative token budget exhausted: {cumulative_tokens} >= {token_ceiling}",
                     current_usage=cumulative_tokens,
-                    limit=budget.max_total_tokens,
+                    limit=token_ceiling,
                     metric="tokens",
                 )
 
-            if budget and budget.max_cost_nano_usd is not None and cumulative_cost_nano >= budget.max_cost_nano_usd:
+            if cost_ceiling is not None and cumulative_cost_nano >= cost_ceiling:
                 raise BudgetExceededError(
-                    f"Cumulative cost budget exhausted: {cumulative_cost_nano} >= {budget.max_cost_nano_usd}",
+                    f"Cumulative cost budget exhausted: {cumulative_cost_nano} >= {cost_ceiling}",
                     current_usage=cumulative_cost_nano,
-                    limit=budget.max_cost_nano_usd,
+                    limit=cost_ceiling,
                     metric="cost_nano",
                 )
 
@@ -338,19 +352,19 @@ class CoreRuntimeExecutor:
                 )
                 await usage_store.record_invocation(record)
 
-            if budget and budget.max_total_tokens is not None and cumulative_tokens > budget.max_total_tokens:
+            if token_ceiling is not None and cumulative_tokens > token_ceiling:
                 raise BudgetExceededError(
-                    f"Cumulative token budget exceeded: {cumulative_tokens} > {budget.max_total_tokens}",
+                    f"Cumulative token budget exceeded: {cumulative_tokens} > {token_ceiling}",
                     current_usage=cumulative_tokens,
-                    limit=budget.max_total_tokens,
+                    limit=token_ceiling,
                     metric="tokens",
                 )
 
-            if budget and budget.max_cost_nano_usd is not None and cumulative_cost_nano > budget.max_cost_nano_usd:
+            if cost_ceiling is not None and cumulative_cost_nano > cost_ceiling:
                 raise BudgetExceededError(
-                    f"Cumulative cost budget exceeded: {cumulative_cost_nano} > {budget.max_cost_nano_usd}",
+                    f"Cumulative cost budget exceeded: {cumulative_cost_nano} > {cost_ceiling}",
                     current_usage=cumulative_cost_nano,
-                    limit=budget.max_cost_nano_usd,
+                    limit=cost_ceiling,
                     metric="cost_nano",
                 )
 
@@ -541,7 +555,6 @@ class CoreRuntimeExecutor:
                 self._run_children[parent_run_id].discard(run_id_str)
             self._run_parents.pop(run_id_str, None)
 
-            # Ensure all asynchronous event dispatches have drained cleanly (MA-10 Fix)
             if pending_listener_futures:
                 try:
                     await asyncio.wait(

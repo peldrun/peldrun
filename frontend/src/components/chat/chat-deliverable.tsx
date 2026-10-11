@@ -139,7 +139,7 @@ export function ChatDeliverable({
                   key={`${targetPath}-${idx}`}
                   type="button"
                   onClick={() => onSelectFile(targetPath)}
-                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-card hover:bg-muted text-foreground border border-border text-xs cursor-pointer shadow-xs transition-all"
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-card hover:bg-muted text-foreground border border-card text-xs cursor-pointer shadow-sm hover:shadow-xl transition-all"
                   title={`Preview ${targetPath} in Workspace`}
                 >
                   <FileText size={13} className="text-primary shrink-0" />
