@@ -1,12 +1,5 @@
 ﻿// Path: frontend/src/components/chat/chat-container.tsx
 
-/**
- * frontend/src/components/chat/chat-container.tsx
- *
- * Core Chat & Autonomous Agent Execution Container.
- * Hardened against setState-in-render side-effects and cross-tab switching conflicts.
- */
-
 "use client";
 
 import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
@@ -21,6 +14,32 @@ import { EngineOption } from "@/components/chat/engine-selector";
 import { useChatStore } from "@/stores/chat-store";
 import { useAppStorage } from "@/hooks/use-app-storage";
 import { inferModelCapabilities, fetchServerMetadata } from "@/lib/modelMetadata";
+
+interface ChildRunState {
+  childRunId: string;
+  parentRunId: string;
+  taskId: string;
+  targetAgentId: string;
+  instruction: string;
+  status: "running" | "completed" | "failed" | "cancelled";
+  startedAt: number;
+  steps: any[];
+  deliverables: any[];
+  tokensUsed?: any;
+  durationSeconds?: number;
+  error?: string;
+}
+
+interface DelegationApprovalRequest {
+  approvalRequestId: string;
+  taskId: string;
+  parentRunId: string;
+  targetAgentId: string;
+  instruction: string;
+  status: "pending" | "resolved";
+  timeoutSeconds: number;
+  createdAt: number;
+}
 
 function safeRender(val: any): string {
   if (val === null || val === undefined) return "";
@@ -63,6 +82,9 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   const [copiedSection, setCopiedSection] = useState<string | null>(null);
   const [showRawTrace, setShowRawTrace] = useState(false);
   const [metadataVault, setMetadataVault] = useState<Record<string, any>>({});
+
+  const [activeChildRuns, setActiveChildRuns] = useState<Record<string, ChildRunState>>({});
+  const [pendingApprovals, setPendingApprovals] = useState<Record<string, DelegationApprovalRequest>>({});
 
   const [showRightPanel, setShowRightPanel] = useAppStorage("right_panel_open");
   const [execMode, setExecMode] = useAppStorage("exec_mode");
@@ -485,6 +507,78 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       "error",
     ].forEach(bindEvt);
 
+    [
+      "delegation_requested",
+      "approval_required",
+      "approval_resolved",
+      "child_run_started",
+      "child_run_step",
+      "child_run_completed",
+      "child_run_failed",
+      "child_run_cancelled",
+    ].forEach((name) => {
+      es.addEventListener(name, (e: any) => {
+        try {
+          const payload = JSON.parse(e.data);
+          if (name === "approval_required") {
+            setPendingApprovals((prev) => ({
+              ...prev,
+              [payload.data.approval_request_id]: {
+                approvalRequestId: payload.data.approval_request_id,
+                taskId: payload.data.task_id,
+                parentRunId: payload.data.parent_run_id,
+                targetAgentId: payload.data.target_agent_id,
+                instruction: payload.data.instruction,
+                status: "pending",
+                timeoutSeconds: payload.data.timeout_seconds || 300,
+                createdAt: Date.now(),
+              },
+            }));
+          } else if (name === "approval_resolved") {
+            setPendingApprovals((prev) => {
+              const next = { ...prev };
+              delete next[payload.data.approval_request_id];
+              return next;
+            });
+          } else if (name === "child_run_started") {
+            setActiveChildRuns((prev) => ({
+              ...prev,
+              [payload.data.child_run_id]: {
+                childRunId: payload.data.child_run_id,
+                parentRunId: payload.data.parent_run_id,
+                taskId: payload.data.task_id,
+                targetAgentId: payload.data.target_agent_id,
+                instruction: payload.data.instruction,
+                status: "running",
+                startedAt: Date.now(),
+                steps: [],
+                deliverables: [],
+              },
+            }));
+          } else if (name === "child_run_completed" || name === "child_run_failed" || name === "child_run_cancelled") {
+            const cStatus = name === "child_run_completed" ? "completed" : (name === "child_run_cancelled" ? "cancelled" : "failed");
+            setActiveChildRuns((prev) => {
+              const cur = prev[payload.data.child_run_id];
+              if (!cur) return prev;
+              return {
+                ...prev,
+                [payload.data.child_run_id]: {
+                  ...cur,
+                  status: cStatus,
+                  deliverables: payload.data.deliverables || cur.deliverables,
+                  tokensUsed: payload.data.tokens_used,
+                  durationSeconds: payload.data.duration_seconds,
+                  error: payload.data.error,
+                },
+              };
+            });
+          }
+        } catch (parseErr) {
+          console.error("Failed to parse SSE payload for", name, parseErr);
+        }
+      });
+    });
+
     es.onerror = () => {
       es.close();
       fetchJobFiles(jobId);
@@ -534,6 +628,8 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     setElapsedSeconds(0);
     setSessionTimestamp("");
     setShowRightPanel(false);
+    setActiveChildRuns({});
+    setPendingApprovals({});
     router.push("/chat");
   };
 
@@ -579,7 +675,64 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     }
   };
 
-  // Pure state updater without any cross-component side-effects
+  const handleApproveDelegation = async (approvalId: string, editedInstruction?: string) => {
+    if (!activeJobId) return;
+    try {
+      await fetch(`/api/run/jobs/${activeJobId}/respond`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          answer: {
+            decision: "approve",
+            instruction: editedInstruction,
+          },
+        }),
+      });
+      setPendingApprovals((prev) => {
+        const next = { ...prev };
+        delete next[approvalId];
+        return next;
+      });
+    } catch (err) {
+      console.error("Failed to approve delegation:", err);
+    }
+  };
+
+  const handleRejectDelegation = async (approvalId: string) => {
+    if (!activeJobId) return;
+    try {
+      await fetch(`/api/run/jobs/${activeJobId}/respond`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          answer: { decision: "reject" },
+        }),
+      });
+      setPendingApprovals((prev) => {
+        const next = { ...prev };
+        delete next[approvalId];
+        return next;
+      });
+    } catch (err) {
+      console.error("Failed to reject delegation:", err);
+    }
+  };
+
+  const handleCancelSubtask = async (childRunId: string) => {
+    try {
+      await fetch(`/api/run/jobs/${childRunId}/stop`, { method: "POST" });
+      setActiveChildRuns((prev) => {
+        if (!prev[childRunId]) return prev;
+        return {
+          ...prev,
+          [childRunId]: { ...prev[childRunId], status: "cancelled" },
+        };
+      });
+    } catch (err) {
+      console.error("Failed to cancel subtask:", err);
+    }
+  };
+
   const fetchJobFiles = async (jobId: string) => {
     try {
       const res = await fetch(`/api/run/jobs/${jobId}/files`);
@@ -697,6 +850,8 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     setCurrentUsageMetrics(null);
     setElapsedSeconds(0);
     setSessionTimestamp(new Date().toLocaleString());
+    setActiveChildRuns({});
+    setPendingApprovals({});
 
     try {
       let storedOverride = {};
@@ -776,7 +931,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     }, {} as Record<number, StepEvent[]>);
   };
 
-const isFreshSession = historyTurns.length === 0 && steps.length === 0 && !submittedPrompt && status !== "running";
+  const isFreshSession = historyTurns.length === 0 && steps.length === 0 && !submittedPrompt && status !== "running";
 
   const getLiveStatusMessage = () => {
     if (execMode === "chat") return "Synthesizing conversational response...";
@@ -885,6 +1040,11 @@ const isFreshSession = historyTurns.length === 0 && steps.length === 0 && !submi
             costUsd={currentCostUsd}
             latencyMs={currentLatencyMs}
             tokensPerSecond={currentTokensPerSecond}
+            activeChildRuns={activeChildRuns}
+            pendingApprovals={pendingApprovals}
+            onApproveDelegation={handleApproveDelegation}
+            onRejectDelegation={handleRejectDelegation}
+            onCancelSubtask={handleCancelSubtask}
           />
         )}
 

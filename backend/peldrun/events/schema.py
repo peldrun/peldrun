@@ -1,10 +1,9 @@
+# backend/peldrun/events/schema.py
 """
-backend/peldrun/events/schema.py
-
 PELDRUN Core Event Protocol Schemas.
 Implements the strict Canonical Envelope Pattern using Pydantic v2 for the unified runtime lifecycle.
 Includes canonical Artifact lifecycle and Tool Retry event models under PELDRUN Runtime V1.
-Hardened to support flexible run_id identifiers and full test-suite backward compatibility.
+Hardened under Phase M3 (PR 5): Enforces multi-agent delegation, approval gates, and child run lifecycle schemas.
 """
 
 from __future__ import annotations
@@ -43,6 +42,16 @@ class EventType(str, Enum):
     ARTIFACT_UPDATED = "artifact_updated"
     ARTIFACT_DELETED = "artifact_deleted"
     ARTIFACT_MOVED = "artifact_moved"
+
+    # Multi-Agent Lineage & Approval Events (Phase M3)
+    DELEGATION_REQUESTED = "delegation_requested"
+    APPROVAL_REQUIRED = "approval_required"
+    APPROVAL_RESOLVED = "approval_resolved"
+    CHILD_RUN_STARTED = "child_run_started"
+    CHILD_RUN_STEP = "child_run_step"
+    CHILD_RUN_COMPLETED = "child_run_completed"
+    CHILD_RUN_FAILED = "child_run_failed"
+    CHILD_RUN_CANCELLED = "child_run_cancelled"
 
 
 # Typed helper payloads for domain modeling and strict event validation
@@ -192,6 +201,36 @@ class ArtifactPayload(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class DelegationLifecyclePayload(BaseModel):
+    """Payload for multi-agent delegation initiation, step dispatch, and completion."""
+    model_config = ConfigDict(extra="allow")
+    task_id: str
+    parent_run_id: str
+    target_agent_id: str
+    child_run_id: Optional[str] = None
+    instruction: Optional[str] = None
+    status: str = "pending"
+    duration_seconds: float = 0.0
+    deliverables: List[str] = Field(default_factory=list)
+    tokens_used: int = 0
+    cost_nano_usd: int = 0
+    error: Optional[str] = None
+
+
+class ApprovalLifecyclePayload(BaseModel):
+    """Payload for durable Human-in-the-Loop delegation approval gates."""
+    model_config = ConfigDict(extra="allow")
+    approval_request_id: str
+    task_id: str
+    parent_run_id: str
+    target_agent_id: str
+    instruction: str
+    status: str = "pending"
+    decision: Optional[str] = None
+    edited_instruction: Optional[str] = None
+    timeout_seconds: float = 300.0
+
+
 EVENT_PAYLOAD_MAP: Dict[EventType, type[BaseModel]] = {
     EventType.SNAPSHOT: SnapshotPayload,
     EventType.RUN_STARTED: SnapshotPayload,
@@ -213,6 +252,15 @@ EVENT_PAYLOAD_MAP: Dict[EventType, type[BaseModel]] = {
     EventType.ARTIFACT_UPDATED: ArtifactPayload,
     EventType.ARTIFACT_DELETED: ArtifactPayload,
     EventType.ARTIFACT_MOVED: ArtifactPayload,
+    # Phase M3 Payloads
+    EventType.DELEGATION_REQUESTED: DelegationLifecyclePayload,
+    EventType.APPROVAL_REQUIRED: ApprovalLifecyclePayload,
+    EventType.APPROVAL_RESOLVED: ApprovalLifecyclePayload,
+    EventType.CHILD_RUN_STARTED: DelegationLifecyclePayload,
+    EventType.CHILD_RUN_STEP: StepStartPayload,
+    EventType.CHILD_RUN_COMPLETED: DelegationLifecyclePayload,
+    EventType.CHILD_RUN_FAILED: DelegationLifecyclePayload,
+    EventType.CHILD_RUN_CANCELLED: DelegationLifecyclePayload,
 }
 
 
@@ -325,10 +373,7 @@ class PeldrunEvent(BaseModel):
         self.payload = value
 
     def to_sse_payload(self) -> Dict[str, Any]:
-        """
-        Return serialized JSON-safe dictionary representation of the canonical envelope.
-        Strict protocol wire format without redundant alias keys.
-        """
+        """Return serialized JSON-safe dictionary representation of the canonical envelope."""
         return self.model_dump(mode="json")
 
     def to_sse(self) -> str:
@@ -343,66 +388,51 @@ BaseEvent = PeldrunEvent
 AgentEvent = PeldrunEvent
 
 
-# Specialized convenience envelope subclasses with strictly enforced literal types
+# Specialized convenience envelope subclasses
 class SnapshotEvent(PeldrunEvent):
     type: Literal[EventType.SNAPSHOT] = EventType.SNAPSHOT
-
 
 class RunStatusEvent(PeldrunEvent):
     type: Literal[EventType.RUN_STATUS] = EventType.RUN_STATUS
 
-
 class StepStartEvent(PeldrunEvent):
     type: Literal[EventType.STEP_START] = EventType.STEP_START
-
 
 class ThoughtEvent(PeldrunEvent):
     type: Literal[EventType.THOUGHT] = EventType.THOUGHT
 
-
 class AgentActivityEvent(PeldrunEvent):
     type: Literal[EventType.AGENT_ACTIVITY] = EventType.AGENT_ACTIVITY
-
 
 class ToolCallEvent(PeldrunEvent):
     type: Literal[EventType.TOOL_CALL] = EventType.TOOL_CALL
 
-
 class ToolRetryEvent(PeldrunEvent):
     type: Literal[EventType.TOOL_RETRY] = EventType.TOOL_RETRY
-
 
 class ObservationEvent(PeldrunEvent):
     type: Literal[EventType.OBSERVATION] = EventType.OBSERVATION
 
-
 class StepEndEvent(PeldrunEvent):
     type: Literal[EventType.STEP_END] = EventType.STEP_END
-
 
 class FinalEvent(PeldrunEvent):
     type: Literal[EventType.FINAL] = EventType.FINAL
 
-
 class ErrorEvent(PeldrunEvent):
     type: Literal[EventType.ERROR] = EventType.ERROR
-
 
 class AskHumanEvent(PeldrunEvent):
     type: Literal[EventType.ASK_HUMAN] = EventType.ASK_HUMAN
 
-
 class ArtifactCreatedEvent(PeldrunEvent):
     type: Literal[EventType.ARTIFACT_CREATED] = EventType.ARTIFACT_CREATED
-
 
 class ArtifactUpdatedEvent(PeldrunEvent):
     type: Literal[EventType.ARTIFACT_UPDATED] = EventType.ARTIFACT_UPDATED
 
-
 class ArtifactDeletedEvent(PeldrunEvent):
     type: Literal[EventType.ARTIFACT_DELETED] = EventType.ARTIFACT_DELETED
-
 
 class ArtifactMovedEvent(PeldrunEvent):
     type: Literal[EventType.ARTIFACT_MOVED] = EventType.ARTIFACT_MOVED
@@ -427,6 +457,8 @@ __all__ = [
     "ErrorPayload",
     "AskHumanPayload",
     "ArtifactPayload",
+    "DelegationLifecyclePayload",
+    "ApprovalLifecyclePayload",
     "SnapshotEvent",
     "RunStatusEvent",
     "StepStartEvent",

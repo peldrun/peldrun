@@ -1,9 +1,9 @@
+# backend/peldrun/runtime/contract.py
 """
-backend/peldrun/runtime/contract.py
-
 Canonical Runtime Invocations and Lifecycle Contract.
 Defines standardized execution requests, handles, results, and human interaction specifications.
 Adheres strictly to the PELDRUN Runtime V1 Durable Execution specification.
+Extended under Phase M3 with typed delegation budgets, lineage tracing, and governance metadata.
 """
 
 from __future__ import annotations
@@ -103,13 +103,38 @@ class AgentSpec(BaseModel):
     temperature: float = 0.7
 
 
+class DelegationBudget(BaseModel):
+    """
+    Typed budget and resource execution ceilings enforced across child delegation runs.
+    Defends against infinite delegation cascades and runaway LLM invocation costs.
+    """
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    max_steps: int = Field(default=10, ge=1, le=50, description="Step count ceiling for child run")
+    max_total_tokens: Optional[int] = Field(default=12_000, ge=1, description="Cumulative token limit across all child steps")
+    max_cost_nano_usd: Optional[int] = Field(default=None, ge=1, description="Maximum cost ceiling in nano-USD (1e-9 USD)")
+    timeout_seconds: float = Field(default=300.0, gt=0, le=1800.0, description="Hard wall-clock timeout in seconds")
+    max_child_runs: int = Field(default=3, ge=0, le=10, description="Maximum number of child runs spawned by parent")
+    max_parallel_children: int = Field(default=2, ge=1, le=4, description="Maximum concurrent active child executions")
+
+    @field_validator("max_steps")
+    @classmethod
+    def _validate_max_steps(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("max_steps must be at least 1")
+        return v
+
+
 class RunRequest(BaseModel):
-    """Standardized invocation request connecting Web or external API to Core."""
+    """
+    Standardized invocation request connecting Web or external API to Core.
+    Equipped with complete lineage tracking and delegation governance parameters.
+    """
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 
     run_id: Union[uuid.UUID, str] = Field(
         default_factory=uuid.uuid4,
-        description="Globally unique identifier for the execution run",
+        description="Globally unique canonical identifier for the execution run",
     )
     job_id: str = Field(..., description="Associated Web layer job tracking token")
     prompt: str = Field(..., description="Overarching task directive")
@@ -122,6 +147,15 @@ class RunRequest(BaseModel):
     project_rules: Optional[str] = Field(default=None, description="Explicit project execution rules")
     step_timeout_seconds: Optional[float] = Field(default=120.0, description="Per-step execution deadline")
     total_timeout_seconds: Optional[float] = Field(default=None, description="Global execution deadline ceiling")
+
+    # Multi-Agent Lineage and Governance
+    parent_run_id: Optional[str] = Field(default=None, description="Run ID of the delegating parent agent if sub-run")
+    root_run_id: Optional[str] = Field(default=None, description="Top-level root run ID of the execution tree")
+    delegator_agent_id: Optional[str] = Field(default=None, description="Identifier of the delegating agent blueprint")
+    delegation_depth: int = Field(default=0, ge=0, le=5, description="Nesting depth in delegation tree (0 = root)")
+    delegation_allowed: bool = Field(default=False, description="Whether this agent is authorized to invoke delegation tools")
+    budget: DelegationBudget = Field(default_factory=DelegationBudget, description="Typed resource and execution budget")
+    approval_request_id: Optional[str] = Field(default=None, description="Durable human approval token if gate was invoked")
 
     @field_validator("run_id", mode="before")
     @classmethod
@@ -163,3 +197,23 @@ class RunResult(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
     created_at: float = Field(default_factory=time.time)
     completed_at: Optional[float] = None
+
+    # Lineage reflection
+    parent_run_id: Optional[str] = Field(default=None, description="Parent run ID if this was a delegated sub-run")
+    root_run_id: Optional[str] = Field(default=None, description="Root run ID of the execution tree")
+    delegation_depth: int = Field(default=0, ge=0, description="Nesting level where this execution occurred")
+
+class BudgetExceededError(RuntimeError):
+    """Raised when an agent execution exceeds its cumulative token or cost budget."""
+
+    def __init__(
+        self,
+        message: str,
+        current_usage: int,
+        limit: int,
+        metric: str = "tokens",
+    ) -> None:
+        super().__init__(message)
+        self.current_usage = current_usage
+        self.limit = limit
+        self.metric = metric

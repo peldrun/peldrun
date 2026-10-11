@@ -1,5 +1,4 @@
 ﻿// Path: frontend/src/components/chat/composer.tsx
-
 "use client";
 
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
@@ -17,6 +16,7 @@ import {
   RotateCcw,
   AlertCircle,
   Info,
+  GitFork,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AgentSelector } from "./agent-selector";
@@ -129,6 +129,11 @@ export function Composer({
   const [isExpanded, setIsExpanded] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
+  // Multi-Agent Delegation Toggle State
+  const [delegationAllowed, setDelegationAllowed] = useAppStorage(
+    "peldrun_delegation_allowed" as Parameters<typeof useAppStorage>[0]
+  );
+
   const [failedDraft, setFailedDraft] = useState<{
     text: string;
     files: File[];
@@ -239,6 +244,9 @@ export function Composer({
 
   const isReasoningSupported = Boolean(modelCaps?.isReasoning);
 
+  // Role Governance: Delegation is ONLY allowed for the primary Team Lead ('peldrun')
+  const isTeamLead = (selectedAgentId || "peldrun").toLowerCase() === "peldrun";
+
   const handleModeChange = (mode: "agent" | "chat") => {
     setExecMode(mode);
     if (typeof window !== "undefined") {
@@ -253,6 +261,9 @@ export function Composer({
     const directives = resolveExecutionDirectives(inputText, selectedMentions);
     const effectiveAgentId = directives.agentId || selectedAgentId || "peldrun";
 
+    // Strictly enforce role-based delegation permission in payload
+    const canDelegate = execMode === "agent" && isTeamLead && Boolean(delegationAllowed);
+
     let base: Record<string, any> = {
       model: activeModel,
       provider: activeProvider.toLowerCase().replace(/[^a-z0-9]/g, ""),
@@ -264,6 +275,7 @@ export function Composer({
       reasoning_effort: effectiveEffort,
       is_reasoning_model: isReasoning,
       agent_id: execMode === "agent" || directives.agentId ? effectiveAgentId : "peldrun",
+      delegation_allowed: canDelegate,
     };
 
     if (directives.toolIds.length > 0) {
@@ -280,6 +292,7 @@ export function Composer({
           reasoning_effort: effectiveEffort,
           is_reasoning_model: isReasoning,
           agent_id: base.agent_id,
+          delegation_allowed: canDelegate,
           tools: base.tools || parsed.tools,
         };
       } catch (e) {}
@@ -592,6 +605,36 @@ export function Composer({
               <div className="animate-in fade-in duration-150 flex items-center gap-1.5">
                 <AgentSelector disabled={disabled || isRunning || isSubmitting} />
                 <ActiveToolsModal />
+
+                {/* Delegation Toggle with Strict Role Governance */}
+                {isTeamLead ? (
+                  <button
+                    type="button"
+                    onClick={() => setDelegationAllowed(!delegationAllowed)}
+                    disabled={disabled || isRunning || isSubmitting}
+                    className={`flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium border transition-all cursor-pointer ${
+                      delegationAllowed
+                        ? "bg-primary/15 border-primary/40 text-primary shadow-xs"
+                        : "bg-card hover:bg-muted border-border text-muted-foreground"
+                    }`}
+                    title={
+                      delegationAllowed
+                        ? "Multi-Agent Delegation: ENABLED (Leader can delegate subtasks)"
+                        : "Multi-Agent Delegation: DISABLED (Single agent execution only)"
+                    }
+                  >
+                    <GitFork size={12} className={delegationAllowed ? "text-primary" : "text-muted-foreground"} />
+                    <span className="text-[11px]">Delegation</span>
+                  </button>
+                ) : (
+                  <div
+                    className="flex items-center gap-1 px-2 py-1 rounded-md text-xs border border-border/40 bg-muted/30 text-muted-foreground/50 cursor-not-allowed select-none"
+                    title="Delegation is strictly restricted to Team Lead ('peldrun'). Manual specialists cannot delegate."
+                  >
+                    <GitFork size={12} />
+                    <span className="text-[11px]">Solo</span>
+                  </div>
+                )}
               </div>
             )}
           </div>

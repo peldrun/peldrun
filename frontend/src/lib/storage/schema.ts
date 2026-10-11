@@ -1,8 +1,10 @@
-﻿import { z } from "zod";
+﻿// frontend/src/lib/storage/schema.ts
+import { z } from "zod";
 
 /**
  * Storage Schema definition for PELDRUN-Web.
  * Explicitly separates SSR-critical cookies from client-only local storage.
+ * Updated under PR 6 & PR 7: registers peldrun_delegation_allowed toggle.
  */
 export const storageSchema = {
   // ------------------------------------------------------------
@@ -82,6 +84,13 @@ export const storageSchema = {
     schema: z.string().max(100000),
     defaultValue: "",
   },
+
+  // Multi-Agent Delegation Governance Toggle (Phase M3 / PR 6)
+  peldrun_delegation_allowed: {
+    tier: "local",
+    schema: z.boolean(),
+    defaultValue: false,
+  },
 } as const;
 
 export type StorageSchema = typeof storageSchema;
@@ -94,5 +103,7 @@ export type StorageSnapshot = {
 };
 
 export function isCookieKey<K extends StorageKey>(key: K): boolean {
-  return storageSchema[key].tier === "cookie";
+  // Defensive guard against undefined access
+  const definition = storageSchema[key];
+  return definition?.tier === "cookie";
 }

@@ -6,7 +6,8 @@
     "dev": "next dev -p 3088",
     "build": "next build",
     "start": "next start -p 3088",
-    "lint": "next lint"
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@lexical/markdown": "0.52.0",
@@ -32,6 +33,7 @@
     "zustand": "^5.0.2"
   },
   "devDependencies": {
+    "@types/jest": "^30.0.0",
     "@types/node": "^22.10.1",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",

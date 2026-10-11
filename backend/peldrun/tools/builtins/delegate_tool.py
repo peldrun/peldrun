@@ -1,19 +1,20 @@
+# backend/peldrun/tools/builtins/delegate_tool.py
 """
-backend/peldrun/tools/builtins/delegate_tool.py
-
 PELDRUN Core Task Delegation Tool.
 Enables autonomous primary agents to delegate complex sub-tasks
-to registered specialized sub-agents with context injection and workspace scoping.
+to registered specialized sub-agents with context injection, workspace scoping,
+and strict resource budget propagation under Phase M3.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 from uuid import UUID
 from pydantic import BaseModel, Field
 
 from peldrun.agents.multi.coordinator import MultiAgentCoordinator
 from peldrun.agents.multi.protocol import DelegatedTask
+from peldrun.runtime.contract import DelegationBudget
 from peldrun.tools.base import BaseTool, ToolResult
 
 
@@ -46,12 +47,18 @@ class DelegateTool(BaseTool):
     def __init__(
         self,
         coordinator: MultiAgentCoordinator,
-        parent_run_id: UUID,
+        parent_run_id: Union[UUID, str],
+        root_run_id: Optional[Union[UUID, str]] = None,
+        delegation_depth: int = 0,
+        budget: Optional[DelegationBudget] = None,
         workspace_root: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.coordinator = coordinator
         self.parent_run_id = parent_run_id
+        self.root_run_id = root_run_id or parent_run_id
+        self.delegation_depth = delegation_depth
+        self.budget = budget or DelegationBudget()
         self.workspace_root = workspace_root
 
     async def execute(
@@ -61,14 +68,17 @@ class DelegateTool(BaseTool):
         context_data: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> ToolResult:
-        """Execute task delegation to the target specialist agent."""
+        """Execute task delegation to the target specialist agent with lineage and budget bounds."""
         ctx = context_data if context_data is not None else kwargs.get("context", {})
         task = DelegatedTask(
             parent_run_id=self.parent_run_id,
+            root_run_id=self.root_run_id,
             target_agent_id=target_agent,
             instruction=instruction,
             context_data=ctx if isinstance(ctx, dict) else {},
             workspace_root=self.workspace_root,
+            delegation_depth=self.delegation_depth + 1,
+            budget=self.budget,
         )
 
         res = await self.coordinator.delegate(task)
@@ -80,8 +90,13 @@ class DelegateTool(BaseTool):
                 exit_code=0,
                 metadata={
                     "child_run_id": str(res.child_run_id),
+                    "parent_run_id": str(res.parent_run_id),
+                    "root_run_id": str(res.root_run_id),
                     "target_agent": target_agent,
+                    "status": res.status.value if hasattr(res.status, "value") else str(res.status),
                     "duration_seconds": res.duration_seconds,
+                    "tokens_used": res.tokens_used,
+                    "cost_nano_usd": res.cost_nano_usd,
                     "deliverables": res.deliverables,
                     "artifacts_count": len(res.artifacts),
                 },
@@ -93,7 +108,11 @@ class DelegateTool(BaseTool):
                 exit_code=1,
                 metadata={
                     "child_run_id": str(res.child_run_id),
+                    "parent_run_id": str(res.parent_run_id),
+                    "root_run_id": str(res.root_run_id),
                     "target_agent": target_agent,
+                    "status": res.status.value if hasattr(res.status, "value") else str(res.status),
+                    "error_code": res.error_code,
                     "duration_seconds": res.duration_seconds,
                 },
             )

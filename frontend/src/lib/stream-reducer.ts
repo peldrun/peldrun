@@ -1,4 +1,5 @@
-﻿import {
+﻿// frontend/src/lib/stream-reducer.ts
+import {
   RunState,
   SSEEnvelope,
   StepGroup,
@@ -7,6 +8,8 @@
   HumanInputItem,
   ArtifactItem,
   RunStatus,
+  ChildRunState,
+  DelegationApprovalRequest,
 } from "./types";
 
 export const initialRunState = (jobId: string, prompt: string): RunState => ({
@@ -15,6 +18,8 @@ export const initialRunState = (jobId: string, prompt: string): RunState => ({
   status: "pending",
   startedAt: Date.now(),
   steps: [],
+  childRuns: {},
+  pendingApprovals: {},
   finalAnswer: null,
   error: null,
   lastEventAt: Date.now(),
@@ -107,6 +112,8 @@ export function reduceEvent(state: RunState, event: SSEEnvelope): RunState {
     lastEventAt: now,
     lastSequence: nextSequence,
     seenEventIds: nextSeenEventIds,
+    childRuns: { ...(state.childRuns || {}) },
+    pendingApprovals: { ...(state.pendingApprovals || {}) },
   };
 
   const stepNum = event.step || 1;
@@ -276,6 +283,136 @@ export function reduceEvent(state: RunState, event: SSEEnvelope): RunState {
         })),
       };
 
+    // ==========================================
+    // Multi-Agent Event Reduction Handlers
+    // ==========================================
+    case "approval_required": {
+      const approvalId = event.data.approval_request_id || `appr_${now}`;
+      const approvalItem: DelegationApprovalRequest = {
+        approvalRequestId: approvalId,
+        taskId: event.data.task_id || "",
+        parentRunId: event.data.parent_run_id || "",
+        targetAgentId: event.data.target_agent_id || "specialist",
+        instruction: event.data.instruction || "",
+        status: "pending",
+        timeoutSeconds: event.data.timeout_seconds || 300,
+        createdAt: now,
+      };
+
+      return {
+        ...base,
+        status: "waiting_for_input",
+        pendingApprovals: {
+          ...base.pendingApprovals,
+          [approvalId]: approvalItem,
+        },
+      };
+    }
+
+    case "approval_resolved": {
+      const approvalId = event.data.approval_request_id || "";
+      const currentApprovals = { ...(base.pendingApprovals || {}) };
+      if (approvalId && currentApprovals[approvalId]) {
+        delete currentApprovals[approvalId];
+      }
+
+      return {
+        ...base,
+        status: base.status === "waiting_for_input" ? "running" : base.status,
+        pendingApprovals: currentApprovals,
+      };
+    }
+
+    case "child_run_started": {
+      const childId = event.data.child_run_id || `child_${now}`;
+      const newChild: ChildRunState = {
+        childRunId: childId,
+        parentRunId: event.data.parent_run_id || "",
+        taskId: event.data.task_id || "",
+        targetAgentId: event.data.target_agent_id || "specialist",
+        instruction: event.data.instruction || "",
+        status: "running",
+        startedAt: now,
+        steps: [],
+        deliverables: [],
+        tokensUsed: 0,
+      };
+
+      return {
+        ...base,
+        childRuns: {
+          ...base.childRuns,
+          [childId]: newChild,
+        },
+      };
+    }
+
+    case "child_run_step": {
+      const childId =
+        event.metadata?.child_run_id ||
+        event.data.child_run_id ||
+        Object.keys(base.childRuns || {}).slice(-1)[0];
+
+      if (!childId || !base.childRuns?.[childId]) {
+        return base;
+      }
+
+      const existingChild = base.childRuns[childId];
+      const updatedSteps = upsertGroup(existingChild.steps, stepNum, stepId, (g) => ({
+        ...g,
+        startedAt: g.startedAt || now,
+      }));
+
+      return {
+        ...base,
+        childRuns: {
+          ...base.childRuns,
+          [childId]: {
+            ...existingChild,
+            steps: updatedSteps,
+          },
+        },
+      };
+    }
+
+    case "child_run_completed":
+    case "child_run_failed":
+    case "child_run_cancelled": {
+      const childId =
+        event.metadata?.child_run_id ||
+        event.data.child_run_id ||
+        Object.keys(base.childRuns || {}).slice(-1)[0];
+
+      if (!childId || !base.childRuns?.[childId]) {
+        return base;
+      }
+
+      const outcomeStatus =
+        event.type === "child_run_completed"
+          ? "completed"
+          : event.type === "child_run_cancelled"
+          ? "cancelled"
+          : "failed";
+
+      const existingChild = base.childRuns[childId];
+      return {
+        ...base,
+        childRuns: {
+          ...base.childRuns,
+          [childId]: {
+            ...existingChild,
+            status: outcomeStatus,
+            finishedAt: now,
+            durationSeconds: event.data.duration_seconds || (now - existingChild.startedAt) / 1000,
+            deliverables: event.data.deliverables || existingChild.deliverables,
+            tokensUsed: event.data.tokens_used || existingChild.tokensUsed,
+            costNanoUsd: event.data.cost_nano_usd || existingChild.costNanoUsd,
+            error: event.data.error || null,
+          },
+        },
+      };
+    }
+
     case "final":
     case "done":
       return {
@@ -306,7 +443,21 @@ export function reduceEvent(state: RunState, event: SSEEnvelope): RunState {
     case "run_accepted": {
       const incomingStatus = (event.data.status || event.data.state || "").toLowerCase();
       let mappedStatus: RunStatus = state.status;
-      if (incomingStatus in ["pending", "queued", "starting", "running", "waiting_for_input", "retrying", "paused", "cancelling", "cancelled", "completed", "failed"]) {
+      if (
+        [
+          "pending",
+          "queued",
+          "starting",
+          "running",
+          "waiting_for_input",
+          "retrying",
+          "paused",
+          "cancelling",
+          "cancelled",
+          "completed",
+          "failed",
+        ].includes(incomingStatus)
+      ) {
         mappedStatus = incomingStatus as RunStatus;
       }
       return {

@@ -1,4 +1,5 @@
-﻿export type ServerEventName =
+﻿// frontend/src/lib/types.ts
+export type ServerEventName =
   | "status"
   | "run_accepted"
   | "run_started"
@@ -14,6 +15,14 @@
   | "artifact_updated"
   | "artifact_deleted"
   | "artifact_moved"
+  | "delegation_requested"
+  | "approval_required"
+  | "approval_resolved"
+  | "child_run_started"
+  | "child_run_step"
+  | "child_run_completed"
+  | "child_run_failed"
+  | "child_run_cancelled"
   | "final"
   | "error"
   | "cancelled"
@@ -105,12 +114,47 @@ export interface StepGroup {
   items: StepItem[];
 }
 
+// ==========================================
+// Multi-Agent Domain Contracts (Phase M3)
+// ==========================================
+export interface ChildRunState {
+  childRunId: string;
+  parentRunId: string;
+  taskId: string;
+  targetAgentId: string;
+  instruction: string;
+  status: "pending" | "running" | "completed" | "failed" | "cancelled";
+  startedAt: number;
+  finishedAt?: number | null;
+  durationSeconds?: number;
+  steps: StepGroup[];
+  deliverables: string[];
+  tokensUsed?: number;
+  costNanoUsd?: number;
+  error?: string | null;
+}
+
+export interface DelegationApprovalRequest {
+  approvalRequestId: string;
+  taskId: string;
+  parentRunId: string;
+  targetAgentId: string;
+  instruction: string;
+  status: "pending" | "resolved";
+  timeoutSeconds: number;
+  createdAt: number;
+  decision?: string;
+  editedInstruction?: string;
+}
+
 export interface RunState {
   jobId: string;
   prompt: string;
   status: RunStatus;
   startedAt: number;
   steps: StepGroup[];
+  childRuns?: Record<string, ChildRunState>;
+  pendingApprovals?: Record<string, DelegationApprovalRequest>;
   finalAnswer: string | null;
   error: string | null;
   lastEventAt: number;
@@ -130,6 +174,7 @@ export interface SSEEnvelope {
   seq?: number;
   sequence?: number;
   data: Record<string, any>;
+  metadata?: Record<string, any>;
 }
 
 // ==========================================
@@ -188,6 +233,7 @@ export interface ModelQuantization {
   name: string | null;
   bits_per_weight: number | null;
 }
+
 export interface ModelInstanceConfig {
   context_length: number;
   eval_batch_size?: number;
@@ -195,11 +241,13 @@ export interface ModelInstanceConfig {
   num_experts?: number;
   offload_kv_cache_to_gpu?: boolean;
 }
+
 export interface ModelCapabilities {
   vision: boolean;
   trained_for_tool_use: boolean;
   reasoning?: boolean;
 }
+
 export interface ModelMetadata {
   type: string;
   publisher?: string | null;

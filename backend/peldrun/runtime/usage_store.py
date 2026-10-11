@@ -83,6 +83,10 @@ class LLMInvocationRecord(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
     created_at: float = Field(default_factory=time.time)
 
+    # Multi-Agent Lineage Tracking
+    parent_run_id: Optional[str] = Field(default=None, description="Parent run ID if this invocation was spawned by a sub-agent")
+    root_run_id: Optional[str] = Field(default=None, description="Root run ID of the execution tree")
+
 
 def is_local_endpoint(provider: str, base_url: Optional[str] = None) -> bool:
     """
@@ -206,19 +210,19 @@ class SqliteUsageStore:
                     created_at REAL NOT NULL
                 );
 
-                CREATE INDEX IF NOT EXISTS idx_token_ledger_created 
+                CREATE INDEX IF NOT EXISTS idx_token_ledger_created
                     ON token_ledger(created_at);
-                CREATE INDEX IF NOT EXISTS idx_token_ledger_chat_created 
+                CREATE INDEX IF NOT EXISTS idx_token_ledger_chat_created
                     ON token_ledger(chat_id, created_at);
-                CREATE INDEX IF NOT EXISTS idx_token_ledger_project_created 
+                CREATE INDEX IF NOT EXISTS idx_token_ledger_project_created
                     ON token_ledger(project_id, created_at);
-                CREATE INDEX IF NOT EXISTS idx_token_ledger_provider_model_created 
+                CREATE INDEX IF NOT EXISTS idx_token_ledger_provider_model_created
                     ON token_ledger(provider, model_requested, created_at);
-                CREATE INDEX IF NOT EXISTS idx_token_ledger_mode_created 
+                CREATE INDEX IF NOT EXISTS idx_token_ledger_mode_created
                     ON token_ledger(mode, created_at);
-                CREATE INDEX IF NOT EXISTS idx_token_ledger_run 
+                CREATE INDEX IF NOT EXISTS idx_token_ledger_run
                     ON token_ledger(run_id);
-                CREATE INDEX IF NOT EXISTS idx_token_ledger_turn 
+                CREATE INDEX IF NOT EXISTS idx_token_ledger_turn
                     ON token_ledger(turn_id);
             """)
 
@@ -229,7 +233,12 @@ class SqliteUsageStore:
 
     def _sync_record_invocation(self, record: LLMInvocationRecord) -> bool:
         conn = self._get_connection()
-        meta_str = json.dumps(record.metadata, ensure_ascii=False)
+        meta_dict = dict(record.metadata)
+        if record.parent_run_id:
+            meta_dict["parent_run_id"] = record.parent_run_id
+        if record.root_run_id:
+            meta_dict["root_run_id"] = record.root_run_id
+        meta_str = json.dumps(meta_dict, ensure_ascii=False)
         with conn:
             cursor = conn.execute(
                 """
@@ -321,8 +330,8 @@ class SqliteUsageStore:
         conn = self._get_connection()
         cursor = conn.execute(
             """
-            SELECT * FROM token_ledger 
-            WHERE chat_id = ? 
+            SELECT * FROM token_ledger
+            WHERE chat_id = ?
             ORDER BY created_at ASC
             """,
             (chat_id,),
@@ -343,7 +352,7 @@ class SqliteUsageStore:
         conn = self._get_connection()
         cursor = conn.execute(
             """
-            SELECT 
+            SELECT
                 COUNT(*) as call_count,
                 COALESCE(SUM(input_tokens), 0) as total_input,
                 COALESCE(SUM(output_tokens), 0) as total_output,
@@ -394,7 +403,7 @@ class SqliteUsageStore:
         conn = self._get_connection()
         cursor = conn.execute(
             """
-            SELECT 
+            SELECT
                 COUNT(*) as call_count,
                 COALESCE(SUM(input_tokens), 0) as total_input,
                 COALESCE(SUM(output_tokens), 0) as total_output,
@@ -474,7 +483,7 @@ class SqliteUsageStore:
         where_clause, params = self._build_filter_clause(filters)
 
         query = f"""
-            SELECT 
+            SELECT
                 COUNT(*) as call_count,
                 COALESCE(SUM(input_tokens), 0) as total_input,
                 COALESCE(SUM(output_tokens), 0) as total_output,
@@ -529,7 +538,7 @@ class SqliteUsageStore:
             fmt = "%Y-%m"
 
         query = f"""
-            SELECT 
+            SELECT
                 strftime('{fmt}', datetime(created_at, 'unixepoch')) as bucket,
                 COUNT(*) as call_count,
                 COALESCE(SUM(input_tokens), 0) as total_input,
@@ -573,7 +582,7 @@ class SqliteUsageStore:
         col = col_map.get(group_by.lower(), "model_requested")
 
         query = f"""
-            SELECT 
+            SELECT
                 {col} as key_name,
                 COUNT(*) as call_count,
                 COALESCE(SUM(input_tokens), 0) as total_input,

@@ -1,6 +1,5 @@
+# backend/peldrun/runtime/executor.py
 """
-backend/peldrun/runtime/executor.py
-
 PELDRUN Core Runtime Executor.
 
 Authoritative execution gateway inside peldrun-core.
@@ -9,6 +8,12 @@ Fully instrumented with P1-05 Structured Diagnostics & Latency Telemetry.
 Persists immutable invocation records into token_ledger via usage_store and pricing_store.
 Adheres strictly to the Runtime V1 contract in peldrun.runtime.contract.
 Faithfully extracts and propagates reasoning_effort control to the agent's LLM provider.
+
+Hardened under Phase M3 (PR 5):
+- Complete Event Queue Draining: guarantees all bridged async events drain prior to terminal result emission.
+- Cumulative Budget Enforcement: halts execution immediately if cumulative tokens or cost exceed ceilings.
+- Cascading and Independent Cancellation: parent cancellation terminates all active children; child cancellation is isolated.
+- Complete Lineage Accounting: persists parent_run_id and root_run_id in ledger invocation records.
 """
 
 from __future__ import annotations
@@ -17,10 +22,11 @@ import asyncio
 import logging
 from pathlib import Path
 import time
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 import uuid
 
 from peldrun.agents.base import AgentConfig
+from peldrun.agents.multi.coordinator import MultiAgentCoordinator
 from peldrun.agents.tool_call_agent import ToolCallAgent
 from peldrun.context.builder import ContextManager
 from peldrun.context.sidecar import load_context_sidecar
@@ -30,13 +36,15 @@ from peldrun.events.emitter import EventEmitter
 from peldrun.events.schema import EventType, PeldrunEvent
 from peldrun.llm.client import LLMConfig
 from peldrun.llm.providers.openai_compat import OpenAICompatProvider
-from peldrun.runtime.contract import RunRequest, RunResult, RunStatus
+from peldrun.runtime.contract import BudgetExceededError, RunRequest, RunResult, RunStatus
 from peldrun.runtime.diagnostics import DiagnosticsCollector
 from peldrun.runtime.pricing_store import get_pricing_store
 from peldrun.runtime.usage_store import LLMInvocationRecord, get_usage_store
+from peldrun.tools.builtins.delegate_tool import DelegateTool
 from peldrun.tools.builtins.terminate import TerminateTool
 from peldrun.tools.collection import ToolCollection
 from peldrun.tools.registry import ToolRegistry
+
 
 logger = logging.getLogger("peldrun.runtime.executor")
 
@@ -48,15 +56,30 @@ class CoreRuntimeExecutor:
 
     def __init__(self) -> None:
         self._active_runners: Dict[str, AgentRunner] = {}
+        self._run_children: Dict[str, Set[str]] = {}
+        self._run_parents: Dict[str, str] = {}
+        self._job_to_run: Dict[str, str] = {}
 
-    def cancel(self, job_id: str) -> bool:
-        """Cancel an active agent execution by job ID."""
-        runner = self._active_runners.get(job_id)
+    def cancel(self, run_or_job_id: str) -> bool:
+        """Cancel an active execution supporting independent and cascading cancellation."""
+        canonical_id = self._job_to_run.get(run_or_job_id, run_or_job_id)
+        cancelled_any = False
+
+        runner = self._active_runners.get(canonical_id) or self._active_runners.get(run_or_job_id)
         if runner:
             runner.cancel()
-            logger.info("Cancellation signal dispatched for active job: %s", job_id)
-            return True
-        return False
+            logger.info("Cancellation signal dispatched for active execution handle: %s", canonical_id)
+            cancelled_any = True
+
+        children = list(self._run_children.get(canonical_id, set()))
+        for child_id in children:
+            child_runner = self._active_runners.get(child_id)
+            if child_runner:
+                child_runner.cancel()
+                logger.info("Cascaded cancellation to child execution handle: %s", child_id)
+                cancelled_any = True
+
+        return cancelled_any
 
     async def execute(
         self,
@@ -70,12 +93,21 @@ class CoreRuntimeExecutor:
         """
         job_id = request.job_id
         run_id_str = str(request.run_id)
+        parent_run_id = request.parent_run_id
+        root_run_id = request.root_run_id or run_id_str
+        delegation_depth = request.delegation_depth
+
         start_time = time.time()
         ws_root = str(request.workspace.root_path)
         chat_id = request.workspace.chat_id
         project_id = request.workspace.project_id or "default_project"
         spec = request.agent_spec
         llm_cfg_dict = request.llm_config
+
+        self._job_to_run[job_id] = run_id_str
+        if parent_run_id:
+            self._run_children.setdefault(parent_run_id, set()).add(run_id_str)
+            self._run_parents[run_id_str] = parent_run_id
 
         # 1. Initialize Diagnostics Collector
         diagnostics = DiagnosticsCollector(
@@ -84,11 +116,12 @@ class CoreRuntimeExecutor:
             chat_id=chat_id,
         )
 
-        # 2. Initialize EventEmitter and bind event listener & telemetry hooks
-        emitter = EventEmitter(run_id=job_id)
+        # 2. Initialize EventEmitter and bind event listener with durable queue tracking
+        emitter = EventEmitter(run_id=run_id_str)
         main_loop = asyncio.get_running_loop()
 
         active_tool_calls: Dict[str, str] = {}
+        pending_listener_futures: Set[Any] = set()
 
         def _telemetry_event_interceptor(evt: PeldrunEvent) -> None:
             if hasattr(evt, "step") and isinstance(evt.step, int) and evt.step > 0:
@@ -115,15 +148,53 @@ class CoreRuntimeExecutor:
         if event_listener:
             def _sync_listener_bridge(evt: PeldrunEvent) -> None:
                 if asyncio.iscoroutinefunction(event_listener):
-                    asyncio.run_coroutine_threadsafe(event_listener(evt), main_loop)
+                    fut = asyncio.run_coroutine_threadsafe(event_listener(evt), main_loop)
+                    pending_listener_futures.add(fut)
+                    fut.add_done_callback(pending_listener_futures.discard)
                 else:
                     event_listener(evt)
 
             emitter.subscribe_all(_sync_listener_bridge)
 
-        # 3. Build Tool Registry
+        # 3. Build Tool Registry and configure Native Delegation
         registry = ToolRegistry(workspace_root=ws_root)
         registry.register(TerminateTool(workspace_root=ws_root))
+
+        agent_id_clean = (spec.id or "").lower().strip()
+        is_lead_agent = agent_id_clean in ("peldrun", "lead", "team_lead")
+        can_delegate = (
+            request.delegation_allowed
+            and request.delegation_depth == 0
+            and is_lead_agent
+        )
+
+        if can_delegate:
+            coordinator = MultiAgentCoordinator(
+                parent_emitter=emitter,
+                workspace_root=ws_root,
+                step_timeout_seconds=float(request.step_timeout_seconds or 120.0),
+                default_max_steps=int(spec.max_steps),
+                execute_fn=self.execute,
+                parent_request=request,
+            )
+            delegate_tool = DelegateTool(
+                coordinator=coordinator,
+                parent_run_id=run_id_str,
+                root_run_id=root_run_id,
+                delegation_depth=delegation_depth,
+                budget=request.budget,
+                workspace_root=ws_root,
+            )
+            registry.register(delegate_tool)
+            logger.info("Native DelegateTool wired for Team Lead run %s", run_id_str)
+        else:
+            logger.debug(
+                "Delegation prohibited for run %s (agent=%s, allowed=%s, depth=%s)",
+                run_id_str,
+                agent_id_clean,
+                request.delegation_allowed,
+                delegation_depth,
+            )
 
         if custom_tools:
             for tool in custom_tools:
@@ -135,7 +206,7 @@ class CoreRuntimeExecutor:
             ToolCollection(registry.list_tools()),
         )
 
-        # 4. Configure LLM Provider with explicit reasoning effort propagation
+        # 4. Configure LLM Provider with Cumulative Budget Enforcement
         base_url = llm_cfg_dict.get("base_url") or "http://127.0.0.1:1234/v1"
         api_key = llm_cfg_dict.get("api_key") or "EMPTY"
         max_tokens = min(int(llm_cfg_dict.get("max_tokens") or 4096), 4096)
@@ -143,7 +214,6 @@ class CoreRuntimeExecutor:
         model_name = llm_cfg_dict.get("model", "default")
         provider_name = llm_cfg_dict.get("provider", "openai")
 
-        # Resolve reasoning effort: normalize 'off' or 'none' strictly to 'none', keep others intact
         raw_effort = llm_cfg_dict.get("reasoning_effort")
         resolved_effort: Optional[str] = None
         if raw_effort:
@@ -168,7 +238,29 @@ class CoreRuntimeExecutor:
         usage_store = get_usage_store()
         pricing_store = get_pricing_store()
 
+        cumulative_tokens = 0
+        cumulative_cost_nano = 0
+        budget = request.budget
+
         async def _instrumented_generate(*args: Any, **kwargs: Any):
+            nonlocal cumulative_tokens, cumulative_cost_nano
+
+            if budget and budget.max_total_tokens is not None and cumulative_tokens >= budget.max_total_tokens:
+                raise BudgetExceededError(
+                    f"Cumulative token budget exhausted: {cumulative_tokens} >= {budget.max_total_tokens}",
+                    current_usage=cumulative_tokens,
+                    limit=budget.max_total_tokens,
+                    metric="tokens",
+                )
+
+            if budget and budget.max_cost_nano_usd is not None and cumulative_cost_nano >= budget.max_cost_nano_usd:
+                raise BudgetExceededError(
+                    f"Cumulative cost budget exhausted: {cumulative_cost_nano} >= {budget.max_cost_nano_usd}",
+                    current_usage=cumulative_cost_nano,
+                    limit=budget.max_cost_nano_usd,
+                    metric="cost_nano",
+                )
+
             inv_start = time.time()
             resp = await original_generate(*args, **kwargs)
             inv_end = time.time()
@@ -184,6 +276,10 @@ class CoreRuntimeExecutor:
                     model=model_name,
                     base_url=base_url,
                 )
+                if u.total_tokens:
+                    cumulative_tokens += int(u.total_tokens)
+                if cost_nano:
+                    cumulative_cost_nano += int(cost_nano)
 
             diagnostics.record_llm_invocation(
                 invocation_id=inv_id,
@@ -232,8 +328,31 @@ class CoreRuntimeExecutor:
                     finish_reason=resp.finish_reason,
                     pricing_version_id=rule_id,
                     cost_nano_usd=cost_nano,
+                    parent_run_id=parent_run_id,
+                    root_run_id=root_run_id,
+                    metadata={
+                        "parent_run_id": parent_run_id,
+                        "root_run_id": root_run_id,
+                        "delegation_depth": delegation_depth,
+                    },
                 )
                 await usage_store.record_invocation(record)
+
+            if budget and budget.max_total_tokens is not None and cumulative_tokens > budget.max_total_tokens:
+                raise BudgetExceededError(
+                    f"Cumulative token budget exceeded: {cumulative_tokens} > {budget.max_total_tokens}",
+                    current_usage=cumulative_tokens,
+                    limit=budget.max_total_tokens,
+                    metric="tokens",
+                )
+
+            if budget and budget.max_cost_nano_usd is not None and cumulative_cost_nano > budget.max_cost_nano_usd:
+                raise BudgetExceededError(
+                    f"Cumulative cost budget exceeded: {cumulative_cost_nano} > {budget.max_cost_nano_usd}",
+                    current_usage=cumulative_cost_nano,
+                    limit=budget.max_cost_nano_usd,
+                    metric="cost_nano",
+                )
 
             return resp
 
@@ -290,15 +409,16 @@ class CoreRuntimeExecutor:
         )
 
         logger.info(
-            "Context assembled for agent job %s | model: %s | active tokens: %s / %s",
+            "Context assembled for agent job %s (run %s) | model: %s | active tokens: %s / %s",
             job_id,
+            run_id_str,
             model_name,
             budget_usage.get("total_tokens", 0),
             budget_usage.get("effective_limit", 0),
         )
 
         initial_state = ExecutionState(
-            run_id=job_id,
+            run_id=run_id_str,
             task_prompt=request.prompt,
             agent_name=agent.name,
             max_steps=spec.max_steps,
@@ -306,13 +426,15 @@ class CoreRuntimeExecutor:
             metadata={
                 "run_id": run_id_str,
                 "job_id": job_id,
+                "parent_run_id": parent_run_id,
+                "root_run_id": root_run_id,
+                "delegation_depth": delegation_depth,
                 "request_metadata": request.metadata,
                 "reasoning_effort": resolved_effort,
                 "context_budget": budget_usage,
             },
         )
 
-        # Populate ExecutionState messages from the assembled context tiers
         for msg in assembled_messages:
             role_str = str(msg.get("role", "user")).lower()
             if role_str == "system":
@@ -325,10 +447,11 @@ class CoreRuntimeExecutor:
 
         agent.messages = [dict(m) for m in assembled_messages]
 
-        # 7. Configure Runner Lifecycle
+        # 7. Configure Runner Lifecycle with explicit total_timeout_seconds propagation
         runner_config = RunnerConfig(
             max_steps=spec.max_steps,
             step_timeout_seconds=step_timeout,
+            total_timeout_seconds=request.total_timeout_seconds,
             enable_checkpointing=True,
             checkpoint_interval=1,
         )
@@ -337,7 +460,10 @@ class CoreRuntimeExecutor:
             emitter=emitter,
             config=runner_config,
         )
-        self._active_runners[job_id] = runner
+
+        self._active_runners[run_id_str] = runner
+        if job_id != run_id_str:
+            self._active_runners[job_id] = runner
 
         # 8. Execute Autonomous Loop with Diagnostic Catching
         execution_state: Optional[ExecutionState] = None
@@ -350,7 +476,7 @@ class CoreRuntimeExecutor:
             )
         except asyncio.CancelledError:
             runner.cancel()
-            logger.warning("Execution cancelled for job: %s", job_id)
+            logger.warning("Execution cancelled for run %s (job %s)", run_id_str, job_id)
             diag = diagnostics.finalize(status=RunStatus.CANCELLED, failure_reason="Cancelled by operator.")
             return RunResult(
                 run_id=run_id_str,
@@ -364,9 +490,32 @@ class CoreRuntimeExecutor:
                 metadata={"diagnostics": diag.model_dump(mode="json")},
                 created_at=start_time,
                 completed_at=time.time(),
+                parent_run_id=parent_run_id,
+                root_run_id=root_run_id,
+                delegation_depth=delegation_depth,
+            )
+        except BudgetExceededError as b_err:
+            logger.warning("Execution halted due to budget overrun for run %s: %s", run_id_str, b_err)
+            diag = diagnostics.finalize(status=RunStatus.FAILED, failure_reason=str(b_err))
+            code = "TOKEN_BUDGET_EXCEEDED" if b_err.metric == "tokens" else "COST_BUDGET_EXCEEDED"
+            return RunResult(
+                run_id=run_id_str,
+                job_id=job_id,
+                status=RunStatus.FAILED,
+                output=None,
+                deliverables=[],
+                total_steps=diagnostics._current_step,
+                error=str(b_err),
+                error_code=code,
+                metadata={"diagnostics": diag.model_dump(mode="json")},
+                created_at=start_time,
+                completed_at=time.time(),
+                parent_run_id=parent_run_id,
+                root_run_id=root_run_id,
+                delegation_depth=delegation_depth,
             )
         except Exception as exc:
-            logger.error("Core execution failure for job %s: %s", job_id, exc, exc_info=True)
+            logger.error("Core execution failure for run %s (job %s): %s", run_id_str, job_id, exc, exc_info=True)
             diag = diagnostics.finalize(status=RunStatus.FAILED, failure_reason=str(exc))
             return RunResult(
                 run_id=run_id_str,
@@ -380,9 +529,27 @@ class CoreRuntimeExecutor:
                 metadata={"diagnostics": diag.model_dump(mode="json")},
                 created_at=start_time,
                 completed_at=time.time(),
+                parent_run_id=parent_run_id,
+                root_run_id=root_run_id,
+                delegation_depth=delegation_depth,
             )
         finally:
+            self._active_runners.pop(run_id_str, None)
             self._active_runners.pop(job_id, None)
+            self._job_to_run.pop(job_id, None)
+            if parent_run_id and parent_run_id in self._run_children:
+                self._run_children[parent_run_id].discard(run_id_str)
+            self._run_parents.pop(run_id_str, None)
+
+            # Ensure all asynchronous event dispatches have drained cleanly (MA-10 Fix)
+            if pending_listener_futures:
+                try:
+                    await asyncio.wait(
+                        [asyncio.wrap_future(f) for f in list(pending_listener_futures)],
+                        timeout=2.0,
+                    )
+                except Exception as drain_err:
+                    logger.debug("Event drain cleanup notice for run %s: %s", run_id_str, drain_err)
 
         completed_time = time.time()
 
@@ -400,10 +567,19 @@ class CoreRuntimeExecutor:
                 metadata={"diagnostics": diag.model_dump(mode="json")},
                 created_at=start_time,
                 completed_at=completed_time,
+                parent_run_id=parent_run_id,
+                root_run_id=root_run_id,
+                delegation_depth=delegation_depth,
             )
 
         if execution_state.is_failed:
             err = execution_state.metadata.get("error") or "Execution failed during task execution."
+            err_code = "AGENT_EXECUTION_FAILED"
+            if "token budget" in err.lower():
+                err_code = "TOKEN_BUDGET_EXCEEDED"
+            elif "cost budget" in err.lower():
+                err_code = "COST_BUDGET_EXCEEDED"
+
             diag = diagnostics.finalize(status=RunStatus.FAILED, failure_reason=err)
             meta = dict(execution_state.metadata)
             meta["diagnostics"] = diag.model_dump(mode="json")
@@ -415,10 +591,13 @@ class CoreRuntimeExecutor:
                 deliverables=list(execution_state.deliverables),
                 total_steps=execution_state.current_step,
                 error=err,
-                error_code="AGENT_EXECUTION_FAILED",
+                error_code=err_code,
                 metadata=meta,
                 created_at=start_time,
                 completed_at=completed_time,
+                parent_run_id=parent_run_id,
+                root_run_id=root_run_id,
+                delegation_depth=delegation_depth,
             )
 
         if execution_state.is_cancelled:
@@ -437,6 +616,9 @@ class CoreRuntimeExecutor:
                 metadata=meta,
                 created_at=start_time,
                 completed_at=completed_time,
+                parent_run_id=parent_run_id,
+                root_run_id=root_run_id,
+                delegation_depth=delegation_depth,
             )
 
         diag = diagnostics.finalize(status=RunStatus.COMPLETED)
@@ -455,6 +637,9 @@ class CoreRuntimeExecutor:
             metadata=meta,
             created_at=start_time,
             completed_at=completed_time,
+            parent_run_id=parent_run_id,
+            root_run_id=root_run_id,
+            delegation_depth=delegation_depth,
         )
 
 

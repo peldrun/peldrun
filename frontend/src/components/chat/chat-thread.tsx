@@ -1,5 +1,4 @@
 ﻿// Path: frontend/src/components/chat/chat-thread.tsx
-
 "use client";
 
 import React, { useState, useRef, useEffect } from "react";
@@ -16,13 +15,15 @@ import {
   Table,
   Film,
   Archive,
-  ImageIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ChatTimeline, StepEvent } from "./chat-timeline";
 import { ChatDeliverable } from "./chat-deliverable";
 import { MarkdownRenderer } from "./markdown-renderer";
 import AIThinkingLoader from "@/components/AIThinkingLoader";
+import { DelegationApprovalCard } from "./DelegationApprovalCard";
+import { SubtaskTree } from "./SubtaskTree";
+import { ChildRunState, DelegationApprovalRequest } from "@/lib/types";
 
 export interface AttachedUserFile {
   name: string;
@@ -37,6 +38,7 @@ export interface ChatTurn {
   prompt: string;
   timestamp: string;
   steps: StepEvent[];
+  childRuns?: Record<string, ChildRunState>;
   finalResult: string | null;
   status: "completed" | "failed";
   tokensUsed?: { input: number; output: number; total: number };
@@ -83,6 +85,12 @@ interface ChatThreadProps {
   costUsd?: number | null;
   latencyMs?: number | null;
   tokensPerSecond?: number | null;
+  // Multi-Agent PR 6 Extensions
+  activeChildRuns?: Record<string, ChildRunState>;
+  pendingApprovals?: Record<string, DelegationApprovalRequest>;
+  onApproveDelegation?: (approvalId: string, editedInstruction?: string) => Promise<void>;
+  onRejectDelegation?: (approvalId: string) => Promise<void>;
+  onCancelSubtask?: (childRunId: string) => Promise<void>;
 }
 
 function parsePromptAndAttachments(
@@ -92,7 +100,7 @@ function parsePromptAndAttachments(
   let cleanedText = rawPrompt || "";
   const files: AttachedUserFile[] = explicitFiles ? [...explicitFiles] : [];
 
-  const filesSummaryRegex = /(?:\n\n|\n)?\[Uploaded Files\]:\n([\s\S]*)$/i;
+  const filesSummaryRegex = /(?:\n\n|\n)?[Uploaded Files]:\n([\s\S]*)$/i;
   const match = cleanedText.match(filesSummaryRegex);
 
   if (match) {
@@ -232,7 +240,6 @@ function UserMessageBubble({
 
   return (
     <div className="flex flex-col items-end space-y-2 w-full">
-      {/* Attached Files Grid */}
       {attachedFiles.length > 0 && (
         <div className="flex flex-wrap gap-2.5 justify-end max-w-[90%]">
           {attachedFiles.map((file, idx) => (
@@ -245,9 +252,8 @@ function UserMessageBubble({
         </div>
       )}
 
-      {/* User Text Bubble with Collapsible Logic */}
       {displayText && (
-        <div className="w-auto max-w-[90%] sm:max-w-[85%] rounded-3xl bg-muted/60 bg-user_message  text-t_user_message p-3.5 sm:p-4 transition-all relative">
+        <div className="w-auto max-w-[90%] sm:max-w-[85%] rounded-3xl bg-muted/60 bg-user_message text-t_user_message p-3.5 sm:p-4 transition-all relative">
           <div
             className={`overflow-hidden transition-all duration-200 ${
               isLongText && !isExpanded ? "max-h-24 relative" : "max-h-none"
@@ -274,7 +280,6 @@ function UserMessageBubble({
         </div>
       )}
 
-      {/* Metadata & Copy Action */}
       <div className="flex items-center gap-2 px-1 text-[10px] text-muted-foreground font-mono">
         {timestamp && <span>{timestamp}</span>}
         <button
@@ -324,6 +329,11 @@ export function ChatThread({
   costUsd,
   latencyMs,
   tokensPerSecond,
+  activeChildRuns = {},
+  pendingApprovals = {},
+  onApproveDelegation,
+  onRejectDelegation,
+  onCancelSubtask,
 }: ChatThreadProps) {
   const activePromptAnchorRef = useRef<HTMLDivElement | null>(null);
 
@@ -384,6 +394,7 @@ export function ChatThread({
   }
 
   const isHumanWaiting = Boolean(detectedPrompt && status === "running");
+  const activeApprovalList = Object.values(pendingApprovals || {});
 
   return (
     <div className="flex-1 overflow-y-auto p-4 sm:p-5 font-sans">
@@ -404,7 +415,6 @@ export function ChatThread({
 
           return (
             <div key={turn.id || `turn-${tIdx}`} className="space-y-4 pb-4">
-              {/* Rich User Message with Markdown, Links, Attached Cards & Collapsible View */}
               <UserMessageBubble
                 prompt={turn.prompt}
                 files={turn.attachedFiles}
@@ -415,7 +425,6 @@ export function ChatThread({
                 onSelectFile={onSelectFile}
               />
 
-              {/* Execution Steps */}
               {isAgentTurn && turnGrouped && Object.keys(turnGrouped).length > 0 && (
                 <ChatTimeline
                   prefix={`turn-${tIdx}`}
@@ -428,7 +437,14 @@ export function ChatThread({
                 />
               )}
 
-              {/* Final Result with Historical Telemetry Badges */}
+              {/* Historical Subtask Tree */}
+              {turn.childRuns && Object.keys(turn.childRuns).length > 0 && (
+                <SubtaskTree
+                  childRuns={turn.childRuns}
+                  onSelectFile={onSelectFile}
+                />
+              )}
+
               {turn.finalResult && (
                 <ChatDeliverable
                   finalResult={turn.finalResult}
@@ -483,6 +499,30 @@ export function ChatThread({
           />
         )}
 
+        {/* Active Delegation Approval Cards (PR 5 & PR 6) */}
+        {activeApprovalList.length > 0 && onApproveDelegation && onRejectDelegation && (
+          <div className="space-y-2">
+            {activeApprovalList.map((approval) => (
+              <DelegationApprovalCard
+                key={approval.approvalRequestId}
+                approval={approval}
+                onApprove={onApproveDelegation}
+                onReject={onRejectDelegation}
+                disabled={status !== "running"}
+              />
+            ))}
+          </div>
+        )}
+
+        {/* Active Multi-Agent Subtask Observability Tree (PR 6) */}
+        {Object.keys(activeChildRuns || {}).length > 0 && (
+          <SubtaskTree
+            childRuns={activeChildRuns}
+            onCancelSubtask={onCancelSubtask}
+            onSelectFile={onSelectFile}
+          />
+        )}
+
         {/* Interactive Human-in-the-Loop Dialog Suspension Card */}
         {isHumanWaiting && (
           <div className="p-4 sm:p-5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-xs space-y-3.5 shadow-sm transition-all">
@@ -500,7 +540,6 @@ export function ChatThread({
               {detectedPrompt}
             </div>
 
-            {/* Clickable Quick Action Option Buttons */}
             {detectedOptions.length > 0 && (
               <div className="space-y-1.5">
                 <span className="text-[11px] font-medium text-muted-foreground block">
@@ -522,7 +561,6 @@ export function ChatThread({
               </div>
             )}
 
-            {/* Freeform Text Input Response */}
             <div className="flex items-center gap-2 pt-1">
               <div className="relative flex-1">
                 <input
@@ -552,7 +590,7 @@ export function ChatThread({
         )}
 
         {/* Live Running Indicator */}
-        {status === "running" && !isHumanWaiting && (
+        {status === "running" && !isHumanWaiting && activeApprovalList.length === 0 && (
           <div className="flex items-center justify-between px-3.5 py-2.5 bg-muted/40 text-foreground transition-all">
             <div className="flex items-center gap-2.5 text-xs">
               <AIThinkingLoader
@@ -569,7 +607,6 @@ export function ChatThread({
           </div>
         )}
 
-        {/* Current Turn Final Deliverable */}
         {finalResult && (
           <ChatDeliverable
             finalResult={finalResult}

@@ -1,13 +1,12 @@
-﻿"""
-backend/omweb/sse_events.py
-
+﻿# backend/omweb/sse_events.py
+"""
 Authoritative Server-Sent Events (SSE) contract and dispatching layer.
 Provides:
 - Strongly typed SSE event models with lifecycle and artifact enum discriminators.
 - Isolated per-job listener queues guaranteeing strict FIFO delivery fan-out.
 - Asynchronous event stream generator with automatic keepalive heartbeat (PING).
 - Deterministic listener registration and cleanup to prevent memory leaks.
-- Full support for TOOL_RETRY and CANCELLED event discriminators.
+- Full support for multi-agent delegation, approval gates, and child run lifecycle streaming (Phase M3).
 """
 
 from __future__ import annotations
@@ -44,6 +43,16 @@ class SSEEventType(str, Enum):
     ARTIFACT_UPDATED = "artifact_updated"
     ARTIFACT_DELETED = "artifact_deleted"
     ARTIFACT_MOVED = "artifact_moved"
+
+    # Multi-Agent Lineage & Approval Events (Phase M3)
+    DELEGATION_REQUESTED = "delegation_requested"
+    APPROVAL_REQUIRED = "approval_required"
+    APPROVAL_RESOLVED = "approval_resolved"
+    CHILD_RUN_STARTED = "child_run_started"
+    CHILD_RUN_STEP = "child_run_step"
+    CHILD_RUN_COMPLETED = "child_run_completed"
+    CHILD_RUN_FAILED = "child_run_failed"
+    CHILD_RUN_CANCELLED = "child_run_cancelled"
 
     # Terminal Events
     FINAL = "final"
@@ -86,15 +95,7 @@ _listeners_lock = asyncio.Lock()
 
 
 async def register_job_listener(job_id: str) -> asyncio.Queue[SSEEvent]:
-    """
-    Register a new SSE stream listener queue for a specific job.
-
-    Args:
-        job_id: Unique identifier of the job being monitored.
-
-    Returns:
-        An isolated asyncio.Queue receiving live dispatched SSEEvents.
-    """
+    """Register a new SSE stream listener queue for a specific job."""
     async with _listeners_lock:
         queue: asyncio.Queue[SSEEvent] = asyncio.Queue()
         _job_listeners.setdefault(job_id, []).append(queue)
@@ -102,13 +103,7 @@ async def register_job_listener(job_id: str) -> asyncio.Queue[SSEEvent]:
 
 
 async def unregister_job_listener(job_id: str, queue: asyncio.Queue[SSEEvent]) -> None:
-    """
-    Unregister an SSE stream listener queue and purge empty containers.
-
-    Args:
-        job_id: Unique identifier of the job.
-        queue: Active queue instance to remove.
-    """
+    """Unregister an SSE stream listener queue and purge empty containers."""
     async with _listeners_lock:
         listeners = _job_listeners.get(job_id, [])
         if queue in listeners:
@@ -118,14 +113,7 @@ async def unregister_job_listener(job_id: str, queue: asyncio.Queue[SSEEvent]) -
 
 
 async def dispatch_event(job_id: str, event: SSEEvent) -> None:
-    """
-    Dispatch an SSE event to all connected listeners for the given job.
-    Guarantees non-blocking fan-out across all active stream consumers.
-
-    Args:
-        job_id: Target job identifier.
-        event: SSEEvent payload to broadcast.
-    """
+    """Dispatch an SSE event to all connected listeners for the given job."""
     async with _listeners_lock:
         listeners = list(_job_listeners.get(job_id, []))
 
@@ -140,13 +128,7 @@ async def subscribe_events(
     job_id: str,
     keepalive_interval: float = 15.0,
 ) -> AsyncGenerator[SSEEvent, None]:
-    """
-    Asynchronous generator yielding live SSEEvents for a specified job.
-
-    Maintains a dedicated listener queue and periodically emits keepalive PING events
-    during idle intervals. Automatically cleans up listener registrations when
-    consumer finishes or connection drops.
-    """
+    """Asynchronous generator yielding live SSEEvents for a specified job."""
     queue = await register_job_listener(job_id)
     try:
         while True:
@@ -154,7 +136,6 @@ async def subscribe_events(
                 event = await asyncio.wait_for(queue.get(), timeout=keepalive_interval)
                 yield event
 
-                # Stop iteration upon reaching a canonical terminal state
                 if event.type in (
                     SSEEventType.FINAL,
                     SSEEventType.ERROR,
@@ -163,7 +144,6 @@ async def subscribe_events(
                 ):
                     break
             except asyncio.TimeoutError:
-                # Dispatch keepalive heartbeat
                 yield SSEEvent(
                     type=SSEEventType.PING,
                     step=0,
