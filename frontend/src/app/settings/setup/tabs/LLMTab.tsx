@@ -471,7 +471,7 @@ export function LLMTab({
   return (
     <div className="llm-tab w-full space-y-6 max-auto font-sans pb-6">
       {/* Header */}
-      <div className="border-b border-border w-full pb-0 pt-4 bg-custom">
+      <div className="border-b border-card w-full pb-0 pt-4 bg-custom">
         <div className="flex items-center gap-2 pr-4 pl-4">
           <Sparkles size={16} className="text-primary" />
           <h2 className="text-sm font-semibold font-heading text-foreground uppercase tracking-wide">
@@ -483,7 +483,7 @@ export function LLMTab({
         </p>
 
         {/* 4 Professional Sub-Tabs */}
-        <div className="flex items-center gap-2 mt-4 border-b border-border/60 w-full bg-card m-auto max-auto">
+        <div className="flex items-center gap-2 mt-4 border-b border-card/60 w-full bg-card m-auto max-auto">
           <button
             type="button"
             onClick={() => setActiveSubTab("overview")}
@@ -560,7 +560,7 @@ export function LLMTab({
       {activeSubTab === "overview" && (
         <div className="w-full max-w-7xl space-y-9 pt-8 m-auto">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div className="p-4 rounded-md border border-primary/50 bg-primary/5 space-y-2 shadow-xs ring-1 ring-primary/20">
+            <div className="p-4 rounded-md border border-primary/50 bg-primary/5 space-y-2 shadow-sm ring-1 ring-primary/20">
               <div className="flex items-center justify-between">
                 <span className="text-[10px] font-bold text-primary uppercase tracking-wider block">
                   Primary Autonomous Engine [llm]
@@ -571,7 +571,7 @@ export function LLMTab({
               </div>
               <div className="flex items-center justify-between">
                 <span className="text-sm font-bold font-mono text-foreground">{config.llm.model}</span>
-                <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-card border border-border text-foreground">
+                <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-card border border-card text-foreground">
                   {config.llm.provider_name || config.llm.provider}
                 </span>
               </div>
@@ -580,7 +580,7 @@ export function LLMTab({
               </span>
             </div>
 
-            <div className="p-4 rounded-md border border-border bg-card space-y-2 shadow-xs">
+            <div className="p-4 rounded-md border border-card bg-card space-y-2 shadow-sm">
               <div className="flex items-center justify-between">
                 <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider block">
                   Visual Perception Engine [llm.vision]
@@ -601,8 +601,8 @@ export function LLMTab({
             </div>
           </div>
 
-          <div className="p-5 rounded-md border border-border bg-card space-y-4 shadow-sm">
-            <div className="flex items-center justify-between border-b border-border/60 pb-3">
+          <div className="p-5 rounded-md border border-card bg-card space-y-4 shadow-sm">
+            <div className="flex items-center justify-between border-b border-card/60 pb-3">
               <div>
                 <span className="text-xs font-bold text-foreground uppercase tracking-wider block">
                   Connectivity Health Matrix
@@ -617,7 +617,7 @@ export function LLMTab({
                 size="sm"
                 onClick={handleTestAll}
                 disabled={testingAll}
-                className="h-7 text-xs border-border bg-background hover:bg-muted text-foreground cursor-pointer shadow-xs flex items-center gap-1.5"
+                className="h-7 text-xs border-card bg-background hover:bg-muted text-foreground cursor-pointer shadow-sm flex items-center gap-1.5"
               >
                 <RefreshCw size={11} className={`text-primary ${testingAll ? "animate-spin" : ""}`} />
                 <span>{testingAll ? "Pinging Endpoints..." : "Test All Endpoints"}</span>
@@ -805,8 +805,8 @@ export function LLMTab({
           </div>
 
           {/* Hyperparameters & Context Budget Panel */}
-          <div className="p-5 rounded-md border border-border bg-card space-y-4 shadow-xs">
-            <div className="flex items-center justify-between border-b border-border/60 pb-3">
+          <div className="p-5 rounded-md border border-card bg-card space-y-4 shadow-sm">
+            <div className="flex items-center justify-between border-b border-card/60 pb-3">
               <div className="flex items-center gap-2">
                 <Gauge size={16} className="text-primary" />
                 <span className="text-xs font-bold text-foreground uppercase tracking-wider">
@@ -818,7 +818,7 @@ export function LLMTab({
                 variant="outline"
                 size="sm"
                 onClick={autoDetectActiveModelLimit}
-                className="h-6 text-[11px] border-border bg-background hover:bg-muted text-foreground cursor-pointer shadow-xs flex items-center gap-1.5"
+                className="h-6 text-[11px] border-card bg-background hover:bg-muted text-foreground cursor-pointer shadow-sm flex items-center gap-1.5"
               >
                 <Sparkles size={11} className="text-amber-500" />
                 <span>Auto-detect from Model</span>
@@ -840,7 +840,7 @@ export function LLMTab({
                       llm: { ...config.llm, context_window: val, max_tokens: val }
                     });
                   }}
-                  className="w-full bg-background border border-border rounded px-3 py-1.5 text-xs text-foreground font-mono shadow-xs"
+                  className="w-full bg-muted border border-custom rounded px-3 py-1.5 text-xs text-foreground font-mono shadow-sm"
                 />
                 <span className="text-[10px] text-muted-foreground mt-0.5 block">
                   Total available token window (Inputs + Outputs)
@@ -861,7 +861,7 @@ export function LLMTab({
                       llm: { ...config.llm, max_output_tokens: val }
                     });
                   }}
-                  className="w-full bg-background border border-border rounded px-3 py-1.5 text-xs text-foreground font-mono shadow-xs"
+                  className="w-full bg-muted border border-custom rounded px-3 py-1.5 text-xs text-foreground font-mono shadow-sm"
                 />
                 <span className="text-[10px] text-muted-foreground mt-0.5 block">
                   Reserved token buffer strictly for LLM generation
@@ -888,7 +888,7 @@ export function LLMTab({
             </div>
 
             {/* Live Effective Context Budget Calculation Card */}
-            <div className="p-3.5 rounded-lg border border-border/80 bg-background/50 space-y-2.5">
+            <div className="p-3.5 rounded-lg border border-card/80 bg-background/50 space-y-2.5">
               <div className="flex items-center justify-between text-xs">
                 <span className="font-semibold text-foreground flex items-center gap-1.5">
                   <Sliders size={13} className="text-primary" /> Effective Context Input Budget:
@@ -935,8 +935,8 @@ export function LLMTab({
       {activeSubTab === "lmstudio" && (
         <div className="w-full max-w-7xl space-y-9 pt-8 m-auto">
           {/* 1. LM STUDIO CARD */}
-          <div className="p-5 rounded-md border border-border bg-card space-y-4 shadow-sm">
-            <div className="flex items-center justify-between border-b border-border/60 pb-3">
+          <div className="p-5 rounded-md border border-card bg-card space-y-4 shadow-sm">
+            <div className="flex items-center justify-between border-b border-card/60 pb-3">
               <div className="flex items-center gap-2">
                 <Cpu size={16} className="text-primary" />
                 <span className="text-xs font-bold text-foreground uppercase tracking-wider">
@@ -963,7 +963,7 @@ export function LLMTab({
                       }
                     }}
                     placeholder="http://127.0.0.1:1234/v1"
-                    className="w-full bg-background border border-border rounded px-3 py-1.5 text-xs text-foreground font-mono shadow-xs"
+                    className="w-full bg-muted border border-custom rounded px-3 py-1.5 text-xs text-foreground font-mono shadow-sm"
                   />
                 </div>
 
@@ -982,7 +982,7 @@ export function LLMTab({
                       }
                     }}
                     placeholder="Leave blank for standard local server"
-                    className="w-full bg-background border border-border rounded px-3 py-1.5 text-xs text-foreground font-mono shadow-xs"
+                    className="w-full bg-muted border border-custom rounded px-3 py-1.5 text-xs text-foreground font-mono shadow-sm"
                   />
                 </div>
               </div>
@@ -1001,7 +1001,7 @@ export function LLMTab({
                       setConfig((p) => ({ ...p, llm: { ...p.llm, model: val } }));
                     }
                   }}
-                  className="w-full bg-background border border-border rounded px-3 py-1.5 text-xs text-foreground font-mono shadow-xs"
+                  className="w-full bg-muted border border-custom rounded px-3 py-1.5 text-xs text-foreground font-mono shadow-sm"
                 />
               </div>
 
@@ -1012,7 +1012,7 @@ export function LLMTab({
                     size="sm"
                     onClick={handleTestLMStudio}
                     disabled={testingId === "lmstudio"}
-                    className="h-7 text-xs border-border bg-background hover:bg-muted text-foreground cursor-pointer shadow-xs"
+                    className="h-7 text-xs border-card bg-background hover:bg-muted text-foreground cursor-pointer shadow-sm"
                   >
                     <Zap size={11} className={`text-amber-500 mr-1 ${testingId === "lmstudio" ? "animate-spin" : ""}`} />
                     <span>{testingId === "lmstudio" ? "Testing..." : "Test Connection"}</span>
@@ -1034,7 +1034,7 @@ export function LLMTab({
                   onClick={() =>
                     activateEngine("lmstudio", "LM Studio (Local)", lmStudioSettings.model, lmStudioSettings.baseUrl, lmStudioSettings.apiKey, "")
                   }
-                  className="Primary Button h-7 text-xs bg-primary text-primary-foreground font-medium cursor-pointer shadow-xs"
+                  className="Primary Button h-7 text-xs bg-primary text-primary-foreground font-medium cursor-pointer shadow-sm"
                 >
                   Set as Active Primary
                 </Button>
@@ -1042,7 +1042,7 @@ export function LLMTab({
             </div>
 
             {/* Loaded LM Studio Models Sub-card */}
-            <div className="p-3.5 rounded-lg border border-border/80 bg-background/50 space-y-3 pt-3">
+            <div className="p-3.5 rounded-lg border border-card/80 bg-background/50 space-y-3 pt-3">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Layers size={14} className="text-primary" />
@@ -1071,7 +1071,7 @@ export function LLMTab({
                     size="sm"
                     onClick={handleFetchModels}
                     disabled={fetchingModels}
-                    className="h-6 text-[11px] border-border bg-background hover:bg-muted text-foreground cursor-pointer shadow-xs"
+                    className="h-6 text-[11px] border-card bg-background hover:bg-muted text-foreground cursor-pointer shadow-sm"
                   >
                     <RefreshCw size={10} className={`mr-1 ${fetchingModels ? "animate-spin" : ""}`} />
                     <span>Scan Models</span>
@@ -1087,7 +1087,7 @@ export function LLMTab({
                   onChange={(e) => setNewLMModelInput(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && handleAddLMModel()}
                   placeholder="Add local model ID (e.g. qwen3-vl-8b)..."
-                  className="flex-1 bg-background border border-border rounded px-2.5 py-1 text-xs text-foreground font-mono placeholder:text-muted-foreground shadow-xs"
+                  className="flex-1 bg-background border border-card rounded px-2.5 py-1 text-xs text-foreground font-mono placeholder:text-muted-foreground shadow-sm"
                 />
                 <Button
                   type="button"
@@ -1110,7 +1110,7 @@ export function LLMTab({
                       <div
                         key={m}
                         className={`p-2.5 rounded-lg border text-xs font-mono flex flex-col gap-1.5 transition-all ${
-                          isCurrentPrimary ? "bg-primary/10 border-primary/40 shadow-xs" : "bg-card border-border/70 hover:border-border"
+                          isCurrentPrimary ? "bg-primary/10 border-primary/40 shadow-sm" : "bg-card border-card/70 hover:border-card"
                         }`}
                       >
                         <div className="flex items-center justify-between">
@@ -1176,12 +1176,12 @@ export function LLMTab({
                             </span>
                           )}
                           {caps.quantDisplay && (
-                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-muted text-muted-foreground border border-border font-mono">
+                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-muted text-muted-foreground border border-card font-mono">
                               {caps.quantDisplay}
                             </span>
                           )}
                           {caps.contextDisplay && (
-                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-muted text-muted-foreground border border-border font-mono">
+                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-muted text-muted-foreground border border-card font-mono">
                               {caps.contextDisplay}
                             </span>
                           )}
@@ -1195,8 +1195,8 @@ export function LLMTab({
           </div>
 
           {/* 2. OLLAMA LOCAL SERVER CARD */}
-          <div className="p-5 rounded-md border border-border bg-card space-y-4 shadow-sm">
-            <div className="flex items-center justify-between border-b border-border/60 pb-3">
+          <div className="p-5 rounded-md border border-card bg-card space-y-4 shadow-sm">
+            <div className="flex items-center justify-between border-b border-card/60 pb-3">
               <div className="flex items-center gap-2">
                 <Terminal size={16} className="text-amber-500" />
                 <span className="text-xs font-bold text-foreground uppercase tracking-wider">
@@ -1238,7 +1238,7 @@ export function LLMTab({
                       }
                     }}
                     placeholder="http://127.0.0.1:11434"
-                    className="w-full bg-background border border-border rounded px-3 py-1.5 text-xs text-foreground font-mono shadow-xs"
+                    className="w-full bg-muted border border-custom rounded px-3 py-1.5 text-xs text-foreground font-mono shadow-sm"
                   />
                 </div>
 
@@ -1257,7 +1257,7 @@ export function LLMTab({
                       }
                     }}
                     placeholder="e.g. llama3.2, qwen2.5, deepseek-r1"
-                    className="w-full bg-background border border-border rounded px-3 py-1.5 text-xs text-foreground font-mono shadow-xs"
+                    className="w-full bg-muted border border-custom rounded px-3 py-1.5 text-xs text-foreground font-mono shadow-sm"
                   />
                 </div>
               </div>
@@ -1268,7 +1268,7 @@ export function LLMTab({
                   size="sm"
                   onClick={handleTestOllama}
                   disabled={testingId === "ollama"}
-                  className="h-7 text-xs border-border bg-background hover:bg-muted text-foreground cursor-pointer shadow-xs"
+                  className="h-7 text-xs border-card bg-background hover:bg-muted text-foreground cursor-pointer shadow-sm"
                 >
                   <Zap size={11} className={`text-amber-500 mr-1 ${testingId === "ollama" ? "animate-spin" : ""}`} />
                   <span>{testingId === "ollama" ? "Testing..." : "Test Connection"}</span>
@@ -1280,7 +1280,7 @@ export function LLMTab({
                       const b = ollamaSettings.baseUrl.endsWith("/v1") ? ollamaSettings.baseUrl : `${ollamaSettings.baseUrl}/v1`;
                       activateEngine("ollama", "Ollama (Local)", ollamaSettings.model, b, "", "");
                     }}
-                    className="h-7 text-xs bg-amber-600 hover:bg-amber-700 text-white font-medium cursor-pointer shadow-xs"
+                    className="h-7 text-xs bg-amber-600 hover:bg-amber-700 text-white font-medium cursor-pointer shadow-sm"
                   >
                     Set as Active Primary
                   </Button>
@@ -1289,7 +1289,7 @@ export function LLMTab({
             </div>
 
             {/* Discovered Ollama Models Sub-card */}
-            <div className="p-3.5 rounded-lg border border-border/80 bg-background/50 space-y-3 pt-3">
+            <div className="p-3.5 rounded-lg border border-card/80 bg-background/50 space-y-3 pt-3">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Layers size={14} className="text-amber-500" />
@@ -1313,7 +1313,7 @@ export function LLMTab({
                     size="sm"
                     onClick={handleScanOllama}
                     disabled={scanningOllama}
-                    className="h-6 text-[11px] border-border bg-background hover:bg-muted text-foreground cursor-pointer shadow-xs"
+                    className="h-6 text-[11px] border-card bg-background hover:bg-muted text-foreground cursor-pointer shadow-sm"
                   >
                     <RefreshCw size={10} className={`mr-1 ${scanningOllama ? "animate-spin" : ""}`} />
                     <span>Scan Models</span>
@@ -1329,7 +1329,7 @@ export function LLMTab({
                   onChange={(e) => setNewOllamaModelInput(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && handleAddOllamaModel()}
                   placeholder="Add Ollama model ID (e.g. deepseek-r1:7b)..."
-                  className="flex-1 bg-background border border-border rounded px-2.5 py-1 text-xs text-foreground font-mono placeholder:text-muted-foreground shadow-xs"
+                  className="flex-1 bg-background border border-card rounded px-2.5 py-1 text-xs text-foreground font-mono placeholder:text-muted-foreground shadow-sm"
                 />
                 <Button
                   type="button"
@@ -1352,7 +1352,7 @@ export function LLMTab({
                       <div
                         key={m}
                         className={`p-2.5 rounded-lg border text-xs font-mono flex flex-col gap-1.5 transition-all ${
-                          isCurrentPrimary ? "bg-amber-500/10 border-amber-500/40 shadow-xs" : "bg-card border-border/70 hover:border-border"
+                          isCurrentPrimary ? "bg-amber-500/10 border-amber-500/40 shadow-sm" : "bg-card border-card/70 hover:border-card"
                         }`}
                       >
                         <div className="flex items-center justify-between">
@@ -1410,12 +1410,12 @@ export function LLMTab({
                             </span>
                           )}
                           {caps.paramsDisplay && (
-                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-muted text-muted-foreground border border-border font-mono">
+                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-muted text-muted-foreground border border-card font-mono">
                               {caps.paramsDisplay}
                             </span>
                           )}
                           {caps.quantDisplay && (
-                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-muted text-muted-foreground border border-border font-mono">
+                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-muted text-muted-foreground border border-card font-mono">
                               {caps.quantDisplay}
                             </span>
                           )}
@@ -1425,7 +1425,7 @@ export function LLMTab({
                   })}
                 </div>
               ) : (
-                <div className="py-4 text-center text-xs text-muted-foreground bg-muted/20 border border-dashed border-border rounded-lg">
+                <div className="py-4 text-center text-xs text-muted-foreground bg-muted/20 border border-dashed border-card rounded-lg">
                   <span>No Ollama models found. Start Ollama and click &quot;Scan Models&quot; to detect local models.</span>
                 </div>
               )}
@@ -1445,8 +1445,8 @@ export function LLMTab({
             const isVision = config.llm_vision.provider === cp.id || config.llm_vision.base_url === cp.baseUrl;
 
             return (
-              <div key={cp.id} className="p-4 rounded-md border border-border bg-card space-y-3.5 shadow-xs">
-                <div className="flex items-center justify-between border-b border-border/50 pb-2.5">
+              <div key={cp.id} className="p-4 rounded-md border border-card bg-card space-y-3.5 shadow-sm">
+                <div className="flex items-center justify-between border-b border-card/50 pb-2.5">
                   <div className="flex items-center gap-2">
                     <span className="text-xs font-bold text-foreground">{cp.name}</span>
                     <span className="text-[9px] px-1.5 py-0.2 rounded bg-muted text-muted-foreground font-mono">
@@ -1527,7 +1527,7 @@ export function LLMTab({
                             );
                           }
                         }}
-                        className="w-full bg-background border border-border rounded px-2.5 py-1 text-xs text-foreground font-mono shadow-xs focus:ring-1 focus:ring-primary"
+                        className="w-full bg-muted border border-custom rounded px-2.5 py-1 text-xs text-foreground font-mono shadow-sm focus:ring-1 focus:ring-primary"
                       >
                         {cp.savedModels && cp.savedModels.length > 0 && (
                           <optgroup label="Discovered & Saved Models">
@@ -1552,7 +1552,7 @@ export function LLMTab({
                           setCloudProviders((prev) => prev.map((p) => (p.id === cp.id ? { ...p, model: val } : p)));
                         }}
                         placeholder="Model identifier..."
-                        className="w-full bg-background border border-border rounded px-2.5 py-1 text-[11px] text-foreground font-mono shadow-xs"
+                        className="w-full bg-muted border border-custom rounded px-2.5 py-1 text-[11px] text-foreground font-mono shadow-sm"
                       />
                     </div>
                   </div>
@@ -1566,7 +1566,7 @@ export function LLMTab({
                         const val = e.target.value;
                         setCloudProviders((prev) => prev.map((p) => (p.id === cp.id ? { ...p, baseUrl: val, status: "untested" } : p)));
                       }}
-                      className="w-full bg-background border border-border rounded px-2.5 py-1 text-xs text-foreground font-mono shadow-xs"
+                      className="w-full bg-muted border border-custom rounded px-2.5 py-1 text-xs text-foreground font-mono shadow-sm"
                     />
                   </div>
 
@@ -1592,7 +1592,7 @@ export function LLMTab({
                         setCloudProviders((prev) => prev.map((p) => (p.id === cp.id ? { ...p, apiKey: val, status: "untested" } : p)));
                       }}
                       placeholder={`Enter key for ${cp.name}...`}
-                      className="w-full bg-background border border-border rounded px-2.5 py-1 text-xs text-foreground font-mono shadow-xs"
+                      className="w-full bg-muted border border-custom rounded px-2.5 py-1 text-xs text-foreground font-mono shadow-sm"
                     />
                     <span className="text-[9px] text-muted-foreground block mt-0.5">{cp.keyPrefixHint}</span>
                   </div>
@@ -1612,7 +1612,7 @@ export function LLMTab({
                       size="sm"
                       onClick={() => handleTestCloud(cp.id)}
                       disabled={isTestingThis}
-                      className="h-7 px-2.5 text-xs border-border bg-background hover:bg-muted text-foreground cursor-pointer shadow-xs flex items-center gap-1"
+                      className="h-7 px-2.5 text-xs border-card bg-background hover:bg-muted text-foreground cursor-pointer shadow-sm flex items-center gap-1"
                     >
                       <Zap size={11} className={`text-amber-500 ${isTestingThis ? "animate-spin" : ""}`} />
                       <span>{isTestingThis ? "Verifying..." : "Test Connection"}</span>
@@ -1637,7 +1637,7 @@ export function LLMTab({
                           isCustom: false
                         });
                       }}
-                      className="h-7 px-2.5 text-xs border-border bg-card hover:bg-muted text-foreground cursor-pointer shadow-xs flex items-center gap-1.5"
+                      className="h-7 px-2.5 text-xs border-card bg-card hover:bg-muted text-foreground cursor-pointer shadow-sm flex items-center gap-1.5"
                     >
                       <RefreshCw size={11} className="text-primary" />
                       <span>Scan Models</span>
@@ -1674,12 +1674,12 @@ export function LLMTab({
 
           <div className="space-y-3">
             {customEndpoints.length === 0 ? (
-              <div className="p-6 rounded-md border border-dashed border-border bg-card text-center text-xs text-muted-foreground">
+              <div className="p-6 rounded-md border border-dashed border-card bg-card text-center text-xs text-muted-foreground">
                 No custom endpoints configured yet. Add your local vLLM, FastChat, or remote custom API servers below.
               </div>
             ) : (
               customEndpoints.map((ce) => (
-                <div key={ce.id} className="p-4 rounded-md border border-border bg-card shadow-xs flex items-center justify-between">
+                <div key={ce.id} className="p-4 rounded-md border border-card bg-card shadow-sm flex items-center justify-between">
                   <div className="space-y-0.5">
                     <div className="flex items-center gap-2">
                       <span className="text-sm font-bold text-foreground">{ce.name}</span>
@@ -1706,7 +1706,7 @@ export function LLMTab({
                           isCustom: true
                         });
                       }}
-                      className="h-8 px-2.5 text-xs border-border bg-background hover:bg-muted text-foreground cursor-pointer shadow-xs flex items-center gap-1"
+                      className="h-8 px-2.5 text-xs border-card bg-background hover:bg-muted text-foreground cursor-pointer shadow-sm flex items-center gap-1"
                       title="Scan available models for this endpoint"
                     >
                       <RefreshCw size={11} className="text-primary" />
@@ -1722,7 +1722,7 @@ export function LLMTab({
                       onClick={() =>
                         activateEngine(ce.providerId, ce.name, ce.defaultModel, ce.endpointUrl, ce.apiKey, "")
                       }
-                      className="h-8 px-3 text-xs bg-primary text-primary-foreground font-medium flex items-center gap-1.5 cursor-pointer shadow-xs"
+                      className="h-8 px-3 text-xs bg-primary text-primary-foreground font-medium flex items-center gap-1.5 cursor-pointer shadow-sm"
                     >
                       <Zap size={12} />
                       <span>Use</span>
@@ -1742,8 +1742,8 @@ export function LLMTab({
             )}
           </div>
 
-          <div className="p-5 rounded-md border border-border bg-card space-y-4 shadow-sm">
-            <div className="flex items-center gap-2 pb-2 border-b border-border/60">
+          <div className="p-5 rounded-md border border-card bg-card space-y-4 shadow-sm">
+            <div className="flex items-center gap-2 pb-2 border-b border-card/60">
               <Plus size={14} className="text-primary" />
               <span className="text-xs font-bold text-foreground uppercase tracking-wider">
                 Add Custom Endpoint
@@ -1759,7 +1759,7 @@ export function LLMTab({
                     value={endpointForm.name}
                     onChange={(e) => setEndpointForm({ ...endpointForm, name: e.target.value })}
                     placeholder="e.g. Local vLLM, FastChat, Custom API"
-                    className="w-full bg-background border border-border rounded px-3 py-1.5 text-xs text-foreground shadow-xs"
+                    className="w-full bg-muted border border-custom rounded px-3 py-1.5 text-xs text-foreground shadow-sm"
                   />
                 </div>
                 <div>
@@ -1769,7 +1769,7 @@ export function LLMTab({
                     value={endpointForm.providerId}
                     onChange={(e) => setEndpointForm({ ...endpointForm, providerId: e.target.value })}
                     placeholder="e.g. local-vllm, custom-endpoint"
-                    className="w-full bg-background border border-border rounded px-3 py-1.5 text-xs text-foreground shadow-xs font-mono"
+                    className="w-full bg-muted border border-custom rounded px-3 py-1.5 text-xs text-foreground shadow-sm font-mono"
                   />
                 </div>
               </div>
@@ -1781,13 +1781,13 @@ export function LLMTab({
                   value={endpointForm.endpointUrl}
                   onChange={(e) => setEndpointForm({ ...endpointForm, endpointUrl: e.target.value })}
                   placeholder="e.g. http://127.0.0.1:8000/v1"
-                  className="w-full bg-background border border-border rounded px-3 py-1.5 text-xs text-foreground shadow-xs font-mono"
+                  className="w-full bg-muted border border-custom rounded px-3 py-1.5 text-xs text-foreground shadow-sm font-mono"
                 />
               </div>
 
               <div>
                 <label className="text-[11px] font-medium text-muted-foreground block mb-1.5">API Mode</label>
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-1 p-1 rounded-lg bg-background border border-border">
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-1 p-1 rounded-lg bg-custom  border border-card">
                   {(["Auto-detect", "Chat Completions", "Responses API", "Anthropic Messages"] as ApiModeType[]).map((mode) => (
                     <button
                       key={mode}
@@ -1795,7 +1795,7 @@ export function LLMTab({
                       onClick={() => setEndpointForm({ ...endpointForm, apiMode: mode })}
                       className={`py-1.5 px-2 rounded text-[11px] font-medium transition-all cursor-pointer ${
                         endpointForm.apiMode === mode
-                          ? "bg-card text-foreground shadow-xs font-bold border border-border"
+                          ? "bg-card text-foreground shadow-sm font-bold border border-card"
                           : "text-muted-foreground hover:text-foreground"
                       }`}
                     >
@@ -1813,7 +1813,7 @@ export function LLMTab({
                     value={endpointForm.defaultModel}
                     onChange={(e) => setEndpointForm({ ...endpointForm, defaultModel: e.target.value })}
                     placeholder="e.g. meta-llama/Llama-3-8B-Instruct"
-                    className="w-full bg-background border border-border rounded px-3 py-1.5 text-xs text-foreground shadow-xs font-mono"
+                    className="w-full bg-muted border border-custom rounded px-3 py-1.5 text-xs text-foreground shadow-sm font-mono"
                   />
                 </div>
                 <div>
@@ -1823,7 +1823,7 @@ export function LLMTab({
                     value={endpointForm.contextWindow}
                     onChange={(e) => setEndpointForm({ ...endpointForm, contextWindow: e.target.value })}
                     placeholder="Auto"
-                    className="w-full bg-background border border-border rounded px-3 py-1.5 text-xs text-foreground shadow-xs font-mono"
+                    className="w-full bg-muted border border-custom rounded px-3 py-1.5 text-xs text-foreground shadow-sm font-mono"
                   />
                 </div>
               </div>
@@ -1835,7 +1835,7 @@ export function LLMTab({
                   value={endpointForm.apiKey}
                   onChange={(e) => setEndpointForm({ ...endpointForm, apiKey: e.target.value })}
                   placeholder="Leave blank to keep current key or for unauthenticated local servers"
-                  className="w-full bg-background border border-border rounded px-3 py-1.5 text-xs text-foreground shadow-xs font-mono"
+                  className="w-full bg-muted border border-custom rounded px-3 py-1.5 text-xs text-foreground shadow-sm font-mono"
                 />
               </div>
 
@@ -1845,20 +1845,20 @@ export function LLMTab({
                     type="checkbox"
                     checked={endpointForm.useForNewChats}
                     onChange={(e) => setEndpointForm({ ...endpointForm, useForNewChats: e.target.checked })}
-                    className="rounded border-border text-primary"
+                    className="rounded border-card text-primary"
                   />
                   <span className="text-xs text-foreground">Use for new chats</span>
                 </label>
               </div>
 
-              <div className="flex items-center gap-2.5 pt-3 border-t border-border/60">
+              <div className="flex items-center gap-2.5 pt-3 border-t border-card/60">
                 <Button
                   type="button"
                   variant="outline"
                   size="sm"
                   onClick={handleTestCustomForm}
                   disabled={testingId === "custom_form"}
-                  className="h-8 px-3 text-xs border-border bg-background hover:bg-muted text-foreground cursor-pointer shadow-xs flex items-center gap-1.5"
+                  className="h-8 px-3 text-xs border-card bg-background hover:bg-muted text-foreground cursor-pointer shadow-sm flex items-center gap-1.5"
                 >
                   <Zap size={12} className={`text-amber-500 ${testingId === "custom_form" ? "animate-spin" : ""}`} />
                   <span>Test</span>
@@ -1868,7 +1868,7 @@ export function LLMTab({
                   type="button"
                   size="sm"
                   onClick={handleSaveCustomEndpoint}
-                  className="h-8 px-4 text-xs bg-primary text-primary-foreground font-medium cursor-pointer shadow-xs"
+                  className="h-8 px-4 text-xs bg-primary text-primary-foreground font-medium cursor-pointer shadow-sm"
                 >
                   Save
                 </Button>

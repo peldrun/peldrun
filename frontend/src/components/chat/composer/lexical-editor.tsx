@@ -213,7 +213,7 @@ export const LexicalEditorComponent = forwardRef<
           <RichTextPlugin
             contentEditable={
               <ContentEditable
-                className={`w-full resize-none overflow-y-auto bg-transparent text-start text-sm text-foreground focus:outline-none disabled:cursor-not-allowed disabled:opacity-50 font-sans ${contentClassName} ${className}`}
+                className={`peldrun-id-input-bar w-full resize-none overflow-y-auto bg-transparent text-start text-sm text-foreground focus:outline-none disabled:cursor-not-allowed disabled:opacity-50 font-sans ${contentClassName} ${className}`}
               />
             }
             placeholder={
