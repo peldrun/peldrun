@@ -1,4 +1,5 @@
-﻿"use client";
+﻿// frontend/src/app/settings/setup/Sidebar.tsx
+"use client";
 
 import React from "react";
 import Link from "next/link";
@@ -16,6 +17,7 @@ import {
   Activity,
   ExternalLink,
   Coins,
+  Sparkles,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { SettingsTab } from "./types";
@@ -42,6 +44,7 @@ export function Sidebar({
   const tabs: { id: SettingsTab; label: string; icon: React.ReactNode }[] = [
     { id: "llm", label: "Model Hub [LLM]", icon: <Cpu size={14} /> },
     { id: "usage", label: "Usage & Cost Analytics", icon: <Coins size={14} /> },
+    { id: "generative-ui", label: "Generative UI", icon: <Sparkles size={14} /> },
     { id: "browser", label: "Browser & CDP", icon: <Globe size={14} /> },
     { id: "search", label: "Search Engine", icon: <Search size={14} /> },
     { id: "sandbox", label: "Docker & Daytona", icon: <Box size={14} /> },

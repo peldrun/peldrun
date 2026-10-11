@@ -12,6 +12,9 @@ import { SystemTab } from "./setup/tabs/SystemTab";
 import { ToastContainer, showToast } from "@/components/ui/ToastNotification";
 import { saveLocalMetadataVault, fetchServerMetadata } from "@/lib/modelMetadata";
 import { fetchVault, saveVaultToBackend, type VaultData } from "@/lib/vault";
+
+import { GenerativeUITab } from "./setup/tabs/GenerativeUITab";
+
 import {
   INITIAL_CLOUD_PROVIDERS,
   INITIAL_LMSTUDIO_SETTINGS,
@@ -650,6 +653,7 @@ export default function SettingsPage() {
         {activeTab === "sandbox" && <SandboxTab config={config} setConfig={setConfig} />}
         {activeTab === "mcp" && <MCPTab config={config} setConfig={setConfig} />}
         {activeTab === "system" && <SystemTab systemInfo={systemInfo} fetchSystemInfo={fetchSystemInfo} />}
+        {activeTab === "generative-ui" && <GenerativeUITab />}
       </div>
     </div>
   );

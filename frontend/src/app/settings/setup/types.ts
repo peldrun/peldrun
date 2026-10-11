@@ -1,6 +1,8 @@
-﻿export type SettingsTab =
+﻿// frontend/src/app/settings/setup/types.ts
+export type SettingsTab =
   | "llm"
   | "usage"
+  | "generative-ui"
   | "browser"
   | "search"
   | "sandbox"
@@ -212,7 +214,6 @@ export interface FullAppConfig {
   mcp: { server_reference: string };
   runflow: { use_data_analysis_agent: boolean };
 }
-
 
 export interface ModelBudgetItemConfig {
   context_window: number;

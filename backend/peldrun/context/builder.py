@@ -22,6 +22,7 @@ class ContextManagerProtocol(Protocol):
         system_prompt: Optional[str] = None,
         project_rules: Optional[str] = None,
         include_execution: bool = True,
+        generative_ui: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         ...
 
@@ -35,6 +36,62 @@ class ContextManager:
 
     def __init__(self, default_system_prompt: Optional[str] = None):
         self.default_system_prompt = default_system_prompt
+
+    @staticmethod
+    def _format_generative_ui_prompt(generative_ui: Optional[Dict[str, Any]]) -> str:
+        """
+        Assemble concise, token-economical system instructions for Generative UI.
+        Strict rule: Only include component specifications for components that are explicitly allowed.
+        If disabled or no allowed components, returns an empty string (0 tokens added).
+        """
+        if not generative_ui or not generative_ui.get("enabled"):
+            return ""
+
+        allowed_raw = (
+            generative_ui.get("allowed_components")
+            or generative_ui.get("allowedComponents")
+            or []
+        )
+        allowed = set(allowed_raw) if isinstance(allowed_raw, (list, set, tuple)) else set()
+
+        if not allowed:
+            return ""
+
+        component_specs: Dict[str, str] = {
+            "Card": "Card: <Title>\\n<Description or items>",
+            "Metric": "Metric: <Label> | <Value> | <Change> | <up|down|neutral>",
+            "Badge": "Badge: <Label> | <info|success|warning|error|neutral>",
+            "Alert": "Alert [<info|success|warning|error>]: <Message>",
+            "Progress": "Progress: <Label> | <Percentage 0-100>",
+            "Table": "Table: Header1, Header2 | Row1Col1, Row1Col2 (Max 15 rows)",
+            "Chart": "Chart [<bar|line>]: Label1:Val1, Label2:Val2 (Max 30 points)",
+            "Form": "Form: <Title> | Field1, Field2 (Max 8 fields)",
+            "TestResults": "TestResults: Passed:<N>, Failed:<N>, Skipped:<N>",
+            "Accordion": "Accordion: Title1:Content1 | Title2:Content2",
+            "ActionButton": "Action: <Action Label>",
+        }
+
+        active_lines: List[str] = []
+        for comp_name, spec in component_specs.items():
+            if comp_name in allowed:
+                active_lines.append(f"- {spec}")
+
+        if not active_lines:
+            return ""
+
+        specs_str = "\n".join(active_lines)
+        return (
+            "[Generative UI Mode Active]\n"
+            "When responding with interactive dashboards, metrics, forms, tables, or actionable summaries, "
+            "output OpenUI Lang DSL enclosed strictly inside <openui>...</openui> tags.\n"
+            "Plain explanations and analysis must remain outside <openui> as standard text or Markdown.\n"
+            "Allowed components catalog:\n"
+            f"{specs_str}\n"
+            "Rules & Guardrails:\n"
+            "- Do not use any component outside the allowed list above.\n"
+            "- Limit Tables to 15 rows and Charts to 30 points. For large datasets, save the full data via file tools "
+            "and render an executive summary Card inside <openui>."
+        )
 
     def _format_execution_telemetry(self, execution: Optional[CurrentExecution]) -> str:
         """
@@ -73,15 +130,17 @@ class ContextManager:
         system_prompt: Optional[str] = None,
         project_rules: Optional[str] = None,
         include_execution: bool = True,
+        generative_ui: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         """
         Assemble the architectural context tiers in deterministic sequence:
         1. System Directive (Tier 1A)
         2. Project Rules (Tier 1B)
-        3. Compacted Context Summary (Tier 2)
-        4. Sanitized Recent Dialogue (Tier 3)
-        5. Ongoing Execution Telemetry (Tier 4)
-        6. Current User Input (Tier 5)
+        3. Generative UI Instructions (Tier 1C - Conditional)
+        4. Compacted Context Summary (Tier 2)
+        5. Sanitized Recent Dialogue (Tier 3)
+        6. Ongoing Execution Telemetry (Tier 4)
+        7. Current User Input (Tier 5)
         """
         system_msgs: List[Dict[str, Any]] = []
 
@@ -100,6 +159,12 @@ class ContextManager:
             if not rules_content.startswith("[Project Rules]"):
                 rules_content = f"[Project Rules]\n{rules_content}"
             system_msgs.append({"role": "system", "content": rules_content})
+
+        # Tier 1C: Generative UI Directive (Only injected if enabled and allowed components exist)
+        if generative_ui and generative_ui.get("enabled"):
+            ui_directive = self._format_generative_ui_prompt(generative_ui)
+            if ui_directive:
+                system_msgs.append({"role": "system", "content": ui_directive})
 
         # Tier 2: Compacted Context Summary & Covered Turns Identification
         summary_msgs: List[Dict[str, Any]] = []

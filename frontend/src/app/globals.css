@@ -4,6 +4,7 @@
  * Critical: Next.js 16 Turbopack strictly requires all @import rules
  * to precede all other style rules and CSS directives.
  */
+
 @import url('../../public/css/glow.css');
 
 @tailwind base;

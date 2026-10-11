@@ -15,6 +15,8 @@ import { useChatStore } from "@/stores/chat-store";
 import { useAppStorage } from "@/hooks/use-app-storage";
 import { inferModelCapabilities, fetchServerMetadata } from "@/lib/modelMetadata";
 
+import { getGenerativeUIPayload } from "@/components/generative-ui/store";
+
 interface ChildRunState {
   childRunId: string;
   parentRunId: string;
@@ -861,6 +863,8 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         } catch (e) {}
       }
 
+      const generativeUiPayload = getGenerativeUIPayload();
+
       const res = await fetch("/api/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -872,6 +876,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
           mode: effectiveMode,
           reasoning_effort: effectiveReasoningEffort,
           is_reasoning_model: isModelReasoning,
+          generative_ui: generativeUiPayload,
           ...storedOverride,
           ...(customOverride || {})
         }),

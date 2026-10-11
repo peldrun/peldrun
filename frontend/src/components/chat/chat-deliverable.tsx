@@ -1,10 +1,9 @@
-﻿// Path: frontend/src/components/chat/chat-deliverable.tsx
-
+﻿// frontend/src/components/chat/chat-deliverable.tsx
 "use client";
 
 import React from "react";
 import { FileText, ExternalLink, Activity, Check, Copy, Bot, AlertCircle } from "lucide-react";
-import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
+import { GenerativeUIRouter } from "@/components/generative-ui/GenerativeUIRouter";
 import { UsageBadgeGroup } from "@/components/chat/UsageBadges";
 
 interface ChatDeliverableProps {
@@ -81,9 +80,9 @@ export function ChatDeliverable({
         </div>
       </div>
 
-      {/* 2. Primary Markdown Response */}
+      {/* 2. Primary Response with Isolated Generative UI Router */}
       <div className="p-4 rounded-md bg-card/40 text-foreground text-sm leading-relaxed">
-        <MarkdownRenderer content={displayContent} />
+        <GenerativeUIRouter content={displayContent} />
       </div>
 
       {/* 3. Diagnostic Trace Toggle (Keeps raw command logs isolated) */}
@@ -122,7 +121,6 @@ export function ChatDeliverable({
       )}
 
       {/* 5. Adaptive Deliverable Box: Generated Files */}
-
       {execMode === "agent" && status === "completed" && hasFiles && (
         <div className="p-3.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-xs space-y-2.5">
           <div className="flex items-center justify-between">

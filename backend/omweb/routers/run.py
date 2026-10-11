@@ -1,14 +1,4 @@
-﻿"""
-backend/omweb/routers/run.py
-
-PELDRUN Universal Run Router.
-Manages job lifecycles, chat associations, real-time SSE streaming, and deliverable downloads.
-Hardened under PR 5 and Milestone P1 (Token Accounting Integration):
-- Fully propagates token usage and session summaries upon job termination.
-- Preserves usage accounting facts across historical turns in session.json.
-- Full support for 'after_sequence' SSE stream replay.
-- Seamlessly propagates reasoning_effort and is_reasoning_model across Agent and Chat modes.
-"""
+﻿# Path: backend/omweb/routers/run.py
 
 from __future__ import annotations
 
@@ -111,6 +101,7 @@ class RunRequest(BaseModel):
     mode: Optional[str] = "agent"
     reasoning_effort: Optional[str] = None
     is_reasoning_model: Optional[bool] = None
+    generative_ui: Optional[Dict[str, Any]] = None
 
 
 class FileContentPayload(BaseModel):
@@ -195,6 +186,8 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
         llm_override["reasoning_effort"] = req.reasoning_effort.strip()
     if req.is_reasoning_model is not None:
         llm_override["is_reasoning_model"] = req.is_reasoning_model
+    if req.generative_ui:
+        llm_override["generative_ui"] = req.generative_ui
 
     existing_chat = None
     if req.chat_id:
@@ -264,7 +257,6 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
 
     effective_agent = (req.agent_id or "peldrun").strip()
 
-
     project_manager.save_chat_session(
         chat_id=chat_id,
         project_id=project_id,
@@ -292,6 +284,8 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
                 s_data["agent_id"] = effective_agent
                 if "reasoning_effort" in llm_override:
                     s_data["reasoning_effort"] = llm_override["reasoning_effort"]
+                if "generative_ui" in llm_override:
+                    s_data["generative_ui"] = llm_override["generative_ui"]
             session_file.write_text(json.dumps(s_data, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
@@ -322,6 +316,7 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
         "provider_name": llm_override.get("provider_name") or llm_override.get("provider"),
         "agent_id": effective_agent,
         "reasoning_effort": llm_override.get("reasoning_effort"),
+        "generative_ui_enabled": bool(req.generative_ui and req.generative_ui.get("enabled")),
     }
 
 
@@ -405,6 +400,7 @@ async def get_job_detail(job_id: str):
         "model": chat.get("model"),
         "mode": chat.get("mode", "agent"),
         "produced_files": resolved_files,
+        "generative_ui": chat.get("generative_ui"),
     }
 
 
@@ -595,7 +591,6 @@ async def stream_job_events(job_id: str, after_sequence: int = Query(0, ge=0)):
                 calculated_delta = compute_job_delta_files(job_id, files_dir_for_delta)
                 JOB_DELTA_ARTIFACTS[job_id] = calculated_delta
                 job_scoped_artifacts[job_id] = calculated_delta
-
 
                 project_manager.save_chat_session(
                     chat_id=chat_id,
