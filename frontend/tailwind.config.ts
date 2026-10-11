@@ -16,7 +16,7 @@ const config: Config = {
       },
     },
     extend: {
-      fontFamily: { 
+      fontFamily: {
         sans: ["var(--font-sans)", "system-ui", "sans-serif"],
         serif: ["var(--font-serif)", "Georgia", "serif"],
         arabic: ["var(--font-arabic)", "sans-serif"],
@@ -77,14 +77,18 @@ const config: Config = {
           DEFAULT: "hsl(var(--black))",
           foreground: "hsl(var(--black-foreground))",
         },
-        
-        
 
-        
+
+
+
 
         custom: "var(--custom-color)",
         sidebg: "var(--sidebg)",
-        
+        user_message: "var(--user-message)",
+        t_user_message: "var(--t-user-message)",
+
+
+
         peldrun: {
           black: "#34322D",
           gray: "#F8F8F8",

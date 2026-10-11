@@ -35,10 +35,18 @@ export function PreviewTab({
   const isHtml = lowerFile.endsWith(".html") || lowerFile.endsWith(".htm");
   const isPreviewable = isMarkdown || isTxt || isSvg || isHtml;
 
-  useEffect(() => {
+useEffect(() => {
     const handleSaved = (e: Event) => {
       const ce = e as CustomEvent<{ path?: string }>;
-      if (!effectiveFile || !ce.detail?.path || ce.detail.path.endsWith(effectiveFile) || effectiveFile.endsWith(ce.detail.path)) {
+      const savedPath = ce.detail?.path?.toLowerCase() || "";
+      // If current deliverable is an HTML application, any CSS, JS or workspace file modification must trigger live refresh
+      if (
+        !effectiveFile ||
+        !savedPath ||
+        isHtml ||
+        savedPath.endsWith(effectiveFile.toLowerCase()) ||
+        effectiveFile.toLowerCase().endsWith(savedPath)
+      ) {
         setRefreshKey((k) => k + 1);
       }
     };
@@ -49,11 +57,16 @@ export function PreviewTab({
 
     window.addEventListener("peldrun:file-saved", handleSaved);
     window.addEventListener("peldrun:artifact-created", handleArtifact);
+    window.addEventListener("peldrun:artifact-updated", handleArtifact);
+    window.addEventListener("peldrun:run-completed", handleArtifact);
+
     return () => {
       window.removeEventListener("peldrun:file-saved", handleSaved);
       window.removeEventListener("peldrun:artifact-created", handleArtifact);
+      window.removeEventListener("peldrun:artifact-updated", handleArtifact);
+      window.removeEventListener("peldrun:run-completed", handleArtifact);
     };
-  }, [effectiveFile]);
+  }, [effectiveFile, isHtml]);
 
   const scanForPreviewableDeliverables = useCallback(() => {
     if (effectiveJobId && !explicitFile) {
@@ -137,11 +150,28 @@ export function PreviewTab({
     const baseHref = effectiveJobId ? `/api/run/jobs/${effectiveJobId}/raw/` : `/api/files/raw/`;
     const baseTag = `<base href="${baseHref}">`;
 
-    if (rawContent.includes("<head>")) {
-      return rawContent.replace("<head>", `<head>${baseTag}`);
+    // Cache-bust relative CSS and JS assets so modifications reload live in the iframe
+    let processed = rawContent.replace(
+      /(<link\s+[^>]*href=["'])(?!https?:\/\/|\/\/)([^"'>]+)(["'][^>]*>)/gi,
+      (_match, p1, url, p3) => {
+        const sep = url.includes("?") ? "&" : "?";
+        return `${p1}${url}${sep}_t=${refreshKey}${p3}`;
+      }
+    );
+
+    processed = processed.replace(
+      /(<script\s+[^>]*src=["'])(?!https?:\/\/|\/\/)([^"'>]+)(["'][^>]*>)/gi,
+      (_match, p1, url, p3) => {
+        const sep = url.includes("?") ? "&" : "?";
+        return `${p1}${url}${sep}_t=${refreshKey}${p3}`;
+      }
+    );
+
+    if (processed.includes("<head>")) {
+      return processed.replace("<head>", `<head>${baseTag}`);
     }
-    return `${baseTag}${rawContent}`;
-  }, [rawContent, isHtml, effectiveJobId]);
+    return `${baseTag}${processed}`;
+  }, [rawContent, isHtml, effectiveJobId, refreshKey]);
 
   if (!effectiveFile || !isPreviewable || (!rawContent && !loading)) {
     return (

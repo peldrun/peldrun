@@ -1,11 +1,35 @@
-﻿"use client";
+﻿// Path: frontend/src/components/chat/chat-thread.tsx
 
-import React from "react";
-import { Copy, Check, HelpCircle, CheckCircle2, MessageSquare } from "lucide-react";
+"use client";
+
+import React, { useState, useRef, useEffect } from "react";
+import {
+  Copy,
+  Check,
+  HelpCircle,
+  CheckCircle2,
+  MessageSquare,
+  ChevronDown,
+  ChevronUp,
+  Code2,
+  FileText,
+  Table,
+  Film,
+  Archive,
+  ImageIcon,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ChatTimeline, StepEvent } from "./chat-timeline";
 import { ChatDeliverable } from "./chat-deliverable";
+import { MarkdownRenderer } from "./markdown-renderer";
 import AIThinkingLoader from "@/components/AIThinkingLoader";
+
+export interface AttachedUserFile {
+  name: string;
+  path?: string;
+  url?: string;
+  type?: string;
+}
 
 export interface ChatTurn {
   id: string;
@@ -17,6 +41,7 @@ export interface ChatTurn {
   status: "completed" | "failed";
   tokensUsed?: { input: number; output: number; total: number };
   producedFiles?: { name: string; path: string }[];
+  attachedFiles?: AttachedUserFile[];
   model?: string;
   mode?: "agent" | "chat";
   usage?: {
@@ -31,6 +56,7 @@ export interface ChatTurn {
 interface ChatThreadProps {
   historyTurns: ChatTurn[];
   submittedPrompt: string;
+  submittedFiles?: AttachedUserFile[];
   sessionTimestamp: string;
   humanQuery: string | null;
   humanAnswer: string;
@@ -59,9 +85,219 @@ interface ChatThreadProps {
   tokensPerSecond?: number | null;
 }
 
+function parsePromptAndAttachments(
+  rawPrompt: string,
+  explicitFiles?: AttachedUserFile[]
+): { displayText: string; attachedFiles: AttachedUserFile[] } {
+  let cleanedText = rawPrompt || "";
+  const files: AttachedUserFile[] = explicitFiles ? [...explicitFiles] : [];
+
+  const filesSummaryRegex = /(?:\n\n|\n)?\[Uploaded Files\]:\n([\s\S]*)$/i;
+  const match = cleanedText.match(filesSummaryRegex);
+
+  if (match) {
+    const listBlock = match[1];
+    cleanedText = cleanedText.replace(filesSummaryRegex, "").trim();
+
+    const lines = listBlock.split("\n");
+    for (const line of lines) {
+      const lineMatch = line.trim().match(/^-\s*([^\s(]+)/);
+      if (lineMatch) {
+        const extractedName = lineMatch[1].trim();
+        if (extractedName && !files.some((f) => f.name === extractedName)) {
+          files.push({ name: extractedName, path: extractedName });
+        }
+      }
+    }
+  }
+
+  if (cleanedText === "Inspect workspace files:") {
+    cleanedText = "";
+  }
+
+  return { displayText: cleanedText, attachedFiles: files };
+}
+
+function resolveFileCategory(fileName: string, customUrl?: string) {
+  const extension = fileName.includes(".")
+    ? fileName.slice(fileName.lastIndexOf(".")).toLowerCase()
+    : "";
+
+  const isImage = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"].includes(extension);
+  const isPdf = extension === ".pdf";
+  const isData = [".csv", ".tsv", ".xlsx", ".xls"].includes(extension);
+  const isDoc = [".doc", ".docx", ".txt", ".rtf", ".odt", ".md"].includes(extension);
+  const isAudioVideo = [".mp3", ".wav", ".ogg", ".mp4", ".mov", ".mkv", ".webm"].includes(extension);
+  const isArchive = [".zip", ".tar", ".gz", ".rar", ".7z"].includes(extension);
+  const isCode =
+    !isImage &&
+    !isPdf &&
+    !isData &&
+    !isDoc &&
+    !isAudioVideo &&
+    !isArchive;
+
+  const previewUrl = customUrl || (isImage ? `/api/files/raw/${fileName}` : undefined);
+
+  return {
+    isImage,
+    isPdf,
+    isData,
+    isDoc,
+    isAudioVideo,
+    isArchive,
+    isCode,
+    previewUrl,
+  };
+}
+
+interface AttachedCardProps {
+  file: AttachedUserFile;
+  onSelectFile?: (name: string) => void;
+}
+
+function AttachedFileCard({ file, onSelectFile }: AttachedCardProps) {
+  const info = resolveFileCategory(file.name, file.url);
+
+  if (info.isImage && info.previewUrl) {
+    return (
+      <div
+        onClick={() => onSelectFile && onSelectFile(file.name)}
+        className="w-24 h-24 sm:w-28 sm:h-28 rounded-2xl border border-border/50 overflow-hidden bg-muted/40 relative shadow-xs hover:border-primary/50 transition-all flex items-center justify-center group cursor-pointer"
+        title={file.name}
+      >
+        <img
+          src={info.previewUrl}
+          alt={file.name}
+          className="w-full h-full object-cover rounded-2xl"
+          onError={(e) => {
+            (e.currentTarget as HTMLElement).style.display = "none";
+          }}
+        />
+        <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-end p-1.5 pointer-events-none">
+          <span className="text-[10px] text-white truncate max-w-full font-mono">{file.name}</span>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      onClick={() => onSelectFile && onSelectFile(file.name)}
+      className="w-24 h-24 sm:w-28 sm:h-28 rounded-2xl bg-muted/70 dark:bg-muted/30 border border-border/50 flex flex-col justify-between p-2.5 relative shadow-xs hover:border-primary/40 transition-all select-none overflow-hidden cursor-pointer group"
+      title={file.name}
+    >
+      <div className="self-end w-5 h-5 rounded-md flex items-center justify-center shadow-xs bg-[#8b2626] text-white">
+        {info.isCode && <Code2 size={12} strokeWidth={2.5} />}
+        {info.isPdf && <FileText size={12} strokeWidth={2.5} />}
+        {info.isData && <Table size={12} strokeWidth={2.5} />}
+        {info.isDoc && <FileText size={12} strokeWidth={2.5} />}
+        {info.isAudioVideo && <Film size={12} strokeWidth={2.5} />}
+        {info.isArchive && <Archive size={12} strokeWidth={2.5} />}
+        {!info.isCode && !info.isPdf && !info.isData && !info.isDoc && !info.isAudioVideo && !info.isArchive && (
+          <Code2 size={12} strokeWidth={2.5} />
+        )}
+      </div>
+
+      <div className="text-[11px] sm:text-xs text-foreground font-medium truncate max-w-full text-center tracking-tight px-1 font-sans">
+        {file.name}
+      </div>
+    </div>
+  );
+}
+
+interface UserMessageBubbleProps {
+  prompt: string;
+  files?: AttachedUserFile[];
+  timestamp?: string;
+  copyId: string;
+  copiedSection: string | null;
+  onCopy: (text: string, id: string) => void;
+  onSelectFile?: (name: string) => void;
+}
+
+function UserMessageBubble({
+  prompt,
+  files = [],
+  timestamp,
+  copyId,
+  copiedSection,
+  onCopy,
+  onSelectFile,
+}: UserMessageBubbleProps) {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const { displayText, attachedFiles } = parsePromptAndAttachments(prompt, files);
+
+  const isLongText = displayText.length > 220 || displayText.split("\n").length > 4;
+
+  return (
+    <div className="flex flex-col items-end space-y-2 w-full">
+      {/* Attached Files Grid */}
+      {attachedFiles.length > 0 && (
+        <div className="flex flex-wrap gap-2.5 justify-end max-w-[90%]">
+          {attachedFiles.map((file, idx) => (
+            <AttachedFileCard
+              key={`${file.name}-${idx}`}
+              file={file}
+              onSelectFile={onSelectFile}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* User Text Bubble with Collapsible Logic */}
+      {displayText && (
+        <div className="w-auto max-w-[90%] sm:max-w-[85%] rounded-3xl bg-muted/60 bg-user_message  text-t_user_message p-3.5 sm:p-4 transition-all relative">
+          <div
+            className={`overflow-hidden transition-all duration-200 ${
+              isLongText && !isExpanded ? "max-h-24 relative" : "max-h-none"
+            }`}
+          >
+            <MarkdownRenderer content={displayText} />
+            {isLongText && !isExpanded && (
+              <div className="absolute bottom-0 left-0 right-0 h-10 bg-gradient-to-t from-user_message/90 to-transparent pointer-events-none" />
+            )}
+          </div>
+
+          {isLongText && (
+            <div className="flex justify-start pt-2">
+              <button
+                type="button"
+                onClick={() => setIsExpanded(!isExpanded)}
+                className="w-6 h-6 rounded-full bg-background border border-border shadow-xs flex items-center justify-center text-muted-foreground hover:text-foreground cursor-pointer transition-transform hover:scale-105 active:scale-95"
+                title={isExpanded ? "Collapse message" : "Expand message"}
+              >
+                {isExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Metadata & Copy Action */}
+      <div className="flex items-center gap-2 px-1 text-[10px] text-muted-foreground font-mono">
+        {timestamp && <span>{timestamp}</span>}
+        <button
+          type="button"
+          onClick={() => onCopy(displayText || prompt, copyId)}
+          className="p-1 hover:text-foreground text-muted-foreground transition-all cursor-pointer rounded"
+          title="Copy prompt"
+        >
+          {copiedSection === copyId ? (
+            <Check size={11} className="text-emerald-500" />
+          ) : (
+            <Copy size={11} />
+          )}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function ChatThread({
   historyTurns,
   submittedPrompt,
+  submittedFiles = [],
   sessionTimestamp,
   humanQuery,
   humanAnswer,
@@ -89,6 +325,14 @@ export function ChatThread({
   latencyMs,
   tokensPerSecond,
 }: ChatThreadProps) {
+  const activePromptAnchorRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (submittedPrompt) {
+      activePromptAnchorRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [submittedPrompt]);
+
   const groupStepEvents = (evts: StepEvent[]) => {
     return evts.reduce((acc, s) => {
       const isVisible = (s.content && s.content.trim() !== "") || Boolean(s.toolName);
@@ -109,7 +353,6 @@ export function ChatThread({
     .reverse()
     .find((s) => s.type === "thought" && s.content && !s.content.startsWith("Step ") && !s.content.startsWith("terminate("));
 
-  // Inspect active steps to detect interactive human inquiry parameters (prompt, options, input_type)
   const pendingHumanCall = [...activeStepsList].reverse().find((s) => {
     return (
       (s.toolName === "ask_human" || s.toolName === "human_input") &&
@@ -134,7 +377,6 @@ export function ChatThread({
         }
       }
     } catch {
-      // Content may be a raw string prompt
       if (!detectedPrompt) {
         detectedPrompt = pendingHumanCall.content;
       }
@@ -162,27 +404,16 @@ export function ChatThread({
 
           return (
             <div key={turn.id || `turn-${tIdx}`} className="space-y-4 pb-4">
-              {/* User Prompt */}
-              <div className="flex flex-col items-end space-y-1">
-                <div className="max-w-[90%] bg-transparent text-foreground px-4 py-2.5 text-sm sm:text-base leading-relaxed whitespace-pre-wrap font-sans">
-                  {turn.prompt}
-                </div>
-                <div className="flex items-center gap-2 px-1 text-[10px] text-muted-foreground font-mono">
-                  {turn.timestamp && <span>{turn.timestamp}</span>}
-                  <button
-                    type="button"
-                    onClick={() => copyText(turn.prompt, `turn-prompt-${tIdx}`)}
-                    className="p-1 hover:text-foreground text-muted-foreground transition-all cursor-pointer rounded"
-                    title="Copy prompt"
-                  >
-                    {copiedSection === `turn-prompt-${tIdx}` ? (
-                      <Check size={11} className="text-emerald-500" />
-                    ) : (
-                      <Copy size={11} />
-                    )}
-                  </button>
-                </div>
-              </div>
+              {/* Rich User Message with Markdown, Links, Attached Cards & Collapsible View */}
+              <UserMessageBubble
+                prompt={turn.prompt}
+                files={turn.attachedFiles}
+                timestamp={turn.timestamp}
+                copyId={`turn-prompt-${tIdx}`}
+                copiedSection={copiedSection}
+                onCopy={copyText}
+                onSelectFile={onSelectFile}
+              />
 
               {/* Execution Steps */}
               {isAgentTurn && turnGrouped && Object.keys(turnGrouped).length > 0 && (
@@ -226,25 +457,16 @@ export function ChatThread({
 
         {/* Current Active Turn Prompt */}
         {submittedPrompt && (
-          <div className="flex flex-col items-end space-y-1">
-            <div className="max-w-[90%] bg-transparent text-foreground px-4 py-2.5 text-sm sm:text-base leading-relaxed whitespace-pre-wrap font-sans">
-              {submittedPrompt}
-            </div>
-            <div className="flex items-center gap-2 px-1 text-[10px] text-muted-foreground font-mono">
-              {sessionTimestamp && <span>{sessionTimestamp}</span>}
-              <button
-                type="button"
-                onClick={() => copyText(submittedPrompt, "user-prompt")}
-                className="p-1 hover:text-foreground text-muted-foreground transition-all cursor-pointer rounded"
-                title="Copy prompt"
-              >
-                {copiedSection === "user-prompt" ? (
-                  <Check size={11} className="text-emerald-500" />
-                ) : (
-                  <Copy size={11} />
-                )}
-              </button>
-            </div>
+          <div ref={activePromptAnchorRef} className="space-y-4">
+            <UserMessageBubble
+              prompt={submittedPrompt}
+              files={submittedFiles}
+              timestamp={sessionTimestamp}
+              copyId="user-prompt"
+              copiedSection={copiedSection}
+              onCopy={copyText}
+              onSelectFile={onSelectFile}
+            />
           </div>
         )}
 
@@ -347,7 +569,7 @@ export function ChatThread({
           </div>
         )}
 
-        {/* Current Turn Final Deliverable (Immediate Token & Telemetry Rendering) */}
+        {/* Current Turn Final Deliverable */}
         {finalResult && (
           <ChatDeliverable
             finalResult={finalResult}

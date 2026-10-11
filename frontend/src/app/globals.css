@@ -48,6 +48,8 @@
 
     --custom-color: #f0f0f0;
     --sidebg: #f8f8f7;
+    --user-message: #e8f3fe;
+    --t-user-message:#0c274a;
 
     --font-sans: 'DM Sans', sans-serif;
     --font-serif: 'Libre Baskerville', serif;
@@ -88,6 +90,8 @@
 
     --custom-color: #000000;
     --sidebg: #101010;
+    --user-message: #101010;
+    --t-user-message:#fff;
 
   }
 }
@@ -159,6 +163,12 @@
       0 2px 8px -2px rgba(66, 133, 244, .12);
   }
 
+
+
+/*--------------------------------------*/
+::marker ,li::marker, li  p {
+  display: inline;
+}
 
  /* Path: frontend/src/app/globals.css */
 

@@ -1,13 +1,14 @@
-﻿/**
+﻿// Path: frontend/src/components/workspace/workspace-panel.tsx
+
+/**
  * frontend/src/components/workspace/workspace-panel.tsx
  *
  * Workspace Panel component hardened against frontend freeze and path divergence.
  * Key enhancements:
- * - Completely eliminates re-render storms by removing selectedFilePath from fetch effect dependency array.
- * - Uses authoritative relative paths (f.path) instead of flat filenames (f.name).
- * - Prioritizes deliverables with size > 0 over empty placeholder files.
- * - Auto-selects the primary web deliverable once per scope without infinite fetch cascading.
- * - Seamlessly routes newly created artifacts to their dedicated tab (preview, artifacts, or editor).
+ * - Eliminates setState-in-render errors across components.
+ * - Enforces Preview stickiness: CSS/JS generation never hijacks preview focus.
+ * - Text documents (.txt, .md, .markdown) open under Preview tab.
+ * - Editor tab only opens upon deliberate user selection.
  */
 
 "use client";
@@ -24,11 +25,11 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { PreviewTab } from "./preview-tab";
-import { FilesTab } from "./files-tab";
-import { ArtifactsTab } from "./artifacts-tab";
-import { LogsTab } from "./logs-tab";
-import { EditorTab } from "./editor-tab";
+import { PreviewTab } from "@/components/workspace/preview-tab";
+import { FilesTab } from "@/components/workspace/files-tab";
+import { ArtifactsTab } from "@/components/workspace/artifacts-tab";
+import { LogsTab } from "@/components/workspace/logs-tab";
+import { EditorTab } from "@/components/workspace/editor-tab";
 
 export type TabId = "preview" | "files" | "artifacts" | "logs" | "editor";
 
@@ -43,8 +44,8 @@ export function getFileCategory(filepath: string): "preview" | "artifacts" | "ed
   const lower = filepath.toLowerCase();
   const ext = lower.split(".").pop() || "";
 
-  // Web apps, SVGs, and markdown documents belong to Preview
-  if (["html", "htm", "svg", "md", "markdown"].includes(ext)) {
+  // Web apps, SVGs, and markdown/text documents belong to Preview
+  if (["html", "htm", "svg", "md", "markdown", "txt"].includes(ext)) {
     return "preview";
   }
 
@@ -88,7 +89,18 @@ export function WorkspacePanel({
   const selectedFilePathRef = useRef<string | null>(null);
   selectedFilePathRef.current = selectedFilePath;
 
-  const handleSelectArtifact = useCallback((filePath: string) => {
+  const activeTabRef = useRef<TabId>(activeTab);
+  activeTabRef.current = activeTab;
+
+  const lastPreviewFileRef = useRef<string | null>(null);
+
+  // Keep track of the latest HTML/preview deliverable path
+  if (selectedFilePath && getFileCategory(selectedFilePath) === "preview") {
+    lastPreviewFileRef.current = selectedFilePath;
+  }
+
+  // Explicit user selection (clicking a file icon, chat deliverable, or tree entry)
+  const handleUserSelectFile = useCallback((filePath: string) => {
     if (!filePath) return;
     const cleanPath = filePath.replace(/\\/g, "/");
     setSelectedFilePath(cleanPath);
@@ -96,6 +108,7 @@ export function WorkspacePanel({
 
     const category = getFileCategory(cleanPath);
     if (category === "preview") {
+      lastPreviewFileRef.current = cleanPath;
       setActiveTab("preview");
     } else if (category === "artifacts") {
       setActiveTab("artifacts");
@@ -104,11 +117,32 @@ export function WorkspacePanel({
     }
   }, []);
 
+  // Autonomous agent artifact creation (only Preview or Artifacts may open automatically)
+  const handleAutoArtifact = useCallback((filePath: string) => {
+    if (!filePath) return;
+    const cleanPath = filePath.replace(/\\/g, "/");
+    const category = getFileCategory(cleanPath);
+
+    if (category === "preview") {
+      lastPreviewFileRef.current = cleanPath;
+      setSelectedFilePath(cleanPath);
+      setActiveTab("preview");
+    } else if (category === "artifacts") {
+      if (activeTabRef.current !== "preview") {
+        setSelectedFilePath(cleanPath);
+        setActiveTab("artifacts");
+      }
+    } else {
+      // Code/CSS/JS generation: maintain preview tab and keep previewable deliverable active
+    }
+  }, []);
+
   const handleEditorSaved = (savedPath: string) => {
     const cleanPath = savedPath.replace(/\\/g, "/");
     setSelectedFilePath(cleanPath);
     const category = getFileCategory(cleanPath);
     if (category === "preview") {
+      lastPreviewFileRef.current = cleanPath;
       setActiveTab("preview");
     }
   };
@@ -134,27 +168,30 @@ export function WorkspacePanel({
 
         // Auto-select once upon initial load if nothing is selected
         if (!hasAutoSelectedRef.current && !selectedFilePathRef.current && list.length > 0) {
-          // 1. Prefer non-empty HTML files
+          // 1. Prefer non-empty HTML or preview files
           const webAppFile =
             list.find((f) => f.name.toLowerCase() === "index.html" && (f.size ?? 1) > 0) ||
             list.find((f) => {
               const l = f.name.toLowerCase();
               return (l.endsWith(".html") || l.endsWith(".htm")) && (f.size ?? 1) > 0;
             }) ||
+            list.find((f) => getFileCategory(f.path) === "preview" && (f.size ?? 1) > 0) ||
             list.find((f) => f.name.toLowerCase() === "index.html") ||
             list.find((f) => {
               const l = f.name.toLowerCase();
               return l.endsWith(".html") || l.endsWith(".htm");
-            });
+            }) ||
+            list.find((f) => getFileCategory(f.path) === "preview");
 
           if (webAppFile) {
             hasAutoSelectedRef.current = true;
+            lastPreviewFileRef.current = webAppFile.path;
             setSelectedFilePath(webAppFile.path);
             setActiveTab("preview");
             return;
           }
 
-          // 2. Media artifact deliverables
+          // 2. Visual media artifact deliverables
           const mediaFile = list.find((f) => getFileCategory(f.path) === "artifacts");
           if (mediaFile) {
             hasAutoSelectedRef.current = true;
@@ -163,10 +200,8 @@ export function WorkspacePanel({
             return;
           }
 
-          // 3. Fallback to the first available non-empty file
+          // 3. If only code files exist, do not auto-open editor; default to preview or files
           hasAutoSelectedRef.current = true;
-          setSelectedFilePath(list[0].path);
-          setActiveTab("editor");
         }
       }
     } catch (err) {
@@ -180,20 +215,28 @@ export function WorkspacePanel({
   useEffect(() => {
     hasAutoSelectedRef.current = false;
     setSelectedFilePath(null);
+    lastPreviewFileRef.current = null;
     fetchFiles();
   }, [effectiveScopeId, fetchFiles]);
 
   // Listen to live push events
   useEffect(() => {
     const handleSwitchTab = (e: Event) => {
-      const ce = e as CustomEvent<TabId | { tab: TabId; file?: string }>;
+      const ce = e as CustomEvent<TabId | { tab?: TabId; file?: string; userInitiated?: boolean }>;
       const targetTab = typeof ce.detail === "string" ? ce.detail : ce.detail?.tab;
       const targetFile = typeof ce.detail === "object" ? ce.detail?.file : undefined;
+      const isUserAction = typeof ce.detail === "object" ? Boolean(ce.detail?.userInitiated) : false;
 
       if (targetFile) {
-        handleSelectArtifact(targetFile);
+        if (isUserAction) {
+          handleUserSelectFile(targetFile);
+        } else {
+          handleAutoArtifact(targetFile);
+        }
       } else if (targetTab && ["preview", "files", "artifacts", "logs", "editor"].includes(targetTab)) {
-        setActiveTab(targetTab as TabId);
+        if (isUserAction || targetTab === "preview" || targetTab === "artifacts") {
+          setActiveTab(targetTab as TabId);
+        }
       }
     };
 
@@ -201,8 +244,7 @@ export function WorkspacePanel({
       const ce = e as CustomEvent<{ artifact?: string; path?: string; relative_path?: string; file?: string }>;
       const artPath = (ce.detail?.relative_path || ce.detail?.path || ce.detail?.artifact || ce.detail?.file || "").replace(/\\/g, "/");
       if (artPath) {
-        handleSelectArtifact(artPath);
-        // Refresh list to display newly discovered artifact
+        handleAutoArtifact(artPath);
         fetchFiles();
       }
     };
@@ -216,7 +258,7 @@ export function WorkspacePanel({
       window.removeEventListener("peldrun:artifact-created", handleArtifactCreated);
       window.removeEventListener("peldrun:artifact-updated", handleArtifactCreated);
     };
-  }, [fetchFiles, handleSelectArtifact]);
+  }, [fetchFiles, handleAutoArtifact, handleUserSelectFile]);
 
   const handleExportZip = async () => {
     if (!effectiveScopeId) return;
@@ -244,9 +286,9 @@ export function WorkspacePanel({
 
   useEffect(() => {
     if (overrideFile) {
-      handleSelectArtifact(overrideFile);
+      handleUserSelectFile(overrideFile);
     }
-  }, [overrideFile, handleSelectArtifact]);
+  }, [overrideFile, handleUserSelectFile]);
 
   useEffect(() => {
     if (overrideDraft) {
@@ -269,7 +311,7 @@ export function WorkspacePanel({
   const previewablePath =
     selectedFilePath && getFileCategory(selectedFilePath) === "preview"
       ? selectedFilePath
-      : null;
+      : lastPreviewFileRef.current;
 
   return (
     <div className="flex flex-col h-full bg-custom border-l border-border font-sans">
@@ -345,7 +387,7 @@ export function WorkspacePanel({
           <PreviewTab currentHtmlPath={previewablePath} activeJobId={effectiveScopeId} />
         )}
         {activeTab === "files" && (
-          <FilesTab onSelectFile={handleSelectArtifact} activeJobId={effectiveScopeId} />
+          <FilesTab onSelectFile={handleUserSelectFile} activeJobId={effectiveScopeId} />
         )}
         {activeTab === "artifacts" && (
           <ArtifactsTab

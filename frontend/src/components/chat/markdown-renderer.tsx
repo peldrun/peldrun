@@ -58,36 +58,36 @@ export function MarkdownRenderer({ content, className = "" }: MarkdownRendererPr
               </div>
             );
           },
-          thead({ children }: any) {
+      thead({ children }: any) {
             return <thead className="bg-muted/70 text-foreground font-semibold border-b border-border">{children}</thead>;
           },
           th({ children }: any) {
-            return <th className="px-3.5 py-2 text-xs font-semibold">{children}</th>;
+            return <th className="px-3.5 py-2 text-sm font-semibold">{children}</th>;
           },
           td({ children }: any) {
-            return <td className="px-3.5 py-2 border-t border-border/50 text-foreground/90">{children}</td>;
+            return <td className="px-3.5 py-2 border-t border-border/50 text-foreground/90 text-sm">{children}</td>;
           },
           h1({ children }: any) {
-            return <h1 className="text-base font-semibold font-heading text-foreground mt-4 mb-2">{children}</h1>;
+            return <h1 className="text-2xl font-semibold font-heading text-foreground mt-4 mb-2">{children}</h1>;
           },
           h2({ children }: any) {
-            return <h2 className="text-sm font-semibold font-heading text-foreground mt-3 mb-1.5">{children}</h2>;
+            return <h2 className="text-xl font-semibold font-heading text-foreground mt-3 mb-1.5">{children}</h2>;
           },
           h3({ children }: any) {
-            return <h3 className="text-xs font-semibold font-heading text-foreground mt-2.5 mb-1">{children}</h3>;
+            return <h3 className="text-lg font-semibold font-heading text-foreground mt-2.5 mb-1">{children}</h3>;
           },
           p({ children }: any) {
-            return <p className="mb-2 leading-relaxed text-xs">{children}</p>;
+            return <p className="mb-2 leading-relaxed text-sm">{children}</p>;
           },
           ul({ children }: any) {
-            return <ul className="list-disc list-inside mb-2 space-y-1 text-xs">{children}</ul>;
+            return <ul className="list-disc list-inside mb-2 space-y-1 text-sm">{children}</ul>;
           },
           ol({ children }: any) {
-            return <ol className="list-decimal list-inside mb-2 space-y-1 text-xs">{children}</ol>;
+            return <ol className="list-decimal list-inside mb-2 space-y-1 text-sm">{children}</ol>;
           },
           blockquote({ children }: any) {
             return (
-              <blockquote className="border-l-2 border-primary/60 pl-3 my-2 text-xs text-muted-foreground italic bg-muted/20 py-1 rounded-r-md">
+              <blockquote className="border-l-2 border-primary/60 pl-3 my-2 text-sm text-muted-foreground italic bg-muted/20 py-1 rounded-r-md">
                 {children}
               </blockquote>
             );

@@ -1,9 +1,10 @@
 ﻿// Path: frontend/src/components/chat/chat-container.tsx
+
 /**
  * frontend/src/components/chat/chat-container.tsx
  *
  * Core Chat & Autonomous Agent Execution Container.
- * Enhanced with verified submission handshake and resilient error propagation.
+ * Hardened against setState-in-render side-effects and cross-tab switching conflicts.
  */
 
 "use client";
@@ -12,11 +13,11 @@ import React, { useState, useRef, useEffect, useMemo, useCallback } from "react"
 import { useRouter } from "next/navigation";
 import { WorkspacePanel, getFileCategory } from "@/components/workspace/workspace-panel";
 import { Composer } from "@/components/chat/composer";
-import { ChatSubHeader } from "./chat-sub-header";
-import { ChatLanding } from "./chat-landing";
-import { ChatThread, ChatTurn } from "./chat-thread";
-import { StepEvent } from "./chat-timeline";
-import { EngineOption } from "./engine-selector";
+import { ChatSubHeader } from "@/components/chat/chat-sub-header";
+import { ChatLanding } from "@/components/chat/chat-landing";
+import { ChatThread, ChatTurn, AttachedUserFile } from "@/components/chat/chat-thread";
+import { StepEvent } from "@/components/chat/chat-timeline";
+import { EngineOption } from "@/components/chat/engine-selector";
 import { useChatStore } from "@/stores/chat-store";
 import { useAppStorage } from "@/hooks/use-app-storage";
 import { inferModelCapabilities, fetchServerMetadata } from "@/lib/modelMetadata";
@@ -48,6 +49,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   const [inputValue, setInputValue] = useState("");
   const [landingAttachedFiles, setLandingAttachedFiles] = useState<File[]>([]);
   const [submittedPrompt, setSubmittedPrompt] = useState("");
+  const [submittedFiles, setSubmittedFiles] = useState<AttachedUserFile[]>([]);
   const [activeJobId, setActiveJobId] = useState<string | null>(initialJobId || null);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [historyTurns, setHistoryTurns] = useState<ChatTurn[]>([]);
@@ -123,10 +125,10 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   );
 
   useEffect(() => {
-    if (status === "running" || steps.length > 0) {
+    if (status === "running" || steps.length > 0 || submittedPrompt) {
       chatScrollBottomRef.current?.scrollIntoView({ behavior: "smooth" });
     }
-  }, [steps, status, finalResult]);
+  }, [steps, status, finalResult, submittedPrompt]);
 
   useEffect(() => {
     const handleSandboxEvent = (e: Event) => {
@@ -143,7 +145,10 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       const ce = e as CustomEvent<{ artifact?: string; path?: string; file?: string }>;
       const artName = ce.detail?.path || ce.detail?.file || ce.detail?.artifact;
       if (artName) {
-        setSelectedFileForEditor(artName);
+        const cat = getFileCategory(artName);
+        if (cat === "preview" || cat === "artifacts") {
+          setSelectedFileForEditor(artName);
+        }
       }
       setShowRightPanel(true);
     };
@@ -199,6 +204,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
               status: t.status || "completed",
               model: t.model,
               producedFiles: t.produced_files,
+              attachedFiles: t.attached_files || undefined,
               usage: t.usage || undefined,
               tokensUsed: t.usage ? {
                 input: t.usage.prompt_tokens || t.usage.input_tokens || 0,
@@ -344,11 +350,12 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         if (payload.data?.event === "artifact_created" || artName) {
           setShowRightPanel(true);
           if (artName) {
-            setSelectedFileForEditor(artName);
-            const targetTab = getFileCategory(artName);
+            const cat = getFileCategory(artName);
+            if (cat === "preview" || cat === "artifacts") {
+              setSelectedFileForEditor(artName);
+            }
             if (typeof window !== "undefined") {
               window.dispatchEvent(new CustomEvent("peldrun:artifact-created", { detail: { ...payload.data, file: artName } }));
-              window.dispatchEvent(new CustomEvent("peldrun:switch-tab", { detail: { tab: targetTab, file: artName } }));
             }
           }
         }
@@ -358,11 +365,12 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         const artName = payload.data?.artifact || payload.data?.path || payload.data?.file || "";
         if (artName) {
           setShowRightPanel(true);
-          setSelectedFileForEditor(artName);
-          const targetTab = getFileCategory(artName);
+          const cat = getFileCategory(artName);
+          if (cat === "preview" || cat === "artifacts") {
+            setSelectedFileForEditor(artName);
+          }
           if (typeof window !== "undefined") {
             window.dispatchEvent(new CustomEvent("peldrun:artifact-created", { detail: { ...payload.data, file: artName } }));
-            window.dispatchEvent(new CustomEvent("peldrun:switch-tab", { detail: { tab: targetTab, file: artName } }));
           }
         }
         fetchJobFiles(jobId);
@@ -508,6 +516,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     setInputValue("");
     setLandingAttachedFiles([]);
     setSubmittedPrompt("");
+    setSubmittedFiles([]);
     setActiveJobId(null);
     setActiveChatId(null);
     setHistoryTurns([]);
@@ -570,28 +579,14 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     }
   };
 
+  // Pure state updater without any cross-component side-effects
   const fetchJobFiles = async (jobId: string) => {
     try {
       const res = await fetch(`/api/run/jobs/${jobId}/files`);
       if (res.ok) {
         const data = await res.json();
-        const incomingFiles = data.files || [];
-        setProducedFiles((prev) => {
-          if (incomingFiles.length > prev.length && incomingFiles.length > 0) {
-            const newest = incomingFiles[incomingFiles.length - 1];
-            if (newest?.path) {
-              setShowRightPanel(true);
-              setSelectedFileForEditor(newest.path);
-              const targetTab = getFileCategory(newest.path);
-              if (typeof window !== "undefined") {
-                window.dispatchEvent(
-                  new CustomEvent("peldrun:switch-tab", { detail: { tab: targetTab, file: newest.path } })
-                );
-              }
-            }
-          }
-          return incomingFiles;
-        });
+        const incomingFiles: { name: string; path: string }[] = data.files || [];
+        setProducedFiles(incomingFiles);
       }
     } catch (e) {
       console.error("Error fetching job files", e);
@@ -621,7 +616,15 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       : "none";
     const targetChatId = activeChatId || `chat_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 8)}`;
 
+    let attachedMetadata: AttachedUserFile[] = [];
+
     if (filesToUpload && filesToUpload.length > 0) {
+      attachedMetadata = filesToUpload.map((f) => ({
+        name: f.name,
+        type: f.type,
+        url: f.type.startsWith("image/") ? URL.createObjectURL(f) : undefined,
+      }));
+
       try {
         const formData = new FormData();
         filesToUpload.forEach((f) => formData.append("files", f));
@@ -661,6 +664,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
           status: status === "failed" ? "failed" : "completed",
           tokensUsed: { ...tokensUsed },
           producedFiles: [...producedFiles],
+          attachedFiles: [...submittedFiles],
           model: activeModelName,
           usage: tokensUsed.total > 0 ? {
             input_tokens: tokensUsed.input,
@@ -679,6 +683,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     setInputValue("");
     setLandingAttachedFiles([]);
     setSubmittedPrompt(finalPrompt);
+    setSubmittedFiles(attachedMetadata);
     setStatus("running");
     setSteps([]);
     setFinalResult(null);
@@ -770,7 +775,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     }, {} as Record<number, StepEvent[]>);
   };
 
-  const isFreshSession = historyTurns.length === 0 && steps.length === 0 && !submittedPrompt && status !== "running";
+const isFreshSession = historyTurns.length === 0 && steps.length === 0 && !submittedPrompt && status !== "running";
 
   const getLiveStatusMessage = () => {
     if (execMode === "chat") return "Synthesizing conversational response...";
@@ -841,6 +846,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
           <ChatThread
             historyTurns={historyTurns}
             submittedPrompt={submittedPrompt}
+            submittedFiles={submittedFiles}
             sessionTimestamp={sessionTimestamp}
             humanQuery={humanQuery}
             humanAnswer={humanAnswer}
@@ -857,12 +863,16 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
             copyText={copyText}
             expandedSteps={expandedSteps}
             toggleStep={toggleStep}
-            onSelectFile={(f) => {
+            onSelectFile={(f: string) => {
               setSelectedFileForEditor(f);
               setShowRightPanel(true);
               const targetTab = getFileCategory(f);
               if (typeof window !== "undefined") {
-                window.dispatchEvent(new CustomEvent("peldrun:switch-tab", { detail: { tab: targetTab, file: f } }));
+                window.dispatchEvent(
+                  new CustomEvent("peldrun:switch-tab", {
+                    detail: { tab: targetTab, file: f, userInitiated: true },
+                  })
+                );
               }
             }}
             showRawTrace={showRawTrace}

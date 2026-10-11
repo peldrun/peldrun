@@ -1,4 +1,6 @@
-﻿"use client";
+﻿// Path: frontend/src/components/chat/chat-deliverable.tsx
+
+"use client";
 
 import React from "react";
 import { FileText, ExternalLink, Activity, Check, Copy, Bot, AlertCircle } from "lucide-react";
@@ -128,9 +130,9 @@ export function ChatDeliverable({
             </span>
           </div>
           <div className="flex flex-wrap gap-2">
-            {producedFiles.map((f) => (
+            {producedFiles.map((f, idx) => (
               <button
-                key={f.path || f.name}
+                key={`${f.path || f.name || "file"}-${idx}`}
                 type="button"
                 onClick={() => onSelectFile(f.name)}
                 className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-card hover:bg-muted text-foreground border border-border text-xs cursor-pointer shadow-xs transition-all"
