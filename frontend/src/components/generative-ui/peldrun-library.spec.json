@@ -1,0 +1,149 @@
+{
+  "name": "PeldrunUI",
+  "version": "1.0.0",
+  "description": "Native sovereign generative UI component library for Peldrun AI Agent",
+  "components": [
+    {
+      "name": "Metric",
+      "description": "Displays numeric KPI metrics with change indicator and trend.",
+      "parameters": {
+        "label": { "type": "string", "required": true, "description": "Metric title or KPI name" },
+        "value": { "type": "string", "required": true, "description": "Metric value (e.g. '42.8%', '1.2 GB')" },
+        "change": { "type": "string", "required": false, "description": "Relative change (e.g. '+5.2%', '-12ms')" },
+        "trend": { "type": "string", "enum": ["up", "down", "neutral"], "default": "neutral" }
+      }
+    },
+    {
+      "name": "Badge",
+      "description": "Displays small status or categorization badge.",
+      "parameters": {
+        "label": { "type": "string", "required": true, "description": "Label text (e.g. 'Active', 'Operational')" },
+        "variant": { "type": "string", "enum": ["info", "success", "warning", "error", "neutral"], "default": "neutral" }
+      }
+    },
+    {
+      "name": "Alert",
+      "description": "Callout notification for critical warnings, errors, or system notices.",
+      "parameters": {
+        "message": { "type": "string", "required": true, "description": "Alert notice content" },
+        "type": { "type": "string", "enum": ["info", "success", "warning", "error"], "default": "info" }
+      }
+    },
+    {
+      "name": "Progress",
+      "description": "Percentage progress bar.",
+      "parameters": {
+        "label": { "type": "string", "required": true, "description": "Task or metric label" },
+        "percentage": { "type": "number", "required": true, "description": "Value between 0 and 100" }
+      }
+    },
+    {
+      "name": "Table",
+      "description": "Structured comparative data table.",
+      "parameters": {
+        "headers": { "type": "array", "items": "string", "required": true, "description": "Column headers" },
+        "rows": { "type": "array", "items": "array", "required": true, "description": "Row values matrix" }
+      }
+    },
+    {
+      "name": "Chart",
+      "description": "Visual data charts (bar, line, donut, area).",
+      "parameters": {
+        "title": { "type": "string", "required": false, "description": "Chart header title" },
+        "type": { "type": "string", "enum": ["bar", "line", "donut", "area"], "default": "bar" },
+        "unit": { "type": "string", "required": false, "description": "Unit of measurement (e.g. ms, %, req/s)" },
+        "data": {
+          "type": "array",
+          "items": { "label": "string", "value": "number" },
+          "required": true
+        }
+      }
+    },
+    {
+      "name": "Diagram",
+      "description": "Architectural workflows and sequence diagrams in Mermaid syntax.",
+      "parameters": {
+        "title": { "type": "string", "required": false, "description": "Diagram title" },
+        "code": { "type": "string", "required": true, "description": "Raw Mermaid DSL code" }
+      }
+    },
+    {
+      "name": "MathPlot",
+      "description": "Interactive 2D math curves and LaTeX equations.",
+      "parameters": {
+        "title": { "type": "string", "required": false, "description": "Plot title" },
+        "functionFormula": { "type": "string", "required": false, "description": "Formula in terms of x (e.g. sin(x))" },
+        "equation": { "type": "string", "required": false, "description": "LaTeX formula" },
+        "rangeX": { "type": "array", "items": "number", "default": [-10, 10] }
+      }
+    },
+    {
+      "name": "Carousel",
+      "description": "Showcase of multiple items or comparison cards.",
+      "parameters": {
+        "title": { "type": "string", "required": false },
+        "slides": {
+          "type": "array",
+          "items": { "title": "string", "description": "string", "content": "string" },
+          "required": true
+        }
+      }
+    },
+    {
+      "name": "Accordion",
+      "description": "Collapsible disclosure items for expandable details.",
+      "parameters": {
+        "items": {
+          "type": "array",
+          "items": { "title": "string", "content": "string" },
+          "required": true
+        }
+      }
+    },
+    {
+      "name": "TestResults",
+      "description": "Automated test execution telemetry scorecard.",
+      "parameters": {
+        "passedCount": { "type": "number", "required": true },
+        "failedCount": { "type": "number", "required": true },
+        "skippedCount": { "type": "number", "default": 0 }
+      }
+    },
+    {
+      "name": "ActionButton",
+      "description": "Interactive action trigger button.",
+      "parameters": {
+        "label": { "type": "string", "required": true },
+        "actionId": { "type": "string", "required": true }
+      }
+    },
+    {
+      "name": "Form",
+      "description": "Interactive structured input form.",
+      "parameters": {
+        "title": { "type": "string", "required": true },
+        "description": { "type": "string", "required": false },
+        "submitLabel": { "type": "string", "default": "Submit" },
+        "fields": {
+          "type": "array",
+          "items": {
+            "name": "string",
+            "label": "string",
+            "type": "string",
+            "placeholder": "string"
+          },
+          "required": true
+        }
+      }
+    },
+    {
+      "name": "Card",
+      "description": "Structured container card with title and content items.",
+      "parameters": {
+        "title": { "type": "string", "required": false },
+        "description": { "type": "string", "required": false },
+        "items": { "type": "array", "items": "string", "required": false }
+      }
+    }
+  ]
+}

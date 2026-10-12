@@ -11,6 +11,46 @@ interface PeldrunDiagramProps {
   title?: string;
 }
 
+/**
+ * Sanitizes SVG markup to prevent script execution and cross-site scripting (XSS).
+ */
+function sanitizeSvg(rawSvg: string): string {
+  if (typeof window === "undefined" || !rawSvg) {
+    return rawSvg;
+  }
+
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(rawSvg, "image/svg+xml");
+
+    // Strip dangerous active elements
+    const blockedTags = ["script", "foreignobject", "iframe", "object", "embed"];
+    blockedTags.forEach((tagName) => {
+      const elements = doc.querySelectorAll(tagName);
+      elements.forEach((el) => el.remove());
+    });
+
+    // Strip inline event listeners and dangerous URI protocols
+    const allElements = doc.querySelectorAll("*");
+    allElements.forEach((el) => {
+      const attributes = Array.from(el.attributes);
+      for (const attr of attributes) {
+        const attrName = attr.name.toLowerCase();
+        const attrValue = attr.value.toLowerCase().trim();
+
+        if (attrName.startsWith("on") || attrValue.startsWith("javascript:") || attrValue.startsWith("data:text/html")) {
+          el.removeAttribute(attr.name);
+        }
+      }
+    });
+
+    return new XMLSerializer().serializeToString(doc.documentElement);
+  } catch (err) {
+    console.warn("[PeldrunDiagram] SVG sanitization fallback applied:", err);
+    return "";
+  }
+}
+
 export function PeldrunDiagram({ code, title }: PeldrunDiagramProps): React.JSX.Element {
   const containerRef = useRef<HTMLDivElement>(null);
   const [svgHtml, setSvgHtml] = useState<string>("");
@@ -20,8 +60,9 @@ export function PeldrunDiagram({ code, title }: PeldrunDiagramProps): React.JSX.
 
   useEffect(() => {
     let isMounted = true;
+    const originalParseError = mermaid.parseError;
 
-    // Remove any leftover error elements injected by mermaid into document.body
+    // Remove leftover error artifacts injected globally by mermaid
     const cleanupGlobalMermaidErrors = () => {
       if (typeof document === "undefined") return;
       const danglingErrors = document.querySelectorAll(
@@ -42,9 +83,9 @@ export function PeldrunDiagram({ code, title }: PeldrunDiagramProps): React.JSX.
 
         mermaid.initialize({
           startOnLoad: false,
-          suppressErrorRendering: true, // PREVENTS MERMAID FROM INJECTING THE BOMB INTO THE DOM
+          suppressErrorRendering: true,
           theme: isDark ? "dark" : "neutral",
-          securityLevel: "loose",
+          securityLevel: "strict",
           fontFamily: "ui-sans-serif, system-ui, sans-serif",
           themeVariables: {
             darkMode: isDark,
@@ -55,7 +96,7 @@ export function PeldrunDiagram({ code, title }: PeldrunDiagramProps): React.JSX.
           },
         });
 
-        // Override parseError to silence global DOM error injection
+        // Intercept parser errors locally without polluting global callbacks permanently
         mermaid.parseError = (err: any) => {
           if (isMounted) {
             setError(typeof err === "string" ? err : err?.message || "Invalid diagram syntax.");
@@ -74,7 +115,8 @@ export function PeldrunDiagram({ code, title }: PeldrunDiagramProps): React.JSX.
         cleanupGlobalMermaidErrors();
 
         if (isMounted) {
-          setSvgHtml(svg);
+          const sanitized = sanitizeSvg(svg);
+          setSvgHtml(sanitized);
           setError(null);
         }
       } catch (err: any) {
@@ -89,6 +131,7 @@ export function PeldrunDiagram({ code, title }: PeldrunDiagramProps): React.JSX.
 
     return () => {
       isMounted = false;
+      mermaid.parseError = originalParseError;
       cleanupGlobalMermaidErrors();
     };
   }, [code, uniqueId]);

@@ -21,7 +21,7 @@ const CLOSED_OPENUI_REGEX =
 const UNCLOSED_TAIL_REGEX =
   /(?:```(?:xml|html|openui|markdown)?\s*)?(<(?:openui(?:-lang)?|ui|diagram|carousel|mathplot)\b[^>]*>)([\s\S]*)$/i;
 
-const STANDALONE_MERMAID_REGEX = /(?:^|\n)```mermaid\s*\n([\s\S]*?)\n```/gi;
+const MERMAID_BLOCK_REGEX = /(?:^|\n)```mermaid\s*\n([\s\S]*?)\n```/gi;
 
 function normalizeMarkdownTables(md: string): string {
   if (!md) return "";
@@ -30,9 +30,22 @@ function normalizeMarkdownTables(md: string): string {
   return md.replace(/([^\n])\n(\s*\|[^\n]+\|\s*\n\s*\|[\s\-:|]+\|)/g, "$1\n\n$2");
 }
 
+/**
+ * Strips raw generative UI container tags and code fences when the feature is disabled.
+ */
+function sanitizeDisabledContent(raw: string): string {
+  if (!raw) return "";
+  return raw
+    .replace(/(?:```(?:xml|html|openui|markdown)?\s*)?<\/?(?:openui(?:-lang)?|ui|diagram|carousel|mathplot)\b[^>]*>(?:\s*```)?/gi, "")
+    .replace(/<\/?(?:openui(?:-lang)?|ui|diagram|carousel|mathplot)\b[^>]*>/gi, "")
+    .trim();
+}
+
 export function GenerativeUIRouter({ content }: GenerativeUIRouterProps): React.JSX.Element {
   const [mounted, setMounted] = useState(false);
-  const isEnabled = useGenerativeUIStore((s) => s.enabled);
+  const isEnabled = useGenerativeUIStore(
+    (s) => (s as any).enabled ?? (s as any).isEnabled ?? true
+  );
 
   useEffect(() => {
     setMounted(true);
@@ -40,13 +53,17 @@ export function GenerativeUIRouter({ content }: GenerativeUIRouterProps): React.
 
   const segments = useMemo<ContentSegment[]>(() => {
     if (!content) return [];
+
+    // When the Generative UI engine is disabled in settings, cleanly strip UI wrappers
     if (mounted && !isEnabled) {
-      return [{ type: "markdown", content: normalizeMarkdownTables(content) }];
+      const sanitized = sanitizeDisabledContent(content);
+      return [{ type: "markdown", content: normalizeMarkdownTables(sanitized) }];
     }
 
     const result: ContentSegment[] = [];
     let lastIndex = 0;
 
+    // Reset regex cursor before sequential matching
     CLOSED_OPENUI_REGEX.lastIndex = 0;
     let match: RegExpExecArray | null;
 
@@ -71,6 +88,7 @@ export function GenerativeUIRouter({ content }: GenerativeUIRouterProps): React.
       lastIndex = matchEnd;
     }
 
+    // Process potential unclosed streaming tail
     if (lastIndex < content.length) {
       const tail = content.slice(lastIndex);
       const unclosedMatch = tail.match(UNCLOSED_TAIL_REGEX);
@@ -94,31 +112,45 @@ export function GenerativeUIRouter({ content }: GenerativeUIRouterProps): React.
       }
     }
 
+    // Convert standalone markdown Mermaid blocks to interactive Diagram components
     const finalSegments: ContentSegment[] = [];
     for (const seg of result) {
-      if (seg.type === "markdown" && STANDALONE_MERMAID_REGEX.test(seg.content)) {
-        STANDALONE_MERMAID_REGEX.lastIndex = 0;
-        let mIdx = 0;
-        let mMatch: RegExpExecArray | null;
+      if (seg.type === "markdown") {
+        const mermaidMatches = Array.from(seg.content.matchAll(MERMAID_BLOCK_REGEX));
 
-        while ((mMatch = STANDALONE_MERMAID_REGEX.exec(seg.content)) !== null) {
-          const beforeMermaid = seg.content.slice(mIdx, mMatch.index).trim();
-          if (beforeMermaid) {
-            finalSegments.push({ type: "markdown", content: normalizeMarkdownTables(beforeMermaid) });
+        if (mermaidMatches.length > 0) {
+          let mIdx = 0;
+          for (const mMatch of mermaidMatches) {
+            const mStart = mMatch.index ?? 0;
+            const mEnd = mStart + mMatch[0].length;
+
+            const beforeMermaid = seg.content.slice(mIdx, mStart).trim();
+            if (beforeMermaid) {
+              finalSegments.push({
+                type: "markdown",
+                content: normalizeMarkdownTables(beforeMermaid),
+              });
+            }
+
+            const rawMermaid = (mMatch[1] || "").trim();
+            finalSegments.push({
+              type: "openui",
+              dslContent: `Diagram: Workflow Diagram\n${rawMermaid}`,
+              rawContent: mMatch[0],
+            });
+
+            mIdx = mEnd;
           }
 
-          const rawMermaid = (mMatch[1] || "").trim();
-          finalSegments.push({
-            type: "openui",
-            dslContent: `Diagram: Workflow Diagram\n${rawMermaid}`,
-            rawContent: mMatch[0],
-          });
-          mIdx = mMatch.index + mMatch[0].length;
-        }
-
-        const afterMermaid = seg.content.slice(mIdx).trim();
-        if (afterMermaid) {
-          finalSegments.push({ type: "markdown", content: normalizeMarkdownTables(afterMermaid) });
+          const afterMermaid = seg.content.slice(mIdx).trim();
+          if (afterMermaid) {
+            finalSegments.push({
+              type: "markdown",
+              content: normalizeMarkdownTables(afterMermaid),
+            });
+          }
+        } else {
+          finalSegments.push(seg);
         }
       } else {
         finalSegments.push(seg);

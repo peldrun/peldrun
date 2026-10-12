@@ -14,21 +14,22 @@ from typing import Any, Dict, List, Optional, Set
 logger = logging.getLogger("peldrun.context.generative_ui")
 
 # 1. Complete Component DSL Specification Registry (All 14 components)
-# NOTE: Placeholders use square brackets [ ] instead of angle brackets < >
-# to strictly prevent LLMs from hallucinating literal XML/HTML tags.
+# NOTE: Placeholders use single square brackets [ ] instead of double brackets [[ ]]
+# or angle brackets < > to strictly prevent LLMs from hallucinating XML/HTML tags
+# or confusing delimiters with markdown wiki-links.
 COMPONENT_SPECIFICATIONS: Dict[str, str] = {
     "Card": "Card: [Title]\n[Executive summary or description text]",
     "Metric": "Metric: [Label] | [Value] | [Change] | [up|down|neutral]",
     "Badge": "Badge: [Label] | [success|warning|error|neutral]",
-    "Alert": "Alert [[info|success|warning|error]]: [Message]",
+    "Alert": "Alert [info|success|warning|error]: [Message]",
     "Progress": "Progress: [Label] | [Percentage 0-100]",
     "Table": "Table:\nHeader1 | Header2 | Header3\nRow1Col1 | Row1Col2 | Row1Col3",
-    "Chart": "Chart [[area|bar|line|donut]]: Label1:Number1, Label2:Number2 | Title: [Title] | Unit: [Unit]",
+    "Chart": "Chart [bar|line|donut|area]: Label1:Number1, Label2:Number2 | Title: [Title] | Unit: [Unit]",
     "Diagram": "Diagram: [Title]\ngraph TD\n  A[Node1] --> B[Node2]",
     "Carousel": "Carousel: [Title]\nSlide: Title1 | Desc1 | Content1\nSlide: Title2 | Desc2 | Content2",
     "TestResults": "TestResults: Passed:[N], Failed:[N], Skipped:[N]",
     "Accordion": "Accordion: Title1:Content1 | Title2:Content2",
-    "Form": "Form: [Title]\nField: Field1\nField: Field2",
+    "Form": "Form: [Title]\nField: [Label] ([text|number|email|password])",
     "MathPlot": "Plot: y = f(x) | range=[min, max] | title: [Title]  OR  Equation: [LaTeX string]",
     "ActionButton": "ActionButton: [Action Label]",
 }

@@ -7,6 +7,8 @@
 
 @import url('../../public/css/glow.css');
 
+@layer theme, base, openui, components, utilities;
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -112,14 +114,11 @@
   }
 }
 
-
-
 [dir="rtl"] {
   font-family: var(--font-arabic), var(--font-sans), system-ui, sans-serif;
   --font-sans: 'Cairo', sans-serif;
   --font-serif: 'Cairo', serif;
   --font-arabic: 'Cairo', sans-serif;
-
 }
 
 /* peldrun Ultra-Subtle Scrollbar */
@@ -141,39 +140,36 @@
   background: hsl(var(--muted-foreground) / 0.45);
 }
 
-.peldrun-input-bar{
-   position: relative;
-    -webkit-box-shadow:
-      0 4px 20px -4px rgba(0, 0, 0, .12),
-      0 2px 6px -2px rgba(0, 0, 0, .08);
-       -moz-box-shadow:
-      0 4px 20px -4px rgba(0, 0, 0, .12),
-      0 2px 6px -2px rgba(0, 0, 0, .08);
-            box-shadow:
-      0 4px 20px -4px rgba(0, 0, 0, .12),
-      0 2px 6px -2px rgba(0, 0, 0, .08);
-
-    transition: box-shadow .25s ease, transform .25s ease;
+.peldrun-input-bar {
+  position: relative;
+  -webkit-box-shadow:
+    0 4px 20px -4px rgba(0, 0, 0, .12),
+    0 2px 6px -2px rgba(0, 0, 0, .08);
+  -moz-box-shadow:
+    0 4px 20px -4px rgba(0, 0, 0, .12),
+    0 2px 6px -2px rgba(0, 0, 0, .08);
+  box-shadow:
+    0 4px 20px -4px rgba(0, 0, 0, .12),
+    0 2px 6px -2px rgba(0, 0, 0, .08);
+  transition: box-shadow .25s ease, transform .25s ease;
 }
-.peldrun-input-bar:hover{
-    box-shadow:
-      0 6px 24px -4px rgba(0, 0, 0, .14),
-      0 3px 8px -2px rgba(0, 0, 0, .10);
-  }
+
+.peldrun-input-bar:hover {
+  box-shadow:
+    0 6px 24px -4px rgba(0, 0, 0, .14),
+    0 3px 8px -2px rgba(0, 0, 0, .10);
+}
+
 .peldrun-input-bar:focus-within {
-    box-shadow:
-      0 6px 28px -4px rgba(66, 133, 244, .18),
-      0 2px 8px -2px rgba(66, 133, 244, .12);
-  }
-
-
+  box-shadow:
+    0 6px 28px -4px rgba(66, 133, 244, .18),
+    0 2px 8px -2px rgba(66, 133, 244, .12);
+}
 
 /*--------------------------------------*/
-::marker ,li::marker, li  p {
+::marker, li::marker, li p {
   display: inline;
 }
-
- /* Path: frontend/src/app/globals.css */
 
 /* ============================================================
    PELDRUN SMART LINK CHIPS & FAVICONS (ChatGPT-style)

@@ -16,7 +16,6 @@ import { PeldrunForm } from "./catalog/PeldrunForm";
 import { PeldrunTestResults } from "./catalog/PeldrunTestResults";
 import { PeldrunAccordion } from "./catalog/PeldrunAccordion";
 import { PeldrunMotionWrapper } from "./catalog/PeldrunMotionWrapper";
-import type { ChartVariant } from "./catalog/PeldrunShadcnChart";
 import type { CarouselSlide } from "./catalog/PeldrunCarousel";
 import type { FormFieldDefinition } from "./types";
 
@@ -46,13 +45,13 @@ const LazyMathPlot = dynamic(
   }
 );
 
-const LazyShadcnChart = dynamic(
-  () => import("./catalog/PeldrunShadcnChart").then((m) => m.PeldrunShadcnChart),
+const LazyChart = dynamic(
+  () => import("./catalog/PeldrunChart").then((m) => m.PeldrunChart),
   {
     loading: () => (
       <div className="my-2 rounded-xl border border-border/80 bg-card/50 p-6 flex items-center justify-center gap-2 text-xs text-muted-foreground animate-pulse">
         <span className="w-3.5 h-3.5 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-        <span>Rendering visual analytics chart...</span>
+        <span>Rendering Recharts analytics canvas...</span>
       </div>
     ),
     ssr: false,
@@ -133,10 +132,35 @@ function splitEscapedPipes(str: string): string[] {
   return str.split(/(?<!\\)\|/).map((s) => s.replace(/\\\|/g, "|").trim());
 }
 
+/**
+ * Normalizes lines emitted with bracketed component tags by small LLMs.
+ * Example: `[Chart line] Title: ...` -> `Chart line: Title: ...`
+ */
+function normalizeBracketedLine(raw: string): string {
+  return raw.replace(
+    /^\[(Card\vert{}Chart\vert{}Table\vert{}Metric\vert{}Badge\vert{}Alert\vert{}Progress\vert{}Form\vert{}Accordion\vert{}Diagram\vert{}Carousel\vert{}MathPlot)([^\]]*)\](?::|\s)*/i,
+    "$1$2: "
+  );
+}
+
 export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.Element {
-  const allowedComponents = useGenerativeUIStore((s) => s.allowedComponents);
+  const allowedComponents = useGenerativeUIStore((s) => (s as any).allowedComponents || []);
+  const isEnabled = useGenerativeUIStore(
+    (s) => (s as any).enabled ?? (s as any).isEnabled ?? true
+  );
 
   const parsedElements = useMemo(() => {
+    if (isEnabled === false) {
+      const sanitizedMarkdown = dslContent
+        .replace(/<\/?(?:openui(?:-lang)?|ui|diagram|carousel|mathplot)\b[^>]*>/gi, "")
+        .trim();
+      return [
+        <div key="plain-markdown" className="my-2 leading-relaxed">
+          <MarkdownRenderer content={sanitizedMarkdown} />
+        </div>,
+      ];
+    }
+
     const rawLines = dslContent.split("\n").map((l) => l.trim()).filter(Boolean);
     const elements: React.JSX.Element[] = [];
 
@@ -285,7 +309,7 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
 
     const flushTable = () => {
       if (tableLines.length > 0) {
-        if (allowedComponents.includes("Table")) {
+        if (allowedComponents.length === 0 || allowedComponents.includes("Table")) {
           const rawRows = tableLines
             .map((r) => {
               if (r.includes("|")) {
@@ -394,21 +418,24 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
 
     for (let index = 0; index < rawLines.length; index++) {
       const line = rawLines[index];
-      let cleanLine = line.trim();
+      let cleanLine = normalizeBracketedLine(line.trim());
 
-      // Filter out structural XML tags hallucinated by LLMs
-      if (
-        cleanLine.startsWith("<!--") ||
-        /^<\/?(?:openui|ui|carousel|mathplot)\b/i.test(cleanLine) ||
-        cleanLine === "</Table>" ||
-        cleanLine === "</Chart>" ||
-        cleanLine === "</Card>"
-      ) {
-        if (cleanLine === "</Table>") flushTable();
+      // Catch and resolve closing XML tags
+      if (/^<\/[a-zA-Z0-9_-]+>$/i.test(cleanLine)) {
+        const closingTag = cleanLine.slice(2, -1).toLowerCase();
+        if (closingTag === "table") flushTable();
+        else if (closingTag === "card") flushCard();
+        else if (closingTag === "form") flushForm();
+        else if (closingTag === "accordion") flushAccordion();
+        else if (closingTag === "carousel") flushCarousel();
+        else if (closingTag === "diagram") flushDiagram();
         continue;
       }
 
-      // If line is `<Title>Text</Title>`, normalize to a Card container
+      if (cleanLine.startsWith("<!--") || /^<\/?(?:openui|ui)\b/i.test(cleanLine)) {
+        continue;
+      }
+
       const xmlTitleMatch = cleanLine.match(/<Title\b[^>]*>(.*?)<\/Title>/i);
       if (xmlTitleMatch) {
         flushAllBuffers();
@@ -416,7 +443,6 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
         continue;
       }
 
-      // Check for Diagram collector state
       if (currentDiagram !== null) {
         if (/<\/Diagram>/i.test(cleanLine)) {
           flushDiagram();
@@ -434,7 +460,7 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
       // --- 1. Card Component ---
       const xmlCardMatch = cleanLine.match(/<Card\b([^>]*)>/i);
       const isLineCard = /^(?:Card|Executive\s*Summary\s*Card|Server\s*Status\s*Card)(?::|\s)/i.test(cleanLine);
-      if ((xmlCardMatch || isLineCard) && allowedComponents.includes("Card")) {
+      if ((xmlCardMatch || isLineCard) && (allowedComponents.length === 0 || allowedComponents.includes("Card"))) {
         flushAllBuffers();
         if (xmlCardMatch) {
           const attrs = parseXmlAttributes(xmlCardMatch[1]);
@@ -447,15 +473,11 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
         }
         continue;
       }
-      if (/<\/Card>/i.test(cleanLine)) {
-        flushCard();
-        continue;
-      }
 
       // --- 2. Alert Component ---
       const isXmlAlert = cleanLine.match(/<Alert\b([^>]*)>(.*?)<\/Alert>/i);
       const isLineAlert = /^Alert(?:\s*\[|\s*\(|\s*:|\s+warning|\s+error|\s+info|\s+success)/i.test(cleanLine);
-      if ((isXmlAlert || isLineAlert) && allowedComponents.includes("Alert")) {
+      if ((isXmlAlert || isLineAlert) && (allowedComponents.length === 0 || allowedComponents.includes("Alert"))) {
         flushAllBuffers();
         let alertType: "info" | "success" | "warning" | "error" = "info";
         let message = cleanLine;
@@ -465,10 +487,16 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
           alertType = (attrs.type as any) || "info";
           message = isXmlAlert[2] || attrs.message || "";
         } else {
-          const match = cleanLine.match(/^Alert(?:\s*\[(info\vert{}success\vert{}warning\vert{}error)\]|\s*\((info\vert{}success\vert{}warning\vert{}error)\)|\s+(info|success|warning|error))?[:\s]*(.*)$/i);
-          const rawType = (match?.[1] || match?.[2] || match?.[3] || "info").toLowerCase();
-          alertType = (rawType as any) || "info";
-          message = match?.[4] || cleanLine;
+          const match = cleanLine.match(
+            /^Alert(?:\s*(?:\[\[?|\()([a-zA-Z]+)(?:\]\]?\vert{}\))|\s+([a-zA-Z]+))?[:\s]*(.*)$/i
+          );
+          const rawType = (match?.[1] || match?.[2] || "info").toLowerCase();
+          if (rawType === "success" || rawType === "warning" || rawType === "error") {
+            alertType = rawType;
+          } else {
+            alertType = "info";
+          }
+          message = match?.[3] || cleanLine.replace(/^Alert(?::|\s)*/i, "").trim();
         }
 
         elements.push(
@@ -493,11 +521,10 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
 
       if (
         (xmlMetricMatch || isExplicitMetric || isNamedMetric || isMultiMetricLine) &&
-        allowedComponents.includes("Metric")
+        (allowedComponents.length === 0 || allowedComponents.includes("Metric"))
       ) {
         if (xmlMetricMatch) {
           const attrs = parseXmlAttributes(xmlMetricMatch[1]);
-          // Ignore empty `<Metric>` tags without meaningful attributes
           if (!attrs.name && !attrs.label && !attrs.value) {
             continue;
           }
@@ -546,13 +573,24 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
       // --- 4. Badge Component ---
       const xmlBadgeMatch = cleanLine.match(/<Badge\b([^>]*)>/i);
       const isExplicitBadge = /^Badge(?:\s*\d+)?(?::|\s)/i.test(cleanLine);
-      const isStatusItem =
-        !cleanLine.toLowerCase().startsWith("alert") &&
-        cleanLine.includes(":") &&
-        (/[✅⚠️🟢❌🔴➖]/i.test(cleanLine) ||
-          /Operational|Healthy|Warning|Neutral|Standby|Idle/i.test(cleanLine));
 
-      if ((xmlBadgeMatch || isExplicitBadge || isStatusItem) && allowedComponents.includes("Badge")) {
+      const colonIdx = cleanLine.indexOf(":");
+      const isStatusItem =
+        colonIdx > 0 &&
+        colonIdx < 35 &&
+        cleanLine.length - colonIdx < 40 &&
+        !cleanLine.slice(0, colonIdx).includes(".") &&
+        !cleanLine.toLowerCase().startsWith("alert") &&
+        !cleanLine.toLowerCase().startsWith("note") &&
+        (/[✅⚠️🟢❌🔴➖]/i.test(cleanLine) ||
+          /\b(?:operational|healthy|warning|neutral|standby|idle|active|online|offline|degraded)\b/i.test(
+            cleanLine
+          ));
+
+      if (
+        (xmlBadgeMatch || isExplicitBadge || isStatusItem) &&
+        (allowedComponents.length === 0 || allowedComponents.includes("Badge"))
+      ) {
         flushProse();
         flushCard();
         flushMetrics();
@@ -596,7 +634,10 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
       }
 
       // --- 5. Progress Component ---
-      if (/^Progress(?::|\s)/i.test(cleanLine) && allowedComponents.includes("Progress")) {
+      if (
+        /^Progress(?::|\s)/i.test(cleanLine) &&
+        (allowedComponents.length === 0 || allowedComponents.includes("Progress"))
+      ) {
         flushAllBuffers();
         const parts = splitEscapedPipes(cleanLine.replace(/^Progress(?::|\s)*/i, ""));
         const label = parts[0] || "";
@@ -609,17 +650,40 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
         continue;
       }
 
-      // --- 6. Chart Component (Handles both Chart: prefix and raw Label1:Val, Title:...) ---
+      // --- 6. Chart Component ---
       const isChartHeader = /(?:^Chart|<Chart\b)/i.test(cleanLine);
-      const isImplicitChartLine = !cleanLine.startsWith("|") && cleanLine.includes("Title:") && cleanLine.includes("Unit:") && cleanLine.includes(":");
+      const isImplicitChartLine =
+        !cleanLine.startsWith("|") &&
+        cleanLine.includes("Title:") &&
+        cleanLine.includes("Unit:") &&
+        cleanLine.includes(":");
 
-      if ((isChartHeader || isImplicitChartLine) && allowedComponents.includes("Chart")) {
+      if (
+        (isChartHeader || isImplicitChartLine) &&
+        (allowedComponents.length === 0 || allowedComponents.includes("Chart"))
+      ) {
         flushAllBuffers();
-        const lowerLine = cleanLine.toLowerCase();
-        let chartType: ChartVariant = "bar";
-        if (lowerLine.includes("line")) chartType = "line";
-        else if (lowerLine.includes("donut") || lowerLine.includes("pie")) chartType = "donut";
-        else if (lowerLine.includes("area")) chartType = "area";
+        let chartType: "bar" | "line" | "donut" | "area" | "pie" = "line";
+
+        const typeMatch = cleanLine.match(
+          /Chart(?:\s*(?:\[\[?|\()([a-zA-Z]+)(?:\]\]?\vert{}\))|\s*:?\s*([a-zA-Z]+))/i
+        );
+        const extracted = (typeMatch?.[1] || typeMatch?.[2] || "").toLowerCase();
+        if (
+          extracted === "line" ||
+          extracted === "donut" ||
+          extracted === "pie" ||
+          extracted === "area" ||
+          extracted === "bar"
+        ) {
+          chartType = extracted as any;
+        } else {
+          const lowerLine = cleanLine.toLowerCase();
+          if (lowerLine.includes("bar")) chartType = "bar";
+          else if (lowerLine.includes("donut") || lowerLine.includes("pie")) chartType = "donut";
+          else if (lowerLine.includes("area")) chartType = "area";
+          else chartType = "line";
+        }
 
         let chartTitle = "Performance Analytics";
         let chartUnit = "";
@@ -636,9 +700,15 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
           } else if (!rawDataSegment && (part.includes(":") || part.includes(","))) {
             const cleaned = part
               .replace(/<Chart\b[^>]*>/i, "")
-              .replace(/^Chart(?:\s*\[.*?\])?(?::|\s)*/i, "")
+              .replace(/^Chart(?:\s*(?:\[\[?|\().*?(?:\]\]?\vert{}\)))?(?::|\s)*/i, "")
               .trim();
-            if (cleaned) rawDataSegment = cleaned;
+            if (
+              cleaned &&
+              !cleaned.toLowerCase().startsWith("title") &&
+              !cleaned.toLowerCase().startsWith("unit")
+            ) {
+              rawDataSegment = cleaned;
+            }
           }
         }
 
@@ -659,7 +729,7 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
 
         if (dataPoints.length > 0) {
           elements.push(
-            <LazyShadcnChart
+            <LazyChart
               key={`chart-${index}`}
               title={chartTitle}
               type={chartType}
@@ -672,12 +742,23 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
       }
 
       // --- 7. Diagram Component ---
-      const isMermaidKeyword = /^(?:graph|flowchart|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|pie|gitGraph)\b/i.test(cleanLine);
-      const isDiagramHeader = /^(?:Diagram|Workflow|Architecture)(?::|\s)/i.test(cleanLine) || /<Diagram\b/i.test(cleanLine);
-      if ((isDiagramHeader || isMermaidKeyword) && allowedComponents.includes("Diagram")) {
+      const isMermaidKeyword =
+        /^(?:graph|flowchart|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|pie|gitGraph)\b/i.test(
+          cleanLine
+        );
+      const isDiagramHeader =
+        /^(?:Diagram|Workflow|Architecture)(?::|\s)/i.test(cleanLine) || /<Diagram\b/i.test(cleanLine);
+
+      if (
+        (isDiagramHeader || isMermaidKeyword) &&
+        (allowedComponents.length === 0 || allowedComponents.includes("Diagram"))
+      ) {
         flushAllBuffers();
         const title = isDiagramHeader
-          ? cleanLine.replace(/<Diagram\b[^>]*>/i, "").replace(/^(?:Diagram|Workflow|Architecture)(?::|\s)*/i, "").trim()
+          ? cleanLine
+              .replace(/<Diagram\b[^>]*>/i, "")
+              .replace(/^(?:Diagram|Workflow|Architecture)(?::|\s)*/i, "")
+              .trim()
           : "Workflow Diagram";
         const initialLines = isDiagramHeader ? [] : [cleanLine];
         currentDiagram = { title: title || "Workflow Diagram", codeLines: initialLines };
@@ -686,32 +767,50 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
 
       // --- 8. Carousel Component ---
       const isCarouselHeader = /^Carousel(?::|\s)/i.test(cleanLine) || /<Carousel\b/i.test(cleanLine);
-      if (isCarouselHeader && allowedComponents.includes("Carousel")) {
+      if (
+        isCarouselHeader &&
+        (allowedComponents.length === 0 || allowedComponents.includes("Carousel"))
+      ) {
         flushAllBuffers();
-        const title = cleanLine.replace(/<Carousel\b[^>]*>/i, "").replace(/^Carousel(?::|\s)*/i, "").trim();
+        const title = cleanLine
+          .replace(/<Carousel\b[^>]*>/i, "")
+          .replace(/^Carousel(?::|\s)*/i, "")
+          .trim();
         currentCarousel = { title: title || "Feature Showcase", slides: [] };
         continue;
       }
 
       const isSlideLine = /^Slide(?::|\s)/i.test(cleanLine) || /<Slide\b/i.test(cleanLine);
-      if (isSlideLine && allowedComponents.includes("Carousel")) {
+      if (
+        isSlideLine &&
+        (allowedComponents.length === 0 || allowedComponents.includes("Carousel"))
+      ) {
         if (currentCarousel === null) {
           flushAllBuffers();
           currentCarousel = { title: "Comparative Showcase", slides: [] };
         }
-        const slideRaw = cleanLine.replace(/<Slide\b[^>]*>/i, "").replace(/<\/Slide>/i, "").replace(/^Slide(?::|\s)*/i, "").trim();
+        const slideRaw = cleanLine
+          .replace(/<Slide\b[^>]*>/i, "")
+          .replace(/<\/Slide>/i, "")
+          .replace(/^Slide(?::|\s)*/i, "")
+          .trim();
         const parts = splitEscapedPipes(slideRaw);
         currentCarousel.slides.push({
           title: parts[0] || `Item ${currentCarousel.slides.length + 1}`,
           description: parts.length > 2 ? parts[1] : undefined,
-          content: parts.length > 2 ? parts.slice(2).join(" | ") : (parts[1] || parts[0]),
+          content: parts.length > 2 ? parts.slice(2).join(" | ") : parts[1] || parts[0],
         });
         continue;
       }
 
       // --- 9. Mathematical Plots & Equations ---
-      const isMathPlot = /^(?:MathPlot|Plot|Equation)(?::|\s)/i.test(cleanLine) || /<MathPlot\b/i.test(cleanLine);
-      if (isMathPlot && allowedComponents.includes("MathPlot")) {
+      const isMathPlot =
+        /^(?:MathPlot|Plot|Equation)(?::|\s)/i.test(cleanLine) || /<MathPlot\b/i.test(cleanLine);
+
+      if (
+        isMathPlot &&
+        (allowedComponents.length === 0 || allowedComponents.includes("MathPlot"))
+      ) {
         flushAllBuffers();
         const rawContent = cleanLine
           .replace(/<MathPlot\b[^>]*>/i, "")
@@ -756,11 +855,17 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
       }
 
       // --- 10. TestResults Component ---
-      const xmlTestMatch = cleanLine.match(/<TestResults\b([^>]*)>(.*?)<\/TestResults>/i) || cleanLine.match(/<TestResults\b([^>]*)\/?>/i);
+      const xmlTestMatch =
+        cleanLine.match(/<TestResults\b([^>]*)>(.*?)<\/TestResults>/i) ||
+        cleanLine.match(/<TestResults\b([^>]*)\/?>/i);
       const isLineTest = /^TestResults(?::|\s)/i.test(cleanLine);
-      if ((xmlTestMatch || isLineTest) && allowedComponents.includes("TestResults")) {
+
+      if (
+        (xmlTestMatch || isLineTest) &&
+        (allowedComponents.length === 0 || allowedComponents.includes("TestResults"))
+      ) {
         flushAllBuffers();
-        const contentStr = xmlTestMatch ? (xmlTestMatch[2] || xmlTestMatch[1] || "") : cleanLine;
+        const contentStr = xmlTestMatch ? xmlTestMatch[2] || xmlTestMatch[1] || "" : cleanLine;
         let passed = 0;
         let failed = 0;
         let skipped = 0;
@@ -782,7 +887,10 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
       }
 
       // --- 11. Accordion Component ---
-      if (/^Accordion(?::|\s)/i.test(cleanLine) && allowedComponents.includes("Accordion")) {
+      if (
+        /^Accordion(?::|\s)/i.test(cleanLine) &&
+        (allowedComponents.length === 0 || allowedComponents.includes("Accordion"))
+      ) {
         flushAllBuffers();
         const raw = cleanLine.replace(/^Accordion(?::|\s)*/i, "").trim();
         const parts = splitEscapedPipes(raw);
@@ -797,7 +905,11 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
       // --- 12. Form Component & Fields ---
       const xmlFormMatch = cleanLine.match(/<Form\b([^>]*)>/i);
       const isLineForm = /^Form(?::|\s)/i.test(cleanLine);
-      if ((xmlFormMatch || isLineForm) && allowedComponents.includes("Form")) {
+
+      if (
+        (xmlFormMatch || isLineForm) &&
+        (allowedComponents.length === 0 || allowedComponents.includes("Form"))
+      ) {
         flushAllBuffers();
         let formTitle = "Form";
         let inlineFields: FormFieldDefinition[] = [];
@@ -822,6 +934,7 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
 
       const xmlFieldMatch = cleanLine.match(/<Field\b([^>]*)\/?>/i);
       const isLineField = /^Field(?::|\s)/i.test(cleanLine);
+
       if ((xmlFieldMatch || isLineField) && currentForm !== null) {
         if (xmlFieldMatch) {
           const attrs = parseXmlAttributes(xmlFieldMatch[1]);
@@ -847,7 +960,7 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
       // --- 13. ActionButton Component ---
       if (
         /^(?:Action|ActionButton)(?::|\s)/i.test(cleanLine) &&
-        allowedComponents.includes("ActionButton")
+        (allowedComponents.length === 0 || allowedComponents.includes("ActionButton"))
       ) {
         const actionLabel = cleanLine.replace(/^(?:Action|ActionButton)(?::|\s)*/i, "").trim();
         if (currentForm !== null) {
@@ -868,13 +981,13 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
         flushActions();
       }
 
-      // --- 14. Table Component Detection (Ultra-Resilient) ---
+      // --- 14. Table Component Detection ---
       const isExplicitTableHeader = /^(?:Table|Table:|<Table>)/i.test(cleanLine);
       if (isExplicitTableHeader) {
         flushAllBuffers();
         inTableContext = true;
         const inlineContent = cleanLine.replace(/^(?:Table:?|<Table>)\s*/i, "").trim();
-        if (inlineContent.includes("|") && inlineContent.length > 3) {
+        if (inlineContent.includes("|") && inlineContent.length > 2) {
           tableLines.push(inlineContent);
         }
         continue;
@@ -883,7 +996,6 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
       const isTableDivider = /^[|\s:-]+$/.test(cleanLine) && cleanLine.includes("-");
       const pipeCount = (cleanLine.match(/(?<!\\)\|/g) || []).length;
 
-      // Match table rows whether inside Table block or standalone markdown table
       if (inTableContext) {
         if (pipeCount >= 1 || isTableDivider) {
           tableLines.push(cleanLine);
@@ -891,17 +1003,22 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
         } else {
           flushTable();
         }
-      } else if (pipeCount >= 1 && !isTableDivider && (cleanLine.startsWith("|") || cleanLine.split("|").length >= 2)) {
-        flushProse();
-        flushMetrics();
-        flushBadges();
-        flushActions();
-        inTableContext = true;
-        tableLines.push(cleanLine);
-        continue;
+      } else if (pipeCount >= 1 && (isTableDivider || cleanLine.includes("|"))) {
+        const nextLine = rawLines[index + 1]?.trim() || "";
+        const nextIsDivider = /^[|\s:-]+$/.test(nextLine) && nextLine.includes("-");
+
+        if (cleanLine.startsWith("|") || isTableDivider || nextIsDivider) {
+          flushProse();
+          flushMetrics();
+          flushBadges();
+          flushActions();
+          inTableContext = true;
+          tableLines.push(cleanLine);
+          continue;
+        }
       }
 
-      // --- 15. Markdown Prose & Descriptions Buffer ---
+      // --- 15. Markdown Prose & Fallback Buffer ---
       if (cleanLine) {
         if (currentCard !== null) {
           if (!currentCard.desc) {
@@ -922,7 +1039,7 @@ export function OpenUIRenderer({ dslContent }: OpenUIRendererProps): React.JSX.E
 
     flushAllBuffers();
     return elements;
-  }, [dslContent, allowedComponents]);
+  }, [dslContent, allowedComponents, isEnabled]);
 
   return <div className="space-y-2 py-1">{parsedElements}</div>;
 }
