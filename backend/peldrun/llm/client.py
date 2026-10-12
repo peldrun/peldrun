@@ -654,7 +654,7 @@ class AsyncLLMClient:
         if isinstance(self.config, dict):
             limit_tokens = limit_tokens or self.config.get("max_tokens")
         if limit_tokens:
-            call_kwargs["max_tokens"] = min(int(limit_tokens), 4096)
+            call_kwargs["max_tokens"] = int(limit_tokens)
 
         if call_kwargs.get("stream"):
             try:
@@ -907,7 +907,7 @@ class AsyncLLMClient:
         if isinstance(self.config, dict):
             limit_tokens = limit_tokens or self.config.get("max_tokens")
         if limit_tokens:
-            call_kwargs["max_tokens"] = min(int(limit_tokens), 4096)
+            call_kwargs["max_tokens"] = int(limit_tokens)
 
         accumulated_content = []
         accumulated_reasoning = []

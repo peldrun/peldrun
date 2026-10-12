@@ -107,6 +107,46 @@ def _check_model_metadata_reasoning(model_name: str) -> Optional[bool]:
     return None
 
 
+def _resolve_model_max_output_tokens(model_name: str, active_llm: Optional[Dict[str, Any]] = None) -> int:
+    """
+    Dynamically resolve max output tokens for the target model:
+    1. Check explicit active_llm overrides (max_output_tokens or max_tokens).
+    2. Check persisted storage/models_budget.json configured via UI.
+    3. Fallback to 8192 default.
+    """
+    if active_llm:
+        val = active_llm.get("max_output_tokens") or active_llm.get("max_tokens")
+        if val is not None:
+            try:
+                parsed = int(val)
+                if parsed > 0:
+                    return parsed
+            except (ValueError, TypeError):
+                pass
+
+    try:
+        module_dir = Path(__file__).resolve().parent
+        candidates = [
+            module_dir.parent.parent / "storage" / "models_budget.json",
+            Path("storage/models_budget.json").resolve(),
+            Path("backend/storage/models_budget.json").resolve(),
+        ]
+        for p in candidates:
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                cfg = data.get(model_name) or data.get(model_name.lower())
+                if isinstance(cfg, dict):
+                    budget_val = cfg.get("max_output_tokens") or cfg.get("max_tokens")
+                    if budget_val is not None:
+                        parsed_val = int(budget_val)
+                        if parsed_val > 0:
+                            return parsed_val
+    except Exception as e:
+        logger.debug("Could not load budget cache for %s: %s", model_name, e)
+
+    return 8192
+
+
 def _is_reasoning_model(model_name: str, active_llm: Optional[Dict[str, Any]] = None) -> bool:
     """
     Deterministically identify whether the target model is a reasoning-centric model.
@@ -412,6 +452,9 @@ async def run_instrumented(
         f"Task started: {prompt[:120]}",
     )
 
+    resolved_max_tokens = _resolve_model_max_output_tokens(model_name, active_llm)
+    active_llm["max_tokens"] = resolved_max_tokens
+
     context = EngineRunContext(
         job_id=job_id,
         prompt=prompt,
@@ -571,12 +614,8 @@ async def run_direct_chat(
             f"Active: {budget_usage.get('total_tokens', 0)} / {budget_usage.get('effective_limit', 0)} tokens"
         )
 
-        max_tokens = active_llm.get("max_tokens") or 8192
-        if isinstance(max_tokens, str):
-            try:
-                max_tokens = int(max_tokens)
-            except Exception:
-                max_tokens = 8192
+        max_tokens = _resolve_model_max_output_tokens(model_name, active_llm)
+        active_llm["max_tokens"] = max_tokens
 
         client = AsyncLLMClient(
             base_url=base_url,

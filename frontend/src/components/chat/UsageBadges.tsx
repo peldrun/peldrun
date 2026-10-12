@@ -8,8 +8,6 @@ import {
   Gauge,
   Database,
   Brain,
-  ChevronDown,
-  ChevronUp,
   HelpCircle,
   Sparkles,
 } from "lucide-react";
@@ -352,116 +350,124 @@ export function UsageBadgeGroup({
   }
 
   const badgeSize = variant === "compact" ? "sm" : "md";
+  const iconSize = badgeSize === "sm" ? 10 : 12;
 
   return (
-    <div className={`inline-flex flex-col gap-1 select-none ${className}`}>
-      <div className="flex flex-wrap items-center gap-1.5">
-        {/* Token Badge */}
-        <TokenBadge
-          tokens={resolvedTokens}
-          inputTokens={resolvedInput}
-          outputTokens={resolvedOutput}
-          cachedTokens={resolvedCached}
-          reasoningTokens={resolvedReasoning}
-          isEstimated={resolvedEstimated}
-          size={badgeSize}
-        />
+    <div className={`relative inline-flex select-none ${className}`}>
+      {/* Collapsed trigger: token icon only */}
+      <button
+        type="button"
+        onClick={() => setExpanded((current) => !current)}
+        className={`inline-flex items-center justify-center rounded-md border border-border bg-muted/50 text-muted-foreground shadow-xs transition-colors hover:bg-muted/80 hover:text-foreground cursor-pointer ${
+          badgeSize === "sm" ? "h-5 w-5" : "h-6 w-6"
+        }`}
+        title={
+          hasTokens
+            ? `Usage details: ${formatTokenCount(resolvedTokens)} tokens`
+            : "Usage details"
+        }
+        aria-expanded={expanded}
+        aria-label="Toggle usage details"
+      >
+        <Coins size={iconSize} className="shrink-0 opacity-80" />
+      </button>
 
-        {/* Cost Badge */}
-        <CostBadge
-          costUsd={resolvedCost}
-          isLocal={isLocal}
-          size={badgeSize}
-        />
-
-        {/* Latency / Speed Badge */}
-        <LatencyBadge
-          latencyMs={resolvedLatency}
-          ttftMs={resolvedTtft}
-          tokensPerSecond={resolvedThroughput}
-          size={badgeSize}
-        />
-
-        {/* Toggle Detailed Breakdown Button */}
-        {showBreakdown && hasTokens && (
-          <button
-            type="button"
-            onClick={() => setExpanded(!expanded)}
-            className="p-1 rounded text-muted-foreground/70 hover:text-foreground hover:bg-muted/80 transition-colors cursor-pointer"
-            title="Toggle Detailed Token & Telemetry Breakdown"
-          >
-            {expanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
-          </button>
-        )}
-      </div>
-
-      {/* Expandable Accounting Matrix */}
+      {/* Expanded dropdown: badges + full accounting matrix */}
       {expanded && (
-        <div className="p-2 mt-1 rounded bg-card border border-border text-[11px] font-mono shadow-xs space-y-1.5 animate-in fade-in-50 duration-150">
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-muted-foreground pb-1 border-b border-border/50">
-            <div>
-              <span className="block text-[9px] uppercase tracking-wider text-muted-foreground/70">
-                Input (Prompt)
-              </span>
-              <span className="font-bold text-foreground">
-                {formatTokenCount(resolvedInput)}
-              </span>
-            </div>
+        <div className="absolute left-0 top-full z-50 mt-1 w-max min-w-[280px] max-w-[calc(100vw-2rem)] rounded-lg border border-border bg-card p-2 shadow-lg animate-in fade-in-50 duration-150">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <TokenBadge
+              tokens={resolvedTokens}
+              inputTokens={resolvedInput}
+              outputTokens={resolvedOutput}
+              cachedTokens={resolvedCached}
+              reasoningTokens={resolvedReasoning}
+              isEstimated={resolvedEstimated}
+              size={badgeSize}
+            />
 
-            <div>
-              <span className="block text-[9px] uppercase tracking-wider text-muted-foreground/70">
-                Output (Completion)
-              </span>
-              <span className="font-bold text-foreground">
-                {formatTokenCount(resolvedOutput)}
-              </span>
-            </div>
+            <CostBadge
+              costUsd={resolvedCost}
+              isLocal={isLocal}
+              size={badgeSize}
+            />
 
-            <div>
-              <span className="block text-[9px] uppercase tracking-wider text-muted-foreground/70">
-                Prompt Cache
-              </span>
-              <span className="font-bold text-blue-500">
-                {resolvedCached ? formatTokenCount(resolvedCached) : "0"}
-              </span>
-            </div>
-
-            <div>
-              <span className="block text-[9px] uppercase tracking-wider text-muted-foreground/70">
-                Reasoning (Thought)
-              </span>
-              <span className="font-bold text-violet-500">
-                {resolvedReasoning ? formatTokenCount(resolvedReasoning) : "0"}
-              </span>
-            </div>
+            <LatencyBadge
+              latencyMs={resolvedLatency}
+              ttftMs={resolvedTtft}
+              tokensPerSecond={resolvedThroughput}
+              size={badgeSize}
+            />
           </div>
 
-          <div className="flex flex-wrap items-center justify-between text-[10px] text-muted-foreground pt-0.5">
-            <div className="flex items-center gap-2">
-              {model && (
-                <span>
-                  Model: <strong className="text-foreground">{model}</strong>
-                </span>
-              )}
-              {provider && (
-                <span>
-                  Provider: <strong className="text-foreground">{provider}</strong>
-                </span>
-              )}
-            </div>
+          {showBreakdown && hasTokens && (
+            <div className="p-2 mt-2 rounded bg-background/50 border border-border text-[11px] font-mono shadow-xs space-y-1.5">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-muted-foreground pb-1 border-b border-border/50">
+                <div>
+                  <span className="block text-[9px] uppercase tracking-wider text-muted-foreground/70">
+                    Input (Prompt)
+                  </span>
+                  <span className="font-bold text-foreground">
+                    {formatTokenCount(resolvedInput)}
+                  </span>
+                </div>
 
-            <div className="flex items-center gap-1 font-sans">
-              {resolvedEstimated ? (
-                <span className="text-amber-500 flex items-center gap-1">
-                  <HelpCircle size={10} /> Estimated via Tokenizer Fallback (Unknown != 0)
-                </span>
-              ) : (
-                <span className="text-emerald-500 flex items-center gap-1">
-                  <Sparkles size={10} /> Exact Provider Metrics
-                </span>
-              )}
+                <div>
+                  <span className="block text-[9px] uppercase tracking-wider text-muted-foreground/70">
+                    Output (Completion)
+                  </span>
+                  <span className="font-bold text-foreground">
+                    {formatTokenCount(resolvedOutput)}
+                  </span>
+                </div>
+
+                <div>
+                  <span className="block text-[9px] uppercase tracking-wider text-muted-foreground/70">
+                    Prompt Cache
+                  </span>
+                  <span className="font-bold text-blue-500">
+                    {resolvedCached ? formatTokenCount(resolvedCached) : "0"}
+                  </span>
+                </div>
+
+                <div>
+                  <span className="block text-[9px] uppercase tracking-wider text-muted-foreground/70">
+                    Reasoning (Thought)
+                  </span>
+                  <span className="font-bold text-violet-500">
+                    {resolvedReasoning ? formatTokenCount(resolvedReasoning) : "0"}
+                  </span>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between text-[10px] text-muted-foreground pt-0.5">
+                <div className="flex items-center gap-2">
+                  {model && (
+                    <span>
+                      Model: <strong className="text-foreground">{model}</strong>
+                    </span>
+                  )}
+                  {provider && (
+                    <span>
+                      Provider: <strong className="text-foreground">{provider}</strong>
+                    </span>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-1 font-sans">
+                  {resolvedEstimated ? (
+                    <span className="text-amber-500 flex items-center gap-1">
+                      <HelpCircle size={10} /> Estimated via Tokenizer Fallback (Unknown != 0)
+                    </span>
+                  ) : (
+                    <span className="text-emerald-500 flex items-center gap-1">
+                      <Sparkles size={10} /> Exact Provider Metrics
+                    </span>
+                  )}
+                </div>
+              </div>
             </div>
-          </div>
+          )}
         </div>
       )}
     </div>
