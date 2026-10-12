@@ -20,16 +20,14 @@ import type {
 } from "../types";
 
 interface UseSseStreamParams {
-  /** Ref tracking the current step number to avoid stale closures inside handlers. */
   currentStepNumRef: React.MutableRefObject<number>;
-  /** Ref tracking the active chat id to avoid stale closures inside handlers. */
   activeChatIdRef: React.MutableRefObject<string | null>;
   setSteps: React.Dispatch<React.SetStateAction<StepEvent[]>>;
   setCurrentStepNum: (n: number) => void;
   setActiveModelName: (m: string) => void;
   setTokensUsed: React.Dispatch<React.SetStateAction<TokenUsage>>;
   setCurrentUsageMetrics: (m: UsageMetrics | null) => void;
-  setFinalResult: (r: string | null) => void;
+  setFinalResult: React.Dispatch<React.SetStateAction<string | null>>;
   setStatus: (s: ChatStatus) => void;
   setExpandedSteps: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
   setHumanQuery: (q: string | null) => void;
@@ -170,16 +168,59 @@ export function useSseStream(params: UseSseStreamParams) {
 
       if (eventType === "step_start") {
         logEntry(`[${logTimestamp}] [STEP] Step ${step} started`);
+      } else if (eventType === "chunk") {
+        const delta =
+          payload.data?.delta ??
+          payload.data?.text ??
+          payload.data?.content ??
+          (typeof payload.data === "string" ? payload.data : "");
+        if (delta) {
+          ctx.setFinalResult((prev) => (prev ? prev + delta : delta));
+        }
       } else if (eventType === "thought") {
+        const isDelta = Boolean(payload.data?.is_delta);
         const raw =
-          payload.data?.thought ?? payload.data?.content ?? payload.data;
+          payload.data?.delta ??
+          payload.data?.thought ??
+          payload.data?.content ??
+          payload.data;
         if (safeRender(raw).trim() !== "") {
-          appendStep("thought", raw, step);
+          if (isDelta) {
+            ctx.setSteps((prev) => {
+              const lastIdx = prev.length - 1;
+              if (
+                lastIdx >= 0 &&
+                prev[lastIdx].type === "thought" &&
+                prev[lastIdx].step === step
+              ) {
+                const updated = [...prev];
+                updated[lastIdx] = {
+                  ...updated[lastIdx],
+                  content: updated[lastIdx].content + safeRender(raw),
+                };
+                return updated;
+              }
+              return [
+                ...prev,
+                {
+                  id: `thought-${step}-${Date.now()}`,
+                  step,
+                  type: "thought",
+                  content: safeRender(raw),
+                  timestamp: new Date().toLocaleTimeString(),
+                },
+              ];
+            });
+          } else {
+            appendStep("thought", raw, step);
+          }
           ctx.setExpandedSteps((prev) => ({
             ...prev,
             [`active-${step}`]: true,
           }));
-          logEntry(`[${logTimestamp}] [THOUGHT] ${safeRender(raw)}`);
+          if (!isDelta) {
+            logEntry(`[${logTimestamp}] [THOUGHT] ${safeRender(raw)}`);
+          }
         }
         if (payload.data?.tokens) ctx.setTokensUsed(payload.data.tokens);
       } else if (normalizedType === "tool_call") {
@@ -526,7 +567,7 @@ export function useSseStream(params: UseSseStreamParams) {
       (es as any).__lastErrorFetch = now;
       p().fetchJobFiles(jobId);
     };
-  }, []); // ← Stable identity: prevents the parent's effects from re-running.
+  }, []); // Stable identity: prevents the parent's effects from re-running.
 
   return { connectStream, closeStream, eventSourceRef };
 }

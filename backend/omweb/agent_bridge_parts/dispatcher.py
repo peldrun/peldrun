@@ -617,6 +617,39 @@ async def run_direct_chat(
         max_tokens = _resolve_model_max_output_tokens(model_name, active_llm)
         active_llm["max_tokens"] = max_tokens
 
+
+
+        async def _handle_chunk(delta_text: str) -> None:
+            await dispatch_event(
+                job_id,
+                SSEEvent(
+                    type=SSEEventType.CHUNK,
+                    step=1,
+                    data={
+                        "delta": delta_text,
+                        "text": delta_text,
+                        "content": delta_text,
+                        "model": model_name,
+                    },
+                ),
+            )
+
+        async def _handle_thought_chunk(thought_delta: str) -> None:
+            await dispatch_event(
+                job_id,
+                SSEEvent(
+                    type=SSEEventType.THOUGHT,
+                    step=1,
+                    data={
+                        "delta": thought_delta,
+                        "thought": thought_delta,
+                        "content": thought_delta,
+                        "is_delta": True,
+                        "model": model_name,
+                    },
+                ),
+            )
+
         client = AsyncLLMClient(
             base_url=base_url,
             api_key=api_key,
@@ -628,6 +661,8 @@ async def run_direct_chat(
             "max_tokens": max_tokens,
             "temperature": float(active_llm.get("temperature", 0.7)),
             "model": model_name,
+            "on_chunk": _handle_chunk,
+            "on_thought_chunk": _handle_thought_chunk,
         }
 
         if is_reasoner and reasoning_effort in ("none", "minimal", "low", "medium", "high", "xhigh"):

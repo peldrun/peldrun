@@ -44,7 +44,7 @@ export function useJobStream(jobId: string | null) {
         if (!event.data) return;
         const payload = JSON.parse(event.data);
 
-        if (payload.type === "ping") return;
+        if (payload.type === "ping" || payload.type === "chunk") return;
 
         // Monotonic sequence tracking
         const currentSeq = payload.seq || payload.sequence || payload.data?.seq;

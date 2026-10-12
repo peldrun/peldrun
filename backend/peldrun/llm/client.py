@@ -11,12 +11,13 @@ Includes model-aware prompt compatibility normalization (e.g. Gemma chat templat
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from enum import Enum
 import json
 import logging
 import time
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 import uuid
 
 from openai import AsyncOpenAI
@@ -596,6 +597,8 @@ class AsyncLLMClient:
         timeout: Optional[float] = None,
         reasoning_effort: Optional[str] = None,
         stream: bool = True,
+        on_chunk: Optional[Callable[[str], Any]] = None,
+        on_thought_chunk: Optional[Callable[[str], Any]] = None,
         **kwargs: Any,
     ) -> LLMResponse:
         """Executes a chat completion request with resilient stream accumulation and auto-fallback."""
@@ -720,11 +723,25 @@ class AsyncLLMClient:
                         accumulated_content.append(content_delta)
                         sys.stdout.write(content_delta)
                         sys.stdout.flush()
+                        if on_chunk:
+                            try:
+                                cb_res = on_chunk(content_delta)
+                                if asyncio.iscoroutine(cb_res):
+                                    await cb_res
+                            except Exception as cb_err:
+                                logger.debug("on_chunk callback error: %s", cb_err)
 
                     if reasoning_delta:
                         accumulated_reasoning.append(reasoning_delta)
                         sys.stdout.write(reasoning_delta)
                         sys.stdout.flush()
+                        if on_thought_chunk:
+                            try:
+                                cb_res = on_thought_chunk(reasoning_delta)
+                                if asyncio.iscoroutine(cb_res):
+                                    await cb_res
+                            except Exception as cb_err:
+                                logger.debug("on_thought_chunk callback error: %s", cb_err)
 
                     tc_deltas = getattr(delta, "tool_calls", None)
                     if tc_deltas:

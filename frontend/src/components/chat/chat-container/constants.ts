@@ -29,6 +29,7 @@ export const SSE_EVENT_TYPES = [
   "step_end",
   "thought",
   "tool_call",
+  "chunk",
   "tool_called",
   "tool_retry",
   "observation",

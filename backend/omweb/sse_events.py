@@ -33,6 +33,7 @@ class SSEEventType(str, Enum):
     STEP_START = "step_start"
     STEP_END = "step_end"
     THOUGHT = "thought"
+    CHUNK = "chunk"
     TOOL_CALL = "tool_call"
     TOOL_CALLED = "tool_called"  # Compatibility alias
     TOOL_RETRY = "tool_retry"    # Centralized retry event
