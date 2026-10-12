@@ -46,7 +46,7 @@ class RunnerConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     max_steps: int = Field(default=30, description="Maximum allowed reasoning/acting iterations")
-    step_timeout_seconds: float = Field(default=120.0, description="Timeout ceiling per individual step")
+    step_timeout_seconds: float = Field(default=300.0, description="Timeout ceiling per individual step")
     total_timeout_seconds: Optional[float] = Field(default=None, description="Global job timeout in seconds")
     enable_checkpointing: bool = Field(default=True, description="Whether to capture state checkpoints each step")
     checkpoint_interval: int = Field(default=1, description="Interval in steps between checkpoints")

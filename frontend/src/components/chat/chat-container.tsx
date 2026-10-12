@@ -15,6 +15,7 @@ import { useAppStorage } from "@/hooks/use-app-storage";
 import { inferModelCapabilities, fetchServerMetadata } from "@/lib/modelMetadata";
 
 import { getGenerativeUIPayload } from "@/components/generative-ui/store";
+import { fa } from "zod/v4/locales";
 
 interface ChildRunState {
   childRunId: string;
@@ -49,6 +50,12 @@ interface DelegationApprovalRequest {
  */
 const HUMAN_TOOL_NAMES = new Set(["ask_human", "human_input"]);
 
+/**
+ * Diagnostic flag: enable verbose SSE event logging in browser console.
+ * Set to false once the ask_human rendering issue is confirmed resolved.
+ */
+const DEBUG_SSE = false;
+
 function safeRender(val: any): string {
   if (val === null || val === undefined) return "";
   if (typeof val === "string") {
@@ -64,6 +71,53 @@ function safeRender(val: any): string {
   } catch {
     return String(val);
   }
+}
+
+/**
+ * Robustly extracts a human-readable prompt string from tool-call arguments.
+ *
+ * Arguments may arrive in several shapes depending on the SSE bridge:
+ *   1. Plain object:                  { prompt: "...", input_type: "text" }
+ *   2. JSON-encoded string:           "{\"prompt\":\"...\"}"
+ *   3. Free-form string (fallback):   "What is your name?"
+ *   4. Empty / malformed:             "" or "{}"
+ *
+ * Returns both the extracted prompt text and the parsed object (when available)
+ * so the caller can reuse the object for step recording without re-parsing.
+ */
+function extractHumanPrompt(rawArgs: any): {
+  promptText: string;
+  parsedArgs: any | null;
+} {
+  let parsedArgs: any | null = null;
+
+  if (rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
+    parsedArgs = rawArgs;
+  } else if (typeof rawArgs === "string") {
+    const trimmed = rawArgs.trim();
+    if (trimmed.startsWith("{")) {
+      try {
+        parsedArgs = JSON.parse(trimmed);
+      } catch (e) {
+        if (DEBUG_SSE) {
+          console.warn("[extractHumanPrompt] JSON.parse failed for string args:", e, trimmed.slice(0, 200));
+        }
+      }
+    }
+  }
+
+  const promptText =
+    (parsedArgs &&
+      (parsedArgs.prompt ||
+        parsedArgs.question ||
+        parsedArgs.query ||
+        parsedArgs.message)) ||
+    (typeof rawArgs === "string" && rawArgs.length > 0 && !rawArgs.trim().startsWith("{")
+      ? rawArgs
+      : "") ||
+    "";
+
+  return { promptText, parsedArgs };
 }
 
 export interface ChatContainerProps {
@@ -319,6 +373,24 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     };
 
     const handleEventPayload = (eventType: string, payload: any) => {
+      // ✅ Normalize aliases so both "tool_call" and "tool_called" trigger the same logic
+      const normalizedType =
+        eventType === "tool_called" ? "tool_call" :
+        eventType === "tool_retry"  ? "tool_call" :  // treat retry as another call
+        eventType;
+
+      if (DEBUG_SSE) {
+        console.log(`[SSE] ▶ ${eventType}`, {
+          step: payload?.step,
+          tool: payload?.data?.tool_name || payload?.data?.name,
+          argsType: typeof payload?.data?.arguments,
+          argsPreview:
+            typeof payload?.data?.arguments === "string"
+              ? payload.data.arguments.slice(0, 200)
+              : JSON.stringify(payload?.data?.arguments || {}).slice(0, 200),
+        });
+      }
+
       const step = payload.step || payload.data?.step || currentStepNum || 1;
       setCurrentStepNum(step);
 
@@ -351,35 +423,50 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         }
         if (payload.data?.tokens) setTokensUsed(payload.data.tokens);
       } else if (eventType === "tool_call") {
-        const name = payload.data?.tool_name || payload.data?.name || payload.data?.toolName || payload.data?.tool;
+        const name =
+          payload.data?.tool_name ||
+          payload.data?.name ||
+          payload.data?.toolName ||
+          payload.data?.tool ||
+          "";
         const rawArgs = payload.data?.arguments ?? payload.data?.args ?? "";
 
-        let promptText = "";
-        if (typeof rawArgs === "object" && rawArgs !== null) {
-          promptText = rawArgs.prompt || rawArgs.question || rawArgs.query || rawArgs.message || "";
-        } else if (typeof rawArgs === "string") {
-          try {
-            const parsed = JSON.parse(rawArgs);
-            promptText = parsed.prompt || parsed.question || parsed.query || parsed.message || rawArgs;
-          } catch {
-            promptText = rawArgs;
-          }
-        }
+        // ✅ Robust extraction that handles object / JSON-string / free-string / empty
+        const { promptText, parsedArgs } = extractHumanPrompt(rawArgs);
 
-        const isHumanInteraction =
-          HUMAN_TOOL_NAMES.has(name || "") ||
+        const isHumanTool = HUMAN_TOOL_NAMES.has(name);
+        const isHumanLike =
+          isHumanTool ||
           (promptText && (promptText.includes("?") || promptText.includes("prefer")));
 
-        if (isHumanInteraction && promptText) {
-          setHumanQuery(promptText);
+        if (isHumanTool && !promptText) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            "[ASK_HUMAN] Human tool detected but no prompt text extracted.",
+            { name, rawArgs }
+          );
         }
 
-        appendStep("tool_call", rawArgs, step, name);
+        if (isHumanLike && promptText) {
+          setHumanQuery(promptText);
+        } else if (isHumanTool) {
+          // ✅ Even without extractable prompt, mark the query so the card renders
+          setHumanQuery("The agent is awaiting your input. Please respond below.");
+        }
+
+        // ✅ Store the parsed object when available so chat-thread can re-hydrate
+        //    input_type and options without needing to re-parse.
+        appendStep("tool_call", parsedArgs || rawArgs, step, name);
         setExpandedSteps((prev) => ({ ...prev, [`active-${step}`]: true }));
+
         if (typeof window !== "undefined") {
           window.dispatchEvent(
             new CustomEvent("peldrun:log-entry", {
-              detail: { line: `[${logTimestamp}] [TOOL_CALL] ${name || "tool"}(${typeof rawArgs === "string" ? rawArgs : JSON.stringify(rawArgs)})` },
+              detail: {
+                line: `[${logTimestamp}] [TOOL_CALL] ${name || "tool"}(${
+                  typeof rawArgs === "string" ? rawArgs : JSON.stringify(rawArgs)
+                })`,
+              },
             })
           );
         }
@@ -392,12 +479,15 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
           "";
         if (promptText) {
           setHumanQuery(promptText);
+        } else {
+          setHumanQuery("The agent is awaiting your input. Please respond below.");
         }
         appendStep("tool_call", payload.data, step, "ask_human");
         setExpandedSteps((prev) => ({ ...prev, [`active-${step}`]: true }));
       } else if (eventType === "observation") {
         const raw = payload.data?.output ?? "Execution completed.";
-        const observationTool = payload.data?.tool_name || payload.data?.name || payload.data?.tool;
+        const observationTool =
+          payload.data?.tool_name || payload.data?.name || payload.data?.tool || "";
 
         /**
          * FIX: Only clear the pending human query when the observation comes
@@ -406,7 +496,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
          * awaiting prompt from the UI, otherwise the interaction card would
          * never render.
          */
-        if (!HUMAN_TOOL_NAMES.has(observationTool || "")) {
+        if (!HUMAN_TOOL_NAMES.has(observationTool)) {
           setHumanQuery(null);
         }
 
@@ -428,12 +518,15 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
               setSelectedFileForEditor(artName);
             }
             if (typeof window !== "undefined") {
-              window.dispatchEvent(new CustomEvent("peldrun:artifact-created", { detail: { ...payload.data, file: artName } }));
+              window.dispatchEvent(
+                new CustomEvent("peldrun:artifact-created", {
+                  detail: { ...payload.data, file: artName },
+                })
+              );
             }
           }
         }
         fetchJobFiles(jobId);
-
       } else if (eventType === "artifact_created" || eventType === "artifact") {
         const artName = payload.data?.artifact || payload.data?.path || payload.data?.file || "";
         if (artName) {
@@ -443,13 +536,32 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
             setSelectedFileForEditor(artName);
           }
           if (typeof window !== "undefined") {
-            window.dispatchEvent(new CustomEvent("peldrun:artifact-created", { detail: { ...payload.data, file: artName } }));
+            window.dispatchEvent(
+              new CustomEvent("peldrun:artifact-created", {
+                detail: { ...payload.data, file: artName },
+              })
+            );
           }
         }
         fetchJobFiles(jobId);
-
       } else if (eventType === "final" || eventType === "done") {
-        setHumanQuery(null);
+        /**
+         * FIX: Do not unconditionally clear humanQuery here. If the final
+         * event was produced because the ask_human tool timed out, we keep
+         * the question visible so the user can see what was requested.
+         */
+        const lastTool =
+          payload.data?.tool_name || payload.data?.last_tool || "";
+        const finalError = String(payload.data?.error || payload.data?.message || "");
+        const isHumanTimeout =
+          HUMAN_TOOL_NAMES.has(lastTool) ||
+          finalError.includes("ask_human") ||
+          finalError.includes("human_input");
+
+        if (!isHumanTimeout) {
+          setHumanQuery(null);
+        }
+
         const resText = payload.data?.result ?? payload.data?.content ?? "Task completed successfully.";
         if (eventType === "final") setFinalResult(safeRender(resText));
 
@@ -481,7 +593,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
           setTokensUsed((prev) => ({
             input: inTok > 0 ? inTok : prev.input,
             output: outTok > 0 ? outTok : prev.output,
-            total: totTok > 0 ? totTok : (inTok + outTok > 0 ? inTok + outTok : prev.total),
+            total: totTok > 0 ? totTok : inTok + outTok > 0 ? inTok + outTok : prev.total,
           }));
           setCurrentUsageMetrics({
             cost_usd: u.cost_usd,
@@ -498,11 +610,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         if (typeof window !== "undefined") {
           window.dispatchEvent(
             new CustomEvent("omweb:chat-status-changed", {
-              detail: {
-                chatId: activeChatId,
-                jobId: jobId,
-                status: "completed",
-              },
+              detail: { chatId: activeChatId, jobId, status: "completed" },
             })
           );
           window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
@@ -526,11 +634,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         if (typeof window !== "undefined") {
           window.dispatchEvent(
             new CustomEvent("omweb:chat-status-changed", {
-              detail: {
-                chatId: activeChatId,
-                jobId: jobId,
-                status: "failed",
-              },
+              detail: { chatId: activeChatId, jobId, status: "failed" },
             })
           );
           window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
@@ -542,23 +646,49 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       es.addEventListener(name, (e: any) => {
         try {
           handleEventPayload(name, JSON.parse(e.data));
-        } catch {
+        } catch (parseErr) {
+          if (DEBUG_SSE) {
+            // eslint-disable-next-line no-console
+            console.warn(`[SSE] Failed to parse JSON for ${name}`, parseErr, e.data);
+          }
           handleEventPayload(name, { data: e.data });
         }
       });
     };
 
+    // ✅ COMPLETE list of all SSE event types the backend may emit.
+    // The frontend must listen for every type; otherwise events like
+    // tool_called / tool_retry / status are silently dropped.
     [
+      // Control plane
+      "status",
+      "run_accepted",
+      "run_started",
+
+      // Execution plane
       "step_start",
+      "step_end",
       "thought",
       "tool_call",
-      "ask_human",
+      "tool_called",       // ← كان مفقوداً
+      "tool_retry",        // ← كان مفقوداً
       "observation",
+
+      // Artifact lifecycle
       "artifact_created",
+      "artifact_updated",
+      "artifact_deleted",
+      "artifact_moved",
       "artifact",
+
+      // Terminal
       "final",
       "done",
       "error",
+      "cancelled",
+
+      // Transport / heartbeat
+      "ping",
     ].forEach(bindEvt);
 
     [
@@ -609,8 +739,17 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
                 deliverables: [],
               },
             }));
-          } else if (name === "child_run_completed" || name === "child_run_failed" || name === "child_run_cancelled") {
-            const cStatus = name === "child_run_completed" ? "completed" : (name === "child_run_cancelled" ? "cancelled" : "failed");
+          } else if (
+            name === "child_run_completed" ||
+            name === "child_run_failed" ||
+            name === "child_run_cancelled"
+          ) {
+            const cStatus =
+              name === "child_run_completed"
+                ? "completed"
+                : name === "child_run_cancelled"
+                ? "cancelled"
+                : "failed";
             setActiveChildRuns((prev) => {
               const cur = prev[payload.data.child_run_id];
               if (!cur) return prev;
@@ -697,11 +836,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       if (typeof window !== "undefined") {
         window.dispatchEvent(
           new CustomEvent("omweb:chat-status-changed", {
-            detail: {
-              chatId: activeChatId,
-              jobId: activeJobId,
-              status: "failed",
-            },
+            detail: { chatId: activeChatId, jobId: activeJobId, status: "failed" },
           })
         );
         window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
@@ -737,10 +872,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          answer: {
-            decision: "approve",
-            instruction: editedInstruction,
-          },
+          answer: { decision: "approve", instruction: editedInstruction },
         }),
       });
       setPendingApprovals((prev) => {
@@ -759,9 +891,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       await fetch(`/api/run/jobs/${activeJobId}/respond`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          answer: { decision: "reject" },
-        }),
+        body: JSON.stringify({ answer: { decision: "reject" } }),
       });
       setPendingApprovals((prev) => {
         const next = { ...prev };
@@ -794,7 +924,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       if (res.ok) {
         const data = await res.json();
         const turnFiles: { name: string; path: string; action?: string; status?: string }[] =
-          data.delta_files !== undefined ? data.delta_files : (data.files || []);
+          data.delta_files !== undefined ? data.delta_files : data.files || [];
         setProducedFiles(turnFiles);
       }
     } catch (e) {
@@ -816,14 +946,17 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     const effectiveMode = customOverride?.mode || execMode;
 
     const activeCaps = inferModelCapabilities(activeModelName, metadataVault[activeModelName]);
-    const isModelReasoning = customOverride?.is_reasoning_model !== undefined
-      ? Boolean(customOverride.is_reasoning_model)
-      : Boolean(activeCaps?.isReasoning);
+    const isModelReasoning =
+      customOverride?.is_reasoning_model !== undefined
+        ? Boolean(customOverride.is_reasoning_model)
+        : Boolean(activeCaps?.isReasoning);
 
     const effectiveReasoningEffort = isModelReasoning
-      ? (customOverride?.reasoning_effort || reasoningEffort || "none")
+      ? customOverride?.reasoning_effort || reasoningEffort || "none"
       : "none";
-    const targetChatId = activeChatId || `chat_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 8)}`;
+    const targetChatId =
+      activeChatId ||
+      `chat_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 8)}`;
 
     let attachedMetadata: AttachedUserFile[] = [];
 
@@ -849,7 +982,9 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         const uploadData = await uploadRes.json();
         const uploadedList: { name: string; path: string }[] = uploadData.files || [];
         if (uploadedList.length > 0) {
-          const filesSummary = uploadedList.map((f) => `- ${f.name} (in workspace directory)`).join("\n");
+          const filesSummary = uploadedList
+            .map((f) => `- ${f.name} (in workspace directory)`)
+            .join("\n");
           finalPrompt = rawText
             ? `${rawText}\n\n[Uploaded Files]:\n${filesSummary}`
             : `Inspect workspace files:\n${filesSummary}`;
@@ -875,16 +1010,22 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
           producedFiles: [...producedFiles],
           attachedFiles: [...submittedFiles],
           model: activeModelName,
-          usage: tokensUsed.total > 0 ? {
-            input_tokens: tokensUsed.input,
-            output_tokens: tokensUsed.output,
-            total_tokens: tokensUsed.total,
-            cost_usd: currentUsageMetrics?.cost_usd ?? 0,
-            latency_ms: currentUsageMetrics?.latency_ms ?? (elapsedSeconds * 1000),
-            tokens_per_second: currentUsageMetrics?.tokens_per_second ?? (elapsedSeconds > 0 ? tokensUsed.output / elapsedSeconds : 0),
-            provider: "local",
-            model: activeModelName,
-          } as any : undefined,
+          usage:
+            tokensUsed.total > 0
+              ? ({
+                  input_tokens: tokensUsed.input,
+                  output_tokens: tokensUsed.output,
+                  total_tokens: tokensUsed.total,
+                  cost_usd: currentUsageMetrics?.cost_usd ?? 0,
+                  latency_ms:
+                    currentUsageMetrics?.latency_ms ?? elapsedSeconds * 1000,
+                  tokens_per_second:
+                    currentUsageMetrics?.tokens_per_second ??
+                    (elapsedSeconds > 0 ? tokensUsed.output / elapsedSeconds : 0),
+                  provider: "local",
+                  model: activeModelName,
+                } as any)
+              : undefined,
         },
       ]);
     }
@@ -931,7 +1072,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
           is_reasoning_model: isModelReasoning,
           generative_ui: generativeUiPayload,
           ...storedOverride,
-          ...(customOverride || {})
+          ...(customOverride || {}),
         }),
       });
 
@@ -989,14 +1130,17 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     }, {} as Record<number, StepEvent[]>);
   };
 
-  const isFreshSession = historyTurns.length === 0 && steps.length === 0 && !submittedPrompt && status !== "running";
+  const isFreshSession =
+    historyTurns.length === 0 && steps.length === 0 && !submittedPrompt && status !== "running";
 
   const getLiveStatusMessage = () => {
     if (execMode === "chat") return "Synthesizing conversational response...";
     if (steps.length === 0) return "Analyzing request and formulating execution plan...";
     const lastEvt = steps[steps.length - 1];
-    if (lastEvt.type === "tool_call") return `Executing tool: ${lastEvt.toolName || "external tool"}...`;
-    if (lastEvt.type === "observation") return "Processing tool observation & planning next action...";
+    if (lastEvt.type === "tool_call")
+      return `Executing tool: ${lastEvt.toolName || "external tool"}...`;
+    if (lastEvt.type === "observation")
+      return "Processing tool observation & planning next action...";
     if (lastEvt.type === "thought") return "Deep reasoning and verifying solution...";
     return "Agent reasoning & executing autonomously...";
   };

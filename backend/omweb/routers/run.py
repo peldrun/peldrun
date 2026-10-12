@@ -823,6 +823,7 @@ async def download_job_zip(job_id: str):
         zip_buffer,
         media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
+
     )
 
 

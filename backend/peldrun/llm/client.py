@@ -332,7 +332,6 @@ def normalize_messages_for_target_model(
     if not is_gemma:
         return list(messages)
 
-    # Collect system instructions and dialogue messages
     system_parts: List[str] = []
     dialogue: List[Dict[str, Any]] = []
 
@@ -350,7 +349,6 @@ def normalize_messages_for_target_model(
 
     combined_system_text = "\n\n".join(system_parts)
 
-    # Prepend system instruction to the first user turn
     if dialogue and str(dialogue[0].get("role", "")).lower() == "user":
         first_user_content = str(dialogue[0].get("content", ""))
         dialogue[0]["content"] = f"{combined_system_text}\n\n{first_user_content}"
@@ -512,9 +510,12 @@ class AsyncLLMClient:
         model: Optional[str] = None,
         timeout: Optional[float] = None,
         reasoning_effort: Optional[str] = None,
+        stream: bool = True,
         **kwargs: Any,
     ) -> LLMResponse:
-        """Executes a chat completion request, normalizes usage metrics, and falls back gracefully."""
+        """Executes a chat completion request with real-time stream accumulation and fallback handling."""
+        import sys
+
         start_time = time.time()
         chosen_model = model or getattr(self.config, "model", None) or self.model or "default"
         if isinstance(self.config, dict):
@@ -530,10 +531,9 @@ class AsyncLLMClient:
             "model": chosen_model,
             "messages": effective_messages,
             "temperature": float(temp),
-            "stream": False,
+            "stream": stream,
         }
 
-        # Resolve reasoning effort hierarchy (arg -> kwargs -> config)
         effort = (
             reasoning_effort
             or kwargs.get("reasoning_effort")
@@ -545,7 +545,6 @@ class AsyncLLMClient:
 
         if effort and str(effort).lower() in ("none", "off", "0", "low", "medium", "high", "minimal", "xhigh"):
             raw_eff = str(effort).lower().strip()
-            # Canonical OpenAI normalization: 'off' -> 'none' prevents 400 Bad Request
             norm_effort = "none" if raw_eff in ("none", "off", "0") else raw_eff
 
             call_kwargs["reasoning_effort"] = norm_effort
@@ -573,8 +572,132 @@ class AsyncLLMClient:
             call_kwargs["max_tokens"] = min(int(limit_tokens), 4096)
 
         response = await self.client.chat.completions.create(**call_kwargs)
-        total_latency_ms = (time.time() - start_time) * 1000.0
 
+        if call_kwargs.get("stream"):
+            accumulated_content: List[str] = []
+            accumulated_reasoning: List[str] = []
+            accumulated_tool_calls: Dict[int, Dict[str, Any]] = {}
+            finish_reason: Optional[str] = None
+            captured_usage: Optional[TokenUsage] = None
+            first_token_at: Optional[float] = None
+
+            async for chunk in response:
+                now = time.time()
+                if hasattr(chunk, "usage") and chunk.usage:
+                    captured_usage = self._normalize_raw_usage(chunk.usage)
+
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+
+                first_choice = choices[0]
+                if getattr(first_choice, "finish_reason", None):
+                    finish_reason = first_choice.finish_reason
+
+                delta = getattr(first_choice, "delta", None)
+                if not delta:
+                    continue
+
+                content_delta = getattr(delta, "content", None)
+                reasoning_delta = (
+                    getattr(delta, "reasoning_content", None)
+                    or getattr(delta, "reasoning", None)
+                    or getattr(delta, "thought", None)
+                )
+                if not reasoning_delta and hasattr(delta, "model_extra") and isinstance(delta.model_extra, dict):
+                    reasoning_delta = (
+                        delta.model_extra.get("reasoning_content")
+                        or delta.model_extra.get("reasoning")
+                        or delta.model_extra.get("thought")
+                    )
+
+                if (content_delta or reasoning_delta) and first_token_at is None:
+                    first_token_at = now
+
+                if content_delta:
+                    accumulated_content.append(content_delta)
+                    sys.stdout.write(content_delta)
+                    sys.stdout.flush()
+
+                if reasoning_delta:
+                    accumulated_reasoning.append(reasoning_delta)
+                    sys.stdout.write(reasoning_delta)
+                    sys.stdout.flush()
+
+                tc_deltas = getattr(delta, "tool_calls", None)
+                if tc_deltas:
+                    for tc in tc_deltas:
+                        idx = getattr(tc, "index", 0)
+                        if idx not in accumulated_tool_calls:
+                            accumulated_tool_calls[idx] = {
+                                "id": getattr(tc, "id", None) or f"call_{idx}_{uuid.uuid4().hex[:6]}",
+                                "name": "",
+                                "arguments": "",
+                            }
+                        if getattr(tc, "id", None):
+                            accumulated_tool_calls[idx]["id"] = tc.id
+
+                        fn = getattr(tc, "function", None)
+                        if fn:
+                            if getattr(fn, "name", None):
+                                if not accumulated_tool_calls[idx]["name"]:
+                                    print(f"\n[ENGINE PELDRUN] Tool call requested: '{fn.name}'", flush=True)
+                                accumulated_tool_calls[idx]["name"] += fn.name
+                            if getattr(fn, "arguments", None):
+                                accumulated_tool_calls[idx]["arguments"] += fn.arguments
+
+            total_latency_ms = (time.time() - start_time) * 1000.0
+            ttft_ms = (first_token_at - start_time) * 1000.0 if first_token_at else total_latency_ms
+
+            full_content = "".join(accumulated_content)
+            full_reasoning = "".join(accumulated_reasoning) or None
+
+            parsed_tool_calls: List[ToolCall] = []
+            for idx in sorted(accumulated_tool_calls.keys()):
+                tc_item = accumulated_tool_calls[idx]
+                raw_args = tc_item["arguments"]
+                if raw_args:
+                    try:
+                        args_obj = json.loads(raw_args)
+                    except Exception:
+                        args_obj = {"raw": raw_args}
+                else:
+                    args_obj = {}
+
+                parsed_tool_calls.append(
+                    ToolCall(
+                        id=tc_item["id"],
+                        name=tc_item["name"],
+                        arguments=args_obj,
+                        type="function",
+                    )
+                )
+
+            usage = captured_usage
+            if usage is None:
+                usage = self._fallback_usage_estimation(
+                    messages=effective_messages,
+                    output_text=full_content,
+                    reasoning_text=full_reasoning,
+                    tool_calls=parsed_tool_calls,
+                    model=chosen_model,
+                )
+
+            return LLMResponse(
+                content=full_content,
+                reasoning=full_reasoning,
+                reasoning_content=full_reasoning,
+                thought=full_reasoning,
+                tool_calls=parsed_tool_calls,
+                finish_reason=finish_reason or "stop",
+                usage=usage,
+                model=chosen_model,
+                raw=None,
+                latency_ms=total_latency_ms,
+                ttft_ms=ttft_ms,
+            )
+
+        total_latency_ms = (time.time() - start_time) * 1000.0
         if not response.choices:
             return LLMResponse(
                 content="",
@@ -587,7 +710,6 @@ class AsyncLLMClient:
         message = first_choice.message
         content = message.content or ""
 
-        # Extract reasoning content from standard attributes or model_extra dictionary
         reasoning = (
             getattr(message, "reasoning_content", None)
             or getattr(message, "reasoning", None)
@@ -602,7 +724,7 @@ class AsyncLLMClient:
 
         finish_reason = first_choice.finish_reason
 
-        parsed_tool_calls: List[ToolCall] = []
+        parsed_tool_calls = []
         if message.tool_calls:
             for idx, call in enumerate(message.tool_calls):
                 fn = call.function
