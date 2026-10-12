@@ -29,12 +29,10 @@ from omweb.job_manager import job_manager
 from omweb.project_manager import project_manager
 from omweb.sse_events import SSEEvent, SSEEventType, dispatch_event
 
-# Public Core LLM & Telemetry Boundary Imports
 from peldrun.llm.client import AsyncLLMClient
 from peldrun.runtime.pricing_store import NANO_USD_PER_USD, get_pricing_store
 from peldrun.runtime.usage_store import LLMInvocationRecord, get_usage_store
 
-# Context Management & Sidecar Integration
 from omweb.chat_storage_engine import chat_storage_engine
 from peldrun.context.builder import ContextManager
 from peldrun.context.sidecar import build_context_sidecar, load_context_sidecar
@@ -161,14 +159,13 @@ def _resolve_chat_system_prompt(
         return None
     elif is_reasoner:
         if genui_enabled:
-            # Neutral: no format directive so OpenUI Lang directive (Tier 1C) rules alone
             return "You are a helpful and concise assistant. Respond naturally and directly."
         return "You are a helpful and concise assistant. Respond naturally and directly using Markdown."
     else:
         if genui_enabled:
-            # Neutral: OpenUI Lang directive will govern the output format
             return "You are a helpful, direct, and conversational AI assistant. Respond naturally and directly."
         return "You are a helpful, direct, and conversational AI assistant. Respond directly and accurately using Markdown."
+
 
 def _build_optimized_chat_messages(
     turns: List[Dict[str, Any]],
@@ -341,7 +338,6 @@ async def run_instrumented(
                 active_llm["provider_name"] = active_llm.get("provider") or active_llm.get("model")
         active_llm.update(llm_override)
 
-    # Normalize reasoning_effort strictly: 'off' -> 'none'
     if "reasoning_effort" in active_llm and active_llm["reasoning_effort"]:
         raw_eff = str(active_llm["reasoning_effort"]).lower().strip()
         if raw_eff in ("none", "off", "0"):
@@ -380,7 +376,6 @@ async def run_instrumented(
             cleanup_job_state(job_id)
             return
 
-    # Dispatch native PELDRUN run acceptance event
     status_event_type = getattr(SSEEventType, "STATUS", None) or getattr(SSEEventType, "RUN_ACCEPTED", None)
     if status_event_type is not None:
         await dispatch_event(
@@ -599,7 +594,16 @@ async def run_direct_chat(
         if is_reasoner and reasoning_effort in ("none", "minimal", "low", "medium", "high", "xhigh"):
             completion_kwargs["reasoning_effort"] = reasoning_effort
 
-        response = await client.chat_completion(**completion_kwargs)
+        try:
+            response = await client.chat_completion(**completion_kwargs)
+        except Exception as chat_err:
+            logger.warning(
+                "[BRIDGE DIRECT CHAT] Primary streaming chat completion failed (%s). Retrying with non-streaming fallback...",
+                chat_err,
+            )
+            completion_kwargs["stream"] = False
+            response = await client.chat_completion(**completion_kwargs)
+
         completed_time = time.time()
 
         result_text = response.content or ""

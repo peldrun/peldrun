@@ -1,0 +1,798 @@
+// Path: frontend/src/components/chat/chat-container/index.tsx
+"use client";
+
+import React, {
+  useState,
+  useRef,
+  useEffect,
+  useMemo,
+  useCallback,
+} from "react";
+import { useRouter } from "next/navigation";
+import {
+  WorkspacePanel,
+  getFileCategory,
+} from "@/components/workspace/workspace-panel";
+import { Composer } from "@/components/chat/composer";
+import { ChatSubHeader } from "@/components/chat/chat-sub-header";
+import { ChatLanding } from "@/components/chat/chat-landing";
+import {
+  ChatThread,
+  ChatTurn,
+  AttachedUserFile,
+} from "@/components/chat/chat-thread";
+import type { StepEvent } from "@/components/chat/chat-timeline";
+import type { EngineOption } from "@/components/chat/engine-selector";
+import { useChatStore } from "@/stores/chat-store";
+import { useAppStorage } from "@/hooks/use-app-storage";
+import { inferModelCapabilities } from "@/lib/modelMetadata";
+
+import { getGenerativeUIPayload } from "@/components/generative-ui/store";
+import { fa } from "zod/v4/locales";
+
+import type {
+  ChatContainerProps,
+  ChatStatus,
+  TokenUsage,
+  UsageMetrics,
+  ChildRunState,
+  DelegationApprovalRequest,
+} from "./types";
+import { formatFileSize, groupStepEvents } from "./utils";
+import { useMetadataVault } from "./hooks/use-metadata-vault";
+import { useElapsedTimer } from "./hooks/use-elapsed-timer";
+import { useJobFiles } from "./hooks/use-job-files";
+import { useSseStream } from "./hooks/use-sse-stream";
+import { useJobDetails } from "./hooks/use-job-details";
+
+export type { ChatContainerProps };
+
+export function ChatContainer({ initialJobId }: ChatContainerProps) {
+  const router = useRouter();
+  const { selectedAgentId, setSelectedAgentId, getAgentMaxSteps } =
+    useChatStore();
+
+  // --- UI / input state -----------------------------------------------------
+  const [inputValue, setInputValue] = useState("");
+  const [landingAttachedFiles, setLandingAttachedFiles] = useState<File[]>([]);
+  const [submittedPrompt, setSubmittedPrompt] = useState("");
+  const [submittedFiles, setSubmittedFiles] = useState<AttachedUserFile[]>([]);
+  const [activeJobId, setActiveJobId] = useState<string | null>(
+    initialJobId || null
+  );
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [historyTurns, setHistoryTurns] = useState<ChatTurn[]>([]);
+  const [status, setStatus] = useState<ChatStatus>("idle");
+  const [steps, setSteps] = useState<StepEvent[]>([]);
+  const [finalResult, setFinalResult] = useState<string | null>(null);
+  const [currentStepNum, setCurrentStepNum] = useState(0);
+  const [selectedFileForEditor, setSelectedFileForEditor] = useState<
+    string | null
+  >(null);
+  const [expandedSteps, setExpandedSteps] = useState<Record<string, boolean>>(
+    {}
+  );
+  const [copiedSection, setCopiedSection] = useState<string | null>(null);
+  const [showRawTrace, setShowRawTrace] = useState(false);
+  const [sandboxDraft, setSandboxDraft] = useState<{
+    filename: string;
+    content: string;
+  } | null>(null);
+  const [tokensUsed, setTokensUsed] = useState<TokenUsage>({
+    input: 0,
+    output: 0,
+    total: 0,
+  });
+  const [currentUsageMetrics, setCurrentUsageMetrics] =
+    useState<UsageMetrics | null>(null);
+  const [humanQuery, setHumanQuery] = useState<string | null>(null);
+  const [humanAnswer, setHumanAnswer] = useState("");
+  const [sessionTimestamp, setSessionTimestamp] = useState<string>("");
+  const [activeChildRuns, setActiveChildRuns] = useState<
+    Record<string, ChildRunState>
+  >({});
+  const [pendingApprovals, setPendingApprovals] = useState<
+    Record<string, DelegationApprovalRequest>
+  >({});
+
+  // --- Persisted user preferences ------------------------------------------
+  const [showRightPanel, setShowRightPanel] = useAppStorage("right_panel_open");
+  const [execMode, setExecMode] = useAppStorage("exec_mode");
+  const [reasoningEffort] = useAppStorage("reasoning_effort");
+  const [selectedEngineId, setSelectedEngineId] =
+    useAppStorage("selected_engine");
+  const [activeModelName, setActiveModelName] = useAppStorage("active_model");
+  const [activeLlmOverride] = useAppStorage("active_llm_override");
+
+  // --- Extracted hooks ------------------------------------------------------
+  const metadataVault = useMetadataVault();
+  const [elapsedSeconds, setElapsedSeconds] = useElapsedTimer(status);
+  const { producedFiles, setProducedFiles, fetchJobFiles } = useJobFiles();
+
+  // Refs mirror fast-changing state so SSE handlers always read the latest
+  // value rather than a closure-captured snapshot.
+  const currentStepNumRef = useRef(currentStepNum);
+  const activeChatIdRef = useRef(activeChatId);
+  useEffect(() => {
+    currentStepNumRef.current = currentStepNum;
+  }, [currentStepNum]);
+  useEffect(() => {
+    activeChatIdRef.current = activeChatId;
+  }, [activeChatId]);
+
+  const { connectStream, closeStream, eventSourceRef } = useSseStream({
+    currentStepNumRef,
+    activeChatIdRef,
+    setSteps,
+    setCurrentStepNum,
+    setActiveModelName,
+    setTokensUsed,
+    setCurrentUsageMetrics,
+    setFinalResult,
+    setStatus,
+    setExpandedSteps,
+    setHumanQuery,
+    setShowRightPanel,
+    setSelectedFileForEditor,
+    setActiveChildRuns,
+    setPendingApprovals,
+    fetchJobFiles,
+  });
+
+  const fetchJobDetails = useJobDetails({
+    setActiveChatId,
+    setSubmittedPrompt,
+    setSelectedAgentId,
+    setExecMode,
+    setActiveModelName,
+    setStatus,
+    setFinalResult,
+    setSessionTimestamp,
+    setHistoryTurns,
+    setTokensUsed,
+    setCurrentUsageMetrics,
+    setSteps,
+    setCurrentStepNum,
+    currentStepNumRef,
+    fetchJobFiles,
+    connectStream,
+  });
+
+  const chatScrollBottomRef = useRef<HTMLDivElement | null>(null);
+
+  // --- Effects --------------------------------------------------------------
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onModelChange = (e: any) => {
+      if (e.detail?.model) setActiveModelName(e.detail.model);
+    };
+    window.addEventListener("omweb:model-change", onModelChange);
+    return () => window.removeEventListener("omweb:model-change", onModelChange);
+  }, [setActiveModelName]);
+
+  useEffect(() => {
+    if (status === "running" || steps.length > 0 || submittedPrompt) {
+      chatScrollBottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [steps, status, finalResult, submittedPrompt]);
+
+  useEffect(() => {
+    const handleSandboxEvent = (e: Event) => {
+      const customEvent = e as CustomEvent<{
+        code: string;
+        language: string;
+        filename: string;
+      }>;
+      if (customEvent.detail) {
+        setShowRightPanel(true);
+        setSandboxDraft({
+          filename: customEvent.detail.filename,
+          content: customEvent.detail.code,
+        });
+      }
+    };
+    const handleArtifactEvent = (e: Event) => {
+      const ce = e as CustomEvent<{
+        artifact?: string;
+        path?: string;
+        file?: string;
+      }>;
+      const artName = ce.detail?.path || ce.detail?.file || ce.detail?.artifact;
+      if (artName) {
+        const cat = getFileCategory(artName);
+        if (cat === "preview" || cat === "artifacts") {
+          setSelectedFileForEditor(artName);
+        }
+      }
+      setShowRightPanel(true);
+    };
+    window.addEventListener("peldrun:artifact-created", handleArtifactEvent);
+    window.addEventListener("peldrun:open-in-sandbox", handleSandboxEvent);
+    return () => {
+      window.removeEventListener(
+        "peldrun:artifact-created",
+        handleArtifactEvent
+      );
+      window.removeEventListener("peldrun:open-in-sandbox", handleSandboxEvent);
+    };
+  }, [setShowRightPanel]);
+
+  useEffect(() => {
+    if (initialJobId) {
+      setActiveJobId(initialJobId);
+      fetchJobDetails(initialJobId);
+    }
+  }, [initialJobId, fetchJobDetails]);
+
+  // --- Mode / engine handlers ----------------------------------------------
+  const handleModeChange = useCallback(
+    (newMode: "agent" | "chat") => {
+      setExecMode(newMode);
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent("omweb:mode-change", { detail: newMode })
+        );
+      }
+    },
+    [setExecMode]
+  );
+
+  const handleSelectEngine = useCallback(
+    (engine: EngineOption) => {
+      setSelectedEngineId(engine.id);
+      handleModeChange(engine.mode);
+    },
+    [setSelectedEngineId, handleModeChange]
+  );
+
+  // --- Timeline helpers -----------------------------------------------------
+  const toggleStep = useCallback((key: string) => {
+    setExpandedSteps((prev) => ({ ...prev, [key]: !prev[key] }));
+  }, []);
+
+  const copyText = useCallback((text: string, identifier: string) => {
+    if (!text) return;
+    navigator.clipboard.writeText(text).then(() => {
+      setCopiedSection(identifier);
+      setTimeout(() => setCopiedSection(null), 2000);
+    });
+  }, []);
+
+  // --- Session control ------------------------------------------------------
+  const handleNewSession = useCallback(() => {
+    closeStream();
+    setInputValue("");
+    setLandingAttachedFiles([]);
+    setSubmittedPrompt("");
+    setSubmittedFiles([]);
+    setActiveJobId(null);
+    setActiveChatId(null);
+    setHistoryTurns([]);
+    setStatus("idle");
+    setSteps([]);
+    setFinalResult(null);
+    setCurrentStepNum(0);
+    setProducedFiles([]);
+    setSelectedFileForEditor(null);
+    setExpandedSteps({});
+    setTokensUsed({ input: 0, output: 0, total: 0 });
+    setCurrentUsageMetrics(null);
+    setHumanQuery(null);
+    setHumanAnswer("");
+    setElapsedSeconds(0);
+    setSessionTimestamp("");
+    setShowRightPanel(false);
+    setActiveChildRuns({});
+    setPendingApprovals({});
+    router.push("/chat");
+  }, [
+    closeStream,
+    router,
+    setProducedFiles,
+    setElapsedSeconds,
+    setShowRightPanel,
+  ]);
+
+  const handleStopTask = useCallback(async () => {
+    if (!activeJobId || status !== "running") return;
+    try {
+      await fetch(`/api/run/jobs/${activeJobId}/stop`, { method: "POST" });
+      setStatus("failed");
+      setHumanQuery(null);
+      closeStream();
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent("omweb:chat-status-changed", {
+            detail: { chatId: activeChatId, jobId: activeJobId, status: "failed" },
+          })
+        );
+        window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
+      }
+    } catch (e) {
+      console.error("Failed to stop job", e);
+    }
+  }, [activeJobId, status, activeChatId, closeStream]);
+
+  // --- Human-in-the-loop ----------------------------------------------------
+  const handleSendHumanAnswer = useCallback(
+    async (customAnswer?: string) => {
+      const finalAnswer = (
+        typeof customAnswer === "string" ? customAnswer : humanAnswer
+      ).trim();
+      if (!finalAnswer || !activeJobId) return;
+
+      try {
+        const res = await fetch(`/api/run/jobs/${activeJobId}/respond`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ answer: finalAnswer }),
+        });
+        if (res.ok) {
+          setHumanAnswer("");
+          setHumanQuery(null);
+        }
+      } catch (e) {
+        console.error("Failed to send human answer:", e);
+      }
+    },
+    [activeJobId, humanAnswer]
+  );
+
+  const handleApproveDelegation = useCallback(
+    async (approvalId: string, editedInstruction?: string) => {
+      if (!activeJobId) return;
+      try {
+        await fetch(`/api/run/jobs/${activeJobId}/respond`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            answer: { decision: "approve", instruction: editedInstruction },
+          }),
+        });
+        setPendingApprovals((prev) => {
+          const next = { ...prev };
+          delete next[approvalId];
+          return next;
+        });
+      } catch (err) {
+        console.error("Failed to approve delegation:", err);
+      }
+    },
+    [activeJobId]
+  );
+
+  const handleRejectDelegation = useCallback(
+    async (approvalId: string) => {
+      if (!activeJobId) return;
+      try {
+        await fetch(`/api/run/jobs/${activeJobId}/respond`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ answer: { decision: "reject" } }),
+        });
+        setPendingApprovals((prev) => {
+          const next = { ...prev };
+          delete next[approvalId];
+          return next;
+        });
+      } catch (err) {
+        console.error("Failed to reject delegation:", err);
+      }
+    },
+    [activeJobId]
+  );
+
+  const handleCancelSubtask = useCallback(async (childRunId: string) => {
+    try {
+      await fetch(`/api/run/jobs/${childRunId}/stop`, { method: "POST" });
+      setActiveChildRuns((prev) => {
+        if (!prev[childRunId]) return prev;
+        return {
+          ...prev,
+          [childRunId]: { ...prev[childRunId], status: "cancelled" },
+        };
+      });
+    } catch (err) {
+      console.error("Failed to cancel subtask:", err);
+    }
+  }, []);
+
+  // --- Task dispatch --------------------------------------------------------
+  const handleStartTask = useCallback(
+    async (
+      customPrompt?: string,
+      customOverride?: any,
+      filesToUpload?: File[]
+    ): Promise<{ accepted: true; jobId: string; chatId: string }> => {
+      const rawText = (
+        customPrompt !== undefined ? customPrompt : inputValue
+      ).trim();
+      if (
+        (!rawText && (!filesToUpload || filesToUpload.length === 0)) ||
+        status === "running"
+      ) {
+        throw new Error(
+          "Task cannot be started with empty input or during ongoing run."
+        );
+      }
+
+      let finalPrompt = rawText;
+      const effectiveMode = customOverride?.mode || execMode;
+
+      const activeCaps = inferModelCapabilities(
+        activeModelName,
+        metadataVault[activeModelName]
+      );
+      const isModelReasoning =
+        customOverride?.is_reasoning_model !== undefined
+          ? Boolean(customOverride.is_reasoning_model)
+          : Boolean(activeCaps?.isReasoning);
+
+      const effectiveReasoningEffort = isModelReasoning
+        ? customOverride?.reasoning_effort || reasoningEffort || "none"
+        : "none";
+      const targetChatId =
+        activeChatId ||
+        `chat_${Date.now().toString(36)}_${Math.random()
+          .toString(36)
+          .substring(2, 8)}`;
+
+      let attachedMetadata: AttachedUserFile[] = [];
+
+      if (filesToUpload && filesToUpload.length > 0) {
+        attachedMetadata = filesToUpload.map((f) => ({
+          name: f.name,
+          type: f.type,
+          url: f.type.startsWith("image/") ? URL.createObjectURL(f) : undefined,
+        }));
+
+        try {
+          const formData = new FormData();
+          filesToUpload.forEach((f) => formData.append("files", f));
+          formData.append("chat_id", targetChatId);
+          if (activeJobId) formData.append("job_id", activeJobId);
+
+          const uploadRes = await fetch("/api/files/upload", {
+            method: "POST",
+            body: formData,
+          });
+          if (!uploadRes.ok) {
+            const uploadErrData = await uploadRes.json().catch(() => ({}));
+            throw new Error(
+              uploadErrData.detail || "Failed to upload attached files"
+            );
+          }
+
+          const uploadData = await uploadRes.json();
+          const uploadedList: { name: string; path: string }[] =
+            uploadData.files || [];
+          if (uploadedList.length > 0) {
+            const filesSummary = uploadedList
+              .map((f) => `- ${f.name} (in workspace directory)`)
+              .join("\n");
+            finalPrompt = rawText
+              ? `${rawText}\n\n[Uploaded Files]:\n${filesSummary}`
+              : `Inspect workspace files:\n${filesSummary}`;
+          }
+        } catch (uploadErr) {
+          console.error("[ChatContainer] Failed to upload files:", uploadErr);
+          throw uploadErr;
+        }
+      }
+
+      // Archive the current turn before starting a new one.
+      if (submittedPrompt && (finalResult || steps.length > 0)) {
+        setHistoryTurns((prev) => [
+          ...prev,
+          {
+            id: activeJobId || `turn-${Date.now()}`,
+            jobId: activeJobId || "",
+            prompt: submittedPrompt,
+            timestamp: sessionTimestamp || new Date().toLocaleString(),
+            steps: [...steps],
+            finalResult,
+            status: status === "failed" ? "failed" : "completed",
+            tokensUsed: { ...tokensUsed },
+            producedFiles: [...producedFiles],
+            attachedFiles: [...submittedFiles],
+            model: activeModelName,
+            usage:
+              tokensUsed.total > 0
+                ? ({
+                    input_tokens: tokensUsed.input,
+                    output_tokens: tokensUsed.output,
+                    total_tokens: tokensUsed.total,
+                    cost_usd: currentUsageMetrics?.cost_usd ?? 0,
+                    latency_ms:
+                      currentUsageMetrics?.latency_ms ?? elapsedSeconds * 1000,
+                    tokens_per_second:
+                      currentUsageMetrics?.tokens_per_second ??
+                      (elapsedSeconds > 0
+                        ? tokensUsed.output / elapsedSeconds
+                        : 0),
+                    provider: "local",
+                    model: activeModelName,
+                  } as any)
+                : undefined,
+          },
+        ]);
+      }
+
+      setInputValue("");
+      setLandingAttachedFiles([]);
+      setSubmittedPrompt(finalPrompt);
+      setSubmittedFiles(attachedMetadata);
+      setStatus("running");
+      setSteps([]);
+      setFinalResult(null);
+      setCurrentStepNum(1);
+      setProducedFiles([]);
+      setSelectedFileForEditor(null);
+      setExpandedSteps({ "active-1": true });
+      setHumanQuery(null);
+      setTokensUsed({ input: 0, output: 0, total: 0 });
+      setCurrentUsageMetrics(null);
+      setElapsedSeconds(0);
+      setSessionTimestamp(new Date().toLocaleString());
+      setActiveChildRuns({});
+      setPendingApprovals({});
+
+      try {
+        let storedOverride = {};
+        if (activeLlmOverride) {
+          try {
+            storedOverride = JSON.parse(activeLlmOverride);
+          } catch (e) {}
+        }
+
+        const generativeUiPayload = getGenerativeUIPayload();
+
+        const res = await fetch("/api/run", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            prompt: finalPrompt,
+            max_steps:
+              effectiveMode === "agent"
+                ? getAgentMaxSteps(selectedAgentId)
+                : 1,
+            chat_id: targetChatId,
+            agent_id: selectedAgentId || "peldrun",
+            mode: effectiveMode,
+            reasoning_effort: effectiveReasoningEffort,
+            is_reasoning_model: isModelReasoning,
+            generative_ui: generativeUiPayload,
+            ...storedOverride,
+            ...(customOverride || {}),
+          }),
+        });
+
+        if (!res.ok) {
+          const errorData = await res.json().catch(() => ({}));
+          throw new Error(errorData.detail || "Failed to start run");
+        }
+
+        const data = await res.json();
+        const jobId = data.job_id;
+        const returnedChatId = data.chat_id || targetChatId;
+        setActiveChatId(returnedChatId);
+        if (typeof window !== "undefined") {
+          window.history.replaceState(null, "", `/chat/${returnedChatId}`);
+        }
+        setActiveJobId(jobId);
+
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(
+            new CustomEvent("omweb:chat-status-changed", {
+              detail: {
+                chatId: returnedChatId,
+                jobId: jobId,
+                status: "running",
+                title: finalPrompt.slice(0, 30),
+              },
+            })
+          );
+          window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
+        }
+
+        connectStream(jobId);
+        return { accepted: true, jobId, chatId: returnedChatId };
+      } catch (err: any) {
+        console.error("[ChatContainer] Execution dispatch error:", err);
+        setStatus("failed");
+        setFinalResult(err?.message || "Execution error encountered.");
+        throw err;
+      }
+    },
+    [
+      inputValue,
+      status,
+      execMode,
+      activeModelName,
+      metadataVault,
+      reasoningEffort,
+      activeChatId,
+      activeJobId,
+      submittedPrompt,
+      finalResult,
+      steps,
+      sessionTimestamp,
+      tokensUsed,
+      producedFiles,
+      submittedFiles,
+      currentUsageMetrics,
+      elapsedSeconds,
+      activeLlmOverride,
+      getAgentMaxSteps,
+      selectedAgentId,
+      connectStream,
+      setProducedFiles,
+      setElapsedSeconds,
+    ]
+  );
+
+  // --- Derived values -------------------------------------------------------
+  const isFreshSession =
+    historyTurns.length === 0 &&
+    steps.length === 0 &&
+    !submittedPrompt &&
+    status !== "running";
+
+  const getLiveStatusMessage = useCallback(() => {
+    if (execMode === "chat") return "Synthesizing conversational response...";
+    if (steps.length === 0)
+      return "Analyzing request and formulating execution plan...";
+    const lastEvt = steps[steps.length - 1];
+    if (lastEvt.type === "tool_call")
+      return `Executing tool: ${lastEvt.toolName || "external tool"}...`;
+    if (lastEvt.type === "observation")
+      return "Processing tool observation & planning next action...";
+    if (lastEvt.type === "thought")
+      return "Deep reasoning and verifying solution...";
+    return "Agent reasoning & executing autonomously...";
+  }, [execMode, steps]);
+
+  const currentCostUsd = useMemo(() => {
+    return currentUsageMetrics?.cost_usd ?? 0;
+  }, [currentUsageMetrics]);
+
+  const currentLatencyMs = useMemo(() => {
+    if (
+      currentUsageMetrics?.latency_ms &&
+      currentUsageMetrics.latency_ms > 0
+    ) {
+      return currentUsageMetrics.latency_ms;
+    }
+    return elapsedSeconds > 0 ? elapsedSeconds * 1000 : null;
+  }, [currentUsageMetrics, elapsedSeconds]);
+
+  const currentTokensPerSecond = useMemo(() => {
+    if (
+      currentUsageMetrics?.tokens_per_second &&
+      currentUsageMetrics.tokens_per_second > 0
+    ) {
+      return currentUsageMetrics.tokens_per_second;
+    }
+    if (elapsedSeconds > 0 && tokensUsed.output > 0) {
+      return Number((tokensUsed.output / elapsedSeconds).toFixed(1));
+    }
+    return null;
+  }, [currentUsageMetrics, elapsedSeconds, tokensUsed.output]);
+
+  // --- Render ---------------------------------------------------------------
+  return (
+    <div className="flex h-full w-full bg-background text-foreground overflow-hidden font-sans">
+      <div className="flex-1 flex flex-col h-full border-r border-border min-w-0 transition-all">
+        <ChatSubHeader
+          isFreshSession={isFreshSession}
+          submittedPrompt={submittedPrompt}
+          activeChatId={activeChatId}
+          activeJobId={activeJobId}
+          historyTurnsCount={historyTurns.length}
+          tokensUsed={tokensUsed}
+          currentStepNum={currentStepNum}
+          maxSteps={getAgentMaxSteps(selectedAgentId)}
+          execMode={execMode}
+          selectedEngineId={selectedEngineId}
+          onSelectEngine={handleSelectEngine}
+          onNewSession={handleNewSession}
+          onStopTask={handleStopTask}
+          showRightPanel={showRightPanel}
+          onToggleRightPanel={() => setShowRightPanel(!showRightPanel)}
+          status={status as any}
+          activeModel={activeModelName}
+        />
+
+        {isFreshSession ? (
+          <ChatLanding
+            inputValue={inputValue}
+            setInputValue={setInputValue}
+            execMode={execMode}
+            handleModeChange={handleModeChange}
+            landingAttachedFiles={landingAttachedFiles}
+            setLandingAttachedFiles={setLandingAttachedFiles}
+            onStartTask={handleStartTask}
+            formatFileSize={formatFileSize}
+          />
+        ) : (
+          <ChatThread
+            historyTurns={historyTurns}
+            submittedPrompt={submittedPrompt}
+            submittedFiles={submittedFiles}
+            sessionTimestamp={sessionTimestamp}
+            humanQuery={humanQuery}
+            humanAnswer={humanAnswer}
+            setHumanAnswer={setHumanAnswer}
+            onSendHumanAnswer={handleSendHumanAnswer}
+            execMode={execMode}
+            activeGroupedSteps={
+              execMode === "agent" ? groupStepEvents(steps) : {}
+            }
+            currentStepNum={currentStepNum}
+            status={status}
+            elapsedSeconds={elapsedSeconds}
+            finalResult={finalResult}
+            producedFiles={producedFiles}
+            copiedSection={copiedSection}
+            copyText={copyText}
+            expandedSteps={expandedSteps}
+            toggleStep={toggleStep}
+            onSelectFile={(f: string) => {
+              setSelectedFileForEditor(f);
+              setShowRightPanel(true);
+              const targetTab = getFileCategory(f);
+              if (typeof window !== "undefined") {
+                window.dispatchEvent(
+                  new CustomEvent("peldrun:switch-tab", {
+                    detail: { tab: targetTab, file: f, userInitiated: true },
+                  })
+                );
+              }
+            }}
+            showRawTrace={showRawTrace}
+            setShowRawTrace={setShowRawTrace}
+            getLiveStatusMessage={getLiveStatusMessage}
+            activeModelName={activeModelName}
+            chatScrollBottomRef={chatScrollBottomRef}
+            tokensUsed={tokensUsed}
+            costUsd={currentCostUsd}
+            latencyMs={currentLatencyMs}
+            tokensPerSecond={currentTokensPerSecond}
+            activeChildRuns={activeChildRuns}
+            pendingApprovals={pendingApprovals}
+            onApproveDelegation={handleApproveDelegation}
+            onRejectDelegation={handleRejectDelegation}
+            onCancelSubtask={handleCancelSubtask}
+          />
+        )}
+
+        {!isFreshSession && (
+          <div className="p-3 sm:p-4 bg-background shrink-0">
+            <Composer
+              chatId={activeChatId || undefined}
+              onSend={(textToSend, files, llmOverride) =>
+                handleStartTask(textToSend, llmOverride, files)
+              }
+              onStop={handleStopTask}
+              isRunning={status === "running"}
+              disabled={status === "running"}
+            />
+          </div>
+        )}
+      </div>
+
+      {showRightPanel && (
+        <div className="flex-1 h-full min-w-0 transition-all">
+          <WorkspacePanel
+            activeJobId={activeJobId}
+            activeChatId={activeChatId || activeJobId}
+            overrideFile={selectedFileForEditor}
+            overrideDraft={sandboxDraft}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default ChatContainer;

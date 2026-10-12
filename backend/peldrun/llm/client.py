@@ -500,6 +500,91 @@ class AsyncLLMClient:
                 estimation_method="failed_estimation",
             )
 
+    def _process_non_streaming_choice(
+        self,
+        response: Any,
+        effective_messages: List[Dict[str, Any]],
+        chosen_model: str,
+        start_time: float,
+    ) -> LLMResponse:
+        """Helper to process standard non-streaming ChatCompletion response."""
+        import sys
+
+        total_latency_ms = (time.time() - start_time) * 1000.0
+        if not getattr(response, "choices", None):
+            return LLMResponse(
+                content="",
+                raw=response,
+                latency_ms=total_latency_ms,
+                usage=self._fallback_usage_estimation(messages=effective_messages, model=chosen_model),
+            )
+
+        first_choice = response.choices[0]
+        message = first_choice.message
+        content = message.content or ""
+        if content:
+            sys.stdout.write(content)
+            sys.stdout.flush()
+
+        reasoning = (
+            getattr(message, "reasoning_content", None)
+            or getattr(message, "reasoning", None)
+            or getattr(message, "thought", None)
+        )
+        if not reasoning and hasattr(message, "model_extra") and isinstance(message.model_extra, dict):
+            reasoning = (
+                message.model_extra.get("reasoning_content")
+                or message.model_extra.get("reasoning")
+                or message.model_extra.get("thought")
+            )
+
+        finish_reason = first_choice.finish_reason
+
+        parsed_tool_calls: List[ToolCall] = []
+        if message.tool_calls:
+            for idx, call in enumerate(message.tool_calls):
+                fn = call.function
+                args = fn.arguments
+                if isinstance(args, str):
+                    try:
+                        parsed_args = json.loads(args)
+                    except Exception:
+                        parsed_args = {"raw": args}
+                else:
+                    parsed_args = args or {}
+                parsed_tool_calls.append(
+                    ToolCall(
+                        id=call.id or f"call_{idx}_{uuid.uuid4().hex[:6]}",
+                        name=fn.name,
+                        arguments=parsed_args,
+                        type="function",
+                    )
+                )
+
+        usage = self._normalize_raw_usage(response.usage)
+        if usage is None:
+            usage = self._fallback_usage_estimation(
+                messages=effective_messages,
+                output_text=content,
+                reasoning_text=reasoning,
+                tool_calls=parsed_tool_calls,
+                model=chosen_model,
+            )
+
+        return LLMResponse(
+            content=content,
+            reasoning=reasoning,
+            reasoning_content=reasoning,
+            thought=reasoning,
+            tool_calls=parsed_tool_calls,
+            finish_reason=finish_reason,
+            usage=usage,
+            model=response.model or chosen_model,
+            raw=response,
+            latency_ms=total_latency_ms,
+            ttft_ms=total_latency_ms,
+        )
+
     async def chat_completion(
         self,
         messages: List[Dict[str, Any]],
@@ -513,7 +598,7 @@ class AsyncLLMClient:
         stream: bool = True,
         **kwargs: Any,
     ) -> LLMResponse:
-        """Executes a chat completion request with real-time stream accumulation and fallback handling."""
+        """Executes a chat completion request with resilient stream accumulation and auto-fallback."""
         import sys
 
         start_time = time.time()
@@ -571,80 +656,119 @@ class AsyncLLMClient:
         if limit_tokens:
             call_kwargs["max_tokens"] = min(int(limit_tokens), 4096)
 
-        response = await self.client.chat.completions.create(**call_kwargs)
-
         if call_kwargs.get("stream"):
+            try:
+                response = await self.client.chat.completions.create(**call_kwargs)
+            except Exception as stream_init_err:
+                logger.warning(
+                    "[LLM CLIENT] Streaming init failed for model '%s' (%s). Retrying with stream=False fallback...",
+                    chosen_model,
+                    stream_init_err,
+                )
+                call_kwargs["stream"] = False
+                fallback_resp = await self.client.chat.completions.create(**call_kwargs)
+                return self._process_non_streaming_choice(
+                    response=fallback_resp,
+                    effective_messages=effective_messages,
+                    chosen_model=chosen_model,
+                    start_time=start_time,
+                )
+
             accumulated_content: List[str] = []
             accumulated_reasoning: List[str] = []
             accumulated_tool_calls: Dict[int, Dict[str, Any]] = {}
             finish_reason: Optional[str] = None
             captured_usage: Optional[TokenUsage] = None
             first_token_at: Optional[float] = None
+            stream_interrupted = False
 
-            async for chunk in response:
-                now = time.time()
-                if hasattr(chunk, "usage") and chunk.usage:
-                    captured_usage = self._normalize_raw_usage(chunk.usage)
+            try:
+                async for chunk in response:
+                    now = time.time()
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        captured_usage = self._normalize_raw_usage(chunk.usage)
 
-                choices = getattr(chunk, "choices", None) or []
-                if not choices:
-                    continue
+                    choices = getattr(chunk, "choices", None) or []
+                    if not choices:
+                        continue
 
-                first_choice = choices[0]
-                if getattr(first_choice, "finish_reason", None):
-                    finish_reason = first_choice.finish_reason
+                    first_choice = choices[0]
+                    if getattr(first_choice, "finish_reason", None):
+                        finish_reason = first_choice.finish_reason
 
-                delta = getattr(first_choice, "delta", None)
-                if not delta:
-                    continue
+                    delta = getattr(first_choice, "delta", None)
+                    if not delta:
+                        continue
 
-                content_delta = getattr(delta, "content", None)
-                reasoning_delta = (
-                    getattr(delta, "reasoning_content", None)
-                    or getattr(delta, "reasoning", None)
-                    or getattr(delta, "thought", None)
-                )
-                if not reasoning_delta and hasattr(delta, "model_extra") and isinstance(delta.model_extra, dict):
+                    content_delta = getattr(delta, "content", None)
                     reasoning_delta = (
-                        delta.model_extra.get("reasoning_content")
-                        or delta.model_extra.get("reasoning")
-                        or delta.model_extra.get("thought")
+                        getattr(delta, "reasoning_content", None)
+                        or getattr(delta, "reasoning", None)
+                        or getattr(delta, "thought", None)
                     )
+                    if not reasoning_delta and hasattr(delta, "model_extra") and isinstance(delta.model_extra, dict):
+                        reasoning_delta = (
+                            delta.model_extra.get("reasoning_content")
+                            or delta.model_extra.get("reasoning")
+                            or delta.model_extra.get("thought")
+                        )
 
-                if (content_delta or reasoning_delta) and first_token_at is None:
-                    first_token_at = now
+                    if (content_delta or reasoning_delta) and first_token_at is None:
+                        first_token_at = now
 
-                if content_delta:
-                    accumulated_content.append(content_delta)
-                    sys.stdout.write(content_delta)
-                    sys.stdout.flush()
+                    if content_delta:
+                        accumulated_content.append(content_delta)
+                        sys.stdout.write(content_delta)
+                        sys.stdout.flush()
 
-                if reasoning_delta:
-                    accumulated_reasoning.append(reasoning_delta)
-                    sys.stdout.write(reasoning_delta)
-                    sys.stdout.flush()
+                    if reasoning_delta:
+                        accumulated_reasoning.append(reasoning_delta)
+                        sys.stdout.write(reasoning_delta)
+                        sys.stdout.flush()
 
-                tc_deltas = getattr(delta, "tool_calls", None)
-                if tc_deltas:
-                    for tc in tc_deltas:
-                        idx = getattr(tc, "index", 0)
-                        if idx not in accumulated_tool_calls:
-                            accumulated_tool_calls[idx] = {
-                                "id": getattr(tc, "id", None) or f"call_{idx}_{uuid.uuid4().hex[:6]}",
-                                "name": "",
-                                "arguments": "",
-                            }
-                        if getattr(tc, "id", None):
-                            accumulated_tool_calls[idx]["id"] = tc.id
+                    tc_deltas = getattr(delta, "tool_calls", None)
+                    if tc_deltas:
+                        for tc in tc_deltas:
+                            idx = getattr(tc, "index", 0)
+                            if idx not in accumulated_tool_calls:
+                                accumulated_tool_calls[idx] = {
+                                    "id": getattr(tc, "id", None) or f"call_{idx}_{uuid.uuid4().hex[:6]}",
+                                    "name": "",
+                                    "arguments": "",
+                                }
+                            if getattr(tc, "id", None):
+                                accumulated_tool_calls[idx]["id"] = tc.id
 
-                        fn = getattr(tc, "function", None)
-                        if fn:
-                            if getattr(fn, "name", None):
-                                if not accumulated_tool_calls[idx]["name"]:
-                                    print(f"\n[ENGINE PELDRUN] Tool call requested: '{fn.name}'", flush=True)
-                                accumulated_tool_calls[idx]["name"] += fn.name
-                            if getattr(fn, "arguments", None):
-                                accumulated_tool_calls[idx]["arguments"] += fn.arguments
+                            fn = getattr(tc, "function", None)
+                            if fn:
+                                if getattr(fn, "name", None):
+                                    if not accumulated_tool_calls[idx]["name"]:
+                                        print(f"\n[ENGINE PELDRUN] Tool call requested: '{fn.name}'", flush=True)
+                                    accumulated_tool_calls[idx]["name"] += fn.name
+                                if getattr(fn, "arguments", None):
+                                    accumulated_tool_calls[idx]["arguments"] += fn.arguments
+
+            except Exception as stream_read_err:
+                logger.warning(
+                    "[LLM CLIENT] Active stream interrupted for model '%s': %s",
+                    chosen_model,
+                    stream_read_err,
+                )
+                stream_interrupted = True
+
+            if stream_interrupted and not accumulated_content and not accumulated_reasoning and not accumulated_tool_calls:
+                print(
+                    f"\n[LLM CLIENT] Stream interrupted for '{chosen_model}' with zero tokens. Falling back to non-streaming...",
+                    flush=True,
+                )
+                call_kwargs["stream"] = False
+                non_stream_resp = await self.client.chat.completions.create(**call_kwargs)
+                return self._process_non_streaming_choice(
+                    response=non_stream_resp,
+                    effective_messages=effective_messages,
+                    chosen_model=chosen_model,
+                    start_time=start_time,
+                )
 
             total_latency_ms = (time.time() - start_time) * 1000.0
             ttft_ms = (first_token_at - start_time) * 1000.0 if first_token_at else total_latency_ms
@@ -697,76 +821,12 @@ class AsyncLLMClient:
                 ttft_ms=ttft_ms,
             )
 
-        total_latency_ms = (time.time() - start_time) * 1000.0
-        if not response.choices:
-            return LLMResponse(
-                content="",
-                raw=response,
-                latency_ms=total_latency_ms,
-                usage=self._fallback_usage_estimation(messages=effective_messages, model=chosen_model),
-            )
-
-        first_choice = response.choices[0]
-        message = first_choice.message
-        content = message.content or ""
-
-        reasoning = (
-            getattr(message, "reasoning_content", None)
-            or getattr(message, "reasoning", None)
-            or getattr(message, "thought", None)
-        )
-        if not reasoning and hasattr(message, "model_extra") and isinstance(message.model_extra, dict):
-            reasoning = (
-                message.model_extra.get("reasoning_content")
-                or message.model_extra.get("reasoning")
-                or message.model_extra.get("thought")
-            )
-
-        finish_reason = first_choice.finish_reason
-
-        parsed_tool_calls = []
-        if message.tool_calls:
-            for idx, call in enumerate(message.tool_calls):
-                fn = call.function
-                args = fn.arguments
-                if isinstance(args, str):
-                    try:
-                        parsed_args = json.loads(args)
-                    except Exception:
-                        parsed_args = {"raw": args}
-                else:
-                    parsed_args = args or {}
-                parsed_tool_calls.append(
-                    ToolCall(
-                        id=call.id or f"call_{idx}_{uuid.uuid4().hex[:6]}",
-                        name=fn.name,
-                        arguments=parsed_args,
-                        type="function",
-                    )
-                )
-
-        usage = self._normalize_raw_usage(response.usage)
-        if usage is None:
-            usage = self._fallback_usage_estimation(
-                messages=effective_messages,
-                output_text=content,
-                reasoning_text=reasoning,
-                tool_calls=parsed_tool_calls,
-                model=chosen_model,
-            )
-
-        return LLMResponse(
-            content=content,
-            reasoning=reasoning,
-            reasoning_content=reasoning,
-            thought=reasoning,
-            tool_calls=parsed_tool_calls,
-            finish_reason=finish_reason,
-            usage=usage,
-            model=response.model or chosen_model,
-            raw=response,
-            latency_ms=total_latency_ms,
-            ttft_ms=total_latency_ms,
+        response = await self.client.chat.completions.create(**call_kwargs)
+        return self._process_non_streaming_choice(
+            response=response,
+            effective_messages=effective_messages,
+            chosen_model=chosen_model,
+            start_time=start_time,
         )
 
     async def generate(self, *args: Any, **kwargs: Any) -> LLMResponse:
