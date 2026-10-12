@@ -1,3 +1,4 @@
+# Path: backend/peldrun/agents/tool_call_agent.py
 """
 backend/peldrun/agents/tool_call_agent.py
 
@@ -367,8 +368,13 @@ class ToolCallAgent(BaseAgent):
                 attempt_exc: Optional[Exception] = None
 
                 if tool_inst is not None:
+                    timeout_limit = (
+                        float(args.get("timeout_seconds") or 600.0)
+                        if is_human_tool
+                        else policy.timeout_seconds
+                    )
+
                     try:
-                        timeout_limit = policy.timeout_seconds
                         res: Any
 
                         async def _execute_underlying() -> Any:
@@ -410,7 +416,7 @@ class ToolCallAgent(BaseAgent):
                     except (asyncio.TimeoutError, TimeoutError) as t_err:
                         attempt_exc = t_err
                         has_error = True
-                        output_str = f"Tool '{tool_name}' timed out after {policy.timeout_seconds}s."
+                        output_str = f"Tool '{tool_name}' timed out after {timeout_limit}s."
 
                     except asyncio.CancelledError as cancel_err:
                         if is_human_tool and self.state is not None:

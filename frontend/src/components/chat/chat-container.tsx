@@ -1,5 +1,4 @@
 ﻿// Path: frontend/src/components/chat/chat-container.tsx
-
 "use client";
 
 import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
@@ -42,6 +41,13 @@ interface DelegationApprovalRequest {
   timeoutSeconds: number;
   createdAt: number;
 }
+
+/**
+ * Human-interactive tool names recognized by the container's SSE handlers.
+ * Kept as a Set to allow fast lookups both in event routing and in the
+ * observation-clearing guard below.
+ */
+const HUMAN_TOOL_NAMES = new Set(["ask_human", "human_input"]);
 
 function safeRender(val: any): string {
   if (val === null || val === undefined) return "";
@@ -213,7 +219,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
                 step: ev.step || 1,
                 type: ev.type || "thought",
                 content: safeRender(ev.data?.thought || ev.data?.output || ev.data?.content || ev.data || JSON.stringify(ev)),
-                toolName: ev.data?.name,
+                toolName: ev.data?.tool_name || ev.data?.name || ev.data?.tool,
                 timestamp: ev.timestamp || "",
               }))
               .filter((ev: StepEvent) => ev.content.trim() !== "" || Boolean(ev.toolName));
@@ -259,7 +265,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
             const evType = ev.type || "thought";
             const evContent = ev.data?.thought || ev.data?.output || ev.data?.content || ev.data || JSON.stringify(ev);
             const rendered = safeRender(evContent);
-            const tool = ev.data?.name;
+            const tool = ev.data?.tool_name || ev.data?.name || ev.data?.tool;
             if (rendered.trim() !== "" || Boolean(tool)) {
               replayed.push({
                 id: `replay-${idx}-${Math.random()}`,
@@ -345,23 +351,66 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         }
         if (payload.data?.tokens) setTokensUsed(payload.data.tokens);
       } else if (eventType === "tool_call") {
-        const name = payload.data?.name;
-        const args = payload.data?.arguments ?? "";
-        if (name === "ask_human" || (typeof args === "string" && (args.includes("?") || args.includes("prefer")))) {
-          setHumanQuery(typeof args === "string" ? args : JSON.stringify(args));
+        const name = payload.data?.tool_name || payload.data?.name || payload.data?.toolName || payload.data?.tool;
+        const rawArgs = payload.data?.arguments ?? payload.data?.args ?? "";
+
+        let promptText = "";
+        if (typeof rawArgs === "object" && rawArgs !== null) {
+          promptText = rawArgs.prompt || rawArgs.question || rawArgs.query || rawArgs.message || "";
+        } else if (typeof rawArgs === "string") {
+          try {
+            const parsed = JSON.parse(rawArgs);
+            promptText = parsed.prompt || parsed.question || parsed.query || parsed.message || rawArgs;
+          } catch {
+            promptText = rawArgs;
+          }
         }
-        appendStep("tool_call", args, step, name);
+
+        const isHumanInteraction =
+          HUMAN_TOOL_NAMES.has(name || "") ||
+          (promptText && (promptText.includes("?") || promptText.includes("prefer")));
+
+        if (isHumanInteraction && promptText) {
+          setHumanQuery(promptText);
+        }
+
+        appendStep("tool_call", rawArgs, step, name);
         setExpandedSteps((prev) => ({ ...prev, [`active-${step}`]: true }));
         if (typeof window !== "undefined") {
           window.dispatchEvent(
             new CustomEvent("peldrun:log-entry", {
-              detail: { line: `[${logTimestamp}] [TOOL_CALL] ${name || "tool"}(${typeof args === "string" ? args : JSON.stringify(args)})` },
+              detail: { line: `[${logTimestamp}] [TOOL_CALL] ${name || "tool"}(${typeof rawArgs === "string" ? rawArgs : JSON.stringify(rawArgs)})` },
             })
           );
         }
+      } else if (eventType === "ask_human") {
+        const promptText =
+          payload.data?.prompt ||
+          payload.data?.question ||
+          payload.data?.query ||
+          payload.data?.message ||
+          "";
+        if (promptText) {
+          setHumanQuery(promptText);
+        }
+        appendStep("tool_call", payload.data, step, "ask_human");
+        setExpandedSteps((prev) => ({ ...prev, [`active-${step}`]: true }));
       } else if (eventType === "observation") {
         const raw = payload.data?.output ?? "Execution completed.";
-        appendStep("observation", raw, step);
+        const observationTool = payload.data?.tool_name || payload.data?.name || payload.data?.tool;
+
+        /**
+         * FIX: Only clear the pending human query when the observation comes
+         * from a NON-human tool. Observations emitted by ask_human/human_input
+         * themselves represent the tool's own result and must NOT wipe the
+         * awaiting prompt from the UI, otherwise the interaction card would
+         * never render.
+         */
+        if (!HUMAN_TOOL_NAMES.has(observationTool || "")) {
+          setHumanQuery(null);
+        }
+
+        appendStep("observation", raw, step, observationTool);
         if (typeof window !== "undefined") {
           window.dispatchEvent(
             new CustomEvent("peldrun:log-entry", {
@@ -400,6 +449,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         fetchJobFiles(jobId);
 
       } else if (eventType === "final" || eventType === "done") {
+        setHumanQuery(null);
         const resText = payload.data?.result ?? payload.data?.content ?? "Task completed successfully.";
         if (eventType === "final") setFinalResult(safeRender(resText));
 
@@ -458,6 +508,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
           window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
         }
       } else if (eventType === "error") {
+        setHumanQuery(null);
         const errText = payload.data?.message ?? "Execution error encountered.";
         setFinalResult(safeRender(errText));
         setStatus("failed");
@@ -501,6 +552,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       "step_start",
       "thought",
       "tool_call",
+      "ask_human",
       "observation",
       "artifact_created",
       "artifact",
@@ -640,6 +692,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     try {
       await fetch(`/api/run/jobs/${activeJobId}/stop`, { method: "POST" });
       setStatus("failed");
+      setHumanQuery(null);
       if (eventSourceRef.current) eventSourceRef.current.close();
       if (typeof window !== "undefined") {
         window.dispatchEvent(

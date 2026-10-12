@@ -85,13 +85,19 @@ interface ChatThreadProps {
   costUsd?: number | null;
   latencyMs?: number | null;
   tokensPerSecond?: number | null;
-  // Multi-Agent PR 6 Extensions
   activeChildRuns?: Record<string, ChildRunState>;
   pendingApprovals?: Record<string, DelegationApprovalRequest>;
   onApproveDelegation?: (approvalId: string, editedInstruction?: string) => Promise<void>;
   onRejectDelegation?: (approvalId: string) => Promise<void>;
   onCancelSubtask?: (childRunId: string) => Promise<void>;
 }
+
+/**
+ * Human-interactive tool names recognized by the chat thread renderer.
+ * Kept as a constant so both the extraction logic and the resolution logic
+ * remain consistent across the component tree.
+ */
+const HUMAN_TOOL_NAMES = new Set(["ask_human", "human_input"]);
 
 function parsePromptAndAttachments(
   rawPrompt: string,
@@ -363,12 +369,26 @@ export function ChatThread({
     .reverse()
     .find((s) => s.type === "thought" && s.content && !s.content.startsWith("Step ") && !s.content.startsWith("terminate("));
 
-  const pendingHumanCall = [...activeStepsList].reverse().find((s) => {
-    return (
-      (s.toolName === "ask_human" || s.toolName === "human_input") &&
-      s.type === "tool_call"
-    );
+  // Locate the most recent human tool invocation in the active steps sequence
+  const humanCallIndex = [...activeStepsList].map((s, idx) => ({ s, idx })).reverse().find(({ s }) => {
+    return HUMAN_TOOL_NAMES.has(s.toolName || "") && s.type === "tool_call";
   });
+
+  /**
+   * FIX: An observation is only considered as "resolving" the human call if it
+   * was produced by a NON-human tool. Observations emitted by the ask_human tool
+   * itself (reflecting its own result) must be ignored, otherwise the pending
+   * human prompt would immediately be marked as resolved and the awaiting card
+   * would never render.
+   */
+  const isCallResolved = humanCallIndex !== undefined &&
+    activeStepsList.slice(humanCallIndex.idx + 1).some((s) => {
+      if (s.type !== "observation") return false;
+      if (HUMAN_TOOL_NAMES.has(s.toolName || "")) return false;
+      return true;
+    });
+
+  const pendingHumanCall = humanCallIndex && !isCallResolved ? humanCallIndex.s : undefined;
 
   let detectedPrompt = humanQuery;
   let detectedType = "text";
@@ -376,9 +396,19 @@ export function ChatThread({
 
   if (pendingHumanCall && pendingHumanCall.content) {
     try {
-      const parsedArgs = JSON.parse(pendingHumanCall.content);
+      const parsedArgs =
+        typeof pendingHumanCall.content === "object"
+          ? pendingHumanCall.content
+          : JSON.parse(pendingHumanCall.content);
+
       if (parsedArgs && typeof parsedArgs === "object") {
-        detectedPrompt = parsedArgs.prompt || parsedArgs.query || detectedPrompt;
+        detectedPrompt =
+          humanQuery ||
+          parsedArgs.prompt ||
+          parsedArgs.question ||
+          parsedArgs.query ||
+          parsedArgs.message ||
+          "";
         detectedType = (parsedArgs.input_type || "text").toLowerCase();
         if (Array.isArray(parsedArgs.options) && parsedArgs.options.length > 0) {
           detectedOptions = parsedArgs.options.map(String);
@@ -393,7 +423,17 @@ export function ChatThread({
     }
   }
 
-  const isHumanWaiting = Boolean(detectedPrompt && status === "running");
+  /**
+   * FIX: The waiting card should render whenever there is a pending human call
+   * OR a detected prompt, and the agent is still running. Previously this
+   * required both `detectedPrompt` AND the call to be unresolved, which failed
+   * whenever the observation from ask_human cleared the humanQuery upstream.
+   */
+  const isHumanWaiting = Boolean(
+    (detectedPrompt || pendingHumanCall) &&
+    !isCallResolved &&
+    (status === "running" || (status as string) === "waiting_for_input")
+  );
   const activeApprovalList = Object.values(pendingApprovals || {});
 
   return (
@@ -499,7 +539,7 @@ export function ChatThread({
           />
         )}
 
-        {/* Active Delegation Approval Cards (PR 5 & PR 6) */}
+        {/* Active Delegation Approval Cards */}
         {activeApprovalList.length > 0 && onApproveDelegation && onRejectDelegation && (
           <div className="space-y-2">
             {activeApprovalList.map((approval) => (
@@ -514,7 +554,7 @@ export function ChatThread({
           </div>
         )}
 
-        {/* Active Multi-Agent Subtask Observability Tree (PR 6) */}
+        {/* Active Multi-Agent Subtask Observability Tree */}
         {Object.keys(activeChildRuns || {}).length > 0 && (
           <SubtaskTree
             childRuns={activeChildRuns}
@@ -537,7 +577,7 @@ export function ChatThread({
             </div>
 
             <div className="p-3 rounded-lg bg-background border border-border text-foreground text-sm font-medium leading-relaxed whitespace-pre-wrap">
-              {detectedPrompt}
+              {detectedPrompt || "The agent requires your input to proceed."}
             </div>
 
             {detectedOptions.length > 0 && (
