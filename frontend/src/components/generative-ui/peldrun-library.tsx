@@ -4,6 +4,7 @@
 import React from "react";
 import dynamic from "next/dynamic";
 import { z } from "zod";
+import { defineComponent, createLibrary } from "@openuidev/react-lang";
 
 import { PeldrunCard } from "./catalog/PeldrunCard";
 import { PeldrunMetric } from "./catalog/PeldrunMetric";
@@ -23,87 +24,63 @@ import type { ChartVariant } from "./catalog/PeldrunShadcnChart";
 import type { CarouselSlide } from "./catalog/PeldrunCarousel";
 import type { FormFieldDefinition } from "./types";
 
-// Dynamic imports for resource-heavy engines
+// ============================================================
+// Dynamic imports for heavy rendering engines
+// ============================================================
+
 const LazyDiagram = dynamic(
   () => import("./catalog/PeldrunDiagram").then((m) => m.PeldrunDiagram),
-  {
-    loading: () => (
-      <div className="my-2.5 rounded-xl border border-border/80 bg-card/50 p-6 flex items-center justify-center gap-2 text-xs text-muted-foreground animate-pulse">
-        <span className="w-3.5 h-3.5 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-        <span>Loading diagram engine...</span>
-      </div>
-    ),
-    ssr: false,
-  }
+  { loading: () => <div className="p-6 text-xs text-muted-foreground animate-pulse">Loading diagram...</div>, ssr: false }
 );
 
 const LazyMathPlot = dynamic(
   () => import("./catalog/PeldrunMathPlot").then((m) => m.PeldrunMathPlot),
-  {
-    loading: () => (
-      <div className="my-2.5 rounded-xl border border-border/80 bg-card/50 p-6 flex items-center justify-center gap-2 text-xs text-muted-foreground animate-pulse">
-        <span className="w-3.5 h-3.5 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-        <span>Loading mathematical plotting engine...</span>
-      </div>
-    ),
-    ssr: false,
-  }
+  { loading: () => <div className="p-6 text-xs text-muted-foreground animate-pulse">Loading math plot...</div>, ssr: false }
 );
 
 const LazyShadcnChart = dynamic(
   () => import("./catalog/PeldrunShadcnChart").then((m) => m.PeldrunShadcnChart),
-  {
-    loading: () => (
-      <div className="my-2 rounded-xl border border-border/80 bg-card/50 p-6 flex items-center justify-center gap-2 text-xs text-muted-foreground animate-pulse">
-        <span className="w-3.5 h-3.5 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-        <span>Rendering visual analytics chart...</span>
-      </div>
-    ),
-    ssr: false,
-  }
+  { loading: () => <div className="p-6 text-xs text-muted-foreground animate-pulse">Loading chart...</div>, ssr: false }
 );
 
 // ============================================================
-// 1. Zod Component Schemas
+// 1. Zod Schemas (Field order = positional argument order)
 // ============================================================
 
+export const StackSchema = z.object({
+  children: z.array(z.any()).default([]).describe("Child component references"),
+  direction: z.enum(["vertical", "horizontal"]).default("vertical").describe("Layout direction"),
+  gap: z.string().optional().describe("Spacing gap"),
+});
+
+export const GridSchema = z.object({
+  children: z.array(z.any()).default([]).describe("Child component references"),
+  columns: z.number().default(2).describe("Number of columns"),
+});
+
+export const CardSchema = z.object({
+  title: z.string().optional().describe("Card title"),
+  description: z.string().optional().describe("Card description"),
+  items: z.array(z.string()).default([]).describe("Bullet items"),
+});
+
 export const MetricSchema = z.object({
-  label: z.string().default("Metric"),
-  value: z.union([z.string(), z.number()]).default("0"),
-  change: z.string().optional(),
-  trend: z.enum(["up", "down", "neutral"]).default("neutral"),
+  label: z.string().default("Metric").describe("KPI label"),
+  value: z.union([z.string(), z.number()]).default("0").describe("KPI value"),
+  change: z.string().optional().describe("Change magnitude"),
+  trend: z.enum(["up", "down", "neutral"]).default("neutral").describe("Trend"),
 });
 
-export const BadgeSchema = z.object({
-  label: z.string(),
-  variant: z.enum(["info", "success", "warning", "error", "neutral"]).default("neutral"),
-});
-
-export const AlertSchema = z.object({
-  message: z.string(),
-  type: z.enum(["info", "success", "warning", "error"]).default("info"),
-});
-
-export const ProgressSchema = z.object({
-  label: z.string().default("Progress"),
-  percentage: z.number().min(0).max(100).default(0),
+export const ChartSchema = z.object({
+  type: z.enum(["bar", "line", "donut", "area"]).default("bar"),
+  title: z.string().default("Analytics"),
+  unit: z.string().optional(),
+  data: z.array(z.object({ label: z.string(), value: z.number() })).default([]),
 });
 
 export const TableSchema = z.object({
   headers: z.array(z.string()).default(["Item", "Value"]),
-  rows: z.array(z.array(z.string())).default([]),
-});
-
-export const ChartSchema = z.object({
-  title: z.string().default("Performance Analytics"),
-  type: z.enum(["bar", "line", "donut", "area"]).default("bar"),
-  data: z.array(
-    z.object({
-      label: z.string(),
-      value: z.number(),
-    })
-  ).default([]),
-  unit: z.string().optional(),
+  rows: z.array(z.array(z.union([z.string(), z.number()]))).default([]),
 });
 
 export const DiagramSchema = z.object({
@@ -113,35 +90,39 @@ export const DiagramSchema = z.object({
 
 export const MathPlotSchema = z.object({
   title: z.string().optional(),
-  functionFormula: z.string().optional(),
+  formula: z.string().optional(),
   equation: z.string().optional(),
   rangeX: z.tuple([z.number(), z.number()]).default([-10, 10]),
 });
 
+export const AlertSchema = z.object({
+  type: z.enum(["info", "success", "warning", "error"]).default("info"),
+  message: z.string(),
+});
+
+export const BadgeSchema = z.object({
+  label: z.string(),
+  variant: z.enum(["info", "success", "warning", "error", "neutral"]).default("neutral"),
+});
+
+export const ProgressSchema = z.object({
+  label: z.string().default("Progress"),
+  percentage: z.number().min(0).max(100).default(0),
+});
+
 export const CarouselSchema = z.object({
   title: z.string().optional(),
-  slides: z.array(
-    z.object({
-      title: z.string(),
-      description: z.string().optional(),
-      content: z.string(),
-    })
-  ).default([]),
+  slides: z.array(z.object({ title: z.string(), description: z.string().optional(), content: z.string() })).default([]),
 });
 
 export const AccordionSchema = z.object({
-  items: z.array(
-    z.object({
-      title: z.string(),
-      content: z.string(),
-    })
-  ).default([]),
+  items: z.array(z.object({ title: z.string(), content: z.string() })).default([]),
 });
 
 export const TestResultsSchema = z.object({
-  passedCount: z.number().default(0),
-  failedCount: z.number().default(0),
-  skippedCount: z.number().default(0),
+  passed: z.number().default(0),
+  failed: z.number().default(0),
+  skipped: z.number().default(0),
 });
 
 export const ActionButtonSchema = z.object({
@@ -160,238 +141,253 @@ export const FormFieldSchema = z.object({
 
 export const FormSchema = z.object({
   title: z.string(),
-  description: z.string().optional(),
   fields: z.array(FormFieldSchema).default([]),
   submitLabel: z.string().default("Submit"),
-});
-
-export const CardSchema = z.object({
-  title: z.string().optional(),
   description: z.string().optional(),
-  items: z.array(z.string()).default([]),
 });
 
 // ============================================================
-// 2. Component Contract & Definition Builder
+// 2. Component Definitions (CORRECT { props, renderNode } pattern)
 // ============================================================
 
-export interface ComponentDefinition {
-  name: string;
-  description: string;
-  schema: z.ZodTypeAny;
-  render: (props: any) => React.JSX.Element;
-}
+export const Stack = defineComponent({
+  name: "Stack",
+  description: "Root layout container that stacks UI components vertically or horizontally.",
+  props: StackSchema,
+  component: ({ props, renderNode }: any) => {
+    const p = props ?? {};
+    const items = Array.isArray(p.children) ? p.children : p.children ? [p.children] : [];
+    const isHorizontal = p.direction === "horizontal";
+    return (
+      <div className={`flex ${isHorizontal ? "flex-row flex-wrap" : "flex-col"} gap-3.5 w-full my-2`}>
+        {items.map((child: any, idx: number) => (
+          <div key={`stack-item-${idx}`} className="w-full">
+            {renderNode ? renderNode(child) : null}
+          </div>
+        ))}
+      </div>
+    );
+  },
+});
 
-function createComponentDefinition<T extends z.ZodTypeAny>(def: {
-  name: string;
-  description: string;
-  schema: T;
-  render: (props: z.infer<T>) => React.JSX.Element;
-}): ComponentDefinition {
-  return {
-    name: def.name,
-    description: def.description,
-    schema: def.schema,
-    render: (props: unknown) => def.render(props as z.infer<T>),
-  };
-}
+export const Grid = defineComponent({
+  name: "Grid",
+  description: "Responsive grid container for multi-column layout.",
+  props: GridSchema,
+  component: ({ props, renderNode }: any) => {
+    const p = props ?? {};
+    const items = Array.isArray(p.children) ? p.children : p.children ? [p.children] : [];
+    const cols = p.columns ?? 2;
+    const colClass =
+      cols === 1 ? "grid-cols-1"
+      : cols === 3 ? "grid-cols-1 md:grid-cols-3"
+      : cols === 4 ? "grid-cols-1 md:grid-cols-2 lg:grid-cols-4"
+      : "grid-cols-1 md:grid-cols-2";
+    return (
+      <div className={`grid ${colClass} gap-3.5 w-full my-2`}>
+        {items.map((child: any, idx: number) => (
+          <div key={`grid-item-${idx}`} className="w-full">
+            {renderNode ? renderNode(child) : null}
+          </div>
+        ))}
+      </div>
+    );
+  },
+});
 
-// ============================================================
-// 3. Peldrun Component Registry Map
-// ============================================================
-
-export const peldrunComponentRegistry: Record<string, ComponentDefinition> = {
-  Metric: createComponentDefinition({
-    name: "Metric",
-    description: "Displays a numeric KPI metric with change magnitude and trend indicator.",
-    schema: MetricSchema,
-    render: (props) => (
+export const Card = defineComponent({
+  name: "Card",
+  description: "General container card with title, description, and optional nested markdown items.",
+  props: CardSchema,
+  component: ({ props }: any) => {
+    const p = props ?? {};
+    return (
       <PeldrunMotionWrapper>
-        <PeldrunMetric
-          label={props.label}
-          value={props.value}
-          change={props.change}
-          trend={props.trend}
-        />
-      </PeldrunMotionWrapper>
-    ),
-  }),
-
-  Badge: createComponentDefinition({
-    name: "Badge",
-    description: "Displays a compact status badge or service state indicator.",
-    schema: BadgeSchema,
-    render: (props) => (
-      <PeldrunBadge label={props.label} variant={props.variant} />
-    ),
-  }),
-
-  Alert: createComponentDefinition({
-    name: "Alert",
-    description: "Displays a prominent message callout with contextual severity coloring.",
-    schema: AlertSchema,
-    render: (props) => (
-      <PeldrunMotionWrapper>
-        <PeldrunAlert message={props.message} type={props.type} />
-      </PeldrunMotionWrapper>
-    ),
-  }),
-
-  Progress: createComponentDefinition({
-    name: "Progress",
-    description: "Visualizes completion percentage or resource capacity.",
-    schema: ProgressSchema,
-    render: (props) => (
-      <PeldrunMotionWrapper>
-        <PeldrunProgress label={props.label} percentage={props.percentage} />
-      </PeldrunMotionWrapper>
-    ),
-  }),
-
-  Table: createComponentDefinition({
-    name: "Table",
-    description: "Renders tabular structured data with headers and cell rows.",
-    schema: TableSchema,
-    render: (props) => (
-      <PeldrunMotionWrapper>
-        <PeldrunTable headers={props.headers} rows={props.rows} />
-      </PeldrunMotionWrapper>
-    ),
-  }),
-
-  Chart: createComponentDefinition({
-    name: "Chart",
-    description: "Renders visual data charts (bar, line, donut, area).",
-    schema: ChartSchema,
-    render: (props) => (
-      <LazyShadcnChart
-        title={props.title}
-        type={props.type as ChartVariant}
-        data={props.data}
-        unit={props.unit}
-      />
-    ),
-  }),
-
-  Diagram: createComponentDefinition({
-    name: "Diagram",
-    description: "Renders visual flowcharts and architecture diagrams via Mermaid syntax.",
-    schema: DiagramSchema,
-    render: (props) => (
-      <LazyDiagram title={props.title} code={props.code} />
-    ),
-  }),
-
-  MathPlot: createComponentDefinition({
-    name: "MathPlot",
-    description: "Plots mathematical 2D function curves and scientific LaTeX formulas.",
-    schema: MathPlotSchema,
-    render: (props) => (
-      <LazyMathPlot
-        title={props.title}
-        functionFormula={props.functionFormula}
-        equation={props.equation}
-        rangeX={props.rangeX}
-      />
-    ),
-  }),
-
-  Carousel: createComponentDefinition({
-    name: "Carousel",
-    description: "Displays multi-card showcases in an interactive swipeable slider.",
-    schema: CarouselSchema,
-    render: (props) => (
-      <PeldrunCarousel title={props.title} slides={props.slides as CarouselSlide[]} />
-    ),
-  }),
-
-  Accordion: createComponentDefinition({
-    name: "Accordion",
-    description: "Collapsible disclosure sections for progressive detail disclosure.",
-    schema: AccordionSchema,
-    render: (props) => (
-      <PeldrunMotionWrapper>
-        <PeldrunAccordion items={props.items} />
-      </PeldrunMotionWrapper>
-    ),
-  }),
-
-  TestResults: createComponentDefinition({
-    name: "TestResults",
-    description: "Displays test execution summary with passed, failed, and skipped metrics.",
-    schema: TestResultsSchema,
-    render: (props) => (
-      <PeldrunMotionWrapper>
-        <PeldrunTestResults
-          passedCount={props.passedCount}
-          failedCount={props.failedCount}
-          skippedCount={props.skippedCount}
-        />
-      </PeldrunMotionWrapper>
-    ),
-  }),
-
-  ActionButton: createComponentDefinition({
-    name: "ActionButton",
-    description: "Interactive button triggering predefined agent workflows or tools.",
-    schema: ActionButtonSchema,
-    render: (props) => (
-      <PeldrunActionButton label={props.label} actionId={props.actionId} />
-    ),
-  }),
-
-  Form: createComponentDefinition({
-    name: "Form",
-    description: "Configurable user input form with typed input fields.",
-    schema: FormSchema,
-    render: (props) => (
-      <PeldrunMotionWrapper>
-        <PeldrunForm
-          title={props.title}
-          description={props.description}
-          fields={props.fields as FormFieldDefinition[]}
-          submitLabel={props.submitLabel}
-        />
-      </PeldrunMotionWrapper>
-    ),
-  }),
-
-  Card: createComponentDefinition({
-    name: "Card",
-    description: "General container card with title, description, and nested elements.",
-    schema: CardSchema,
-    render: (props) => (
-      <PeldrunMotionWrapper>
-        <PeldrunCard title={props.title} description={props.description}>
-          {props.items && props.items.length > 0 && (
+        <PeldrunCard title={p.title} description={p.description}>
+          {p.items && p.items.length > 0 && (
             <div className="space-y-1 mt-1.5 text-xs text-muted-foreground">
-              {props.items.map((it, idx) => (
-                <div key={`card-item-${idx}`}>
-                  <MarkdownRenderer content={it} />
-                </div>
+              {p.items.map((it: string, idx: number) => (
+                <div key={`card-item-${idx}`}><MarkdownRenderer content={it} /></div>
               ))}
             </div>
           )}
         </PeldrunCard>
       </PeldrunMotionWrapper>
-    ),
-  }),
-};
+    );
+  },
+});
 
-/**
- * Validates raw payload against a registered component schema and renders it.
- */
-export function renderPeldrunComponent(componentName: string, rawProps: unknown): React.JSX.Element | null {
-  const definition = peldrunComponentRegistry[componentName];
-  if (!definition) {
-    return null;
-  }
+export const Metric = defineComponent({
+  name: "Metric",
+  description: "Displays a numeric KPI metric with trend.",
+  props: MetricSchema,
+  component: ({ props }: any) => {
+    const p = props ?? {};
+    return (
+      <PeldrunMotionWrapper>
+        <PeldrunMetric label={p.label} value={p.value} change={p.change} trend={p.trend} />
+      </PeldrunMotionWrapper>
+    );
+  },
+});
 
-  const parseResult = definition.schema.safeParse(rawProps);
-  if (!parseResult.success) {
-    console.warn(`[PeldrunLibrary] Schema validation failed for component ${componentName}:`, parseResult.error);
-    return null;
-  }
+export const Chart = defineComponent({
+  name: "Chart",
+  description: "Renders visual data analytics charts (bar, line, donut, area).",
+  props: ChartSchema,
+  component: ({ props }: any) => {
+    const p = props ?? {};
+    return <LazyShadcnChart type={(p.type as ChartVariant) || "bar"} title={p.title} unit={p.unit} data={Array.isArray(p.data) ? p.data : []} />;
+  },
+});
 
-  return definition.render(parseResult.data);
-}
+export const Table = defineComponent({
+  name: "Table",
+  description: "Renders tabular structured data.",
+  props: TableSchema,
+  component: ({ props }: any) => {
+    const p = props ?? {};
+    const safeRows = Array.isArray(p.rows)
+      ? p.rows.map((row: any) => Array.isArray(row) ? row.map((c: any) => String(c ?? "")) : [String(row ?? "")])
+      : [];
+    return (
+      <PeldrunMotionWrapper>
+        <PeldrunTable headers={p.headers || ["Item", "Value"]} rows={safeRows} />
+      </PeldrunMotionWrapper>
+    );
+  },
+});
+
+export const Diagram = defineComponent({
+  name: "Diagram",
+  description: "Renders Mermaid diagrams.",
+  props: DiagramSchema,
+  component: ({ props }: any) => {
+    const p = props ?? {};
+    return <LazyDiagram title={p.title} code={p.code ?? ""} />;
+  },
+});
+
+export const MathPlot = defineComponent({
+  name: "MathPlot",
+  description: "Plots 2D math curves and LaTeX equations.",
+  props: MathPlotSchema,
+  component: ({ props }: any) => {
+    const p = props ?? {};
+    return <LazyMathPlot title={p.title} functionFormula={p.formula} equation={p.equation} rangeX={p.rangeX} />;
+  },
+});
+
+export const Alert = defineComponent({
+  name: "Alert",
+  description: "Severity-colored message callout.",
+  props: AlertSchema,
+  component: ({ props }: any) => {
+    const p = props ?? {};
+    return (
+      <PeldrunMotionWrapper>
+        <PeldrunAlert type={p.type} message={p.message} />
+      </PeldrunMotionWrapper>
+    );
+  },
+});
+
+export const Badge = defineComponent({
+  name: "Badge",
+  description: "Compact status badge.",
+  props: BadgeSchema,
+  component: ({ props }: any) => {
+    const p = props ?? {};
+    return <PeldrunBadge label={p.label} variant={p.variant} />;
+  },
+});
+
+export const Progress = defineComponent({
+  name: "Progress",
+  description: "Percentage progress bar.",
+  props: ProgressSchema,
+  component: ({ props }: any) => {
+    const p = props ?? {};
+    return (
+      <PeldrunMotionWrapper>
+        <PeldrunProgress label={p.label} percentage={p.percentage} />
+      </PeldrunMotionWrapper>
+    );
+  },
+});
+
+export const Carousel = defineComponent({
+  name: "Carousel",
+  description: "Swipeable multi-card showcase.",
+  props: CarouselSchema,
+  component: ({ props }: any) => {
+    const p = props ?? {};
+    return <PeldrunCarousel title={p.title} slides={p.slides as CarouselSlide[]} />;
+  },
+});
+
+export const Accordion = defineComponent({
+  name: "Accordion",
+  description: "Collapsible disclosure sections.",
+  props: AccordionSchema,
+  component: ({ props }: any) => {
+    const p = props ?? {};
+    return (
+      <PeldrunMotionWrapper>
+        <PeldrunAccordion items={p.items} />
+      </PeldrunMotionWrapper>
+    );
+  },
+});
+
+export const TestResults = defineComponent({
+  name: "TestResults",
+  description: "Test execution summary.",
+  props: TestResultsSchema,
+  component: ({ props }: any) => {
+    const p = props ?? {};
+    return (
+      <PeldrunMotionWrapper>
+        <PeldrunTestResults passedCount={p.passed} failedCount={p.failed} skippedCount={p.skipped} />
+      </PeldrunMotionWrapper>
+    );
+  },
+});
+
+export const ActionButton = defineComponent({
+  name: "ActionButton",
+  description: "Interactive action trigger.",
+  props: ActionButtonSchema,
+  component: ({ props }: any) => {
+    const p = props ?? {};
+    return <PeldrunActionButton label={p.label} actionId={p.actionId} />;
+  },
+});
+
+export const Form = defineComponent({
+  name: "Form",
+  description: "Configurable input form.",
+  props: FormSchema,
+  component: ({ props }: any) => {
+    const p = props ?? {};
+    return (
+      <PeldrunMotionWrapper>
+        <PeldrunForm title={p.title} description={p.description} fields={p.fields as FormFieldDefinition[]} submitLabel={p.submitLabel} />
+      </PeldrunMotionWrapper>
+    );
+  },
+});
+
+// ============================================================
+// 3. Assembled Library
+// ============================================================
+
+export const peldrunLibrary = createLibrary({
+  root: "Stack",
+  components: [
+    Stack, Grid, Card, Metric, Chart, Table, Diagram, MathPlot,
+    Alert, Badge, Progress, Carousel, Accordion, TestResults, ActionButton, Form,
+  ],
+});
+
+export default peldrunLibrary;

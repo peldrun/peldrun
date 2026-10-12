@@ -1,148 +1,251 @@
 {
-  "name": "PeldrunUI",
-  "version": "1.0.0",
-  "description": "Native sovereign generative UI component library for Peldrun AI Agent",
+  "version": "0.5.0",
+  "root": "Stack",
   "components": [
     {
-      "name": "Metric",
-      "description": "Displays numeric KPI metrics with change indicator and trend.",
-      "parameters": {
-        "label": { "type": "string", "required": true, "description": "Metric title or KPI name" },
-        "value": { "type": "string", "required": true, "description": "Metric value (e.g. '42.8%', '1.2 GB')" },
-        "change": { "type": "string", "required": false, "description": "Relative change (e.g. '+5.2%', '-12ms')" },
-        "trend": { "type": "string", "enum": ["up", "down", "neutral"], "default": "neutral" }
+      "name": "Stack",
+      "description": "Root layout container that stacks UI components vertically or horizontally.",
+      "positionalArgs": ["children", "direction", "gap"],
+      "schema": {
+        "type": "object",
+        "properties": {
+          "children": { "type": "array", "items": { "type": "any" }, "description": "Child component references" },
+          "direction": { "type": "string", "enum": ["vertical", "horizontal"], "default": "vertical" },
+          "gap": { "type": "string" }
+        },
+        "required": ["children"]
       }
     },
     {
-      "name": "Badge",
-      "description": "Displays small status or categorization badge.",
-      "parameters": {
-        "label": { "type": "string", "required": true, "description": "Label text (e.g. 'Active', 'Operational')" },
-        "variant": { "type": "string", "enum": ["info", "success", "warning", "error", "neutral"], "default": "neutral" }
-      }
-    },
-    {
-      "name": "Alert",
-      "description": "Callout notification for critical warnings, errors, or system notices.",
-      "parameters": {
-        "message": { "type": "string", "required": true, "description": "Alert notice content" },
-        "type": { "type": "string", "enum": ["info", "success", "warning", "error"], "default": "info" }
-      }
-    },
-    {
-      "name": "Progress",
-      "description": "Percentage progress bar.",
-      "parameters": {
-        "label": { "type": "string", "required": true, "description": "Task or metric label" },
-        "percentage": { "type": "number", "required": true, "description": "Value between 0 and 100" }
-      }
-    },
-    {
-      "name": "Table",
-      "description": "Structured comparative data table.",
-      "parameters": {
-        "headers": { "type": "array", "items": "string", "required": true, "description": "Column headers" },
-        "rows": { "type": "array", "items": "array", "required": true, "description": "Row values matrix" }
-      }
-    },
-    {
-      "name": "Chart",
-      "description": "Visual data charts (bar, line, donut, area).",
-      "parameters": {
-        "title": { "type": "string", "required": false, "description": "Chart header title" },
-        "type": { "type": "string", "enum": ["bar", "line", "donut", "area"], "default": "bar" },
-        "unit": { "type": "string", "required": false, "description": "Unit of measurement (e.g. ms, %, req/s)" },
-        "data": {
-          "type": "array",
-          "items": { "label": "string", "value": "number" },
-          "required": true
-        }
-      }
-    },
-    {
-      "name": "Diagram",
-      "description": "Architectural workflows and sequence diagrams in Mermaid syntax.",
-      "parameters": {
-        "title": { "type": "string", "required": false, "description": "Diagram title" },
-        "code": { "type": "string", "required": true, "description": "Raw Mermaid DSL code" }
-      }
-    },
-    {
-      "name": "MathPlot",
-      "description": "Interactive 2D math curves and LaTeX equations.",
-      "parameters": {
-        "title": { "type": "string", "required": false, "description": "Plot title" },
-        "functionFormula": { "type": "string", "required": false, "description": "Formula in terms of x (e.g. sin(x))" },
-        "equation": { "type": "string", "required": false, "description": "LaTeX formula" },
-        "rangeX": { "type": "array", "items": "number", "default": [-10, 10] }
-      }
-    },
-    {
-      "name": "Carousel",
-      "description": "Showcase of multiple items or comparison cards.",
-      "parameters": {
-        "title": { "type": "string", "required": false },
-        "slides": {
-          "type": "array",
-          "items": { "title": "string", "description": "string", "content": "string" },
-          "required": true
-        }
-      }
-    },
-    {
-      "name": "Accordion",
-      "description": "Collapsible disclosure items for expandable details.",
-      "parameters": {
-        "items": {
-          "type": "array",
-          "items": { "title": "string", "content": "string" },
-          "required": true
-        }
-      }
-    },
-    {
-      "name": "TestResults",
-      "description": "Automated test execution telemetry scorecard.",
-      "parameters": {
-        "passedCount": { "type": "number", "required": true },
-        "failedCount": { "type": "number", "required": true },
-        "skippedCount": { "type": "number", "default": 0 }
-      }
-    },
-    {
-      "name": "ActionButton",
-      "description": "Interactive action trigger button.",
-      "parameters": {
-        "label": { "type": "string", "required": true },
-        "actionId": { "type": "string", "required": true }
-      }
-    },
-    {
-      "name": "Form",
-      "description": "Interactive structured input form.",
-      "parameters": {
-        "title": { "type": "string", "required": true },
-        "description": { "type": "string", "required": false },
-        "submitLabel": { "type": "string", "default": "Submit" },
-        "fields": {
-          "type": "array",
-          "items": {
-            "name": "string",
-            "label": "string",
-            "type": "string",
-            "placeholder": "string"
-          },
-          "required": true
-        }
+      "name": "Grid",
+      "description": "Responsive grid container for displaying components in multi-column layout.",
+      "positionalArgs": ["children", "columns"],
+      "schema": {
+        "type": "object",
+        "properties": {
+          "children": { "type": "array", "items": { "type": "any" }, "description": "Child component references" },
+          "columns": { "type": "number", "default": 2 }
+        },
+        "required": ["children"]
       }
     },
     {
       "name": "Card",
-      "description": "Structured container card with title and content items.",
-      "parameters": {
-        "title": { "type": "string", "required": false },
-        "description": { "type": "string", "required": false },
-        "items": { "type": "array", "items": "string", "required": false }
+      "description": "General container card with title, description, and optional nested markdown items.",
+      "positionalArgs": ["title", "description", "items"],
+      "schema": {
+        "type": "object",
+        "properties": {
+          "title": { "type": "string" },
+          "description": { "type": "string" },
+          "items": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    {
+      "name": "Metric",
+      "description": "Displays a numeric KPI metric with change magnitude and trend indicator.",
+      "positionalArgs": ["label", "value", "change", "trend"],
+      "schema": {
+        "type": "object",
+        "properties": {
+          "label": { "type": "string", "default": "Metric" },
+          "value": { "type": ["string", "number"], "default": "0" },
+          "change": { "type": "string" },
+          "trend": { "type": "string", "enum": ["up", "down", "neutral"], "default": "neutral" }
+        },
+        "required": ["label", "value"]
+      }
+    },
+    {
+      "name": "Chart",
+      "description": "Renders visual data analytics charts (bar, line, donut, area).",
+      "positionalArgs": ["type", "title", "unit", "data"],
+      "schema": {
+        "type": "object",
+        "properties": {
+          "type": { "type": "string", "enum": ["bar", "line", "donut", "area"], "default": "bar" },
+          "title": { "type": "string", "default": "Analytics" },
+          "unit": { "type": "string" },
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "label": { "type": "string" },
+                "value": { "type": "number" }
+              },
+              "required": ["label", "value"]
+            }
+          }
+        },
+        "required": ["type", "title", "data"]
+      }
+    },
+    {
+      "name": "Table",
+      "description": "Renders tabular structured data with column headers and cell rows.",
+      "positionalArgs": ["headers", "rows"],
+      "schema": {
+        "type": "object",
+        "properties": {
+          "headers": { "type": "array", "items": { "type": "string" } },
+          "rows": { "type": "array", "items": { "type": "array", "items": { "type": ["string", "number"] } } }
+        },
+        "required": ["headers", "rows"]
+      }
+    },
+    {
+      "name": "Diagram",
+      "description": "Renders visual flowcharts, architecture diagrams, and state machines via Mermaid syntax.",
+      "positionalArgs": ["title", "code"],
+      "schema": {
+        "type": "object",
+        "properties": {
+          "title": { "type": "string" },
+          "code": { "type": "string" }
+        },
+        "required": ["code"]
+      }
+    },
+    {
+      "name": "MathPlot",
+      "description": "Plots 2D mathematical curves and renders scientific LaTeX formulas.",
+      "positionalArgs": ["title", "formula", "equation", "rangeX"],
+      "schema": {
+        "type": "object",
+        "properties": {
+          "title": { "type": "string" },
+          "formula": { "type": "string" },
+          "equation": { "type": "string" },
+          "rangeX": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2, "default": [-10, 10] }
+        }
+      }
+    },
+    {
+      "name": "Alert",
+      "description": "Displays a prominent message callout with severity coloring (info, success, warning, error).",
+      "positionalArgs": ["type", "message"],
+      "schema": {
+        "type": "object",
+        "properties": {
+          "type": { "type": "string", "enum": ["info", "success", "warning", "error"], "default": "info" },
+          "message": { "type": "string" }
+        },
+        "required": ["type", "message"]
+      }
+    },
+    {
+      "name": "Badge",
+      "description": "Displays a compact status badge or service state indicator.",
+      "positionalArgs": ["label", "variant"],
+      "schema": {
+        "type": "object",
+        "properties": {
+          "label": { "type": "string" },
+          "variant": { "type": "string", "enum": ["info", "success", "warning", "error", "neutral"], "default": "neutral" }
+        },
+        "required": ["label"]
+      }
+    },
+    {
+      "name": "Progress",
+      "description": "Visualizes task completion percentage or resource capacity.",
+      "positionalArgs": ["label", "percentage"],
+      "schema": {
+        "type": "object",
+        "properties": {
+          "label": { "type": "string", "default": "Progress" },
+          "percentage": { "type": "number", "minimum": 0, "maximum": 100, "default": 0 }
+        },
+        "required": ["label", "percentage"]
+      }
+    },
+    {
+      "name": "Carousel",
+      "description": "Displays multi-card showcases in an interactive swipeable slider.",
+      "positionalArgs": ["title", "slides"],
+      "schema": {
+        "type": "object",
+        "properties": {
+          "title": { "type": "string" },
+          "slides": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "title": { "type": "string" },
+                "description": { "type": "string" },
+                "content": { "type": "string" }
+              },
+              "required": ["title", "content"]
+            }
+          }
+        },
+        "required": ["slides"]
+      }
+    },
+    {
+      "name": "Accordion",
+      "description": "Collapsible disclosure sections for progressive detail discovery.",
+      "positionalArgs": ["items"],
+      "schema": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "title": { "type": "string" },
+                "content": { "type": "string" }
+              },
+              "required": ["title", "content"]
+            }
+          }
+        },
+        "required": ["items"]
+      }
+    },
+    {
+      "name": "TestResults",
+      "description": "Displays automated test execution summary with passed, failed, and skipped metrics.",
+      "positionalArgs": ["passed", "failed", "skipped"],
+      "schema": {
+        "type": "object",
+        "properties": {
+          "passed": { "type": "number", "default": 0 },
+          "failed": { "type": "number", "default": 0 },
+          "skipped": { "type": "number", "default": 0 }
+        }
+      }
+    },
+    {
+      "name": "ActionButton",
+      "description": "Interactive button triggering predefined agent workflows or tools.",
+      "positionalArgs": ["label", "actionId"],
+      "schema": {
+        "type": "object",
+        "properties": {
+          "label": { "type": "string" },
+          "actionId": { "type": "string" }
+        },
+        "required": ["label", "actionId"]
+      }
+    },
+    {
+      "name": "Form",
+      "description": "Configurable user input form with typed controls and submit callback.",
+      "positionalArgs": ["title", "fields", "submitLabel", "description"],
+      "schema": {
+        "type": "object",
+        "properties": {
+          "title": { "type": "string" },
+          "fields": { "type": "array", "items": { "type": "object" } },
+          "submitLabel": { "type": "string", "default": "Submit" },
+          "description": { "type": "string" }
+        },
+        "required": ["title", "fields"]
       }
     }
   ]

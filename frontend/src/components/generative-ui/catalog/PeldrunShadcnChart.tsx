@@ -38,13 +38,30 @@ interface PeldrunShadcnChartProps {
 }
 
 const PALETTE = [
-  "#3b82f6", // blue
-  "#10b981", // emerald
-  "#f59e0b", // amber
-  "#8b5cf6", // purple
-  "#ec4899", // pink
-  "#06b6d4", // cyan
+  "#3b82f6",
+  "#10b981",
+  "#f59e0b",
+  "#8b5cf6",
+  "#ec4899",
+  "#06b6d4",
 ];
+
+// Shared axis styling — auto-domain lets Recharts fit the visible data range
+const X_AXIS_PROPS = {
+  stroke: "#888888",
+  fontSize: 11,
+  tickLine: false,
+  axisLine: false,
+} as const;
+
+const Y_AXIS_PROPS = {
+  stroke: "#888888",
+  fontSize: 11,
+  tickLine: false,
+  axisLine: false,
+  domain: ["auto", "auto"] as [string, string],
+  width: 45,
+} as const;
 
 export function PeldrunShadcnChart({
   title,
@@ -76,60 +93,53 @@ export function PeldrunShadcnChart({
     );
   }
 
+  const renderTooltip = () => (
+    <Tooltip
+      content={({ active, payload }) => {
+        if (active && payload && payload.length) {
+          return (
+            <div className="rounded-lg border border-border bg-card p-2 shadow-md text-xs">
+              <p className="font-semibold text-foreground">{payload[0].payload.name}</p>
+              <p className="text-primary font-mono">
+                {typeof payload[0].value === "number"
+                  ? payload[0].value.toLocaleString()
+                  : payload[0].value}{" "}
+                {unit}
+              </p>
+            </div>
+          );
+        }
+        return null;
+      }}
+    />
+  );
+
   const renderChartBody = () => {
     switch (type) {
       case "bar":
         return (
-          <BarChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+          <BarChart data={chartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" opacity={0.15} vertical={false} />
-            <XAxis dataKey="name" stroke="#888888" fontSize={11} tickLine={false} axisLine={false} />
-            <YAxis stroke="#888888" fontSize={11} tickLine={false} axisLine={false} />
-            <Tooltip
-              content={({ active, payload }) => {
-                if (active && payload && payload.length) {
-                  return (
-                    <div className="rounded-lg border border-border bg-card p-2 shadow-md text-xs">
-                      <p className="font-semibold text-foreground">{payload[0].payload.name}</p>
-                      <p className="text-primary font-mono">
-                        {payload[0].value?.toLocaleString()} {unit}
-                      </p>
-                    </div>
-                  );
-                }
-                return null;
-              }}
-            />
+            <XAxis dataKey="name" {...X_AXIS_PROPS} />
+            <YAxis {...Y_AXIS_PROPS} />
+            {renderTooltip()}
             <Bar dataKey="value" fill="#3b82f6" radius={[4, 4, 0, 0]} />
           </BarChart>
         );
 
       case "line":
         return (
-          <LineChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+          <LineChart data={chartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" opacity={0.15} vertical={false} />
-            <XAxis dataKey="name" stroke="#888888" fontSize={11} tickLine={false} axisLine={false} />
-            <YAxis stroke="#888888" fontSize={11} tickLine={false} axisLine={false} />
-            <Tooltip
-              content={({ active, payload }) => {
-                if (active && payload && payload.length) {
-                  return (
-                    <div className="rounded-lg border border-border bg-card p-2 shadow-md text-xs">
-                      <p className="font-semibold text-foreground">{payload[0].payload.name}</p>
-                      <p className="text-primary font-mono">
-                        {payload[0].value?.toLocaleString()} {unit}
-                      </p>
-                    </div>
-                  );
-                }
-                return null;
-              }}
-            />
+            <XAxis dataKey="name" {...X_AXIS_PROPS} />
+            <YAxis {...Y_AXIS_PROPS} />
+            {renderTooltip()}
             <Line
               type="monotone"
               dataKey="value"
               stroke="#3b82f6"
               strokeWidth={2.5}
-              dot={{ fill: "#3b82f6", r: 4 }}
+              dot={{ fill: "#3b82f6", r: 3 }}
               activeDot={{ r: 6 }}
             />
           </LineChart>
@@ -139,21 +149,7 @@ export function PeldrunShadcnChart({
       case "pie":
         return (
           <PieChart>
-            <Tooltip
-              content={({ active, payload }) => {
-                if (active && payload && payload.length) {
-                  return (
-                    <div className="rounded-lg border border-border bg-card p-2 shadow-md text-xs">
-                      <p className="font-semibold text-foreground">{payload[0].name}</p>
-                      <p className="text-primary font-mono">
-                        {payload[0].value?.toLocaleString()} {unit}
-                      </p>
-                    </div>
-                  );
-                }
-                return null;
-              }}
-            />
+            {renderTooltip()}
             <Pie
               data={chartData}
               innerRadius={type === "donut" ? 50 : 0}
@@ -171,7 +167,7 @@ export function PeldrunShadcnChart({
       case "area":
       default:
         return (
-          <AreaChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+          <AreaChart data={chartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
             <defs>
               <linearGradient id="peldrunAreaGrad" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.4} />
@@ -179,23 +175,9 @@ export function PeldrunShadcnChart({
               </linearGradient>
             </defs>
             <CartesianGrid strokeDasharray="3 3" opacity={0.15} vertical={false} />
-            <XAxis dataKey="name" stroke="#888888" fontSize={11} tickLine={false} axisLine={false} />
-            <YAxis stroke="#888888" fontSize={11} tickLine={false} axisLine={false} />
-            <Tooltip
-              content={({ active, payload }) => {
-                if (active && payload && payload.length) {
-                  return (
-                    <div className="rounded-lg border border-border bg-card p-2 shadow-md text-xs">
-                      <p className="font-semibold text-foreground">{payload[0].payload.name}</p>
-                      <p className="text-primary font-mono">
-                        {payload[0].value?.toLocaleString()} {unit}
-                      </p>
-                    </div>
-                  );
-                }
-                return null;
-              }}
-            />
+            <XAxis dataKey="name" {...X_AXIS_PROPS} />
+            <YAxis {...Y_AXIS_PROPS} />
+            {renderTooltip()}
             <Area
               type="monotone"
               dataKey="value"
@@ -236,8 +218,14 @@ export function PeldrunShadcnChart({
           </div>
         )}
 
-        <div className="h-56 w-full">{renderChartBody()}</div>
+        <div className="h-56 w-full">
+          <ResponsiveContainer width="100%" height="100%">
+            {renderChartBody()}
+          </ResponsiveContainer>
+        </div>
       </div>
     </PeldrunMotionWrapper>
   );
 }
+
+export default PeldrunShadcnChart;

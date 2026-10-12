@@ -16,28 +16,23 @@ type ContentSegment =
   | { type: "openui"; dslContent: string; rawContent: string };
 
 const CLOSED_OPENUI_REGEX =
-  /(?:```(?:xml|html|openui|markdown)?\s*)?(<(?:openui(?:-lang)?|ui|diagram|carousel|mathplot)\b[^>]*>)([\s\S]*?)<\/(?:openui(?:-lang)?|ui|diagram|carousel|mathplot)>(?:\s*```)?/gi;
+  /(?:```(?:xml|html|openui|markdown)?\s*)?(<(?:openui(?:-lang)?|ui)\b[^>]*>)([\s\S]*?)<\/(?:openui(?:-lang)?|ui)>(?:\s*```)?|(?:^|\n)```openui\s*\n([\s\S]*?)\n```/gi;
 
 const UNCLOSED_TAIL_REGEX =
-  /(?:```(?:xml|html|openui|markdown)?\s*)?(<(?:openui(?:-lang)?|ui|diagram|carousel|mathplot)\b[^>]*>)([\s\S]*)$/i;
+  /(?:^|\n)(?:```(?:xml|html|openui|markdown)?\s*)?(<(?:openui(?:-lang)?|ui)\b[^>]*>)([\s\S]*)$|(?:^|\n)```openui\s*\n([\s\S]*)$/i;
 
 const MERMAID_BLOCK_REGEX = /(?:^|\n)```mermaid\s*\n([\s\S]*?)\n```/gi;
 
 function normalizeMarkdownTables(md: string): string {
   if (!md) return "";
-  // Ensure a blank line before any markdown table that immediately follows text,
-  // preventing CommonMark / remark-gfm from treating it as lazy paragraph text.
   return md.replace(/([^\n])\n(\s*\|[^\n]+\|\s*\n\s*\|[\s\-:|]+\|)/g, "$1\n\n$2");
 }
 
-/**
- * Strips raw generative UI container tags and code fences when the feature is disabled.
- */
 function sanitizeDisabledContent(raw: string): string {
   if (!raw) return "";
   return raw
-    .replace(/(?:```(?:xml|html|openui|markdown)?\s*)?<\/?(?:openui(?:-lang)?|ui|diagram|carousel|mathplot)\b[^>]*>(?:\s*```)?/gi, "")
-    .replace(/<\/?(?:openui(?:-lang)?|ui|diagram|carousel|mathplot)\b[^>]*>/gi, "")
+    .replace(/(?:```(?:xml|html|openui|markdown)?\s*)?<\/?(?:openui(?:-lang)?|ui)\b[^>]*>(?:\s*```)?/gi, "")
+    .replace(/(?:^|\n)```openui\s*\n([\s\S]*?)\n```/gi, "\n```text\n$1\n```\n")
     .trim();
 }
 
@@ -54,7 +49,6 @@ export function GenerativeUIRouter({ content }: GenerativeUIRouterProps): React.
   const segments = useMemo<ContentSegment[]>(() => {
     if (!content) return [];
 
-    // When the Generative UI engine is disabled in settings, cleanly strip UI wrappers
     if (mounted && !isEnabled) {
       const sanitized = sanitizeDisabledContent(content);
       return [{ type: "markdown", content: normalizeMarkdownTables(sanitized) }];
@@ -63,7 +57,6 @@ export function GenerativeUIRouter({ content }: GenerativeUIRouterProps): React.
     const result: ContentSegment[] = [];
     let lastIndex = 0;
 
-    // Reset regex cursor before sequential matching
     CLOSED_OPENUI_REGEX.lastIndex = 0;
     let match: RegExpExecArray | null;
 
@@ -78,7 +71,7 @@ export function GenerativeUIRouter({ content }: GenerativeUIRouterProps): React.
         }
       }
 
-      const dslContent = (match[2] || "").trim();
+      const dslContent = (match[2] || match[3] || "").trim();
       result.push({
         type: "openui",
         dslContent,
@@ -88,7 +81,6 @@ export function GenerativeUIRouter({ content }: GenerativeUIRouterProps): React.
       lastIndex = matchEnd;
     }
 
-    // Process potential unclosed streaming tail
     if (lastIndex < content.length) {
       const tail = content.slice(lastIndex);
       const unclosedMatch = tail.match(UNCLOSED_TAIL_REGEX);
@@ -98,7 +90,7 @@ export function GenerativeUIRouter({ content }: GenerativeUIRouterProps): React.
         if (textBeforeTail) {
           result.push({ type: "markdown", content: normalizeMarkdownTables(textBeforeTail) });
         }
-        const streamingDsl = (unclosedMatch[2] || "").trim();
+        const streamingDsl = (unclosedMatch[2] || unclosedMatch[3] || "").trim();
         result.push({
           type: "openui",
           dslContent: streamingDsl,
@@ -112,7 +104,6 @@ export function GenerativeUIRouter({ content }: GenerativeUIRouterProps): React.
       }
     }
 
-    // Convert standalone markdown Mermaid blocks to interactive Diagram components
     const finalSegments: ContentSegment[] = [];
     for (const seg of result) {
       if (seg.type === "markdown") {
@@ -133,9 +124,11 @@ export function GenerativeUIRouter({ content }: GenerativeUIRouterProps): React.
             }
 
             const rawMermaid = (mMatch[1] || "").trim();
+            const openUiLangCode = `root = Stack([diag_node])\ndiag_node = Diagram("Workflow Diagram", ${JSON.stringify(rawMermaid)})`;
+
             finalSegments.push({
               type: "openui",
-              dslContent: `Diagram: Workflow Diagram\n${rawMermaid}`,
+              dslContent: openUiLangCode,
               rawContent: mMatch[0],
             });
 

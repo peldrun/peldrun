@@ -29,6 +29,8 @@ from peldrun.runtime.executor import core_executor
 from peldrun.runtime.pricing_store import NANO_USD_PER_USD
 from peldrun.tools.builtins.human_input import HumanInputRegistry
 
+from peldrun.context.generative_ui import build_generative_ui_prompt
+
 logger = logging.getLogger(__name__)
 
 
@@ -126,6 +128,13 @@ class PeldrunEngine(ExecutionEngine):
             "3. Workspace Operations: Current working directory is already workspace root. Use relative paths.\n"
             "4. Task Conclusion: Ensure all parts of the user request are satisfied completely before calling 'terminate'."
         )
+
+        # === NEW: Generative UI Directive Injection ===
+        genui_cfg = active_llm.get("generative_ui") if active_llm else None
+        if genui_cfg and genui_cfg.get("enabled"):
+            genui_directive = build_generative_ui_prompt(genui_cfg)
+            if genui_directive:
+                system_prompt = system_prompt.rstrip() + "\n\n" + genui_directive
 
         # 1. Resolve & Refresh Context Sidecar from disk
         session_dir = project_manager.chats_dir / chat_id

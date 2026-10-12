@@ -87,15 +87,30 @@ class ContextManager:
     ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         """
         Assemble the architectural context tiers in deterministic sequence:
-        1. System Directive (Tier 1A)
-        2. Project Rules (Tier 1B)
-        3. Generative UI Instructions (Tier 1C - Conditional & Adaptive)
+        1. System Directive (Tier 1A)        ┐
+        2. Project Rules (Tier 1B)            ├── Merged into ONE system message
+        3. Generative UI Instructions (1C)   ┘
         4. Compacted Context Summary (Tier 2)
         5. Sanitized Recent Dialogue (Tier 3)
         6. Ongoing Execution Telemetry (Tier 4)
         7. Current User Input (Tier 5)
+
+        Engineering note on Tier 1 merging:
+            Small and medium-sized models (≤ 14B) reliably read only the FIRST
+            `system` message in the sequence and treat additional `system` messages
+            as ignorable context. Empirically, splitting base directive + OpenUI
+            directive into two separate system messages caused the model to fully
+            ignore the OpenUI directive when a base Markdown directive was present.
+
+            To guarantee the OpenUI directive is honored, all Tier 1 content is
+            concatenated into a SINGLE system message. This preserves the
+            behavior of the disabled (Markdown-only) path while making the
+            enabled (OpenUI Lang) path functional across model sizes.
         """
-        system_msgs: List[Dict[str, Any]] = []
+        # ------------------------------------------------------------------
+        # Tier 1: Unified System Directive (1A Base + 1B Rules + 1C GenUI)
+        # ------------------------------------------------------------------
+        system_parts: List[str] = []
 
         # Tier 1A: Base System Directive
         effective_system = (
@@ -104,22 +119,31 @@ class ContextManager:
             else self.default_system_prompt
         )
         if effective_system and effective_system.strip():
-            system_msgs.append({"role": "system", "content": effective_system.strip()})
+            system_parts.append(effective_system.strip())
 
         # Tier 1B: Explicit Project Rules Block
         if project_rules and project_rules.strip():
             rules_content = project_rules.strip()
             if not rules_content.startswith("[Project Rules]"):
                 rules_content = f"[Project Rules]\n{rules_content}"
-            system_msgs.append({"role": "system", "content": rules_content})
+            system_parts.append(rules_content)
 
-        # Tier 1C: Generative UI Directive (Only injected if enabled and allowed components exist)
+        # Tier 1C: Generative UI Directive (only when enabled and catalog non-empty)
         if generative_ui and generative_ui.get("enabled"):
             ui_directive = self._format_generative_ui_prompt(generative_ui)
             if ui_directive:
-                system_msgs.append({"role": "system", "content": ui_directive})
+                system_parts.append(ui_directive)
 
+        system_msgs: List[Dict[str, Any]] = []
+        if system_parts:
+            system_msgs.append({
+                "role": "system",
+                "content": "\n\n".join(system_parts),
+            })
+
+        # ------------------------------------------------------------------
         # Tier 2: Compacted Context Summary & Covered Turns Identification
+        # ------------------------------------------------------------------
         summary_msgs: List[Dict[str, Any]] = []
         covered_turn_ids: Set[str] = set()
 
@@ -131,7 +155,9 @@ class ContextManager:
             if sidecar.summary.covers_turns:
                 covered_turn_ids = set(sidecar.summary.covers_turns)
 
+        # ------------------------------------------------------------------
         # Tier 3: Recent Sanitized Conversation
+        # ------------------------------------------------------------------
         recent_msgs: List[Dict[str, Any]] = []
         clean_current_input = current_user_message.strip()
 
@@ -146,7 +172,9 @@ class ContextManager:
                         continue
                     recent_msgs.append({"role": msg.role, "content": msg.content})
 
-        # Tier 4: Execution State (Only included when actively requested AND in non-terminal state)
+        # ------------------------------------------------------------------
+        # Tier 4: Execution State (only when running / waiting_for_user)
+        # ------------------------------------------------------------------
         exec_msgs: List[Dict[str, Any]] = []
         if include_execution and sidecar and sidecar.current_execution:
             exec_status = getattr(sidecar.current_execution, "status", "running")
@@ -155,12 +183,16 @@ class ContextManager:
                 if formatted_exec:
                     exec_msgs.append({"role": "system", "content": formatted_exec})
 
+        # ------------------------------------------------------------------
         # Tier 5: Current User Message
+        # ------------------------------------------------------------------
         current_msgs: List[Dict[str, Any]] = []
         if clean_current_input:
             current_msgs.append({"role": "user", "content": clean_current_input})
 
+        # ------------------------------------------------------------------
         # Apply Token Budget Controller
+        # ------------------------------------------------------------------
         budget_spec = sidecar.budget if sidecar else None
         controller = TokenBudgetController(budget_spec)
         fitted_messages, usage = controller.fit_all(

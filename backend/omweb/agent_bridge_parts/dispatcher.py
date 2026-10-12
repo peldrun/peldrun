@@ -143,20 +143,32 @@ def _resolve_chat_system_prompt(
     model_name: str,
     reasoning_effort: str,
     active_llm: Optional[Dict[str, Any]] = None,
+    generative_ui: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """
     Resolve chat system instructions following reasoning specifications.
+
+    When Generative UI is enabled, the output-format directive is relaxed so the
+    downstream OpenUI Lang directive (injected at Tier 1C of the context builder)
+    is not contradicted by a conflicting 'Respond using Markdown' instruction.
+    When Generative UI is disabled, the original Markdown directive is preserved.
     """
     is_reasoner = _is_reasoning_model(model_name, active_llm=active_llm)
     norm_effort = (reasoning_effort or "none").lower().strip()
+    genui_enabled = bool(generative_ui and generative_ui.get("enabled"))
 
     if is_reasoner and norm_effort in ("none", "off", "0"):
         return None
     elif is_reasoner:
-        return "You are a helpful and concise assistant. Respond naturally and directly."
+        if genui_enabled:
+            # Neutral: no format directive so OpenUI Lang directive (Tier 1C) rules alone
+            return "You are a helpful and concise assistant. Respond naturally and directly."
+        return "You are a helpful and concise assistant. Respond naturally and directly using Markdown."
     else:
+        if genui_enabled:
+            # Neutral: OpenUI Lang directive will govern the output format
+            return "You are a helpful, direct, and conversational AI assistant. Respond naturally and directly."
         return "You are a helpful, direct, and conversational AI assistant. Respond directly and accurately using Markdown."
-
 
 def _build_optimized_chat_messages(
     turns: List[Dict[str, Any]],
@@ -548,6 +560,7 @@ async def run_direct_chat(
             model_name=model_name,
             reasoning_effort=reasoning_effort,
             active_llm=active_llm,
+            generative_ui=active_llm.get("generative_ui"),
         )
 
         context_mgr = ContextManager()
