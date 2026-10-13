@@ -23,6 +23,7 @@ export interface ChildRunState {
   error?: string;
 }
 
+
 /**
  * Pending delegation approval request awaiting a human decision.
  * Resolved requests are removed from the pending map by the SSE handler.
@@ -44,7 +45,7 @@ export interface ChatContainerProps {
 }
 
 /** Lifecycle status of the current chat run. */
-export type ChatStatus = "idle" | "running" | "completed" | "failed";
+export type ChatStatus = "idle" | "running" | "paused" | "completed" | "failed";
 
 /** Aggregated token usage counters for the current or completed run. */
 export interface TokenUsage {

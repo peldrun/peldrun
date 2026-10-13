@@ -1,14 +1,13 @@
-﻿// frontend/src/components/chat/chat-deliverable.tsx
-"use client";
+﻿"use client";
 
 import React from "react";
-import { FileText, ExternalLink, Activity, Check, Copy, Bot, AlertCircle } from "lucide-react";
+import { FileText, ExternalLink, Activity, Check, Copy, Bot, AlertCircle, RotateCcw } from "lucide-react";
 import { UsageBadgeGroup } from "@/components/chat/UsageBadges";
 import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
 
 interface ChatDeliverableProps {
   finalResult: string;
-  status: "completed" | "failed";
+  status?: "completed" | "failed" | "stopped" | "paused";
   turnIndex?: number;
   isTurnRawTrace?: boolean;
   lastThoughtContent?: string;
@@ -25,11 +24,12 @@ interface ChatDeliverableProps {
   costUsd?: number | null;
   latencyMs?: number | null;
   tokensPerSecond?: number | null;
+  onRegenerate?: (turnIndex?: number) => void;
 }
 
 export function ChatDeliverable({
   finalResult,
-  status,
+  status = "completed",
   turnIndex,
   isTurnRawTrace = false,
   lastThoughtContent,
@@ -46,6 +46,7 @@ export function ChatDeliverable({
   costUsd,
   latencyMs,
   tokensPerSecond,
+  onRegenerate,
 }: ChatDeliverableProps) {
   const copyId = typeof turnIndex === "number" ? `turn-res-${turnIndex}` : "final-result";
   const hasFiles = producedFiles && producedFiles.length > 0;
@@ -81,7 +82,7 @@ export function ChatDeliverable({
 
       {/* 2. Primary Response rendered via GenerativeUIRouter */}
       <div className="p-4 rounded-md bg-card/40 text-foreground text-sm leading-relaxed">
-        <MarkdownRenderer  content={displayContent} />
+        <MarkdownRenderer content={displayContent} />
       </div>
 
       {/* 3. Diagnostic Trace Toggle */}
@@ -106,14 +107,16 @@ export function ChatDeliverable({
         </div>
       )}
 
-      {/* 4. Adaptive Deliverable Box: Error Alert */}
-      {status === "failed" && (
+      {/* 4. Adaptive Deliverable Box: Error or Stop Alert */}
+      {(status === "failed" || status === "stopped") && (
         <div className="p-3.5 rounded-lg bg-destructive/10 border border-destructive/30 text-destructive text-xs flex items-start gap-2.5">
           <AlertCircle size={15} className="shrink-0 mt-0.5" />
           <div className="space-y-1">
-            <span className="font-semibold block">Execution Terminated with Error</span>
+            <span className="font-semibold block">
+              {status === "stopped" ? "Execution Stopped by Operator" : "Execution Terminated with Error"}
+            </span>
             <p className="text-[11px] opacity-90 leading-relaxed font-mono whitespace-pre-wrap">
-              {finalResult || "Execution was aborted or encountered an error."}
+              {finalResult || (status === "stopped" ? "Task was stopped by operator." : "Execution was aborted or encountered an error.")}
             </p>
           </div>
         </div>
@@ -173,24 +176,38 @@ export function ChatDeliverable({
           )}
         </div>
 
-        <button
-          type="button"
-          onClick={() => onCopy(displayContent, copyId)}
-          className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-muted/50 hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer transition-all border border-border/40 text-[11px]"
-          title="Copy Response"
-        >
-          {copiedSection === copyId ? (
-            <>
-              <Check size={12} className="text-emerald-500 shrink-0" />
-              <span className="text-emerald-500 font-medium font-mono">Copied!</span>
-            </>
-          ) : (
-            <>
-              <Copy size={12} className="shrink-0" />
-              <span className="font-mono">Copy</span>
-            </>
+        <div className="flex items-center gap-1.5">
+          {onRegenerate && (
+            <button
+              type="button"
+              onClick={() => onRegenerate(turnIndex)}
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-muted/50 hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer transition-all border border-border/40 text-[11px]"
+              title="Regenerate Response"
+            >
+              <RotateCcw size={12} className="shrink-0" />
+              <span className="font-mono">Regenerate</span>
+            </button>
           )}
-        </button>
+
+          <button
+            type="button"
+            onClick={() => onCopy(displayContent, copyId)}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-muted/50 hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer transition-all border border-border/40 text-[11px]"
+            title="Copy Response"
+          >
+            {copiedSection === copyId ? (
+              <>
+                <Check size={12} className="text-emerald-500 shrink-0" />
+                <span className="text-emerald-500 font-medium font-mono">Copied!</span>
+              </>
+            ) : (
+              <>
+                <Copy size={12} className="shrink-0" />
+                <span className="font-mono">Copy</span>
+              </>
+            )}
+          </button>
+        </div>
       </div>
     </div>
   );

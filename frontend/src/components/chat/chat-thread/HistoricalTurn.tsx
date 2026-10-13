@@ -1,4 +1,3 @@
-// Path: frontend/src/components/chat/chat-thread/HistoricalTurn.tsx
 "use client";
 
 /**
@@ -34,6 +33,7 @@ export interface HistoricalTurnProps {
   showRawTrace: boolean;
   setShowRawTrace: (val: boolean) => void;
   activeModelName: string;
+  onRegenerate?: (turnIndex: number, turn: ChatTurn) => void;
 }
 
 /**
@@ -63,6 +63,7 @@ export function HistoricalTurn({
   showRawTrace,
   setShowRawTrace,
   activeModelName,
+  onRegenerate,
 }: HistoricalTurnProps) {
   const turnMode = turn.mode || (turn.steps && turn.steps.length > 0 ? "agent" : "chat");
   const isAgentTurn = turnMode === "agent";
@@ -133,6 +134,7 @@ export function HistoricalTurn({
           costUsd={turn.usage?.cost_usd}
           latencyMs={turn.usage?.latency_ms}
           tokensPerSecond={turn.usage?.tokens_per_second}
+          onRegenerate={onRegenerate ? () => onRegenerate(tIdx, turn) : undefined}
         />
       )}
     </div>

@@ -32,6 +32,11 @@ class RunRequest(BaseModel):
     is_reasoning_model: Optional[bool] = None
     generative_ui: Optional[Dict[str, Any]] = None
 
+    # Extensibility for Pause / Resume and Checkpoint Interruption Resumption
+    checkpoint_id: Optional[str] = None
+    resume_from_checkpoint: Optional[bool] = False
+    regenerate_turn_id: Optional[str] = None
+
 
 class FileContentPayload(BaseModel):
     """Payload used to persist edited file content back to the workspace."""
@@ -45,3 +50,14 @@ class HumanRespondRequest(BaseModel):
 
     answer: str
     request_id: Optional[str] = None
+
+
+class JobControlResponse(BaseModel):
+    """Unified response payload for job lifecycle mutation operations."""
+
+    success: bool
+    job_id: str
+    chat_id: Optional[str] = None
+    status: str
+    message: str
+    task_cancelled: Optional[bool] = None

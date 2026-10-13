@@ -5,6 +5,7 @@ Handles ``POST /`` (and ``POST ""``) to start a new agent or direct-chat
 execution. The endpoint is responsible for:
 
 * Validating the incoming prompt and execution mode.
+* Handling turn regeneration requests with session history branching.
 * Creating the backing job and chat session records.
 * Persisting the resolved LLM overrides on the session.
 * Capturing a pre-execution filesystem snapshot so the delta artifacts can
@@ -48,7 +49,31 @@ router = APIRouter()
 @router.post("/")
 async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
     """Create a job, capture a filesystem baseline, and schedule execution."""
-    prompt = req.prompt.strip()
+    raw_prompt = (req.prompt or "").strip()
+
+    # Resolve existing chat session if chat_id provided
+    existing_chat = None
+    if req.chat_id:
+        existing_chat, _ = resolve_chat(req.chat_id)
+
+    # In regeneration workflows, recover prompt from targeted turn if omitted
+    target_turn_prompt = None
+    if req.regenerate_turn_id and existing_chat:
+        prev_jid = existing_chat.get("job_id", "")
+        if str(req.regenerate_turn_id).lower() in (str(prev_jid).lower(), "latest", "-1"):
+            target_turn_prompt = existing_chat.get("prompt", "")
+        else:
+            existing_turns = existing_chat.get("turns", [])
+            for idx, t in enumerate(existing_turns):
+                if (
+                    str(idx) == str(req.regenerate_turn_id)
+                    or str(t.get("job_id", "")) == str(req.regenerate_turn_id)
+                    or str(t.get("id", "")) == str(req.regenerate_turn_id)
+                ):
+                    target_turn_prompt = t.get("prompt", "")
+                    break
+
+    prompt = raw_prompt or (target_turn_prompt.strip() if target_turn_prompt else "")
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
@@ -60,8 +85,7 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
         if m_val in ["agent", "chat"]:
             exec_mode = m_val
 
-    # Create the backing job record. Some job_manager versions accept a prompt
-    # keyword; older ones only accept an id, so we handle both signatures.
+    # Create the backing job record.
     generated_job_id = f"job_{uuid.uuid4().hex[:12]}"
     try:
         job = job_manager.create_job(generated_job_id, prompt=prompt)
@@ -97,45 +121,83 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
     if req.generative_ui:
         llm_override["generative_ui"] = req.generative_ui
 
-    # Resolve or create the chat session.
-    existing_chat = None
-    if req.chat_id:
-        existing_chat, _ = resolve_chat(req.chat_id)
-
+    # Resolve session turns and context
     if existing_chat:
         chat_id = existing_chat.get("id", req.chat_id)
         project_id = existing_chat.get("project_id", req.project_id or "default_project")
         title = existing_chat.get("title") or prompt[:40]
         turns = list(existing_chat.get("turns", []))
-
-        # Flush the previous (unflushed) turn into the turns list so the new
-        # turn starts from a clean state.
-        prev_p = existing_chat.get("prompt", "")
-        prev_r = existing_chat.get("result", "")
-        prev_ev = existing_chat.get("events", [])
         prev_jid = existing_chat.get("job_id", "")
-        if prev_p and (prev_r or prev_ev):
-            if not turns or turns[-1].get("job_id") != prev_jid:
-                turns.append({
-                    "job_id": prev_jid,
-                    "prompt": prev_p,
-                    "result": prev_r,
-                    "events": prev_ev,
-                    "status": existing_chat.get("status", "completed"),
-                    "created_at": existing_chat.get("updated_at") or existing_chat.get("created_at"),
-                    "produced_files": job_scoped_artifacts.get(prev_jid, []),
-                    "model": existing_chat.get("model"),
-                    "usage": existing_chat.get("usage"),
-                })
 
-        # Provide the agent with lightweight context from the previous turn.
+        if req.regenerate_turn_id:
+            # Handle regeneration branching
+            is_latest = str(req.regenerate_turn_id).lower() in (str(prev_jid).lower(), "latest", "-1")
+            if is_latest:
+                # Discard latest unflushed turn; overwrite in-place
+                pass
+            else:
+                matched_idx = None
+                for idx, t in enumerate(turns):
+                    if (
+                        str(idx) == str(req.regenerate_turn_id)
+                        or str(t.get("job_id", "")) == str(req.regenerate_turn_id)
+                        or str(t.get("id", "")) == str(req.regenerate_turn_id)
+                    ):
+                        matched_idx = idx
+                        break
+
+                if matched_idx is not None:
+                    # Truncate all subsequent turns to branch from this point
+                    turns = turns[:matched_idx]
+                else:
+                    # Fallback to flush previous turn if target not matched
+                    prev_p = existing_chat.get("prompt", "")
+                    prev_r = existing_chat.get("result", "")
+                    prev_ev = existing_chat.get("events", [])
+                    if prev_p and (prev_r or prev_ev):
+                        if not turns or turns[-1].get("job_id") != prev_jid:
+                            turns.append({
+                                "job_id": prev_jid,
+                                "prompt": prev_p,
+                                "result": prev_r,
+                                "events": prev_ev,
+                                "status": existing_chat.get("status", "completed"),
+                                "created_at": existing_chat.get("updated_at") or existing_chat.get("created_at"),
+                                "produced_files": job_scoped_artifacts.get(prev_jid, []),
+                                "model": existing_chat.get("model"),
+                                "usage": existing_chat.get("usage"),
+                            })
+        else:
+            # Standard sequential run: flush previous unflushed turn into historical turns
+            prev_p = existing_chat.get("prompt", "")
+            prev_r = existing_chat.get("result", "")
+            prev_ev = existing_chat.get("events", [])
+            if prev_p and (prev_r or prev_ev):
+                if not turns or turns[-1].get("job_id") != prev_jid:
+                    turns.append({
+                        "job_id": prev_jid,
+                        "prompt": prev_p,
+                        "result": prev_r,
+                        "events": prev_ev,
+                        "status": existing_chat.get("status", "completed"),
+                        "created_at": existing_chat.get("updated_at") or existing_chat.get("created_at"),
+                        "produced_files": job_scoped_artifacts.get(prev_jid, []),
+                        "model": existing_chat.get("model"),
+                        "usage": existing_chat.get("usage"),
+                    })
+
+        # Provide context from the latest historical turn if available
         agent_prompt = prompt
-        if prev_r:
-            clean_prev = prev_r[:350].replace("\n", " ").strip()
-            agent_prompt = (
-                f"[Context: In previous turn, user asked: '{prev_p}'. "
-                f"Result: '{clean_prev}']. Follow-up task: {prompt}"
-            )
+        if turns:
+            last_turn = turns[-1]
+            last_p = last_turn.get("prompt", "")
+            last_r = last_turn.get("result", "")
+            if last_r:
+                clean_prev = last_r[:350].replace("\n", " ").strip()
+                agent_prompt = (
+                    f"[Context: In previous turn, user asked: '{last_p}'. "
+                    f"Result: '{clean_prev}']. Follow-up task: {prompt}"
+                )
     else:
         chat_id = (
             req.chat_id.strip()
@@ -217,7 +279,6 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
                 encoding="utf-8",
             )
     except Exception:
-        # Session enrichment is best-effort; execution must not be blocked.
         pass
 
     # Schedule the actual execution task.

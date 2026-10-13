@@ -3,9 +3,11 @@ backend/peldrun/engine/checkpoint.py
 
 PELDRUN Core State Checkpoint Management.
 Provides snapshots, persistence, and resumption capabilities for agent execution runs.
-Hardened under PR 3 (Durable HITL & State Persistence):
+Hardened under PR 3 & Runtime V1:
+- Automatic disk index synchronization on initialization.
 - Integrates with RunStore to persist checkpoints into the durable runtime database.
-- Preserves local filesystem JSON snapshots for inspectability.
+- Preserves local filesystem JSON snapshots for inspectability and quick recovery.
+- Supports single-call latest state reconstruction for resume-on-interruption workflows.
 """
 
 from __future__ import annotations
@@ -39,8 +41,15 @@ class CheckpointManager:
         self._checkpoints: List[StateCheckpoint] = []
 
     async def ainitialize(self) -> None:
-        """Create checkpoints persistence directory."""
+        """Create checkpoints persistence directory and re-index existing checkpoints from disk."""
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        if not self._checkpoints and self.checkpoint_dir.exists():
+            for f in sorted(self.checkpoint_dir.glob("cp_*.json")):
+                try:
+                    data = json.loads(f.read_text(encoding="utf-8"))
+                    self._checkpoints.append(StateCheckpoint.model_validate(data))
+                except Exception:
+                    pass
 
     async def asave_checkpoint(self, state: ExecutionState, label: str = "") -> StateCheckpoint:
         """
@@ -76,14 +85,25 @@ class CheckpointManager:
 
     async def alist_checkpoints(self) -> List[StateCheckpoint]:
         """Return all persisted checkpoints in chronological order."""
+        await self.ainitialize()
         return list(self._checkpoints)
+
+    async def aload_checkpoint(self, checkpoint_id: str) -> Optional[StateCheckpoint]:
+        """Fetch a specific checkpoint by id."""
+        await self.ainitialize()
+        for cp in self._checkpoints:
+            if cp.id == checkpoint_id:
+                return cp
+        return None
 
     async def aload_latest_checkpoint(self) -> Optional[StateCheckpoint]:
         """Fetch the most recently created checkpoint."""
+        await self.ainitialize()
         return self._checkpoints[-1] if self._checkpoints else None
 
     async def arestore_state(self, checkpoint_id: str) -> ExecutionState:
         """Reconstruct an ExecutionState from a saved checkpoint."""
+        await self.ainitialize()
         for cp in self._checkpoints:
             if cp.id == checkpoint_id:
                 return ExecutionState.from_snapshot_dict(cp.state_data)
@@ -94,7 +114,10 @@ class CheckpointManager:
 
             store = get_run_store()
             conn = store._get_connection()
-            cursor = conn.execute("SELECT state_dump_json FROM checkpoints WHERE checkpoint_id = ?", (checkpoint_id,))
+            cursor = conn.execute(
+                "SELECT state_dump_json FROM checkpoints WHERE checkpoint_id = ?",
+                (checkpoint_id,),
+            )
             row = cursor.fetchone()
             if row:
                 return ExecutionState.from_snapshot_dict(json.loads(row["state_dump_json"]))
@@ -102,6 +125,14 @@ class CheckpointManager:
             pass
 
         raise FileNotFoundError(f"Checkpoint '{checkpoint_id}' not found.")
+
+    async def arestore_latest_state(self) -> Optional[ExecutionState]:
+        """Reconstruct an ExecutionState from the latest available checkpoint."""
+        await self.ainitialize()
+        latest = await self.aload_latest_checkpoint()
+        if latest:
+            return await self.arestore_state(latest.id)
+        return None
 
 
 __all__ = ["StateCheckpoint", "CheckpointManager"]

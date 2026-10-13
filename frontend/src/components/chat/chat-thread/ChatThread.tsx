@@ -1,4 +1,3 @@
-// Path: frontend/src/components/chat/chat-thread/ChatThread.tsx
 "use client";
 
 /**
@@ -11,10 +10,10 @@
  *    final deliverable when the current run completes.
  *  - Detects a pending human-in-the-loop tool call and mounts the
  *    interactive `HumanInputCard` accordingly.
+ *  - Exposes lifecycle actions (Regenerate, Pause, Resume).
  *
- * All state is passed in from the parent (`useChat` hook or similar); this
- * component is a pure presentational shell that delegates to focused
- * sub-components.
+ * All state is passed in from the parent; this component is a pure
+ * presentational shell that delegates to focused sub-components.
  */
 
 import React, { useEffect, useRef } from "react";
@@ -80,6 +79,9 @@ export function ChatThread({
   onApproveDelegation,
   onRejectDelegation,
   onCancelSubtask,
+  onPauseJob,
+  onResumeJob,
+  onRegenerate,
 }: ChatThreadProps) {
   const activePromptAnchorRef = useRef<HTMLDivElement | null>(null);
 
@@ -94,7 +96,7 @@ export function ChatThread({
   }, [submittedPrompt]);
 
   // Detect whether the agent is currently paused waiting for human input.
-  const activeStepsList = Object.values(activeGroupedSteps).flat();
+  const activeStepsList = Object.values(activeGroupedSteps || {}).flat();
   const { isHumanWaiting, detectedPrompt, detectedOptions } = useHumanToolDetection(
     activeStepsList,
     humanQuery,
@@ -137,6 +139,7 @@ export function ChatThread({
               showRawTrace={showRawTrace}
               setShowRawTrace={setShowRawTrace}
               activeModelName={activeModelName}
+              onRegenerate={onRegenerate}
             />
           </div>
         ))}
@@ -207,14 +210,18 @@ export function ChatThread({
           />
         )}
 
-        {/* Live Running Indicator */}
-        {status === "running" && !isHumanWaiting && activeApprovalList.length === 0 && (
+        {/* Live Running / Paused Indicator */}
+        {(status === "running" || status === "paused") && !isHumanWaiting && activeApprovalList.length === 0 && (
           <LiveStatusIndicator
-            message={getLiveStatusMessage()}
+            message={status === "paused" ? "Execution paused by operator" : getLiveStatusMessage()}
             elapsedSeconds={elapsedSeconds}
+            isPaused={status === "paused"}
+            onPause={onPauseJob}
+            onResume={onResumeJob}
           />
         )}
 
+        {/* Deliverable for Completed / Current Turn */}
         {finalResult && (
           <ChatDeliverable
             finalResult={finalResult}
@@ -234,6 +241,7 @@ export function ChatThread({
             costUsd={costUsd}
             latencyMs={latencyMs}
             tokensPerSecond={tokensPerSecond}
+            onRegenerate={status !== "running" && status !== "paused" && onRegenerate ? () => onRegenerate(-1) : undefined}
           />
         )}
 

@@ -4,10 +4,12 @@ backend/peldrun/engine/runner.py
 PELDRUN Core Agent Execution Runner.
 Coordinates agent lifecycle, asynchronous execution loops, checkpointing, and event emission.
 Hardened under PELDRUN Runtime V1:
-- Semantic cancellation pipeline: RUNNING -> CANCELLING -> CANCELLED (never PAUSED).
+- Semantic cancellation pipeline: RUNNING -> CANCELLING -> CANCELLED.
+- Inter-step pause & resume lifecycle: RUNNING <-> PAUSED.
+- Checkpoint auto-capture upon pause and step boundaries.
 - Max-step exhaustion handled strictly as FAILED with MAX_STEPS_EXCEEDED (never fake COMPLETED).
 - All lifecycle modifications pass strictly through ExecutionState FSM validators.
-- Timeout suspension preserved during human interactions.
+- Global timeout suspended during pause intervals and human interactions.
 """
 
 from __future__ import annotations
@@ -76,7 +78,7 @@ class AgentRunner:
         self._cancel_requested.set()
 
     def pause(self) -> None:
-        """Signal execution pause."""
+        """Signal execution pause at the current step boundary."""
         self._pause_requested.set()
 
     def resume(self) -> None:
@@ -176,10 +178,21 @@ class AgentRunner:
                     )
                     break
 
-                while self.is_paused and not self.is_cancelled:
-                    if state.status != ExecutionStatus.PAUSED:
-                        state.mark_paused(reason="Operator requested pause")
-                    await asyncio.sleep(0.5)
+                # Inter-step graceful pause handling
+                if self.is_paused:
+                    pause_start_time = time.time()
+                    while self.is_paused and not self.is_cancelled:
+                        if state.status != ExecutionStatus.PAUSED:
+                            state.mark_paused(reason="Operator requested pause")
+                            if self.config.enable_checkpointing:
+                                state.create_checkpoint()
+                            await self.emitter.emit_snapshot(
+                                self._build_snapshot_payload(state, {"event_action": "paused"})
+                            )
+                        await asyncio.sleep(0.5)
+
+                    # Deduct paused interval from global timeout to avoid spurious timeouts
+                    global_start_time += (time.time() - pause_start_time)
 
                 if self.is_cancelled:
                     state.mark_cancelling(reason="Operator cancelled run during pause")
@@ -188,6 +201,9 @@ class AgentRunner:
 
                 if state.status == ExecutionStatus.PAUSED:
                     state.mark_running(reason="Resuming from paused state")
+                    await self.emitter.emit_snapshot(
+                        self._build_snapshot_payload(state, {"event_action": "resumed"})
+                    )
 
                 state.current_step += 1
                 step_index = state.current_step

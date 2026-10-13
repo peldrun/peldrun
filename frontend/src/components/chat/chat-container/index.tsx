@@ -1,4 +1,3 @@
-// Path: frontend/src/components/chat/chat-container/index.tsx
 "use client";
 
 import React, {
@@ -28,7 +27,6 @@ import { useAppStorage } from "@/hooks/use-app-storage";
 import { inferModelCapabilities } from "@/lib/modelMetadata";
 
 import { getGenerativeUIPayload } from "@/components/generative-ui/store";
-import { fa } from "zod/v4/locales";
 
 import type {
   ChatContainerProps,
@@ -62,7 +60,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   );
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [historyTurns, setHistoryTurns] = useState<ChatTurn[]>([]);
-  const [status, setStatus] = useState<ChatStatus>("idle");
+  const [status, setStatus] = useState<ChatStatus | "paused">("idle");
   const [steps, setSteps] = useState<StepEvent[]>([]);
   const [finalResult, setFinalResult] = useState<string | null>(null);
   const [currentStepNum, setCurrentStepNum] = useState(0);
@@ -106,7 +104,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
 
   // --- Extracted hooks ------------------------------------------------------
   const metadataVault = useMetadataVault();
-  const [elapsedSeconds, setElapsedSeconds] = useElapsedTimer(status);
+  const [elapsedSeconds, setElapsedSeconds] = useElapsedTimer(status as any);
   const { producedFiles, setProducedFiles, fetchJobFiles } = useJobFiles();
 
   // Refs mirror fast-changing state so SSE handlers always read the latest
@@ -129,7 +127,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     setTokensUsed,
     setCurrentUsageMetrics,
     setFinalResult,
-    setStatus,
+    setStatus: setStatus as any,
     setExpandedSteps,
     setHumanQuery,
     setShowRightPanel,
@@ -145,7 +143,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     setSelectedAgentId,
     setExecMode,
     setActiveModelName,
-    setStatus,
+    setStatus: setStatus as any,
     setFinalResult,
     setSessionTimestamp,
     setHistoryTurns,
@@ -171,7 +169,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   }, [setActiveModelName]);
 
   useEffect(() => {
-    if (status === "running" || steps.length > 0 || submittedPrompt) {
+    if (status === "running" || status === "paused" || steps.length > 0 || submittedPrompt) {
       chatScrollBottomRef.current?.scrollIntoView({ behavior: "smooth" });
     }
   }, [steps, status, finalResult, submittedPrompt]);
@@ -294,7 +292,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   ]);
 
   const handleStopTask = useCallback(async () => {
-    if (!activeJobId || status !== "running") return;
+    if (!activeJobId || (status !== "running" && status !== "paused")) return;
     try {
       await fetch(`/api/run/jobs/${activeJobId}/stop`, { method: "POST" });
       setStatus("failed");
@@ -309,9 +307,43 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
       }
     } catch (e) {
-      console.error("Failed to stop job", e);
+      console.error("[ChatContainer] Failed to stop job:", e);
     }
   }, [activeJobId, status, activeChatId, closeStream]);
+
+  const handlePauseTask = useCallback(async () => {
+    if (!activeJobId || status !== "running") return;
+    try {
+      await fetch(`/api/run/jobs/${activeJobId}/pause`, { method: "POST" });
+      setStatus("paused");
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent("omweb:chat-status-changed", {
+            detail: { chatId: activeChatId, jobId: activeJobId, status: "paused" },
+          })
+        );
+      }
+    } catch (e) {
+      console.error("[ChatContainer] Failed to pause job:", e);
+    }
+  }, [activeJobId, status, activeChatId]);
+
+  const handleResumeTask = useCallback(async () => {
+    if (!activeJobId || status !== "paused") return;
+    try {
+      await fetch(`/api/run/jobs/${activeJobId}/resume`, { method: "POST" });
+      setStatus("running");
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent("omweb:chat-status-changed", {
+            detail: { chatId: activeChatId, jobId: activeJobId, status: "running" },
+          })
+        );
+      }
+    } catch (e) {
+      console.error("[ChatContainer] Failed to resume job:", e);
+    }
+  }, [activeJobId, status, activeChatId]);
 
   // --- Human-in-the-loop ----------------------------------------------------
   const handleSendHumanAnswer = useCallback(
@@ -409,7 +441,8 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       ).trim();
       if (
         (!rawText && (!filesToUpload || filesToUpload.length === 0)) ||
-        status === "running"
+        status === "running" ||
+        status === "paused"
       ) {
         throw new Error(
           "Task cannot be started with empty input or during ongoing run."
@@ -631,14 +664,174 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     ]
   );
 
+  // --- Turn Regeneration Handler --------------------------------------------
+  const handleRegenerate = useCallback(
+    async (turnIndex: number, turn?: ChatTurn) => {
+      if (status === "running" || status === "paused") return;
+
+      if (turnIndex === -1 || turnIndex === undefined) {
+        // Regenerating the current/latest completed turn
+        const promptToRerun = submittedPrompt;
+        if (!promptToRerun) return;
+
+        setStatus("running");
+        setSteps([]);
+        setFinalResult(null);
+        setCurrentStepNum(1);
+        setProducedFiles([]);
+        setSelectedFileForEditor(null);
+        setExpandedSteps({ "active-1": true });
+        setHumanQuery(null);
+        setTokensUsed({ input: 0, output: 0, total: 0 });
+        setCurrentUsageMetrics(null);
+        setElapsedSeconds(0);
+        setSessionTimestamp(new Date().toLocaleString());
+        setActiveChildRuns({});
+        setPendingApprovals({});
+
+        const targetChatId = activeChatId;
+        const effectiveMode = execMode;
+
+        try {
+          let storedOverride = {};
+          if (activeLlmOverride) {
+            try {
+              storedOverride = JSON.parse(activeLlmOverride);
+            } catch (e) {}
+          }
+
+          const generativeUiPayload = getGenerativeUIPayload();
+
+          const res = await fetch("/api/run", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              prompt: promptToRerun,
+              max_steps:
+                effectiveMode === "agent"
+                  ? getAgentMaxSteps(selectedAgentId)
+                  : 1,
+              chat_id: targetChatId,
+              agent_id: selectedAgentId || "peldrun",
+              mode: effectiveMode,
+              regenerate_turn_id: "latest",
+              generative_ui: generativeUiPayload,
+              ...storedOverride,
+            }),
+          });
+
+          if (!res.ok) {
+            const errorData = await res.json().catch(() => ({}));
+            throw new Error(errorData.detail || "Failed to regenerate turn");
+          }
+
+          const data = await res.json();
+          const jobId = data.job_id;
+          setActiveJobId(jobId);
+          connectStream(jobId);
+        } catch (err: any) {
+          console.error("[ChatContainer] Regeneration dispatch error:", err);
+          setStatus("failed");
+          setFinalResult(err?.message || "Regeneration failed.");
+        }
+      } else {
+        // Regenerating a historical turn: truncate subsequent history to branch
+        const targetTurn = turn || historyTurns[turnIndex];
+        if (!targetTurn) return;
+
+        const promptToRerun = targetTurn.prompt;
+        const targetTurnId = targetTurn.jobId || String(turnIndex);
+
+        setHistoryTurns((prev) => prev.slice(0, turnIndex));
+        setSubmittedPrompt(promptToRerun);
+        setSubmittedFiles(targetTurn.attachedFiles || []);
+        setStatus("running");
+        setSteps([]);
+        setFinalResult(null);
+        setCurrentStepNum(1);
+        setProducedFiles([]);
+        setSelectedFileForEditor(null);
+        setExpandedSteps({ "active-1": true });
+        setHumanQuery(null);
+        setTokensUsed({ input: 0, output: 0, total: 0 });
+        setCurrentUsageMetrics(null);
+        setElapsedSeconds(0);
+        setSessionTimestamp(new Date().toLocaleString());
+        setActiveChildRuns({});
+        setPendingApprovals({});
+
+        const targetChatId = activeChatId;
+        const effectiveMode = targetTurn.mode || execMode;
+
+        try {
+          let storedOverride = {};
+          if (activeLlmOverride) {
+            try {
+              storedOverride = JSON.parse(activeLlmOverride);
+            } catch (e) {}
+          }
+
+          const generativeUiPayload = getGenerativeUIPayload();
+
+          const res = await fetch("/api/run", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              prompt: promptToRerun,
+              max_steps:
+                effectiveMode === "agent"
+                  ? getAgentMaxSteps(selectedAgentId)
+                  : 1,
+              chat_id: targetChatId,
+              agent_id: selectedAgentId || "peldrun",
+              mode: effectiveMode,
+              regenerate_turn_id: targetTurnId,
+              generative_ui: generativeUiPayload,
+              ...storedOverride,
+            }),
+          });
+
+          if (!res.ok) {
+            const errorData = await res.json().catch(() => ({}));
+            throw new Error(errorData.detail || "Failed to regenerate turn");
+          }
+
+          const data = await res.json();
+          const jobId = data.job_id;
+          setActiveJobId(jobId);
+          connectStream(jobId);
+        } catch (err: any) {
+          console.error("[ChatContainer] Historical turn regeneration error:", err);
+          setStatus("failed");
+          setFinalResult(err?.message || "Regeneration failed.");
+        }
+      }
+    },
+    [
+      status,
+      submittedPrompt,
+      activeChatId,
+      execMode,
+      activeLlmOverride,
+      getAgentMaxSteps,
+      selectedAgentId,
+      historyTurns,
+      connectStream,
+      setProducedFiles,
+      setElapsedSeconds,
+    ]
+  );
+
   // --- Derived values -------------------------------------------------------
   const isFreshSession =
     historyTurns.length === 0 &&
     steps.length === 0 &&
     !submittedPrompt &&
-    status !== "running";
+    status !== "running" &&
+    status !== "paused";
 
   const getLiveStatusMessage = useCallback(() => {
+    if (status === "paused") return "Execution paused at step boundary";
     if (execMode === "chat") return "Synthesizing conversational response...";
     if (steps.length === 0)
       return "Analyzing request and formulating execution plan...";
@@ -650,7 +843,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     if (lastEvt.type === "thought")
       return "Deep reasoning and verifying solution...";
     return "Agent reasoning & executing autonomously...";
-  }, [execMode, steps]);
+  }, [execMode, steps, status]);
 
   const currentCostUsd = useMemo(() => {
     return currentUsageMetrics?.cost_usd ?? 0;
@@ -763,6 +956,9 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
             onApproveDelegation={handleApproveDelegation}
             onRejectDelegation={handleRejectDelegation}
             onCancelSubtask={handleCancelSubtask}
+            onPauseJob={handlePauseTask}
+            onResumeJob={handleResumeTask}
+            onRegenerate={handleRegenerate}
           />
         )}
 
@@ -774,8 +970,8 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
                 handleStartTask(textToSend, llmOverride, files)
               }
               onStop={handleStopTask}
-              isRunning={status === "running"}
-              disabled={status === "running"}
+              isRunning={status === "running" || status === "paused"}
+              disabled={status === "running" || status === "paused"}
             />
           </div>
         )}
