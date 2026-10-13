@@ -99,6 +99,22 @@ interface ChatThreadProps {
  */
 const HUMAN_TOOL_NAMES = new Set(["ask_human", "human_input"]);
 
+/**
+ * Visual phases for the human-in-the-loop submission flow.
+ *
+ * idle       -> card is displayed and awaiting user input
+ * sending    -> card flies away (letter-send animation) after submission
+ * verifying  -> compact loader shown while confirming delivery
+ * success    -> green check confirmation is briefly displayed
+ * fading     -> confirmation fades out with a subtle scale-down
+ */
+type HumanSubmitPhase = "idle" | "sending" | "verifying" | "success" | "fading";
+
+const SENDING_ANIMATION_MS = 450;
+const SUCCESS_HOLD_MS = 900;
+const FADING_DURATION_MS = 400;
+const VERIFY_FALLBACK_MS = 5000;
+
 function parsePromptAndAttachments(
   rawPrompt: string,
   explicitFiles?: AttachedUserFile[]
@@ -375,7 +391,7 @@ export function ChatThread({
   });
 
   /**
-   * FIX: An observation is only considered as "resolving" the human call if it
+   * An observation is only considered as "resolving" the human call if it
    * was produced by a NON-human tool. Observations emitted by the ask_human tool
    * itself (reflecting its own result) must be ignored, otherwise the pending
    * human prompt would immediately be marked as resolved and the awaiting card
@@ -424,7 +440,7 @@ export function ChatThread({
   }
 
   /**
-   * FIX: The waiting card should render whenever there is a pending human call
+   * The waiting card should render whenever there is a pending human call
    * OR a detected prompt, and the agent is still running. Previously this
    * required both `detectedPrompt` AND the call to be unresolved, which failed
    * whenever the observation from ask_human cleared the humanQuery upstream.
@@ -435,6 +451,60 @@ export function ChatThread({
     (status === "running" || (status as string) === "waiting_for_input")
   );
   const activeApprovalList = Object.values(pendingApprovals || {});
+
+  /**
+   * Visual submission state machine for the human-in-the-loop card.
+   * Drives the send -> verify -> success -> fade transition sequence.
+   */
+  const [humanSubmitPhase, setHumanSubmitPhase] = useState<HumanSubmitPhase>("idle");
+
+  /**
+   * Guarded submission handler. Prevents duplicate submissions while a
+   * submission animation is already in progress, then forwards the answer
+   * upstream and kicks off the visual transition to `sending`.
+   */
+  const handleHumanSubmit = (answer?: string) => {
+    if (humanSubmitPhase !== "idle") return;
+    setHumanSubmitPhase("sending");
+    onSendHumanAnswer(answer);
+  };
+
+  // sending -> verifying: fly-away animation window
+  useEffect(() => {
+    if (humanSubmitPhase !== "sending") return;
+    const t = setTimeout(() => {
+      setHumanSubmitPhase((prev) => (prev === "sending" ? "verifying" : prev));
+    }, SENDING_ANIMATION_MS);
+    return () => clearTimeout(t);
+  }, [humanSubmitPhase]);
+
+  // verifying -> success: wait until the pending human call is resolved
+  // upstream, falling back to a fixed delay if the resolution signal is lost.
+  useEffect(() => {
+    if (humanSubmitPhase !== "verifying") return;
+    if (!isHumanWaiting) {
+      setHumanSubmitPhase("success");
+      return;
+    }
+    const t = setTimeout(() => {
+      setHumanSubmitPhase((prev) => (prev === "verifying" ? "success" : prev));
+    }, VERIFY_FALLBACK_MS);
+    return () => clearTimeout(t);
+  }, [humanSubmitPhase, isHumanWaiting]);
+
+  // success -> fading: hold the green confirmation briefly
+  useEffect(() => {
+    if (humanSubmitPhase !== "success") return;
+    const t = setTimeout(() => setHumanSubmitPhase("fading"), SUCCESS_HOLD_MS);
+    return () => clearTimeout(t);
+  }, [humanSubmitPhase]);
+
+  // fading -> idle: collapse back to baseline after fade-out completes
+  useEffect(() => {
+    if (humanSubmitPhase !== "fading") return;
+    const t = setTimeout(() => setHumanSubmitPhase("idle"), FADING_DURATION_MS);
+    return () => clearTimeout(t);
+  }, [humanSubmitPhase]);
 
   return (
     <div className="flex-1 overflow-y-auto p-4 sm:p-5 font-sans">
@@ -564,68 +634,126 @@ export function ChatThread({
         )}
 
         {/* Interactive Human-in-the-Loop Dialog Suspension Card */}
-        {isHumanWaiting && (
-          <div className="p-4 sm:p-5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-xs space-y-3.5 shadow-sm transition-all">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2 text-amber-600 dark:text-amber-400 font-semibold text-xs">
-                <HelpCircle size={15} className="shrink-0 animate-bounce" />
-                <span>Agent Paused & Waiting for Your Decision:</span>
-              </div>
-              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/20 font-bold">
-                Action Required
-              </span>
-            </div>
+        {(isHumanWaiting || humanSubmitPhase !== "idle") && (
+          <div>
+            {/*
+              Idle / Sending shell:
+                - During `idle`, this is the fully interactive card with
+                  option buttons, text input, and Send button.
+                - During `sending`, the same DOM is kept (so the letter-fly
+                  animation has something to animate) and all interactive
+                  controls are disabled while the card transitions away.
+            */}
+            {(humanSubmitPhase === "idle" ||  humanSubmitPhase === "sending") && (
+              <div
+                className={`p-4 sm:p-5 rounded-md bg-gigbg border border-custom text-xs space-y-3.5 shadow-md origin-top-right ${
+                  humanSubmitPhase === "sending"
+                    ? "opacity-0 translate-x-[110px] -translate-y-[40px] scale-[0.8] rotate-[7deg] pointer-events-none transition-all duration-[500ms] ease-[cubic-bezier(0.34,1.2,0.64,1)]"
+                    : ""
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 font-semibold text-[#274AB3] dark:text-[#305CDE] text-xs">
+                    <HelpCircle size={15} className="shrink-0 animate-bounce" />
+                    <span>Agent Paused &amp; Waiting for Your Decision:</span>
+                  </div>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/20 font-bold inline-flex justify-center items-center">
+                    <span className="relative flex h-2 w-2 mr-1">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500"></span>
+                    </span>
+                    Action Required
+                  </span>
+                </div>
 
-            <div className="p-3 rounded-lg bg-background border border-border text-foreground text-sm font-medium leading-relaxed whitespace-pre-wrap">
-              {detectedPrompt || "The agent requires your input to proceed."}
-            </div>
+                <div className="p-3 rounded-sm bg-custom border border-border text-black text-sm font-medium leading-relaxed whitespace-pre-wrap">
+                  {detectedPrompt || "The agent requires your input to proceed."}
+                </div>
 
-            {detectedOptions.length > 0 && (
-              <div className="space-y-1.5">
-                <span className="text-[11px] font-medium text-muted-foreground block">
-                  Select an option to proceed:
-                </span>
-                <div className="flex flex-wrap items-center gap-2">
-                  {detectedOptions.map((opt) => (
-                    <button
-                      key={opt}
-                      type="button"
-                      onClick={() => onSendHumanAnswer(opt)}
-                      className="px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-primary text-primary-foreground hover:bg-primary/90 transition-all shadow-xs cursor-pointer flex items-center gap-1.5 active:scale-95"
-                    >
-                      <CheckCircle2 size={13} />
-                      <span>{opt}</span>
-                    </button>
-                  ))}
+                {/*
+                  Quick-pick option buttons.
+                  Rendered whenever the agent supplied a list of options
+                  (or a confirm/boolean input type which maps to Yes/No).
+                */}
+                {detectedOptions.length > 0 && (
+                  <div className="space-y-1.5">
+                    <span className="text-[11px] font-medium text-muted-foreground block">
+                      Select an option to proceed:
+                    </span>
+                    <div className="flex flex-wrap items-center gap-2">
+                      {detectedOptions.map((opt) => (
+                        <button
+                          key={opt}
+                          type="button"
+                          onClick={() => handleHumanSubmit(opt)}
+                          disabled={humanSubmitPhase !== "idle"}
+                          className="px-3.5 py-1.5 rounded-sm text-xs capitalize bg-primary text-primary-foreground hover:bg-primary/90 transition-all shadow-xs cursor-pointer flex items-center gap-1.5 active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed"
+                        >
+                          <CheckCircle2 size={13} />
+                          <span>{opt}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex items-center gap-2 pt-1">
+                  <div className="relative flex-1">
+                    <input
+                      type="text"
+                      value={humanAnswer}
+                      onChange={(e) => setHumanAnswer(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && handleHumanSubmit()}
+                      placeholder={
+                        detectedOptions.length > 0
+                          ? "Or type a custom response to the agent..."
+                          : "Type your response to the agent..."
+                      }
+                      disabled={humanSubmitPhase !== "idle"}
+                      className="w-full bg-background border border-border rounded-sm pl-3 pr-8 py-2 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-primary shadow-xs disabled:opacity-60"
+                    />
+                    <MessageSquare size={13} className="absolute right-2.5 top-2.5 text-muted-foreground/60 pointer-events-none" />
+                  </div>
+                  <Button
+                    variant="primary"
+                    onClick={() => handleHumanSubmit()}
+                    disabled={!humanAnswer.trim() || humanSubmitPhase !== "idle"}
+                    className="text-xs px-4 h-8.5 rounded-sm cursor-pointer font-medium"
+                  >
+                    Send
+                  </Button>
                 </div>
               </div>
             )}
 
-            <div className="flex items-center gap-2 pt-1">
-              <div className="relative flex-1">
-                <input
-                  type="text"
-                  value={humanAnswer}
-                  onChange={(e) => setHumanAnswer(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && onSendHumanAnswer()}
-                  placeholder={
-                    detectedOptions.length > 0
-                      ? "Or type a custom response to the agent..."
-                      : "Type your response to the agent..."
-                  }
-                  className="w-full bg-background border border-border rounded-lg pl-3 pr-8 py-2 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-primary shadow-xs"
+            {humanSubmitPhase === "verifying" && (
+              <div className="p-3.5 rounded-md bg-gigbg border border-custom shadow-md flex items-center justify-center">
+                <AIThinkingLoader
+                  message="Sending your response..."
+                  color="blue"
+                  speed={5}
+                  textAnimation="shimmer"
+                  showDots={false}
                 />
-                <MessageSquare size={13} className="absolute right-2.5 top-2.5 text-muted-foreground/60 pointer-events-none" />
               </div>
-              <Button
-                variant="primary"
-                onClick={() => onSendHumanAnswer()}
-                disabled={!humanAnswer.trim()}
-                className="text-xs px-4 h-8.5 rounded-lg cursor-pointer font-medium"
+            )}
+
+            {(humanSubmitPhase === "success" || humanSubmitPhase === "fading") && (
+              <div
+                className={`p-3.5 rounded-md bg-emerald-500/5 border border-emerald-500/25 shadow-md flex items-center justify-center gap-2 transition-all duration-500 ease-out ${
+                  humanSubmitPhase === "fading"
+                    ? "opacity-0 scale-90"
+                    : "opacity-100 scale-100"
+                }`}
               >
-                Send
-              </Button>
-            </div>
+                <div className="w-6 h-6 rounded-full bg-emerald-500 flex items-center justify-center shadow-sm">
+                  <Check size={14} className="text-white" strokeWidth={3} />
+                </div>
+                <span className="text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                  Response sent
+                </span>
+              </div>
+            )}
           </div>
         )}
 
