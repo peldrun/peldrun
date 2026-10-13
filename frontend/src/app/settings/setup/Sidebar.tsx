@@ -66,6 +66,8 @@ export function Sidebar({
         )}
       </div>
 
+
+
       <div className="space-y-1 flex-1">
         {tabs.map((tab) => {
           const isActive = activeTab === tab.id;
@@ -87,11 +89,23 @@ export function Sidebar({
           );
         })}
 
-        {/* Dedicated Live Monitoring Link */}
+
+              {/* Dedicated Live Monitoring Link */}
         <div className="pt-2.5 mt-2.5 border-t border-border/60">
           <span className="text-[10px] font-semibold text-muted-foreground/70 uppercase tracking-wider px-3 mb-1.5 block">
-            Live Monitoring
+            Live Monitoring & Telemetry
           </span>
+          <Link
+            href="/settings/search"
+            title="Open dedicated search orchestrator, analytics, and provider telemetry"
+            className="w-full flex items-center justify-between px-3 py-2 rounded-0 text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-all cursor-pointer group"
+          >
+            <div className="flex items-center gap-2.5">
+              <Search size={14} className="text-peldrun-accent group-hover:scale-110 transition-transform" />
+              <span className="group-hover:text-foreground transition-colors">Search & Telemetry</span>
+            </div>
+            <ExternalLink size={12} className="text-muted-foreground/50 group-hover:text-foreground transition-colors" />
+          </Link>
           <Link
             href="/status"
             title="Open real-time system health and runtime diagnostics"
@@ -104,6 +118,9 @@ export function Sidebar({
             <ExternalLink size={12} className="text-muted-foreground/50 group-hover:text-foreground transition-colors" />
           </Link>
         </div>
+
+
+
       </div>
 
       <div className="pl-3 pr-3 pt-3 border-t border-border space-y-2">

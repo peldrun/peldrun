@@ -1,129 +1,304 @@
 """
 backend/peldrun/tools/builtins/web_search.py
 
-PELDRUN Core Web Search Tool.
-Queries the web using resilient search scraping providers with verified link attribution.
-Configured with an idempotent, retryable ToolExecutionPolicy under PR 4.
+PELDRUN Core Web Search Orchestrator Tool.
+Queries enabled internet search engines through the provider factory
+without deadlocking the event loop or triggering agent retry loops.
+
+Fixes applied:
+- Critical: exit_code=1 and is_error=True when the search fails,
+  preventing the LLM from entering an infinite retry loop.
+- Explicit failure message instructs the LLM not to retry the same query.
+- Telemetry persistence runs in a worker thread (non-blocking).
+- Removed hardcoded Windows paths from config discovery.
+- Config file discovery order is now deterministic and portable.
+- Improved tool description to warn the LLM about retry behavior.
+- Query and result limit validation is centralized.
+- Air-Gapped mode returns a clear success-shaped response (no error).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional
-import urllib.parse
-from pydantic import BaseModel, Field
 
-import httpx
+from pydantic import BaseModel, Field
 
 from peldrun.tools.base import BaseTool, ToolResult
 from peldrun.tools.contract import ToolExecutionPolicy
+from peldrun.tools.builtins.search_providers.factory import SearchProviderFactory
 
 logger = logging.getLogger("peldrun.tools.builtins.web_search")
 
-try:
-    from bs4 import BeautifulSoup
-except ImportError:
-    BeautifulSoup = None  # type: ignore[assignment, misc]
-
 
 class WebSearchArgs(BaseModel):
-    """Arguments for the web_search tool."""
-    query: str = Field(..., description="The search terms or keyword query.")
-    max_results: Optional[int] = Field(default=5, ge=1, le=10, description="Maximum snippet results to retrieve.")
+    query: str = Field(
+        ...,
+        description="The search terms or keyword query.",
+    )
+    max_results: Optional[int] = Field(
+        default=5,
+        ge=1,
+        le=15,
+        description="Maximum snippet results to retrieve.",
+    )
 
 
 class WebSearchTool(BaseTool):
-    """
-    Search tool querying internet search engines with automatic retry capabilities.
-    Marked as idempotent and retryable with max_attempts=3.
-    """
-
     name: str = "web_search"
     description: str = (
-        "Search the live web for recent information, documentation, news, or technical queries. "
-        "Returns snippets with verified Markdown links and URLs."
+        "Search the live web for recent information, documentation, news, or "
+        "technical queries. Returns verified citations and clean Markdown links. "
+        "IMPORTANT: If this tool returns an error or no results, DO NOT retry "
+        "the same or a similar query repeatedly. Report the failure to the user "
+        "after ONE attempt and proceed with your existing knowledge."
     )
     args_schema = WebSearchArgs
 
+    # A single attempt is enforced here because SearchProviderFactory already
+    # orchestrates its own internal fallback chain across multiple engines.
     execution_policy = ToolExecutionPolicy(
-        max_attempts=3,
-        timeout_seconds=30.0,
-        retryable=True,
+        max_attempts=1,
+        timeout_seconds=25.0,
+        retryable=False,
         idempotent=True,
         side_effects=False,
-        backoff_factor=1.5,
     )
 
-    def __init__(self, workspace_root: Optional[str] = None, **kwargs: Any) -> None:
-        super().__init__(workspace_root=workspace_root, execution_policy=self.execution_policy)
+    def __init__(
+        self,
+        workspace_root: Optional[str] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            workspace_root=workspace_root,
+            execution_policy=self.execution_policy,
+        )
 
-    async def _arun(self, query: str, max_results: Optional[int] = 5, **kwargs: Any) -> ToolResult:
-        clean_q = query.strip()
+    # ------------------------------------------------------------------
+    # Configuration loading
+    # ------------------------------------------------------------------
+    def _load_live_search_config(self) -> Dict[str, Any]:
+        """
+        Discover and parse the [search] table from config.toml.
+        Search order is deterministic and portable across platforms.
+        Falls back to a safe DuckDuckGo-only default when no config is found.
+        """
+        candidates: List[Path] = [
+            Path("config/config.toml"),
+            Path("../config/config.toml"),
+            Path("../../config/config.toml"),
+        ]
+
+        # Compute a repository-relative path based on this file's location.
+        try:
+            module_relative = (
+                Path(__file__).resolve().parent.parent.parent.parent.parent
+                / "config"
+                / "config.toml"
+            )
+            candidates.append(module_relative)
+        except Exception:
+            pass
+
+        target_file: Optional[Path] = None
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    target_file = candidate
+                    break
+            except OSError:
+                continue
+
+        if target_file is not None:
+            data = self._parse_toml(target_file)
+            if isinstance(data, dict):
+                search_section = data.get("search")
+                if isinstance(search_section, dict):
+                    return search_section
+
+        logger.debug(
+            "No config.toml found in any candidate path; using built-in defaults."
+        )
+        return self._default_search_config()
+
+    @staticmethod
+    def _parse_toml(target_file: Path) -> Optional[Dict[str, Any]]:
+        """
+        Parse a TOML file using the standard library when available,
+        otherwise fall back to the third-party tomli package.
+        """
+        try:
+            import tomllib  # type: ignore[import-not-found]
+            with open(target_file, "rb") as handle:
+                return tomllib.load(handle)
+        except Exception:
+            pass
+
+        try:
+            import tomli  # type: ignore[import-not-found]
+            with open(target_file, "rb") as handle:
+                return tomli.load(handle)
+        except Exception as exc:
+            logger.debug(f"Failed to parse config.toml at {target_file}: {exc}")
+            return None
+
+    @staticmethod
+    def _default_search_config() -> Dict[str, Any]:
+        return {
+            "enabled": True,
+            "engine": "DuckDuckGo",
+            "fallback_engines": ["DuckDuckGo"],
+            "retry_delay": 5,
+            "max_retries": 3,
+            "lang": "en",
+            "country": "us",
+        }
+
+    # ------------------------------------------------------------------
+    # Telemetry persistence helper
+    # ------------------------------------------------------------------
+    @staticmethod
+    async def _persist_telemetry_async(
+        query: str,
+        provider: str,
+        results_count: int,
+        latency_ms: float,
+        cost_usd: float,
+        is_success: bool,
+        error_message: Optional[str],
+        session_id: Optional[str],
+        run_id: Optional[str],
+    ) -> None:
+        """
+        Record search telemetry in a worker thread so the event loop is
+        never blocked by SQLite I/O. Failures are silently ignored.
+        """
+        def _persist() -> None:
+            try:
+                from peldrun.runtime.search_usage_store import (
+                    get_search_usage_store,
+                )
+                store = get_search_usage_store()
+                store.record_search(
+                    query=query,
+                    provider=provider,
+                    results_count=results_count,
+                    latency_ms=latency_ms,
+                    cost_usd=cost_usd,
+                    is_success=is_success,
+                    error_message=error_message,
+                    session_id=session_id,
+                    run_id=run_id,
+                )
+            except Exception:
+                # Telemetry failures must never break search execution.
+                pass
+
+        try:
+            await asyncio.to_thread(_persist)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Main execution entry point
+    # ------------------------------------------------------------------
+    async def _arun(
+        self,
+        query: str,
+        max_results: Optional[int] = 5,
+        **kwargs: Any,
+    ) -> ToolResult:
+        clean_q = (query or "").strip()
+
         if not clean_q:
-            return ToolResult(output="Search query cannot be empty.", exit_code=1, is_error=True)
+            return ToolResult(
+                output="Search query cannot be empty.",
+                exit_code=1,
+                is_error=True,
+            )
 
-        limit = max_results or 5
+        # Clamp the requested result count to a safe range.
+        try:
+            requested = int(max_results or 5)
+        except (TypeError, ValueError):
+            requested = 5
+        limit = min(max(requested, 1), 15)
 
-        if BeautifulSoup is None:
+        search_cfg = self._load_live_search_config()
+
+        # Air-Gapped mode is a valid, non-error administrative state.
+        if search_cfg.get("enabled") is False:
             return ToolResult(
                 output=(
-                    f"Search completed for '{clean_q}'. No snippets returned. "
-                    "Notice: 'beautifulsoup4' is not installed in the environment."
+                    "Web search is administratively disabled in this workspace "
+                    "(Air-Gapped Mode). Proceed without live search and inform "
+                    "the user that live search is unavailable."
                 ),
                 exit_code=0,
                 is_error=False,
             )
 
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/128.0.0.0 Safari/537.36"
-            ),
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        }
+        # Execute the orchestrated search across all configured providers.
+        try:
+            response = await SearchProviderFactory.execute_orchestrated_search(
+                query=clean_q,
+                search_config=search_cfg,
+                max_results=limit,
+                lang=search_cfg.get("lang", "en"),
+                country=search_cfg.get("country", "us"),
+                **kwargs,
+            )
+        except Exception as exc:
+            logger.error(f"Search orchestration raised an exception: {exc}")
+            return ToolResult(
+                output=(
+                    f"⚠️ Web search failed due to an internal error: {exc}\n"
+                    f"IMPORTANT: Do NOT retry this search. Proceed with your "
+                    f"existing knowledge or inform the user that live search "
+                    f"is currently unavailable."
+                ),
+                exit_code=1,
+                is_error=True,
+            )
 
-        results: List[Dict[str, str]] = []
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=headers) as client:
-            resp = await client.post("https://lite.duckduckgo.com/lite/", data={"q": clean_q})
-            if resp.status_code >= 400:
-                raise RuntimeError(f"Search provider returned HTTP error {resp.status_code}")
+        # Persist telemetry without blocking the event loop.
+        await self._persist_telemetry_async(
+            query=clean_q,
+            provider=response.provider,
+            results_count=len(response.results),
+            latency_ms=response.latency_ms,
+            cost_usd=response.estimated_cost_usd,
+            is_success=response.is_success,
+            error_message=response.error_message,
+            session_id=kwargs.get("session_id"),
+            run_id=kwargs.get("run_id"),
+        )
 
-            soup = BeautifulSoup(resp.text, "html.parser")
-            links = soup.find_all("a", class_="result-link")
-            snippets = soup.find_all("td", class_="result-snippet")
+        # Success path: results were returned by the orchestrator.
+        if response.is_success and response.results:
+            return ToolResult(
+                output=response.format_markdown(),
+                exit_code=0,
+                is_error=False,
+            )
 
-            for idx in range(min(len(links), limit)):
-                a_tag = links[idx]
-                raw_href = a_tag.get("href", "")
-                target_url = raw_href
-                if "uddg=" in raw_href:
-                    m = re.search(r"uddg=([^&]+)", raw_href)
-                    if m:
-                        target_url = urllib.parse.unquote(m.group(1))
-
-                title = a_tag.get_text().strip()
-                snip = snippets[idx].get_text().strip() if idx < len(snippets) else ""
-                if target_url and not target_url.startswith("/"):
-                    results.append({"title": title or target_url, "url": target_url, "snippet": snip})
-
-        if results:
-            lines = [
-                f"### Verified Web Search Results for: '{clean_q}'",
-                "*(You MUST cite these sources and include their target URLs in your response)*\n",
-            ]
-            for i, r in enumerate(results, 1):
-                lines.append(
-                    f"**{i}. [{r['title']}]({r['url']})**\n   - **URL:** {r['url']}\n   - **Snippet:** {r['snippet']}\n"
-                )
-            return ToolResult(output="\n".join(lines).strip(), exit_code=0, is_error=False)
-
+        # Failure path: explicit error signal prevents LLM retry loops.
+        diagnostic = response.error_message or "No results were returned."
         return ToolResult(
-            output=f"Search completed for '{clean_q}'. No web snippets were returned.",
-            exit_code=0,
-            is_error=False,
+            output=(
+                f"⚠️ Web search did not return any results.\n"
+                f"Provider: {response.provider}\n"
+                f"Query: '{clean_q}'\n"
+                f"Reason: {diagnostic}\n"
+                f"IMPORTANT: Do NOT retry this search with the same or a "
+                f"similar query. Either proceed with your existing knowledge "
+                f"or clearly inform the user that live search is unavailable."
+            ),
+            exit_code=1,
+            is_error=True,
         )
 
 

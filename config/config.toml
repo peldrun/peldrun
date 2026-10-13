@@ -15,9 +15,9 @@ cdp_url = "http://localhost:9222"
 max_content_length = 2000
 
 [search]
-engine = "DuckDuckGo"
-fallback_engines = [ "Baidu", "Bing", "DuckDuckGo", "Google",]
-retry_delay = 60
+engine = "Jina"
+fallback_engines = []
+retry_delay = 5
 max_retries = 3
 lang = "en"
 country = "us"
@@ -47,7 +47,7 @@ use_data_analysis_agent = false
 [llm.vision]
 provider = "lmstudio"
 provider_name = "LM Studio (Local)"
-model = "google/gemma-4-12b-qat"
+model = "qwen3-vl-8b-instruct"
 base_url = "http://127.0.0.1:1234/v1"
 api_key = ""
 max_tokens = 8192
@@ -57,3 +57,6 @@ temperature = 0
 server = ""
 username = ""
 password = ""
+
+[search.jina]
+api_key = "jina_0bc606578d42487aab705f2e6ca3c88aNUm6oNf-c8k-0uQ1ipyR1fXse8e1"
