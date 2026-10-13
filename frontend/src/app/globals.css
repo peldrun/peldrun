@@ -6,6 +6,7 @@
  */
 
 @import url('../../public/css/glow.css');
+@import url('../../public/css/tooltip.css');
 
 @layer theme, base, openui, components, utilities;
 
@@ -120,7 +121,9 @@
   --font-serif: 'Cairo', serif;
   --font-arabic: 'Cairo', sans-serif;
 }
-
+[dir="rtl"] table{
+  text-align: right;
+}
 /* peldrun Ultra-Subtle Scrollbar */
 ::-webkit-scrollbar {
   width: 5px;

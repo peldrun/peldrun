@@ -14,19 +14,23 @@ import {
   PanelLeft,
 } from "lucide-react";
 import "@/lib/vault";
+
+import { GlobalTooltip } from "@/components/ui/global-tooltip";
+
 import { Header } from "@/components/layout/header";
 import { Sidebar } from "@/components/layout/sidebar";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { LanguageToggle } from "@/components/ui/language-toggle";
 import { useAppStorage } from "@/hooks/use-app-storage";
 
+
 const navItems = [
   { href: "/chat", icon: MessageSquare, label: "Chat" },
   { href: "/projects", icon: FolderOpen, label: "Projects" },
   { href: "/files", icon: Folder, label: "Files" },
   { href: "/history", icon: History, label: "History" },
-  
-  
+
+
 ];
 
 export function AppShell({ children }: { children: React.ReactNode }) {
@@ -41,8 +45,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   if (pathname === "/setup") {
     return (
       <div className="min-h-screen w-screen bg-background text-foreground font-sans overflow-x-hidden selection:bg-primary/25">
+        <GlobalTooltip />
         {children}
       </div>
+
+
     );
   }
 
@@ -50,6 +57,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-background text-foreground font-sans">
+      <GlobalTooltip />
       <aside className="w-16 h-full flex flex-col items-center justify-between py-3 border-r border-border bg-custom backdrop-blur-md z-30 shrink-0 select-none">
         <div className="flex flex-col items-center gap-3">
           <Link
@@ -60,13 +68,13 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <img
                 src="/peldrun-logo.svg"
                 alt="peldrun Web Logo"
-                className="w-full h-full object-contain group-hover:scale-105 transition-transform bg-transparent 
+                className="w-full h-full object-contain group-hover:scale-105 transition-transform bg-transparent
                           [[data-theme='dark']_&]:hidden"
               />
             <img
                 src="/peldrun-logo-light.svg"
                 alt="peldrun Web Logo"
-                className="w-full h-full object-contain group-hover:scale-105 transition-transform bg-transparent 
+                className="w-full h-full object-contain group-hover:scale-105 transition-transform bg-transparent
                           hidden [[data-theme='dark']_&]:block"
               />
 
@@ -87,7 +95,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               const active =
                 pathname === item.href ||
                 (item.href !== "/chat" && pathname.startsWith(item.href)) ||
-                (item.href === "/chat" && pathname.startsWith("/chat")); 
+                (item.href === "/chat" && pathname.startsWith("/chat"));
 
               return (
                 <Link
