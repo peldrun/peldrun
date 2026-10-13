@@ -3,8 +3,8 @@
 
 import React from "react";
 import { FileText, ExternalLink, Activity, Check, Copy, Bot, AlertCircle } from "lucide-react";
-import { GenerativeUIRouter } from "@/components/generative-ui/GenerativeUIRouter";
 import { UsageBadgeGroup } from "@/components/chat/UsageBadges";
+import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
 
 interface ChatDeliverableProps {
   finalResult: string;
@@ -81,7 +81,7 @@ export function ChatDeliverable({
 
       {/* 2. Primary Response rendered via GenerativeUIRouter */}
       <div className="p-4 rounded-md bg-card/40 text-foreground text-sm leading-relaxed">
-        <GenerativeUIRouter content={displayContent} />
+        <MarkdownRenderer  content={displayContent} />
       </div>
 
       {/* 3. Diagnostic Trace Toggle */}

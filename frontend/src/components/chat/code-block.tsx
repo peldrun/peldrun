@@ -1,8 +1,22 @@
 ﻿// frontend/src/components/chat/code-block.tsx
+//
+// Syntax-highlighted code block.
+//
+// This component only renders fenced code blocks. All content dispatch
+// (mermaid diagrams, chart payloads, plain text blocks) is handled upstream
+// by MarkdownRenderer before this component is invoked.
+//
+// Features:
+//   - Prism-based syntax highlighting with language normalization
+//   - Line numbers
+//   - Copy to clipboard
+//   - Download as file
+//   - Open in workspace sandbox (emits a CustomEvent)
+//   - Collapse / expand for long snippets
+
 "use client";
 
-import React, { useState, useMemo } from "react";
-import dynamic from "next/dynamic";
+import React, { useState } from "react";
 import { Highlight, themes } from "prism-react-renderer";
 import {
   Check,
@@ -13,26 +27,11 @@ import {
   ChevronUp,
   Terminal,
   PanelRightOpen,
-  LineChart as ChartIcon,
-  Code2,
 } from "lucide-react";
 
-// Dynamic import for PeldrunChart to prevent bundling overhead when not charting
-const LazyChart = dynamic(
-  () =>
-    import("@/components/generative-ui/catalog/PeldrunChart").then(
-      (m) => m.PeldrunChart || (m as any).default
-    ),
-  {
-    loading: () => (
-      <div className="my-2 rounded-xl border border-border/80 bg-card/50 p-6 flex items-center justify-center gap-2 text-xs text-muted-foreground animate-pulse">
-        <span className="w-3.5 h-3.5 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-        <span>Rendering Recharts canvas...</span>
-      </div>
-    ),
-    ssr: false,
-  }
-);
+// ---------------------------------------------------------------------------
+// Public props
+// ---------------------------------------------------------------------------
 
 export interface CodeBlockProps {
   code: string;
@@ -41,14 +40,11 @@ export interface CodeBlockProps {
   className?: string;
 }
 
-interface ParsedChartData {
-  title: string;
-  type: "line" | "bar" | "area" | "donut";
-  unit?: string;
-  data: Array<{ label: string; value: number }>;
-}
+// ---------------------------------------------------------------------------
+// Language normalization
+// ---------------------------------------------------------------------------
 
-const languageAliases: Record<string, string> = {
+const LANGUAGE_ALIASES: Record<string, string> = {
   py: "python",
   python: "python",
   js: "javascript",
@@ -62,8 +58,6 @@ const languageAliases: Record<string, string> = {
   svg: "markup",
   css: "css",
   json: "json",
-  recharts: "json",
-  chart: "json",
   sh: "bash",
   bash: "bash",
   shell: "bash",
@@ -80,9 +74,15 @@ const languageAliases: Record<string, string> = {
   go: "go",
   c: "c",
   cpp: "cpp",
+  java: "java",
+  kotlin: "kotlin",
+  swift: "swift",
+  php: "php",
+  ruby: "ruby",
+  rb: "ruby",
 };
 
-const extensionMap: Record<string, string> = {
+const EXTENSION_MAP: Record<string, string> = {
   python: "py",
   javascript: "js",
   typescript: "ts",
@@ -91,8 +91,6 @@ const extensionMap: Record<string, string> = {
   markup: "html",
   css: "css",
   json: "json",
-  recharts: "json",
-  chart: "json",
   bash: "sh",
   sql: "sql",
   yaml: "yaml",
@@ -101,211 +99,36 @@ const extensionMap: Record<string, string> = {
   go: "go",
   c: "c",
   cpp: "cpp",
+  java: "java",
+  kotlin: "kt",
+  swift: "swift",
+  php: "php",
+  ruby: "rb",
+  text: "txt",
 };
 
-/**
- * Extracts normalized { label, value } pairs from varied engineering data key patterns
- * (e.g. time/voltage in RLC steps, freq/gain in Bode plots, or label/value).
- */
-function extractDataPoints(items: any[]): Array<{ label: string; value: number }> {
-  if (!Array.isArray(items) || items.length === 0) return [];
-
-  const result: Array<{ label: string; value: number }> = [];
-
-  const xKeyCandidates = [
-    "time",
-    "t",
-    "freq",
-    "frequency",
-    "date",
-    "step",
-    "omega",
-    "timestamp",
-    "x",
-    "label",
-    "name",
-    "phase",
-  ];
-
-  const yKeyCandidates = [
-    "voltage",
-    "v",
-    "current",
-    "i",
-    "amplitude",
-    "gain",
-    "magnitude",
-    "mag",
-    "db",
-    "val",
-    "value",
-    "y",
-    "power",
-    "response",
-    "stress",
-    "strain",
-    "temp",
-  ];
-
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i];
-    if (!item || typeof item !== "object") continue;
-
-    // Direct match: explicit label & value
-    if (
-      ("label" in item || "name" in item || "x" in item) &&
-      ("value" in item || "y" in item)
-    ) {
-      const label = String(item.label ?? item.name ?? item.x ?? `P${i + 1}`);
-      const valNum = Number(item.value ?? item.y);
-      if (!isNaN(valNum)) {
-        result.push({ label, value: valNum });
-        continue;
-      }
-    }
-
-    const keys = Object.keys(item);
-    let labelVal: string | null = null;
-    let numVal: number | null = null;
-
-    // Detect known candidates
-    for (const k of keys) {
-      const lowerK = k.toLowerCase();
-      if (yKeyCandidates.includes(lowerK) && typeof item[k] === "number" && !isNaN(item[k])) {
-        numVal = item[k];
-      }
-      if (xKeyCandidates.includes(lowerK) && labelVal === null) {
-        labelVal = String(item[k]);
-      }
-    }
-
-    // Generic fallback: first numerical key is value, first string/non-value key is label
-    if (numVal === null) {
-      for (const k of keys) {
-        if (typeof item[k] === "number" && !isNaN(item[k])) {
-          numVal = item[k];
-          break;
-        }
-      }
-    }
-
-    if (labelVal === null) {
-      for (const k of keys) {
-        if (
-          typeof item[k] === "string" ||
-          (typeof item[k] === "number" && item[k] !== numVal)
-        ) {
-          labelVal = String(item[k]);
-          break;
-        }
-      }
-    }
-
-    if (numVal !== null) {
-      result.push({
-        label: labelVal ?? `P${i + 1}`,
-        value: numVal,
-      });
-    }
-  }
-
-  return result;
-}
-
-/**
- * Validates and transforms JSON or recharts blocks into interactive chart datasets.
- */
-function parseChartableData(code: string, rawLang: string): ParsedChartData | null {
-  const lang = rawLang?.toLowerCase()?.trim() || "";
-  const isTargetLanguage =
-    lang === "json" ||
-    lang === "recharts" ||
-    lang === "chart" ||
-    lang === "application/json";
-
-  if (!isTargetLanguage || !code) return null;
-
-  try {
-    const parsed = JSON.parse(code);
-    if (!parsed || typeof parsed !== "object") return null;
-
-    // Pattern 1: Standard Chart envelope { title?, type?, unit?, data: [...] }
-    if (!Array.isArray(parsed) && Array.isArray(parsed.data) && parsed.data.length >= 2) {
-      const normalizedData = extractDataPoints(parsed.data);
-      if (normalizedData.length >= 2) {
-        const rawType = (parsed.type || "line").toLowerCase();
-        const validTypes = ["line", "bar", "area", "donut"];
-        const chartType = validTypes.includes(rawType) ? (rawType as any) : "line";
-        return {
-          title: parsed.title || "Engineering Analytics",
-          type: chartType,
-          unit: parsed.unit || "",
-          data: normalizedData,
-        };
-      }
-    }
-
-    // Pattern 2: Direct array of points [ { time: ..., voltage: ... }, ... ]
-    if (Array.isArray(parsed) && parsed.length >= 2) {
-      const normalizedData = extractDataPoints(parsed);
-      if (normalizedData.length >= 2) {
-        return {
-          title: "Engineering Simulation Response",
-          type: "line",
-          unit: "",
-          data: normalizedData,
-        };
-      }
-    }
-
-    // Pattern 3: Envelope with series or points { series: [...] }
-    const possibleArray = parsed.series || parsed.points || parsed.measurements;
-    if (Array.isArray(possibleArray) && possibleArray.length >= 2) {
-      const normalizedData = extractDataPoints(possibleArray);
-      if (normalizedData.length >= 2) {
-        const rawType = (parsed.type || "line").toLowerCase();
-        const validTypes = ["line", "bar", "area", "donut"];
-        const chartType = validTypes.includes(rawType) ? (rawType as any) : "line";
-        return {
-          title: parsed.title || "Engineering Analytics",
-          type: chartType,
-          unit: parsed.unit || "",
-          data: normalizedData,
-        };
-      }
-    }
-
-    return null;
-  } catch {
-    return null;
-  }
-}
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
 
 export function CodeBlock({
   code = "",
   language = "text",
   filename,
   className = "",
-}: CodeBlockProps) {
+}: CodeBlockProps): React.JSX.Element {
   const [copied, setCopied] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
 
-  const cleanCode = typeof code === "string" ? code.trim() : String(code || "");
+  const cleanCode = typeof code === "string" ? code.trim() : String(code ?? "");
   const lines = cleanCode.split("\n");
   const isLong = lines.length > 20;
 
-  const normalizedLang = languageAliases[language.toLowerCase()] || "javascript";
+  const normalizedLang =
+    LANGUAGE_ALIASES[language.toLowerCase()] || language.toLowerCase() || "text";
   const displayLang = (language || "TEXT").toUpperCase();
-  const fileExt = extensionMap[normalizedLang] || "txt";
+  const fileExt = EXTENSION_MAP[normalizedLang] || "txt";
   const defaultFilename = filename || `snippet.${fileExt}`;
-
-  // Evaluate if the snippet can be transformed into an interactive chart
-  const chartData = useMemo(() => {
-    return parseChartableData(cleanCode, language);
-  }, [cleanCode, language]);
-
-  // Default to interactive chart view if chart data is detected
-  const [viewMode, setViewMode] = useState<"chart" | "code">("chart");
 
   const handleCopy = async () => {
     if (!cleanCode) return;
@@ -358,13 +181,17 @@ export function CodeBlock({
     }
   };
 
-  const HighlightComponent = Highlight as any;
+  // prism-react-renderer v2 exposes `Highlight` as a render-prop component.
+  // The generic signature can conflict with React 19 types, so we cast to
+  // `any` at the call site only.
+  const HighlightComponent = Highlight as unknown as React.ComponentType<any>;
 
   return (
     <div
       dir="ltr"
       className={`my-3 overflow-hidden rounded-sm border border-border bg-[#0d1117] text-slate-100 shadow-peldrun-sm font-mono ${className}`}
     >
+      {/* Header */}
       <div className="flex items-center justify-between px-3.5 py-2 border-b border-border/60 bg-[#161b22]">
         <div className="flex items-center gap-2 truncate">
           {normalizedLang === "bash" ? (
@@ -378,43 +205,9 @@ export function CodeBlock({
           <span className="px-1.5 py-0.5 rounded text-[10px] font-mono uppercase bg-muted/10 text-card">
             {displayLang}
           </span>
-          {(!chartData || viewMode === "code") && (
-            <span className="hidden sm:inline-block text-[11px] font-mono text-muted-foreground">
-              ({lines.length} lines)
-            </span>
-          )}
-
-          {/* Interactive Chart / Raw JSON View Switcher */}
-          {chartData && (
-            <div className="ml-2 flex items-center bg-muted/20 p-0.5 rounded border border-border/40 text-[11px]">
-              <button
-                type="button"
-                onClick={() => setViewMode("chart")}
-                className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all cursor-pointer ${
-                  viewMode === "chart"
-                    ? "bg-primary text-primary-foreground font-medium shadow-xs"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
-                title="Render Interactive Chart"
-              >
-                <ChartIcon size={12} />
-                <span>Chart</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setViewMode("code")}
-                className={`flex items-center gap-1 px-2 py-0.5 rounded transition-all cursor-pointer ${
-                  viewMode === "code"
-                    ? "bg-primary text-primary-foreground font-medium shadow-xs"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
-                title="View Raw Code"
-              >
-                <Code2 size={12} />
-                <span>JSON</span>
-              </button>
-            </div>
-          )}
+          <span className="hidden sm:inline-block text-[11px] font-mono text-muted-foreground">
+            ({lines.length} lines)
+          </span>
         </div>
 
         <div className="flex items-center gap-1.5 flex-shrink-0">
@@ -459,78 +252,68 @@ export function CodeBlock({
         </div>
       </div>
 
-      {/* Render Chart or Code Block based on current View Mode */}
-      {chartData && viewMode === "chart" ? (
-        <div className="p-3 bg-card/40 border-t border-border/40">
-          <LazyChart
-            title={chartData.title}
-            type={chartData.type}
-            unit={chartData.unit}
-            data={chartData.data}
-          />
-        </div>
-      ) : (
-        <>
-          <div
-            className={`relative transition-all ${
-              isLong && !isExpanded ? "max-h-[380px] overflow-y-auto" : "overflow-x-auto"
-            }`}
-          >
-            <HighlightComponent
-              theme={themes.nightOwl}
-              code={cleanCode}
-              language={normalizedLang}
+      {/* Body */}
+      <div
+        className={`relative transition-all ${
+          isLong && !isExpanded
+            ? "max-h-[380px] overflow-y-auto"
+            : "overflow-x-auto"
+        }`}
+      >
+        <HighlightComponent
+          theme={themes.nightOwl}
+          code={cleanCode}
+          language={normalizedLang}
+        >
+          {({
+            className: highlightClass,
+            style,
+            tokens,
+            getLineProps,
+            getTokenProps,
+          }: any) => (
+            <pre
+              className={`${highlightClass} p-3.5 text-xs font-mono leading-relaxed bg-transparent m-0 min-w-full`}
+              style={style}
             >
-              {({
-                className: highlightClass,
-                style,
-                tokens,
-                getLineProps,
-                getTokenProps,
-              }: any) => (
-                <pre
-                  className={`${highlightClass} p-3.5 text-xs font-mono leading-relaxed bg-transparent m-0 min-w-full`}
-                  style={style}
-                >
-                  {tokens.map((line: any, i: number) => (
-                    <div key={i} {...getLineProps({ line })} className="table-row">
-                      <span className="table-cell select-none pr-4 text-right text-[11px] font-mono opacity-35 w-8">
-                        {i + 1}
-                      </span>
-                      <span className="table-cell whitespace-pre">
-                        {line.map((token: any, key: number) => (
-                          <span key={key} {...getTokenProps({ token })} />
-                        ))}
-                      </span>
-                    </div>
-                  ))}
-                </pre>
-              )}
-            </HighlightComponent>
-          </div>
-
-          {isLong && (
-            <div className="flex items-center justify-center p-1.5 border-t border-border/40 bg-[#161b22]/70">
-              <button
-                type="button"
-                onClick={() => setIsExpanded(!isExpanded)}
-                className="flex items-center gap-1.5 text-xs font-medium text-primary hover:underline transition-all cursor-pointer py-0.5"
-              >
-                {isExpanded ? (
-                  <>
-                    <ChevronUp size={13} />
-                    <span>Collapse snippet</span>
-                  </>
-                ) : (
-                  <>
-                    <ChevronDown size={13} />
-                    <span>Expand full view ({lines.length} lines)</span>
-                  </>
-                )}
-              </button>
-            </div>
+              {tokens.map((line: any, i: number) => (
+                <div key={i} {...getLineProps({ line })} className="table-row">
+                  <span className="table-cell select-none pr-4 text-right text-[11px] font-mono opacity-35 w-8">
+                    {i + 1}
+                  </span>
+                  <span className="table-cell whitespace-pre">
+                    {line.map((token: any, key: number) => (
+                      <span key={key} {...getTokenProps({ token })} />
+                    ))}
+                  </span>
+                </div>
+              ))}
+            </pre>
           )}
-        </>
+        </HighlightComponent>
+      </div>
+
+      {/* Expand / collapse for long snippets */}
+      {isLong && (
+        <div className="flex items-center justify-center p-1.5 border-t border-border/40 bg-[#161b22]/70">
+          <button
+            type="button"
+            onClick={() => setIsExpanded(!isExpanded)}
+            className="flex items-center gap-1.5 text-xs font-medium text-primary hover:underline transition-all cursor-pointer py-0.5"
+          >
+            {isExpanded ? (
+              <>
+                <ChevronUp size={13} />
+                <span>Collapse snippet</span>
+              </>
+            ) : (
+              <>
+                <ChevronDown size={13} />
+                <span>Expand full view ({lines.length} lines)</span>
+              </>
+            )}
+          </button>
+        </div>
       )}
     </div>
   );

@@ -112,6 +112,7 @@ export default async function RootLayout({
             defaultTheme={theme}
             enableSystem
           >
+
             <I18nProvider initialLocale={locale}>
               <AppShell>{children}</AppShell>
             </I18nProvider>
