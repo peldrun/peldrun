@@ -30,6 +30,10 @@ class IsolatedShellTool(BaseTool):
         super().__init__()
         self.workspace_root = os.path.abspath(workspace_root or os.getcwd())
 
+    async def _arun(self, command: str, timeout: Optional[int] = 60, **kwargs: Any) -> ToolResult:
+        """Satisfies BaseTool abstract contract by delegating to execute()."""
+        return await self.execute(command=command, timeout=timeout, **kwargs)
+
     async def execute(self, command: str, timeout: Optional[int] = 60, **kwargs: Any) -> ToolResult:
         timeout_val = float(timeout) if timeout else 60.0
 

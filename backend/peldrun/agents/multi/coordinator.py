@@ -4,20 +4,24 @@ PELDRUN Core Multi-Agent Coordinator.
 Orchestrates isolated child execution runs, bridges event streams with
 explicit lineage tracking, and aggregates deliverables via authoritative Runtime.
 
-Hardened under Phase M3 (PR 5 & PR 7):
+Hardened under Phase M3 (PR 5 & PR 7) and Search Results Plan Phase 7 (SR-701..SR-704):
 - Durable Approval Gate: persists delegation proposals into RunStore; strictly blocks child execution until operator approval.
 - Rich Lineage Events: emits explicit DELEGATION_REQUESTED, APPROVAL_*, and CHILD_RUN_* lifecycle events.
 - Branching and Concurrency Regulation: enforces max_child_runs and max_parallel_children semaphore ceilings.
 - Complete Runtime Authority: routes child execution via execute_fn to enforce ledger and token ceilings.
+- Explicit Child Tool Authorization & Workspace Isolation: resolves an explicit allowlist of authorized
+  tool IDs for each delegated child run, constructs fresh tool instances bound to the child workspace
+  root and authoritative search configuration, and passes only permitted tools to CoreRuntimeExecutor.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from pathlib import Path
 import time
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Set, Union
 from uuid import uuid4
 
 from peldrun.agents.base import BaseAgent
@@ -46,6 +50,17 @@ from peldrun.runtime.store import RunStore, get_run_store
 logger = logging.getLogger("peldrun.agents.multi.coordinator")
 
 ExecuteCallable = Callable[..., Awaitable[RunResult]]
+ToolResolverCallable = Callable[..., List[Any]]
+
+_PROHIBITED_CHILD_TOOLS: Set[str] = {"delegate_task", "delegate", "terminate"}
+_WRITE_OR_EXEC_TOOLS: Set[str] = {
+    "bash",
+    "shell_exec",
+    "isolated_shell",
+    "python_execute",
+    "file_saver",
+    "str_replace_editor",
+}
 
 
 class MultiAgentCoordinator:
@@ -61,6 +76,7 @@ class MultiAgentCoordinator:
         execute_fn: Optional[ExecuteCallable] = None,
         parent_request: Optional[RunRequest] = None,
         run_store: Optional[RunStore] = None,
+        tool_resolver: Optional[ToolResolverCallable] = None,
     ) -> None:
         self.parent_emitter = parent_emitter
         self.workspace_root = workspace_root
@@ -70,8 +86,10 @@ class MultiAgentCoordinator:
         self._execute_fn = execute_fn
         self._parent_request = parent_request
         self._run_store = run_store or get_run_store()
+        self._tool_resolver = tool_resolver
         self._specialists: Dict[str, Union[StepExecutableAgent, BaseAgent]] = {}
         self._factories: Dict[str, Callable[[], StepExecutableAgent]] = {}
+        self._specialist_tools: Dict[str, List[str]] = {}
         self._lock = asyncio.Lock()
 
         # Branching and concurrency tracking
@@ -87,19 +105,36 @@ class MultiAgentCoordinator:
         self,
         agent_id: str,
         agent: Union[StepExecutableAgent, BaseAgent],
+        tools: Optional[Iterable[str]] = None,
     ) -> None:
-        """Register a specialist agent template instance."""
-        self._specialists[agent_id.lower().strip()] = agent
+        """Register a specialist agent template instance and optional authorized tool allowlist."""
+        clean_id = agent_id.lower().strip()
+        self._specialists[clean_id] = agent
+        if tools is not None:
+            self._specialist_tools[clean_id] = [str(t).strip() for t in tools if str(t).strip()]
         logger.debug("Registered specialist agent instance template: '%s'", agent_id)
 
     def register_factory(
         self,
         agent_id: str,
         factory: Callable[[], StepExecutableAgent],
+        tools: Optional[Iterable[str]] = None,
     ) -> None:
         """Register an agent factory to spawn clean, isolated instances per delegation run."""
-        self._factories[agent_id.lower().strip()] = factory
+        clean_id = agent_id.lower().strip()
+        self._factories[clean_id] = factory
+        if tools is not None:
+            self._specialist_tools[clean_id] = [str(t).strip() for t in tools if str(t).strip()]
         logger.debug("Registered specialist agent factory: '%s'", agent_id)
+
+    def register_specialist_tools(
+        self,
+        agent_id: str,
+        tools: Iterable[str],
+    ) -> None:
+        """Explicitly set the authorized tool IDs for a target specialist agent."""
+        clean_id = agent_id.lower().strip()
+        self._specialist_tools[clean_id] = [str(t).strip() for t in tools if str(t).strip()]
 
     def list_specialists(self) -> List[str]:
         """Return a sorted list of all available specialist identifiers."""
@@ -131,6 +166,257 @@ class MultiAgentCoordinator:
             return None
 
         return None
+
+    def _resolve_authorized_child_tool_ids(
+        self,
+        specialist_key: str,
+        task: DelegatedTask,
+        child_agent: Optional[Any] = None,
+    ) -> List[str]:
+        """
+        Determine the explicit authorized tool-ID list for a delegated child run (SR-701).
+
+        Precedence order:
+        1. Explicit per-task tool allowlist (`task.tools` or `task.context_data['tools' | 'allowed_tools' | 'authorized_tools']`).
+        2. Explicit coordinator registration (`self._specialist_tools[specialist_key]`).
+        3. Parent request metadata mapping (`parent_request.metadata['specialist_tools'][specialist_key]` or `child_tools`).
+        4. Specialist agent instance/config `tools` attribute.
+        5. Platform agent registry manifest (`omweb.agents.registry.agent_registry`).
+        6. Parent `agent_spec.tools` fallback when present.
+
+        Privilege and security constraints:
+        - Strips delegation and termination control tools (`delegate_task`, `delegate`, `terminate`).
+        - Honors `disallowed_tools` / `blocked_tools` in `task.context_data` or parent metadata.
+        - Enforces parent tool ceiling intersection when `enforce_parent_tool_ceiling` is active.
+        - Strips write/exec tools if the workspace is marked `read_only`.
+        """
+        raw_candidates: Optional[List[str]] = None
+        ctx_data = task.context_data if isinstance(task.context_data, dict) else {}
+        parent_meta = (
+            self._parent_request.metadata
+            if self._parent_request and isinstance(self._parent_request.metadata, dict)
+            else {}
+        )
+
+        # 1. Explicit task-level allowlist
+        task_tools_attr = getattr(task, "tools", None)
+        if isinstance(task_tools_attr, (list, tuple, set)):
+            raw_candidates = [str(t).strip() for t in task_tools_attr]
+        else:
+            for key in ("tools", "allowed_tools", "authorized_tools"):
+                if key in ctx_data and isinstance(ctx_data[key], (list, tuple, set)):
+                    raw_candidates = [str(t).strip() for t in ctx_data[key]]
+                    break
+
+        # 2. Coordinator-registered specialist tools
+        if raw_candidates is None and specialist_key in self._specialist_tools:
+            raw_candidates = list(self._specialist_tools[specialist_key])
+
+        # 3. Parent request metadata specialist tool mapping
+        if raw_candidates is None:
+            spec_map = parent_meta.get("specialist_tools")
+            if isinstance(spec_map, dict):
+                for map_k, map_v in spec_map.items():
+                    if str(map_k).lower().strip() == specialist_key and isinstance(map_v, (list, tuple, set)):
+                        raw_candidates = [str(t).strip() for t in map_v]
+                        break
+            if raw_candidates is None and isinstance(parent_meta.get("child_tools"), (list, tuple, set)):
+                raw_candidates = [str(t).strip() for t in parent_meta["child_tools"]]
+
+        # 4. Specialist agent object attributes
+        if raw_candidates is None and child_agent is not None:
+            agent_tools = getattr(child_agent, "tools", None)
+            if not isinstance(agent_tools, (list, tuple, set)):
+                agent_cfg = getattr(child_agent, "config", None)
+                agent_tools = getattr(agent_cfg, "tools", None) if agent_cfg else None
+            if isinstance(agent_tools, (list, tuple, set)):
+                raw_candidates = [
+                    str(getattr(t, "name", t)).strip() for t in agent_tools
+                ]
+
+        # 5. Platform Agent Registry lookup for known specialists (e.g. deep_researcher)
+        if raw_candidates is None:
+            try:
+                from omweb.agents.registry import agent_registry  # type: ignore[import-not-found]
+
+                for getter_name in ("get_agent", "get"):
+                    getter = getattr(agent_registry, getter_name, None)
+                    if callable(getter):
+                        manifest = getter(specialist_key) or getter(task.target_agent_id)
+                        if isinstance(manifest, dict) and isinstance(manifest.get("tools"), list):
+                            raw_candidates = [str(t).strip() for t in manifest["tools"]]
+                            break
+            except Exception:
+                pass
+
+        # 6. Fallback to parent AgentSpec.tools if defined
+        if raw_candidates is None and self._parent_request and self._parent_request.agent_spec:
+            parent_tools = getattr(self._parent_request.agent_spec, "tools", None)
+            if isinstance(parent_tools, (list, tuple, set)):
+                raw_candidates = [str(t).strip() for t in parent_tools]
+
+        if not raw_candidates:
+            return []
+
+        # Collect blocked/disallowed tools
+        blocked: Set[str] = set(_PROHIBITED_CHILD_TOOLS)
+        for src in (ctx_data, parent_meta):
+            for b_key in ("disallowed_tools", "blocked_tools", "excluded_tools"):
+                b_val = src.get(b_key)
+                if isinstance(b_val, (list, tuple, set)):
+                    blocked.update(str(item).strip() for item in b_val if str(item).strip())
+
+        # Optional parent tool ceiling enforcement
+        enforce_ceiling = bool(
+            ctx_data.get(
+                "enforce_parent_tool_ceiling",
+                parent_meta.get("enforce_parent_tool_ceiling", False),
+            )
+        )
+        parent_allowed_set: Optional[Set[str]] = None
+        if (
+            enforce_ceiling
+            and self._parent_request
+            and self._parent_request.agent_spec
+            and self._parent_request.agent_spec.tools
+        ):
+            parent_allowed_set = {
+                str(t).strip() for t in self._parent_request.agent_spec.tools if str(t).strip()
+            }
+
+        read_only_ws = bool(
+            ctx_data.get("read_only")
+            or (
+                self._parent_request
+                and self._parent_request.workspace
+                and getattr(self._parent_request.workspace, "read_only", False)
+            )
+        )
+
+        authorized: List[str] = []
+        seen: Set[str] = set()
+        for raw_tid in raw_candidates:
+            tid = str(raw_tid or "").strip()
+            if not tid or tid in seen or tid in blocked:
+                continue
+            if read_only_ws and tid in _WRITE_OR_EXEC_TOOLS:
+                continue
+            if parent_allowed_set is not None and tid not in parent_allowed_set:
+                continue
+            seen.add(tid)
+            authorized.append(tid)
+
+        return authorized
+
+    def _extract_effective_search_config(self, task: DelegatedTask) -> Optional[Dict[str, Any]]:
+        """Extract authoritative search configuration override from task or parent request metadata."""
+        if isinstance(task.context_data, dict) and isinstance(task.context_data.get("search_config"), dict):
+            return dict(task.context_data["search_config"])
+
+        if self._parent_request and isinstance(self._parent_request.metadata, dict):
+            parent_sc = self._parent_request.metadata.get("search_config")
+            if isinstance(parent_sc, dict):
+                return dict(parent_sc)
+
+        return None
+
+    def _build_child_custom_tools(
+        self,
+        authorized_tool_ids: List[str],
+        child_ws_path: Path,
+        *,
+        child_run_id: str,
+        child_job_id: str,
+        chat_id: Optional[str],
+        project_id: Optional[str],
+        search_config: Optional[Dict[str, Any]],
+    ) -> List[Any]:
+        """
+        Construct fresh, workspace-isolated tool instances for a child run (SR-702, SR-703).
+        Never reuses parent-bound mutable tool objects.
+        """
+        if not authorized_tool_ids:
+            return []
+
+        # 1. Custom injected resolver (e.g. from PeldrunEngine or test harness)
+        if callable(self._tool_resolver):
+            try:
+                return list(
+                    self._tool_resolver(
+                        authorized_tool_ids=authorized_tool_ids,
+                        workspace_root=child_ws_path,
+                        run_id=child_run_id,
+                        job_id=child_job_id,
+                        chat_id=chat_id,
+                        project_id=project_id,
+                        search_config=search_config,
+                    )
+                )
+            except TypeError:
+                return list(self._tool_resolver(authorized_tool_ids, child_ws_path))
+
+        # 2. Canonical Web-to-Core adapter resolver
+        try:
+            from omweb.adapters.core_adapter_parts.resolve_tool_runtime import (  # type: ignore[import-not-found]
+                resolve_authorized_tools,
+            )
+
+            resolved = resolve_authorized_tools(
+                authorized_tool_ids=authorized_tool_ids,
+                workspace_root=child_ws_path,
+                run_id=child_run_id,
+                job_id=child_job_id,
+                chat_id=chat_id,
+                project_id=project_id,
+                search_config=search_config,
+            )
+            if resolved:
+                return resolved
+        except Exception as adapter_exc:
+            logger.debug("Web adapter child tool resolution fallback notice: %s", adapter_exc)
+
+        # 3. Pure peldrun-core builtin fallback (for standalone Core unit/integration tests)
+        core_tools: List[Any] = []
+        ws_str = str(child_ws_path)
+        for tid in authorized_tool_ids:
+            try:
+                if tid == "web_search":
+                    from peldrun.tools.builtins.web_search import WebSearchTool
+
+                    core_tools.append(
+                        WebSearchTool(
+                            workspace_root=ws_str,
+                            search_config=search_config,
+                            run_id=child_run_id,
+                            job_id=child_job_id,
+                            chat_id=chat_id,
+                            project_id=project_id,
+                        )
+                    )
+                elif tid == "python_execute":
+                    from peldrun.tools.builtins.isolated_shell import IsolatedPythonTool
+
+                    core_tools.append(IsolatedPythonTool(workspace_root=ws_str))
+                elif tid in ("bash", "shell_exec", "isolated_shell"):
+                    from peldrun.tools.builtins.shell_exec import ShellExecTool
+
+                    core_tools.append(ShellExecTool(workspace_root=ws_str))
+                elif tid == "str_replace_editor":
+                    from peldrun.tools.builtins.str_replace_editor import StrReplaceEditorTool
+
+                    core_tools.append(StrReplaceEditorTool(workspace_root=ws_str))
+                elif tid == "file_saver":
+                    from peldrun.tools.builtins.file_ops import FileWriteTool
+
+                    core_tools.append(FileWriteTool(workspace_root=ws_str))
+                elif tid == "file_reader":
+                    from peldrun.tools.builtins.file_ops import FileReadTool
+
+                    core_tools.append(FileReadTool(workspace_root=ws_str))
+            except Exception as tool_err:
+                logger.warning("Failed to build Core tool %r for child run %s: %s", tid, child_run_id, tool_err)
+
+        return core_tools
 
     @staticmethod
     def _extract_result_text(state: ExecutionState) -> str:
@@ -246,7 +532,8 @@ class MultiAgentCoordinator:
 
     async def delegate(self, task: DelegatedTask) -> DelegationResult:
         """
-        Execute a delegated task subject to approval gates, branching limits, and concurrency caps.
+        Execute a delegated task subject to approval gates, branching limits,
+        concurrency caps, and explicit child tool authorization.
         """
         start_time = time.time()
         child_run_id = uuid4()
@@ -366,6 +653,13 @@ class MultiAgentCoordinator:
                     duration_seconds=round(time.time() - start_time, 3),
                 )
 
+            # Resolve explicit authorized tools for this child run (SR-701)
+            authorized_tool_ids = self._resolve_authorized_child_tool_ids(
+                specialist_key=specialist_key,
+                task=task,
+                child_agent=child_agent,
+            )
+
             # 5. Emit explicit CHILD_RUN_STARTED event
             await self.parent_emitter.emit(
                 PeldrunEvent(
@@ -377,6 +671,7 @@ class MultiAgentCoordinator:
                         "target_agent_id": task.target_agent_id,
                         "child_run_id": str(child_run_id),
                         "instruction": effective_instruction,
+                        "authorized_tools": authorized_tool_ids,
                         "status": "running",
                     },
                     metadata={
@@ -385,6 +680,7 @@ class MultiAgentCoordinator:
                         "task_id": str(task.task_id),
                         "target_agent": task.target_agent_id,
                         "workspace": effective_workspace,
+                        "authorized_tools": authorized_tool_ids,
                     },
                 )
             )
@@ -433,6 +729,7 @@ class MultiAgentCoordinator:
                     id=task.target_agent_id,
                     name=child_agent_name,
                     system_prompt=agent_prompt,
+                    tools=authorized_tool_ids,
                     max_steps=max_steps,
                 )
                 chat_id = getattr(self._parent_request.workspace, "chat_id", None) if self._parent_request else None
@@ -444,6 +741,15 @@ class MultiAgentCoordinator:
                     chat_id=chat_id,
                     project_id=project_id,
                 )
+
+                effective_search_cfg = self._extract_effective_search_config(task)
+                child_metadata: Dict[str, Any] = {
+                    "authorized_tools": list(authorized_tool_ids),
+                    "parent_run_id": parent_id_str,
+                    "root_run_id": root_id_str,
+                }
+                if effective_search_cfg is not None:
+                    child_metadata["search_config"] = effective_search_cfg
 
                 child_req = RunRequest(
                     run_id=child_run_id,
@@ -460,12 +766,35 @@ class MultiAgentCoordinator:
                     delegation_depth=task.delegation_depth,
                     delegation_allowed=False,
                     budget=budget,
+                    metadata=child_metadata,
+                )
+
+                # Build workspace-bound tool instances strictly from authorized_tool_ids (SR-702, SR-703)
+                child_custom_tools = self._build_child_custom_tools(
+                    authorized_tool_ids=authorized_tool_ids,
+                    child_ws_path=child_ws_path,
+                    child_run_id=str(child_run_id),
+                    child_job_id=child_job_id,
+                    chat_id=chat_id,
+                    project_id=project_id,
+                    search_config=effective_search_cfg,
                 )
 
                 try:
+                    exec_kwargs: Dict[str, Any] = {"event_listener": bridge_child_event}
+                    if child_custom_tools:
+                        try:
+                            sig = inspect.signature(self._execute_fn)
+                            if "custom_tools" in sig.parameters or any(
+                                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                            ):
+                                exec_kwargs["custom_tools"] = child_custom_tools
+                        except (TypeError, ValueError):
+                            exec_kwargs["custom_tools"] = child_custom_tools
+
                     child_run_res: RunResult = await self._execute_fn(
                         child_req,
-                        event_listener=bridge_child_event,
+                        **exec_kwargs,
                     )
 
                     duration = round(time.time() - start_time, 3)
@@ -594,6 +923,7 @@ class MultiAgentCoordinator:
             child_state.metadata["root_run_id"] = root_id_str
             child_state.metadata["task_id"] = str(task.task_id)
             child_state.metadata["delegation_depth"] = task.delegation_depth
+            child_state.metadata["authorized_tools"] = list(authorized_tool_ids)
             child_state.add_message(role=MessageRole.USER, content=formatted_prompt)
 
             if hasattr(child_agent, "workspace_dir"):

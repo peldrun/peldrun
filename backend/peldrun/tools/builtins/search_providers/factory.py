@@ -1,934 +1,895 @@
+# backend/peldrun/tools/builtins/search_providers/factory.py
 """
-backend/peldrun/tools/builtins/search_providers/factory.py
+Search Provider Factory and Orchestration Layer for PELDRUN.
 
-Dynamic Search Provider Factory and First-Success Failover Orchestrator.
-
-Key guarantees:
-- Unknown provider names raise UnknownProviderError explicitly (never silently
-  falling back to DuckDuckGo).
-- Monotonic deadline is strictly enforced around every individual provider call
-  via asyncio.wait_for and per-call timeout clamping.
-- Empty fallback_engines=[] is preserved for single-provider execution.
-- First-success failover is the default execution model; configuration and
-  authentication errors do not silently trigger secondary providers unless
-  explicitly enabled via fallback_on_auth_error=true.
-- Exposes authoritative provider capabilities and effective pricing metadata
-  for the Settings UI and API routes.
+Responsibilities:
+- Authoritative registry of search provider capabilities and technical limits.
+- Centralized calculation of effective max_results per provider:
+  * Global default: search.default_max_results (default 5, range 1..20)
+  * Optional per-provider ceiling: search.<provider>.max_results
+  * Optional explicit tool call count: clamped to configured ceiling and capability limit
+  * Read-only provider capability limit: max_results_limit
+  * Application hard cap: MAX_RESULTS_HARD_CAP = 20
+- Per-provider count recalculation inside the primary/failover execution loop.
+- Defensive output truncation so SearchResponse.results never exceeds effective_max_results.
 """
 
 from __future__ import annotations
 
 import asyncio
+import importlib
+import inspect
 import logging
 import time
-from typing import Any, Dict, List, Optional, Set, Type
-import urllib.parse
+from typing import Any, Dict, List, Optional, Tuple, Type
 
+from peldrun.tools.builtins.search_providers import base as base_mod
 from peldrun.tools.builtins.search_providers.base import (
     BaseSearchProvider,
-    ConfigurationError,
-    CostBasis,
-    PricingMode,
     ProviderCapability,
-    ProviderFieldSpec,
-    ProviderLifecycle,
-    ProviderStatus,
     SearchProviderError,
     SearchResponse,
-    SearchResult,
-    UnknownProviderError,
 )
-from peldrun.tools.builtins.search_providers.brave_provider import BraveSearchProvider
-from peldrun.tools.builtins.search_providers.duckduckgo_provider import (
-    DuckDuckGoSearchProvider,
-)
-from peldrun.tools.builtins.search_providers.google_provider import GoogleSearchProvider
-from peldrun.tools.builtins.search_providers.jina_provider import JinaSearchProvider
-from peldrun.tools.builtins.search_providers.searxng_provider import (
-    SearXNGSearchProvider,
-)
-from peldrun.tools.builtins.search_providers.tavily_provider import TavilySearchProvider
-from peldrun.tools.builtins.search_providers.yandex_provider import YandexSearchProvider
 
-logger = logging.getLogger("peldrun.search.factory")
+logger = logging.getLogger("peldrun.tools.search_providers.factory")
+
+MAX_RESULTS_HARD_CAP: int = getattr(base_mod, "MAX_RESULTS_HARD_CAP", 20)
+DEFAULT_MAX_RESULTS: int = getattr(base_mod, "DEFAULT_MAX_RESULTS", 5)
+MIN_RESULTS_LIMIT: int = 1
+
+# Canonical provider metadata and module mapping
+_PROVIDER_SPECS: Dict[str, Dict[str, Any]] = {
+    "duckduckgo": {
+        "id": "duckduckgo",
+        "name": "DuckDuckGo",
+        "module": "peldrun.tools.builtins.search_providers.duckduckgo_provider",
+        "class_candidates": ("DuckDuckGoProvider", "DuckDuckGoSearchProvider"),
+        "max_results_limit": 20,
+        "requires_api_key": False,
+        "supports_region": True,
+        "supports_language": True,
+        "supports_safe_search": True,
+        "cost_model": "free",
+        "limit_type": "peldrun_cap",
+        "notes": "DDGS exposes a max_results argument; actual output can be lower.",
+    },
+    "searxng": {
+        "id": "searxng",
+        "id_aliases": ("searx",),
+        "name": "SearXNG",
+        "module": "peldrun.tools.builtins.search_providers.searxng_provider",
+        "class_candidates": ("SearXNGProvider", "SearXNGSearchProvider", "SearxngProvider"),
+        "max_results_limit": 20,
+        "requires_api_key": False,
+        "supports_region": False,
+        "supports_language": True,
+        "supports_safe_search": True,
+        "cost_model": "self_hosted",
+        "limit_type": "parse_output_cap",
+        "notes": "PELDRUN parse/output cap; instance and upstream engines determine returned count.",
+    },
+    "tavily": {
+        "id": "tavily",
+        "name": "Tavily",
+        "module": "peldrun.tools.builtins.search_providers.tavily_provider",
+        "class_candidates": ("TavilyProvider", "TavilySearchProvider"),
+        "max_results_limit": 20,
+        "requires_api_key": True,
+        "supports_region": False,
+        "supports_language": False,
+        "supports_safe_search": False,
+        "cost_model": "credit_based",
+        "limit_type": "upstream_and_peldrun_cap",
+        "notes": "Up to 20 results per request; usage and cost depend on search depth.",
+    },
+    "brave": {
+        "id": "brave",
+        "name": "Brave",
+        "module": "peldrun.tools.builtins.search_providers.brave_provider",
+        "class_candidates": ("BraveProvider", "BraveSearchProvider"),
+        "max_results_limit": 20,
+        "requires_api_key": True,
+        "supports_region": True,
+        "supports_language": True,
+        "supports_safe_search": True,
+        "cost_model": "paid_api",
+        "limit_type": "upstream_api_limit",
+        "notes": "Official Brave Web Search API count range is 1-20; delivered results may be fewer.",
+    },
+    "google": {
+        "id": "google",
+        "id_aliases": ("google_cse", "googlecse"),
+        "name": "Google",
+        "module": "peldrun.tools.builtins.search_providers.google_provider",
+        "class_candidates": ("GoogleProvider", "GoogleSearchProvider", "GoogleCSEProvider"),
+        "max_results_limit": 10,
+        "requires_api_key": True,
+        "supports_region": True,
+        "supports_language": True,
+        "supports_safe_search": True,
+        "cost_model": "paid_api",
+        "limit_type": "upstream_api_limit",
+        "notes": "Google Custom Search JSON API num parameter is strictly constrained to 1-10.",
+    },
+    "jina": {
+        "id": "jina",
+        "id_aliases": ("jina_ai", "jinaai"),
+        "name": "Jina",
+        "module": "peldrun.tools.builtins.search_providers.jina_provider",
+        "class_candidates": ("JinaProvider", "JinaSearchProvider"),
+        "max_results_limit": 20,
+        "requires_api_key": False,
+        "supports_region": True,
+        "supports_language": True,
+        "supports_safe_search": False,
+        "cost_model": "freemium_token",
+        "limit_type": "peldrun_cap",
+        "notes": "PELDRUN adapter cap of 20 for s.jina.ai search requests.",
+    },
+    "yandex": {
+        "id": "yandex",
+        "id_aliases": ("yandex_cloud", "yandex_search"),
+        "name": "Yandex",
+        "module": "peldrun.tools.builtins.search_providers.yandex_provider",
+        "class_candidates": ("YandexProvider", "YandexSearchProvider"),
+        "max_results_limit": 15,
+        "requires_api_key": True,
+        "supports_region": True,
+        "supports_language": True,
+        "supports_safe_search": True,
+        "cost_model": "paid_api",
+        "limit_type": "peldrun_cap",
+        "notes": "Current PELDRUN integration cap is 15 results per query.",
+    },
+}
+
+_ALIAS_TO_KEY: Dict[str, str] = {}
+for _key, _spec in _PROVIDER_SPECS.items():
+    _ALIAS_TO_KEY[_key] = _key
+    _ALIAS_TO_KEY[_spec["name"].lower()] = _key
+    for _alias in _spec.get("id_aliases", ()):
+        _ALIAS_TO_KEY[str(_alias).lower()] = _key
+
+
+def _parse_strict_positive_int(
+    value: Any,
+    field_name: str,
+    min_value: int = MIN_RESULTS_LIMIT,
+    max_value: Optional[int] = None,
+) -> int:
+    """
+    Validate that value is a strict positive integer within bounds.
+    Rejects booleans, fractional floats, non-numeric strings, and <= 0 values.
+    """
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"{field_name} must be an integer, got {type(value).__name__}.")
+
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"{field_name} must be a whole integer, got fractional float {value}.")
+        parsed = int(value)
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if not stripped or (stripped[0] in "+-" and not stripped[1:].isdigit()) or (
+            stripped[0] not in "+-" and not stripped.isdigit()
+        ):
+            raise ValueError(f"{field_name} must be a valid integer string, got {value!r}.")
+        parsed = int(stripped)
+    else:
+        raise ValueError(f"{field_name} must be an integer, got {type(value).__name__}.")
+
+    if parsed < min_value:
+        if max_value is not None:
+            raise ValueError(f"{field_name} must be between {min_value} and {max_value}, got {parsed}.")
+        raise ValueError(f"{field_name} must be >= {min_value}, got {parsed}.")
+
+    if max_value is not None and parsed > max_value:
+        raise ValueError(f"{field_name} must be between {min_value} and {max_value}, got {parsed}.")
+
+    return parsed
 
 
 class SearchProviderFactory:
-    """Factory creating and orchestrating configured search provider instances."""
+    """Central factory for search provider instantiation, capability authority, and failover execution."""
 
-    _REGISTRY: Dict[str, Type[BaseSearchProvider]] = {
-        "DuckDuckGo": DuckDuckGoSearchProvider,
-        "SearXNG": SearXNGSearchProvider,
-        "Tavily": TavilySearchProvider,
-        "Brave": BraveSearchProvider,
-        "Google": GoogleSearchProvider,
-        "Jina": JinaSearchProvider,
-        "Yandex": YandexSearchProvider,
-    }
-
-    # Hard ceiling on total wall-clock time across the entire failover chain.
-    # Kept strictly below WebSearchTool.execution_policy.timeout_seconds (25.0s).
-    DEFAULT_TOTAL_BUDGET_SECONDS: float = 22.0
-    MAX_TOTAL_BUDGET_SECONDS: float = 23.5
-
-    # Minimum remaining time required to start a new provider attempt.
-    MIN_PROVIDER_BUDGET_SECONDS: float = 1.5
-
-    # ------------------------------------------------------------------
-    # Introspection & Capability Metadata
-    # ------------------------------------------------------------------
-    @classmethod
-    def list_supported_providers(cls) -> List[str]:
-        return list(cls._REGISTRY.keys())
+    _provider_class_cache: Dict[str, Type[BaseSearchProvider]] = {}
 
     @classmethod
-    def resolve_provider_key(cls, name: str) -> str:
-        """
-        Resolve a provider name case-insensitively against the registry.
-        Raises UnknownProviderError if the name is empty or not registered.
-        """
-        norm_name = (name or "").strip()
-        if not norm_name:
-            raise UnknownProviderError(
-                "Search provider name cannot be empty.",
-                provider=name,
-            )
-        matched_key = next(
-            (k for k in cls._REGISTRY if k.lower() == norm_name.lower()),
-            None,
+    def normalize_provider_key(cls, provider_name: str) -> str:
+        """Normalize any provider display name or alias to its canonical lowercase key."""
+        if not provider_name or not isinstance(provider_name, str):
+            raise ValueError("Provider name must be a non-empty string.")
+        cleaned = provider_name.strip().lower()
+        if cleaned not in _ALIAS_TO_KEY:
+            supported = ", ".join(spec["name"] for spec in _PROVIDER_SPECS.values())
+            raise ValueError(f"Unsupported search provider {provider_name!r}. Supported providers: {supported}.")
+        return _ALIAS_TO_KEY[cleaned]
+
+    @classmethod
+    def get_canonical_display_name(cls, provider_name: str) -> str:
+        """Return canonical display name (e.g., 'DuckDuckGo', 'Google', 'SearXNG')."""
+        key = cls.normalize_provider_key(provider_name)
+        return str(_PROVIDER_SPECS[key]["name"])
+
+    @classmethod
+    def list_provider_keys(cls) -> List[str]:
+        """Return ordered list of canonical provider keys."""
+        return list(_PROVIDER_SPECS.keys())
+
+    @classmethod
+    def _load_provider_class(cls, provider_key: str) -> Type[BaseSearchProvider]:
+        """Dynamically import and cache the concrete provider implementation class."""
+        key = cls.normalize_provider_key(provider_key)
+        if key in cls._provider_class_cache:
+            return cls._provider_class_cache[key]
+
+        spec = _PROVIDER_SPECS[key]
+        module = importlib.import_module(spec["module"])
+
+        for candidate_name in spec["class_candidates"]:
+            candidate = getattr(module, candidate_name, None)
+            if inspect.isclass(candidate) and issubclass(candidate, BaseSearchProvider):
+                cls._provider_class_cache[key] = candidate
+                return candidate
+
+        for _, obj in inspect.getmembers(module, inspect.isclass):
+            if issubclass(obj, BaseSearchProvider) and obj is not BaseSearchProvider:
+                cls._provider_class_cache[key] = obj
+                return obj
+
+        raise ImportError(
+            f"No BaseSearchProvider subclass found in module {spec['module']} for provider {key!r}."
         )
-        if not matched_key:
-            supported = ", ".join(cls._REGISTRY.keys())
-            raise UnknownProviderError(
-                f"Unknown search provider '{name}'. Supported providers: {supported}.",
-                provider=name,
-            )
-        return matched_key
 
     @classmethod
-    def get_effective_cost(
+    def get_provider_capability(
         cls,
         provider_name: str,
         search_config: Optional[Dict[str, Any]] = None,
-    ) -> float:
+    ) -> ProviderCapability:
         """
-        Return the effective per-query cost in USD for a provider,
-        combining class defaults with any valid user override in search_config.
+        Return the authoritative ProviderCapability descriptor for a given provider.
+        Prefers the concrete provider's capability descriptor if defined, while enforcing
+        the canonical max_results_limit and application hard cap.
         """
-        matched_key = cls.resolve_provider_key(provider_name)
-        provider_cls = cls._REGISTRY[matched_key]
-        default_cost = float(getattr(provider_cls, "cost_per_query", 0.0))
+        key = cls.normalize_provider_key(provider_name)
+        spec = _PROVIDER_SPECS[key]
+        canonical_limit = min(int(spec["max_results_limit"]), MAX_RESULTS_HARD_CAP)
 
-        if not search_config or not isinstance(search_config, dict):
-            return default_cost
+        provider_cls: Optional[Type[BaseSearchProvider]] = None
+        try:
+            provider_cls = cls._load_provider_class(key)
+        except Exception as exc:
+            logger.debug("Fallback to static capability spec for %s: %s", key, exc)
 
-        sub_cfg = search_config.get(matched_key.lower())
-        if isinstance(sub_cfg, dict) and "cost_per_query" in sub_cfg:
-            raw_val = sub_cfg.get("cost_per_query")
-            if raw_val is not None and raw_val != "":
+        if provider_cls is not None:
+            for attr_name in ("get_capability", "capability", "CAPABILITY"):
+                attr = getattr(provider_cls, attr_name, None)
                 try:
-                    parsed = float(raw_val)
-                    if parsed >= 0.0:
-                        return parsed
-                except (TypeError, ValueError):
-                    pass
-        return default_cost
+                    cap_obj = attr() if callable(attr) else attr
+                    if isinstance(cap_obj, ProviderCapability):
+                        if hasattr(cap_obj, "max_results_limit"):
+                            object.__setattr__(
+                                cap_obj,
+                                "max_results_limit",
+                                min(int(cap_obj.max_results_limit), canonical_limit, MAX_RESULTS_HARD_CAP),
+                            )
+                        return cap_obj
+                except Exception as exc:
+                    logger.debug("Provider %s capability getter %s notice: %s", key, attr_name, exc)
+
+            try:
+                provider_cfg = cls._extract_provider_section(key, search_config)
+                instance = cls._instantiate_provider(provider_cls, key, provider_cfg, search_config)
+                if hasattr(instance, "get_capability") and callable(instance.get_capability):
+                    cap_obj = instance.get_capability()
+                    if isinstance(cap_obj, ProviderCapability):
+                        return cap_obj
+                if hasattr(instance, "capability") and isinstance(instance.capability, ProviderCapability):
+                    return instance.capability
+            except Exception as exc:
+                logger.debug("Provider %s instance capability inspection notice: %s", key, exc)
+
+        return cls._build_fallback_capability(key, spec, canonical_limit)
+
+    @classmethod
+    def _build_fallback_capability(
+        cls,
+        key: str,
+        spec: Dict[str, Any],
+        canonical_limit: int,
+    ) -> ProviderCapability:
+        """Construct a ProviderCapability compatible with base.ProviderCapability fields."""
+        return ProviderCapability(
+            id=key,
+            config_key=key,
+            display_name=spec["name"],
+            tagline=spec.get("notes") or f"{spec['name']} search provider integration.",
+            docs_url="",
+            requires_credentials=bool(spec.get("requires_api_key", True)),
+            supports_language=bool(spec.get("supports_language", True)),
+            supports_country=bool(spec.get("supports_region", False)),
+            supports_safesearch=bool(spec.get("supports_safe_search", False)),
+            max_results_limit=canonical_limit,
+        )
+
+    @classmethod
+    def get_global_default_max_results(
+        cls,
+        search_config: Optional[Dict[str, Any]] = None,
+        *,
+        strict: bool = False,
+    ) -> int:
+        """
+        Resolve global search.default_max_results (defaults to 5, range 1..20).
+        When strict=True, raises ValueError if an invalid value is present in search_config.
+        """
+        cfg = cls._unwrap_search_section(search_config)
+        if "default_max_results" not in cfg or cfg.get("default_max_results") is None:
+            return DEFAULT_MAX_RESULTS
+
+        raw_val = cfg.get("default_max_results")
+        try:
+            parsed = _parse_strict_positive_int(
+                raw_val,
+                "search.default_max_results",
+                min_value=MIN_RESULTS_LIMIT,
+                max_value=MAX_RESULTS_HARD_CAP if strict else None,
+            )
+            return min(parsed, MAX_RESULTS_HARD_CAP)
+        except ValueError:
+            if strict:
+                raise
+            logger.warning(
+                "Invalid search.default_max_results=%r in config; falling back to default %d.",
+                raw_val,
+                DEFAULT_MAX_RESULTS,
+            )
+            return DEFAULT_MAX_RESULTS
+
+    @classmethod
+    def get_configured_provider_max_results(
+        cls,
+        provider_name: str,
+        search_config: Optional[Dict[str, Any]] = None,
+        *,
+        strict: bool = False,
+    ) -> Optional[int]:
+        """
+        Return the explicit per-provider max_results override from [search.<provider>],
+        or None if no provider-specific override is configured (meaning it inherits global default).
+        Do NOT treat 0 as None: 0 is an invalid configuration value.
+        """
+        key = cls.normalize_provider_key(provider_name)
+        cap = cls.get_provider_capability(key, search_config)
+        provider_limit = min(int(getattr(cap, "max_results_limit", MAX_RESULTS_HARD_CAP)), MAX_RESULTS_HARD_CAP)
+
+        provider_cfg = cls._extract_provider_section(key, search_config)
+        if "max_results" not in provider_cfg or provider_cfg.get("max_results") is None:
+            return None
+
+        raw_val = provider_cfg.get("max_results")
+        try:
+            parsed = _parse_strict_positive_int(
+                raw_val,
+                f"search.{key}.max_results",
+                min_value=MIN_RESULTS_LIMIT,
+                max_value=provider_limit if strict else None,
+            )
+            return min(parsed, provider_limit, MAX_RESULTS_HARD_CAP)
+        except ValueError:
+            if strict:
+                raise
+            raise ValueError(
+                f"{cls.get_canonical_display_name(key)} max_results must be an integer between "
+                f"{MIN_RESULTS_LIMIT} and {provider_limit}, got {raw_val!r}."
+            )
+
+    @classmethod
+    def resolve_effective_max_results(
+        cls,
+        provider_name: str,
+        requested: Optional[int] = None,
+        search_config: Optional[Dict[str, Any]] = None,
+        *,
+        strict_config: bool = False,
+    ) -> int:
+        """
+        Calculate the authoritative effective max_results for a specific provider according to
+        Section 4.2 of the Search Results Configuration Engineering Plan:
+
+            provider_configured_count = provider_config.get("max_results")
+            provider_ceiling = (
+                provider_configured_count
+                if provider_configured_count is not None
+                else global_default
+            )
+            requested_count = (
+                explicit_tool_count
+                if explicit_tool_count is not None
+                else provider_ceiling
+            )
+            effective_count = min(
+                requested_count,
+                provider_ceiling,
+                provider_capability.max_results_limit,
+                MAX_RESULTS_HARD_CAP,
+            )
+        """
+        key = cls.normalize_provider_key(provider_name)
+        cap = cls.get_provider_capability(key, search_config)
+        provider_limit = min(int(getattr(cap, "max_results_limit", MAX_RESULTS_HARD_CAP)), MAX_RESULTS_HARD_CAP)
+
+        global_default = cls.get_global_default_max_results(search_config, strict=strict_config)
+        provider_configured_count = cls.get_configured_provider_max_results(
+            key,
+            search_config,
+            strict=strict_config,
+        )
+
+        provider_ceiling = (
+            provider_configured_count
+            if provider_configured_count is not None
+            else global_default
+        )
+
+        if requested is not None:
+            requested_count = _parse_strict_positive_int(
+                requested,
+                "max_results",
+                min_value=MIN_RESULTS_LIMIT,
+            )
+        else:
+            requested_count = provider_ceiling
+
+        effective_count = min(
+            requested_count,
+            provider_ceiling,
+            provider_limit,
+            MAX_RESULTS_HARD_CAP,
+        )
+        return max(MIN_RESULTS_LIMIT, effective_count)
+
+    @classmethod
+    def resolve_count_Audit_details(
+        cls,
+        provider_name: str,
+        requested: Optional[int] = None,
+        search_config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Return full resolution breakdown for diagnostics, telemetry, and API responses.
+        Includes requested_max_results, configured_max_results (None if inherited),
+        global_default_max_results, provider_ceiling, max_results_limit, and effective_max_results.
+        """
+        key = cls.normalize_provider_key(provider_name)
+        cap = cls.get_provider_capability(key, search_config)
+        provider_limit = min(int(getattr(cap, "max_results_limit", MAX_RESULTS_HARD_CAP)), MAX_RESULTS_HARD_CAP)
+        global_default = cls.get_global_default_max_results(search_config)
+        configured_override = cls.get_configured_provider_max_results(key, search_config)
+        provider_ceiling = configured_override if configured_override is not None else min(global_default, provider_limit)
+        effective = cls.resolve_effective_max_results(key, requested=requested, search_config=search_config)
+
+        return {
+            "provider": cls.get_canonical_display_name(key),
+            "provider_key": key,
+            "requested_max_results": requested,
+            "configured_max_results": configured_override,
+            "inherits_global_default": configured_override is None,
+            "global_default_max_results": global_default,
+            "provider_ceiling": min(provider_ceiling, provider_limit, MAX_RESULTS_HARD_CAP),
+            "max_results_limit": provider_limit,
+            "effective_max_results": effective,
+            "hard_cap": MAX_RESULTS_HARD_CAP,
+        }
 
     @classmethod
     def get_provider_capabilities(
         cls,
         search_config: Optional[Dict[str, Any]] = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Dict[str, Any]]:
         """
-        Build authoritative capability descriptors for all supported providers,
-        including effective pricing and lifecycle notices.
+        Return a dictionary mapping canonical provider keys to their serialized capability metadata,
+        enriched with configured_max_results (None when inheriting) and effective_max_results.
         """
-        cfg = search_config or {}
-        capabilities: List[ProviderCapability] = [
-            ProviderCapability(
-                id="DuckDuckGo",
-                config_key="duckduckgo",
-                display_name="DuckDuckGo",
-                tagline="Zero-credential fallback engine with regional & SafeSearch support",
-                docs_url="https://github.com/deedy5/ddgs",
-                lifecycle=ProviderLifecycle.SUPPORTED,
-                requires_credentials=False,
-                supports_language=True,
-                supports_country=True,
-                supports_safesearch=True,
-                supports_raw_content=False,
-                max_results_limit=20,
-                pricing_mode=PricingMode.FREE_PUBLIC,
-                default_cost_per_query=0.0,
-                effective_cost_per_query=cls.get_effective_cost("DuckDuckGo", cfg),
-                cost_basis=CostBasis.ASSUMED_ZERO_LOCAL,
-                cost_editable=True,
-                supports_non_billable_reachability=True,
-                supports_non_billable_auth_check=False,
-                diagnostic_consumes_quota=False,
-                test_button_label="Check Reachability",
-                fields=[],
-            ),
-            ProviderCapability(
-                id="SearXNG",
-                config_key="searxng",
-                display_name="SearXNG",
-                tagline="Self-hosted meta-search aggregator (requires JSON format enabled)",
-                docs_url="https://docs.searxng.org/dev/search_api.html",
-                lifecycle=ProviderLifecycle.SUPPORTED,
-                requires_credentials=True,
-                supports_language=True,
-                supports_country=False,
-                supports_safesearch=True,
-                supports_raw_content=False,
-                max_results_limit=20,
-                pricing_mode=PricingMode.SELF_HOSTED_ZERO,
-                default_cost_per_query=0.0,
-                effective_cost_per_query=cls.get_effective_cost("SearXNG", cfg),
-                cost_basis=CostBasis.ASSUMED_ZERO_LOCAL,
-                cost_editable=True,
-                supports_non_billable_reachability=True,
-                supports_non_billable_auth_check=False,
-                diagnostic_consumes_quota=False,
-                test_button_label="Check Instance & JSON",
-                fields=[
-                    ProviderFieldSpec(
-                        key="base_url",
-                        label="Instance Base URL",
-                        field_type="text",
-                        required=True,
-                        placeholder="http://localhost:8080",
-                        mono=True,
-                    ),
-                ],
-            ),
-            ProviderCapability(
-                id="Tavily",
-                config_key="tavily",
-                display_name="Tavily AI",
-                tagline="LLM-optimized search API with credit usage reporting",
-                docs_url="https://docs.tavily.com/documentation/api-reference/endpoint/search",
-                lifecycle=ProviderLifecycle.SUPPORTED,
-                requires_credentials=True,
-                supports_language=False,
-                supports_country=False,
-                supports_safesearch=False,
-                supports_raw_content=True,
-                max_results_limit=20,
-                pricing_mode=PricingMode.PER_CREDIT,
-                default_cost_per_query=0.005,
-                effective_cost_per_query=cls.get_effective_cost("Tavily", cfg),
-                cost_basis=CostBasis.PROVIDER_REPORTED,
-                cost_editable=True,
-                supports_non_billable_reachability=False,
-                supports_non_billable_auth_check=False,
-                diagnostic_consumes_quota=True,
-                diagnostic_warning="Executes a minimal search probe that may consume 1 API credit.",
-                test_button_label="Verify Key (1 Credit)",
-                supported_modes=["basic", "advanced", "fast", "ultra-fast"],
-                fields=[
-                    ProviderFieldSpec(
-                        key="api_key",
-                        label="API Key (Bearer)",
-                        field_type="password",
-                        required=True,
-                        placeholder="tvly-••••••",
-                        secret_key="tavily",
-                    ),
-                    ProviderFieldSpec(
-                        key="search_depth",
-                        label="Search Depth",
-                        field_type="select",
-                        required=False,
-                        placeholder="basic",
-                        options=["basic", "advanced", "fast", "ultra-fast"],
-                    ),
-                ],
-            ),
-            ProviderCapability(
-                id="Brave",
-                config_key="brave",
-                display_name="Brave Search",
-                tagline="Independent web index (max 20 results per query)",
-                docs_url="https://api.search.brave.com/app/documentation/web-search/get-started",
-                lifecycle=ProviderLifecycle.SUPPORTED,
-                requires_credentials=True,
-                supports_language=True,
-                supports_country=True,
-                supports_safesearch=False,
-                supports_raw_content=False,
-                max_results_limit=20,
-                pricing_mode=PricingMode.PER_REQUEST,
-                default_cost_per_query=0.005,
-                effective_cost_per_query=cls.get_effective_cost("Brave", cfg),
-                cost_basis=CostBasis.CONFIGURED_ESTIMATE,
-                cost_editable=True,
-                supports_non_billable_reachability=False,
-                supports_non_billable_auth_check=False,
-                diagnostic_consumes_quota=True,
-                diagnostic_warning="Executes a minimal search probe that counts as 1 request against quota.",
-                test_button_label="Verify Token (Uses Quota)",
-                fields=[
-                    ProviderFieldSpec(
-                        key="api_key",
-                        label="Subscription Token",
-                        field_type="password",
-                        required=True,
-                        placeholder="BSA••••••",
-                        secret_key="brave",
-                    ),
-                ],
-            ),
-            ProviderCapability(
-                id="Google",
-                config_key="google",
-                display_name="Google CSE (Legacy)",
-                tagline="Programmable Search Engine JSON API (max 10 results/query)",
-                docs_url="https://developers.google.com/custom-search/v1/overview",
-                lifecycle=ProviderLifecycle.LEGACY,
-                lifecycle_notice=(
-                    "Google Custom Search JSON API is closed to new customers and "
-                    "scheduled for retirement on 2027-01-01. Plan migration to Brave, "
-                    "Tavily, or SearXNG."
-                ),
-                requires_credentials=True,
-                supports_language=True,
-                supports_country=True,
-                supports_safesearch=False,
-                supports_raw_content=False,
-                max_results_limit=10,
-                pricing_mode=PricingMode.PER_REQUEST,
-                default_cost_per_query=0.005,
-                effective_cost_per_query=cls.get_effective_cost("Google", cfg),
-                cost_basis=CostBasis.CONFIGURED_ESTIMATE,
-                cost_editable=True,
-                supports_non_billable_reachability=False,
-                supports_non_billable_auth_check=False,
-                diagnostic_consumes_quota=True,
-                diagnostic_warning="Executes a minimal CSE query that counts toward daily API quota.",
-                test_button_label="Verify CSE (Uses Quota)",
-                fields=[
-                    ProviderFieldSpec(
-                        key="api_key",
-                        label="API Key",
-                        field_type="password",
-                        required=True,
-                        placeholder="AIza••••",
-                        secret_key="google",
-                    ),
-                    ProviderFieldSpec(
-                        key="cx",
-                        label="Search Engine ID (cx)",
-                        field_type="text",
-                        required=True,
-                        placeholder="0123456789abcdef...",
-                        mono=True,
-                    ),
-                ],
-            ),
-            ProviderCapability(
-                id="Jina",
-                config_key="jina",
-                display_name="Jina Search",
-                tagline="Markdown web search endpoint via s.jina.ai",
-                docs_url="https://api.jina.ai/docs",
-                lifecycle=ProviderLifecycle.SUPPORTED,
-                requires_credentials=True,
-                supports_language=True,
-                supports_country=True,
-                supports_safesearch=False,
-                supports_raw_content=True,
-                max_results_limit=20,
-                pricing_mode=PricingMode.PER_REQUEST,
-                default_cost_per_query=0.002,
-                effective_cost_per_query=cls.get_effective_cost("Jina", cfg),
-                cost_basis=CostBasis.CONFIGURED_ESTIMATE,
-                cost_editable=True,
-                supports_non_billable_reachability=False,
-                supports_non_billable_auth_check=False,
-                diagnostic_consumes_quota=True,
-                diagnostic_warning="Executes a minimal search request against s.jina.ai that may consume tokens.",
-                test_button_label="Verify Key & Search",
-                fields=[
-                    ProviderFieldSpec(
-                        key="api_key",
-                        label="Bearer Token",
-                        field_type="password",
-                        required=True,
-                        placeholder="jina_••••",
-                        secret_key="jina",
-                    ),
-                ],
-            ),
-            ProviderCapability(
-                id="Yandex",
-                config_key="yandex",
-                display_name="Yandex Search",
-                tagline="Yandex Cloud Search API v2 (POST rawData) & Classic XML",
-                docs_url="https://yandex.cloud/en/docs/search-api/api-ref/SyncSearch",
-                lifecycle=ProviderLifecycle.SUPPORTED,
-                requires_credentials=True,
-                supports_language=True,
-                supports_country=True,
-                supports_safesearch=False,
-                supports_raw_content=False,
-                max_results_limit=15,
-                pricing_mode=PricingMode.PER_REQUEST,
-                default_cost_per_query=0.003,
-                effective_cost_per_query=cls.get_effective_cost("Yandex", cfg),
-                cost_basis=CostBasis.CONFIGURED_ESTIMATE,
-                cost_editable=True,
-                supports_non_billable_reachability=False,
-                supports_non_billable_auth_check=False,
-                diagnostic_consumes_quota=True,
-                diagnostic_warning="Executes a minimal search request that counts toward Yandex Search API usage.",
-                test_button_label="Verify Credentials (Uses Quota)",
-                supported_modes=["cloud_v2", "classic_xml"],
-                fields=[
-                    ProviderFieldSpec(
-                        key="mode",
-                        label="API Mode",
-                        field_type="select",
-                        required=True,
-                        placeholder="cloud_v2",
-                        options=["cloud_v2", "classic_xml"],
-                    ),
-                    ProviderFieldSpec(
-                        key="api_key",
-                        label="API Key",
-                        field_type="password",
-                        required=True,
-                        placeholder="AQVN••••",
-                        secret_key="yandex",
-                    ),
-                    ProviderFieldSpec(
-                        key="folder_id",
-                        label="Folder ID (Required for Cloud v2)",
-                        field_type="text",
-                        required=False,
-                        placeholder="b1g••••",
-                        mono=True,
-                    ),
-                ],
-            ),
-        ]
-        return [cap.model_dump() for cap in capabilities]
+        capabilities: Dict[str, Dict[str, Any]] = {}
+        global_default = cls.get_global_default_max_results(search_config)
 
-    # ------------------------------------------------------------------
-    # Provider instantiation
-    # ------------------------------------------------------------------
+        for key, spec in _PROVIDER_SPECS.items():
+            cap = cls.get_provider_capability(key, search_config)
+            if hasattr(cap, "model_dump"):
+                cap_dict = cap.model_dump()
+            elif hasattr(cap, "dict"):
+                cap_dict = cap.dict()
+            elif hasattr(cap, "__dict__"):
+                cap_dict = dict(vars(cap))
+            else:
+                cap_dict = {}
+
+            provider_limit = min(
+                int(cap_dict.get("max_results_limit") or spec["max_results_limit"]),
+                MAX_RESULTS_HARD_CAP,
+            )
+
+            configured_override: Optional[int] = None
+            try:
+                configured_override = cls.get_configured_provider_max_results(key, search_config)
+            except ValueError:
+                configured_override = None
+
+            effective_default = min(
+                configured_override if configured_override is not None else global_default,
+                provider_limit,
+                MAX_RESULTS_HARD_CAP,
+            )
+
+            cap_dict.update(
+                {
+                    "id": key,
+                    "name": spec["name"],
+                    "max_results_limit": provider_limit,
+                    "configured_max_results": configured_override,
+                    "effective_max_results": effective_default,
+                    "inherits_global_default": configured_override is None,
+                    "default_max_results": global_default,
+                    "limit_type": cap_dict.get("limit_type") or spec["limit_type"],
+                    "notes": cap_dict.get("notes") or spec["notes"],
+                }
+            )
+            capabilities[key] = cap_dict
+
+        return capabilities
+
+    @classmethod
+    def _unwrap_search_section(cls, search_config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Extract the [search] table whether passed a full config dict or the [search] dict directly."""
+        if not isinstance(search_config, dict):
+            return {}
+        if "search" in search_config and isinstance(search_config["search"], dict):
+            # Merge only if top-level does not already look like a direct [search] section
+            if "engine" in search_config["search"] or "default_max_results" in search_config["search"] or any(
+                k in search_config["search"] for k in _PROVIDER_SPECS
+            ):
+                return dict(search_config["search"])
+        return dict(search_config)
+
+    @classmethod
+    def _extract_provider_section(
+        cls,
+        provider_key: str,
+        search_config: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Extract the [search.<provider>] sub-table case-insensitively."""
+        key = cls.normalize_provider_key(provider_key)
+        cfg = cls._unwrap_search_section(search_config)
+
+        direct = cfg.get(key)
+        if isinstance(direct, dict):
+            return dict(direct)
+
+        display_name = _PROVIDER_SPECS[key]["name"]
+        by_display = cfg.get(display_name)
+        if isinstance(by_display, dict):
+            return dict(by_display)
+
+        for k, v in cfg.items():
+            if isinstance(k, str) and k.strip().lower() == key and isinstance(v, dict):
+                return dict(v)
+
+        return {}
+
+    @classmethod
+    def _instantiate_provider(
+        cls,
+        provider_cls: Type[BaseSearchProvider],
+        provider_key: str,
+        provider_cfg: Dict[str, Any],
+        search_config: Optional[Dict[str, Any]] = None,
+    ) -> BaseSearchProvider:
+        """Instantiate a provider class safely regardless of its constructor signature."""
+        full_search_cfg = cls._unwrap_search_section(search_config)
+        merged_cfg = dict(provider_cfg)
+        for global_key in ("lang", "country", "privacy_mode", "total_budget_seconds"):
+            if global_key not in merged_cfg and global_key in full_search_cfg:
+                merged_cfg[global_key] = full_search_cfg[global_key]
+
+        try:
+            sig = inspect.signature(provider_cls.__init__)
+            params = sig.parameters
+            if "config" in params and "search_config" in params:
+                return provider_cls(config=merged_cfg, search_config=full_search_cfg)  # type: ignore[call-arg]
+            if "config" in params:
+                return provider_cls(config=merged_cfg)  # type: ignore[call-arg]
+            if "provider_config" in params:
+                return provider_cls(provider_config=merged_cfg)  # type: ignore[call-arg]
+            if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                return provider_cls(**merged_cfg)
+            filtered = {k: v for k, v in merged_cfg.items() if k in params and k != "self"}
+            if filtered:
+                return provider_cls(**filtered)
+            return provider_cls()
+        except TypeError:
+            try:
+                return provider_cls(merged_cfg)  # type: ignore[call-arg]
+            except TypeError:
+                return provider_cls()
+
     @classmethod
     def create_provider(
         cls,
-        name: str,
-        config: Optional[Dict[str, Any]] = None,
+        provider_name: str,
+        search_config: Optional[Dict[str, Any]] = None,
     ) -> BaseSearchProvider:
-        """
-        Instantiate a provider by name, injecting the effective sub-config
-        and honoring any user-defined cost override.
-        Raises UnknownProviderError if `name` is not a registered provider.
-        """
-        matched_key = cls.resolve_provider_key(name)
-        provider_cls = cls._REGISTRY[matched_key]
+        """Create and configure a concrete BaseSearchProvider instance by provider name."""
+        key = cls.normalize_provider_key(provider_name)
+        provider_cls = cls._load_provider_class(key)
+        provider_cfg = cls._extract_provider_section(key, search_config)
+        return cls._instantiate_provider(provider_cls, key, provider_cfg, search_config)
 
-        sub_config: Dict[str, Any] = {}
-        has_explicit_cost_override = False
-        explicit_cost_value: Optional[float] = None
-
-        if config and isinstance(config, dict):
-            engine_key = matched_key.lower()
-            engine_overrides = config.get(engine_key)
-            if isinstance(engine_overrides, dict):
-                sub_config = {**config, **engine_overrides}
-                if "cost_per_query" in engine_overrides:
-                    raw_cost = engine_overrides["cost_per_query"]
-                    if raw_cost is not None and raw_cost != "":
-                        try:
-                            parsed = float(raw_cost)
-                            if parsed >= 0.0:
-                                has_explicit_cost_override = True
-                                explicit_cost_value = parsed
-                            else:
-                                logger.warning(
-                                    f"Negative cost_per_query for {matched_key} ignored."
-                                )
-                        except (ValueError, TypeError):
-                            logger.warning(
-                                f"Invalid cost_per_query for {matched_key}: {raw_cost!r}"
-                            )
-            else:
-                sub_config = dict(config)
-                if "cost_per_query" in sub_config:
-                    raw_cost = sub_config["cost_per_query"]
-                    if raw_cost is not None and raw_cost != "":
-                        try:
-                            parsed = float(raw_cost)
-                            if parsed >= 0.0:
-                                has_explicit_cost_override = True
-                                explicit_cost_value = parsed
-                        except (ValueError, TypeError):
-                            pass
-
-        provider_instance = provider_cls(config=sub_config)
-
-        if has_explicit_cost_override and explicit_cost_value is not None:
-            provider_instance.cost_per_query = explicit_cost_value
-            provider_instance.cost_overridden = True
-
-        return provider_instance
-
-    # ------------------------------------------------------------------
-    # Operability checks
-    # ------------------------------------------------------------------
-    @classmethod
-    def is_engine_operable(
-        cls,
-        engine_name: str,
-        search_config: Dict[str, Any],
-    ) -> bool:
-        """
-        Determine whether a registered search engine is enabled and has the
-        minimum credentials required to run a query.
-        Raises UnknownProviderError if `engine_name` is not registered.
-        """
-        matched_key = cls.resolve_provider_key(engine_name)
-        eng_lower = matched_key.lower()
-        sub_cfg = search_config.get(eng_lower)
-        if not isinstance(sub_cfg, dict):
-            sub_cfg = {}
-
-        if sub_cfg.get("enabled") is False:
-            return False
-
-        if eng_lower == "duckduckgo":
-            return True
-
-        if eng_lower == "searxng":
-            return bool(str(sub_cfg.get("base_url", "")).strip())
-
-        if eng_lower == "tavily":
-            return bool(str(sub_cfg.get("api_key", "")).strip())
-
-        if eng_lower == "brave":
-            return bool(str(sub_cfg.get("api_key", "")).strip())
-
-        if eng_lower == "google":
-            has_key = bool(str(sub_cfg.get("api_key", "")).strip())
-            has_cx = bool(str(sub_cfg.get("cx", "")).strip())
-            return has_key and has_cx
-
-        if eng_lower == "jina":
-            has_key = bool(str(sub_cfg.get("api_key", "")).strip())
-            allow_no_key = bool(sub_cfg.get("allow_no_key", False))
-            return has_key or allow_no_key
-
-        if eng_lower == "yandex":
-            has_key = bool(str(sub_cfg.get("api_key", "")).strip())
-            if not has_key:
-                return False
-            mode = str(sub_cfg.get("mode", "")).strip().lower()
-            folder_id = str(sub_cfg.get("folder_id", "")).strip()
-            if mode == "classic_xml":
-                return True
-            if mode == "cloud_v2":
-                return bool(folder_id)
-            # When mode is unspecified, Cloud v2 requires folder_id while XML does not
-            endpoint = str(sub_cfg.get("endpoint", "")).strip().lower()
-            if "yandex.com/search/xml" in endpoint or "yandex.ru/search/xml" in endpoint:
-                return True
-            return bool(folder_id) or True
-
-        return False
-
-    # ------------------------------------------------------------------
-    # URL normalization & deduplication helpers
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _normalize_url_for_dedup(raw_url: str) -> str:
-        """
-        Normalize URL for deduplication without corrupting case-sensitive
-        path or query parameters:
-        - Lowercases scheme and hostname only.
-        - Preserves path and query case.
-        """
-        candidate = (raw_url or "").strip()
-        if not candidate:
-            return ""
-        try:
-            parsed = urllib.parse.urlsplit(candidate)
-            scheme = (parsed.scheme or "https").lower()
-            netloc = (parsed.netloc or "").lower()
-            path = parsed.path or "/"
-            if path != "/" and path.endswith("/"):
-                path = path.rstrip("/")
-            return urllib.parse.urlunsplit((scheme, netloc, path, parsed.query, ""))
-        except Exception:
-            return candidate
+    # Alias for backward compatibility
+    get_provider = create_provider
 
     @classmethod
-    def _deduplicate_results(
+    def build_execution_chain(
         cls,
-        results: List[SearchResult],
-        seen_urls: Set[str],
-    ) -> List[SearchResult]:
-        """Filter out duplicate URLs within a single provider response."""
-        unique: List[SearchResult] = []
-        for item in results:
-            url_key = cls._normalize_url_for_dedup(item.url)
-            if not url_key or url_key in seen_urls:
-                continue
-            seen_urls.add(url_key)
-            unique.append(item)
-        return unique
-
-    # ------------------------------------------------------------------
-    # Candidate chain construction & validation
-    # ------------------------------------------------------------------
-    @classmethod
-    def _build_candidate_chain(
-        cls,
-        search_config: Dict[str, Any],
+        search_config: Optional[Dict[str, Any]] = None,
+        override_provider: Optional[str] = None,
     ) -> List[str]:
         """
-        Build and validate the ordered list of engines to try:
-          1. Primary engine from config.
-          2. User-configured fallback_engines (deduplicated).
-          3. Never injects unrequested fallback engines when fallback_engines=[].
-        Raises UnknownProviderError if any configured engine name is invalid.
+        Build the ordered list of canonical provider keys to attempt.
+        If override_provider is explicitly specified (e.g. diagnostic test), only that provider runs.
+        Otherwise uses primary `engine` followed by `fallback_engines`, skipping explicitly disabled providers.
         """
-        raw_primary = search_config.get("engine")
-        primary = str(raw_primary).strip() if raw_primary is not None else "DuckDuckGo"
-        if not primary:
-            raise ConfigurationError("Primary search engine ('engine') cannot be empty.")
+        cfg = cls._unwrap_search_section(search_config)
 
-        canonical_primary = cls.resolve_provider_key(primary)
+        if override_provider:
+            return [cls.normalize_provider_key(override_provider)]
 
-        raw_fallbacks = search_config.get("fallback_engines")
-        if raw_fallbacks is None:
-            fallback_list: List[Any] = []
-        elif isinstance(raw_fallbacks, list):
-            fallback_list = raw_fallbacks
-        else:
-            raise ConfigurationError(
-                "'fallback_engines' must be a list of provider names."
-            )
+        primary_raw = cfg.get("engine") or "DuckDuckGo"
+        primary_key = cls.normalize_provider_key(str(primary_raw))
 
-        chain: List[str] = [canonical_primary]
-        for eng in fallback_list:
-            if not eng or not str(eng).strip():
+        fallbacks_raw = cfg.get("fallback_engines") or []
+        if isinstance(fallbacks_raw, str):
+            fallbacks_raw = [item.strip() for item in fallbacks_raw.split(",") if item.strip()]
+
+        chain: List[str] = []
+        candidates = [primary_key]
+        for fb in fallbacks_raw:
+            if fb:
+                candidates.append(cls.normalize_provider_key(str(fb)))
+
+        for cand_key in candidates:
+            if cand_key in chain:
                 continue
-            canonical_eng = cls.resolve_provider_key(str(eng))
-            if canonical_eng not in chain:
-                chain.append(canonical_eng)
+            prov_section = cls._extract_provider_section(cand_key, cfg)
+            # Primary engine is included unless explicitly disabled in its sub-table;
+            # fallback engines are included unless explicitly disabled (enabled is False).
+            if "enabled" in prov_section and prov_section["enabled"] is False and cand_key != primary_key:
+                logger.debug("Skipping disabled fallback search provider: %s", cand_key)
+                continue
+            chain.append(cand_key)
 
         return chain
 
-    # ------------------------------------------------------------------
-    # Orchestration (First-Success Failover with Strict Deadline)
-    # ------------------------------------------------------------------
     @classmethod
-    async def execute_orchestrated_search(
+    async def search(
         cls,
         query: str,
-        search_config: Dict[str, Any],
-        max_results: int = 5,
-        lang: str = "en",
-        country: str = "us",
+        max_results: Optional[int] = None,
+        search_config: Optional[Dict[str, Any]] = None,
+        *,
+        override_provider: Optional[str] = None,
+        lang: Optional[str] = None,
+        country: Optional[str] = None,
+        timeout: Optional[float] = None,
         **kwargs: Any,
     ) -> SearchResponse:
         """
-        Execute a search across the validated candidate chain using a
-        first-success failover strategy and a strict monotonic time budget.
+        Execute a search query across the configured provider chain with per-provider
+        effective max_results calculation, retry policy, time budget enforcement, and
+        defensive result count truncation.
         """
-        if search_config.get("enabled") is False:
-            return SearchResponse(
-                query=query,
-                provider="AirGapped",
-                results=[],
-                status=ProviderStatus.DISABLED,
-                request_count=0,
-                estimated_cost_usd=0.0,
-                cost_basis=CostBasis.NOT_BILLABLE_LOCAL,
-                is_success=False,
-                error_code="air_gapped",
-                error_message="Web search is administratively disabled (Air-Gapped Mode).",
+        clean_query = (query or "").strip()
+        if not clean_query:
+            raise SearchProviderError("Search query cannot be empty.")
+
+        cfg = cls._unwrap_search_section(search_config)
+        if cfg.get("enabled") is False:
+            raise SearchProviderError("External web search is disabled by PELDRUN Search Settings.")
+
+        # Validate configuration result limits upfront so invalid config surfaces clearly
+        cls.get_global_default_max_results(cfg, strict=True)
+
+        chain = cls.build_execution_chain(cfg, override_provider=override_provider)
+        if not chain:
+            raise SearchProviderError("No active search providers available in execution chain.")
+
+        resolved_lang = lang if lang is not None else str(cfg.get("lang") or "en")
+        resolved_country = country if country is not None else str(cfg.get("country") or "us")
+        privacy_mode = bool(cfg.get("privacy_mode", False))
+
+        total_budget = float(timeout if timeout is not None else (cfg.get("total_budget_seconds") or 22.0))
+        max_retries = max(0, int(cfg.get("max_retries") or 0))
+        retry_delay = max(0.0, float(cfg.get("retry_delay") or 1.0))
+
+        deadline = time.monotonic() + total_budget
+        errors: List[Tuple[str, str]] = []
+
+        for provider_index, provider_key in enumerate(chain):
+            display_name = cls.get_canonical_display_name(provider_key)
+            prov_section = cls._extract_provider_section(provider_key, cfg)
+
+            if prov_section.get("enabled") is False and override_provider is None and len(chain) > 1:
+                errors.append((display_name, f"Provider {display_name} is disabled."))
+                continue
+
+            # Compute the authoritative effective max_results specifically for THIS provider
+            audit = cls.resolve_count_Audit_details(
+                provider_key,
+                requested=max_results,
+                search_config=cfg,
             )
+            effective_count = int(audit["effective_max_results"])
+            provider_limit = int(audit["max_results_limit"])
 
-        try:
-            raw_chain = cls._build_candidate_chain(search_config)
-        except SearchProviderError as exc:
-            return SearchResponse(
-                query=query,
-                provider=exc.provider or "InvalidProvider",
-                results=[],
-                status=exc.status,
-                request_count=0,
-                estimated_cost_usd=0.0,
-                cost_basis=CostBasis.NOT_BILLABLE_LOCAL,
-                is_success=False,
-                error_code=exc.error_code,
-                error_message=exc.message,
-            )
-
-        active_chain: List[str] = []
-        for engine in raw_chain:
-            if cls.is_engine_operable(engine, search_config):
-                active_chain.append(engine)
-
-        if not active_chain:
-            primary_name = raw_chain[0] if raw_chain else "None"
-            return SearchResponse(
-                query=query,
-                provider=primary_name,
-                results=[],
-                status=ProviderStatus.CONFIGURATION_ERROR,
-                request_count=0,
-                estimated_cost_usd=0.0,
-                cost_basis=CostBasis.NOT_BILLABLE_LOCAL,
-                is_success=False,
-                error_code="no_operable_provider",
-                error_message=(
-                    f"Provider '{primary_name}' is not enabled or is missing required "
-                    f"credentials, and no operable fallback providers are configured."
-                ),
-            )
-
-        try:
-            requested_budget = float(
-                search_config.get("total_budget_seconds", cls.DEFAULT_TOTAL_BUDGET_SECONDS)
-            )
-        except (TypeError, ValueError):
-            requested_budget = cls.DEFAULT_TOTAL_BUDGET_SECONDS
-        total_budget = max(1.0, min(requested_budget, cls.MAX_TOTAL_BUDGET_SECONDS))
-
-        try:
-            min_budget = float(
-                search_config.get("min_provider_budget_seconds", cls.MIN_PROVIDER_BUDGET_SECONDS)
-            )
-        except (TypeError, ValueError):
-            min_budget = cls.MIN_PROVIDER_BUDGET_SECONDS
-        min_budget = max(0.2, min(min_budget, total_budget))
-
-        # Bounded retry controls: default to 0 retries to prevent unrequested
-        # duplicate billable queries. If user sets max_retries > 0, only transient
-        # errors (timeout/upstream/rate-limit) are retried within the time budget.
-        try:
-            max_retries = max(0, min(int(search_config.get("max_retries", 0)), 2))
-        except (TypeError, ValueError):
-            max_retries = 0
-
-        try:
-            retry_delay = max(0.0, min(float(search_config.get("retry_delay", 1.0)), 5.0))
-        except (TypeError, ValueError):
-            retry_delay = 1.0
-
-        fallback_on_auth_error = bool(search_config.get("fallback_on_auth_error", False))
-
-        start_monotonic = time.monotonic()
-        deadline = start_monotonic + total_budget
-
-        effective_lang = lang or str(search_config.get("lang", "en"))
-        effective_country = country or str(search_config.get("country", "us"))
-
-        total_requests = 0
-        accumulated_cost = 0.0
-        last_response: Optional[SearchResponse] = None
-
-        for engine_name in active_chain:
-            remaining = deadline - time.monotonic()
-            if remaining < min_budget:
-                logger.warning(
-                    f"Search budget exhausted before attempting '{engine_name}'. "
-                    f"Remaining: {remaining:.2f}s"
-                )
-                if last_response is None:
-                    last_response = SearchResponse(
-                        query=query,
-                        provider=engine_name,
-                        results=[],
-                        status=ProviderStatus.TIMEOUT,
-                        latency_ms=round((time.monotonic() - start_monotonic) * 1000.0, 2),
-                        request_count=total_requests,
-                        estimated_cost_usd=accumulated_cost,
-                        cost_basis=CostBasis.UNKNOWN,
-                        is_success=False,
-                        error_code="budget_exhausted",
-                        error_message=(
-                            f"Search time budget ({total_budget:.1f}s) exhausted before "
-                            f"provider '{engine_name}' could be called."
-                        ),
-                    )
-                break
-
-            provider = cls.create_provider(name=engine_name, config=search_config)
+            provider = cls.create_provider(provider_key, cfg)
 
             for attempt in range(max_retries + 1):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0.1:
-                    last_response = SearchResponse(
-                        query=query,
-                        provider=engine_name,
-                        results=[],
-                        status=ProviderStatus.TIMEOUT,
-                        latency_ms=round((time.monotonic() - start_monotonic) * 1000.0, 2),
-                        request_count=total_requests,
-                        estimated_cost_usd=accumulated_cost,
-                        cost_basis=provider.default_cost_basis,
-                        is_success=False,
-                        error_code="timeout",
-                        error_message=(
-                            f"Provider '{engine_name}' exceeded the remaining search "
-                            f"budget ({total_budget:.1f}s)."
-                        ),
-                    )
+                remaining_budget = deadline - time.monotonic()
+                if remaining_budget <= 0:
+                    errors.append((display_name, "Total search time budget exhausted."))
                     break
 
-                # Clamp the adapter's internal HTTP timeout to fit inside remaining budget
-                if hasattr(provider, "timeout_seconds"):
-                    try:
-                        current_timeout = float(getattr(provider, "timeout_seconds"))
-                        setattr(
-                            provider,
-                            "timeout_seconds",
-                            max(0.5, min(current_timeout, remaining)),
-                        )
-                    except (TypeError, ValueError):
-                        pass
+                prov_timeout = float(prov_section.get("timeout") or remaining_budget)
+                attempt_timeout = max(0.5, min(remaining_budget, prov_timeout))
 
-                call_start = time.perf_counter()
                 try:
-                    response = await asyncio.wait_for(
-                        provider.search(
-                            query=query,
-                            max_results=max_results,
-                            lang=effective_lang,
-                            country=effective_country,
-                            **kwargs,
-                        ),
-                        timeout=remaining,
+                    response = await cls._invoke_provider_search(
+                        provider=provider,
+                        query=clean_query,
+                        effective_count=effective_count,
+                        lang=resolved_lang,
+                        country=resolved_country,
+                        privacy_mode=privacy_mode,
+                        timeout=attempt_timeout,
+                        extra_kwargs=kwargs,
                     )
-                except asyncio.TimeoutError:
-                    elapsed_ms = round((time.perf_counter() - call_start) * 1000.0, 2)
-                    total_requests += 1
-                    last_response = SearchResponse(
-                        query=query,
-                        provider=provider.provider_name,
-                        results=[],
-                        status=ProviderStatus.TIMEOUT,
-                        latency_ms=elapsed_ms,
-                        request_count=total_requests,
-                        estimated_cost_usd=accumulated_cost,
-                        cost_basis=provider.default_cost_basis,
-                        is_success=False,
-                        error_code="timeout",
-                        error_message=(
-                            f"Provider '{provider.provider_name}' timed out after "
-                            f"{remaining:.1f}s (global budget {total_budget:.1f}s)."
-                        ),
+
+                    # Defensive post-search truncation: never return more than effective_count
+                    if hasattr(response, "results") and isinstance(response.results, list):
+                        if len(response.results) > effective_count:
+                            response.results = list(response.results[:effective_count])
+
+                    # Attach traceability metadata for QA, diagnostics, and usage accounting
+                    cls._attach_count_metadata(
+                        response=response,
+                        provider_name=display_name,
+                        provider_key=provider_key,
+                        requested_max_results=max_results,
+                        effective_max_results=effective_count,
+                        configured_max_results=audit["configured_max_results"],
+                        max_results_limit=provider_limit,
+                        fallback_used=(provider_index > 0),
+                        attempt_number=(attempt + 1),
                     )
-                    break
-                except SearchProviderError as exc:
-                    elapsed_ms = round((time.perf_counter() - call_start) * 1000.0, 2)
-                    total_requests += 1
-                    last_response = SearchResponse(
-                        query=query,
-                        provider=provider.provider_name,
-                        results=[],
-                        status=exc.status,
-                        latency_ms=elapsed_ms,
-                        request_count=total_requests,
-                        estimated_cost_usd=accumulated_cost,
-                        cost_basis=provider.default_cost_basis,
-                        is_success=False,
-                        error_code=exc.error_code,
-                        error_message=exc.message,
-                    )
+                    return response
+
                 except Exception as exc:
-                    elapsed_ms = round((time.perf_counter() - call_start) * 1000.0, 2)
-                    total_requests += 1
-                    logger.error(f"Provider '{engine_name}' raised an exception: {exc}")
-                    last_response = SearchResponse(
-                        query=query,
-                        provider=provider.provider_name,
-                        results=[],
-                        status=ProviderStatus.UPSTREAM_ERROR,
-                        latency_ms=elapsed_ms,
-                        request_count=total_requests,
-                        estimated_cost_usd=accumulated_cost,
-                        cost_basis=provider.default_cost_basis,
-                        is_success=False,
-                        error_code="upstream_exception",
-                        error_message=str(exc),
+                    err_text = str(exc) or exc.__class__.__name__
+                    logger.warning(
+                        "Search provider %s failed (attempt %d/%d, effective_max_results=%d): %s",
+                        display_name,
+                        attempt + 1,
+                        max_retries + 1,
+                        effective_count,
+                        err_text,
                     )
-                else:
-                    total_requests += max(1, int(response.request_count or 1))
-                    if response.estimated_cost_usd:
-                        accumulated_cost += float(response.estimated_cost_usd)
+                    if attempt < max_retries and (deadline - time.monotonic()) > retry_delay:
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        errors.append((display_name, err_text))
+                        break
 
-                    response.request_count = total_requests
-                    if response.estimated_cost_usd is not None:
-                        response.estimated_cost_usd = round(accumulated_cost, 6)
-                    last_response = response
+        summary = "; ".join(f"{prov}: {msg}" for prov, msg in errors) or "Unknown provider failure."
+        raise SearchProviderError(f"All configured search providers failed. Details: {summary}")
 
-                    if response.is_success and response.results:
-                        seen_urls: Set[str] = set()
-                        response.results = cls._deduplicate_results(
-                            response.results,
-                            seen_urls,
-                        )
-                        if response.results:
-                            response.status = ProviderStatus.SUCCESS
-                            return response
+    # Aliases to support all runtime and test callers
+    execute_search = search
+    search_with_failover = search
 
-                # Check if same-provider retry is permitted and feasible
-                if last_response is not None and attempt < max_retries:
-                    retryable_statuses = {
-                        ProviderStatus.TIMEOUT,
-                        ProviderStatus.UPSTREAM_ERROR,
-                        ProviderStatus.RATE_LIMITED,
-                    }
-                    if last_response.status in retryable_statuses:
-                        remaining_after = deadline - time.monotonic()
-                        if remaining_after > (retry_delay + min_budget):
-                            if retry_delay > 0:
-                                await asyncio.sleep(retry_delay)
-                            continue
-                break
+    @classmethod
+    async def _invoke_provider_search(
+        cls,
+        provider: BaseSearchProvider,
+        query: str,
+        effective_count: int,
+        lang: str,
+        country: str,
+        privacy_mode: bool,
+        timeout: float,
+        extra_kwargs: Dict[str, Any],
+    ) -> SearchResponse:
+        """Invoke provider.search() adapting to the concrete provider's accepted parameters."""
+        search_fn = provider.search
+        sig = inspect.signature(search_fn)
+        params = sig.parameters
+        accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
-            # Do not mask configuration or authentication errors with a silent
-            # fallback unless the user explicitly opted into fallback_on_auth_error.
-            if (
-                last_response is not None
-                and last_response.status
-                in (
-                    ProviderStatus.CONFIGURATION_ERROR,
-                    ProviderStatus.AUTHENTICATION_ERROR,
-                    ProviderStatus.PERMISSION_ERROR,
-                )
-                and not fallback_on_auth_error
-            ):
-                return last_response
+        call_kwargs: Dict[str, Any] = {}
+        candidate_args = {
+            "query": query,
+            "max_results": effective_count,
+            "lang": lang,
+            "language": lang,
+            "country": country,
+            "region": country,
+            "privacy_mode": privacy_mode,
+            "timeout": timeout,
+            **extra_kwargs,
+        }
 
-        if last_response is not None:
-            last_response.request_count = total_requests
-            if last_response.estimated_cost_usd is not None:
-                last_response.estimated_cost_usd = round(accumulated_cost, 6)
-            return last_response
+        for k, v in candidate_args.items():
+            if k in params or accepts_var_kw:
+                # Avoid passing duplicate aliases unless explicitly declared in signature
+                if k in ("language", "region") and k not in params:
+                    continue
+                call_kwargs[k] = v
 
-        return SearchResponse(
-            query=query,
-            provider="None",
-            results=[],
-            status=ProviderStatus.TIMEOUT,
-            request_count=total_requests,
-            estimated_cost_usd=round(accumulated_cost, 6),
-            cost_basis=CostBasis.UNKNOWN,
-            is_success=False,
-            error_code="budget_exhausted",
-            error_message=(
-                "Search chain produced no response within the allotted time budget."
-            ),
-        )
+        if "query" not in call_kwargs:
+            return await asyncio.wait_for(search_fn(query, max_results=effective_count), timeout=timeout + 1.0)
+
+        return await asyncio.wait_for(search_fn(**call_kwargs), timeout=timeout + 1.0)
+
+    @classmethod
+    def _attach_count_metadata(
+        cls,
+        response: SearchResponse,
+        provider_name: str,
+        provider_key: str,
+        requested_max_results: Optional[int],
+        effective_max_results: int,
+        configured_max_results: Optional[int],
+        max_results_limit: int,
+        fallback_used: bool,
+        attempt_number: int,
+    ) -> None:
+        """Enrich SearchResponse with count resolution metadata without breaking strict models."""
+        trace_meta = {
+            "provider": provider_name,
+            "provider_key": provider_key,
+            "requested_max_results": requested_max_results,
+            "effective_max_results": effective_max_results,
+            "configured_max_results": configured_max_results,
+            "max_results_limit": max_results_limit,
+            "fallback_used": fallback_used,
+            "attempt": attempt_number,
+        }
+
+        if hasattr(response, "metadata") and isinstance(getattr(response, "metadata"), dict):
+            response.metadata.update(trace_meta)
+        else:
+            try:
+                setattr(response, "metadata", trace_meta)
+            except Exception:
+                pass
+
+        for attr_key, attr_val in (
+            ("requested_max_results", requested_max_results),
+            ("effective_max_results", effective_max_results),
+            ("configured_max_results", configured_max_results),
+            ("max_results_limit", max_results_limit),
+        ):
+            try:
+                setattr(response, attr_key, attr_val)
+            except Exception:
+                pass
 
 
-__all__ = ["SearchProviderFactory"]
+__all__ = [
+    "DEFAULT_MAX_RESULTS",
+    "MAX_RESULTS_HARD_CAP",
+    "MIN_RESULTS_LIMIT",
+    "SearchProviderFactory",
+]

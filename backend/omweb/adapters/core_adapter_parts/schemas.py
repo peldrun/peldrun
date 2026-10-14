@@ -1,52 +1,112 @@
+# backend/omweb/adapters/core_adapter_parts/schemas.py
 """
-Canonical tool JSON schemas for the PELDRUN core adapter layer.
+Canonical JSON Schemas for PELDRUN Web-to-Core Builtin Tools.
 
-These schemas guarantee that every LLM (local or remote) sees explicit,
-non-empty parameter definitions, so it never attempts to call a tool
-with an empty argument object.
+Synchronized with peldrun-core tool argument contracts (Phase 3 — SR-301..SR-305):
+- `web_search.properties.max_results` is strictly optional (`required: ["query"]`),
+  has no hard-coded `"default": 5`, and uses the centralized bounds
+  `MIN_RESULTS_LIMIT` (1) .. `MAX_RESULTS_HARD_CAP` (20).
 """
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Dict
 
+from peldrun.tools.builtins.search_providers.factory import (
+    MAX_RESULTS_HARD_CAP,
+    MIN_RESULTS_LIMIT,
+)
 
-# Standard schemas ensuring local and remote LLMs receive explicit parameters
-# and never call empty functions.
+CANONICAL_TOOL_DESCRIPTIONS: Dict[str, str] = {
+    "python_execute": (
+        "Execute Python code in an isolated workspace environment and return stdout/stderr."
+    ),
+    "bash": (
+        "Execute a bash or shell command inside the active workspace directory."
+    ),
+    "file_saver": (
+        "Create or overwrite a file inside the active workspace directory."
+    ),
+    "file_reader": (
+        "Read the contents of a file from the active workspace directory."
+    ),
+    "str_replace_editor": (
+        "View, create, and edit files in the workspace using exact string replacements or line insertions."
+    ),
+    "web_search": (
+        "Search the web for up-to-date information, documentation, news, and factual verification. "
+        "Omit max_results to use PELDRUN Search Settings."
+    ),
+    "browser_use": (
+        "Navigate to a web URL and extract readable page text content."
+    ),
+    "ask_human": (
+        "Ask the human operator a clarifying question or request approval when blocked."
+    ),
+}
+
 CANONICAL_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
-    "bash": {
-        "type": "object",
-        "properties": {
-            "command": {
-                "type": "string",
-                "description": "The command-line instruction to execute in the workspace."
-            }
-        },
-        "required": ["command"]
-    },
-    "shell_exec": {
-        "type": "object",
-        "properties": {
-            "command": {
-                "type": "string",
-                "description": "The shell command to execute inside the workspace sandbox."
-            },
-            "timeout": {
-                "type": "number",
-                "description": "Optional execution timeout in seconds (default: 60.0)."
-            }
-        },
-        "required": ["command"]
-    },
     "python_execute": {
         "type": "object",
         "properties": {
             "code": {
                 "type": "string",
-                "description": "The Python source code to execute inside the workspace."
-            }
+                "description": "Valid Python source code to execute in the workspace.",
+            },
+            "timeout_seconds": {
+                "type": "number",
+                "minimum": 1,
+                "maximum": 600,
+                "description": "Optional execution timeout in seconds.",
+            },
         },
-        "required": ["code"]
+        "required": ["code"],
+    },
+    "bash": {
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": "Shell command to execute inside the workspace.",
+            },
+            "timeout_seconds": {
+                "type": "number",
+                "minimum": 1,
+                "maximum": 600,
+                "description": "Optional command timeout in seconds.",
+            },
+        },
+        "required": ["command"],
+    },
+    "file_saver": {
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "Relative path of the file inside the workspace.",
+            },
+            "content": {
+                "type": "string",
+                "description": "Full text content to write to the file.",
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["w", "a"],
+                "description": "Write mode: 'w' to overwrite (default) or 'a' to append.",
+            },
+        },
+        "required": ["file_path", "content"],
+    },
+    "file_reader": {
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "Relative path of the workspace file to read.",
+            },
+        },
+        "required": ["file_path"],
     },
     "str_replace_editor": {
         "type": "object",
@@ -54,86 +114,107 @@ CANONICAL_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
             "command": {
                 "type": "string",
                 "enum": ["view", "create", "str_replace", "insert", "undo_edit"],
-                "description": "The editor command to run."
+                "description": "Editor operation to perform.",
             },
             "path": {
                 "type": "string",
-                "description": "Relative file path within workspace."
+                "description": "Relative file or directory path inside the workspace.",
             },
             "file_text": {
                 "type": "string",
-                "description": "File contents for 'create' command."
+                "description": "Full file content when command is 'create'.",
             },
             "old_str": {
                 "type": "string",
-                "description": "String to replace for 'str_replace' command."
+                "description": "Exact string in the file to replace when command is 'str_replace'.",
             },
             "new_str": {
                 "type": "string",
-                "description": "Replacement string for 'str_replace' command."
-            }
+                "description": "Replacement string for 'str_replace' or text to insert for 'insert'.",
+            },
+            "insert_line": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Line number after which new_str is inserted when command is 'insert'.",
+            },
+            "view_range": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "minItems": 2,
+                "maxItems": 2,
+                "description": "Optional [start_line, end_line] range when command is 'view'.",
+            },
         },
-        "required": ["command", "path"]
+        "required": ["command", "path"],
     },
     "web_search": {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": "The search query terms to look up on the live web."
+                "minLength": 1,
+                "description": "Search query string to look up on the web.",
             },
             "max_results": {
                 "type": "integer",
-                "default": 5,
-                "description": "Maximum number of search results to retrieve (default: 5)."
-            }
+                "minimum": MIN_RESULTS_LIMIT,
+                "maximum": MAX_RESULTS_HARD_CAP,
+                "description": (
+                    "Optional desired maximum number of results. Omit this argument to use "
+                    "PELDRUN Search Settings. The configured provider ceiling and provider "
+                    "capability maximum are always enforced."
+                ),
+            },
         },
-        "required": ["query"]
+        "required": ["query"],
     },
     "browser_use": {
         "type": "object",
         "properties": {
-            "url": {
-                "type": "string",
-                "description": "The target website URL to visit, inspect, or extract content from."
-            },
             "action": {
                 "type": "string",
-                "enum": ["navigate", "extract_content", "click", "scroll_down"],
-                "default": "extract_content",
-                "description": "The browser operation to perform on the target web page."
+                "enum": ["navigate", "open", "extract", "fetch"],
+                "description": "Browser action to perform on the target URL.",
             },
-            "selector": {
+            "url": {
                 "type": "string",
-                "description": "Optional CSS selector or keyword to target specific elements on the page."
-            }
+                "description": "Target HTTP or HTTPS URL to visit.",
+            },
         },
-        "required": ["url"]
+        "required": ["action", "url"],
     },
     "ask_human": {
         "type": "object",
         "properties": {
-            "prompt": {
+            "question": {
                 "type": "string",
-                "description": "The question, confirmation, or clarification needed from the human user."
+                "minLength": 1,
+                "description": "Clear question or confirmation prompt presented to the user.",
             },
-            "input_type": {
-                "type": "string",
-                "enum": ["text", "confirm", "select", "multiple_choice"],
-                "default": "text",
-                "description": "Interaction type: 'text' (input field), 'confirm' (Yes/No buttons), 'select' (choice buttons)."
-            },
-            "options": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "List of choice buttons for the user to select from (e.g. ['Yes', 'No'] or custom options)."
-            },
-            "timeout_seconds": {
-                "type": "integer",
-                "default": 600,
-                "description": "Maximum wait time in seconds for the user to respond."
-            }
         },
-        "required": ["prompt"]
-    }
+        "required": ["question"],
+    },
 }
+
+
+def get_canonical_tool_schema(tool_name: str) -> Dict[str, Any]:
+    """Return a deep copy of the canonical JSON schema for a builtin tool."""
+    key = (tool_name or "").strip().lower()
+    schema = CANONICAL_TOOL_SCHEMAS.get(key)
+    if schema is None:
+        return {"type": "object", "properties": {}, "required": []}
+    return copy.deepcopy(schema)
+
+
+def get_canonical_tool_description(tool_name: str) -> str:
+    """Return the canonical description for a builtin tool."""
+    key = (tool_name or "").strip().lower()
+    return CANONICAL_TOOL_DESCRIPTIONS.get(key, f"Execute {key} tool.")
+
+
+__all__ = [
+    "CANONICAL_TOOL_DESCRIPTIONS",
+    "CANONICAL_TOOL_SCHEMAS",
+    "get_canonical_tool_description",
+    "get_canonical_tool_schema",
+]

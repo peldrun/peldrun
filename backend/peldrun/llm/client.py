@@ -24,7 +24,10 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger("peldrun.llm.client")
-
+from collections import deque as _deque
+_RECENT_TOOL_SIGNATURES: _deque = _deque(maxlen=12)
+from collections import defaultdict as _defaultdict
+_TOOL_CALL_COUNTER: Dict[str, int] = _defaultdict(int)
 
 class UsageSource(str, Enum):
     """Authoritative origin of invocation token metrics."""
@@ -792,7 +795,14 @@ class AsyncLLMClient:
 
             full_content = "".join(accumulated_content)
             full_reasoning = "".join(accumulated_reasoning) or None
-
+            # Register a compact signature of every tool call for downstream
+            # loop detection by the engine layer. Signature = name + args (hashed).
+            import hashlib as _hashlib
+            for idx in sorted(accumulated_tool_calls.keys()):
+                _tc = accumulated_tool_calls[idx]
+                _sig_raw = f"{_tc['name']}::{_tc['arguments']}"
+                _sig = _hashlib.sha256(_sig_raw.encode("utf-8")).hexdigest()[:16]
+                _RECENT_TOOL_SIGNATURES.append((_tc["name"], _sig))
             parsed_tool_calls: List[ToolCall] = []
             for idx in sorted(accumulated_tool_calls.keys()):
                 tc_item = accumulated_tool_calls[idx]

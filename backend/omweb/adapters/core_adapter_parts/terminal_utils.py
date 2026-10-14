@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import re as _re
+
 import sys
 from pathlib import Path
 from typing import Optional
@@ -102,3 +104,35 @@ def decode_terminal_bytes(raw: bytes) -> str:
             pass
 
     return raw.decode("utf-8", errors="replace").replace("\x00", "").strip()
+
+
+_ANSI_ESCAPE_RE = _re.compile(
+    r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])"
+)
+_CONTROL_CHARS_RE = _re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def sanitize_terminal_output(raw_output: Optional[str]) -> str:
+    """
+    Clean terminal output for safe display / model consumption:
+    - Strips ANSI escape sequences (colors, cursor movement).
+    - Removes control characters that break downstream formatting.
+    - Collapses runs of blank lines.
+    - Bounds maximum length to avoid runaway output.
+
+    This is a display-layer sanitizer, not a security boundary.
+    """
+    if not raw_output:
+        return ""
+
+    text = str(raw_output)
+    text = _ANSI_ESCAPE_RE.sub("", text)
+    text = _CONTROL_CHARS_RE.sub("", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = _re.sub(r"\n{4,}", "\n\n\n", text)
+
+    max_chars = 200_000
+    if len(text) > max_chars:
+        text = text[:max_chars] + f"\n\n... [truncated, original length: {len(raw_output)} chars]"
+
+    return text.rstrip()

@@ -108,7 +108,7 @@ function MatrixRow({
     <div className="py-2.5 flex items-center justify-between gap-3">
       <div className="flex items-center gap-2 min-w-0">
         <StatusDot state={state} />
-        <span className="shrink-0 flex items-center justify-center text-muted-foreground rounded rounded-Xl bg-[#fff]/10 p-1">
+        <span className="shrink-0 flex items-center justify-center text-muted-foreground rounded rounded-Xl bg-muted p-1">
           <Icon name={iconName} size={14}    title={`${label} logo`} />
         </span>
         <span className="font-semibold text-foreground truncate">{label}</span>

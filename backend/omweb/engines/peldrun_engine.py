@@ -1,16 +1,20 @@
 """
 backend/omweb/engines/peldrun_engine.py
 
-PELDRUN Native Embedded Execution Engine (Hardened Context Architecture).
+PELDRUN Native Embedded Execution Engine.
 Executes autonomous workflows by delegating to peldrun-core via RunRequest.
 Integrates ContextManager to enforce strict isolation between persistent history
-and LLM context, guaranteeing zero execution telemetry leakage across turns.
-Hardened under PR 2: Zero circular import cycles with agent_bridge subsystems.
+and LLM context.
+
+Design principle: Each agent's manifest is authoritative. The engine does not
+impose tool-calling policies, loop detection, watchdogs, or artificial limits.
+The agent's own system_prompt, tools list, and max_steps govern its behavior.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from pathlib import Path
@@ -22,6 +26,7 @@ from .base import EngineRunContext, ExecutionEngine
 
 # Core Public Boundary Imports
 from peldrun.context.builder import ContextManager
+from peldrun.context.generative_ui import build_generative_ui_prompt
 from peldrun.context.sidecar import build_context_sidecar
 from peldrun.events.schema import EventType, PeldrunEvent
 from peldrun.runtime.contract import AgentSpec, RunRequest, RunStatus, WorkspaceContext
@@ -29,9 +34,38 @@ from peldrun.runtime.executor import core_executor
 from peldrun.runtime.pricing_store import NANO_USD_PER_USD
 from peldrun.tools.builtins.human_input import HumanInputRegistry
 
-from peldrun.context.generative_ui import build_generative_ui_prompt
-
 logger = logging.getLogger(__name__)
+
+
+def _collect_specialist_tool_allowlists(
+    enabled_tool_ids: Set[str],
+) -> Dict[str, List[str]]:
+    """Build a mapping of specialist agent IDs to their authorized, enabled tool IDs."""
+    specialist_map: Dict[str, List[str]] = {}
+    try:
+        from omweb.agents.registry import agent_registry
+
+        agents_list: List[Dict[str, Any]] = []
+        if hasattr(agent_registry, "list_agents") and callable(agent_registry.list_agents):
+            agents_list = list(agent_registry.list_agents() or [])
+
+        for ag in agents_list:
+            if not isinstance(ag, dict):
+                continue
+            ag_id = str(ag.get("id") or "").strip().lower()
+            raw_tools = ag.get("tools")
+            if ag_id and isinstance(raw_tools, list):
+                filtered = [
+                    str(t).strip()
+                    for t in raw_tools
+                    if str(t).strip() in enabled_tool_ids
+                    and str(t).strip() not in ("terminate", "delegate_task", "delegate")
+                ]
+                specialist_map[ag_id] = filtered
+    except Exception as exc:
+        logger.debug("Specialist tool allowlist discovery notice: %s", exc)
+
+    return specialist_map
 
 
 class PeldrunEngine(ExecutionEngine):
@@ -62,7 +96,6 @@ class PeldrunEngine(ExecutionEngine):
 
     async def run(self, context: EngineRunContext) -> None:
         """Execute autonomous agent workflow through canonical Core boundaries."""
-        # Lazy imports of Web layer dependencies to guarantee zero circular import cycles
         from omweb.adapters.core_adapter import resolve_tool_runtime
         from omweb.agent_bridge_parts.state import job_scoped_artifacts
         from omweb.agent_bridge_parts.text_utils import sanitize_final_result_text
@@ -73,6 +106,7 @@ class PeldrunEngine(ExecutionEngine):
         from omweb.tools.registry import tool_registry as web_tool_registry
 
         job_id = context.job_id
+        run_id_str = str(uuid.uuid4())
         prompt = context.prompt
         agent_id = context.agent_id
         active_llm = context.active_llm
@@ -81,6 +115,7 @@ class PeldrunEngine(ExecutionEngine):
         project_dir = context.project_dir
         chat_id = context.chat_id or f"chat_{job_id}"
         manifest = context.manifest
+        project_id = str(manifest.get("project_id") or "default_project")
 
         print(f"\n[ENGINE PELDRUN] >>> Starting Task Execution for Job: {job_id} (Chat: {chat_id}) <<<")
 
@@ -114,22 +149,30 @@ class PeldrunEngine(ExecutionEngine):
             "You are peldrun, an all-around autonomous specialist agent.",
         )
 
+        # Manifest system_prompt is authoritative. The engine only adds
+        # operational guidance common to all agents.
         system_prompt = (
             f"{base_system_prompt}\n\n"
-            f"[CRITICAL OPERATIONAL DIRECTIVE]\n"
-            f"1. Autonomous Loop Contract: You run inside an automated agent loop. If you need to ask the user questions, gather answers, or wait for input, you MUST invoke the 'ask_human' tool for each individual interaction. DO NOT print questions as plain text, as plain text without tool calls terminates execution.\n"
-            f"2. Task Scope Sovereignty: Satisfy the user's overarching objective faithfully. If the user asks for a conversation, questionnaire, or reasoning task, do NOT invent an artificial need to create workspace files or write code unless explicitly commanded.\n"
-            f"3. Strict Counting & Non-Premature Termination: When asked to perform a specific number of interactions, you must execute all of them completely and wait for each answer before concluding. Never call 'terminate' until all requested questions have been answered."
+            f"[OPERATIONAL DIRECTIVE]\n"
+            f"1. Autonomous Loop Contract: You run inside an automated agent loop. "
+            f"If you need to ask the user questions or wait for input, invoke the "
+            f"'ask_human' tool. Printing questions as plain text without a tool "
+            f"call terminates execution.\n"
+            f"2. Task Scope Sovereignty: Satisfy the user's objective faithfully. "
+            f"Do not invent a need to create files or write code unless commanded.\n"
+            f"3. Tool Selection: Use the tools best suited to each step. The list "
+            f"of available tools is defined by your manifest."
         )
 
         project_rules = (
             "1. User Directive Sovereignty: Follow USER TASK instructions strictly.\n"
-            "2. Multi-Question Counting Protocol: Execute all sequential interactions completely before concluding.\n"
-            "3. Workspace Operations: Current working directory is already workspace root. Use relative paths.\n"
-            "4. Task Conclusion: Ensure all parts of the user request are satisfied completely before calling 'terminate'."
+            "2. Workspace Operations: Current working directory is already the workspace "
+            "root. Use relative paths.\n"
+            "3. Task Conclusion: Ensure all parts of the user request are satisfied "
+            "before calling 'terminate'."
         )
 
-        # === NEW: Generative UI Directive Injection ===
+        # === Generative UI Directive Injection ===
         genui_cfg = active_llm.get("generative_ui") if active_llm else None
         if genui_cfg and genui_cfg.get("enabled"):
             genui_directive = build_generative_ui_prompt(genui_cfg)
@@ -169,32 +212,79 @@ class PeldrunEngine(ExecutionEngine):
 
         # 3. Resolve custom Web tools to adapt into Core tools
         requested_tools = list(manifest.get("tools", []))
+        # 'terminate' is a Core built-in; it must be present in AgentSpec.tools
+        # so Core exposes it to the LLM.
+        if "terminate" not in requested_tools:
+            requested_tools.append("terminate")
+
         available_web_tools = {
-            t["id"]: t for t in web_tool_registry.list_tools() if t.get("is_enabled", True)
+            t["id"]: t
+            for t in web_tool_registry.list_tools()
+            if t.get("is_enabled", True) and t.get("enabled", True) is not False
         }
 
         adapted_core_tools: List[Any] = []
+        resolved_tool_ids: List[str] = []
+
+        try:
+            resolve_sig = inspect.signature(resolve_tool_runtime)
+            resolve_params = resolve_sig.parameters
+            accepts_context_kw = (
+                "run_id" in resolve_params
+                or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in resolve_params.values())
+            )
+        except (TypeError, ValueError):
+            accepts_context_kw = False
+
         for req_tool in requested_tools:
+            # 'terminate' and 'file_saver' are Core built-ins; do not inject
+            # custom executors for them, but keep them in AgentSpec.tools.
             if req_tool in ("terminate", "file_saver"):
                 continue
-            if req_tool in available_web_tools:
-                t_meta = available_web_tools[req_tool]
-                adapter = resolve_tool_runtime(
-                    tool_id=req_tool,
-                    tool_meta=t_meta,
-                    workspace_root=ws_path,
-                    registry=web_tool_registry,
-                )
+            if req_tool not in available_web_tools:
+                continue
+            t_meta = available_web_tools[req_tool]
+            try:
+                if accepts_context_kw:
+                    adapter = resolve_tool_runtime(
+                        tool_id=req_tool,
+                        tool_meta=t_meta,
+                        workspace_root=ws_path,
+                        registry=web_tool_registry,
+                        run_id=run_id_str,
+                        job_id=job_id,
+                        session_id=chat_id,
+                        chat_id=chat_id,
+                        project_id=project_id,
+                    )
+                else:
+                    adapter = resolve_tool_runtime(
+                        tool_id=req_tool,
+                        tool_meta=t_meta,
+                        workspace_root=ws_path,
+                        registry=web_tool_registry,
+                    )
                 adapted_core_tools.append(adapter)
+                resolved_tool_ids.append(req_tool)
+            except Exception as tool_resolve_err:
+                logger.warning(
+                    "Failed to resolve tool %r for job %s: %s",
+                    req_tool,
+                    job_id,
+                    tool_resolve_err,
+                )
 
-        # 4. Build Canonical RunRequest with contextual message payload
+        specialist_tools_map = _collect_specialist_tool_allowlists(set(available_web_tools.keys()))
+
+        # 4. Build Canonical RunRequest
         workspace_ctx = WorkspaceContext(
             workspace_id=chat_id,
             root_path=ws_path_str,
             chat_id=chat_id,
-            project_id=manifest.get("project_id", "default_project"),
+            project_id=project_id,
             read_only=False,
         )
+
         agent_spec = AgentSpec(
             id=agent_id,
             name=manifest.get("name") or agent_id,
@@ -203,23 +293,29 @@ class PeldrunEngine(ExecutionEngine):
             max_steps=max_steps,
             temperature=float(active_llm.get("temperature", 0.2)),
         )
+
+        run_metadata: Dict[str, Any] = {
+            "model_name": model_name,
+            "chat_id": chat_id,
+            "provider": provider_name,
+            "session_dir": str(session_dir),
+            "project_rules": project_rules,
+            "sidecar": sidecar,
+            "context_messages": context_messages,
+            "context_usage": context_usage,
+            "authorized_tools": list(requested_tools),
+            "resolved_custom_tools": list(resolved_tool_ids),
+            "specialist_tools": specialist_tools_map,
+        }
+
         run_request = RunRequest(
-            run_id=str(uuid.uuid4()),
+            run_id=run_id_str,
             job_id=job_id,
             prompt=prompt,
             agent_spec=agent_spec,
             workspace=workspace_ctx,
             llm_config=active_llm,
-            metadata={
-                "model_name": model_name,
-                "chat_id": chat_id,
-                "provider": provider_name,
-                "session_dir": str(session_dir),
-                "project_rules": project_rules,
-                "sidecar": sidecar,
-                "context_messages": context_messages,
-                "context_usage": context_usage,
-            },
+            metadata=run_metadata,
             context_sidecar=sidecar,
             project_rules=project_rules,
             step_timeout_seconds=float(active_llm.get("timeout") or 120.0),
@@ -372,7 +468,11 @@ class PeldrunEngine(ExecutionEngine):
                     tool_call_payload["input_type"] = arguments.get("input_type", "text")
                     tool_call_payload["options"] = arguments.get("options", [])
                     req_id = arguments.get("request_id")
-                    if not req_id and hasattr(HumanInputRegistry, "_pending_requests") and HumanInputRegistry._pending_requests:
+                    if (
+                        not req_id
+                        and hasattr(HumanInputRegistry, "_pending_requests")
+                        and HumanInputRegistry._pending_requests
+                    ):
                         req_id = list(HumanInputRegistry._pending_requests.keys())[-1]
                     if req_id:
                         tool_call_payload["request_id"] = req_id
@@ -417,6 +517,9 @@ class PeldrunEngine(ExecutionEngine):
             ):
                 obs_out = event.payload.get("output", "") or event.payload.get("error", "")
                 obs_str = str(obs_out)
+                is_tool_error = bool(
+                    event.payload.get("is_error") or event.payload.get("error")
+                )
 
                 await _sync_and_dispatch_artifacts(curr_step)
 
@@ -428,6 +531,8 @@ class PeldrunEngine(ExecutionEngine):
                         data={
                             "output": obs_str,
                             "content": obs_str,
+                            "is_error": is_tool_error,
+                            "error": event.payload.get("error") if is_tool_error else None,
                             "seq": event_seq,
                             "model": model_name,
                         },
@@ -459,7 +564,10 @@ class PeldrunEngine(ExecutionEngine):
                 try:
                     await _process_single_core_event(event)
                 except Exception as ex:
-                    logger.error(f"[ENGINE PELDRUN ERROR] Consumer failed for job {job_id}: {ex}", exc_info=True)
+                    logger.error(
+                        f"[ENGINE PELDRUN ERROR] Consumer failed for job {job_id}: {ex}",
+                        exc_info=True,
+                    )
                 finally:
                     event_queue.task_done()
 

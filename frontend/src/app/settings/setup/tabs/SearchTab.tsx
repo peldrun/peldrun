@@ -6,14 +6,14 @@ import Link from "next/link";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Search, ExternalLink, Activity, Eye, EyeOff, CheckCircle2, XCircle,
-  RefreshCw, Shield, ShieldOff, Sparkles, Gauge, Network, Sliders,
-  ChevronRight, ChevronDown, Save, Loader2, AlertCircle, Lock, Info,
+  RefreshCw, Shield, ShieldOff, Gauge, Network, Sliders,
+  ChevronDown, Save, Loader2, AlertCircle, Lock, Info, Hash,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/Icon/Icon";
 
 // ---------------------------------------------------------------------------
-// Provider Registry & Field Types
+// Provider Presentation Registry (Capabilities sourced from backend API)
 // ---------------------------------------------------------------------------
 type ProviderField =
   | { key: string; label: string; type: "text"; placeholder?: string; mono?: boolean }
@@ -28,7 +28,6 @@ interface ProviderDef {
   iconName: string;
   accent: string;
   defaultCost: number;
-  maxResultsLimit: number;
   lifecycle?: "supported" | "legacy";
   lifecycleNotice?: string;
   consumesQuotaOnTest?: boolean;
@@ -37,6 +36,22 @@ interface ProviderDef {
   testLabel: string;
   docsUrl?: string;
 }
+
+export interface ProviderCapabilityMeta {
+  id: string;
+  name: string;
+  max_results_limit: number;
+  configured_max_results: number | null;
+  effective_max_results: number;
+  inherits_global_default: boolean;
+  default_max_results: number;
+  limit_type?: string;
+  notes?: string;
+  requires_api_key?: boolean;
+}
+
+const DEFAULT_GLOBAL_MAX_RESULTS = 5;
+const FALLBACK_HARD_CAP = 20;
 
 const PROVIDERS: readonly ProviderDef[] = [
   {
@@ -47,7 +62,6 @@ const PROVIDERS: readonly ProviderDef[] = [
     iconName: "duckduckgo",
     accent: "#DE5833",
     defaultCost: 0.0,
-    maxResultsLimit: 20,
     consumesQuotaOnTest: false,
     fields: [
       { key: "safesearch", label: "SafeSearch", type: "select", options: ["moderate", "on", "off"], defaultValue: "moderate" },
@@ -65,7 +79,6 @@ const PROVIDERS: readonly ProviderDef[] = [
     iconName: "searxng",
     accent: "#3050FF",
     defaultCost: 0.0,
-    maxResultsLimit: 20,
     consumesQuotaOnTest: false,
     fields: [
       { key: "base_url", label: "Instance Base URL", type: "text", placeholder: "http://localhost:8080", mono: true },
@@ -83,7 +96,6 @@ const PROVIDERS: readonly ProviderDef[] = [
     iconName: "tavily",
     accent: "#E85E32",
     defaultCost: 0.005,
-    maxResultsLimit: 20,
     consumesQuotaOnTest: true,
     fields: [
       { key: "api_key", label: "API Key (Bearer)", type: "password", placeholder: "tvly-••••••", secretKey: "tavily" },
@@ -97,11 +109,10 @@ const PROVIDERS: readonly ProviderDef[] = [
     id: "Brave",
     configKey: "brave",
     name: "Brave Search",
-    tagline: "Independent web index (max 20 results/query)",
+    tagline: "Independent web index with regional & SafeSearch controls",
     iconName: "brave",
     accent: "#FB542B",
     defaultCost: 0.005,
-    maxResultsLimit: 20,
     consumesQuotaOnTest: true,
     fields: [
       { key: "api_key", label: "Subscription Token", type: "password", placeholder: "BSA••••••", secretKey: "brave" },
@@ -114,13 +125,13 @@ const PROVIDERS: readonly ProviderDef[] = [
     id: "Google",
     configKey: "google",
     name: "Google CSE",
-    tagline: "Programmable Search Engine JSON API (max 10 results/query)",
+    tagline: "Programmable Search Engine JSON API",
     iconName: "google",
     accent: "#4285F4",
     defaultCost: 0.005,
-    maxResultsLimit: 10,
     lifecycle: "legacy",
-    lifecycleNotice: "Google Custom Search JSON API is closed to new customers and scheduled for retirement on 2027-01-01. Plan migration to Brave, Tavily, or SearXNG.",
+    lifecycleNotice:
+      "Google Custom Search JSON API is closed to new customers and scheduled for retirement on 2027-01-01. Plan migration to Brave, Tavily, or SearXNG.",
     consumesQuotaOnTest: true,
     fields: [
       { key: "api_key", label: "API Key", type: "password", placeholder: "AIza••••", secretKey: "google" },
@@ -134,11 +145,10 @@ const PROVIDERS: readonly ProviderDef[] = [
     id: "Jina",
     configKey: "jina",
     name: "Jina Search",
-    tagline: "Markdown web search endpoint via s.jina.ai (max 20 results)",
+    tagline: "Markdown web search endpoint via s.jina.ai",
     iconName: "jina-ai",
     accent: "#8B5CF6",
     defaultCost: 0.002,
-    maxResultsLimit: 20,
     consumesQuotaOnTest: true,
     fields: [
       { key: "api_key", label: "Bearer Token", type: "password", placeholder: "jina_••••", secretKey: "jina" },
@@ -155,7 +165,6 @@ const PROVIDERS: readonly ProviderDef[] = [
     iconName: "yandex",
     accent: "#FC3F1D",
     defaultCost: 0.003,
-    maxResultsLimit: 15,
     consumesQuotaOnTest: true,
     fields: [
       { key: "mode", label: "API Mode", type: "select", options: ["cloud_v2", "classic_xml"], defaultValue: "cloud_v2" },
@@ -209,7 +218,35 @@ interface DiagnosticState {
   latency_ms?: number;
   estimated_cost_usd?: number;
   cost_basis?: string;
+  requested_max_results?: number;
+  effective_max_results?: number;
+  max_results_limit?: number;
   msg?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Validation Helper
+// ---------------------------------------------------------------------------
+function validatePositiveIntInRange(
+  raw: any,
+  label: string,
+  minVal: number,
+  maxVal: number
+): string | null {
+  if (raw === undefined || raw === null || raw === "") {
+    return `${label} is required (integer between ${minVal} and ${maxVal}).`;
+  }
+  if (typeof raw === "boolean") {
+    return `${label} must be an integer between ${minVal} and ${maxVal}.`;
+  }
+  const num = typeof raw === "number" ? raw : Number(String(raw).trim());
+  if (!Number.isInteger(num)) {
+    return `${label} must be a whole integer between ${minVal} and ${maxVal}.`;
+  }
+  if (num < minVal || num > maxVal) {
+    return `${label} must be between ${minVal} and ${maxVal}.`;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -227,20 +264,25 @@ export function SearchTab({
   const [expandedProvider, setExpandedProvider] = useState<string | null>(null);
   const [pings, setPings] = useState<Record<string, DiagnosticState>>({});
   const [effectiveCosts, setEffectiveCosts] = useState<Record<string, number>>({});
+  const [providerCapabilities, setProviderCapabilities] = useState<
+    Record<string, ProviderCapabilityMeta>
+  >({});
+  const [hardCap, setHardCap] = useState<number>(FALLBACK_HARD_CAP);
+  const [capabilitiesError, setCapabilitiesError] = useState<string | null>(null);
+
   const [saveErrorMsg, setSaveErrorMsg] = useState<string | null>(null);
   const [configErrorBanner, setConfigErrorBanner] = useState<string | null>(null);
   const [primaryDropdownOpen, setPrimaryDropdownOpen] = useState(false);
   const primaryDropdownRef = useRef<HTMLDivElement>(null);
 
-  // Load authoritative config & effective pricing from backend on mount
   const [configLoaded, setConfigLoaded] = useState(false);
-
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [lastSavedAt, setLastSavedAt] = useState<Date | null>(null);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isFirstRender = useRef(true);
   const lastSnapshotRef = useRef<string>("");
 
+  // Load authoritative config, provider capabilities, and pricing from backend
   useEffect(() => {
     let cancelled = false;
 
@@ -253,10 +295,44 @@ export function SearchTab({
         const data = await res.json();
         if (cancelled) return;
 
-        const authoritative = data.search_config || {};
+        const authoritative =
+          data.search_config || data.search || data.config || {};
         if (data.effective_costs) {
           setEffectiveCosts(data.effective_costs);
         }
+        if (typeof data.max_results_hard_cap === "number") {
+          setHardCap(data.max_results_hard_cap);
+        }
+
+        let caps: Record<string, ProviderCapabilityMeta> =
+          data.provider_capabilities || {};
+
+        if (!caps || Object.keys(caps).length === 0) {
+          try {
+            const capRes = await fetch(resolveApiUrl("/api/search/providers"), {
+              cache: "no-store",
+            });
+            if (capRes.ok) {
+              const capData = await capRes.json();
+              caps = capData.provider_capabilities || {};
+              if (typeof capData.max_results_hard_cap === "number") {
+                setHardCap(capData.max_results_hard_cap);
+              }
+            }
+          } catch (capErr) {
+            console.error("Failed to load /api/search/providers:", capErr);
+          }
+        }
+
+        if (caps && Object.keys(caps).length > 0) {
+          setProviderCapabilities(caps);
+          setCapabilitiesError(null);
+        } else {
+          setCapabilitiesError(
+            "Backend provider capability metadata could not be loaded. Result-count limits shown are provisional until backend connectivity is restored."
+          );
+        }
+
         if (data.config_error) {
           setConfigErrorBanner(data.config_error);
         } else {
@@ -270,8 +346,11 @@ export function SearchTab({
 
         setConfigLoaded(true);
         lastSnapshotRef.current = JSON.stringify(authoritative);
-      } catch (err) {
+      } catch (err: any) {
         console.error("Failed to load search config:", err);
+        setCapabilitiesError(
+          `Failed to load authoritative provider capabilities from backend (${err?.message || "network error"}). Values shown are provisional.`
+        );
         setConfigLoaded(true);
       }
     })();
@@ -296,38 +375,108 @@ export function SearchTab({
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
+  // Resolve authoritative capability limit for a provider from backend metadata
+  const getProviderLimit = useCallback(
+    (cfgKey: string): number | null => {
+      const cap = providerCapabilities[cfgKey];
+      if (cap && typeof cap.max_results_limit === "number") {
+        return cap.max_results_limit;
+      }
+      return null;
+    },
+    [providerCapabilities]
+  );
+
+  // Compute inline validation errors for global and per-provider result counts
+  const validationErrors = useMemo(() => {
+    const errs: Record<string, string> = {};
+    const globalRaw =
+      searchConfig.default_max_results !== undefined
+        ? searchConfig.default_max_results
+        : DEFAULT_GLOBAL_MAX_RESULTS;
+
+    const globalErr = validatePositiveIntInRange(
+      globalRaw,
+      "Default Results per Search",
+      1,
+      hardCap
+    );
+    if (globalErr) {
+      errs.default_max_results = globalErr;
+    }
+
+    for (const p of PROVIDERS) {
+      const sub = searchConfig[p.configKey];
+      if (sub && sub.max_results !== undefined && sub.max_results !== null) {
+        const capLimit = getProviderLimit(p.configKey) ?? hardCap;
+        const provErr = validatePositiveIntInRange(
+          sub.max_results,
+          `${p.name} Max Results per Query`,
+          1,
+          capLimit
+        );
+        if (provErr) {
+          errs[p.configKey] = provErr;
+        }
+      }
+    }
+    return errs;
+  }, [searchConfig, hardCap, getProviderLimit]);
+
+  const hasValidationErrors = Object.keys(validationErrors).length > 0;
+
   // ----------------------------------------------------------
   // Persist to backend (only marks saved after backend confirms)
   // ----------------------------------------------------------
-  const persistSearchConfig = useCallback(async (nextSearchConfig: any) => {
-    setSaveState("saving");
-    setSaveErrorMsg(null);
-    try {
-      const res = await fetch(resolveApiUrl("/api/search/config"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ search_config: nextSearchConfig }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || data.ok === false) {
-        throw new Error(data.detail || data.message || `HTTP ${res.status}`);
+  const persistSearchConfig = useCallback(
+    async (nextSearchConfig: any) => {
+      if (hasValidationErrors) {
+        const firstErr = Object.values(validationErrors)[0];
+        setSaveErrorMsg(firstErr);
+        setSaveState("error");
+        return;
       }
-      if (data.effective_costs) {
-        setEffectiveCosts(data.effective_costs);
+
+      setSaveState("saving");
+      setSaveErrorMsg(null);
+      try {
+        const res = await fetch(resolveApiUrl("/api/search/config"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            search_config: nextSearchConfig,
+            search: nextSearchConfig,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.ok === false || data.status === "error") {
+          throw new Error(data.detail || data.message || `HTTP ${res.status}`);
+        }
+        if (data.effective_costs) {
+          setEffectiveCosts(data.effective_costs);
+        }
+        if (data.provider_capabilities) {
+          setProviderCapabilities(data.provider_capabilities);
+          setCapabilitiesError(null);
+        }
+        if (typeof data.max_results_hard_cap === "number") {
+          setHardCap(data.max_results_hard_cap);
+        }
+        setConfigErrorBanner(null);
+        setSaveState("saved");
+        setLastSavedAt(new Date());
+        setTimeout(() => setSaveState((s) => (s === "saved" ? "idle" : s)), 2500);
+      } catch (err: any) {
+        console.error("Failed to save search config:", err);
+        setSaveErrorMsg(err?.message || "Failed to save configuration.");
+        setSaveState("error");
       }
-      setConfigErrorBanner(null);
-      setSaveState("saved");
-      setLastSavedAt(new Date());
-      setTimeout(() => setSaveState((s) => (s === "saved" ? "idle" : s)), 2500);
-    } catch (err: any) {
-      console.error("Failed to save search config:", err);
-      setSaveErrorMsg(err?.message || "Failed to save configuration.");
-      setSaveState("error");
-    }
-  }, []);
+    },
+    [hasValidationErrors, validationErrors]
+  );
 
   // ----------------------------------------------------------
-  // Debounced auto-save on any search config change
+  // Debounced auto-save on any valid search config change
   // ----------------------------------------------------------
   useEffect(() => {
     if (!configLoaded) return;
@@ -342,6 +491,14 @@ export function SearchTab({
     if (snapshot === lastSnapshotRef.current) return;
 
     lastSnapshotRef.current = snapshot;
+
+    if (hasValidationErrors) {
+      setSaveErrorMsg(Object.values(validationErrors)[0]);
+      setSaveState("error");
+      return;
+    }
+
+    setSaveErrorMsg(null);
     setSaveState("dirty");
 
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
@@ -352,7 +509,7 @@ export function SearchTab({
     return () => {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     };
-  }, [searchConfig, configLoaded, persistSearchConfig]);
+  }, [searchConfig, configLoaded, hasValidationErrors, validationErrors, persistSearchConfig]);
 
   const handleManualSave = async () => {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
@@ -370,8 +527,15 @@ export function SearchTab({
   };
 
   const updateEngineSubConfig = (engineKey: string, field: string, value: any) => {
-    const currentSub = searchConfig[engineKey] || {};
-    updateSearch({ [engineKey]: { ...currentSub, [field]: value } });
+    const currentSub = { ...(searchConfig[engineKey] || {}) };
+    currentSub[field] = value;
+    updateSearch({ [engineKey]: currentSub });
+  };
+
+  const removeEngineSubConfigKey = (engineKey: string, field: string) => {
+    const currentSub = { ...(searchConfig[engineKey] || {}) };
+    delete currentSub[field];
+    updateSearch({ [engineKey]: currentSub });
   };
 
   const toggleShowKey = (id: string) => {
@@ -394,34 +558,59 @@ export function SearchTab({
     return sub.enabled !== false;
   };
 
+  const globalDefaultMaxResults: number = useMemo(() => {
+    const raw = searchConfig.default_max_results;
+    if (typeof raw === "number" && Number.isInteger(raw) && raw >= 1 && raw <= hardCap) {
+      return raw;
+    }
+    return DEFAULT_GLOBAL_MAX_RESULTS;
+  }, [searchConfig.default_max_results, hardCap]);
+
   const handleTestConnection = async (engineId: string) => {
     if (pings[engineId]?.testing) return;
     setPings((prev) => ({ ...prev, [engineId]: { testing: true } }));
     try {
-      const res = await fetch(resolveApiUrl("/api/search/test-connection"), {
+      let res = await fetch(resolveApiUrl("/api/search/test-connection"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           provider: engineId,
           config: searchConfig,
+          search_config: searchConfig,
           check_type: "credentials",
         }),
       });
+
+      if (res.status === 404) {
+        res = await fetch(resolveApiUrl("/api/search/test"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            provider: engineId,
+            config: searchConfig,
+            search_config: searchConfig,
+          }),
+        });
+      }
+
       const data = await res.json();
       setPings((prev) => ({
         ...prev,
         [engineId]: {
           testing: false,
-          ok: data.ok,
+          ok: Boolean(data.ok ?? data.status === "ok"),
           status: data.status,
           reachable: data.reachable,
           authenticated: data.authenticated,
           quota_available: data.quota_available,
           consumes_quota: data.consumes_quota,
           latency_ms: data.latency_ms,
-          estimated_cost_usd: data.estimated_cost_usd,
+          estimated_cost_usd: data.estimated_cost_usd ?? data.cost_usd,
           cost_basis: data.cost_basis,
-          msg: data.message,
+          requested_max_results: data.requested_max_results,
+          effective_max_results: data.effective_max_results,
+          max_results_limit: data.max_results_limit,
+          msg: data.message || data.error,
         },
       }));
     } catch (err: any) {
@@ -474,18 +663,22 @@ export function SearchTab({
                 Search Engine Orchestration
               </h1>
               <p className="text-[10px] text-muted-foreground">
-                First-success failover · contract diagnostics · estimated cost basis
+                First-success failover · per-provider result ceilings · contract diagnostics
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-2 flex-wrap">
-            <SaveIndicator state={saveState} lastSavedAt={lastSavedAt} errorMsg={saveErrorMsg} />
+            <SaveIndicator
+              state={saveState}
+              lastSavedAt={lastSavedAt}
+              errorMsg={saveErrorMsg}
+            />
             <Button
               variant="save"
               onClick={handleManualSave}
-              disabled={saveState === "saving"}
-              className="save h-8 text-xs gap-1.5 cursor-pointer hover:scale-105 transition-transform"
+              disabled={saveState === "saving" || hasValidationErrors}
+              className="save h-8 text-xs gap-1.5 cursor-pointer hover:scale-105 transition-transform disabled:opacity-50"
             >
               {saveState === "saving" ? (
                 <Loader2 size={12} className="animate-spin" />
@@ -515,15 +708,33 @@ export function SearchTab({
           <div className="flex items-start gap-3 p-4 rounded-md border border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-400 text-xs">
             <XCircle size={16} className="shrink-0 mt-0.5" />
             <div className="space-y-1">
-              <div className="font-semibold">Configuration Syntax Error in config.toml</div>
-              <div className="font-mono text-[11px] opacity-90">{configErrorBanner}</div>
+              <div className="font-semibold">
+                Configuration Syntax Error in config.toml
+              </div>
+              <div className="font-mono text-[11px] opacity-90">
+                {configErrorBanner}
+              </div>
             </div>
+          </div>
+        )}
+
+        {/* Capability loading failure notice (SR-504 / Section 6.6) */}
+        {capabilitiesError && (
+          <div
+            role="alert"
+            className="flex items-start gap-3 p-3.5 rounded-md border border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs"
+          >
+            <AlertCircle size={15} className="shrink-0 mt-0.5" />
+            <div>{capabilitiesError}</div>
           </div>
         )}
 
         {/* Validation error banner on save */}
         {saveErrorMsg && (
-          <div className="flex items-start gap-3 p-3.5 rounded-md border border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-400 text-xs">
+          <div
+            role="alert"
+            className="flex items-start gap-3 p-3.5 rounded-md border border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-400 text-xs"
+          >
             <AlertCircle size={15} className="shrink-0 mt-0.5" />
             <div>{saveErrorMsg}</div>
           </div>
@@ -543,16 +754,18 @@ export function SearchTab({
             }
             accent={isWebEgressEnabled ? "#10b981" : "#f43f5e"}
             subtitle={
-              isWebEgressEnabled ? "Outbound requests permitted" : "All network calls blocked"
+              isWebEgressEnabled
+                ? "Outbound requests permitted"
+                : "All network calls blocked"
             }
             delay={0}
           />
           <SummaryCard
-            label="Active Providers"
-            value={`${enabledCount} / ${PROVIDERS.length}`}
-            icon={<Network size={18} className="text-primary" />}
+            label="Default Results / Search"
+            value={`${globalDefaultMaxResults} / query`}
+            icon={<Hash size={18} className="text-primary" />}
             accent="#3b82f6"
-            subtitle={`${PROVIDERS.length - enabledCount} disabled`}
+            subtitle={`Global default & ceiling (range 1..${hardCap})`}
             delay={0.05}
           />
           <SummaryCard
@@ -566,12 +779,16 @@ export function SearchTab({
               />
             }
             accent={providerAccent(primaryEngine)}
-            subtitle="First engine queried"
+            subtitle={`${enabledCount} of ${PROVIDERS.length} providers active`}
             delay={0.1}
           />
           <SummaryCard
             label="Failover Chain"
-            value={fallbackList.length === 0 ? "Single-Engine" : `${fallbackList.length} Fallback(s)`}
+            value={
+              fallbackList.length === 0
+                ? "Single-Engine"
+                : `${fallbackList.length} Fallback(s)`
+            }
             icon={<Gauge size={18} className="text-cyan-500" />}
             accent="#06b6d4"
             subtitle={
@@ -597,9 +814,9 @@ export function SearchTab({
                   Single-Provider Isolation Mode Active (fallback_engines = [])
                 </div>
                 <div className="opacity-90 text-[11px]">
-                  Only <strong>{primaryEngine}</strong> will be called. No secondary provider will
-                  be tried automatically on failure, ensuring deterministic single-provider testing
-                  and predictable cost.
+                  Only <strong>{primaryEngine}</strong> will be called. No secondary
+                  provider will be tried automatically on failure, ensuring
+                  deterministic single-provider testing and predictable cost.
                 </div>
               </div>
             </div>
@@ -624,7 +841,8 @@ export function SearchTab({
                   Global Orchestration
                 </h3>
                 <p className="text-[11px] text-muted-foreground">
-                  Primary engine, first-success failover sequence, deadline budget, and privacy
+                  Primary engine, failover sequence, default result count, deadline
+                  budget, and privacy
                 </p>
               </div>
             </div>
@@ -642,14 +860,18 @@ export function SearchTab({
               >
                 <Lock size={12} />
                 <span>
-                  {isPrivacyMode ? "Ledger Privacy: Hash-Only" : "Ledger Privacy: Standard"}
+                  {isPrivacyMode
+                    ? "Ledger Privacy: Hash-Only"
+                    : "Ledger Privacy: Standard"}
                 </span>
               </button>
 
               <button
                 type="button"
                 onClick={() =>
-                  updateSearch({ enabled: searchConfig.enabled === false ? true : false })
+                  updateSearch({
+                    enabled: searchConfig.enabled === false ? true : false,
+                  })
                 }
                 className={`flex items-center gap-2 px-3 py-1.5 rounded-sm text-[11px] font-semibold transition-all cursor-pointer border ${
                   isWebEgressEnabled
@@ -713,6 +935,7 @@ export function SearchTab({
                     >
                       {PROVIDERS.map((p) => {
                         const selected = primaryEngine === p.id;
+                        const capLim = getProviderLimit(p.configKey);
                         return (
                           <li key={p.id}>
                             <button
@@ -734,14 +957,24 @@ export function SearchTab({
                                 size={16}
                                 title={`${p.name} logo`}
                               />
-                              <span className="flex-1 truncate font-medium">{p.name}</span>
+                              <span className="flex-1 truncate font-medium">
+                                {p.name}
+                              </span>
+                              {capLim !== null && (
+                                <span className="text-[9px] font-mono text-muted-foreground">
+                                  cap {capLim}
+                                </span>
+                              )}
                               {p.lifecycle === "legacy" && (
                                 <span className="text-[9px] font-mono px-1 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400">
                                   legacy
                                 </span>
                               )}
                               {selected && (
-                                <CheckCircle2 size={12} className="text-primary shrink-0" />
+                                <CheckCircle2
+                                  size={12}
+                                  className="text-primary shrink-0"
+                                />
                               )}
                             </button>
                           </li>
@@ -755,7 +988,8 @@ export function SearchTab({
 
             <div>
               <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-2">
-                Failover Chain (First-Success · Leave unselected for Single-Engine Mode)
+                Failover Chain (First-Success · Leave unselected for Single-Engine
+                Mode)
               </label>
               <div className="flex flex-wrap gap-1.5">
                 {ENGINE_OPTIONS.map((eng) => {
@@ -785,12 +1019,54 @@ export function SearchTab({
             </div>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 pt-4 border-t border-border/60">
+          {/* Global Numeric & ISO Controls including Default Results per Search (SR-501) */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3 pt-4 border-t border-border/60">
+            <div
+              className={`p-3 rounded-sm border transition-colors ${
+                validationErrors.default_max_results
+                  ? "border-rose-500/60 bg-rose-500/5"
+                  : "border-border/60 bg-background/60 hover:border-primary/30"
+              }`}
+            >
+              <label
+                htmlFor="global-default-max-results"
+                className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-1.5"
+              >
+                Default Results per Search (1-{hardCap})
+              </label>
+              <input
+                id="global-default-max-results"
+                type="number"
+                min={1}
+                max={hardCap}
+                step={1}
+                value={
+                  searchConfig.default_max_results !== undefined
+                    ? searchConfig.default_max_results
+                    : DEFAULT_GLOBAL_MAX_RESULTS
+                }
+                onChange={(e) => {
+                  const rawVal = e.target.value;
+                  if (rawVal === "") {
+                    updateSearch({ default_max_results: "" });
+                    return;
+                  }
+                  const parsed = Number(rawVal);
+                  updateSearch({
+                    default_max_results: Number.isNaN(parsed) ? rawVal : parsed,
+                  });
+                }}
+                aria-invalid={Boolean(validationErrors.default_max_results)}
+                aria-describedby="global-default-max-results-help"
+                className="w-full bg-transparent border-0 outline-none text-xs text-foreground font-mono focus:ring-0"
+              />
+            </div>
+
             <CompactField
               label="Total Budget (s)"
               value={searchConfig.total_budget_seconds ?? 22}
               min={2}
-              max={23}
+              max={120}
               onChange={(v) => updateSearch({ total_budget_seconds: v })}
             />
             <CompactField
@@ -820,6 +1096,28 @@ export function SearchTab({
               placeholder="us / eg / ru"
             />
           </div>
+
+          {/* Helper text and inline validation for Default Results per Search (Section 4.3 / SR-508) */}
+          <div className="space-y-1">
+            <p
+              id="global-default-max-results-help"
+              className="text-[11px] text-muted-foreground"
+            >
+              <strong>Default Results per Search:</strong> Used as the default and
+              maximum whenever no provider override is saved. Explicit tool calls may
+              request fewer results, never more. The provider-supported limit still
+              applies, and actual results returned by an upstream index can be fewer.
+            </p>
+            {validationErrors.default_max_results && (
+              <p
+                role="alert"
+                className="text-[11px] font-medium text-rose-600 dark:text-rose-400 flex items-center gap-1.5"
+              >
+                <AlertCircle size={12} />
+                <span>{validationErrors.default_max_results}</span>
+              </p>
+            )}
+          </div>
         </motion.div>
 
         {/* Provider section header */}
@@ -834,11 +1132,11 @@ export function SearchTab({
             </div>
             <div>
               <h3 className="text-xs font-semibold font-heading uppercase tracking-wider">
-                Provider Configuration & Contracts
+                Provider Configuration & Result Limits
               </h3>
               <p className="text-[11px] text-muted-foreground">
-                {enabledCount} of {PROVIDERS.length} enabled · prices shown are local estimates
-                unless reported by the API
+                {enabledCount} of {PROVIDERS.length} enabled · provider-supported
+                maximums are supplied by the backend capability registry
               </p>
             </div>
           </div>
@@ -853,14 +1151,24 @@ export function SearchTab({
                 ? sub.cost_per_query
                 : effectiveCosts[provider.id] ?? provider.defaultCost;
 
+            const capMeta = providerCapabilities[provider.configKey];
+            const providerLimit = getProviderLimit(provider.configKey);
+
             return (
               <ProviderListRow
                 key={provider.id}
                 provider={provider}
+                capability={capMeta}
+                providerLimit={providerLimit}
+                hardCap={hardCap}
+                globalDefaultMaxResults={globalDefaultMaxResults}
+                validationError={validationErrors[provider.configKey] || null}
                 enabled={isEngineEnabled(provider.configKey)}
                 expanded={expandedProvider === provider.id}
                 onToggleExpand={() =>
-                  setExpandedProvider(expandedProvider === provider.id ? null : provider.id)
+                  setExpandedProvider(
+                    expandedProvider === provider.id ? null : provider.id
+                  )
                 }
                 config={searchConfig}
                 effectiveCost={effectiveCost}
@@ -875,6 +1183,9 @@ export function SearchTab({
                 }
                 onUpdateField={(field, value) =>
                   updateEngineSubConfig(provider.configKey, field, value)
+                }
+                onRemoveField={(field) =>
+                  removeEngineSubConfigKey(provider.configKey, field)
                 }
                 onToggleShowKey={toggleShowKey}
                 onTest={() => handleTestConnection(provider.id)}
@@ -900,9 +1211,14 @@ function SaveIndicator({
   lastSavedAt: Date | null;
   errorMsg?: string | null;
 }) {
-  const map: Record<SaveState, { label: string; cls: string; icon: React.ReactNode }> = {
+  const map: Record<
+    SaveState,
+    { label: string; cls: string; icon: React.ReactNode }
+  > = {
     idle: {
-      label: lastSavedAt ? `Saved ${lastSavedAt.toLocaleTimeString()}` : "Auto-save on",
+      label: lastSavedAt
+        ? `Saved ${lastSavedAt.toLocaleTimeString()}`
+        : "Auto-save on",
       cls: "text-muted-foreground bg-custom",
       icon: <CheckCircle2 size={11} />,
     },
@@ -973,7 +1289,10 @@ function SummaryCard({ label, value, icon, accent, subtitle, delay = 0 }: any) {
           >
             {value}
           </div>
-          <div className="text-[11px] text-muted-foreground truncate" title={subtitle}>
+          <div
+            className="text-[11px] text-muted-foreground truncate"
+            title={subtitle}
+          >
             {subtitle}
           </div>
         </div>
@@ -1010,7 +1329,9 @@ function CompactField({
         value={value}
         onChange={(e) => {
           const parsed = parseFloat(e.target.value);
-          onChange(Number.isNaN(parsed) ? min : Math.max(min, Math.min(max, parsed)));
+          onChange(
+            Number.isNaN(parsed) ? min : Math.max(min, Math.min(max, parsed))
+          );
         }}
         className="w-full bg-transparent border-0 outline-none text-xs text-foreground font-mono focus:ring-0"
       />
@@ -1047,6 +1368,11 @@ function CompactTextField({
 
 interface ProviderListRowProps {
   provider: ProviderDef;
+  capability?: ProviderCapabilityMeta;
+  providerLimit: number | null;
+  hardCap: number;
+  globalDefaultMaxResults: number;
+  validationError: string | null;
   enabled: boolean;
   expanded: boolean;
   onToggleExpand: () => void;
@@ -1056,6 +1382,7 @@ interface ProviderListRowProps {
   showKeys: Record<string, boolean>;
   onToggleEnabled: () => void;
   onUpdateField: (field: string, value: any) => void;
+  onRemoveField: (field: string) => void;
   onToggleShowKey: (id: string) => void;
   onTest: () => void;
   delay: number;
@@ -1063,6 +1390,11 @@ interface ProviderListRowProps {
 
 function ProviderListRow({
   provider,
+  capability,
+  providerLimit,
+  hardCap,
+  globalDefaultMaxResults,
+  validationError,
   enabled,
   expanded,
   onToggleExpand,
@@ -1072,11 +1404,41 @@ function ProviderListRow({
   showKeys,
   onToggleEnabled,
   onUpdateField,
+  onRemoveField,
   onToggleShowKey,
   onTest,
   delay,
 }: ProviderListRowProps) {
   const subConfig = config[provider.configKey] || {};
+  const effectiveCapLimit = providerLimit ?? hardCap;
+
+  const hasExplicitOverride =
+    subConfig.max_results !== undefined && subConfig.max_results !== null;
+
+  const configuredCount = hasExplicitOverride
+    ? Number(subConfig.max_results)
+    : null;
+
+  const effectiveResultCount = useMemo(() => {
+    const baseCount =
+      configuredCount !== null && !Number.isNaN(configuredCount)
+        ? configuredCount
+        : globalDefaultMaxResults;
+    return Math.max(1, Math.min(baseCount, effectiveCapLimit, hardCap));
+  }, [configuredCount, globalDefaultMaxResults, effectiveCapLimit, hardCap]);
+
+  const handleToggleInheritGlobal = (useGlobal: boolean) => {
+    if (useGlobal) {
+      // SR-506: Remove max_results key from provider settings to preserve inheritance
+      onRemoveField("max_results");
+    } else {
+      const initialOverride = Math.max(
+        1,
+        Math.min(globalDefaultMaxResults, effectiveCapLimit)
+      );
+      onUpdateField("max_results", initialOverride);
+    }
+  };
 
   return (
     <motion.div
@@ -1114,14 +1476,37 @@ function ProviderListRow({
 
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
-            <span className="text-sm font-semibold text-foreground">{provider.name}</span>
+            <span className="text-sm font-semibold text-foreground">
+              {provider.name}
+            </span>
             {provider.lifecycle === "legacy" && (
               <span className="text-[9px] font-mono font-semibold px-1.5 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400">
                 Legacy · Retires 2027-01-01
               </span>
             )}
-            <span className="text-[9px] font-mono text-muted-foreground px-1.5 py-0.5 rounded bg-muted/60">
-              max {provider.maxResultsLimit}/q
+            <span
+              className={`text-[9px] font-mono px-1.5 py-0.5 rounded border ${
+                hasExplicitOverride
+                  ? "border-primary/40 bg-primary/10 text-primary"
+                  : "border-border bg-muted/60 text-muted-foreground"
+              }`}
+              title={
+                hasExplicitOverride
+                  ? `Explicit provider ceiling: ${effectiveResultCount} results/query`
+                  : `Inherits global default (${globalDefaultMaxResults}), clamped to provider limit`
+              }
+            >
+              {hasExplicitOverride
+                ? `override ${effectiveResultCount}/q`
+                : `effective ${effectiveResultCount}/q (global)`}
+            </span>
+            <span
+              className="text-[9px] font-mono text-muted-foreground px-1.5 py-0.5 rounded bg-muted/60"
+              title="Read-only technical limit from backend provider capability registry"
+            >
+              {providerLimit !== null
+                ? `supported max ${providerLimit}/q`
+                : `provisional max ${effectiveCapLimit}/q`}
             </span>
             {provider.docsUrl && (
               <a
@@ -1169,7 +1554,10 @@ function ProviderListRow({
                 : ping.status || "Failed"}
             </span>
           )}
-          <motion.div animate={{ rotate: expanded ? 180 : 0 }} transition={{ duration: 0.2 }}>
+          <motion.div
+            animate={{ rotate: expanded ? 180 : 0 }}
+            transition={{ duration: 0.2 }}
+          >
             <ChevronDown size={16} className="text-muted-foreground" />
           </motion.div>
         </div>
@@ -1185,7 +1573,7 @@ function ProviderListRow({
             transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
             className="overflow-hidden"
           >
-            <div className="px-4 pt-4 pb-4 pl-[68px] space-y-3 bg-gigbg">
+            <div className="px-4 pt-4 pb-4 pl-[68px] space-y-4 bg-gigbg">
               {provider.lifecycleNotice && (
                 <div className="flex items-start gap-2 p-2.5 rounded-sm border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-[11px]">
                   <AlertCircle size={14} className="shrink-0 mt-0.5" />
@@ -1193,6 +1581,113 @@ function ProviderListRow({
                 </div>
               )}
 
+              {/* Per-Provider Max Results per Query & Inheritance Control (SR-502, SR-503, SR-505, SR-506, SR-508) */}
+              <div
+                className={`p-3 rounded-sm border space-y-2.5 ${
+                  validationError
+                    ? "border-rose-500/50 bg-rose-500/5"
+                    : "border-border/60 bg-background/50"
+                }`}
+              >
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <div>
+                    <label
+                      htmlFor={`max-results-${provider.configKey}`}
+                      className="text-[10px] font-semibold uppercase tracking-wider text-foreground block"
+                    >
+                      Max Results per Query
+                    </label>
+                    <p className="text-[10px] text-muted-foreground">
+                      Provider-supported maximum:{" "}
+                      <strong className="font-mono text-foreground">
+                        {effectiveCapLimit}
+                      </strong>{" "}
+                      · Effective ceiling:{" "}
+                      <strong className="font-mono text-primary">
+                        {effectiveResultCount}
+                      </strong>{" "}
+                      · Actual results can be fewer.
+                    </p>
+                  </div>
+
+                  <label className="flex items-center gap-2 text-[11px] font-medium cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={!hasExplicitOverride}
+                      onChange={(e) => handleToggleInheritGlobal(e.target.checked)}
+                      className="rounded border-border text-primary focus:ring-primary/40 cursor-pointer"
+                    />
+                    <span>
+                      Use global default ({globalDefaultMaxResults})
+                    </span>
+                  </label>
+                </div>
+
+                {!hasExplicitOverride ? (
+                  <div className="text-[11px] font-mono text-muted-foreground bg-muted/40 px-2.5 py-1.5 rounded-sm border border-border/40 flex items-center justify-between flex-wrap gap-2">
+                    <span>
+                      Inheriting global default ({globalDefaultMaxResults} results/query)
+                    </span>
+                    {globalDefaultMaxResults > effectiveCapLimit && (
+                      <span className="text-amber-600 dark:text-amber-400">
+                        Clamped to provider-supported maximum ({effectiveCapLimit})
+                      </span>
+                    )}
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-center">
+                    <div className="space-y-1">
+                      <span className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground block">
+                        Provider Override Ceiling (1..{effectiveCapLimit})
+                      </span>
+                      <input
+                        id={`max-results-${provider.configKey}`}
+                        type="number"
+                        min={1}
+                        max={effectiveCapLimit}
+                        step={1}
+                        value={subConfig.max_results ?? ""}
+                        onChange={(e) => {
+                          const rawVal = e.target.value;
+                          if (rawVal === "") {
+                            onUpdateField("max_results", "");
+                            return;
+                          }
+                          const parsed = Number(rawVal);
+                          onUpdateField(
+                            "max_results",
+                            Number.isNaN(parsed) ? rawVal : parsed
+                          );
+                        }}
+                        aria-invalid={Boolean(validationError)}
+                        className="w-full bg-background border border-border rounded-sm px-2.5 py-1.5 text-[11px] text-foreground font-mono focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow"
+                      />
+                    </div>
+                    <div className="text-[10px] text-muted-foreground space-y-0.5">
+                      <div>
+                        Tool calls can request fewer than{" "}
+                        <strong className="font-mono">{effectiveResultCount}</strong>{" "}
+                        results, never more.
+                      </div>
+                      {capability?.notes && (
+                        <div className="opacity-85">{capability.notes}</div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {validationError && (
+                  <div
+                    role="alert"
+                    className="text-[11px] font-medium text-rose-600 dark:text-rose-400 flex items-center gap-1.5 pt-1"
+                  >
+                    <AlertCircle size={12} />
+                    <span>{validationError}</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Provider-specific fields & credentials */}
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 pt-1">
                 {provider.fields.map((field) => {
                   if (field.type === "password") {
@@ -1206,13 +1701,17 @@ function ProviderListRow({
                           <input
                             type={isVisible ? "text" : "password"}
                             value={subConfig[field.key] || ""}
-                            onChange={(e) => onUpdateField(field.key, e.target.value)}
+                            onChange={(e) =>
+                              onUpdateField(field.key, e.target.value)
+                            }
                             placeholder={field.placeholder}
                             className="w-full bg-background border border-border rounded-sm px-2.5 py-1.5 text-[11px] text-foreground font-mono pr-7 focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow"
                           />
                           <button
                             type="button"
-                            onClick={() => onToggleShowKey(field.secretKey || provider.id)}
+                            onClick={() =>
+                              onToggleShowKey(field.secretKey || provider.id)
+                            }
                             className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground cursor-pointer"
                           >
                             {isVisible ? <EyeOff size={11} /> : <Eye size={11} />}
@@ -1223,7 +1722,10 @@ function ProviderListRow({
                   }
 
                   if (field.type === "select") {
-                    const val = subConfig[field.key] || field.defaultValue || field.options[0];
+                    const val =
+                      subConfig[field.key] ||
+                      field.defaultValue ||
+                      field.options[0];
                     return (
                       <div key={field.key} className="space-y-1">
                         <label className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">
@@ -1231,7 +1733,9 @@ function ProviderListRow({
                         </label>
                         <select
                           value={val}
-                          onChange={(e) => onUpdateField(field.key, e.target.value)}
+                          onChange={(e) =>
+                            onUpdateField(field.key, e.target.value)
+                          }
                           className="w-full bg-background border border-border rounded-sm px-2.5 py-1.5 text-[11px] text-foreground font-mono focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow"
                         >
                           {field.options.map((opt) => (
@@ -1252,7 +1756,9 @@ function ProviderListRow({
                       <input
                         type="text"
                         value={subConfig[field.key] || ""}
-                        onChange={(e) => onUpdateField(field.key, e.target.value)}
+                        onChange={(e) =>
+                          onUpdateField(field.key, e.target.value)
+                        }
                         placeholder={field.placeholder}
                         className={`w-full bg-background border border-border rounded-sm px-2.5 py-1.5 text-[11px] text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow ${
                           field.mono ? "font-mono" : ""
@@ -1294,7 +1800,7 @@ function ProviderListRow({
                       e.stopPropagation();
                       onTest();
                     }}
-                    disabled={ping?.testing}
+                    disabled={ping?.testing || Boolean(validationError)}
                     className="h-7 text-[11px] px-2.5 gap-1.5 cursor-pointer hover:scale-105 transition-transform disabled:hover:scale-100"
                   >
                     {ping?.testing ? (
@@ -1302,7 +1808,9 @@ function ProviderListRow({
                     ) : (
                       <Activity size={11} />
                     )}
-                    <span>{ping?.testing ? "Testing..." : provider.testLabel}</span>
+                    <span>
+                      {ping?.testing ? "Testing..." : provider.testLabel}
+                    </span>
                   </Button>
 
                   {provider.consumesQuotaOnTest && (
@@ -1335,8 +1843,18 @@ function ProviderListRow({
                           {ping.authenticated ? "Auth OK" : "Auth Rejected"}
                         </span>
                       )}
+                      {typeof ping.effective_max_results === "number" && (
+                        <span className="font-mono px-1.5 py-0.5 rounded border border-primary/30 bg-primary/10 text-primary">
+                          eff {ping.effective_max_results}/
+                          {ping.max_results_limit ?? effectiveCapLimit}
+                        </span>
+                      )}
                       {ping.msg && (
-                        <span className={ping.ok ? "text-muted-foreground" : "text-rose-500"}>
+                        <span
+                          className={
+                            ping.ok ? "text-muted-foreground" : "text-rose-500"
+                          }
+                        >
                           {ping.msg}
                         </span>
                       )}

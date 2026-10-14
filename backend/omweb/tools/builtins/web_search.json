@@ -1,26 +1,28 @@
 {
   "id": "web_search",
-  "name": "Web Search",
-  "category": "network",
-  "description": "Searches online knowledge databases for real-time news, documentation, and web content. Returns titles, direct URLs, and concise snippets. Always cite sources and include target URLs in your response.",
-  "safety_level": "read_only",
+  "name": "web_search",
+  "display_name": "Web Search",
+  "description": "Search the web for up-to-date information, documentation, news, and factual verification. Omit max_results to use PELDRUN Search Settings.",
+  "category": "search",
+  "builtin": true,
+  "enabled": true,
   "parameters": {
     "type": "object",
     "properties": {
       "query": {
         "type": "string",
-        "description": "The search query terms to look up on the live web."
+        "minLength": 1,
+        "description": "Search query string to look up on the web."
       },
       "max_results": {
         "type": "integer",
-        "default": 5,
-        "description": "Maximum number of search results to retrieve (default: 5, min: 1, max: 15)."
+        "minimum": 1,
+        "maximum": 20,
+        "description": "Optional desired maximum number of results. Omit this argument to use PELDRUN Search Settings. The configured provider ceiling and provider capability maximum are always enforced."
       }
     },
     "required": [
       "query"
     ]
-  },
-  "is_builtin": true,
-  "read_only": true
+  }
 }

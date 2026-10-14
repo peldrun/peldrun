@@ -37,6 +37,7 @@ MAX_TITLE_CHARS: int = 300
 MAX_SNIPPET_CHARS: int = 1200
 MAX_RAW_CONTENT_CHARS: int = 4000
 MIN_RAW_CONTENT_CHARS: int = 100
+DEFAULT_MAX_RESULTS: int = 5
 MAX_RESULTS_HARD_CAP: int = 20
 MAX_ERROR_MESSAGE_CHARS: int = 500
 
@@ -379,7 +380,7 @@ class SearchResponse(BaseModel):
     provider: str = Field(..., description="Provider identifier.")
     results: List[SearchResult] = Field(
         default_factory=list,
-        description="Parsed search results (bounded to MAX_RESULTS_HARD_CAP).",
+        description="Parsed search results (bounded to effective_max_results and MAX_RESULTS_HARD_CAP).",
     )
     status: ProviderStatus = Field(
         default=ProviderStatus.SUCCESS,
@@ -420,11 +421,28 @@ class SearchResponse(BaseModel):
         default=None,
         description="Sanitized diagnostic message when results are empty or an error occurred.",
     )
+    requested_max_results: Optional[int] = Field(
+        default=None,
+        description="Explicit caller-requested result count when supplied.",
+    )
+    effective_max_results: Optional[int] = Field(
+        default=None,
+        description="Effective result count ceiling enforced for the executed provider.",
+    )
+    max_results_limit: Optional[int] = Field(
+        default=None,
+        description="Authoritative technical result limit for the executed provider.",
+    )
 
     @model_validator(mode="after")
     def _normalize_contract_fields(self) -> "SearchResponse":
-        if len(self.results) > MAX_RESULTS_HARD_CAP:
-            self.results = self.results[:MAX_RESULTS_HARD_CAP]
+        cap = MAX_RESULTS_HARD_CAP
+        if self.effective_max_results is not None and self.effective_max_results >= 1:
+            cap = min(cap, int(self.effective_max_results))
+        if self.max_results_limit is not None and self.max_results_limit >= 1:
+            cap = min(cap, int(self.max_results_limit))
+        if len(self.results) > cap:
+            self.results = self.results[:cap]
 
         for item in self.results:
             if not item.provider:
@@ -526,6 +544,9 @@ class ProviderCapability(BaseModel):
     supports_safesearch: bool = False
     supports_raw_content: bool = False
     max_results_limit: int = 10
+    default_max_results: int = DEFAULT_MAX_RESULTS
+    configured_max_results: Optional[int] = None
+    effective_max_results: int = DEFAULT_MAX_RESULTS
     pricing_mode: PricingMode = PricingMode.PER_REQUEST
     default_cost_per_query: float = 0.0
     effective_cost_per_query: float = 0.0
@@ -582,7 +603,7 @@ class BaseSearchProvider(ABC):
     async def search(
         self,
         query: str,
-        max_results: int = 5,
+        max_results: int = DEFAULT_MAX_RESULTS,
         lang: str = "en",
         country: str = "us",
         **kwargs: Any,
@@ -677,7 +698,7 @@ class BaseSearchProvider(ABC):
         try:
             req = int(requested)
         except (TypeError, ValueError):
-            req = 5
+            req = DEFAULT_MAX_RESULTS
         try:
             cap = int(configured_cap)
         except (TypeError, ValueError):
@@ -722,6 +743,8 @@ class BaseSearchProvider(ABC):
         """Backward-compatible wrapper around sanitize_untrusted_text."""
         return sanitize_untrusted_text(raw_text, max_chars=MAX_SNIPPET_CHARS)
 
+SearchResultItem = SearchResult
+
 
 __all__ = [
     "MAX_QUERY_CHARS",
@@ -729,6 +752,7 @@ __all__ = [
     "MAX_SNIPPET_CHARS",
     "MAX_RAW_CONTENT_CHARS",
     "MIN_RAW_CONTENT_CHARS",
+    "DEFAULT_MAX_RESULTS",
     "MAX_RESULTS_HARD_CAP",
     "ProviderStatus",
     "CostBasis",
@@ -757,4 +781,5 @@ __all__ = [
     "ProviderCapability",
     "ProviderDiagnosticResult",
     "BaseSearchProvider",
+    "SearchResultItem",
 ]

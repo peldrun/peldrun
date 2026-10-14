@@ -14,72 +14,62 @@ import {
   Loader2,
   RefreshCw,
   Settings,
+  ShieldCheck,
+  Save,
+  Search,
   Bot,
-  ShieldCheck
+  Puzzle,
 } from "lucide-react";
 import { useChatStore } from "@/stores/chat-store";
-import { fetchStoreAgents } from "@/lib/chatsApi";
-import { AgentManifest } from "@/lib/types";
+import { fetchStoreAgents, fetchStoreTools } from "@/lib/chatsApi";
+import { AgentManifest, ToolDefinition } from "@/lib/types";
 
-export interface ToolItem {
+// ============================================================
+// Internal types
+// ============================================================
+type ToolSource = "builtin" | "mcp";
+
+interface UnifiedTool {
   id: string;
   name: string;
   description: string;
-  source: "builtin" | "mcp";
+  category: string;
+  source: ToolSource;
+  is_builtin: boolean;
+  is_enabled: boolean;
+  safety_level?: string;
   serverName?: string;
 }
 
-const DEFAULT_BUILTIN_TOOLS: ToolItem[] = [
-  {
-    id: "python_execute",
-    name: "Python Execute",
-    description: "Executes Python code in a sandboxed runtime for data analytics, scripting, and figure generation.",
-    source: "builtin"
-  },
-  {
-    id: "bash",
-    name: "Terminal (Bash)",
-    description: "Runs system commands, file transformations, and headless operations in the workspace directory.",
-    source: "builtin"
-  },
-  {
-    id: "str_replace_editor",
-    name: "File Editor",
-    description: "Precise file viewing, creation, and surgical string replacement directly inside workspace files.",
-    source: "builtin"
-  },
-  {
-    id: "web_search",
-    name: "Web Search",
-    description: "Searches Google, DuckDuckGo, and Bing for up-to-date live intelligence and documentation.",
-    source: "builtin"
-  },
-  {
-    id: "chrome_browser",
-    name: "Browser Automation",
-    description: "Controls a live headless/interactive Chrome browser instance for web automation and DOM inspection.",
-    source: "builtin"
-  },
-  {
-    id: "ask_human",
-    name: "Ask Human",
-    description: "Requests interactive feedback and authorization from the user without blocking backend loops.",
-    source: "builtin"
-  },
-  {
-    id: "terminate",
-    name: "Task Terminator",
-    description: "Concludes autonomous agent execution cleanly once deliverables are built and verified.",
-    source: "builtin"
-  }
-];
+// ============================================================
+// Icon mapper — categorizes tools by id/category, never hardcoded per tool
+// ============================================================
+function pickToolIcon(tool: UnifiedTool) {
+  const id = tool.id.toLowerCase();
+  const cat = (tool.category || "").toLowerCase();
 
+  if (tool.source === "mcp") return <Server size={14} className="text-primary shrink-0" />;
+  if (id.includes("python") || cat === "execution") return <Code2 size={14} className="text-amber-500 shrink-0" />;
+  if (id.includes("bash") || id.includes("shell") || cat === "system") return <Terminal size={14} className="text-emerald-500 shrink-0" />;
+  if (id.includes("search") || cat === "search") return <Search size={14} className="text-sky-500 shrink-0" />;
+  if (id.includes("editor")) return <FileCode2 size={14} className="text-purple-500 shrink-0" />;
+  if (id.includes("saver") || cat === "storage") return <Save size={14} className="text-pink-500 shrink-0" />;
+  if (id.includes("browser") || cat === "network") return <Globe size={14} className="text-cyan-500 shrink-0" />;
+  if (id.includes("human") || cat === "interaction") return <Bot size={14} className="text-indigo-500 shrink-0" />;
+  return <Wrench size={14} className="text-muted-foreground shrink-0" />;
+}
+
+// ============================================================
+// Main Modal Component
+// ============================================================
 export function ActiveToolsModal() {
   const { selectedAgentId } = useChatStore();
+
   const [agents, setAgents] = useState<AgentManifest[]>([]);
+  const [tools, setTools] = useState<ToolDefinition[]>([]);
+  const [mcpTools, setMcpTools] = useState<UnifiedTool[]>([]);
   const [isOpen, setIsOpen] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [mcpTools, setMcpTools] = useState<ToolItem[]>([]);
   const [activeFilter, setActiveFilter] = useState<"all" | "builtin" | "mcp">("all");
 
   const getApiUrl = (endpoint: string) => {
@@ -89,163 +79,193 @@ export function ActiveToolsModal() {
     return endpoint;
   };
 
-  // Load and cache all agent manifests
-  useEffect(() => {
-    let isMounted = true;
-    fetchStoreAgents()
-      .then((data) => {
-        if (isMounted && data.length > 0) {
-          setAgents(data);
-        }
-      })
-      .catch(console.error);
-
-    return () => {
-      isMounted = false;
-    };
-  }, []);
-
-  const fetchActiveMcpTools = async () => {
+  // ---------------------------------------------------------
+  // Fetch agents + tools from the authoritative backend store
+  // ---------------------------------------------------------
+  const loadData = async () => {
     setLoading(true);
     try {
-      const res = await fetch(getApiUrl("/api/mcp"));
-      if (res.ok) {
-        const data = await res.json();
-        const activeServers = (data.servers || []).filter((s: any) => s.status === "active");
-
-        const tools: ToolItem[] = [];
-        activeServers.forEach((server: any) => {
-          const sid = server.id || "";
-          if (sid.includes("filesystem")) {
-            tools.push(
-              { id: "read_file", name: "MCP: Read File", description: "Read content from workspace files via MCP.", source: "mcp", serverName: server.name },
-              { id: "write_file", name: "MCP: Write File", description: "Write and update files via MCP filesystem transport.", source: "mcp", serverName: server.name },
-              { id: "list_directory", name: "MCP: List Directory", description: "Explore folder hierarchies and directory entries.", source: "mcp", serverName: server.name }
-            );
-          } else if (sid.includes("github")) {
-            tools.push(
-              { id: "get_issue", name: "MCP: GitHub Issue", description: "Fetch and manage GitHub repository issues.", source: "mcp", serverName: server.name },
-              { id: "search_repositories", name: "MCP: Search Repos", description: "Search public and private GitHub repositories.", source: "mcp", serverName: server.name }
-            );
-          } else {
-            tools.push({
-              id: sid,
-              name: `MCP: ${server.name}`,
-              description: server.description || "Active external Model Context Protocol server tools.",
-              source: "mcp",
-              serverName: server.name
-            });
-          }
-        });
-        setMcpTools(tools);
-      }
+      const [agentList, toolList] = await Promise.all([
+        fetchStoreAgents(),
+        fetchStoreTools(),
+      ]);
+      if (Array.isArray(agentList)) setAgents(agentList);
+      if (Array.isArray(toolList)) setTools(toolList);
     } catch (err) {
-      console.error("Failed to fetch active MCP tools", err);
+      console.error("Failed to load store data:", err);
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    fetchActiveMcpTools();
+    loadData();
   }, []);
 
-  // Determine active agent reactively based on selectedAgentId
-  const activeAgent = useMemo(() => {
-    return (
-      agents.find((a) => a.id === selectedAgentId) || {
-        id: "peldrun",
-        name: "peldrun Generalist",
-        role: "General Autonomous Specialist",
-        tools: ["python_execute", "bash", "str_replace_editor", "web_search", "chrome_browser", "mcp"]
-      }
-    );
+  // ---------------------------------------------------------
+  // Fetch live MCP tools from active servers
+  // ---------------------------------------------------------
+  const fetchActiveMcpTools = async () => {
+    try {
+      const res = await fetch(getApiUrl("/api/mcp"), { cache: "no-store" });
+      if (!res.ok) return;
+      const data = await res.json();
+      const activeServers = (data.servers || []).filter((s: any) => s.status === "active");
+
+      const collected: UnifiedTool[] = [];
+      activeServers.forEach((server: any) => {
+        const sid = String(server.id || "").toLowerCase();
+
+        if (sid.includes("filesystem")) {
+          const entries = [
+            { id: "mcp:read_file", desc: "Read content from workspace files via MCP." },
+            { id: "mcp:write_file", desc: "Write and update files via MCP filesystem transport." },
+            { id: "mcp:list_directory", desc: "Explore folder hierarchies and directory entries." },
+          ];
+          entries.forEach((e) => collected.push({
+            id: e.id,
+            name: e.id.replace("mcp:", "MCP: ").replace(/_/g, " "),
+            description: e.desc,
+            category: "mcp",
+            source: "mcp",
+            is_builtin: false,
+            is_enabled: true,
+            serverName: server.name,
+          }));
+        } else if (sid.includes("github")) {
+          const entries = [
+            { id: "mcp:get_issue", desc: "Fetch and manage GitHub repository issues." },
+            { id: "mcp:search_repositories", desc: "Search public and private GitHub repositories." },
+          ];
+          entries.forEach((e) => collected.push({
+            id: e.id,
+            name: e.id.replace("mcp:", "MCP: ").replace(/_/g, " "),
+            description: e.desc,
+            category: "mcp",
+            source: "mcp",
+            is_builtin: false,
+            is_enabled: true,
+            serverName: server.name,
+          }));
+        } else {
+          collected.push({
+            id: `mcp:${sid}`,
+            name: `MCP: ${server.name}`,
+            description: server.description || "Active MCP server tools.",
+            category: "mcp",
+            source: "mcp",
+            is_builtin: false,
+            is_enabled: true,
+            serverName: server.name,
+          });
+        }
+      });
+      setMcpTools(collected);
+    } catch (err) {
+      console.error("Failed to fetch MCP tools", err);
+    }
+  };
+
+  useEffect(() => {
+    if (isOpen) fetchActiveMcpTools();
+  }, [isOpen]);
+
+  // ---------------------------------------------------------
+  // Resolve the active agent manifest (falls back safely)
+  // ---------------------------------------------------------
+  const activeAgent: AgentManifest | null = useMemo(() => {
+    if (!selectedAgentId) return null;
+    return agents.find((a) => a.id === selectedAgentId) || null;
   }, [agents, selectedAgentId]);
 
-  // Compute allowed tools specifically scoped to the active agent
-  const agentScopedTools = useMemo(() => {
-    const rawAllowed = (activeAgent.tools || []).map((t: string) => t.toLowerCase());
-    const allowedSet = new Set(rawAllowed);
-    const hasMcpPermission = rawAllowed.some((t: string) => t.includes("mcp") || t.includes("browser"));
+  // ---------------------------------------------------------
+  // THE ONLY FILTER: intersect backend tools with agent.tools
+  // ---------------------------------------------------------
+  const agentScopedTools: UnifiedTool[] = useMemo(() => {
+    if (!activeAgent) return [];
 
-    // Filter built-in tools
-    const matchedBuiltins = DEFAULT_BUILTIN_TOOLS.filter((t) => {
-      if (t.id === "ask_human" || t.id === "terminate") return true;
-      if (allowedSet.has(t.id.toLowerCase())) return true;
-      if (t.id === "python_execute" && (allowedSet.has("python") || allowedSet.has("py"))) return true;
-      if (t.id === "bash" && (allowedSet.has("terminal") || allowedSet.has("shell"))) return true;
-      if (t.id === "str_replace_editor" && allowedSet.has("editor")) return true;
-      if (t.id === "web_search" && allowedSet.has("search")) return true;
-      if (t.id === "chrome_browser" && allowedSet.has("browser")) return true;
-      return false;
-    });
-
-    // Filter MCP tools based on active agent's manifest permissions
-    const matchedMcp = hasMcpPermission
-      ? mcpTools.filter((t) => {
-          if (allowedSet.has("mcp") || allowedSet.has("browser")) return true;
-          if (t.serverName && allowedSet.has(t.serverName.toLowerCase())) return true;
-          if (allowedSet.has(t.id.toLowerCase())) return true;
-          return false;
-        })
+    const manifestToolIds = Array.isArray(activeAgent.tools)
+      ? activeAgent.tools.map((t: string) => String(t).toLowerCase().trim())
       : [];
+    const allowedSet = new Set(manifestToolIds);
+
+    // Built-in tools: exact id match against the registry
+    const matchedBuiltins: UnifiedTool[] = tools
+      .filter((t) => {
+        const idLower = (t.id || "").toLowerCase();
+        return allowedSet.has(idLower) && t.is_enabled !== false && t.status !== "disabled";
+      })
+      .map((t) => ({
+        id: t.id,
+        name: t.name,
+        description: t.description || "",
+        category: t.category || "builtin",
+        source: "builtin" as ToolSource,
+        is_builtin: t.is_builtin ?? true,
+        is_enabled: true,
+        safety_level: t.safety_level,
+      }));
+
+    // MCP tools: only if the manifest explicitly opts in
+    const hasMcpPermission = manifestToolIds.some(
+      (t) => t === "mcp" || t.startsWith("mcp:")
+    );
+    const matchedMcp = hasMcpPermission ? mcpTools : [];
 
     return [...matchedBuiltins, ...matchedMcp];
-  }, [activeAgent, mcpTools]);
+  }, [activeAgent, tools, mcpTools]);
 
+  // ---------------------------------------------------------
+  // Filter for tabs
+  // ---------------------------------------------------------
   const filteredTools = useMemo(() => {
     if (activeFilter === "builtin") return agentScopedTools.filter((t) => t.source === "builtin");
     if (activeFilter === "mcp") return agentScopedTools.filter((t) => t.source === "mcp");
     return agentScopedTools;
   }, [agentScopedTools, activeFilter]);
 
+  // ---------------------------------------------------------
+  // ESC closes modal
+  // ---------------------------------------------------------
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && isOpen) {
-        setIsOpen(false);
-      }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && isOpen) setIsOpen(false);
     };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, [isOpen]);
 
-  const getToolIcon = (tool: ToolItem) => {
-    if (tool.source === "mcp") return <Server size={14} className="text-primary shrink-0" />;
-    if (tool.id.includes("python")) return <Code2 size={14} className="text-amber-500 shrink-0" />;
-    if (tool.id.includes("bash")) return <Terminal size={14} className="text-emerald-500 shrink-0" />;
-    if (tool.id.includes("search")) return <Globe size={14} className="text-sky-500 shrink-0" />;
-    if (tool.id.includes("editor")) return <FileCode2 size={14} className="text-purple-500 shrink-0" />;
-    return <Wrench size={14} className="text-muted-foreground shrink-0" />;
-  };
+  // ---------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------
+  const toolCount = agentScopedTools.length;
+  const displayName = activeAgent?.name || "Unknown Agent";
 
   return (
     <>
-      {/* Dynamic Trigger Badge: Shows active agent tool count in real-time */}
+      {/* Trigger Badge */}
       <button
         type="button"
         onClick={() => setIsOpen(true)}
         className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-medium border border-border bg-card hover:bg-muted/70 text-foreground transition-all cursor-pointer shadow-xs"
-        title={`View active tools for ${activeAgent.name}`}
+        title={`View active tools for ${displayName}`}
       >
         <Wrench size={12} className="text-primary" />
         <span className="font-medium hidden sm:inline">Active Tools</span>
         <span className="px-1.5 py-0.2 rounded-full text-[10px] font-mono bg-primary/10 text-primary border border-primary/20">
-          {agentScopedTools.length}
+          {toolCount}
         </span>
       </button>
 
-      {/* Reactive Modal Dialog */}
       {isOpen && (
         <div
           role="dialog"
           aria-modal="true"
           className="fixed inset-0 z-100 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-150 font-sans"
-          onClick={(e) => {
-            if (e.target === e.currentTarget) setIsOpen(false);
-          }}
+          onClick={(e) => { if (e.target === e.currentTarget) setIsOpen(false); }}
         >
           <div className="bg-card border border-border rounded-xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden animate-in zoom-in-95 duration-150">
-            {/* Modal Header */}
+            {/* Header */}
             <div className="h-14 border-b border-border bg-muted/30 px-5 flex items-center justify-between shrink-0">
               <div className="flex items-center gap-2.5 min-w-0">
                 <div className="p-2 rounded-lg bg-primary/10 text-primary border border-primary/20 shrink-0">
@@ -253,13 +273,13 @@ export function ActiveToolsModal() {
                 </div>
                 <div className="min-w-0">
                   <h3 className="text-sm font-semibold font-heading text-foreground flex items-center gap-2">
-                    <span className="truncate">{activeAgent.name}</span>
+                    <span className="truncate">{displayName}</span>
                     <span className="px-2 py-0.5 rounded text-[10px] bg-primary/15 text-primary border border-primary/30 font-mono shrink-0">
-                      {agentScopedTools.length} Tools
+                      {toolCount} Tools
                     </span>
                   </h3>
                   <p className="text-[11px] text-muted-foreground truncate">
-                    Active execution tools permitted by this persona manifest.
+                    Live from backend registry · scoped by agent manifest.
                   </p>
                 </div>
               </div>
@@ -267,10 +287,10 @@ export function ActiveToolsModal() {
               <div className="flex items-center gap-1.5 shrink-0">
                 <button
                   type="button"
-                  onClick={fetchActiveMcpTools}
+                  onClick={loadData}
                   disabled={loading}
                   className="p-1.5 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
-                  title="Refresh active tool list"
+                  title="Refresh tool list"
                 >
                   <RefreshCw size={14} className={loading ? "animate-spin text-primary" : ""} />
                 </button>
@@ -285,36 +305,27 @@ export function ActiveToolsModal() {
               </div>
             </div>
 
-            {/* Filter Tabs Bar */}
+            {/* Filter Tabs */}
             <div className="px-5 py-2.5 bg-card border-b border-border/60 flex items-center justify-between text-xs shrink-0">
               <div className="flex items-center gap-1 bg-muted/60 p-0.5 rounded-lg border border-border/60 text-[11px]">
-                <button
-                  type="button"
-                  onClick={() => setActiveFilter("all")}
-                  className={`px-2.5 py-1 rounded-md transition-all font-medium cursor-pointer ${
-                    activeFilter === "all" ? "bg-card text-foreground shadow-xs font-semibold" : "text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  All ({agentScopedTools.length})
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setActiveFilter("builtin")}
-                  className={`px-2.5 py-1 rounded-md transition-all font-medium cursor-pointer ${
-                    activeFilter === "builtin" ? "bg-card text-foreground shadow-xs font-semibold" : "text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  Built-in ({agentScopedTools.filter((t) => t.source === "builtin").length})
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setActiveFilter("mcp")}
-                  className={`px-2.5 py-1 rounded-md transition-all font-medium cursor-pointer ${
-                    activeFilter === "mcp" ? "bg-card text-foreground shadow-xs font-semibold" : "text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  MCP Protocol ({agentScopedTools.filter((t) => t.source === "mcp").length})
-                </button>
+                {(["all", "builtin", "mcp"] as const).map((f) => (
+                  <button
+                    key={f}
+                    type="button"
+                    onClick={() => setActiveFilter(f)}
+                    className={`px-2.5 py-1 rounded-md transition-all font-medium cursor-pointer ${
+                      activeFilter === f
+                        ? "bg-card text-foreground shadow-xs font-semibold"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    {f === "all" ? "All" : f === "builtin" ? "Built-in" : "MCP"} (
+                    {f === "all"
+                      ? agentScopedTools.length
+                      : agentScopedTools.filter((t) => t.source === f).length}
+                    )
+                  </button>
+                ))}
               </div>
 
               <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground font-mono hidden sm:flex">
@@ -325,14 +336,29 @@ export function ActiveToolsModal() {
 
             {/* Tools List */}
             <div className="flex-1 overflow-y-auto p-5 space-y-2.5 bg-background/50">
-              {loading && mcpTools.length === 0 ? (
+              {loading && tools.length === 0 ? (
                 <div className="flex items-center justify-center py-12 text-muted-foreground gap-2 text-xs">
                   <Loader2 size={16} className="animate-spin text-primary" />
-                  Synchronizing active persona tools...
+                  Loading tools from backend registry...
+                </div>
+              ) : !activeAgent ? (
+                <div className="text-center py-10 text-xs text-muted-foreground border border-dashed border-border rounded-lg">
+                  No agent selected. Pick an agent first from the Store.
                 </div>
               ) : filteredTools.length === 0 ? (
-                <div className="text-center py-10 text-xs text-muted-foreground border border-dashed border-border rounded-lg">
-                  No active tools permitted for this category under the current persona.
+                <div className="text-center py-10 text-xs text-muted-foreground border border-dashed border-border rounded-lg space-y-2">
+                  <p className="font-medium text-foreground">No tools resolved for this agent.</p>
+                  <p className="text-[10px] opacity-70">
+                    Backend registry returned {tools.length} tool(s);
+                    agent manifest declares {activeAgent.tools?.length || 0} id(s).
+                  </p>
+                  <details className="text-left max-w-md mx-auto mt-3">
+                    <summary className="cursor-pointer text-primary text-[11px]">Show diagnostic details</summary>
+                    <div className="mt-2 p-3 bg-muted/40 rounded text-[10px] font-mono space-y-1">
+                      <div><strong>Agent tools:</strong> {JSON.stringify(activeAgent.tools || [])}</div>
+                      <div><strong>Registry ids:</strong> {JSON.stringify(tools.map((t) => t.id))}</div>
+                    </div>
+                  </details>
                 </div>
               ) : (
                 filteredTools.map((tool) => (
@@ -342,10 +368,10 @@ export function ActiveToolsModal() {
                   >
                     <div className="flex items-start gap-2.5 min-w-0">
                       <div className="p-1.5 rounded-md bg-muted/60 border border-border/50 shrink-0 mt-0.5">
-                        {getToolIcon(tool)}
+                        {pickToolIcon(tool)}
                       </div>
                       <div className="min-w-0">
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 flex-wrap">
                           <span className="text-xs font-semibold font-mono text-foreground">
                             {tool.name}
                           </span>
@@ -356,12 +382,19 @@ export function ActiveToolsModal() {
                                 : "bg-primary/10 text-primary border border-primary/20"
                             }`}
                           >
-                            {tool.source === "builtin" ? "builtin" : tool.serverName || "mcp"}
+                            {tool.source === "builtin" ? tool.category : tool.serverName || "mcp"}
                           </span>
+                          {tool.is_builtin && (
+                            <span className="text-[9px] font-mono uppercase text-sky-600 dark:text-sky-400">
+                              built-in
+                            </span>
+                          )}
                         </div>
-                        <p className="text-[11px] text-muted-foreground mt-0.5 leading-relaxed">
-                          {tool.description}
-                        </p>
+                        {tool.description && (
+                          <p className="text-[11px] text-muted-foreground mt-0.5 leading-relaxed">
+                            {tool.description}
+                          </p>
+                        )}
                       </div>
                     </div>
 
@@ -374,14 +407,14 @@ export function ActiveToolsModal() {
               )}
             </div>
 
-            {/* Modal Footer */}
+            {/* Footer */}
             <div className="h-12 border-t border-border bg-card px-5 flex items-center justify-between shrink-0 text-xs">
               <a
-                href="/settings"
+                href="/stores"
                 className="text-muted-foreground hover:text-primary transition-colors flex items-center gap-1.5 font-medium"
               >
                 <Settings size={13} />
-                <span>Manage MCP Servers</span>
+                <span>Manage Tools & MCP Servers</span>
                 <ExternalLink size={11} className="opacity-70" />
               </a>
 
