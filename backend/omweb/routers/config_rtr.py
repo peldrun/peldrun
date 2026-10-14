@@ -1,17 +1,22 @@
 ﻿"""
+backend/omweb/routers/config_rtr.py
+
 PELDRUN Web Configuration Router.
 
 Manages application configuration, secret masking, LLM provider testing,
-and models metadata persistence. Decoupled from external core directory synchronization.
+and models metadata persistence. Uses one authoritative configuration path
+shared with the core runtime and surfaces TOML parse errors diagnostically.
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import os
 from pathlib import Path
 import shutil
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, Body, HTTPException
 import httpx
@@ -22,58 +27,140 @@ import toml
 try:
     import tomllib
 except ImportError:
-    import tomli as tomllib
+    import tomli as tomllib  # type: ignore[no-redef]
+
+logger = logging.getLogger("omweb.routers.config_rtr")
 
 router = APIRouter()
 
-CONFIG_PATH = PROJECT_ROOT / "config" / "config.toml"
-CONFIG_EXAMPLE_PATH = PROJECT_ROOT / "config" / "config.example.toml"
-BACKUP_PATH = PROJECT_ROOT / "config" / "config.toml.bak"
+CONFIG_PATH = (PROJECT_ROOT / "config" / "config.toml").resolve()
+CONFIG_EXAMPLE_PATH = (PROJECT_ROOT / "config" / "config.example.toml").resolve()
+BACKUP_PATH = (PROJECT_ROOT / "config" / "config.toml.bak").resolve()
 METADATA_CACHE = STORAGE_ROOT / "models_metadata.json"
 BUDGET_CACHE = STORAGE_ROOT / "models_budget.json"
 
-def read_raw_config() -> dict:
-    """Read raw TOML configuration with automatic UTF-8 BOM stripping."""
-    target = CONFIG_PATH if CONFIG_PATH.exists() else CONFIG_EXAMPLE_PATH
-    if not target.exists():
+SENSITIVE_KEY_TOKENS = ("key", "password", "secret", "token")
+MASK_TOKENS = ("••••", "****", "***")
+
+_LAST_CONFIG_ERROR: Optional[str] = None
+
+
+def get_authoritative_config_path() -> Path:
+    """
+    Return the canonical config.toml path used by both web routes and runtime.
+    Honors PELDRUN_CONFIG_PATH when set (e.g., in isolated tests).
+    """
+    env_override = os.environ.get("PELDRUN_CONFIG_PATH", "").strip()
+    if env_override:
+        return Path(env_override).expanduser().resolve()
+    return CONFIG_PATH
+
+
+def get_last_config_error() -> Optional[str]:
+    """Return the most recent TOML parse/read error, or None if valid."""
+    return _LAST_CONFIG_ERROR
+
+
+def _resolve_readable_target(explicit_path: Optional[Path] = None) -> Tuple[Optional[Path], bool]:
+    """
+    Locate the configuration file to read.
+    Returns (path, is_fallback_example).
+    """
+    primary = (explicit_path or get_authoritative_config_path()).resolve()
+    if primary.is_file():
+        return primary, False
+    if explicit_path is None and CONFIG_EXAMPLE_PATH.is_file():
+        logger.info(
+            "Primary config.toml not found; falling back to config.example.toml."
+        )
+        return CONFIG_EXAMPLE_PATH, True
+    return None, False
+
+
+def read_raw_config_strict(explicit_path: Optional[Path] = None) -> Dict[str, Any]:
+    """
+    Read and parse the authoritative TOML configuration strictly.
+    Raises ValueError with diagnostic details if the TOML file is malformed.
+    """
+    global _LAST_CONFIG_ERROR
+    target, _ = _resolve_readable_target(explicit_path=explicit_path)
+    if target is None:
+        _LAST_CONFIG_ERROR = None
         return {}
+
     try:
         content_bytes = target.read_bytes()
         if content_bytes.startswith(b"\xef\xbb\xbf"):
             content_bytes = content_bytes[3:]
-        return tomllib.loads(content_bytes.decode("utf-8"))
-    except Exception as e:
-        print(f"Error reading config: {e}")
+        parsed = tomllib.loads(content_bytes.decode("utf-8"))
+        _LAST_CONFIG_ERROR = None
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception as exc:
+        err_msg = f"Invalid TOML in {target.name}: {exc}"
+        _LAST_CONFIG_ERROR = err_msg
+        logger.error(err_msg)
+        raise ValueError(err_msg) from exc
+
+
+def read_raw_config(explicit_path: Optional[Path] = None) -> dict:
+    """
+    Read raw TOML configuration with automatic UTF-8 BOM stripping.
+    Records diagnostic state in _LAST_CONFIG_ERROR if parsing fails.
+    """
+    try:
+        return read_raw_config_strict(explicit_path=explicit_path)
+    except ValueError:
         return {}
 
 
-def write_raw_config(data: dict) -> None:
-    """Write central configuration cleanly without external engine duplication."""
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if CONFIG_PATH.exists():
-        try:
-            shutil.copy2(CONFIG_PATH, BACKUP_PATH)
-        except Exception:
-            pass
+def write_raw_config(data: dict, explicit_path: Optional[Path] = None) -> None:
+    """Write central configuration atomically with automatic backup."""
+    global _LAST_CONFIG_ERROR
+    target = (explicit_path or get_authoritative_config_path()).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
 
-    clean_data = {}
+    if target.exists():
+        backup = target.with_suffix(".toml.bak")
+        try:
+            shutil.copy2(target, backup)
+        except Exception as exc:
+            logger.debug(f"Failed to create config backup at {backup}: {exc}")
+
+    clean_data: Dict[str, Any] = {}
     for k, v in data.items():
         if v is not None:
             clean_data[k] = v
 
-    tmp_path = CONFIG_PATH.with_suffix(".tmp")
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        toml.dump(clean_data, f)
-    tmp_path.replace(CONFIG_PATH)
+    tmp_path = target.with_suffix(".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        toml.dump(clean_data, handle)
+
+    # Verify that the generated TOML is valid before replacing the target file.
+    raw_written = tmp_path.read_text(encoding="utf-8")
+    tomllib.loads(raw_written)
+    tmp_path.replace(target)
+    _LAST_CONFIG_ERROR = None
+
+
+def _is_secret_field(key: str) -> bool:
+    key_lower = key.lower()
+    return any(token in key_lower for token in SENSITIVE_KEY_TOKENS)
+
+
+def is_masked_secret_value(value: Any) -> bool:
+    """Return True if the string represents a UI-masked secret placeholder."""
+    if not isinstance(value, str):
+        return False
+    return any(mask in value for mask in MASK_TOKENS)
 
 
 def mask_secrets(data: dict) -> dict:
     """Recursively mask sensitive API keys and tokens in configuration dictionaries."""
-    masked = {}
+    masked: Dict[str, Any] = {}
     for key, val in data.items():
         if isinstance(val, dict):
             masked[key] = mask_secrets(val)
-        elif any(s in key.lower() for s in ["key", "password", "secret", "token"]):
+        elif isinstance(key, str) and _is_secret_field(key):
             if isinstance(val, str) and len(val) > 8:
                 masked[key] = val[:4] + "••••••••" + val[-4:]
             elif isinstance(val, str) and val:
@@ -85,18 +172,35 @@ def mask_secrets(data: dict) -> dict:
     return masked
 
 
-def merge_unmasked(new_dict: dict, old_dict: dict) -> dict:
-    """Merge newly submitted config preserving unmasked values when masks are supplied."""
-    result = {}
+def merge_unmasked(
+    new_dict: dict,
+    old_dict: dict,
+    preserve_on_empty: bool = False,
+) -> dict:
+    """
+    Merge newly submitted config with existing config:
+    - Preserves non-submitted keys in old_dict.
+    - Preserves existing secret values when a masked placeholder ('••••') is supplied.
+    - Allows intentional secret clearing when an empty string '' is submitted
+      (unless preserve_on_empty=True is explicitly requested for read-only probes).
+    """
+    result: Dict[str, Any] = dict(old_dict) if isinstance(old_dict, dict) else {}
     for k, v in new_dict.items():
-        old_val = old_dict.get(k)
+        old_val = result.get(k)
         if isinstance(v, dict) and isinstance(old_val, dict):
-            result[k] = merge_unmasked(v, old_val)
-        elif isinstance(v, str) and any(s in k.lower() for s in ["key", "password", "secret", "token"]):
-            if "••••" in v or "****" in v or "***" in v or (not v.strip() and old_val):
+            result[k] = merge_unmasked(
+                v,
+                old_val,
+                preserve_on_empty=preserve_on_empty,
+            )
+        elif isinstance(k, str) and _is_secret_field(k) and isinstance(v, str):
+            stripped = v.strip()
+            if is_masked_secret_value(stripped):
+                result[k] = old_val if old_val is not None else ""
+            elif not stripped and preserve_on_empty and old_val:
                 result[k] = old_val
             else:
-                result[k] = v.strip()
+                result[k] = stripped
         else:
             result[k] = v
     return result
@@ -117,7 +221,7 @@ def save_metadata_cache(new_meta: dict) -> None:
         with open(METADATA_CACHE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
     except Exception as e:
-        print(f"Error saving metadata cache: {e}")
+        logger.warning(f"Error saving metadata cache: {e}")
 
 
 @router.get("")
@@ -145,7 +249,8 @@ async def get_config():
     return {
         "config": mask_secrets(raw),
         "custom_models": mask_secrets({"models": custom_models}).get("models", []),
-        "raw_path": str(CONFIG_PATH),
+        "raw_path": str(get_authoritative_config_path()),
+        "config_error": get_last_config_error(),
     }
 
 
@@ -156,9 +261,13 @@ async def get_config():
 async def save_config(payload: Dict[str, Any]):
     """Update and persist system configuration."""
     current = read_raw_config()
-    merged = merge_unmasked(payload, current)
+    merged = merge_unmasked(payload, current, preserve_on_empty=False)
     write_raw_config(merged)
-    return {"status": "saved", "config": mask_secrets(merged)}
+    return {
+        "status": "saved",
+        "config": mask_secrets(merged),
+        "raw_path": str(get_authoritative_config_path()),
+    }
 
 
 @router.get("/models-metadata")
@@ -198,7 +307,7 @@ class TestLLMRequest(BaseModel):
 async def test_llm_connection(payload: TestLLMRequest):
     """Test LLM endpoint connectivity and measure latency."""
     api_key = payload.api_key.strip()
-    if not api_key or "••••" in api_key or "****" in api_key or "***" in api_key:
+    if not api_key or is_masked_secret_value(api_key):
         current = read_raw_config()
         api_key = current.get("llm", {}).get("api_key", "")
 
@@ -247,7 +356,7 @@ class FetchModelsRequest(BaseModel):
 async def fetch_available_models(payload: FetchModelsRequest):
     """Query endpoint for dynamically discovered model identifiers and metadata."""
     api_key = (payload.api_key or "").strip()
-    if "••••" in api_key or "****" in api_key or "***" in api_key:
+    if is_masked_secret_value(api_key):
         current = read_raw_config()
         api_key = current.get("llm", {}).get("api_key", "")
 
@@ -353,7 +462,7 @@ def load_vault_from_disk() -> dict:
                     data[k] = v
             return data
     except Exception as e:
-        print(f"[VAULT] Error reading vault file: {e}")
+        logger.warning(f"[VAULT] Error reading vault file: {e}")
         return dict(DEFAULT_VAULT)
 
 
@@ -366,7 +475,7 @@ def save_vault_to_disk(vault_data: dict) -> None:
             json.dump(vault_data, f, indent=2, ensure_ascii=False)
         temp_file.replace(VAULT_FILE)
     except Exception as e:
-        print(f"[VAULT] Error saving vault file: {e}")
+        logger.warning(f"[VAULT] Error saving vault file: {e}")
 
 
 @router.get("/vault")
@@ -385,10 +494,10 @@ async def save_models_vault(payload: dict = Body(...)):
     save_vault_to_disk(current)
     return {"status": "success", "vault": current}
 
+
 # ============================================================
 # Per-Model Context Window & Token Budget Management
 # ============================================================
-
 def load_model_budgets_from_disk() -> dict:
     """Read saved per-model token budget configurations from disk."""
     if BUDGET_CACHE.exists():
@@ -396,7 +505,7 @@ def load_model_budgets_from_disk() -> dict:
             with open(BUDGET_CACHE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            print(f"[BUDGET] Error loading budget cache: {e}")
+            logger.warning(f"[BUDGET] Error loading budget cache: {e}")
     return {}
 
 
@@ -409,7 +518,7 @@ def save_model_budgets_to_disk(budgets_data: dict) -> None:
             json.dump(budgets_data, f, indent=2, ensure_ascii=False)
         temp_file.replace(BUDGET_CACHE)
     except Exception as e:
-        print(f"[BUDGET] Error writing budget cache: {e}")
+        logger.warning(f"[BUDGET] Error writing budget cache: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

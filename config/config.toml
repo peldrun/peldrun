@@ -16,11 +16,14 @@ max_content_length = 2000
 
 [search]
 engine = "Jina"
-fallback_engines = []
-retry_delay = 5
-max_retries = 3
+fallback_engines = [ "DuckDuckGo",]
+retry_delay = 2
+max_retries = 0
 lang = "en"
 country = "us"
+enabled = true
+total_budget_seconds = 22
+privacy_mode = false
 
 [sandbox]
 use_sandbox = false
@@ -58,5 +61,34 @@ server = ""
 username = ""
 password = ""
 
+[search.duckduckgo]
+cost_per_query = 0
+
+[search.searxng]
+cost_per_query = 0
+base_url = "http://localhost:8080"
+enabled = false
+
+[search.tavily]
+cost_per_query = 0.005
+search_depth = "basic"
+enabled = false
+
+[search.brave]
+cost_per_query = 0.005
+enabled = false
+
+[search.google]
+cost_per_query = 0.005
+api_key = ""
+cx = "b3b22fba2ab1f373b"
+enabled = false
+
 [search.jina]
-api_key = "jina_0bc606578d42487aab705f2e6ca3c88aNUm6oNf-c8k-0uQ1ipyR1fXse8e1"
+cost_per_query = 0.002
+api_key = "jina_330c240e759743cdb99eb438bcf7f336o5v3iba1AQy2dOd7MDAFIjCcTIZj"
+
+[search.yandex]
+cost_per_query = 0.003
+mode = "cloud_v2"
+enabled = false

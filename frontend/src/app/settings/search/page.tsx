@@ -24,6 +24,10 @@ import {
   Globe,
   Sparkles,
   Loader2,
+  Trash2,
+  Lock,
+  Info,
+  AlertTriangle,
 } from "lucide-react";
 import {
   ResponsiveContainer,
@@ -75,6 +79,8 @@ const CHART_TOOLTIP_STYLE = {
   boxShadow: "0 10px 30px rgba(0, 0, 0, 0.4)",
   backdropFilter: "blur(8px)",
 } as const;
+
+const BILLABLE_ENGINES = new Set(["Tavily", "Brave", "Google", "Jina", "Yandex"]);
 
 // ============================================================
 // Animated Counter Component
@@ -254,9 +260,9 @@ function ProviderRow({ item, index, maxQueries }: ProviderRowProps) {
           <span className="font-medium">{item.provider}</span>
         </div>
         <div className="flex items-center gap-3 font-mono text-[11px]">
-          <span className="text-muted-foreground">{item.queries_count}q</span>
-          <span className="text-amber-500 font-semibold">
-            ${Number(item.cost_usd).toFixed(3)}
+          <span className="text-muted-foreground">{item.queries_count} req</span>
+          <span className="text-amber-500 font-semibold" title="Estimated cost">
+            Est. ${Number(item.cost_usd).toFixed(4)}
           </span>
         </div>
       </div>
@@ -278,6 +284,7 @@ function ProviderRow({ item, index, maxQueries }: ProviderRowProps) {
 // ============================================================
 export default function SearchTelemetryPage() {
   const [loading, setLoading] = useState<boolean>(true);
+  const [clearingLedger, setClearingLedger] = useState<boolean>(false);
   const [telemetryPeriod, setTelemetryPeriod] = useState<string>("week");
   const [metrics, setMetrics] = useState<any>(null);
 
@@ -323,10 +330,41 @@ export default function SearchTelemetryPage() {
   }, [loadData, telemetryPeriod]);
 
   // ----------------------------------------------------------
+  // Clear Local Ledger Handler
+  // ----------------------------------------------------------
+  const handleClearLedger = async () => {
+    if (clearingLedger) return;
+    try {
+      setClearingLedger(true);
+      const res = await fetch(resolveApiUrl("/api/search/metrics"), {
+        method: "DELETE",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok) {
+        showToast.success(
+          "Ledger Cleared",
+          data.message || "Local search usage history has been cleared."
+        );
+        setTestQueryResult(null);
+        await loadData(telemetryPeriod);
+      } else {
+        showToast.error(
+          "Clear Failed",
+          data.detail || data.message || "Could not clear usage ledger."
+        );
+      }
+    } catch (err: any) {
+      showToast.error("Clear Failed", err.message);
+    } finally {
+      setClearingLedger(false);
+    }
+  };
+
+  // ----------------------------------------------------------
   // Test Query Handler
   // ----------------------------------------------------------
   const handleRunTestQuery = async () => {
-    if (!testQuery.trim()) return;
+    if (!testQuery.trim() || testingQuery) return;
     try {
       setTestingQuery(true);
       setTestQueryResult(null);
@@ -348,11 +386,18 @@ export default function SearchTelemetryPage() {
           `Returned ${data.results_count} snippets in ${data.latency_ms}ms.`
         );
         loadData(telemetryPeriod);
+      } else if (data.status === "empty") {
+        showToast.error(
+          "Zero Matches (HTTP 200)",
+          data.error_message || "Provider responded successfully with 0 matching documents."
+        );
+        loadData(telemetryPeriod);
       } else {
         showToast.error(
-          "Search Warning",
-          data.error_message || "No snippets returned."
+          `Search Failed (${data.status || "error"})`,
+          data.error_message || "Provider search failed."
         );
+        loadData(telemetryPeriod);
       }
     } catch (err: any) {
       showToast.error("Execution Error", err.message);
@@ -383,6 +428,8 @@ export default function SearchTelemetryPage() {
     total_results: 0,
   };
 
+  const privacyModeActive = Boolean(metrics?.privacy_mode);
+
   const radialData = useMemo(
     () => [
       {
@@ -397,12 +444,14 @@ export default function SearchTelemetryPage() {
       },
       {
         name: "Cost Efficiency",
-        value: summary.total_queries > 0
-          ? Math.max(
-              0,
-              100 - (summary.total_cost_usd / Math.max(summary.total_queries, 1)) * 20000
-            )
-          : 100,
+        value:
+          summary.total_queries > 0
+            ? Math.max(
+                0,
+                100 -
+                  (summary.total_cost_usd / Math.max(summary.total_queries, 1)) * 20000
+              )
+            : 100,
         fill: RADIAL_COLORS[2],
       },
     ],
@@ -418,6 +467,8 @@ export default function SearchTelemetryPage() {
     "Jina",
     "Yandex",
   ];
+
+  const isSelectedEngineBillable = BILLABLE_ENGINES.has(testEngine);
 
   // ----------------------------------------------------------
   // Render
@@ -454,16 +505,43 @@ export default function SearchTelemetryPage() {
               </div>
               <div>
                 <h1 className="text-sm font-semibold font-heading tracking-wide">
-                  Search Intelligence Center
+                  Search Intelligence & Usage Ledger
                 </h1>
                 <p className="text-[10px] text-muted-foreground">
-                  Real-time telemetry · cost tracking · live benchmarking
+                  Local SQLite telemetry · estimated cost basis · live contract diagnostics
                 </p>
               </div>
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span
+              className={`hidden md:flex items-center gap-1.5 text-[10px] font-mono px-2.5 py-1 rounded-md border ${
+                privacyModeActive
+                  ? "border-purple-500/40 bg-purple-500/10 text-purple-500"
+                  : "border-border bg-background/60 text-muted-foreground"
+              }`}
+              title="Local SQLite ledger query retention policy"
+            >
+              <Lock size={11} />
+              <span>{privacyModeActive ? "Privacy: Hash-Only" : "Privacy: Full Query Text"}</span>
+            </span>
+
+            <Button
+              onClick={handleClearLedger}
+              variant="outline"
+              disabled={clearingLedger || summary.total_queries === 0}
+              className="h-8 px-3 text-xs gap-1.5 border-rose-500/30 text-rose-500 hover:bg-rose-500/10 cursor-pointer"
+              title="Delete all local search usage records from SQLite"
+            >
+              {clearingLedger ? (
+                <Loader2 size={12} className="animate-spin" />
+              ) : (
+                <Trash2 size={12} />
+              )}
+              <span className="hidden sm:inline">Clear Ledger</span>
+            </Button>
+
             <Link href="/settings">
               <Button
                 variant="outline"
@@ -491,20 +569,20 @@ export default function SearchTelemetryPage() {
         {/* KPI Grid */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
           <KpiCard
-            label="Total Queries"
+            label="Recorded Requests"
             value={summary.total_queries}
             icon={<Search size={18} className="text-primary" />}
             accent="#3b82f6"
-            subtitle="Across all agent executions"
+            subtitle="Physical provider requests logged"
             delay={0}
             animatedValue={{ value: summary.total_queries }}
           />
           <KpiCard
-            label="Accumulated Cost"
+            label="Estimated Spend"
             value={summary.total_cost_usd}
             icon={<DollarSign size={18} className="text-amber-500" />}
             accent="#f59e0b"
-            subtitle="Based on your configured prices"
+            subtitle="Local estimate (not a vendor invoice)"
             delay={0.05}
             animatedValue={{
               value: summary.total_cost_usd,
@@ -513,11 +591,11 @@ export default function SearchTelemetryPage() {
             }}
           />
           <KpiCard
-            label="Success Rate"
+            label="Result Hit Rate"
             value={summary.success_rate_pct}
             icon={<CheckCircle2 size={18} className="text-emerald-500" />}
             accent="#10b981"
-            subtitle={`${summary.failed_queries} failed · ${summary.successful_queries ?? 0} succeeded`}
+            subtitle={`${summary.failed_queries} empty/failed · ${summary.successful_queries ?? 0} with results`}
             delay={0.1}
             animatedValue={{
               value: summary.success_rate_pct,
@@ -530,7 +608,7 @@ export default function SearchTelemetryPage() {
             value={summary.avg_latency_ms}
             icon={<Clock size={18} className="text-cyan-500" />}
             accent="#06b6d4"
-            subtitle="Provider response time"
+            subtitle="End-to-end provider response time"
             delay={0.15}
             animatedValue={{
               value: summary.avg_latency_ms,
@@ -540,7 +618,7 @@ export default function SearchTelemetryPage() {
           />
         </div>
 
-        {/* Live Test Playground — moved above the telemetry charts */}
+        {/* Live Test Playground */}
         <motion.div
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
@@ -549,18 +627,27 @@ export default function SearchTelemetryPage() {
         >
           <div className="absolute top-0 left-0 right-0 h-[2px] bg-gradient-to-r from-transparent via-emerald-500/60 to-transparent" />
 
-          <div className="flex items-center gap-3">
-            <div className="p-2 rounded-lg bg-emerald-500/10 border border-emerald-500/20">
-              <Sparkles size={16} className="text-emerald-500" />
+          <div className="flex items-center justify-between flex-wrap gap-3">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-lg bg-emerald-500/10 border border-emerald-500/20">
+                <Sparkles size={16} className="text-emerald-500" />
+              </div>
+              <div>
+                <h3 className="text-xs font-semibold font-heading uppercase tracking-wider">
+                  Live Diagnostic Search Playground
+                </h3>
+                <p className="text-[11px] text-muted-foreground">
+                  Executes a real search query against the saved configuration in config.toml
+                </p>
+              </div>
             </div>
-            <div>
-              <h3 className="text-xs font-semibold font-heading uppercase tracking-wider">
-                Live Diagnostic Playground
-              </h3>
-              <p className="text-[11px] text-muted-foreground">
-                Execute a real search query against any configured provider
-              </p>
-            </div>
+
+            {isSelectedEngineBillable && (
+              <span className="flex items-center gap-1.5 text-[10px] font-mono text-amber-600 dark:text-amber-400 bg-amber-500/10 border border-amber-500/30 px-2.5 py-1 rounded-md">
+                <AlertTriangle size={12} />
+                <span>Live query against {testEngine} may consume 1 API credit/request</span>
+              </span>
+            )}
           </div>
 
           <div className="flex flex-col sm:flex-row gap-3">
@@ -599,7 +686,7 @@ export default function SearchTelemetryPage() {
               ) : (
                 <Play size={12} />
               )}
-              <span>{testingQuery ? "Testing..." : "Execute Test"}</span>
+              <span>{testingQuery ? "Executing..." : "Run Live Search"}</span>
             </Button>
           </div>
 
@@ -614,21 +701,34 @@ export default function SearchTelemetryPage() {
                 className="mt-3 p-4 rounded-lg border border-border/80 bg-background/60 space-y-3 font-mono text-xs overflow-hidden"
               >
                 <div className="flex items-center justify-between text-[11px] pb-2 border-b border-border/60 flex-wrap gap-2">
-                  <span className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
                     <span
                       className={`w-2 h-2 rounded-full ${
-                        testQueryResult.ok ? "bg-emerald-500" : "bg-rose-500"
+                        testQueryResult.ok
+                          ? "bg-emerald-500"
+                          : testQueryResult.status === "empty"
+                          ? "bg-amber-500"
+                          : "bg-rose-500"
                       }`}
-                      style={{
-                        boxShadow: testQueryResult.ok
-                          ? "0 0 8px rgba(16, 185, 129, 0.6)"
-                          : "0 0 8px rgba(244, 63, 94, 0.6)",
-                      }}
                     />
                     <span className="text-muted-foreground">Provider:</span>
                     <strong>{testQueryResult.provider}</strong>
-                  </span>
-                  <span className="flex items-center gap-3 text-muted-foreground">
+                    {testQueryResult.status && (
+                      <span
+                        className={`text-[10px] px-1.5 py-0.5 rounded border ${
+                          testQueryResult.ok
+                            ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-500"
+                            : testQueryResult.status === "empty"
+                            ? "border-amber-500/30 bg-amber-500/10 text-amber-500"
+                            : "border-rose-500/30 bg-rose-500/10 text-rose-500"
+                        }`}
+                      >
+                        status: {testQueryResult.status}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-3 text-muted-foreground flex-wrap">
                     <span className="flex items-center gap-1">
                       <Clock size={10} />
                       <strong>{testQueryResult.latency_ms}ms</strong>
@@ -637,7 +737,18 @@ export default function SearchTelemetryPage() {
                       <Search size={10} />
                       <strong>{testQueryResult.results_count}</strong> results
                     </span>
-                  </span>
+                    {typeof testQueryResult.request_count === "number" && (
+                      <span>
+                        <strong>{testQueryResult.request_count}</strong> req
+                      </span>
+                    )}
+                    {typeof testQueryResult.estimated_cost_usd === "number" && (
+                      <span className="text-amber-500">
+                        Est. <strong>${Number(testQueryResult.estimated_cost_usd).toFixed(4)}</strong>
+                        {testQueryResult.cost_basis ? ` (${testQueryResult.cost_basis})` : ""}
+                      </span>
+                    )}
+                  </div>
                 </div>
 
                 {testQueryResult.results?.length > 0 ? (
@@ -650,26 +761,41 @@ export default function SearchTelemetryPage() {
                         transition={{ delay: i * 0.05 }}
                         className="p-3 rounded-lg bg-card/60 border border-border/40 space-y-1.5 hover:border-primary/40 transition-colors"
                       >
-                        <a
-                          href={res.url}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="text-primary hover:underline font-semibold block truncate"
-                        >
-                          {i + 1}. {res.title}
-                        </a>
+                        <div className="flex items-center justify-between gap-2">
+                          <a
+                            href={res.url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="text-primary hover:underline font-semibold block truncate"
+                          >
+                            {i + 1}. {res.title}
+                          </a>
+                          {res.source && (
+                            <span className="text-[10px] text-muted-foreground shrink-0">
+                              {res.source}
+                            </span>
+                          )}
+                        </div>
                         <p className="text-[11px] text-muted-foreground line-clamp-2">
                           {res.snippet}
                         </p>
                       </motion.div>
                     ))}
                   </div>
+                ) : testQueryResult.status === "empty" ? (
+                  <div className="flex items-center gap-2 text-amber-500 text-xs py-2">
+                    <Info size={14} />
+                    <span>
+                      {testQueryResult.error_message ||
+                        "Provider responded with HTTP 200, but zero documents matched this query."}
+                    </span>
+                  </div>
                 ) : (
                   <div className="flex items-center gap-2 text-rose-400 text-xs py-2">
                     <XCircle size={14} />
                     <span>
                       {testQueryResult.error_message ||
-                        "No snippet results returned for this query."}
+                        "Search request failed."}
                     </span>
                   </div>
                 )}
@@ -698,7 +824,7 @@ export default function SearchTelemetryPage() {
                     Telemetry Timeline
                   </h3>
                   <p className="text-[11px] text-muted-foreground">
-                    Query volume and latency over time
+                    Request volume and result hits over time
                   </p>
                 </div>
               </div>
@@ -772,7 +898,7 @@ export default function SearchTelemetryPage() {
                       strokeWidth={2}
                       fillOpacity={1}
                       fill="url(#queryGradient)"
-                      name="Total Queries"
+                      name="Total Requests"
                     />
                     <Area
                       type="monotone"
@@ -781,7 +907,7 @@ export default function SearchTelemetryPage() {
                       strokeWidth={2}
                       fillOpacity={1}
                       fill="url(#successGradient)"
-                      name="Successful"
+                      name="With Results"
                     />
                   </AreaChart>
                 </ResponsiveContainer>
@@ -890,7 +1016,7 @@ export default function SearchTelemetryPage() {
                   Provider Split
                 </h3>
                 <p className="text-[11px] text-muted-foreground">
-                  Query distribution by engine
+                  Request distribution by engine
                 </p>
               </div>
             </div>
@@ -955,17 +1081,17 @@ export default function SearchTelemetryPage() {
                 </div>
                 <div>
                   <h3 className="text-xs font-semibold font-heading uppercase tracking-wider">
-                    Cost Distribution
+                    Estimated Cost & Latency Distribution
                   </h3>
                   <p className="text-[11px] text-muted-foreground">
-                    Spending breakdown by provider
+                    Estimated spend and average response time by provider
                   </p>
                 </div>
               </div>
               <div className="flex items-center gap-3 text-[11px]">
                 <div className="flex items-center gap-1.5">
                   <span className="w-2 h-2 rounded-full bg-amber-500" />
-                  <span className="text-muted-foreground">Cost (USD)</span>
+                  <span className="text-muted-foreground">Est. Cost (USD)</span>
                 </div>
                 <div className="flex items-center gap-1.5">
                   <span className="w-2 h-2 rounded-full bg-cyan-500" />
@@ -1017,7 +1143,7 @@ export default function SearchTelemetryPage() {
                       dataKey="cost_usd"
                       fill="url(#costBar)"
                       radius={[6, 6, 0, 0]}
-                      name="Cost (USD)"
+                      name="Est. Cost (USD)"
                       maxBarSize={40}
                     />
                     <Bar

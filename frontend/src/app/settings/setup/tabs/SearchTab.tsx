@@ -7,12 +7,12 @@ import { motion, AnimatePresence } from "framer-motion";
 import {
   Search, ExternalLink, Activity, Eye, EyeOff, CheckCircle2, XCircle,
   RefreshCw, Shield, ShieldOff, Sparkles, Gauge, Network, Sliders,
-  ChevronRight, ChevronDown, Save, Loader2, AlertCircle,
+  ChevronRight, ChevronDown, Save, Loader2, AlertCircle, Lock, Info,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
 // ---------------------------------------------------------------------------
-// Brand icons (unchanged from your version — keep as-is)
+// Brand icons
 // ---------------------------------------------------------------------------
 const BrandIcons = {
   DuckDuckGo: (props: React.SVGProps<SVGSVGElement>) => (
@@ -65,11 +65,12 @@ const BrandIcons = {
 } as const;
 
 // ---------------------------------------------------------------------------
-// Provider registry
+// Provider Registry & Field Types
 // ---------------------------------------------------------------------------
 type ProviderField =
   | { key: string; label: string; type: "text"; placeholder?: string; mono?: boolean }
-  | { key: string; label: string; type: "password"; placeholder?: string; secretKey?: string };
+  | { key: string; label: string; type: "password"; placeholder?: string; secretKey?: string }
+  | { key: string; label: string; type: "select"; options: string[]; defaultValue?: string };
 
 interface ProviderDef {
   id: string;
@@ -78,6 +79,11 @@ interface ProviderDef {
   tagline: string;
   iconKey: keyof typeof BrandIcons;
   accent: string;
+  defaultCost: number;
+  maxResultsLimit: number;
+  lifecycle?: "supported" | "legacy";
+  lifecycleNotice?: string;
+  consumesQuotaOnTest?: boolean;
   fields: ProviderField[];
   costField: boolean;
   testLabel: string;
@@ -85,13 +91,134 @@ interface ProviderDef {
 }
 
 const PROVIDERS: readonly ProviderDef[] = [
-  { id: "DuckDuckGo", configKey: "duckduckgo", name: "DuckDuckGo", tagline: "Zero-credential fallback engine with privacy-first results", iconKey: "DuckDuckGo", accent: "#DE5833", fields: [], costField: true, testLabel: "Test Reachability", docsUrl: "https://duckduckgo.com" },
-  { id: "SearXNG", configKey: "searxng", name: "SearXNG", tagline: "Self-hosted meta-search aggregator", iconKey: "SearXNG", accent: "#3050FF", fields: [{ key: "base_url", label: "Base URL", type: "text", placeholder: "http://localhost:8080", mono: true }], costField: true, testLabel: "Test Reachability", docsUrl: "https://searxng.org" },
-  { id: "Tavily", configKey: "tavily", name: "Tavily AI", tagline: "LLM-optimized cloud search API", iconKey: "Tavily", accent: "#E85E32", fields: [{ key: "api_key", label: "API Key", type: "password", placeholder: "tvly-••••••", secretKey: "tavily" }], costField: true, testLabel: "Verify API Key", docsUrl: "https://tavily.com" },
-  { id: "Brave", configKey: "brave", name: "Brave Search", tagline: "Independent web index with privacy focus", iconKey: "Brave", accent: "#FB542B", fields: [{ key: "api_key", label: "Subscription Token", type: "password", placeholder: "BSA••••••", secretKey: "brave" }], costField: true, testLabel: "Verify Token", docsUrl: "https://brave.com/search/api/" },
-  { id: "Google", configKey: "google", name: "Google CSE", tagline: "Programmable Search Engine (custom sites)", iconKey: "Google", accent: "#4285F4", fields: [{ key: "api_key", label: "API Key", type: "password", placeholder: "AIza••••", secretKey: "google" }, { key: "cx", label: "CX ID", type: "text", placeholder: "0123...", mono: true }], costField: true, testLabel: "Verify CSE", docsUrl: "https://developers.google.com/custom-search" },
-  { id: "Jina", configKey: "jina", name: "Jina Reader", tagline: "Markdown-first reader & search endpoint", iconKey: "Jina", accent: "#8B5CF6", fields: [{ key: "api_key", label: "Bearer Token", type: "password", placeholder: "jina_••••", secretKey: "jina" }], costField: true, testLabel: "Test Endpoint", docsUrl: "https://jina.ai" },
-  { id: "Yandex", configKey: "yandex", name: "Yandex Search", tagline: "Russian + global index with XML / Cloud v2", iconKey: "Yandex", accent: "#FC3F1D", fields: [{ key: "api_key", label: "API Key", type: "password", placeholder: "AQVN••••", secretKey: "yandex" }, { key: "folder_id", label: "Folder ID", type: "text", placeholder: "b1g••••", mono: true }], costField: true, testLabel: "Verify Key", docsUrl: "https://yandex.com/dev/searchapi/" },
+  {
+    id: "DuckDuckGo",
+    configKey: "duckduckgo",
+    name: "DuckDuckGo",
+    tagline: "Zero-credential fallback engine with regional & SafeSearch support",
+    iconKey: "DuckDuckGo",
+    accent: "#DE5833",
+    defaultCost: 0.0,
+    maxResultsLimit: 20,
+    consumesQuotaOnTest: false,
+    fields: [
+      { key: "safesearch", label: "SafeSearch", type: "select", options: ["moderate", "on", "off"], defaultValue: "moderate" },
+      { key: "backend", label: "Backend Mode", type: "select", options: ["auto", "ddgs", "html"], defaultValue: "auto" },
+    ],
+    costField: true,
+    testLabel: "Check Reachability",
+    docsUrl: "https://github.com/deedy5/ddgs",
+  },
+  {
+    id: "SearXNG",
+    configKey: "searxng",
+    name: "SearXNG",
+    tagline: "Self-hosted meta-search aggregator (requires 'json' in search.formats)",
+    iconKey: "SearXNG",
+    accent: "#3050FF",
+    defaultCost: 0.0,
+    maxResultsLimit: 20,
+    consumesQuotaOnTest: false,
+    fields: [
+      { key: "base_url", label: "Instance Base URL", type: "text", placeholder: "http://localhost:8080", mono: true },
+      { key: "categories", label: "Categories", type: "text", placeholder: "general", mono: true },
+    ],
+    costField: true,
+    testLabel: "Check Instance & JSON",
+    docsUrl: "https://docs.searxng.org/dev/search_api.html",
+  },
+  {
+    id: "Tavily",
+    configKey: "tavily",
+    name: "Tavily AI",
+    tagline: "LLM-optimized cloud search API with credit usage reporting",
+    iconKey: "Tavily",
+    accent: "#E85E32",
+    defaultCost: 0.005,
+    maxResultsLimit: 20,
+    consumesQuotaOnTest: true,
+    fields: [
+      { key: "api_key", label: "API Key (Bearer)", type: "password", placeholder: "tvly-••••••", secretKey: "tavily" },
+      { key: "search_depth", label: "Search Depth", type: "select", options: ["basic", "advanced", "fast", "ultra-fast"], defaultValue: "basic" },
+    ],
+    costField: true,
+    testLabel: "Verify Key (1 Credit)",
+    docsUrl: "https://docs.tavily.com/documentation/api-reference/endpoint/search",
+  },
+  {
+    id: "Brave",
+    configKey: "brave",
+    name: "Brave Search",
+    tagline: "Independent web index (max 20 results/query)",
+    iconKey: "Brave",
+    accent: "#FB542B",
+    defaultCost: 0.005,
+    maxResultsLimit: 20,
+    consumesQuotaOnTest: true,
+    fields: [
+      { key: "api_key", label: "Subscription Token", type: "password", placeholder: "BSA••••••", secretKey: "brave" },
+    ],
+    costField: true,
+    testLabel: "Verify Token (Uses Quota)",
+    docsUrl: "https://api.search.brave.com/app/documentation/web-search/get-started",
+  },
+  {
+    id: "Google",
+    configKey: "google",
+    name: "Google CSE",
+    tagline: "Programmable Search Engine JSON API (max 10 results/query)",
+    iconKey: "Google",
+    accent: "#4285F4",
+    defaultCost: 0.005,
+    maxResultsLimit: 10,
+    lifecycle: "legacy",
+    lifecycleNotice: "Google Custom Search JSON API is closed to new customers and scheduled for retirement on 2027-01-01. Plan migration to Brave, Tavily, or SearXNG.",
+    consumesQuotaOnTest: true,
+    fields: [
+      { key: "api_key", label: "API Key", type: "password", placeholder: "AIza••••", secretKey: "google" },
+      { key: "cx", label: "Search Engine ID (cx)", type: "text", placeholder: "0123...", mono: true },
+    ],
+    costField: true,
+    testLabel: "Verify CSE (Uses Quota)",
+    docsUrl: "https://developers.google.com/custom-search/v1/overview",
+  },
+  {
+    id: "Jina",
+    configKey: "jina",
+    name: "Jina Search",
+    tagline: "Markdown web search endpoint via s.jina.ai (max 20 results)",
+    iconKey: "Jina",
+    accent: "#8B5CF6",
+    defaultCost: 0.002,
+    maxResultsLimit: 20,
+    consumesQuotaOnTest: true,
+    fields: [
+      { key: "api_key", label: "Bearer Token", type: "password", placeholder: "jina_••••", secretKey: "jina" },
+    ],
+    costField: true,
+    testLabel: "Verify Key & Search",
+    docsUrl: "https://api.jina.ai/docs",
+  },
+  {
+    id: "Yandex",
+    configKey: "yandex",
+    name: "Yandex Search",
+    tagline: "Yandex Cloud Search API v2 (POST rawData) & Classic XML",
+    iconKey: "Yandex",
+    accent: "#FC3F1D",
+    defaultCost: 0.003,
+    maxResultsLimit: 15,
+    consumesQuotaOnTest: true,
+    fields: [
+      { key: "mode", label: "API Mode", type: "select", options: ["cloud_v2", "classic_xml"], defaultValue: "cloud_v2" },
+      { key: "api_key", label: "API Key", type: "password", placeholder: "AQVN••••", secretKey: "yandex" },
+      { key: "folder_id", label: "Folder ID (Cloud v2)", type: "text", placeholder: "b1g••••", mono: true },
+      { key: "region", label: "Region ID (Optional)", type: "text", placeholder: "213", mono: true },
+    ],
+    costField: true,
+    testLabel: "Verify Credentials (Uses Quota)",
+    docsUrl: "https://yandex.cloud/en/docs/search-api/api-ref/SyncSearch",
+  },
 ] as const;
 
 const ENGINE_OPTIONS = PROVIDERS.map((p) => p.id);
@@ -113,9 +240,23 @@ const FADE_UP = {
 };
 
 // ---------------------------------------------------------------------------
-// Save-state types
+// Types
 // ---------------------------------------------------------------------------
 type SaveState = "idle" | "dirty" | "saving" | "saved" | "error";
+
+interface DiagnosticState {
+  testing: boolean;
+  ok?: boolean;
+  status?: string;
+  reachable?: boolean;
+  authenticated?: boolean | null;
+  quota_available?: boolean | null;
+  consumes_quota?: boolean;
+  latency_ms?: number;
+  estimated_cost_usd?: number;
+  cost_basis?: string;
+  msg?: string;
+}
 
 // ---------------------------------------------------------------------------
 // Main Component
@@ -130,86 +271,96 @@ export function SearchTab({
   const searchConfig = config.search || {};
   const [showKeys, setShowKeys] = useState<Record<string, boolean>>({});
   const [expandedProvider, setExpandedProvider] = useState<string | null>(null);
-  const [pings, setPings] = useState<
-    Record<string, { testing: boolean; ok?: boolean; latency_ms?: number; msg?: string }>
-  >({});
+  const [pings, setPings] = useState<Record<string, DiagnosticState>>({});
+  const [effectiveCosts, setEffectiveCosts] = useState<Record<string, number>>({});
+  const [saveErrorMsg, setSaveErrorMsg] = useState<string | null>(null);
+  const [configErrorBanner, setConfigErrorBanner] = useState<string | null>(null);
 
+  // Load authoritative config & effective pricing from backend on mount
+  const [configLoaded, setConfigLoaded] = useState(false);
 
-  // ── Load authoritative config from backend on mount ────────────
-const [configLoaded, setConfigLoaded] = useState(false);
-
-useEffect(() => {
-  let cancelled = false;
-
-  (async () => {
-    try {
-      const res = await fetch(resolveApiUrl("/api/search/config"), {
-        cache: "no-store",
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      if (cancelled) return;
-
-      const authoritative = data.search_config || {};
-      // Push authoritative config to parent so the rest of the app sees it
-      setConfig((prev: any) => ({
-        ...prev,
-        search: { ...(prev.search || {}), ...authoritative },
-      }));
-
-      // Mark as loaded — auto-save can now start
-      setConfigLoaded(true);
-      // Prime the snapshot so the first effect run doesn't trigger a save
-      lastSnapshotRef.current = JSON.stringify(authoritative);
-    } catch (err) {
-      console.error("Failed to load search config:", err);
-      setConfigLoaded(true); // still allow editing
-    }
-  })();
-
-  return () => { cancelled = true; };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-}, []);
-
-  // ── Auto-save state ────────────────────────────────────────────────
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [lastSavedAt, setLastSavedAt] = useState<Date | null>(null);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isFirstRender = useRef(true);
   const lastSnapshotRef = useRef<string>("");
 
-  // ----------------------------------------------------------
-  // Persist to backend (dedicated endpoint)
-  // ----------------------------------------------------------
-  const persistSearchConfig = useCallback(
-    async (nextSearchConfig: any) => {
-      setSaveState("saving");
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
       try {
         const res = await fetch(resolveApiUrl("/api/search/config"), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ search_config: nextSearchConfig }),
+          cache: "no-store",
         });
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (cancelled) return;
+
+        const authoritative = data.search_config || {};
+        if (data.effective_costs) {
+          setEffectiveCosts(data.effective_costs);
         }
-        setSaveState("saved");
-        setLastSavedAt(new Date());
-        // Reset to idle after a moment so the badge fades back
-        setTimeout(() => setSaveState((s) => (s === "saved" ? "idle" : s)), 2500);
+        if (data.config_error) {
+          setConfigErrorBanner(data.config_error);
+        } else {
+          setConfigErrorBanner(null);
+        }
+
+        setConfig((prev: any) => ({
+          ...prev,
+          search: { ...(prev.search || {}), ...authoritative },
+        }));
+
+        setConfigLoaded(true);
+        lastSnapshotRef.current = JSON.stringify(authoritative);
       } catch (err) {
-        console.error("Failed to save search config:", err);
-        setSaveState("error");
+        console.error("Failed to load search config:", err);
+        setConfigLoaded(true);
       }
-    },
-    []
-  );
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ----------------------------------------------------------
+  // Persist to backend (only marks saved after backend confirms)
+  // ----------------------------------------------------------
+  const persistSearchConfig = useCallback(async (nextSearchConfig: any) => {
+    setSaveState("saving");
+    setSaveErrorMsg(null);
+    try {
+      const res = await fetch(resolveApiUrl("/api/search/config"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ search_config: nextSearchConfig }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.ok === false) {
+        throw new Error(data.detail || data.message || `HTTP ${res.status}`);
+      }
+      if (data.effective_costs) {
+        setEffectiveCosts(data.effective_costs);
+      }
+      setConfigErrorBanner(null);
+      setSaveState("saved");
+      setLastSavedAt(new Date());
+      setTimeout(() => setSaveState((s) => (s === "saved" ? "idle" : s)), 2500);
+    } catch (err: any) {
+      console.error("Failed to save search config:", err);
+      setSaveErrorMsg(err?.message || "Failed to save configuration.");
+      setSaveState("error");
+    }
+  }, []);
 
   // ----------------------------------------------------------
   // Debounced auto-save on any search config change
   // ----------------------------------------------------------
   useEffect(() => {
-    // Serialize to detect real changes
+    if (!configLoaded) return;
     const snapshot = JSON.stringify(searchConfig);
 
     if (isFirstRender.current) {
@@ -231,19 +382,15 @@ useEffect(() => {
     return () => {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchConfig]);
+  }, [searchConfig, configLoaded, persistSearchConfig]);
 
-  // ----------------------------------------------------------
-  // Manual save (bypass debounce)
-  // ----------------------------------------------------------
   const handleManualSave = async () => {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     await persistSearchConfig(searchConfig);
   };
 
   // ----------------------------------------------------------
-  // Update helpers (still update parent state for consistency)
+  // Update helpers
   // ----------------------------------------------------------
   const updateSearch = (partial: any) => {
     setConfig({
@@ -278,17 +425,34 @@ useEffect(() => {
   };
 
   const handleTestConnection = async (engineId: string) => {
+    if (pings[engineId]?.testing) return;
     setPings((prev) => ({ ...prev, [engineId]: { testing: true } }));
     try {
       const res = await fetch(resolveApiUrl("/api/search/test-connection"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider: engineId, config: searchConfig }),
+        body: JSON.stringify({
+          provider: engineId,
+          config: searchConfig,
+          check_type: "credentials",
+        }),
       });
       const data = await res.json();
       setPings((prev) => ({
         ...prev,
-        [engineId]: { testing: false, ok: data.ok, latency_ms: data.latency_ms, msg: data.message },
+        [engineId]: {
+          testing: false,
+          ok: data.ok,
+          status: data.status,
+          reachable: data.reachable,
+          authenticated: data.authenticated,
+          quota_available: data.quota_available,
+          consumes_quota: data.consumes_quota,
+          latency_ms: data.latency_ms,
+          estimated_cost_usd: data.estimated_cost_usd,
+          cost_basis: data.cost_basis,
+          msg: data.message,
+        },
       }));
     } catch (err: any) {
       setPings((prev) => ({
@@ -305,6 +469,7 @@ useEffect(() => {
   );
 
   const isWebEgressEnabled = searchConfig.enabled !== false;
+  const isPrivacyMode = Boolean(searchConfig.privacy_mode);
   const primaryEngine = searchConfig.engine || "DuckDuckGo";
   const fallbackList: string[] = Array.isArray(searchConfig.fallback_engines)
     ? searchConfig.fallback_engines
@@ -339,13 +504,13 @@ useEffect(() => {
                 Search Engine Orchestration
               </h1>
               <p className="text-[10px] text-muted-foreground">
-                Providers · credentials · pricing · fallback chain
+                First-success failover · contract diagnostics · estimated cost basis
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-2 flex-wrap">
-            <SaveIndicator state={saveState} lastSavedAt={lastSavedAt} />
+            <SaveIndicator state={saveState} lastSavedAt={lastSavedAt} errorMsg={saveErrorMsg} />
             <Button
               variant="outline"
               onClick={handleManualSave}
@@ -365,7 +530,7 @@ useEffect(() => {
                 className="h-8 text-xs gap-1.5 border-primary/40 bg-primary/10 hover:bg-primary/20 text-primary cursor-pointer hover:scale-105 transition-transform"
               >
                 <Activity size={12} />
-                <span className="hidden sm:inline">Telemetry</span>
+                <span className="hidden sm:inline">Telemetry & Live Test</span>
                 <ExternalLink size={11} />
               </Button>
             </Link>
@@ -374,6 +539,25 @@ useEffect(() => {
       </motion.header>
 
       <main className="max-w-7xl w-full mx-auto p-6 space-y-6 flex-1 relative">
+        {/* Config parse error banner if config.toml is malformed */}
+        {configErrorBanner && (
+          <div className="flex items-start gap-3 p-4 rounded-xl border border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-400 text-xs">
+            <XCircle size={16} className="shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <div className="font-semibold">Configuration Syntax Error in config.toml</div>
+              <div className="font-mono text-[11px] opacity-90">{configErrorBanner}</div>
+            </div>
+          </div>
+        )}
+
+        {/* Validation error banner on save */}
+        {saveErrorMsg && (
+          <div className="flex items-start gap-3 p-3.5 rounded-xl border border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-400 text-xs">
+            <AlertCircle size={15} className="shrink-0 mt-0.5" />
+            <div>{saveErrorMsg}</div>
+          </div>
+        )}
+
         {/* Summary KPIs */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
           <SummaryCard
@@ -384,28 +568,41 @@ useEffect(() => {
             subtitle={isWebEgressEnabled ? "Outbound requests permitted" : "All network calls blocked"}
             delay={0}
           />
-          <SummaryCard label="Active Providers" value={`${enabledCount} / ${PROVIDERS.length}`} icon={<Network size={18} className="text-primary" />} accent="#3b82f6" subtitle={`${PROVIDERS.length - enabledCount} disabled`} delay={0.05} />
-          <SummaryCard label="Primary Engine" value={primaryEngine} icon={<Sparkles size={18} className="text-amber-500" />} accent="#f59e0b" subtitle="First engine queried" delay={0.1} />
           <SummaryCard
-            label="Fallback Chain"
-            value={fallbackList.length.toString()}
+            label="Active Providers"
+            value={`${enabledCount} / ${PROVIDERS.length}`}
+            icon={<Network size={18} className="text-primary" />}
+            accent="#3b82f6"
+            subtitle={`${PROVIDERS.length - enabledCount} disabled`}
+            delay={0.05}
+          />
+          <SummaryCard
+            label="Primary Engine"
+            value={primaryEngine}
+            icon={<Sparkles size={18} className="text-amber-500" />}
+            accent="#f59e0b"
+            subtitle="First engine queried"
+            delay={0.1}
+          />
+          <SummaryCard
+            label="Failover Chain"
+            value={fallbackList.length === 0 ? "Single-Engine" : `${fallbackList.length} Fallback(s)`}
             icon={<Gauge size={18} className="text-cyan-500" />}
             accent="#06b6d4"
-            subtitle={fallbackList.length === 0 ? "No fallbacks configured" : fallbackList.join(" → ")}
+            subtitle={fallbackList.length === 0 ? "Strict primary-only mode (fallback_engines=[])" : fallbackList.join(" → ")}
             delay={0.15}
           />
         </div>
 
-        {/* Warning if DDG is not in fallback chain */}
-        {!fallbackList.includes("DuckDuckGo") && primaryEngine !== "DuckDuckGo" && (
+        {/* Single-provider mode informational notice (replaces old DDG warning) */}
+        {fallbackList.length === 0 && (
           <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} className="overflow-hidden">
-            <div className="flex items-start gap-3 p-4 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400 text-xs">
-              <AlertCircle size={16} className="shrink-0 mt-0.5" />
-              <div className="space-y-1">
-                <div className="font-semibold">Recommendation: Add DuckDuckGo to the fallback chain</div>
-                <div className="opacity-90">
-                  DuckDuckGo is the only provider that works without API keys. Without it,
-                  all searches fail if every other provider lacks credentials.
+            <div className="flex items-start gap-3 p-3.5 rounded-xl border border-cyan-500/30 bg-cyan-500/10 text-cyan-700 dark:text-cyan-300 text-xs">
+              <Info size={16} className="shrink-0 mt-0.5" />
+              <div className="space-y-0.5">
+                <div className="font-semibold">Single-Provider Isolation Mode Active (fallback_engines = [])</div>
+                <div className="opacity-90 text-[11px]">
+                  Only <strong>{primaryEngine}</strong> will be called. No secondary provider will be tried automatically on failure, ensuring deterministic single-provider testing and predictable cost.
                 </div>
               </div>
             </div>
@@ -423,24 +620,41 @@ useEffect(() => {
               </div>
               <div>
                 <h3 className="text-xs font-semibold font-heading uppercase tracking-wider">Global Orchestration</h3>
-                <p className="text-[11px] text-muted-foreground">Primary engine, fallback sequence, and locale defaults</p>
+                <p className="text-[11px] text-muted-foreground">Primary engine, first-success failover sequence, deadline budget, and privacy</p>
               </div>
             </div>
-            <button
-              type="button"
-              onClick={() => updateSearch({ enabled: searchConfig.enabled === false ? true : false })}
-              className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all cursor-pointer border ${
-                isWebEgressEnabled
-                  ? "bg-emerald-500/10 border-emerald-500/40 text-emerald-600 dark:text-emerald-400"
-                  : "bg-rose-500/10 border-rose-500/40 text-rose-600 dark:text-rose-400"
-              }`}
-            >
-              <span className="relative flex h-2 w-2">
-                {isWebEgressEnabled && (<span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />)}
-                <span className={`relative inline-flex rounded-full h-2 w-2 ${isWebEgressEnabled ? "bg-emerald-500" : "bg-rose-500"}`} />
-              </span>
-              {isWebEgressEnabled ? "Enabled" : "Air-Gapped"}
-            </button>
+
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                type="button"
+                onClick={() => updateSearch({ privacy_mode: !isPrivacyMode })}
+                title="When enabled, the local SQLite usage ledger stores only the SHA-256 query hash instead of plain query text."
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all cursor-pointer border ${
+                  isPrivacyMode
+                    ? "bg-purple-500/10 border-purple-500/40 text-purple-600 dark:text-purple-400"
+                    : "bg-background border-border text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <Lock size={12} />
+                <span>{isPrivacyMode ? "Ledger Privacy: Hash-Only" : "Ledger Privacy: Standard"}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => updateSearch({ enabled: searchConfig.enabled === false ? true : false })}
+                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all cursor-pointer border ${
+                  isWebEgressEnabled
+                    ? "bg-emerald-500/10 border-emerald-500/40 text-emerald-600 dark:text-emerald-400"
+                    : "bg-rose-500/10 border-rose-500/40 text-rose-600 dark:text-rose-400"
+                }`}
+              >
+                <span className="relative flex h-2 w-2">
+                  {isWebEgressEnabled && (<span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />)}
+                  <span className={`relative inline-flex rounded-full h-2 w-2 ${isWebEgressEnabled ? "bg-emerald-500" : "bg-rose-500"}`} />
+                </span>
+                {isWebEgressEnabled ? "Enabled" : "Air-Gapped"}
+              </button>
+            </div>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
@@ -459,7 +673,9 @@ useEffect(() => {
             </div>
 
             <div>
-              <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-2">Fallback Chain</label>
+              <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-2">
+                Failover Chain (First-Success · Leave unselected for Single-Engine Mode)
+              </label>
               <div className="flex flex-wrap gap-1.5">
                 {ENGINE_OPTIONS.map((eng) => {
                   const isSelected = fallbackList.includes(eng);
@@ -483,11 +699,40 @@ useEffect(() => {
             </div>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 pt-4 border-t border-border/60">
-            <CompactField label="Retry Delay (s)" value={searchConfig.retry_delay ?? 5} onChange={(v) => updateSearch({ retry_delay: v })} />
-            <CompactField label="Max Retries" value={searchConfig.max_retries ?? 3} onChange={(v) => updateSearch({ max_retries: v })} />
-            <CompactTextField label="Language" value={searchConfig.lang || "en"} onChange={(v) => updateSearch({ lang: v })} placeholder="en / ar" />
-            <CompactTextField label="Country" value={searchConfig.country || "us"} onChange={(v) => updateSearch({ country: v })} placeholder="us / eg" />
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 pt-4 border-t border-border/60">
+            <CompactField
+              label="Total Budget (s)"
+              value={searchConfig.total_budget_seconds ?? 22}
+              min={2}
+              max={23}
+              onChange={(v) => updateSearch({ total_budget_seconds: v })}
+            />
+            <CompactField
+              label="Transient Retries (0-2)"
+              value={searchConfig.max_retries ?? 0}
+              min={0}
+              max={2}
+              onChange={(v) => updateSearch({ max_retries: v })}
+            />
+            <CompactField
+              label="Retry Delay (s)"
+              value={searchConfig.retry_delay ?? 2}
+              min={0}
+              max={10}
+              onChange={(v) => updateSearch({ retry_delay: v })}
+            />
+            <CompactTextField
+              label="Language (ISO)"
+              value={searchConfig.lang || "en"}
+              onChange={(v) => updateSearch({ lang: v })}
+              placeholder="en / ar / ru"
+            />
+            <CompactTextField
+              label="Country (ISO)"
+              value={searchConfig.country || "us"}
+              onChange={(v) => updateSearch({ country: v })}
+              placeholder="us / eg / ru"
+            />
           </div>
         </motion.div>
 
@@ -498,31 +743,52 @@ useEffect(() => {
               <Network size={16} className="text-emerald-500" />
             </div>
             <div>
-              <h3 className="text-xs font-semibold font-heading uppercase tracking-wider">Provider Configuration</h3>
-              <p className="text-[11px] text-muted-foreground">{enabledCount} of {PROVIDERS.length} enabled · click any row to expand</p>
+              <h3 className="text-xs font-semibold font-heading uppercase tracking-wider">Provider Configuration & Contracts</h3>
+              <p className="text-[11px] text-muted-foreground">
+                {enabledCount} of {PROVIDERS.length} enabled · prices shown are local estimates unless reported by the API
+              </p>
             </div>
           </div>
         </motion.div>
 
         {/* Provider list */}
         <div className="rounded-xl border border-border bg-card shadow-sm overflow-hidden divide-y divide-border/40">
-          {PROVIDERS.map((provider, idx) => (
-            <ProviderListRow
-              key={provider.id}
-              provider={provider}
-              enabled={isEngineEnabled(provider.configKey)}
-              expanded={expandedProvider === provider.id}
-              onToggleExpand={() => setExpandedProvider(expandedProvider === provider.id ? null : provider.id)}
-              config={searchConfig}
-              ping={pings[provider.id]}
-              showKeys={showKeys}
-              onToggleEnabled={() => updateEngineSubConfig(provider.configKey, "enabled", !isEngineEnabled(provider.configKey))}
-              onUpdateField={(field, value) => updateEngineSubConfig(provider.configKey, field, value)}
-              onToggleShowKey={toggleShowKey}
-              onTest={() => handleTestConnection(provider.id)}
-              delay={0.35 + idx * 0.04}
-            />
-          ))}
+          {PROVIDERS.map((provider, idx) => {
+            const sub = searchConfig[provider.configKey] || {};
+            const effectiveCost =
+              typeof sub.cost_per_query === "number"
+                ? sub.cost_per_query
+                : effectiveCosts[provider.id] ?? provider.defaultCost;
+
+            return (
+              <ProviderListRow
+                key={provider.id}
+                provider={provider}
+                enabled={isEngineEnabled(provider.configKey)}
+                expanded={expandedProvider === provider.id}
+                onToggleExpand={() =>
+                  setExpandedProvider(expandedProvider === provider.id ? null : provider.id)
+                }
+                config={searchConfig}
+                effectiveCost={effectiveCost}
+                ping={pings[provider.id]}
+                showKeys={showKeys}
+                onToggleEnabled={() =>
+                  updateEngineSubConfig(
+                    provider.configKey,
+                    "enabled",
+                    !isEngineEnabled(provider.configKey)
+                  )
+                }
+                onUpdateField={(field, value) =>
+                  updateEngineSubConfig(provider.configKey, field, value)
+                }
+                onToggleShowKey={toggleShowKey}
+                onTest={() => handleTestConnection(provider.id)}
+                delay={0.35 + idx * 0.04}
+              />
+            );
+          })}
         </div>
       </main>
     </div>
@@ -532,13 +798,41 @@ useEffect(() => {
 // ---------------------------------------------------------------------------
 // Save Indicator
 // ---------------------------------------------------------------------------
-function SaveIndicator({ state, lastSavedAt }: { state: SaveState; lastSavedAt: Date | null }) {
+function SaveIndicator({
+  state,
+  lastSavedAt,
+  errorMsg,
+}: {
+  state: SaveState;
+  lastSavedAt: Date | null;
+  errorMsg?: string | null;
+}) {
   const map: Record<SaveState, { label: string; cls: string; icon: React.ReactNode }> = {
-    idle: { label: lastSavedAt ? `Saved ${lastSavedAt.toLocaleTimeString()}` : "Auto-save on", cls: "text-muted-foreground border-border/60 bg-background/60", icon: <CheckCircle2 size={11} /> },
-    dirty: { label: "Unsaved changes", cls: "text-amber-600 dark:text-amber-400 border-amber-500/40 bg-amber-500/10", icon: <AlertCircle size={11} /> },
-    saving: { label: "Saving...", cls: "text-primary border-primary/40 bg-primary/10", icon: <Loader2 size={11} className="animate-spin" /> },
-    saved: { label: "All changes saved", cls: "text-emerald-600 dark:text-emerald-400 border-emerald-500/40 bg-emerald-500/10", icon: <CheckCircle2 size={11} /> },
-    error: { label: "Save failed — click Save", cls: "text-rose-600 dark:text-rose-400 border-rose-500/40 bg-rose-500/10", icon: <XCircle size={11} /> },
+    idle: {
+      label: lastSavedAt ? `Saved ${lastSavedAt.toLocaleTimeString()}` : "Auto-save on",
+      cls: "text-muted-foreground border-border/60 bg-background/60",
+      icon: <CheckCircle2 size={11} />,
+    },
+    dirty: {
+      label: "Unsaved changes",
+      cls: "text-amber-600 dark:text-amber-400 border-amber-500/40 bg-amber-500/10",
+      icon: <AlertCircle size={11} />,
+    },
+    saving: {
+      label: "Saving...",
+      cls: "text-primary border-primary/40 bg-primary/10",
+      icon: <Loader2 size={11} className="animate-spin" />,
+    },
+    saved: {
+      label: "Confirmed saved",
+      cls: "text-emerald-600 dark:text-emerald-400 border-emerald-500/40 bg-emerald-500/10",
+      icon: <CheckCircle2 size={11} />,
+    },
+    error: {
+      label: errorMsg ? "Validation / save error" : "Save failed — click Save",
+      cls: "text-rose-600 dark:text-rose-400 border-rose-500/40 bg-rose-500/10",
+      icon: <XCircle size={11} />,
+    },
   };
   const cfg = map[state];
   return (
@@ -565,34 +859,93 @@ function SummaryCard({ label, value, icon, accent, subtitle, delay = 0 }: any) {
       whileHover={{ y: -4, transition: { duration: 0.2 } }}
       className="group relative p-5 rounded-xl border border-border bg-card overflow-hidden shadow-sm hover:shadow-lg hover:border-primary/30 transition-all"
     >
-      <div className="absolute top-0 left-0 right-0 h-[2px] opacity-60 group-hover:opacity-100 transition-opacity" style={{ background: `linear-gradient(90deg, transparent 0%, ${accent} 50%, transparent 100%)` }} />
-      <div className="absolute -top-10 -right-10 w-32 h-32 rounded-full opacity-[0.08] group-hover:opacity-[0.15] transition-opacity blur-2xl" style={{ backgroundColor: accent }} />
+      <div
+        className="absolute top-0 left-0 right-0 h-[2px] opacity-60 group-hover:opacity-100 transition-opacity"
+        style={{ background: `linear-gradient(90deg, transparent 0%, ${accent} 50%, transparent 100%)` }}
+      />
+      <div
+        className="absolute -top-10 -right-10 w-32 h-32 rounded-full opacity-[0.08] group-hover:opacity-[0.15] transition-opacity blur-2xl"
+        style={{ backgroundColor: accent }}
+      />
       <div className="relative flex items-start justify-between">
         <div className="flex-1 space-y-3 min-w-0">
-          <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block">{label}</span>
-          <div className="text-xl lg:text-2xl font-bold font-mono tabular-nums truncate" style={{ color: accent }}>{value}</div>
-          <div className="text-[11px] text-muted-foreground truncate" title={subtitle}>{subtitle}</div>
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block">
+            {label}
+          </span>
+          <div className="text-xl lg:text-2xl font-bold font-mono tabular-nums truncate" style={{ color: accent }}>
+            {value}
+          </div>
+          <div className="text-[11px] text-muted-foreground truncate" title={subtitle}>
+            {subtitle}
+          </div>
         </div>
-        <div className="p-2.5 rounded-lg shrink-0 ml-2" style={{ backgroundColor: `${accent}15`, border: `1px solid ${accent}30` }}>{icon}</div>
+        <div
+          className="p-2.5 rounded-lg shrink-0 ml-2"
+          style={{ backgroundColor: `${accent}15`, border: `1px solid ${accent}30` }}
+        >
+          {icon}
+        </div>
       </div>
     </motion.div>
   );
 }
 
-function CompactField({ label, value, onChange }: { label: string; value: number; onChange: (v: number) => void }) {
+function CompactField({
+  label,
+  value,
+  min = 0,
+  max = 60,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min?: number;
+  max?: number;
+  onChange: (v: number) => void;
+}) {
   return (
     <div className="p-3 rounded-lg border border-border/60 bg-background/60 hover:border-primary/30 transition-colors">
-      <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-1.5">{label}</label>
-      <input type="number" value={value} onChange={(e) => onChange(parseInt(e.target.value, 10) || 0)} className="w-full bg-transparent border-0 outline-none text-xs text-foreground font-mono focus:ring-0" />
+      <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-1.5">
+        {label}
+      </label>
+      <input
+        type="number"
+        min={min}
+        max={max}
+        value={value}
+        onChange={(e) => {
+          const parsed = parseFloat(e.target.value);
+          onChange(Number.isNaN(parsed) ? min : Math.max(min, Math.min(max, parsed)));
+        }}
+        className="w-full bg-transparent border-0 outline-none text-xs text-foreground font-mono focus:ring-0"
+      />
     </div>
   );
 }
 
-function CompactTextField({ label, value, onChange, placeholder }: { label: string; value: string; onChange: (v: string) => void; placeholder?: string }) {
+function CompactTextField({
+  label,
+  value,
+  onChange,
+  placeholder,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+}) {
   return (
     <div className="p-3 rounded-lg border border-border/60 bg-background/60 hover:border-primary/30 transition-colors">
-      <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-1.5">{label}</label>
-      <input type="text" value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} className="w-full bg-transparent border-0 outline-none text-xs text-foreground font-mono focus:ring-0" />
+      <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-1.5">
+        {label}
+      </label>
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        className="w-full bg-transparent border-0 outline-none text-xs text-foreground font-mono focus:ring-0"
+      />
     </div>
   );
 }
@@ -603,7 +956,8 @@ interface ProviderListRowProps {
   expanded: boolean;
   onToggleExpand: () => void;
   config: any;
-  ping?: { testing: boolean; ok?: boolean; latency_ms?: number; msg?: string };
+  effectiveCost: number;
+  ping?: DiagnosticState;
   showKeys: Record<string, boolean>;
   onToggleEnabled: () => void;
   onUpdateField: (field: string, value: any) => void;
@@ -613,11 +967,21 @@ interface ProviderListRowProps {
 }
 
 function ProviderListRow({
-  provider, enabled, expanded, onToggleExpand, config, ping, showKeys,
-  onToggleEnabled, onUpdateField, onToggleShowKey, onTest, delay,
+  provider,
+  enabled,
+  expanded,
+  onToggleExpand,
+  config,
+  effectiveCost,
+  ping,
+  showKeys,
+  onToggleEnabled,
+  onUpdateField,
+  onToggleShowKey,
+  onTest,
+  delay,
 }: ProviderListRowProps) {
   const subConfig = config[provider.configKey] || {};
-  const cost = subConfig.cost_per_query ?? 0.0;
   const Icon = BrandIcons[provider.iconKey];
 
   return (
@@ -631,16 +995,37 @@ function ProviderListRow({
         <div className="absolute left-0 top-0 bottom-0 w-[3px]" style={{ backgroundColor: provider.accent }} />
       )}
 
-      <button type="button" onClick={onToggleExpand} className="w-full flex items-center gap-0 p-4 text-left cursor-pointer hover:bg-muted/30 transition-colors">
-        <div className="shrink-0 w-11 h-11 flex items-center justify-center transition-transform" style={{ color: provider.accent }}>
+      <button
+        type="button"
+        onClick={onToggleExpand}
+        className="w-full flex items-center gap-0 p-4 text-left cursor-pointer hover:bg-muted/30 transition-colors"
+      >
+        <div
+          className="shrink-0 w-11 h-11 flex items-center justify-center transition-transform"
+          style={{ color: provider.accent }}
+        >
           <Icon width={22} height={22} />
         </div>
 
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             <span className="text-sm font-semibold text-foreground">{provider.name}</span>
+            {provider.lifecycle === "legacy" && (
+              <span className="text-[9px] font-mono font-semibold px-1.5 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400">
+                Legacy · Retires 2027-01-01
+              </span>
+            )}
+            <span className="text-[9px] font-mono text-muted-foreground px-1.5 py-0.5 rounded bg-muted/60">
+              max {provider.maxResultsLimit}/q
+            </span>
             {provider.docsUrl && (
-              <a href={provider.docsUrl} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} className="text-[10px] text-muted-foreground hover:text-primary transition-colors flex items-center gap-0.5">
+              <a
+                href={provider.docsUrl}
+                target="_blank"
+                rel="noreferrer"
+                onClick={(e) => e.stopPropagation()}
+                className="text-[10px] text-muted-foreground hover:text-primary transition-colors flex items-center gap-0.5"
+              >
                 <ExternalLink size={9} />
                 <span className="hidden sm:inline">docs</span>
               </a>
@@ -650,16 +1035,31 @@ function ProviderListRow({
         </div>
 
         <div className="flex items-center gap-3 shrink-0">
-          <span className={`text-[10px] font-mono font-semibold px-2 py-0.5 rounded-md border ${
-            enabled ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30" : "bg-muted/50 text-muted-foreground border-border"
-          }`}>
+          <span
+            className={`text-[10px] font-mono font-semibold px-2 py-0.5 rounded-md border ${
+              enabled
+                ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30"
+                : "bg-muted/50 text-muted-foreground border-border"
+            }`}
+          >
             {enabled ? "Active" : "Off"}
           </span>
-          <span className="text-[10px] text-muted-foreground font-mono tabular-nums hidden md:inline">${cost.toFixed(4)}/q</span>
+          <span
+            className="text-[10px] text-muted-foreground font-mono tabular-nums hidden md:inline"
+            title="Estimated cost per query/credit"
+          >
+            Est. ${Number(effectiveCost).toFixed(4)}/q
+          </span>
           {ping && !ping.testing && (
-            <span className={`text-[10px] font-mono flex items-center gap-1 ${ping.ok ? "text-emerald-500" : "text-rose-500"}`}>
+            <span
+              className={`text-[10px] font-mono flex items-center gap-1 ${
+                ping.ok ? "text-emerald-500" : "text-rose-500"
+              }`}
+            >
               {ping.ok ? <CheckCircle2 size={11} /> : <XCircle size={11} />}
-              {ping.ok && typeof ping.latency_ms === "number" ? `${Math.round(ping.latency_ms)}ms` : "Failed"}
+              {ping.ok && typeof ping.latency_ms === "number"
+                ? `${Math.round(ping.latency_ms)}ms`
+                : ping.status || "Failed"}
             </span>
           )}
           <motion.div animate={{ rotate: expanded ? 180 : 0 }} transition={{ duration: 0.2 }}>
@@ -679,13 +1079,22 @@ function ProviderListRow({
             className="overflow-hidden"
           >
             <div className="px-4 pb-4 pl-[68px] space-y-3 bg-muted/10">
+              {provider.lifecycleNotice && (
+                <div className="flex items-start gap-2 p-2.5 rounded-lg border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-[11px]">
+                  <AlertCircle size={14} className="shrink-0 mt-0.5" />
+                  <span>{provider.lifecycleNotice}</span>
+                </div>
+              )}
+
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 pt-1">
                 {provider.fields.map((field) => {
                   if (field.type === "password") {
                     const isVisible = showKeys[field.secretKey || provider.id];
                     return (
                       <div key={field.key} className="space-y-1">
-                        <label className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">{field.label}</label>
+                        <label className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">
+                          {field.label}
+                        </label>
                         <div className="relative">
                           <input
                             type={isVisible ? "text" : "password"}
@@ -694,22 +1103,53 @@ function ProviderListRow({
                             placeholder={field.placeholder}
                             className="w-full bg-background border border-border rounded-lg px-2.5 py-1.5 text-[11px] text-foreground font-mono pr-7 focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow"
                           />
-                          <button type="button" onClick={() => onToggleShowKey(field.secretKey || provider.id)} className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground cursor-pointer">
+                          <button
+                            type="button"
+                            onClick={() => onToggleShowKey(field.secretKey || provider.id)}
+                            className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground cursor-pointer"
+                          >
                             {isVisible ? <EyeOff size={11} /> : <Eye size={11} />}
                           </button>
                         </div>
                       </div>
                     );
                   }
+
+                  if (field.type === "select") {
+                    const val = subConfig[field.key] || field.defaultValue || field.options[0];
+                    return (
+                      <div key={field.key} className="space-y-1">
+                        <label className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">
+                          {field.label}
+                        </label>
+                        <select
+                          value={val}
+                          onChange={(e) => onUpdateField(field.key, e.target.value)}
+                          className="w-full bg-background border border-border rounded-lg px-2.5 py-1.5 text-[11px] text-foreground font-mono focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow"
+                        >
+                          {field.options.map((opt) => (
+                            <option key={opt} value={opt}>
+                              {opt}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    );
+                  }
+
                   return (
                     <div key={field.key} className="space-y-1">
-                      <label className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">{field.label}</label>
+                      <label className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">
+                        {field.label}
+                      </label>
                       <input
                         type="text"
                         value={subConfig[field.key] || ""}
                         onChange={(e) => onUpdateField(field.key, e.target.value)}
                         placeholder={field.placeholder}
-                        className={`w-full bg-background border border-border rounded-lg px-2.5 py-1.5 text-[11px] text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow ${field.mono ? "font-mono" : ""}`}
+                        className={`w-full bg-background border border-border rounded-lg px-2.5 py-1.5 text-[11px] text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow ${
+                          field.mono ? "font-mono" : ""
+                        }`}
                       />
                     </div>
                   );
@@ -717,10 +1157,19 @@ function ProviderListRow({
 
                 {provider.costField && (
                   <div className="space-y-1">
-                    <label className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">Cost per Query (USD)</label>
+                    <label className="text-[9px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      Estimated Cost per Query (USD)
+                    </label>
                     <input
-                      type="number" step="0.001" min={0} value={cost}
-                      onChange={(e) => onUpdateField("cost_per_query", parseFloat(e.target.value) || 0.0)}
+                      type="number"
+                      step="0.001"
+                      min={0}
+                      max={10}
+                      value={effectiveCost}
+                      onChange={(e) => {
+                        const val = parseFloat(e.target.value);
+                        onUpdateField("cost_per_query", Number.isNaN(val) ? 0.0 : Math.max(0.0, val));
+                      }}
                       className="w-full bg-background border border-border rounded-lg px-2.5 py-1.5 text-[11px] text-foreground font-mono focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow"
                     />
                   </div>
@@ -728,24 +1177,69 @@ function ProviderListRow({
               </div>
 
               <div className="flex items-center justify-between pt-3 border-t border-border/40 flex-wrap gap-2">
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
                   <Button
                     variant="outline"
-                    onClick={(e) => { e.stopPropagation(); onTest(); }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onTest();
+                    }}
                     disabled={ping?.testing}
                     className="h-7 text-[11px] px-2.5 gap-1.5 cursor-pointer hover:scale-105 transition-transform disabled:hover:scale-100"
                   >
-                    {ping?.testing ? <RefreshCw size={11} className="animate-spin" /> : <Activity size={11} />}
+                    {ping?.testing ? (
+                      <RefreshCw size={11} className="animate-spin" />
+                    ) : (
+                      <Activity size={11} />
+                    )}
                     <span>{ping?.testing ? "Testing..." : provider.testLabel}</span>
                   </Button>
-                  {ping?.msg && !ping.testing && (
-                    <span className={`text-[10px] ${ping.ok ? "text-muted-foreground" : "text-rose-500"}`}>{ping.msg}</span>
+
+                  {provider.consumesQuotaOnTest && (
+                    <span className="text-[9px] font-mono text-amber-600 dark:text-amber-400 bg-amber-500/10 border border-amber-500/30 px-1.5 py-0.5 rounded">
+                      Billable probe (1 req)
+                    </span>
+                  )}
+
+                  {ping && !ping.testing && (
+                    <div className="flex items-center gap-1.5 flex-wrap text-[10px]">
+                      {typeof ping.reachable === "boolean" && (
+                        <span
+                          className={`font-mono px-1.5 py-0.5 rounded border ${
+                            ping.reachable
+                              ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-500"
+                              : "border-rose-500/30 bg-rose-500/10 text-rose-500"
+                          }`}
+                        >
+                          {ping.reachable ? "Reachable" : "Unreachable"}
+                        </span>
+                      )}
+                      {typeof ping.authenticated === "boolean" && (
+                        <span
+                          className={`font-mono px-1.5 py-0.5 rounded border ${
+                            ping.authenticated
+                              ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-500"
+                              : "border-rose-500/30 bg-rose-500/10 text-rose-500"
+                          }`}
+                        >
+                          {ping.authenticated ? "Auth OK" : "Auth Rejected"}
+                        </span>
+                      )}
+                      {ping.msg && (
+                        <span className={ping.ok ? "text-muted-foreground" : "text-rose-500"}>
+                          {ping.msg}
+                        </span>
+                      )}
+                    </div>
                   )}
                 </div>
 
                 <button
                   type="button"
-                  onClick={(e) => { e.stopPropagation(); onToggleEnabled(); }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onToggleEnabled();
+                  }}
                   className={`text-[10px] font-mono font-semibold px-2.5 py-1 rounded-md border cursor-pointer transition-all ${
                     enabled
                       ? "bg-rose-500/10 text-rose-600 dark:text-rose-400 border-rose-500/30 hover:bg-rose-500/20"

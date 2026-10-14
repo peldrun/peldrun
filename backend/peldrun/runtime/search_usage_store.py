@@ -3,12 +3,9 @@ backend/peldrun/runtime/search_usage_store.py
 
 PELDRUN Dedicated Search Telemetry & Quota Accounting Store.
 Uses an isolated SQLite database file with guaranteed connection closure
-to completely eliminate event loop deadlocks and file lock contention.
-
-FIXED: Separated singleton creation lock from database lock, and made the
-DB lock reentrant to prevent the self-deadlock that occurred when
-get_search_usage_store() acquired the class lock and then _init_database()
-tried to acquire the same lock again.
+and automatic schema migration to record provider status, physical request
+counts, provider-reported usage units, cost basis, and optional privacy
+redaction without blocking the asyncio event loop.
 """
 
 from __future__ import annotations
@@ -19,7 +16,7 @@ from pathlib import Path
 import sqlite3
 import threading
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Union
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -27,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 logger = logging.getLogger("peldrun.runtime.search_usage_store")
 
 NANO_USD_PER_USD = 1_000_000_000
+REDACTED_QUERY_PLACEHOLDER = "[REDACTED_PRIVACY_MODE]"
 
 
 class SearchUsageRecord(BaseModel):
@@ -38,29 +36,26 @@ class SearchUsageRecord(BaseModel):
     query: str
     query_hash: str
     provider: str
+    status: str = "success"
     is_success: bool = True
+    request_count: int = 1
+    usage_units: Optional[float] = None
     results_count: int = 0
     latency_ms: float = 0.0
     cost_nano_usd: int = 0
+    cost_basis: str = "unknown"
     error_message: Optional[str] = None
     session_id: Optional[str] = None
     run_id: Optional[str] = None
 
 
-# ── FIX #1: Two completely independent locks ──────────────────────────────
-# _singleton_lock : guards the creation of the singleton instance only.
-# _db_lock        : guards SQLite writes/reads. Made reentrant so nested
-#                   acquisitions (init -> insert) never deadlock.
 _singleton_lock: threading.Lock = threading.Lock()
 
 
 class SearchUsageStore:
-    """Isolated thread-safe SQLite ledger with safe per-query connection management."""
+    """Isolated thread-safe SQLite ledger with per-operation connection management."""
 
     _instance: Optional["SearchUsageStore"] = None
-
-    # FIX #2: Use RLock (reentrant) instead of Lock.
-    # This alone is sufficient to fix the deadlock even if init is nested.
     _db_lock: threading.RLock = threading.RLock()
 
     def __init__(self, db_path: Optional[Union[str, Path]] = None) -> None:
@@ -77,29 +72,35 @@ class SearchUsageStore:
         self._init_database()
 
     def _init_database(self) -> None:
-        # FIX #3: Use the reentrant DB lock (separate from the singleton lock).
         with self._db_lock:
             try:
                 conn = sqlite3.connect(str(self.db_path), timeout=5.0)
                 try:
                     conn.execute("PRAGMA journal_mode=WAL;")
                     conn.execute("PRAGMA synchronous=NORMAL;")
-                    conn.execute("""
+                    conn.execute(
+                        """
                         CREATE TABLE IF NOT EXISTS search_usage_ledger (
                             record_id TEXT PRIMARY KEY,
                             timestamp REAL NOT NULL,
                             query TEXT NOT NULL,
                             query_hash TEXT NOT NULL,
                             provider TEXT NOT NULL,
+                            status TEXT NOT NULL DEFAULT 'success',
                             is_success INTEGER NOT NULL,
+                            request_count INTEGER NOT NULL DEFAULT 1,
+                            usage_units REAL,
                             results_count INTEGER NOT NULL,
                             latency_ms REAL NOT NULL,
                             cost_nano_usd INTEGER NOT NULL,
+                            cost_basis TEXT NOT NULL DEFAULT 'unknown',
                             error_message TEXT,
                             session_id TEXT,
                             run_id TEXT
                         );
-                    """)
+                        """
+                    )
+                    self._migrate_schema_if_needed(conn)
                     conn.execute(
                         "CREATE INDEX IF NOT EXISTS idx_search_ledger_ts "
                         "ON search_usage_ledger(timestamp);"
@@ -114,6 +115,27 @@ class SearchUsageStore:
             except Exception as exc:
                 logger.error(f"Failed to initialize peldrun_search_usage schema: {exc}")
 
+    @staticmethod
+    def _migrate_schema_if_needed(conn: sqlite3.Connection) -> None:
+        """
+        Safely add new accounting columns to pre-existing SQLite ledger files
+        without dropping existing telemetry records.
+        """
+        rows = conn.execute("PRAGMA table_info(search_usage_ledger);").fetchall()
+        existing_cols: Set[str] = {str(r[1]) for r in rows}
+
+        migrations = [
+            ("status", "TEXT NOT NULL DEFAULT 'success'"),
+            ("request_count", "INTEGER NOT NULL DEFAULT 1"),
+            ("usage_units", "REAL"),
+            ("cost_basis", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ]
+        for col_name, col_def in migrations:
+            if col_name not in existing_cols:
+                conn.execute(
+                    f"ALTER TABLE search_usage_ledger ADD COLUMN {col_name} {col_def};"
+                )
+
     def record_search(
         self,
         query: str,
@@ -125,20 +147,40 @@ class SearchUsageStore:
         error_message: Optional[str] = None,
         session_id: Optional[str] = None,
         run_id: Optional[str] = None,
+        *,
+        status: Optional[str] = None,
+        request_count: int = 1,
+        usage_units: Optional[float] = None,
+        cost_basis: str = "unknown",
+        privacy_mode: bool = False,
+        record_id: Optional[str] = None,
     ) -> Optional[SearchUsageRecord]:
         try:
-            clean_q = query.strip()
+            clean_q = (query or "").strip()
             q_hash = hashlib.sha256(clean_q.lower().encode("utf-8")).hexdigest()[:16]
-            cost_nano = int(round(cost_usd * NANO_USD_PER_USD))
+            stored_query = REDACTED_QUERY_PLACEHOLDER if privacy_mode else clean_q
+
+            safe_cost = max(0.0, float(cost_usd or 0.0))
+            cost_nano = int(round(safe_cost * NANO_USD_PER_USD))
+
+            effective_status = status or (
+                "success" if is_success else ("empty" if results_count == 0 and not error_message else "upstream_error")
+            )
+            safe_req_count = max(0, int(request_count if request_count is not None else 1))
 
             record = SearchUsageRecord(
-                query=clean_q,
+                record_id=record_id or str(uuid.uuid4()),
+                query=stored_query,
                 query_hash=q_hash,
                 provider=provider,
+                status=effective_status,
                 is_success=is_success,
-                results_count=results_count,
-                latency_ms=latency_ms,
+                request_count=safe_req_count,
+                usage_units=float(usage_units) if usage_units is not None else None,
+                results_count=max(0, int(results_count)),
+                latency_ms=max(0.0, float(latency_ms)),
                 cost_nano_usd=cost_nano,
+                cost_basis=str(cost_basis or "unknown"),
                 error_message=error_message,
                 session_id=session_id,
                 run_id=run_id,
@@ -149,10 +191,12 @@ class SearchUsageStore:
                 try:
                     conn.execute(
                         """
-                        INSERT INTO search_usage_ledger (
-                            record_id, timestamp, query, query_hash, provider, is_success,
-                            results_count, latency_ms, cost_nano_usd, error_message, session_id, run_id
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        INSERT OR REPLACE INTO search_usage_ledger (
+                            record_id, timestamp, query, query_hash, provider,
+                            status, is_success, request_count, usage_units,
+                            results_count, latency_ms, cost_nano_usd, cost_basis,
+                            error_message, session_id, run_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                         """,
                         (
                             record.record_id,
@@ -160,10 +204,14 @@ class SearchUsageStore:
                             record.query,
                             record.query_hash,
                             record.provider,
+                            record.status,
                             1 if record.is_success else 0,
+                            record.request_count,
+                            record.usage_units,
                             record.results_count,
                             record.latency_ms,
                             record.cost_nano_usd,
+                            record.cost_basis,
                             record.error_message,
                             record.session_id,
                             record.run_id,
@@ -174,16 +222,41 @@ class SearchUsageStore:
                     conn.close()
             return record
         except Exception as exc:
-            logger.debug(f"Failed to record search telemetry: {exc}")
+            logger.warning(f"Failed to record search telemetry: {exc}")
             return None
+
+    def clear_ledger(self) -> int:
+        """
+        Delete all persisted search usage records from the local SQLite ledger.
+        Returns the number of deleted rows.
+        """
+        try:
+            with self._db_lock:
+                conn = sqlite3.connect(str(self.db_path), timeout=5.0)
+                try:
+                    cursor = conn.execute("DELETE FROM search_usage_ledger;")
+                    deleted = (
+                        cursor.rowcount
+                        if cursor.rowcount is not None and cursor.rowcount >= 0
+                        else 0
+                    )
+                    conn.commit()
+                    return deleted
+                finally:
+                    conn.close()
+        except Exception as exc:
+            logger.error(f"Failed to clear search usage ledger: {exc}")
+            return 0
 
     def get_summary_metrics(self, period: str = "all") -> Dict[str, Any]:
         cutoff = self._get_period_cutoff(period)
         query_sql = """
             SELECT
                 COUNT(*) as total_queries,
+                COALESCE(SUM(request_count), COUNT(*)) as total_requests,
                 COALESCE(SUM(cost_nano_usd), 0) as total_cost_nano,
                 COALESCE(SUM(CASE WHEN is_success = 1 THEN 1 ELSE 0 END), 0) as successful_queries,
+                COALESCE(SUM(CASE WHEN status = 'empty' THEN 1 ELSE 0 END), 0) as empty_queries,
                 COALESCE(AVG(latency_ms), 0.0) as avg_latency_ms,
                 COALESCE(SUM(results_count), 0) as total_results
             FROM search_usage_ledger
@@ -201,19 +274,26 @@ class SearchUsageStore:
             if not row:
                 return self._empty_summary(period)
 
-            total_q = row["total_queries"]
-            succ_q = row["successful_queries"]
+            total_q = int(row["total_queries"] or 0)
+            succ_q = int(row["successful_queries"] or 0)
             return {
                 "period": period,
                 "total_queries": total_q,
-                "total_cost_usd": round(float(row["total_cost_nano"]) / NANO_USD_PER_USD, 4),
+                "total_requests": int(row["total_requests"] or 0),
+                "total_cost_usd": round(
+                    float(row["total_cost_nano"]) / NANO_USD_PER_USD, 4
+                ),
                 "successful_queries": succ_q,
+                "empty_queries": int(row["empty_queries"] or 0),
                 "failed_queries": total_q - succ_q,
-                "success_rate_pct": round((succ_q / total_q * 100.0) if total_q > 0 else 0.0, 2),
-                "avg_latency_ms": round(row["avg_latency_ms"], 2),
-                "total_results": row["total_results"],
+                "success_rate_pct": round(
+                    (succ_q / total_q * 100.0) if total_q > 0 else 0.0, 2
+                ),
+                "avg_latency_ms": round(float(row["avg_latency_ms"] or 0.0), 2),
+                "total_results": int(row["total_results"] or 0),
             }
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"Failed to read summary metrics: {exc}")
             return self._empty_summary(period)
 
     def get_provider_breakdown(self, period: str = "all") -> List[Dict[str, Any]]:
@@ -222,8 +302,10 @@ class SearchUsageStore:
             SELECT
                 provider,
                 COUNT(*) as queries_count,
+                COALESCE(SUM(request_count), COUNT(*)) as requests_count,
                 COALESCE(SUM(cost_nano_usd), 0) as cost_nano,
                 COALESCE(SUM(CASE WHEN is_success = 1 THEN 1 ELSE 0 END), 0) as successes,
+                COALESCE(SUM(CASE WHEN status = 'empty' THEN 1 ELSE 0 END), 0) as empty_count,
                 COALESCE(AVG(latency_ms), 0.0) as avg_latency_ms
             FROM search_usage_ledger
             WHERE timestamp >= ?
@@ -241,16 +323,28 @@ class SearchUsageStore:
                     conn.close()
 
             for r in rows:
-                q_count = r["queries_count"]
-                items.append({
-                    "provider": r["provider"],
-                    "queries_count": q_count,
-                    "cost_usd": round(float(r["cost_nano"]) / NANO_USD_PER_USD, 4),
-                    "success_rate_pct": round((r["successes"] / q_count * 100.0) if q_count > 0 else 0.0, 2),
-                    "avg_latency_ms": round(r["avg_latency_ms"], 2),
-                })
+                q_count = int(r["queries_count"] or 0)
+                items.append(
+                    {
+                        "provider": r["provider"],
+                        "queries_count": q_count,
+                        "requests_count": int(r["requests_count"] or q_count),
+                        "cost_usd": round(
+                            float(r["cost_nano"]) / NANO_USD_PER_USD, 4
+                        ),
+                        "empty_count": int(r["empty_count"] or 0),
+                        "success_rate_pct": round(
+                            (r["successes"] / q_count * 100.0)
+                            if q_count > 0
+                            else 0.0,
+                            2,
+                        ),
+                        "avg_latency_ms": round(float(r["avg_latency_ms"] or 0.0), 2),
+                    }
+                )
             return items
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"Failed to read provider breakdown: {exc}")
             return []
 
     def get_timeseries(self, period: str = "week") -> List[Dict[str, Any]]:
@@ -277,14 +371,19 @@ class SearchUsageStore:
                     conn.close()
 
             for r in rows:
-                timeseries.append({
-                    "date": r["bucket_date"],
-                    "queries": r["queries"],
-                    "cost_usd": round(float(r["cost_nano"]) / NANO_USD_PER_USD, 4),
-                    "successful": r["successful"],
-                })
+                timeseries.append(
+                    {
+                        "date": r["bucket_date"],
+                        "queries": int(r["queries"] or 0),
+                        "cost_usd": round(
+                            float(r["cost_nano"]) / NANO_USD_PER_USD, 4
+                        ),
+                        "successful": int(r["successful"] or 0),
+                    }
+                )
             return timeseries
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"Failed to read search timeseries: {exc}")
             return []
 
     @staticmethod
@@ -293,9 +392,9 @@ class SearchUsageStore:
         p = period.lower()
         if p == "day":
             return now - 86400.0
-        elif p == "week":
+        if p == "week":
             return now - (7 * 86400.0)
-        elif p == "month":
+        if p == "month":
             return now - (30 * 86400.0)
         return 0.0
 
@@ -304,8 +403,10 @@ class SearchUsageStore:
         return {
             "period": period,
             "total_queries": 0,
+            "total_requests": 0,
             "total_cost_usd": 0.0,
             "successful_queries": 0,
+            "empty_queries": 0,
             "failed_queries": 0,
             "success_rate_pct": 0.0,
             "avg_latency_ms": 0.0,
@@ -313,12 +414,9 @@ class SearchUsageStore:
         }
 
 
-def get_search_usage_store(db_path: Optional[Union[str, Path]] = None) -> SearchUsageStore:
-    """
-    FIX #4: Use the dedicated _singleton_lock (NOT the class _db_lock).
-    The instance constructor now uses _db_lock internally, so there is no
-    nested acquisition of the same lock object and no deadlock.
-    """
+def get_search_usage_store(
+    db_path: Optional[Union[str, Path]] = None,
+) -> SearchUsageStore:
     if SearchUsageStore._instance is None:
         with _singleton_lock:
             if SearchUsageStore._instance is None:
