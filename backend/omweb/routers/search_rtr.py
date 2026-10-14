@@ -624,6 +624,22 @@ def _build_provider_status_list(search_cfg: Dict[str, Any]) -> List[Dict[str, An
 
 
 # ---------------------------------------------------------------------------
+# Period helper for metrics queries
+# ---------------------------------------------------------------------------
+def _period_to_cutoff(period: str) -> float:
+    """Map a period keyword to a Unix timestamp cutoff."""
+    now = time.time()
+    p = (period or "all").strip().lower()
+    if p == "day":
+        return now - 86400.0
+    if p == "week":
+        return now - (7 * 86400.0)
+    if p == "month":
+        return now - (30 * 86400.0)
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 @router.get("/config")
@@ -694,51 +710,116 @@ async def get_search_providers() -> Dict[str, Any]:
 
 
 @router.get("/metrics")
-async def get_search_metrics(days: int = Query(default=30, ge=1, le=365)) -> Dict[str, Any]:
+async def get_search_metrics(
+    period: str = Query(default="week"),
+    days: int = Query(default=7, ge=1, le=365),
+) -> Dict[str, Any]:
+    """
+    Return search telemetry shaped for the frontend SearchTelemetryPage.
+
+    Response shape matches:
+      - summary       : KPI object
+      - breakdown     : per-provider array
+      - timeseries    : time-bucketed array
+      - privacy_mode  : boolean
+    """
     full_cfg = _load_full_config_dict()
     raw_search = full_cfg.get("search") if isinstance(full_cfg.get("search"), dict) else {}
     enriched = _enrich_search_config_with_defaults(raw_search)
     capabilities = SearchProviderFactory.get_provider_capabilities(enriched)
 
-    metrics_summary: Dict[str, Any] = {
-        "total_queries": 0, "successful_queries": 0, "failed_queries": 0,
-        "total_cost_usd": 0.0, "avg_latency_ms": 0.0,
-        "by_provider": {}, "recent": [],
+    empty_summary: Dict[str, Any] = {
+        "total_queries": 0,
+        "total_requests": 0,
+        "total_cost_usd": 0.0,
+        "successful_queries": 0,
+        "empty_queries": 0,
+        "failed_queries": 0,
+        "success_rate_pct": 0.0,
+        "avg_latency_ms": 0.0,
+        "total_results": 0,
     }
+
+    summary_data: Dict[str, Any] = dict(empty_summary)
+    breakdown_data: List[Dict[str, Any]] = []
+    timeseries_data: List[Dict[str, Any]] = []
+    privacy_mode = bool(enriched.get("privacy_mode", False))
 
     try:
         from peldrun.runtime import search_usage_store as sus_mod
+
         getter = getattr(sus_mod, "get_search_usage_store", None)
         if callable(getter):
             store = getter()
-            for m in ("get_metrics", "get_summary", "summarize", "get_summary_metrics"):
-                fn = getattr(store, m, None)
-                if callable(fn):
-                    sig = inspect.signature(fn)
-                    res = fn(days=days) if "days" in sig.parameters else (fn(period="all") if "period" in sig.parameters else fn())
+
+            # 1. Summary metrics
+            summary_fn = getattr(store, "get_summary_metrics", None)
+            if callable(summary_fn):
+                try:
+                    res = summary_fn(period=period)
                     if inspect.isawaitable(res):
                         res = await res
                     if isinstance(res, dict):
-                        metrics_summary.update(res)
-                    break
+                        summary_data.update(res)
+                except Exception as exc:
+                    logger.debug("summary metrics notice: %s", exc)
+
+            # 2. Per-provider breakdown
+            breakdown_fn = getattr(store, "get_provider_breakdown", None)
+            if callable(breakdown_fn):
+                try:
+                    res = breakdown_fn(period=period)
+                    if inspect.isawaitable(res):
+                        res = await res
+                    if isinstance(res, list):
+                        breakdown_data = res
+                except Exception as exc:
+                    logger.debug("provider breakdown notice: %s", exc)
+
+            # 3. Time series
+            timeseries_fn = getattr(store, "get_timeseries", None)
+            if callable(timeseries_fn):
+                try:
+                    res = timeseries_fn(period=period)
+                    if inspect.isawaitable(res):
+                        res = await res
+                    if isinstance(res, list):
+                        timeseries_data = res
+                except Exception as exc:
+                    logger.debug("timeseries notice: %s", exc)
     except Exception as exc:
-        logger.debug("Search metrics store notice: %s", exc)
+        logger.debug("Search metrics store access notice: %s", exc)
 
     return {
         "status": "ok",
+        "period": period,
         "days": days,
+        "summary": summary_data,
+        "breakdown": breakdown_data,
+        "timeseries": timeseries_data,
+        "privacy_mode": privacy_mode,
         "default_max_results": enriched["default_max_results"],
         "max_results_hard_cap": MAX_RESULTS_HARD_CAP,
         "provider_capabilities": capabilities,
         "providers": _build_provider_status_list(enriched),
-        "metrics": metrics_summary,
-        **metrics_summary,
     }
 
 
 @router.post("/test")
 @router.post("/test-query")
 async def run_diagnostic_search_test(request: TestQueryRequest) -> Dict[str, Any]:
+    """
+    Execute a diagnostic search query and return a rich, frontend-ready result.
+
+    Response includes:
+      - status: 'ok' | 'empty' | 'error'
+      - ok / success: bool
+      - provider: resolved provider display name
+      - results: list of {title, url, snippet, ...}
+      - request_count, estimated_cost_usd, cost_basis, latency_ms
+      - effective_max_results, max_results_limit
+      - error_message: present when status != 'ok'
+    """
     full_cfg = _load_full_config_dict()
     persisted_search = full_cfg.get("search") if isinstance(full_cfg.get("search"), dict) else {}
     enriched_persisted = _enrich_search_config_with_defaults(persisted_search)
@@ -774,18 +855,48 @@ async def run_diagnostic_search_test(request: TestQueryRequest) -> Dict[str, Any
             lang=request.lang,
             country=request.country,
         )
-    except Exception as exc:
+    except SearchProviderError as exc:
         latency_ms = round((time.perf_counter() - start_ts) * 1000.0, 2)
         return {
-            "status": "error", "ok": False, "success": False,
-            "error": str(exc) or type(exc).__name__,
+            "status": "error",
+            "ok": False,
+            "success": False,
+            "error": str(exc),
+            "error_message": str(exc),
             "provider": pre_audit["provider"],
             "query": request.query,
             "requested_max_results": request.max_results,
             "effective_max_results": pre_audit["effective_max_results"],
             "max_results_limit": pre_audit["max_results_limit"],
-            "results_count": 0, "results": [],
+            "results_count": 0,
+            "results": [],
+            "request_count": 1,
             "latency_ms": latency_ms,
+            "estimated_cost_usd": 0.0,
+            "cost_usd": 0.0,
+            "cost_basis": "unknown",
+        }
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - start_ts) * 1000.0, 2)
+        err_msg = str(exc) or type(exc).__name__
+        return {
+            "status": "error",
+            "ok": False,
+            "success": False,
+            "error": err_msg,
+            "error_message": err_msg,
+            "provider": pre_audit["provider"],
+            "query": request.query,
+            "requested_max_results": request.max_results,
+            "effective_max_results": pre_audit["effective_max_results"],
+            "max_results_limit": pre_audit["max_results_limit"],
+            "results_count": 0,
+            "results": [],
+            "request_count": 1,
+            "latency_ms": latency_ms,
+            "estimated_cost_usd": 0.0,
+            "cost_usd": 0.0,
+            "cost_basis": "unknown",
         }
 
     latency_ms = round((time.perf_counter() - start_ts) * 1000.0, 2)
@@ -819,8 +930,43 @@ async def run_diagnostic_search_test(request: TestQueryRequest) -> Dict[str, Any
                 "snippet": getattr(item, "snippet", ""),
             })
 
+    # Extract rich response attributes with safe fallbacks
+    response_cost_usd = float(
+        getattr(response, "estimated_cost_usd", None)
+        or resp_meta.get("estimated_cost_usd", 0.0)
+        or 0.0
+    )
+    response_cost_basis = str(
+        getattr(response, "cost_basis", None)
+        or resp_meta.get("cost_basis", "unknown")
+        or "unknown"
+    )
+    response_status_enum = getattr(response, "status", None)
+    response_status_str = (
+        response_status_enum.value
+        if hasattr(response_status_enum, "value")
+        else str(response_status_enum or "")
+    )
+    response_request_count = int(getattr(response, "request_count", 1) or 1)
+
+    is_ok = len(serialized) > 0
+    is_empty = (not is_ok) and (response_status_str in ("empty", "EMPTY"))
+    error_message: Optional[str] = None
+    if is_empty:
+        error_message = (
+            getattr(response, "error_message", None)
+            or "Provider responded with HTTP 200 but returned zero matching documents."
+        )
+    elif not is_ok:
+        error_message = (
+            getattr(response, "error_message", None)
+            or "Search failed without a specific error message."
+        )
+
     return {
-        "status": "ok", "ok": True, "success": True,
+        "status": "ok" if is_ok else ("empty" if is_empty else "error"),
+        "ok": is_ok,
+        "success": is_ok,
         "provider": resolved_provider_name,
         "query": request.query,
         "requested_max_results": request.max_results,
@@ -828,8 +974,12 @@ async def run_diagnostic_search_test(request: TestQueryRequest) -> Dict[str, Any
         "max_results_limit": post_audit["max_results_limit"],
         "results_count": len(serialized),
         "results": serialized,
+        "request_count": response_request_count,
         "latency_ms": getattr(response, "latency_ms", None) or latency_ms,
-        "cost_usd": float(getattr(response, "estimated_cost_usd", 0.0) or 0.0),
+        "estimated_cost_usd": response_cost_usd,
+        "cost_usd": response_cost_usd,
+        "cost_basis": response_cost_basis,
+        "error_message": error_message,
     }
 
 

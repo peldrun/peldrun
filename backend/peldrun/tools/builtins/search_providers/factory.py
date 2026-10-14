@@ -717,6 +717,13 @@ class SearchProviderFactory:
         deadline = time.monotonic() + total_budget
         errors: List[Tuple[str, str]] = []
 
+        print(
+            f"\n[SEARCH-FACTORY] Query: {clean_query!r}\n"
+            f"[SEARCH-FACTORY] Chain: {' → '.join(chain)}\n"
+            f"[SEARCH-FACTORY] Requested: {max_results} | Budget: {total_budget}s | Retries: {max_retries}",
+            flush=True,
+        )
+
         for provider_index, provider_key in enumerate(chain):
             display_name = cls.get_canonical_display_name(provider_key)
             prov_section = cls._extract_provider_section(provider_key, cfg)
@@ -745,6 +752,13 @@ class SearchProviderFactory:
                 prov_timeout = float(prov_section.get("timeout") or remaining_budget)
                 attempt_timeout = max(0.5, min(remaining_budget, prov_timeout))
 
+                print(
+                    f"[SEARCH-FACTORY] → Attempt #{provider_index + 1}.{attempt + 1}: "
+                    f"provider={display_name} | effective_max={effective_count} | "
+                    f"limit={provider_limit} | timeout≈{attempt_timeout:.1f}s",
+                    flush=True,
+                )
+
                 try:
                     response = await cls._invoke_provider_search(
                         provider=provider,
@@ -762,6 +776,14 @@ class SearchProviderFactory:
                         if len(response.results) > effective_count:
                             response.results = list(response.results[:effective_count])
 
+                    print(
+                        f"[SEARCH-FACTORY] ✓ {display_name} returned "
+                        f"{len(response.results)} results in "
+                        f"{getattr(response, 'latency_ms', 0):.0f}ms "
+                        f"| status={getattr(response, 'status', 'unknown')}",
+                        flush=True,
+                    )
+
                     # Attach traceability metadata for QA, diagnostics, and usage accounting
                     cls._attach_count_metadata(
                         response=response,
@@ -778,6 +800,11 @@ class SearchProviderFactory:
 
                 except Exception as exc:
                     err_text = str(exc) or exc.__class__.__name__
+                    print(
+                        f"[SEARCH-FACTORY] ✗ {display_name} failed "
+                        f"(attempt {attempt + 1}/{max_retries + 1}): {err_text[:200]}",
+                        flush=True,
+                    )
                     logger.warning(
                         "Search provider %s failed (attempt %d/%d, effective_max_results=%d): %s",
                         display_name,
@@ -793,6 +820,11 @@ class SearchProviderFactory:
                         break
 
         summary = "; ".join(f"{prov}: {msg}" for prov, msg in errors) or "Unknown provider failure."
+        print(
+            f"[SEARCH-FACTORY] ✗✗ ALL PROVIDERS FAILED\n"
+            f"[SEARCH-FACTORY] {summary}",
+            flush=True,
+        )
         raise SearchProviderError(f"All configured search providers failed. Details: {summary}")
 
     # Aliases to support all runtime and test callers

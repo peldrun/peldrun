@@ -90,25 +90,42 @@ class LLMInvocationRecord(BaseModel):
 
 def is_local_endpoint(provider: str, base_url: Optional[str] = None) -> bool:
     """
-    Dynamically determine if an AI endpoint is local (zero billing cost basis).
-    Inspects provider name and target network URL without rigid enum restrictions.
+    Determine whether an AI endpoint is a self-hosted local inference engine.
+
+    Classification is based purely on the provider identity (LM Studio, Ollama,
+    vLLM, llama.cpp, and similar self-hosted runtimes). A localhost URL alone
+    does NOT imply a free endpoint: users may route paid cloud APIs through a
+    local proxy for privacy, routing, or auth reasons.
+
+    This function is only consulted as a FALLBACK when no user-configured
+    pricing rule matches the requested (provider, model) pair — user rules
+    always take precedence in pricing_store.resolve_pricing().
     """
     norm_p = (provider or "").strip().lower()
-    if norm_p in ("lmstudio", "ollama", "local", "local_gpu"):
+
+    local_engines = {
+        "lmstudio",
+        "lm-studio",
+        "lm_studio",
+        "ollama",
+        "local",
+        "local_gpu",
+        "vllm",
+        "v-llm",
+        "llamacpp",
+        "llama.cpp",
+        "llama-cpp",
+        "koboldcpp",
+        "text-generation-webui",
+        "textgen",
+    }
+    if norm_p in local_engines:
         return True
 
-    if base_url:
-        norm_url = base_url.strip().lower()
-        local_markers = (
-            "127.0.0.1",
-            "localhost",
-            "0.0.0.0",
-            ":1234",
-            ":11434",
-            ":8000",
-        )
-        if any(marker in norm_url for marker in local_markers):
-            return True
+    # Explicit opt-in prefixes for custom self-hosted runtimes
+    local_prefixes = ("local-", "local_", "selfhosted-", "selfhosted_", "self-hosted-", "self-hosted_")
+    if any(norm_p.startswith(p) for p in local_prefixes):
+        return True
 
     return False
 

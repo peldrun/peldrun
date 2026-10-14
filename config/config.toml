@@ -8,102 +8,23 @@ max_tokens = 262144
 temperature = 0
 api_type = ""
 
-[llm.vision]
-provider = "lmstudio"
-provider_name = "LM Studio (Local)"
-model = "qwen3-vl-8b-instruct"
-base_url = "http://127.0.0.1:1234/v1"
-api_key = ""
-max_tokens = 8192
-temperature = 0
-
 [browser]
 headless = false
 disable_security = true
 cdp_url = "http://localhost:9222"
 max_content_length = 2000
 
-[browser.proxy]
-server = ""
-username = ""
-password = ""
-
 [search]
-engine = "DuckDuckGo"
-fallback_engines = [
-    "Jina",
-]
+engine = "Jina"
+fallback_engines = [ "DuckDuckGo",]
 enabled = true
 lang = "en"
 country = "us"
 default_max_results = 10
-total_budget_seconds = 22.0
+total_budget_seconds = 22
 max_retries = 0
-retry_delay = 2.0
+retry_delay = 2
 privacy_mode = false
-
-[search.duckduckgo]
-enabled = true
-safesearch = "on"
-backend = "auto"
-timeout = 15.0
-cost_per_query = 0.0
-safe_search = "moderate"
-estimated_cost_per_query = 0
-
-[search.searxng]
-enabled = false
-base_url = "http://localhost:8080"
-categories = "general"
-timeout = 15.0
-cost_per_query = 0.0
-safe_search = "moderate"
-estimated_cost_per_query = 0
-
-[search.tavily]
-enabled = false
-api_key = ""
-search_depth = "basic"
-timeout = 20.0
-cost_per_query = 0.005
-topic = "general"
-include_answer = true
-estimated_cost_per_query = 0.005
-
-[search.brave]
-enabled = false
-api_key = ""
-timeout = 15.0
-cost_per_query = 0.005
-safe_search = "moderate"
-estimated_cost_per_query = 0.005
-
-[search.google]
-enabled = false
-api_key = ""
-cx = "b3b22fba2ab1f373b"
-timeout = 15.0
-cost_per_query = 0.005
-safe_search = "off"
-estimated_cost_per_query = 0.005
-
-[search.jina]
-enabled = false
-api_key = "jina_330c240e759743cdb99eb438bcf7f336o5v3iba1AQy2dOd7MDAFIjCcTIZj"
-timeout = 20.0
-cost_per_query = 0.002
-estimated_cost_per_query = 0.002
-
-[search.yandex]
-enabled = false
-api_key = ""
-folder_id = ""
-mode = "cloud_v2"
-region = ""
-timeout = 20.0
-cost_per_query = 0.003
-safe_search = "moderate"
-estimated_cost_per_query = 0.005
 
 [sandbox]
 use_sandbox = false
@@ -126,3 +47,80 @@ server_reference = "app.mcp.server"
 
 [runflow]
 use_data_analysis_agent = false
+
+[llm.vision]
+provider = "lmstudio"
+provider_name = "LM Studio (Local)"
+model = "qwen3-vl-8b-instruct"
+base_url = "http://127.0.0.1:1234/v1"
+api_key = ""
+max_tokens = 8192
+temperature = 0
+
+[browser.proxy]
+server = ""
+username = ""
+password = ""
+
+[search.duckduckgo]
+enabled = true
+safesearch = "on"
+backend = "auto"
+timeout = 15
+cost_per_query = 0
+safe_search = "moderate"
+estimated_cost_per_query = 0
+
+[search.searxng]
+enabled = false
+base_url = "http://localhost:8080"
+categories = "general"
+timeout = 15
+cost_per_query = 0
+safe_search = "moderate"
+estimated_cost_per_query = 0
+
+[search.tavily]
+enabled = false
+api_key = ""
+search_depth = "basic"
+timeout = 20
+cost_per_query = 0.005
+topic = "general"
+include_answer = true
+estimated_cost_per_query = 0.005
+
+[search.brave]
+enabled = false
+api_key = ""
+timeout = 15
+cost_per_query = 0.005
+safe_search = "moderate"
+estimated_cost_per_query = 0.005
+
+[search.google]
+enabled = false
+api_key = ""
+cx = "********"
+timeout = 15
+cost_per_query = 0.005
+safe_search = "off"
+estimated_cost_per_query = 0.005
+
+[search.jina]
+enabled = true
+api_key = "jina_330c240e759743cdb99eb438bcf7f336o5v3iba1AQy2dOd7MDAFIjCcTIZj"
+timeout = 20
+cost_per_query = 0.002
+estimated_cost_per_query = 0.002
+
+[search.yandex]
+enabled = false
+api_key = ""
+folder_id = ""
+mode = "cloud_v2"
+region = ""
+timeout = 20
+cost_per_query = 0.003
+safe_search = "moderate"
+estimated_cost_per_query = 0.005

@@ -623,6 +623,31 @@ class WebSearchTool(BaseTool):
         privacy_mode = bool(cfg.get("privacy_mode", False))
         sanitized_query = _sanitize_query_for_privacy(query, privacy_mode=privacy_mode)
 
+        # --- Diagnostic console output: search invocation ---
+        try:
+            enabled_chain = SearchProviderFactory.build_execution_chain(
+                cfg, override_provider=override_provider
+            )
+        except Exception:
+            enabled_chain = [str(cfg.get("engine") or "DuckDuckGo")]
+
+        print(
+            "\n"
+            "╔══════════════════════════════════════════════════════════════════\n"
+            "║ [WEB_SEARCH] Invocation\n"
+            "╠══════════════════════════════════════════════════════════════════\n"
+            f"║ Query          : {sanitized_query!r}\n"
+            f"║ Requested max  : {explicit_requested_count if explicit_requested_count is not None else '(from settings)'}\n"
+            f"║ Default max    : {cfg.get('default_max_results')}\n"
+            f"║ Primary engine : {cfg.get('engine')}\n"
+            f"║ Fallback chain : {cfg.get('fallback_engines') or []}\n"
+            f"║ Exec chain     : {' → '.join(enabled_chain)}\n"
+            f"║ Privacy mode   : {cfg.get('privacy_mode', False)}\n"
+            f"║ Override prov  : {override_provider or '(none)'}\n"
+            "╚══════════════════════════════════════════════════════════════════",
+            flush=True,
+        )
+
         # 6. Delegate execution to SearchProviderFactory (computes per-provider effective_max_results)
         try:
             response = await SearchProviderFactory.search(
@@ -635,6 +660,16 @@ class WebSearchTool(BaseTool):
         except Exception as exc:
             latency_ms = (time.perf_counter() - start_ts) * 1000.0
             err_str = str(exc) or exc.__class__.__name__
+            print(
+                "╔══════════════════════════════════════════════════════════════════\n"
+                "║ [WEB_SEARCH] ✗ FAILED\n"
+                "╠══════════════════════════════════════════════════════════════════\n"
+                f"║ Query          : {sanitized_query!r}\n"
+                f"║ Error          : {err_str}\n"
+                f"║ Latency (ms)   : {round(latency_ms, 2)}\n"
+                "╚══════════════════════════════════════════════════════════════════\n",
+                flush=True,
+            )
             self._record_breaker_outcome(
                 scope_key,
                 config_sig,
@@ -717,7 +752,34 @@ class WebSearchTool(BaseTool):
             effective_max_results=effective_max,
         )
 
-        cost_usd = float(getattr(response, "cost_usd", 0.0) or resp_meta.get("cost_usd", 0.0) or 0.0)
+        cost_usd = float(
+            getattr(response, "estimated_cost_usd", None)
+            or resp_meta.get("estimated_cost_usd", None)
+            or getattr(response, "cost_usd", None)
+            or resp_meta.get("cost_usd", None)
+            or 0.0
+        )
+        cost_basis = str(
+            getattr(response, "cost_basis", None)
+            or resp_meta.get("cost_basis", "unknown")
+            or "unknown"
+        )
+
+        # --- Diagnostic console output: search outcome ---
+        print(
+            "╔══════════════════════════════════════════════════════════════════\n"
+            "║ [WEB_SEARCH] ✓ SUCCESS\n"
+            "╠══════════════════════════════════════════════════════════════════\n"
+            f"║ Query          : {sanitized_query!r}\n"
+            f"║ Provider used  : {resolved_provider}\n"
+            f"║ Results count  : {len(capped_items)} / {effective_max} (limit {provider_limit})\n"
+            f"║ Latency (ms)   : {round(latency_ms, 2)}\n"
+            f"║ Cost (USD)     : {cost_usd:.4f}\n"
+            f"║ Cost basis     : {cost_basis}\n"
+            "╚══════════════════════════════════════════════════════════════════\n",
+            flush=True,
+        )
+
         await self._record_search_usage_safely(
             query=sanitized_query,
             provider_name=resolved_provider,
@@ -745,6 +807,9 @@ class WebSearchTool(BaseTool):
             "latency_ms": round(latency_ms, 2),
             "execution_scope": scope_key,
             "config_signature": config_sig,
+            "cost_usd": cost_usd,
+            "estimated_cost_usd": cost_usd,
+            "cost_basis": cost_basis,
         }
 
         return ToolResult(
