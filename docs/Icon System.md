@@ -21,7 +21,9 @@ files from `public/icon/` and exposes them through typed components and hooks.
 ## 🚀 Quick Start
 
 ```tsx
-import { Icon } from '@/components/Icon';
+npm run icons
+
+import { Icon } from '@/components/Icon/Icon';
 
 <Icon name="deepseek" size={32} />
 

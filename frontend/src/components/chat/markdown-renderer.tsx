@@ -339,7 +339,7 @@ function MarkdownRendererInner({
                   href={href}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-primary hover:underline font-medium transition-all"
+                  className="text-primary text-[12px] hover:underline font-medium transition-all"
                   {...props}
                 >
                   {children}
@@ -355,7 +355,7 @@ function MarkdownRendererInner({
                 target="_blank"
                 rel="noopener noreferrer"
                 referrerPolicy="no-referrer"
-                className="inline-flex items-center gap-1.5 px-2 py-0.5 my-0.5 rounded-md bg-muted/60 hover:bg-muted text-primary hover:underline font-mono text-xs font-medium transition-all border border-border/50 align-baseline max-w-full"
+                className="inline-flex items-center gap-1.5 px-2 py-0.5 my-0.5 rounded-md bg-muted/60 hover:bg-muted text-primary hover:underline font-mono text-[10px] font-medium transition-all border border-border/50 align-baseline max-w-full"
                 title={href}
                 {...props}
               >

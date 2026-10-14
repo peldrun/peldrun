@@ -16,13 +16,13 @@ max_content_length = 2000
 
 [search]
 engine = "Jina"
-fallback_engines = [ "DuckDuckGo",]
+fallback_engines = [ "DuckDuckGo", "Google",]
 retry_delay = 2
 max_retries = 0
 lang = "en"
 country = "us"
 enabled = true
-total_budget_seconds = 22
+total_budget_seconds = 22.0
 privacy_mode = false
 
 [sandbox]
@@ -62,10 +62,10 @@ username = ""
 password = ""
 
 [search.duckduckgo]
-cost_per_query = 0
+cost_per_query = 0.0
 
 [search.searxng]
-cost_per_query = 0
+cost_per_query = 0.0
 base_url = "http://localhost:8080"
 enabled = false
 

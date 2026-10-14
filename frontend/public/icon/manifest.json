@@ -1,45 +1,101 @@
 {
-  "generatedAt": "2026-10-14T12:11:04.337Z",
-  "count": 51,
+  "generatedAt": "2026-10-14T14:26:38.323Z",
+  "count": 139,
   "icons": [
+    "7zip",
     "ai-studio-google",
     "ai-studio-google-mono",
+    "amazon-web-services",
+    "amazon-web-services-dark",
+    "amazon-web-services-light",
     "anthropic",
     "anthropic-dark",
     "anthropic-light",
     "anthropic-mono",
     "anthropic-wordmark",
+    "apple-badge",
+    "aws-cat-artificial-intelligence",
+    "azure-app-service-certificates",
+    "azure-app-service-environments",
+    "azure-app-service-plans",
+    "azure-cdn-profiles",
+    "bash",
+    "bing",
+    "brave",
+    "brave-mono",
     "bytedance",
     "bytedance-mono",
+    "c-plusplus",
+    "c-sharp",
+    "chrome",
+    "circuitpython",
     "claude-ai",
     "claude-ai-wordmark",
     "claude-ai-wordmark-dark",
     "claude-ai-wordmark-light",
+    "csharp",
+    "css",
+    "css (1)",
+    "css-mono",
+    "css-new",
     "deepseek",
+    "discord-badge",
+    "duckduckgo",
+    "duckduckgo-mono",
+    "duckduckgo-wordmark",
     "essential-ai",
     "essential-ai-color",
     "essential-ai-mono",
+    "gemini",
     "gemini-google",
     "gemini-google-color",
     "gemini-google-mono",
     "gigachat",
+    "git",
+    "git-mono",
+    "github",
+    "github-dark",
+    "github-light",
+    "github-mono",
+    "github-wordmark",
+    "github-wordmark-dark",
+    "github-wordmark-light",
+    "gmail-2026",
     "google",
     "google-mono",
     "google-wordmark",
+    "gopher",
+    "html5",
+    "html5-mono",
+    "hugging-face",
+    "hugging-face-mono",
     "ibm",
+    "java",
+    "javascript",
+    "javascript-mono",
+    "javascript-wordmark",
     "jina-ai",
+    "jina-ai (1)",
     "jina-ai-mono",
+    "jina-ai-mono (1)",
+    "kotlin",
     "liquid",
     "lm-studio",
     "lm-studio-mono",
+    "markdown",
+    "markdown-dark",
+    "markdown-light",
+    "markdown-mono",
     "meta",
     "meta-mono",
     "meta-wordmark",
     "microsoft",
+    "microsoft-badge",
     "microsoft-wordmark",
     "mistral-ai",
     "mistral-ai-mono",
     "mistral-ai-wordmark",
+    "notion-badge",
     "nvidia",
     "nvidia-dark",
     "nvidia-light",
@@ -48,16 +104,56 @@
     "ollama-dark",
     "ollama-light",
     "ollama-mono",
+    "openai-badge",
     "openai-chatgpt",
     "openai-chatgpt-mono",
+    "perl",
+    "php",
+    "postgresql-badge",
+    "powershell",
+    "proton-badge",
+    "pyscript",
+    "python",
+    "python-mono",
+    "python-package-index-badge",
     "qwen",
     "qwen-dark",
-    "qwen-light"
+    "qwen-light",
+    "rect",
+    "ruby",
+    "rust",
+    "sass",
+    "searxng",
+    "searxng-mono",
+    "svg",
+    "swift",
+    "tavily",
+    "tavily-color",
+    "tavily-mono",
+    "typescript",
+    "typescript-mono",
+    "typescript-wordmark",
+    "wordpress",
+    "wordpress-badge",
+    "wordpress-mono",
+    "yandex",
+    "yandex-badge",
+    "yandex-cloud",
+    "yandex-cloud-mono",
+    "yandex-mono"
   ],
   "groups": {
+    "7zip": [
+      "7zip"
+    ],
     "ai-studio-google": [
       "ai-studio-google",
       "ai-studio-google-mono"
+    ],
+    "amazon-web-services": [
+      "amazon-web-services",
+      "amazon-web-services-dark",
+      "amazon-web-services-light"
     ],
     "anthropic": [
       "anthropic",
@@ -66,9 +162,49 @@
       "anthropic-mono",
       "anthropic-wordmark"
     ],
+    "apple-badge": [
+      "apple-badge"
+    ],
+    "aws-cat-artificial-intelligence": [
+      "aws-cat-artificial-intelligence"
+    ],
+    "azure-app-service-certificates": [
+      "azure-app-service-certificates"
+    ],
+    "azure-app-service-environments": [
+      "azure-app-service-environments"
+    ],
+    "azure-app-service-plans": [
+      "azure-app-service-plans"
+    ],
+    "azure-cdn-profiles": [
+      "azure-cdn-profiles"
+    ],
+    "bash": [
+      "bash"
+    ],
+    "bing": [
+      "bing"
+    ],
+    "brave": [
+      "brave",
+      "brave-mono"
+    ],
     "bytedance": [
       "bytedance",
       "bytedance-mono"
+    ],
+    "c-plusplus": [
+      "c-plusplus"
+    ],
+    "c-sharp": [
+      "c-sharp"
+    ],
+    "chrome": [
+      "chrome"
+    ],
+    "circuitpython": [
+      "circuitpython"
     ],
     "claude-ai": [
       "claude-ai",
@@ -78,13 +214,37 @@
       "claude-ai-wordmark-dark",
       "claude-ai-wordmark-light"
     ],
+    "csharp": [
+      "csharp"
+    ],
+    "css": [
+      "css",
+      "css-mono"
+    ],
+    "css (1)": [
+      "css (1)"
+    ],
+    "css-new": [
+      "css-new"
+    ],
     "deepseek": [
       "deepseek"
+    ],
+    "discord-badge": [
+      "discord-badge"
+    ],
+    "duckduckgo": [
+      "duckduckgo",
+      "duckduckgo-mono",
+      "duckduckgo-wordmark"
     ],
     "essential-ai": [
       "essential-ai",
       "essential-ai-color",
       "essential-ai-mono"
+    ],
+    "gemini": [
+      "gemini"
     ],
     "gemini-google": [
       "gemini-google",
@@ -94,17 +254,63 @@
     "gigachat": [
       "gigachat"
     ],
+    "git": [
+      "git",
+      "git-mono"
+    ],
+    "github": [
+      "github",
+      "github-dark",
+      "github-light",
+      "github-mono",
+      "github-wordmark"
+    ],
+    "github-wordmark": [
+      "github-wordmark-dark",
+      "github-wordmark-light"
+    ],
+    "gmail-2026": [
+      "gmail-2026"
+    ],
     "google": [
       "google",
       "google-mono",
       "google-wordmark"
     ],
+    "gopher": [
+      "gopher"
+    ],
+    "html5": [
+      "html5",
+      "html5-mono"
+    ],
+    "hugging-face": [
+      "hugging-face",
+      "hugging-face-mono"
+    ],
     "ibm": [
       "ibm"
+    ],
+    "java": [
+      "java"
+    ],
+    "javascript": [
+      "javascript",
+      "javascript-mono",
+      "javascript-wordmark"
     ],
     "jina-ai": [
       "jina-ai",
       "jina-ai-mono"
+    ],
+    "jina-ai (1)": [
+      "jina-ai (1)"
+    ],
+    "jina-ai-mono (1)": [
+      "jina-ai-mono (1)"
+    ],
+    "kotlin": [
+      "kotlin"
     ],
     "liquid": [
       "liquid"
@@ -112,6 +318,12 @@
     "lm-studio": [
       "lm-studio",
       "lm-studio-mono"
+    ],
+    "markdown": [
+      "markdown",
+      "markdown-dark",
+      "markdown-light",
+      "markdown-mono"
     ],
     "meta": [
       "meta",
@@ -122,10 +334,16 @@
       "microsoft",
       "microsoft-wordmark"
     ],
+    "microsoft-badge": [
+      "microsoft-badge"
+    ],
     "mistral-ai": [
       "mistral-ai",
       "mistral-ai-mono",
       "mistral-ai-wordmark"
+    ],
+    "notion-badge": [
+      "notion-badge"
     ],
     "nvidia": [
       "nvidia",
@@ -139,14 +357,92 @@
       "ollama-light",
       "ollama-mono"
     ],
+    "openai-badge": [
+      "openai-badge"
+    ],
     "openai-chatgpt": [
       "openai-chatgpt",
       "openai-chatgpt-mono"
+    ],
+    "perl": [
+      "perl"
+    ],
+    "php": [
+      "php"
+    ],
+    "postgresql-badge": [
+      "postgresql-badge"
+    ],
+    "powershell": [
+      "powershell"
+    ],
+    "proton-badge": [
+      "proton-badge"
+    ],
+    "pyscript": [
+      "pyscript"
+    ],
+    "python": [
+      "python",
+      "python-mono"
+    ],
+    "python-package-index-badge": [
+      "python-package-index-badge"
     ],
     "qwen": [
       "qwen",
       "qwen-dark",
       "qwen-light"
+    ],
+    "rect": [
+      "rect"
+    ],
+    "ruby": [
+      "ruby"
+    ],
+    "rust": [
+      "rust"
+    ],
+    "sass": [
+      "sass"
+    ],
+    "searxng": [
+      "searxng",
+      "searxng-mono"
+    ],
+    "svg": [
+      "svg"
+    ],
+    "swift": [
+      "swift"
+    ],
+    "tavily": [
+      "tavily",
+      "tavily-color",
+      "tavily-mono"
+    ],
+    "typescript": [
+      "typescript",
+      "typescript-mono",
+      "typescript-wordmark"
+    ],
+    "wordpress": [
+      "wordpress",
+      "wordpress-mono"
+    ],
+    "wordpress-badge": [
+      "wordpress-badge"
+    ],
+    "yandex": [
+      "yandex",
+      "yandex-mono"
+    ],
+    "yandex-badge": [
+      "yandex-badge"
+    ],
+    "yandex-cloud": [
+      "yandex-cloud",
+      "yandex-cloud-mono"
     ]
   }
 }
