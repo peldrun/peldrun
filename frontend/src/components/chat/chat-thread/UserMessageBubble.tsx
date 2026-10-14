@@ -1,16 +1,4 @@
-// Path: frontend/src/components/chat/chat-thread/UserMessageBubble.tsx
 "use client";
-
-/**
- * User-authored message bubble with optional file attachments.
- *
- * Features:
- *  - Renders attached files as a horizontal stack of `AttachedFileCard`s.
- *  - Renders the prompt body through the shared `MarkdownRenderer`.
- *  - Collapses long prompts behind an expand/collapse chevron toggle.
- *  - Provides a per-message copy button that reports its state via
- *    `copiedSection` controlled by the parent.
- */
 
 import React, { useState } from "react";
 import { Copy, Check, ChevronDown, ChevronUp } from "lucide-react";
@@ -44,7 +32,7 @@ export function UserMessageBubble({
   const isLongText = displayText.length > 220 || displayText.split("\n").length > 4;
 
   return (
-    <div className="flex flex-col items-end space-y-2 w-full">
+    <div className="group flex flex-col items-end space-y-2 w-full">
       {attachedFiles.length > 0 && (
         <div className="flex flex-wrap gap-2.5 justify-end max-w-[90%]">
           {attachedFiles.map((file, idx) => (
@@ -85,7 +73,7 @@ export function UserMessageBubble({
         </div>
       )}
 
-      <div className="flex items-center gap-2 px-1 text-[10px] text-muted-foreground font-mono">
+      <div className="date_timestamp flex items-center gap-2 px-1 text-[10px] text-muted-foreground font-mono opacity-0 group-hover:opacity-100 transition-opacity duration-200">
         {timestamp && <span>{timestamp}</span>}
         <button
           type="button"

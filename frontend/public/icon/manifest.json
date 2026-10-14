@@ -1,0 +1,152 @@
+{
+  "generatedAt": "2026-10-14T12:11:04.337Z",
+  "count": 51,
+  "icons": [
+    "ai-studio-google",
+    "ai-studio-google-mono",
+    "anthropic",
+    "anthropic-dark",
+    "anthropic-light",
+    "anthropic-mono",
+    "anthropic-wordmark",
+    "bytedance",
+    "bytedance-mono",
+    "claude-ai",
+    "claude-ai-wordmark",
+    "claude-ai-wordmark-dark",
+    "claude-ai-wordmark-light",
+    "deepseek",
+    "essential-ai",
+    "essential-ai-color",
+    "essential-ai-mono",
+    "gemini-google",
+    "gemini-google-color",
+    "gemini-google-mono",
+    "gigachat",
+    "google",
+    "google-mono",
+    "google-wordmark",
+    "ibm",
+    "jina-ai",
+    "jina-ai-mono",
+    "liquid",
+    "lm-studio",
+    "lm-studio-mono",
+    "meta",
+    "meta-mono",
+    "meta-wordmark",
+    "microsoft",
+    "microsoft-wordmark",
+    "mistral-ai",
+    "mistral-ai-mono",
+    "mistral-ai-wordmark",
+    "nvidia",
+    "nvidia-dark",
+    "nvidia-light",
+    "nvidia-mono",
+    "ollama",
+    "ollama-dark",
+    "ollama-light",
+    "ollama-mono",
+    "openai-chatgpt",
+    "openai-chatgpt-mono",
+    "qwen",
+    "qwen-dark",
+    "qwen-light"
+  ],
+  "groups": {
+    "ai-studio-google": [
+      "ai-studio-google",
+      "ai-studio-google-mono"
+    ],
+    "anthropic": [
+      "anthropic",
+      "anthropic-dark",
+      "anthropic-light",
+      "anthropic-mono",
+      "anthropic-wordmark"
+    ],
+    "bytedance": [
+      "bytedance",
+      "bytedance-mono"
+    ],
+    "claude-ai": [
+      "claude-ai",
+      "claude-ai-wordmark"
+    ],
+    "claude-ai-wordmark": [
+      "claude-ai-wordmark-dark",
+      "claude-ai-wordmark-light"
+    ],
+    "deepseek": [
+      "deepseek"
+    ],
+    "essential-ai": [
+      "essential-ai",
+      "essential-ai-color",
+      "essential-ai-mono"
+    ],
+    "gemini-google": [
+      "gemini-google",
+      "gemini-google-color",
+      "gemini-google-mono"
+    ],
+    "gigachat": [
+      "gigachat"
+    ],
+    "google": [
+      "google",
+      "google-mono",
+      "google-wordmark"
+    ],
+    "ibm": [
+      "ibm"
+    ],
+    "jina-ai": [
+      "jina-ai",
+      "jina-ai-mono"
+    ],
+    "liquid": [
+      "liquid"
+    ],
+    "lm-studio": [
+      "lm-studio",
+      "lm-studio-mono"
+    ],
+    "meta": [
+      "meta",
+      "meta-mono",
+      "meta-wordmark"
+    ],
+    "microsoft": [
+      "microsoft",
+      "microsoft-wordmark"
+    ],
+    "mistral-ai": [
+      "mistral-ai",
+      "mistral-ai-mono",
+      "mistral-ai-wordmark"
+    ],
+    "nvidia": [
+      "nvidia",
+      "nvidia-dark",
+      "nvidia-light",
+      "nvidia-mono"
+    ],
+    "ollama": [
+      "ollama",
+      "ollama-dark",
+      "ollama-light",
+      "ollama-mono"
+    ],
+    "openai-chatgpt": [
+      "openai-chatgpt",
+      "openai-chatgpt-mono"
+    ],
+    "qwen": [
+      "qwen",
+      "qwen-dark",
+      "qwen-light"
+    ]
+  }
+}
