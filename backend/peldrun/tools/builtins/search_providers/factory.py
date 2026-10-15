@@ -11,6 +11,9 @@ Responsibilities:
   * Read-only provider capability limit: max_results_limit
   * Application hard cap: MAX_RESULTS_HARD_CAP = 20
 - Per-provider count recalculation inside the primary/failover execution loop.
+- Explicit outcome classification (success / empty / retryable / terminal) so that
+  a provider returning SearchResponse(is_success=False) triggers failover to the
+  next provider instead of being returned to the caller as a successful outcome.
 - Defensive output truncation so SearchResponse.results never exceeds effective_max_results.
 """
 
@@ -27,6 +30,7 @@ from peldrun.tools.builtins.search_providers import base as base_mod
 from peldrun.tools.builtins.search_providers.base import (
     BaseSearchProvider,
     ProviderCapability,
+    ProviderStatus,
     SearchProviderError,
     SearchResponse,
 )
@@ -151,6 +155,34 @@ for _key, _spec in _PROVIDER_SPECS.items():
         _ALIAS_TO_KEY[str(_alias).lower()] = _key
 
 
+# Outcome classifications produced by _classify_response_outcome()
+_OUTCOME_SUCCESS = "success"
+_OUTCOME_EMPTY = "empty"
+_OUTCOME_FAILURE_RETRYABLE = "failure_retryable"
+_OUTCOME_FAILURE_TERMINAL = "failure_terminal"
+
+# Provider statuses that should not be retried on the same provider (credentials/permission/quota issues).
+_TERMINAL_FAILURE_STATUSES: frozenset = frozenset(
+    {
+        ProviderStatus.CONFIGURATION_ERROR.value,
+        ProviderStatus.AUTHENTICATION_ERROR.value,
+        ProviderStatus.PERMISSION_ERROR.value,
+        ProviderStatus.QUOTA_EXHAUSTED.value,
+        ProviderStatus.DISABLED.value,
+    }
+)
+
+# Provider statuses that warrant a same-provider retry before failing over.
+_RETRYABLE_FAILURE_STATUSES: frozenset = frozenset(
+    {
+        ProviderStatus.RATE_LIMITED.value,
+        ProviderStatus.TIMEOUT.value,
+        ProviderStatus.UPSTREAM_ERROR.value,
+        ProviderStatus.INVALID_RESPONSE.value,
+    }
+)
+
+
 def _parse_strict_positive_int(
     value: Any,
     field_name: str,
@@ -196,6 +228,9 @@ class SearchProviderFactory:
 
     _provider_class_cache: Dict[str, Type[BaseSearchProvider]] = {}
 
+    # ------------------------------------------------------------------
+    # Provider registry / capability accessors
+    # ------------------------------------------------------------------
     @classmethod
     def normalize_provider_key(cls, provider_name: str) -> str:
         """Normalize any provider display name or alias to its canonical lowercase key."""
@@ -315,6 +350,9 @@ class SearchProviderFactory:
             max_results_limit=canonical_limit,
         )
 
+    # ------------------------------------------------------------------
+    # Count resolution helpers
+    # ------------------------------------------------------------------
     @classmethod
     def get_global_default_max_results(
         cls,
@@ -542,13 +580,15 @@ class SearchProviderFactory:
 
         return capabilities
 
+    # ------------------------------------------------------------------
+    # Config unwrapping / provider instantiation
+    # ------------------------------------------------------------------
     @classmethod
     def _unwrap_search_section(cls, search_config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """Extract the [search] table whether passed a full config dict or the [search] dict directly."""
         if not isinstance(search_config, dict):
             return {}
         if "search" in search_config and isinstance(search_config["search"], dict):
-            # Merge only if top-level does not already look like a direct [search] section
             if "engine" in search_config["search"] or "default_max_results" in search_config["search"] or any(
                 k in search_config["search"] for k in _PROVIDER_SPECS
             ):
@@ -664,8 +704,9 @@ class SearchProviderFactory:
             if cand_key in chain:
                 continue
             prov_section = cls._extract_provider_section(cand_key, cfg)
-            # Primary engine is included unless explicitly disabled in its sub-table;
-            # fallback engines are included unless explicitly disabled (enabled is False).
+            # Primary engine is always included so that the caller can surface
+            # an explicit "primary disabled" error when there are no fallbacks.
+            # Fallback engines are included unless explicitly disabled.
             if "enabled" in prov_section and prov_section["enabled"] is False and cand_key != primary_key:
                 logger.debug("Skipping disabled fallback search provider: %s", cand_key)
                 continue
@@ -673,6 +714,56 @@ class SearchProviderFactory:
 
         return chain
 
+    # ------------------------------------------------------------------
+    # Response outcome classification (P1 fix)
+    # ------------------------------------------------------------------
+    @classmethod
+    def _classify_response_outcome(
+        cls,
+        response: SearchResponse,
+    ) -> Tuple[str, bool]:
+        """
+        Classify a provider SearchResponse to decide whether the orchestrator should
+        accept it, failover to the next provider, or retry the same provider.
+
+        Returns:
+            (outcome, should_failover) where outcome is one of:
+              - _OUTCOME_SUCCESS           : usable results were returned.
+              - _OUTCOME_EMPTY             : valid empty result set; failover may find results.
+              - _OUTCOME_FAILURE_RETRYABLE : transient failure; retry then failover.
+              - _OUTCOME_FAILURE_TERMINAL  : non-retryable failure; failover immediately.
+        """
+        results = getattr(response, "results", None) or []
+        is_success = bool(getattr(response, "is_success", False))
+        status = getattr(response, "status", None)
+
+        # Direct success: results present and provider marked success.
+        if results and is_success:
+            return (_OUTCOME_SUCCESS, False)
+
+        status_val = (
+            status.value if hasattr(status, "value") else str(status or "").strip().lower()
+        )
+
+        # Contract-violation safeguard: SUCCESS status but zero results.
+        if status_val == ProviderStatus.SUCCESS.value and not results:
+            return (_OUTCOME_EMPTY, True)
+
+        if status_val == ProviderStatus.EMPTY.value:
+            return (_OUTCOME_EMPTY, True)
+
+        if status_val in _TERMINAL_FAILURE_STATUSES:
+            return (_OUTCOME_FAILURE_TERMINAL, True)
+
+        if status_val in _RETRYABLE_FAILURE_STATUSES:
+            return (_OUTCOME_FAILURE_RETRYABLE, True)
+
+        # Defensive default: unknown status with no usable results → retryable failure.
+        return (_OUTCOME_FAILURE_RETRYABLE, True)
+
+    # ------------------------------------------------------------------
+    # Primary failover-aware execution loop
+    # ------------------------------------------------------------------
     @classmethod
     async def search(
         cls,
@@ -688,8 +779,18 @@ class SearchProviderFactory:
     ) -> SearchResponse:
         """
         Execute a search query across the configured provider chain with per-provider
-        effective max_results calculation, retry policy, time budget enforcement, and
-        defensive result count truncation.
+        effective max_results calculation, retry policy, time budget enforcement,
+        explicit outcome classification, and defensive result count truncation.
+
+        Failover semantics (P1 fix):
+          - A provider response with is_success=False triggers evaluation instead of being
+            returned directly to the caller.
+          - EMPTY outcomes allow failover to seek non-empty results from the next provider.
+          - Retryable failures (rate limit, timeout, upstream error) retry the same provider
+            up to `max_retries` before moving on.
+          - Terminal failures (config/auth/permission/quota) failover immediately.
+          - If any provider completed the search successfully but returned zero results,
+            that valid EMPTY response is returned rather than raising a "all providers failed" error.
         """
         clean_query = (query or "").strip()
         if not clean_query:
@@ -716,6 +817,7 @@ class SearchProviderFactory:
 
         deadline = time.monotonic() + total_budget
         errors: List[Tuple[str, str]] = []
+        last_empty_response: Optional[SearchResponse] = None
 
         print(
             f"\n[SEARCH-FACTORY] Query: {clean_query!r}\n"
@@ -728,8 +830,18 @@ class SearchProviderFactory:
             display_name = cls.get_canonical_display_name(provider_key)
             prov_section = cls._extract_provider_section(provider_key, cfg)
 
-            if prov_section.get("enabled") is False and override_provider is None and len(chain) > 1:
-                errors.append((display_name, f"Provider {display_name} is disabled."))
+            # --- Disabled-provider handling (P1 fix) ---------------------------------
+            # override_provider bypasses the disabled flag (explicit diagnostic/test intent).
+            # Otherwise, skip disabled providers; if the primary is disabled and there is
+            # no fallback available, raise a clear, deterministic error.
+            if prov_section.get("enabled") is False and override_provider is None:
+                if len(chain) == 1:
+                    raise SearchProviderError(
+                        f"Search provider '{display_name}' is disabled in PELDRUN Search Settings "
+                        f"and no fallback providers are configured."
+                    )
+                errors.append((display_name, f"Provider '{display_name}' is disabled in search settings."))
+                logger.info("Skipping explicitly disabled search provider: %s", display_name)
                 continue
 
             # Compute the authoritative effective max_results specifically for THIS provider
@@ -759,6 +871,7 @@ class SearchProviderFactory:
                     flush=True,
                 )
 
+                # ---- Invoke provider ------------------------------------------------
                 try:
                     response = await cls._invoke_provider_search(
                         provider=provider,
@@ -770,43 +883,15 @@ class SearchProviderFactory:
                         timeout=attempt_timeout,
                         extra_kwargs=kwargs,
                     )
-
-                    # Defensive post-search truncation: never return more than effective_count
-                    if hasattr(response, "results") and isinstance(response.results, list):
-                        if len(response.results) > effective_count:
-                            response.results = list(response.results[:effective_count])
-
-                    print(
-                        f"[SEARCH-FACTORY] ✓ {display_name} returned "
-                        f"{len(response.results)} results in "
-                        f"{getattr(response, 'latency_ms', 0):.0f}ms "
-                        f"| status={getattr(response, 'status', 'unknown')}",
-                        flush=True,
-                    )
-
-                    # Attach traceability metadata for QA, diagnostics, and usage accounting
-                    cls._attach_count_metadata(
-                        response=response,
-                        provider_name=display_name,
-                        provider_key=provider_key,
-                        requested_max_results=max_results,
-                        effective_max_results=effective_count,
-                        configured_max_results=audit["configured_max_results"],
-                        max_results_limit=provider_limit,
-                        fallback_used=(provider_index > 0),
-                        attempt_number=(attempt + 1),
-                    )
-                    return response
-
                 except Exception as exc:
                     err_text = str(exc) or exc.__class__.__name__
                     print(
-                        f"[SEARCH-FACTORY] ✗ {display_name} failed "
+                        f"[SEARCH-FACTORY] ✗ {display_name} raised exception "
                         f"(attempt {attempt + 1}/{max_retries + 1}): {err_text[:200]}",
                         flush=True,
                     )
                     logger.warning(
-                        "Search provider %s failed (attempt %d/%d, effective_max_results=%d): %s",
+                        "Search provider %s raised (attempt %d/%d, effective_max_results=%d): %s",
                         display_name,
                         attempt + 1,
                         max_retries + 1,
@@ -815,9 +900,93 @@ class SearchProviderFactory:
                     )
                     if attempt < max_retries and (deadline - time.monotonic()) > retry_delay:
                         await asyncio.sleep(retry_delay)
-                    else:
-                        errors.append((display_name, err_text))
-                        break
+                        continue
+                    errors.append((display_name, err_text))
+                    break
+
+                # ---- Defensive result-count truncation ------------------------------
+                if hasattr(response, "results") and isinstance(response.results, list):
+                    if len(response.results) > effective_count:
+                        response.results = list(response.results[:effective_count])
+
+                # ---- Traceability metadata -----------------------------------------
+                cls._attach_count_metadata(
+                    response=response,
+                    provider_name=display_name,
+                    provider_key=provider_key,
+                    requested_max_results=max_results,
+                    effective_max_results=effective_count,
+                    configured_max_results=audit["configured_max_results"],
+                    max_results_limit=provider_limit,
+                    fallback_used=(provider_index > 0),
+                    attempt_number=(attempt + 1),
+                )
+
+                # ---- Explicit outcome classification (P1 fix) -----------------------
+                outcome, should_failover = cls._classify_response_outcome(response)
+
+                if outcome == _OUTCOME_SUCCESS:
+                    print(
+                        f"[SEARCH-FACTORY] ✓ {display_name} returned "
+                        f"{len(response.results)} results in "
+                        f"{getattr(response, 'latency_ms', 0):.0f}ms "
+                        f"| status={getattr(response.status, 'value', response.status)}",
+                        flush=True,
+                    )
+                    return response
+
+                status_obj = getattr(response, "status", None)
+                status_val = (
+                    status_obj.value if hasattr(status_obj, "value") else str(status_obj or "unknown")
+                )
+                err_msg = (
+                    getattr(response, "error_message", None)
+                    or f"Provider '{display_name}' returned status '{status_val}' with no usable results."
+                )
+
+                print(
+                    f"[SEARCH-FACTORY] ⚠ {display_name} non-success outcome: "
+                    f"{outcome} (status={status_val}) — "
+                    f"{'failing over' if should_failover else 'accepting'}",
+                    flush=True,
+                )
+                logger.warning(
+                    "Search provider %s non-success outcome=%s status=%s "
+                    "(attempt %d/%d, effective_max_results=%d): %s",
+                    display_name,
+                    outcome,
+                    status_val,
+                    attempt + 1,
+                    max_retries + 1,
+                    effective_count,
+                    err_msg,
+                )
+
+                # Track the most recent valid EMPTY response so we can return it
+                # if every remaining provider fails outright.
+                if outcome == _OUTCOME_EMPTY:
+                    last_empty_response = response
+
+                errors.append((display_name, err_msg))
+
+                # EMPTY and TERMINAL failures do not retry the same provider.
+                if outcome in (_OUTCOME_EMPTY, _OUTCOME_FAILURE_TERMINAL):
+                    break
+
+                # RETRYABLE failure: retry same provider if budget and retry budget allow.
+                if attempt < max_retries and (deadline - time.monotonic()) > retry_delay:
+                    await asyncio.sleep(retry_delay)
+                    continue
+                break
+
+        # ---- All providers exhausted -------------------------------------------
+        if last_empty_response is not None:
+            print(
+                "[SEARCH-FACTORY] ⚠ All providers exhausted; returning valid EMPTY result "
+                f"from {last_empty_response.provider}.",
+                flush=True,
+            )
+            return last_empty_response
 
         summary = "; ".join(f"{prov}: {msg}" for prov, msg in errors) or "Unknown provider failure."
         print(
@@ -831,6 +1000,9 @@ class SearchProviderFactory:
     execute_search = search
     search_with_failover = search
 
+    # ------------------------------------------------------------------
+    # Provider invocation adapter
+    # ------------------------------------------------------------------
     @classmethod
     async def _invoke_provider_search(
         cls,
@@ -874,6 +1046,9 @@ class SearchProviderFactory:
 
         return await asyncio.wait_for(search_fn(**call_kwargs), timeout=timeout + 1.0)
 
+    # ------------------------------------------------------------------
+    # Count metadata attachment
+    # ------------------------------------------------------------------
     @classmethod
     def _attach_count_metadata(
         cls,

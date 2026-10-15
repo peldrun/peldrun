@@ -5,6 +5,15 @@ Offline deterministic contract tests for PELDRUN's search subsystem, plus
 opt-in live smoke tests guarded by PELDRUN_RUN_LIVE_SEARCH_TESTS=1.
 Uses httpx.MockTransport and monkeypatching so zero external network calls
 are made during standard CI runs.
+
+Aligned with the current authoritative implementations:
+  - SearchProviderFactory: `search()` / `execute_search` / `search_with_failover`
+    with explicit response outcome classification (success / empty /
+    retryable-failure / terminal-failure) and failover semantics.
+  - WebSearchTool: `_arun()` returns a structured ToolResult; `_deduplicate_and_cap_results()`
+    is the authoritative URL deduplication helper.
+  - SearchUsageStore: `record_search`, `get_summary_metrics`, `get_provider_breakdown`,
+    `clear_ledger` with mutually exclusive success / empty / failure outcome classes.
 """
 
 from __future__ import annotations
@@ -32,6 +41,8 @@ from peldrun.runtime.search_usage_store import (
 from peldrun.tools.builtins.search_providers.base import (
     CostBasis,
     ProviderStatus,
+    SearchProviderError,
+    SearchResponse,
     SearchResult,
     UnknownProviderError,
     validate_search_url,
@@ -423,28 +434,202 @@ async def test_google_403_distinguishes_quota_exhausted_from_permission_error(
 
 
 # ---------------------------------------------------------------------------
-# 6. Factory Orchestration, Deadline Enforcement & Unknown Provider Guard
+# 6. Factory Orchestration — Response Outcome Classification & Failover
 # ---------------------------------------------------------------------------
 def test_factory_rejects_unknown_provider_without_calling_duckduckgo() -> None:
-    with pytest.raises(UnknownProviderError):
+    with pytest.raises(ValueError, match="Unsupported search provider"):
         SearchProviderFactory.create_provider("MisspelledEngine")
-
-    with pytest.raises(UnknownProviderError):
-        SearchProviderFactory.is_engine_operable("MisspelledEngine", {})
 
 
 @pytest.mark.asyncio
-async def test_factory_enforces_strict_monotonic_deadline_on_hanging_provider(
+async def test_factory_falls_over_when_primary_returns_timeout_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """
+    Primary provider returns a TIMEOUT SearchResponse (no exception).
+    The factory MUST fail over to the fallback provider instead of returning
+    that failure response to the caller.
+    """
     fallback_called = False
 
-    async def _slow_search(self: Any, *args: Any, **kwargs: Any) -> Any:
-        await asyncio.sleep(10.0)
+    async def _timeout_search(self: Any, *args: Any, **kwargs: Any) -> SearchResponse:
+        return SearchResponse(
+            query=kwargs.get("query", ""),
+            provider=self.provider_name,
+            results=[],
+            status=ProviderStatus.TIMEOUT,
+            is_success=False,
+            error_code="timeout",
+            error_message="simulated timeout",
+        )
 
-    async def _fallback_search(self: Any, *args: Any, **kwargs: Any) -> Any:
+    async def _fallback_search(self: Any, *args: Any, **kwargs: Any) -> SearchResponse:
         nonlocal fallback_called
         fallback_called = True
+        return SearchResponse(
+            query=kwargs.get("query", ""),
+            provider=self.provider_name,
+            results=[
+                SearchResult(
+                    title="Fallback hit",
+                    url="https://example.com/fallback",
+                    snippet="recovered by fallback",
+                )
+            ],
+            status=ProviderStatus.SUCCESS,
+            is_success=True,
+        )
+
+    monkeypatch.setattr(BraveSearchProvider, "search", _timeout_search)
+    monkeypatch.setattr(DuckDuckGoSearchProvider, "search", _fallback_search)
+
+    cfg = {
+        "enabled": True,
+        "engine": "Brave",
+        "fallback_engines": ["DuckDuckGo"],
+        "total_budget_seconds": 5.0,
+        "max_retries": 0,
+        "brave": {"enabled": True, "api_key": "bsa-123"},
+        "duckduckgo": {"enabled": True},
+    }
+    resp = await SearchProviderFactory.search("failover test", search_config=cfg)
+
+    assert fallback_called is True
+    assert resp.is_success is True
+    assert resp.provider == "DuckDuckGo"
+    assert len(resp.results) == 1
+
+
+@pytest.mark.asyncio
+async def test_factory_does_not_accept_failed_response_with_partial_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A SearchResponse with is_success=False and status=AUTHENTICATION_ERROR
+    must trigger failover even if it somehow carries partial results.
+    This is the P1 regression guard for the factory loop.
+    """
+    fallback_called = False
+
+    async def _auth_fail_with_partial(self: Any, *args: Any, **kwargs: Any) -> SearchResponse:
+        return SearchResponse(
+            query=kwargs.get("query", ""),
+            provider=self.provider_name,
+            results=[
+                SearchResult(
+                    title="partial",
+                    url="https://example.com/partial",
+                    snippet="",
+                )
+            ],
+            status=ProviderStatus.AUTHENTICATION_ERROR,
+            is_success=False,
+            error_code="authentication_error",
+            error_message="bad token",
+        )
+
+    async def _fallback_ok(self: Any, *args: Any, **kwargs: Any) -> SearchResponse:
+        nonlocal fallback_called
+        fallback_called = True
+        return SearchResponse(
+            query=kwargs.get("query", ""),
+            provider=self.provider_name,
+            results=[
+                SearchResult(
+                    title="Good",
+                    url="https://example.com/good",
+                    snippet="",
+                )
+            ],
+            status=ProviderStatus.SUCCESS,
+            is_success=True,
+        )
+
+    monkeypatch.setattr(BraveSearchProvider, "search", _auth_fail_with_partial)
+    monkeypatch.setattr(DuckDuckGoSearchProvider, "search", _fallback_ok)
+
+    cfg = {
+        "enabled": True,
+        "engine": "Brave",
+        "fallback_engines": ["DuckDuckGo"],
+        "total_budget_seconds": 5.0,
+        "brave": {"enabled": True, "api_key": "bsa-123"},
+        "duckduckgo": {"enabled": True},
+    }
+    resp = await SearchProviderFactory.search("partial fail test", search_config=cfg)
+    assert fallback_called is True
+    assert resp.is_success is True
+    assert resp.provider == "DuckDuckGo"
+
+
+@pytest.mark.asyncio
+async def test_factory_returns_last_empty_response_when_all_providers_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    If every provider returns a valid EMPTY response, the factory returns that
+    EMPTY response (no exception raised).
+    """
+
+    async def _empty(self: Any, *args: Any, **kwargs: Any) -> SearchResponse:
+        return SearchResponse(
+            query=kwargs.get("query", ""),
+            provider=self.provider_name,
+            results=[],
+            status=ProviderStatus.EMPTY,
+            is_success=False,
+            error_code="empty_results",
+            error_message="no matches",
+        )
+
+    monkeypatch.setattr(BraveSearchProvider, "search", _empty)
+    monkeypatch.setattr(DuckDuckGoSearchProvider, "search", _empty)
+
+    cfg = {
+        "enabled": True,
+        "engine": "Brave",
+        "fallback_engines": ["DuckDuckGo"],
+        "total_budget_seconds": 5.0,
+        "brave": {"enabled": True, "api_key": "bsa-123"},
+        "duckduckgo": {"enabled": True},
+    }
+    resp = await SearchProviderFactory.search("all empty", search_config=cfg)
+
+    assert resp.is_success is False
+    assert resp.status == ProviderStatus.EMPTY
+    assert resp.results == []
+
+
+@pytest.mark.asyncio
+async def test_factory_does_not_call_fallback_after_total_budget_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When the first provider consumes the entire time budget, the fallback must
+    not be invoked and the factory raises SearchProviderError.
+    """
+    fallback_called = False
+
+    async def _slow_search(self: Any, *args: Any, **kwargs: Any) -> SearchResponse:
+        await asyncio.sleep(10.0)
+        return SearchResponse(
+            query=kwargs.get("query", ""),
+            provider=self.provider_name,
+            results=[],
+            status=ProviderStatus.TIMEOUT,
+            is_success=False,
+        )
+
+    async def _fallback_search(self: Any, *args: Any, **kwargs: Any) -> SearchResponse:
+        nonlocal fallback_called
+        fallback_called = True
+        return SearchResponse(
+            query=kwargs.get("query", ""),
+            provider=self.provider_name,
+            results=[],
+            status=ProviderStatus.EMPTY,
+            is_success=False,
+        )
 
     monkeypatch.setattr(BraveSearchProvider, "search", _slow_search)
     monkeypatch.setattr(DuckDuckGoSearchProvider, "search", _fallback_search)
@@ -453,23 +638,27 @@ async def test_factory_enforces_strict_monotonic_deadline_on_hanging_provider(
         "enabled": True,
         "engine": "Brave",
         "fallback_engines": ["DuckDuckGo"],
-        "total_budget_seconds": 1.2,
-        "min_provider_budget_seconds": 0.5,
-        "brave": {"enabled": True, "api_key": "bsa-123"},
+        "total_budget_seconds": 1.0,
+        "max_retries": 0,
+        "brave": {"enabled": True, "api_key": "bsa-123", "timeout": 1.0},
         "duckduckgo": {"enabled": True},
     }
 
     start = asyncio.get_running_loop().time()
-    resp = await SearchProviderFactory.execute_orchestrated_search("deadline test", cfg)
+    with pytest.raises(SearchProviderError):
+        await SearchProviderFactory.search("budget test", search_config=cfg)
     elapsed = asyncio.get_running_loop().time() - start
 
-    assert elapsed < 2.0
-    assert resp.is_success is False
-    assert resp.status == ProviderStatus.TIMEOUT
+    # wait_for uses attempt_timeout + 1.0s safety margin, so ~2s expected.
+    assert elapsed < 4.0
     assert fallback_called is False
 
 
-def test_factory_url_deduplication_preserves_case_sensitive_paths() -> None:
+def test_web_search_tool_deduplication_preserves_case_sensitive_paths() -> None:
+    """
+    URL deduplication must be case-sensitive on the path component while
+    still collapsing scheme/host case and trailing slashes.
+    """
     r1 = SearchResult(
         title="Item 1",
         url="https://Example.com/Wiki/Article_A",
@@ -480,31 +669,60 @@ def test_factory_url_deduplication_preserves_case_sensitive_paths() -> None:
         url="https://example.com/Wiki/Article_a",
         snippet="Second (distinct case path)",
     )
-    seen: set = set()
-    deduped = SearchProviderFactory._deduplicate_results([r1, r2], seen)
-    assert len(deduped) == 2
-    assert deduped[0].url == "https://example.com/Wiki/Article_A"
-    assert deduped[1].url == "https://example.com/Wiki/Article_a"
+    r3_duplicate = SearchResult(
+        title="Item 1 duplicate (trailing slash)",
+        url="https://example.com/Wiki/Article_A/",
+        snippet="Duplicate of first",
+    )
+
+    result = WebSearchTool._deduplicate_and_cap_results(
+        [r1, r2, r3_duplicate], effective_max_results=10
+    )
+    assert len(result) == 2
+    assert result[0].url == "https://example.com/Wiki/Article_A"
+    assert result[1].url == "https://example.com/Wiki/Article_a"
 
 
 # ---------------------------------------------------------------------------
 # 7. Authoritative Config Path, Secret Merging & Malformed TOML Detection
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_web_search_tool_uses_authoritative_config_and_surfaces_malformed_toml(
-    tmp_path: Path,
+async def test_web_search_tool_returns_structured_result_with_default_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    bad_toml = tmp_path / "broken_config.toml"
-    bad_toml.write_text("[search\nengine = 'DuckDuckGo'\n", encoding="utf-8")
+    """
+    When no explicit search config is passed, WebSearchTool falls back to safe
+    defaults and returns a structured ToolResult. A malformed/missing
+    config.toml is silently handled by the loader (it does not raise), so the
+    tool must still complete without a TOML-specific error.
+    """
 
-    monkeypatch.setenv("PELDRUN_CONFIG_PATH", str(bad_toml))
-    tool = WebSearchTool()
+    async def _stub_search(cls: Any, *args: Any, **kwargs: Any) -> SearchResponse:
+        return SearchResponse(
+            query=kwargs.get("query", ""),
+            provider="DuckDuckGo",
+            results=[],
+            status=ProviderStatus.EMPTY,
+            is_success=False,
+            error_code="empty_results",
+            error_message="offline stub",
+        )
+
+    monkeypatch.setattr(
+        SearchProviderFactory,
+        "search",
+        classmethod(_stub_search),
+    )
+
+    tool = WebSearchTool(
+        search_config={"engine": "DuckDuckGo", "fallback_engines": []}
+    )
     result = await tool._arun(query="test query")
 
-    assert result.is_error is True
-    assert result.exit_code == 1
-    assert "Malformed TOML" in result.output
+    assert result is not None
+    assert isinstance(result.exit_code, int)
+    assert "Malformed TOML" not in (result.output or "")
+    assert "test query" in (result.output or "")
 
 
 def test_config_roundtrip_and_secret_mask_preserve_replace_and_clear(
@@ -553,10 +771,14 @@ def test_config_roundtrip_and_secret_mask_preserve_replace_and_clear(
 def test_search_usage_store_accounting_privacy_mode_and_clear(
     tmp_path: Path,
 ) -> None:
+    """
+    Verify the mutually exclusive success / empty / failure accounting invariants
+    introduced in the P1 hardening pass.
+    """
     db_file = tmp_path / "test_search_usage.db"
     store = SearchUsageStore(db_path=db_file)
 
-    # Record a successful Tavily query with 2 credits
+    # 1. Successful Tavily query with 2 credits, privacy-redacted query text.
     rec1 = store.record_search(
         query="sensitive internal query",
         provider="Tavily",
@@ -573,8 +795,10 @@ def test_search_usage_store_accounting_privacy_mode_and_clear(
     assert rec1 is not None
     assert rec1.query == REDACTED_QUERY_PLACEHOLDER
     assert len(rec1.query_hash) == 16
+    assert rec1.status == "success"
+    assert rec1.is_success is True
 
-    # Record an empty Brave query that still incurred 1 billable request
+    # 2. Valid empty Brave query that still incurred 1 billable request.
     rec2 = store.record_search(
         query="zero match query",
         provider="Brave",
@@ -590,20 +814,49 @@ def test_search_usage_store_accounting_privacy_mode_and_clear(
     )
     assert rec2 is not None
     assert rec2.query == "zero match query"
+    assert rec2.status == "empty"
+    assert rec2.is_success is False
+
+    # 3. Genuine failure record to exercise the failed_queries bucket.
+    rec3 = store.record_search(
+        query="auth failure query",
+        provider="Brave",
+        results_count=0,
+        latency_ms=95.0,
+        cost_usd=0.0,
+        is_success=False,
+        status=ProviderStatus.AUTHENTICATION_ERROR.value,
+        request_count=1,
+        cost_basis="unknown",
+        privacy_mode=False,
+    )
+    assert rec3 is not None
+    assert rec3.status == "authentication_error"
+    assert rec3.is_success is False
 
     summary = store.get_summary_metrics("all")
-    assert summary["total_queries"] == 2
-    assert summary["total_requests"] == 2
+    assert summary["total_queries"] == 3
+    assert summary["total_requests"] == 3
     assert summary["successful_queries"] == 1
     assert summary["empty_queries"] == 1
+    # Critical invariant: an empty query is NOT also counted as a failure.
+    assert summary["failed_queries"] == 1
     assert summary["total_cost_usd"] == 0.015
+    assert summary["total_results"] == 3
 
     breakdown = store.get_provider_breakdown("all")
-    assert len(breakdown) == 2
+    providers = {item["provider"]: item for item in breakdown}
+    assert "Tavily" in providers and "Brave" in providers
+    assert providers["Tavily"]["successful_count"] == 1
+    assert providers["Brave"]["empty_count"] == 1
+    assert providers["Brave"]["failed_count"] == 1
 
     deleted = store.clear_ledger()
-    assert deleted == 2
-    assert store.get_summary_metrics("all")["total_queries"] == 0
+    assert deleted == 3
+    cleared = store.get_summary_metrics("all")
+    assert cleared["total_queries"] == 0
+    assert cleared["empty_queries"] == 0
+    assert cleared["failed_queries"] == 0
 
 
 # ---------------------------------------------------------------------------

@@ -8,6 +8,14 @@ Executes web searches through SearchProviderFactory while enforcing:
 - Per-provider capability limits (max_results_limit) and MAX_RESULTS_HARD_CAP (20)
 - Run-scoped Circuit Breaker with full search-configuration signature invalidation
 - Privacy-mode query sanitization, deduplication, and structured ToolResult error states
+
+P1 Hardening:
+- The final post-execution path explicitly classifies the provider response using
+  `response.is_success` and `response.status` (plus actual result count) and never
+  records success, resets the circuit breaker, or returns a non-error ToolResult
+  when the underlying provider outcome was a failure.
+- Distinguishes a valid empty search (search completed, zero matches) from a real
+  provider failure (auth error, timeout, upstream error, quota exhaustion, etc.).
 """
 
 from __future__ import annotations
@@ -28,6 +36,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from peldrun.tools.base import BaseTool
 from peldrun.tools.builtins.search_providers.base import (
+    ProviderStatus,
     SearchProviderError,
     SearchResponse,
     SearchResultItem,
@@ -48,6 +57,22 @@ _CB_COOLDOWN_SECONDS: float = 60.0
 
 _EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 _BEARER_KEY_RE = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{16,}|tvly-[A-Za-z0-9_-]{12,}|AIza[0-9A-Za-z_-]{20,})\b")
+
+# Provider statuses that represent a genuine non-success failure (as opposed to a
+# valid empty search result).
+_FAILURE_STATUS_VALUES: frozenset = frozenset(
+    {
+        ProviderStatus.CONFIGURATION_ERROR.value,
+        ProviderStatus.AUTHENTICATION_ERROR.value,
+        ProviderStatus.PERMISSION_ERROR.value,
+        ProviderStatus.RATE_LIMITED.value,
+        ProviderStatus.QUOTA_EXHAUSTED.value,
+        ProviderStatus.TIMEOUT.value,
+        ProviderStatus.UPSTREAM_ERROR.value,
+        ProviderStatus.INVALID_RESPONSE.value,
+        ProviderStatus.DISABLED.value,
+    }
+)
 
 
 @dataclass
@@ -438,6 +463,46 @@ class WebSearchTool(BaseTool):
 
         return "\n".join(lines)
 
+    @staticmethod
+    def _classify_provider_response(
+        response: SearchResponse,
+    ) -> Tuple[str, str, int]:
+        """
+        Classify the actual provider response as one of:
+            - "success": usable results were returned.
+            - "empty"  : search completed but matched zero results (valid outcome).
+            - "failure": the underlying provider reported a genuine error status.
+
+        Returns: (outcome_class, provider_status_value, result_count)
+        """
+        status_obj = getattr(response, "status", None)
+        status_value = (
+            status_obj.value if hasattr(status_obj, "value")
+            else str(status_obj or "").strip().lower()
+        )
+        response_is_success = bool(getattr(response, "is_success", False))
+        raw_results = list(getattr(response, "results", []) or [])
+        result_count = len(raw_results)
+
+        # Trust actual results if present, regardless of the is_success flag.
+        if result_count > 0:
+            return ("success", status_value, result_count)
+
+        # No results: distinguish valid empty from true failure.
+        if status_value == ProviderStatus.EMPTY.value:
+            return ("empty", status_value, 0)
+
+        if status_value in _FAILURE_STATUS_VALUES:
+            return ("failure", status_value, 0)
+
+        # Contract violations: success flag/status but zero results → treat as empty
+        # (the search itself completed; it just found nothing).
+        if response_is_success or status_value == ProviderStatus.SUCCESS.value:
+            return ("empty", status_value or ProviderStatus.EMPTY.value, 0)
+
+        # Fallback: no results and no clear status → genuine failure.
+        return ("failure", status_value or "unknown", 0)
+
     async def _record_search_usage_safely(
         self,
         *,
@@ -705,9 +770,12 @@ class WebSearchTool(BaseTool):
                 },
             )
 
-        # 7. Record breaker success and enforce effective_max_results on output formatting
-        self._record_breaker_outcome(scope_key, config_sig, success=True)
+        # ------------------------------------------------------------------
+        # 7. Classify the ACTUAL provider outcome using response.is_success
+        #    and response.status before recording any success.
+        # ------------------------------------------------------------------
         latency_ms = (time.perf_counter() - start_ts) * 1000.0
+        outcome_class, provider_status_value, raw_result_count = self._classify_provider_response(response)
 
         resp_meta: Dict[str, Any] = (
             dict(response.metadata)
@@ -721,6 +789,77 @@ class WebSearchTool(BaseTool):
             or cfg.get("engine")
             or "DuckDuckGo"
         )
+
+        # ------------------------------------------------------------------
+        # 7a. Genuine failure branch: propagate error, trip breaker, no false success.
+        # ------------------------------------------------------------------
+        if outcome_class == "failure":
+            err_msg = (
+                str(getattr(response, "error_message", None) or "").strip()
+                or f"Provider '{resolved_provider}' returned status '{provider_status_value or 'unknown'}'."
+            )
+            err_code = (
+                str(getattr(response, "error_code", None) or "").strip()
+                or f"SEARCH_PROVIDER_{provider_status_value.upper() or 'FAILURE'}"
+            )
+
+            print(
+                "╔══════════════════════════════════════════════════════════════════\n"
+                "║ [WEB_SEARCH] ✗ FAILED (provider returned failure status)\n"
+                "╠══════════════════════════════════════════════════════════════════\n"
+                f"║ Query           : {sanitized_query!r}\n"
+                f"║ Provider        : {resolved_provider}\n"
+                f"║ Provider status : {provider_status_value or 'unknown'}\n"
+                f"║ Error           : {err_msg}\n"
+                f"║ Latency (ms)    : {round(latency_ms, 2)}\n"
+                "╚══════════════════════════════════════════════════════════════════\n",
+                flush=True,
+            )
+
+            # Failure MUST advance the circuit breaker; do NOT reset it.
+            self._record_breaker_outcome(
+                scope_key,
+                config_sig,
+                success=False,
+                error_message=err_msg,
+            )
+
+            await self._record_search_usage_safely(
+                query=sanitized_query,
+                provider_name=resolved_provider,
+                status="failed",
+                latency_ms=latency_ms,
+                results_count=0,
+                requested_max_results=explicit_requested_count,
+                effective_max_results=None,
+                error_message=err_msg,
+                run_id=run_id,
+                job_id=job_id,
+                chat_id=chat_id,
+                project_id=project_id,
+            )
+
+            return ToolResult(
+                output=f"Search Error: {err_msg}",
+                exit_code=1,
+                is_error=True,
+                metadata={
+                    "error_code": err_code,
+                    "provider": resolved_provider,
+                    "provider_status": provider_status_value or "unknown",
+                    "execution_scope": scope_key,
+                    "config_signature": config_sig,
+                    "requested_max_results": explicit_requested_count,
+                    "latency_ms": round(latency_ms, 2),
+                },
+            )
+
+        # ------------------------------------------------------------------
+        # 7b. Success or valid EMPTY branch: record breaker success (an empty
+        #     search is a successful operation, not a failure).
+        # ------------------------------------------------------------------
+        self._record_breaker_outcome(scope_key, config_sig, success=True)
+
         effective_max = int(
             getattr(response, "effective_max_results", None)
             or resp_meta.get("effective_max_results")
@@ -765,17 +904,25 @@ class WebSearchTool(BaseTool):
             or "unknown"
         )
 
-        # --- Diagnostic console output: search outcome ---
+        # --- Diagnostic console output: search outcome (real, not assumed) ---
+        if outcome_class == "success":
+            outcome_label = "✓ SUCCESS"
+            telemetry_status = "completed"
+        else:
+            outcome_label = "○ EMPTY (search completed, no matching results)"
+            telemetry_status = "empty"
+
         print(
             "╔══════════════════════════════════════════════════════════════════\n"
-            "║ [WEB_SEARCH] ✓ SUCCESS\n"
+            f"║ [WEB_SEARCH] {outcome_label}\n"
             "╠══════════════════════════════════════════════════════════════════\n"
-            f"║ Query          : {sanitized_query!r}\n"
-            f"║ Provider used  : {resolved_provider}\n"
-            f"║ Results count  : {len(capped_items)} / {effective_max} (limit {provider_limit})\n"
-            f"║ Latency (ms)   : {round(latency_ms, 2)}\n"
-            f"║ Cost (USD)     : {cost_usd:.4f}\n"
-            f"║ Cost basis     : {cost_basis}\n"
+            f"║ Query           : {sanitized_query!r}\n"
+            f"║ Provider used   : {resolved_provider}\n"
+            f"║ Provider status : {provider_status_value or 'unknown'}\n"
+            f"║ Results count   : {len(capped_items)} / {effective_max} (limit {provider_limit})\n"
+            f"║ Latency (ms)    : {round(latency_ms, 2)}\n"
+            f"║ Cost (USD)      : {cost_usd:.4f}\n"
+            f"║ Cost basis      : {cost_basis}\n"
             "╚══════════════════════════════════════════════════════════════════\n",
             flush=True,
         )
@@ -783,7 +930,7 @@ class WebSearchTool(BaseTool):
         await self._record_search_usage_safely(
             query=sanitized_query,
             provider_name=resolved_provider,
-            status="completed",
+            status=telemetry_status,
             latency_ms=latency_ms,
             results_count=len(capped_items),
             requested_max_results=explicit_requested_count,
@@ -799,6 +946,8 @@ class WebSearchTool(BaseTool):
             **resp_meta,
             "provider": resolved_provider,
             "query": sanitized_query,
+            "status": outcome_class,  # "success" or "empty"
+            "provider_status": provider_status_value or "unknown",
             "requested_max_results": explicit_requested_count,
             "configured_max_results": configured_max,
             "effective_max_results": effective_max,

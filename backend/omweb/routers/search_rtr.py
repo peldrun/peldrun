@@ -5,6 +5,18 @@ PELDRUN Search Settings, Capability Registry, Diagnostics, and Telemetry Router.
 Canonical field names align with the frontend SearchTab.tsx contract:
 - safe_search key is exposed to providers as "safesearch"
 - cost key is exposed as "cost_per_query"
+
+Hardening notes:
+- /test classifies the provider response using response.is_success AND response.status
+  (not merely the presence of results), so a partial-result response with a failure
+  status is reported as a failure and never as a full success.
+- /test-connection exposes a dedicated provider diagnostic endpoint (credentials /
+  reachability / live-search) that SearchTab.tsx can drive independently.
+- Exception branches of /test no longer assert request_count=1 / estimated_cost_usd=0.0
+  when those numbers cannot be proven; they return usage_unknown=True instead.
+- The preservation of request_count=0 (no more `or 1` coercion) keeps usage counts accurate.
+- /metrics resolves `days` into an effective period and never falls through to "all records"
+  for unrecognized `period` values.
 """
 
 from __future__ import annotations
@@ -14,13 +26,17 @@ import inspect
 import logging
 from pathlib import Path
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Body, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from peldrun.tools.builtins.search_providers.base import SearchProviderError
+from peldrun.tools.builtins.search_providers.base import (
+    DiagnosticCheckType,
+    ProviderStatus,
+    SearchProviderError,
+)
 from peldrun.tools.builtins.search_providers.factory import (
     DEFAULT_MAX_RESULTS,
     MAX_RESULTS_HARD_CAP,
@@ -35,6 +51,21 @@ router = APIRouter(tags=["search"])
 
 _MASKED_SECRET_PLACEHOLDERS = {"********", "••••••••", "***", "<redacted>", "REDACTED"}
 _SECRET_FIELD_NAMES = {"api_key", "cx", "search_engine_id", "folder_id", "secret_key", "token"}
+
+# Provider status values that denote a genuine, non-empty failure.
+_FAILURE_STATUS_VALUES = frozenset(
+    {
+        ProviderStatus.CONFIGURATION_ERROR.value,
+        ProviderStatus.AUTHENTICATION_ERROR.value,
+        ProviderStatus.PERMISSION_ERROR.value,
+        ProviderStatus.RATE_LIMITED.value,
+        ProviderStatus.QUOTA_EXHAUSTED.value,
+        ProviderStatus.TIMEOUT.value,
+        ProviderStatus.UPSTREAM_ERROR.value,
+        ProviderStatus.INVALID_RESPONSE.value,
+        ProviderStatus.DISABLED.value,
+    }
+)
 
 # Canonical provider defaults — field names match the frontend SearchTab.tsx.
 _DEFAULT_PROVIDER_CONFIGS: Dict[str, Dict[str, Any]] = {
@@ -133,6 +164,21 @@ class TestQueryRequest(BaseModel):
     country: Optional[str] = None
     config: Optional[Dict[str, Any]] = None
     search_config: Optional[Dict[str, Any]] = None
+
+
+class TestConnectionRequest(BaseModel):
+    """
+    Parameters accepted by POST /test-connection.
+
+    - `provider` / `engine` : provider to test. Defaults to the configured primary engine.
+    - `config` / `search_config` : optional search-config snapshot (same shape as /config).
+    - `check_type` : "credentials" (default), "reachability", or "live_search".
+    """
+    provider: Optional[str] = None
+    engine: Optional[str] = None
+    config: Optional[Dict[str, Any]] = None
+    search_config: Optional[Dict[str, Any]] = None
+    check_type: str = Field(default="credentials")
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +341,130 @@ def _validate_http_url(url_value: Any, field_label: str) -> str:
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise SearchConfigValidationError(f"{field_label} must be http:// or https://.")
     return cleaned
+
+
+# ---------------------------------------------------------------------------
+# Response classification — used by /test and any other read-side diagnostic
+# ---------------------------------------------------------------------------
+def _classify_provider_response(
+    response: Any,
+) -> Tuple[str, str, int]:
+    """
+    Classify a SearchResponse into one of three outcome classes:
+        - "success" : usable results were returned and the provider declared success.
+        - "empty"   : the search completed but returned zero matches.
+        - "failure" : the provider declared a genuine error (auth, timeout, quota, etc.).
+
+    Classification prioritizes the provider's own is_success/status over the mere
+    presence of results, so partial results arriving alongside a failure status are
+    reported as a failure, not as a success.
+
+    Returns (outcome_class, provider_status_value, result_count).
+    """
+    status_obj = getattr(response, "status", None)
+    status_value = (
+        status_obj.value if hasattr(status_obj, "value")
+        else str(status_obj or "").strip().lower()
+    )
+    is_success = bool(getattr(response, "is_success", False))
+    raw_results = list(getattr(response, "results", []) or [])
+    result_count = len(raw_results)
+
+    # 1. Explicit failure status → failure (even if partial results accompany it).
+    if status_value in _FAILURE_STATUS_VALUES:
+        return ("failure", status_value, result_count)
+
+    # 2. Explicit empty status → empty (no results).
+    if status_value == ProviderStatus.EMPTY.value:
+        return ("empty", status_value, 0)
+
+    # 3. Provider declared success.
+    if is_success:
+        if result_count > 0:
+            return ("success", status_value or ProviderStatus.SUCCESS.value, result_count)
+        # Contract violation (is_success=True but zero results) → empty.
+        return ("empty", status_value or ProviderStatus.EMPTY.value, 0)
+
+    # 4. is_success=False but status=success (contract violation) → failure.
+    if status_value == ProviderStatus.SUCCESS.value:
+        return ("failure", "invalid_response", result_count)
+
+    # 5. is_success=False with an unknown/missing status → failure.
+    return ("failure", status_value or "unknown", result_count)
+
+
+def _resolve_effective_metrics_period(period: str, days: int) -> str:
+    """
+    Normalize (period, days) into a single period keyword that drives store lookups.
+
+    - If `period` is a recognized keyword, it wins.
+    - Otherwise, derive the period from `days`, so an unrecognized `period` value
+      never silently falls through to "all records".
+    """
+    recognized = {"day", "week", "month", "all"}
+    p = (period or "").strip().lower()
+    if p in recognized:
+        return p
+
+    try:
+        d = int(days)
+    except (TypeError, ValueError):
+        d = 7
+    d = max(1, min(d, 365))
+
+    if d <= 1:
+        return "day"
+    if d <= 7:
+        return "week"
+    if d <= 30:
+        return "month"
+    return "all"
+
+
+def _extract_exception_usage_evidence(exc: BaseException) -> Dict[str, Any]:
+    """
+    Derive a conservative usage-evidence bundle from an exception that escaped the
+    factory. We only assert a request happened when the exception's own status
+    proves that a transport round-trip occurred (auth/permission/rate/quota/upstream/timeout).
+    Otherwise we explicitly flag the accounting as unknown.
+    """
+    if isinstance(exc, SearchProviderError):
+        status_obj = getattr(exc, "status", None)
+        status_val = (
+            status_obj.value if hasattr(status_obj, "value") else str(status_obj or "").strip().lower()
+        )
+        # Statuses that imply the provider responded (or the network round-trip happened).
+        if status_val in (
+            ProviderStatus.AUTHENTICATION_ERROR.value,
+            ProviderStatus.PERMISSION_ERROR.value,
+            ProviderStatus.RATE_LIMITED.value,
+            ProviderStatus.QUOTA_EXHAUSTED.value,
+            ProviderStatus.TIMEOUT.value,
+            ProviderStatus.UPSTREAM_ERROR.value,
+            ProviderStatus.INVALID_RESPONSE.value,
+        ):
+            return {
+                "request_count": 1,
+                "estimated_cost_usd": 0.0,
+                "cost_basis": "unknown",
+                "usage_unknown": True,
+            }
+        # Configuration errors clearly did not issue a physical request.
+        if status_val == ProviderStatus.CONFIGURATION_ERROR.value:
+            return {
+                "request_count": 0,
+                "estimated_cost_usd": 0.0,
+                "cost_basis": "not_billable_local",
+                "usage_unknown": False,
+            }
+
+    # Unknown origin — be conservative and flag the accounting.
+    return {
+        "request_count": 0,
+        "estimated_cost_usd": 0.0,
+        "cost_basis": "unknown",
+        "usage_unknown": True,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -728,6 +898,10 @@ async def get_search_metrics(
     enriched = _enrich_search_config_with_defaults(raw_search)
     capabilities = SearchProviderFactory.get_provider_capabilities(enriched)
 
+    # Resolve `days` into the effective period so an unrecognized `period`
+    # never silently widens to "all records".
+    effective_period = _resolve_effective_metrics_period(period, days)
+
     empty_summary: Dict[str, Any] = {
         "total_queries": 0,
         "total_requests": 0,
@@ -756,7 +930,7 @@ async def get_search_metrics(
             summary_fn = getattr(store, "get_summary_metrics", None)
             if callable(summary_fn):
                 try:
-                    res = summary_fn(period=period)
+                    res = summary_fn(period=effective_period)
                     if inspect.isawaitable(res):
                         res = await res
                     if isinstance(res, dict):
@@ -768,7 +942,7 @@ async def get_search_metrics(
             breakdown_fn = getattr(store, "get_provider_breakdown", None)
             if callable(breakdown_fn):
                 try:
-                    res = breakdown_fn(period=period)
+                    res = breakdown_fn(period=effective_period)
                     if inspect.isawaitable(res):
                         res = await res
                     if isinstance(res, list):
@@ -780,7 +954,7 @@ async def get_search_metrics(
             timeseries_fn = getattr(store, "get_timeseries", None)
             if callable(timeseries_fn):
                 try:
-                    res = timeseries_fn(period=period)
+                    res = timeseries_fn(period=effective_period)
                     if inspect.isawaitable(res):
                         res = await res
                     if isinstance(res, list):
@@ -792,7 +966,8 @@ async def get_search_metrics(
 
     return {
         "status": "ok",
-        "period": period,
+        "period": effective_period,
+        "requested_period": period,
         "days": days,
         "summary": summary_data,
         "breakdown": breakdown_data,
@@ -804,12 +979,42 @@ async def get_search_metrics(
         "providers": _build_provider_status_list(enriched),
     }
 
+@router.delete("/metrics")
+async def clear_search_metrics() -> Dict[str, Any]:
+    """
+    Delete all persisted search usage records from the local SQLite ledger.
+    Called by the frontend "Clear Ledger" button on the Search Telemetry page.
+    """
+    try:
+        from peldrun.runtime.search_usage_store import get_search_usage_store
+
+        store = get_search_usage_store()
+        deleted = store.clear_ledger()
+    except Exception as exc:
+        logger.error("Failed to clear search usage ledger: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to clear search usage ledger: {exc}",
+        )
+
+    WebSearchTool.reset_circuit_breakers()
+
+    return {
+        "ok": True,
+        "status": "ok",
+        "deleted_count": int(deleted or 0),
+        "message": f"Cleared {int(deleted or 0)} search usage record(s) from the local ledger.",
+    }
 
 @router.post("/test")
 @router.post("/test-query")
 async def run_diagnostic_search_test(request: TestQueryRequest) -> Dict[str, Any]:
     """
     Execute a diagnostic search query and return a rich, frontend-ready result.
+
+    Outcome classification respects response.is_success and response.status
+    (never merely the presence of results). A provider that returns partial results
+    alongside a failure status is reported as a failure, not as a success.
 
     Response includes:
       - status: 'ok' | 'empty' | 'error'
@@ -818,6 +1023,7 @@ async def run_diagnostic_search_test(request: TestQueryRequest) -> Dict[str, Any
       - results: list of {title, url, snippet, ...}
       - request_count, estimated_cost_usd, cost_basis, latency_ms
       - effective_max_results, max_results_limit
+      - usage_unknown: True when request/cost accounting could not be determined
       - error_message: present when status != 'ok'
     """
     full_cfg = _load_full_config_dict()
@@ -857,6 +1063,7 @@ async def run_diagnostic_search_test(request: TestQueryRequest) -> Dict[str, Any
         )
     except SearchProviderError as exc:
         latency_ms = round((time.perf_counter() - start_ts) * 1000.0, 2)
+        usage_evidence = _extract_exception_usage_evidence(exc)
         return {
             "status": "error",
             "ok": False,
@@ -870,15 +1077,17 @@ async def run_diagnostic_search_test(request: TestQueryRequest) -> Dict[str, Any
             "max_results_limit": pre_audit["max_results_limit"],
             "results_count": 0,
             "results": [],
-            "request_count": 1,
+            "request_count": usage_evidence["request_count"],
+            "usage_unknown": usage_evidence["usage_unknown"],
             "latency_ms": latency_ms,
-            "estimated_cost_usd": 0.0,
-            "cost_usd": 0.0,
-            "cost_basis": "unknown",
+            "estimated_cost_usd": usage_evidence["estimated_cost_usd"],
+            "cost_usd": usage_evidence["estimated_cost_usd"],
+            "cost_basis": usage_evidence["cost_basis"],
         }
     except Exception as exc:
         latency_ms = round((time.perf_counter() - start_ts) * 1000.0, 2)
         err_msg = str(exc) or type(exc).__name__
+        usage_evidence = _extract_exception_usage_evidence(exc)
         return {
             "status": "error",
             "ok": False,
@@ -892,11 +1101,12 @@ async def run_diagnostic_search_test(request: TestQueryRequest) -> Dict[str, Any
             "max_results_limit": pre_audit["max_results_limit"],
             "results_count": 0,
             "results": [],
-            "request_count": 1,
+            "request_count": usage_evidence["request_count"],
+            "usage_unknown": usage_evidence["usage_unknown"],
             "latency_ms": latency_ms,
-            "estimated_cost_usd": 0.0,
-            "cost_usd": 0.0,
-            "cost_basis": "unknown",
+            "estimated_cost_usd": usage_evidence["estimated_cost_usd"],
+            "cost_usd": usage_evidence["estimated_cost_usd"],
+            "cost_basis": usage_evidence["cost_basis"],
         }
 
     latency_ms = round((time.perf_counter() - start_ts) * 1000.0, 2)
@@ -930,44 +1140,57 @@ async def run_diagnostic_search_test(request: TestQueryRequest) -> Dict[str, Any
                 "snippet": getattr(item, "snippet", ""),
             })
 
-    # Extract rich response attributes with safe fallbacks
+    # -------------------------------------------------------------------
+    # Authoritative outcome classification — respects is_success and status,
+    # NOT merely the presence of results.
+    # -------------------------------------------------------------------
+    outcome_class, provider_status_value, _reported_count = _classify_provider_response(response)
+
+    is_ok = outcome_class == "success"
+    is_empty = outcome_class == "empty"
+    is_failure = outcome_class == "failure"
+
+    # Extract rich response attributes with safe fallbacks; preserve 0 when
+    # the provider explicitly reported 0 requests.
+    raw_request_count = getattr(response, "request_count", None)
+    if isinstance(raw_request_count, (int, float)) and not isinstance(raw_request_count, bool):
+        response_request_count = int(raw_request_count)
+    else:
+        response_request_count = 0
+
     response_cost_usd = float(
         getattr(response, "estimated_cost_usd", None)
-        or resp_meta.get("estimated_cost_usd", 0.0)
-        or 0.0
+        if getattr(response, "estimated_cost_usd", None) is not None
+        else (resp_meta.get("estimated_cost_usd") if resp_meta.get("estimated_cost_usd") is not None else 0.0)
     )
     response_cost_basis = str(
         getattr(response, "cost_basis", None)
         or resp_meta.get("cost_basis", "unknown")
         or "unknown"
     )
-    response_status_enum = getattr(response, "status", None)
-    response_status_str = (
-        response_status_enum.value
-        if hasattr(response_status_enum, "value")
-        else str(response_status_enum or "")
-    )
-    response_request_count = int(getattr(response, "request_count", 1) or 1)
 
-    is_ok = len(serialized) > 0
-    is_empty = (not is_ok) and (response_status_str in ("empty", "EMPTY"))
     error_message: Optional[str] = None
-    if is_empty:
+    if is_failure:
+        error_message = (
+            getattr(response, "error_message", None)
+            or f"Provider '{resolved_provider_name}' returned failure status '{provider_status_value}'."
+        )
+    elif is_empty:
         error_message = (
             getattr(response, "error_message", None)
             or "Provider responded with HTTP 200 but returned zero matching documents."
         )
-    elif not is_ok:
-        error_message = (
-            getattr(response, "error_message", None)
-            or "Search failed without a specific error message."
-        )
+
+    # When a failure still carries partial results we surface them, but status
+    # remains "error" — the tool has explicitly declared the underlying call failed.
+    final_status = "ok" if is_ok else ("empty" if is_empty else "error")
 
     return {
-        "status": "ok" if is_ok else ("empty" if is_empty else "error"),
+        "status": final_status,
         "ok": is_ok,
         "success": is_ok,
         "provider": resolved_provider_name,
+        "provider_status": provider_status_value or "unknown",
         "query": request.query,
         "requested_max_results": request.max_results,
         "effective_max_results": effective_max,
@@ -975,6 +1198,7 @@ async def run_diagnostic_search_test(request: TestQueryRequest) -> Dict[str, Any
         "results_count": len(serialized),
         "results": serialized,
         "request_count": response_request_count,
+        "usage_unknown": False,
         "latency_ms": getattr(response, "latency_ms", None) or latency_ms,
         "estimated_cost_usd": response_cost_usd,
         "cost_usd": response_cost_usd,
@@ -983,9 +1207,167 @@ async def run_diagnostic_search_test(request: TestQueryRequest) -> Dict[str, Any
     }
 
 
+@router.post("/test-connection")
+async def test_provider_connection(request: TestConnectionRequest) -> Dict[str, Any]:
+    """
+    Execute a structured diagnostic check against a specific provider and return a
+    frontend-ready ProviderDiagnosticResult payload.
+
+    This endpoint is separate from /test: /test runs a live search and returns
+    search results, whereas /test-connection exercises the provider's own
+    `diagnose()` contract (reachability / credentials / live-search) without
+    attempting to interpret search results.
+
+    Response includes:
+      - status: 'ok' | 'error'
+      - ok: bool
+      - provider: resolved provider display name
+      - check_type: 'reachability' | 'credentials' | 'live_search'
+      - reachable / authenticated / quota_available / search_operational
+      - consumes_quota, latency_ms, request_count, estimated_cost_usd, cost_basis
+      - message: human-readable diagnostic summary
+    """
+    full_cfg = _load_full_config_dict()
+    persisted_search = full_cfg.get("search") if isinstance(full_cfg.get("search"), dict) else {}
+    enriched_persisted = _enrich_search_config_with_defaults(persisted_search)
+
+    snapshot = request.config if request.config is not None else request.search_config
+    if snapshot is not None:
+        active_search_cfg = _validate_and_normalize_search_config(snapshot, existing_search=enriched_persisted)
+    else:
+        active_search_cfg = enriched_persisted
+
+    target_provider_raw = request.provider or request.engine
+    if target_provider_raw:
+        try:
+            target_key = SearchProviderFactory.normalize_provider_key(target_provider_raw)
+        except ValueError as exc:
+            raise SearchConfigValidationError(str(exc)) from exc
+    else:
+        target_key = SearchProviderFactory.normalize_provider_key(
+            str(active_search_cfg.get("engine") or "DuckDuckGo")
+        )
+
+    display_name = SearchProviderFactory.get_canonical_display_name(target_key)
+
+    # Normalize the requested check_type against the DiagnosticCheckType enum.
+    raw_check = (request.check_type or "credentials").strip().lower()
+    check_type_map = {
+        "reachability": DiagnosticCheckType.REACHABILITY,
+        "credentials": DiagnosticCheckType.CREDENTIALS,
+        "auth": DiagnosticCheckType.CREDENTIALS,
+        "live_search": DiagnosticCheckType.LIVE_SEARCH,
+        "live": DiagnosticCheckType.LIVE_SEARCH,
+        "search": DiagnosticCheckType.LIVE_SEARCH,
+    }
+    check_type_enum = check_type_map.get(raw_check, DiagnosticCheckType.CREDENTIALS)
+
+    try:
+        provider = SearchProviderFactory.create_provider(target_key, active_search_cfg)
+    except Exception as exc:
+        err_msg = str(exc) or type(exc).__name__
+        return {
+            "status": "error",
+            "ok": False,
+            "success": False,
+            "provider": display_name,
+            "provider_key": target_key,
+            "check_type": check_type_enum.value,
+            "reachable": False,
+            "authenticated": None,
+            "quota_available": None,
+            "search_operational": None,
+            "consumes_quota": False,
+            "latency_ms": 0.0,
+            "request_count": 0,
+            "usage_unknown": True,
+            "estimated_cost_usd": 0.0,
+            "cost_usd": 0.0,
+            "cost_basis": "unknown",
+            "message": f"Failed to instantiate provider '{display_name}': {err_msg}",
+            "error_message": err_msg,
+        }
+
+    try:
+        diag = await provider.diagnose(check_type=check_type_enum)
+    except Exception as exc:
+        err_msg = str(exc) or type(exc).__name__
+        usage_evidence = _extract_exception_usage_evidence(exc)
+        return {
+            "status": "error",
+            "ok": False,
+            "success": False,
+            "provider": display_name,
+            "provider_key": target_key,
+            "check_type": check_type_enum.value,
+            "reachable": False,
+            "authenticated": None,
+            "quota_available": None,
+            "search_operational": None,
+            "consumes_quota": False,
+            "latency_ms": 0.0,
+            "request_count": usage_evidence["request_count"],
+            "usage_unknown": usage_evidence["usage_unknown"],
+            "estimated_cost_usd": usage_evidence["estimated_cost_usd"],
+            "cost_usd": usage_evidence["estimated_cost_usd"],
+            "cost_basis": usage_evidence["cost_basis"],
+            "message": f"Diagnostic check raised: {err_msg}",
+            "error_message": err_msg,
+        }
+
+    # Serialize the ProviderDiagnosticResult.
+    if hasattr(diag, "model_dump"):
+        diag_dict = diag.model_dump()
+    elif hasattr(diag, "dict"):
+        diag_dict = diag.dict()
+    else:
+        diag_dict = dict(vars(diag))
+
+    status_val = diag_dict.get("status")
+    if hasattr(status_val, "value"):
+        status_val = status_val.value
+    status_str = str(status_val or "unknown")
+
+    cost_basis_val = diag_dict.get("cost_basis")
+    if hasattr(cost_basis_val, "value"):
+        cost_basis_val = cost_basis_val.value
+    cost_basis_str = str(cost_basis_val or "unknown")
+
+    check_type_val = diag_dict.get("check_type")
+    if hasattr(check_type_val, "value"):
+        check_type_val = check_type_val.value
+
+    ok_flag = bool(diag_dict.get("ok", False))
+
+    return {
+        "status": "ok" if ok_flag else "error",
+        "ok": ok_flag,
+        "success": ok_flag,
+        "provider": str(diag_dict.get("provider") or display_name),
+        "provider_key": target_key,
+        "check_type": str(check_type_val or check_type_enum.value),
+        "provider_status": status_str,
+        "reachable": bool(diag_dict.get("reachable", False)),
+        "authenticated": diag_dict.get("authenticated"),
+        "quota_available": diag_dict.get("quota_available"),
+        "search_operational": diag_dict.get("search_operational"),
+        "consumes_quota": bool(diag_dict.get("consumes_quota", False)),
+        "latency_ms": float(diag_dict.get("latency_ms") or 0.0),
+        "request_count": int(diag_dict.get("request_count") or 0),
+        "usage_unknown": False,
+        "usage_units": diag_dict.get("usage_units"),
+        "estimated_cost_usd": float(diag_dict.get("estimated_cost_usd") or 0.0),
+        "cost_usd": float(diag_dict.get("estimated_cost_usd") or 0.0),
+        "cost_basis": cost_basis_str,
+        "message": str(diag_dict.get("message") or ""),
+        "error_message": None if ok_flag else str(diag_dict.get("message") or ""),
+    }
+
+
 __all__ = [
     "SearchConfigValidationError",
     "TestQueryRequest",
+    "TestConnectionRequest",
     "_enrich_search_config_with_defaults",
     "_validate_and_normalize_search_config",
     "router",

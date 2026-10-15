@@ -6,6 +6,16 @@ Uses an isolated SQLite database file with guaranteed connection closure
 and automatic schema migration to record provider status, physical request
 counts, provider-reported usage units, cost basis, and optional privacy
 redaction without blocking the asyncio event loop.
+
+Outcome class invariants (mutual exclusion enforced at the write boundary):
+  - success : is_success=1, status='success'
+  - empty   : is_success=0, status='empty'
+  - failure : is_success=0, status=<any other value>
+
+Because these three classes are strictly disjoint in the ledger,
+get_summary_metrics can compute:
+    failed_queries = total_queries - successful_queries - empty_queries
+without ever double-counting a valid empty search as a failure.
 """
 
 from __future__ import annotations
@@ -25,6 +35,16 @@ logger = logging.getLogger("peldrun.runtime.search_usage_store")
 
 NANO_USD_PER_USD = 1_000_000_000
 REDACTED_QUERY_PLACEHOLDER = "[REDACTED_PRIVACY_MODE]"
+
+# Aliases used to normalize the (status, is_success) pair into the three
+# canonical, mutually exclusive outcome classes. Any status not listed here
+# is treated as a genuine failure (is_success=0).
+_SUCCESS_STATUS_ALIASES = frozenset(
+    {"success", "completed", "ok", "succeeded", "finished", "passed"}
+)
+_EMPTY_STATUS_ALIASES = frozenset(
+    {"empty", "no_results", "zero_results", "nothing_found"}
+)
 
 
 class SearchUsageRecord(BaseModel):
@@ -136,6 +156,47 @@ class SearchUsageStore:
                     f"ALTER TABLE search_usage_ledger ADD COLUMN {col_name} {col_def};"
                 )
 
+    # ------------------------------------------------------------------
+    # Outcome-class normalization
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_outcome(
+        status: Optional[str],
+        is_success: bool,
+        results_count: int,
+        error_message: Optional[str],
+    ) -> tuple[str, bool]:
+        """
+        Normalize (status, is_success) into one of the three mutually exclusive
+        outcome classes so downstream aggregations cannot double-count a record:
+
+            - success : ("success", True)
+            - empty   : ("empty",   False)
+            - failure : (<status>,  False)   # any other status
+
+        An explicit `status` wins over `is_success` and is coerced to a known
+        canonical form. When no status is supplied, the outcome is derived from
+        is_success + results_count + error_message.
+        """
+        # Unwrap enum-like statuses (e.g. ProviderStatus.EMPTY → "empty").
+        raw_status: Any = status
+        if hasattr(raw_status, "value"):
+            raw_status = raw_status.value
+
+        if raw_status is None or str(raw_status).strip() == "":
+            if is_success:
+                return ("success", True)
+            if int(results_count) == 0 and not error_message:
+                return ("empty", False)
+            return ("upstream_error", False)
+
+        st = str(raw_status).strip().lower()
+        if st in _SUCCESS_STATUS_ALIASES:
+            return ("success", True)
+        if st in _EMPTY_STATUS_ALIASES:
+            return ("empty", False)
+        return (st, False)
+
     def record_search(
         self,
         query: str,
@@ -163,8 +224,13 @@ class SearchUsageStore:
             safe_cost = max(0.0, float(cost_usd or 0.0))
             cost_nano = int(round(safe_cost * NANO_USD_PER_USD))
 
-            effective_status = status or (
-                "success" if is_success else ("empty" if results_count == 0 and not error_message else "upstream_error")
+            # Enforce the mutually exclusive (status, is_success) invariant at
+            # the write boundary so get_summary_metrics arithmetic is always safe.
+            effective_status, effective_is_success = self._normalize_outcome(
+                status=status,
+                is_success=bool(is_success),
+                results_count=max(0, int(results_count)),
+                error_message=error_message,
             )
             safe_req_count = max(0, int(request_count if request_count is not None else 1))
 
@@ -174,7 +240,7 @@ class SearchUsageStore:
                 query_hash=q_hash,
                 provider=provider,
                 status=effective_status,
-                is_success=is_success,
+                is_success=effective_is_success,
                 request_count=safe_req_count,
                 usage_units=float(usage_units) if usage_units is not None else None,
                 results_count=max(0, int(results_count)),
@@ -250,13 +316,23 @@ class SearchUsageStore:
 
     def get_summary_metrics(self, period: str = "all") -> Dict[str, Any]:
         cutoff = self._get_period_cutoff(period)
+        # Outcome classes are guaranteed mutually exclusive by _normalize_outcome,
+        # but the SQL below additionally excludes any legacy record where
+        # status='empty' AND is_success=1 (pre-hardening corruption) from the
+        # successful bucket so that failed_q = total - succ - empty is always valid.
         query_sql = """
             SELECT
                 COUNT(*) as total_queries,
                 COALESCE(SUM(request_count), COUNT(*)) as total_requests,
                 COALESCE(SUM(cost_nano_usd), 0) as total_cost_nano,
-                COALESCE(SUM(CASE WHEN is_success = 1 THEN 1 ELSE 0 END), 0) as successful_queries,
-                COALESCE(SUM(CASE WHEN status = 'empty' THEN 1 ELSE 0 END), 0) as empty_queries,
+                COALESCE(
+                    SUM(CASE WHEN is_success = 1 AND status <> 'empty' THEN 1 ELSE 0 END),
+                    0
+                ) as successful_queries,
+                COALESCE(
+                    SUM(CASE WHEN status = 'empty' THEN 1 ELSE 0 END),
+                    0
+                ) as empty_queries,
                 COALESCE(AVG(latency_ms), 0.0) as avg_latency_ms,
                 COALESCE(SUM(results_count), 0) as total_results
             FROM search_usage_ledger
@@ -276,6 +352,12 @@ class SearchUsageStore:
 
             total_q = int(row["total_queries"] or 0)
             succ_q = int(row["successful_queries"] or 0)
+            empty_q = int(row["empty_queries"] or 0)
+
+            # Successful, empty, and failed are mutually exclusive; empty searches
+            # must NOT be counted again as failures.
+            failed_q = max(0, total_q - succ_q - empty_q)
+
             return {
                 "period": period,
                 "total_queries": total_q,
@@ -284,8 +366,8 @@ class SearchUsageStore:
                     float(row["total_cost_nano"]) / NANO_USD_PER_USD, 4
                 ),
                 "successful_queries": succ_q,
-                "empty_queries": int(row["empty_queries"] or 0),
-                "failed_queries": total_q - succ_q,
+                "empty_queries": empty_q,
+                "failed_queries": failed_q,
                 "success_rate_pct": round(
                     (succ_q / total_q * 100.0) if total_q > 0 else 0.0, 2
                 ),
@@ -298,14 +380,27 @@ class SearchUsageStore:
 
     def get_provider_breakdown(self, period: str = "all") -> List[Dict[str, Any]]:
         cutoff = self._get_period_cutoff(period)
+        # As with get_summary_metrics, exclude status='empty' records from the
+        # success bucket so per-provider success_rate_pct does not conflate a
+        # valid empty search with a successful one.
         query_sql = """
             SELECT
                 provider,
                 COUNT(*) as queries_count,
                 COALESCE(SUM(request_count), COUNT(*)) as requests_count,
                 COALESCE(SUM(cost_nano_usd), 0) as cost_nano,
-                COALESCE(SUM(CASE WHEN is_success = 1 THEN 1 ELSE 0 END), 0) as successes,
-                COALESCE(SUM(CASE WHEN status = 'empty' THEN 1 ELSE 0 END), 0) as empty_count,
+                COALESCE(
+                    SUM(CASE WHEN is_success = 1 AND status <> 'empty' THEN 1 ELSE 0 END),
+                    0
+                ) as successes,
+                COALESCE(
+                    SUM(CASE WHEN status = 'empty' THEN 1 ELSE 0 END),
+                    0
+                ) as empty_count,
+                COALESCE(
+                    SUM(CASE WHEN is_success = 0 AND status <> 'empty' THEN 1 ELSE 0 END),
+                    0
+                ) as failed_count,
                 COALESCE(AVG(latency_ms), 0.0) as avg_latency_ms
             FROM search_usage_ledger
             WHERE timestamp >= ?
@@ -324,6 +419,9 @@ class SearchUsageStore:
 
             for r in rows:
                 q_count = int(r["queries_count"] or 0)
+                succ = int(r["successes"] or 0)
+                empty_c = int(r["empty_count"] or 0)
+                failed_c = int(r["failed_count"] or 0)
                 items.append(
                     {
                         "provider": r["provider"],
@@ -332,12 +430,11 @@ class SearchUsageStore:
                         "cost_usd": round(
                             float(r["cost_nano"]) / NANO_USD_PER_USD, 4
                         ),
-                        "empty_count": int(r["empty_count"] or 0),
+                        "successful_count": succ,
+                        "empty_count": empty_c,
+                        "failed_count": failed_c,
                         "success_rate_pct": round(
-                            (r["successes"] / q_count * 100.0)
-                            if q_count > 0
-                            else 0.0,
-                            2,
+                            (succ / q_count * 100.0) if q_count > 0 else 0.0, 2
                         ),
                         "avg_latency_ms": round(float(r["avg_latency_ms"] or 0.0), 2),
                     }
@@ -354,7 +451,18 @@ class SearchUsageStore:
                 strftime('%Y-%m-%d', datetime(timestamp, 'unixepoch')) as bucket_date,
                 COUNT(*) as queries,
                 COALESCE(SUM(cost_nano_usd), 0) as cost_nano,
-                COALESCE(SUM(CASE WHEN is_success = 1 THEN 1 ELSE 0 END), 0) as successful
+                COALESCE(
+                    SUM(CASE WHEN is_success = 1 AND status <> 'empty' THEN 1 ELSE 0 END),
+                    0
+                ) as successful,
+                COALESCE(
+                    SUM(CASE WHEN status = 'empty' THEN 1 ELSE 0 END),
+                    0
+                ) as empty_count,
+                COALESCE(
+                    SUM(CASE WHEN is_success = 0 AND status <> 'empty' THEN 1 ELSE 0 END),
+                    0
+                ) as failed_count
             FROM search_usage_ledger
             WHERE timestamp >= ?
             GROUP BY bucket_date
@@ -379,6 +487,8 @@ class SearchUsageStore:
                             float(r["cost_nano"]) / NANO_USD_PER_USD, 4
                         ),
                         "successful": int(r["successful"] or 0),
+                        "empty": int(r["empty_count"] or 0),
+                        "failed": int(r["failed_count"] or 0),
                     }
                 )
             return timeseries

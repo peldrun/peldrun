@@ -15,8 +15,8 @@ cdp_url = "http://localhost:9222"
 max_content_length = 2000
 
 [search]
-engine = "Jina"
-fallback_engines = [ "DuckDuckGo",]
+engine = "DuckDuckGo"
+fallback_engines = [ "Jina",]
 enabled = true
 lang = "en"
 country = "us"
@@ -70,6 +70,7 @@ timeout = 15
 cost_per_query = 0
 safe_search = "moderate"
 estimated_cost_per_query = 0
+max_results = 20
 
 [search.searxng]
 enabled = false
