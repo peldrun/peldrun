@@ -281,10 +281,18 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
     except Exception:
         pass
 
+    # Web Search is a chat-only feature; ignored in agent mode and never part of llm_override.
+    web_search_enabled = bool(req.web_search_enabled) if exec_mode == "chat" else False
+
     # Schedule the actual execution task.
     if exec_mode == "chat":
         exec_task = asyncio.create_task(
-            run_direct_chat(actual_job_id, prompt, llm_override)
+                        run_direct_chat(
+                actual_job_id,
+                prompt,
+                llm_override,
+                web_search_enabled=web_search_enabled,
+            )
         )
     else:
         exec_task = asyncio.create_task(

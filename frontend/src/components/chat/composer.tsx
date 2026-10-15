@@ -17,6 +17,7 @@ import {
   AlertCircle,
   Info,
   GitFork,
+  Globe,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AgentSelector } from "./agent-selector";
@@ -128,6 +129,9 @@ export function Composer({
   const [metadataVault, setMetadataVault] = useState<Record<string, any>>({});
   const [isExpanded, setIsExpanded] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Web Search: temporary per-message toggle, chat mode only.
+  const [webSearchEnabled, setWebSearchEnabled] = useState(false);
 
   // Multi-Agent Delegation Toggle State
   const [delegationAllowed, setDelegationAllowed] = useAppStorage(
@@ -282,10 +286,15 @@ export function Composer({
       base.tools = directives.toolIds;
     }
 
+    // Web Search is a chat-only, per-message opt-in. Never sent in agent mode.
+    if (execMode === "chat" && !directives.agentId) {
+      base.web_search_enabled = webSearchEnabled;
+    }
+
     if (activeLlmOverride) {
       try {
         const parsed = JSON.parse(activeLlmOverride);
-        return {
+        const merged: Record<string, any> = {
           ...base,
           ...parsed,
           mode: base.mode,
@@ -295,6 +304,13 @@ export function Composer({
           delegation_allowed: canDelegate,
           tools: base.tools || parsed.tools,
         };
+        // Preserve the chat-only web search flag across the override merge.
+        if (execMode === "chat" && !directives.agentId) {
+          merged.web_search_enabled = webSearchEnabled;
+        } else {
+          delete merged.web_search_enabled;
+        }
+        return merged;
       } catch (e) {}
     }
     return base;
@@ -397,6 +413,7 @@ export function Composer({
         }
       }
 
+      setWebSearchEnabled(false);
       editorRef.current?.clear();
       setText("");
       setAttachedFiles([]);
@@ -600,6 +617,29 @@ export function Composer({
                 <ReasoningEffortSelector disabled={disabled || isRunning || isSubmitting} />
               </div>
             )}
+
+            {execMode === "chat" && (
+              <button
+                type="button"
+                onClick={() => setWebSearchEnabled((v) => !v)}
+                disabled={disabled || isRunning || isSubmitting}
+                className={`flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium border transition-all cursor-pointer disabled:opacity-40 ${
+                  webSearchEnabled
+                    ? "bg-primary/15 border-primary/40 text-primary shadow-xs"
+                    : "bg-card hover:bg-muted border-border text-muted-foreground"
+                }`}
+                title={
+                  webSearchEnabled
+                    ? "Web Search: ENABLED for the next message only"
+                    : "Web Search: disabled. Click to enable for the next message."
+                }
+              >
+                <Globe size={12} className={webSearchEnabled ? "text-primary" : "text-muted-foreground"} />
+                <span className="text-[11px]">Web Search</span>
+              </button>
+            )}
+
+
 
             {execMode === "agent" && (
               <div className="animate-in fade-in duration-150 flex items-center gap-1.5">

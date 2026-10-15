@@ -32,10 +32,16 @@ class RunRequest(BaseModel):
     is_reasoning_model: Optional[bool] = None
     generative_ui: Optional[Dict[str, Any]] = None
 
+    # Optional web search for the next direct-chat message only.
+    # Ignored entirely in agent mode; never part of llm_override.
+    web_search_enabled: Optional[bool] = False
+
     # Extensibility for Pause / Resume and Checkpoint Interruption Resumption
     checkpoint_id: Optional[str] = None
     resume_from_checkpoint: Optional[bool] = False
     regenerate_turn_id: Optional[str] = None
+
+
 
 
 class FileContentPayload(BaseModel):
