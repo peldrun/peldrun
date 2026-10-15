@@ -123,4 +123,4 @@ export type {
 /* Constants re-exported as values (typed)                                    */
 /* -------------------------------------------------------------------------- */
 
-export type { ProviderLogoOption } from "./constants";
+export type { badgeOption } from "./constants";

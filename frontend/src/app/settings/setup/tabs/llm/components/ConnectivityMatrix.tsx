@@ -309,8 +309,8 @@ export function ConnectivityMatrix({
         {customEndpoints.map((ce) => {
           const isPrimary = config.llm.base_url === ce.endpointUrl;
           const withLogo = ce as CustomEndpointWithLogo;
-          const iconName = withLogo.providerLogo
-            ? withLogo.providerLogo
+          const iconName = withLogo.badge
+            ? withLogo.badge
             : resolveProviderIcon(ce.providerId || ce.name);
           return (
             <MatrixRow

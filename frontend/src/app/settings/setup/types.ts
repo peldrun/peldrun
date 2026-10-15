@@ -44,7 +44,7 @@ export interface CloudProviderVaultItem {
   apiKey: string;
   model: string;
   popularModels: string[];
-  badge: "Cloud" | "Enterprise" | "Local";
+  badge?: string;
   keyPrefixHint: string;
   status: ProviderConnectionStatus;
   latency?: number;
@@ -59,6 +59,7 @@ export interface LMStudioSettings {
   provider: string;
   baseUrl: string;
   apiKey: string;
+  badge?: string;
   model: string;
   status: ProviderConnectionStatus;
   latency?: number;
@@ -70,6 +71,7 @@ export interface OllamaSettings {
   model: string;
   status: ProviderConnectionStatus;
   latency?: number;
+  badge?: string;
   lastError?: string;
   savedModels: string[];
 }
@@ -79,6 +81,7 @@ export const INITIAL_OLLAMA_SETTINGS: OllamaSettings = {
   model: "",
   status: "untested",
   savedModels: [],
+  badge: "Ollama",
 };
 
 export const INITIAL_CLOUD_PROVIDERS: CloudProviderVaultItem[] = [
@@ -95,7 +98,7 @@ export const INITIAL_CLOUD_PROVIDERS: CloudProviderVaultItem[] = [
       "gemini-1.5-flash",
       "gemini-2.5-pro-preview-05-06",
     ],
-    badge: "Cloud",
+    badge: "google",
     keyPrefixHint: "Google Gemini keys start with 'AIzaSy...'",
     status: "untested",
     savedModels: [],
@@ -108,7 +111,7 @@ export const INITIAL_CLOUD_PROVIDERS: CloudProviderVaultItem[] = [
     apiKey: "",
     model: "deepseek-chat",
     popularModels: ["deepseek-chat", "deepseek-reasoner"],
-    badge: "Cloud",
+    badge: "deepseek",
     keyPrefixHint: "DeepSeek keys start with 'sk-'",
     status: "untested",
     savedModels: [],
@@ -121,7 +124,7 @@ export const INITIAL_CLOUD_PROVIDERS: CloudProviderVaultItem[] = [
     apiKey: "",
     model: "gpt-4o",
     popularModels: ["gpt-4o", "gpt-4o-mini", "o1", "o3-mini"],
-    badge: "Cloud",
+    badge: "openai-chatgpt",
     keyPrefixHint: "OpenAI keys start with 'sk-proj-'",
     status: "untested",
     savedModels: [],
@@ -138,7 +141,7 @@ export const INITIAL_CLOUD_PROVIDERS: CloudProviderVaultItem[] = [
       "claude-3-5-haiku-20241022",
       "claude-3-opus-20240229",
     ],
-    badge: "Cloud",
+    badge: "claude-ai",
     keyPrefixHint: "Anthropic keys start with 'sk-ant-'",
     status: "untested",
     savedModels: [],
@@ -152,6 +155,7 @@ export const INITIAL_LMSTUDIO_SETTINGS: LMStudioSettings = {
   model: "qwen3-vl-8b-instruct",
   status: "untested",
   savedModels: ["qwen3-vl-8b-instruct"],
+  badge: "lm-studio",
 };
 
 export interface FullAppConfig {

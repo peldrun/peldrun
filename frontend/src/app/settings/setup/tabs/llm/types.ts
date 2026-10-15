@@ -58,7 +58,7 @@ import type {
  * that user-created providers visually match the built-in ones.
  */
 export interface CustomEndpointWithLogo extends CustomEndpoint {
-  providerLogo?: string;
+  badge?: string;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -67,7 +67,7 @@ export interface CustomEndpointWithLogo extends CustomEndpoint {
 
 /**
  * Local form state for the "Add Custom Endpoint" panel.
- * Mirrors the original EMPTY_ENDPOINT_FORM shape plus the new `providerLogo`.
+ * Mirrors the original EMPTY_ENDPOINT_FORM shape plus the new `badge`.
  */
 export interface EndpointFormState {
   name: string;
@@ -78,7 +78,7 @@ export interface EndpointFormState {
   contextWindow: string;
   apiKey: string;
   useForNewChats: boolean;
-  providerLogo: string;
+  badge: string;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -97,7 +97,7 @@ export interface DiscoveryTarget {
   type?: string;
   savedModels?: string[];
   isCustom?: boolean;
-  providerLogo?: string;
+  badge?: string;
 }
 
 /* -------------------------------------------------------------------------- */

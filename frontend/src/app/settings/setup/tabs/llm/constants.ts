@@ -9,7 +9,7 @@ import type { EndpointFormState } from "./types";
 
 /**
  * Neutral seed state for the "Add Custom Endpoint" panel.
- * Extended with `providerLogo` for the visual identity of user-defined providers.
+ * Extended with `badge` for the visual identity of user-defined providers.
  */
 export const EMPTY_ENDPOINT_FORM: EndpointFormState = {
   name: "",
@@ -20,7 +20,7 @@ export const EMPTY_ENDPOINT_FORM: EndpointFormState = {
   contextWindow: "Auto",
   apiKey: "",
   useForNewChats: true,
-  providerLogo: "",
+  badge: "",
 };
 
 /* -------------------------------------------------------------------------- */
@@ -86,7 +86,7 @@ export const PROVIDER_ICON_MAP: Readonly<Record<string, string>> = {
  * overwhelming the picker; users can still reach the full inventory by
  * extending this list at a later time.
  */
-export interface ProviderLogoOption {
+export interface badgeOption {
   /** Icon base name as used by `<Icon name="..." />`. */
   value: string;
   /** Human-readable label rendered inside the picker. */
@@ -95,7 +95,7 @@ export interface ProviderLogoOption {
   accent: string;
 }
 
-export const PROVIDER_LOGO_OPTIONS: readonly ProviderLogoOption[] = [
+export const PROVIDER_LOGO_OPTIONS: readonly badgeOption[] = [
   { value: "openai-chatgpt", label: "OpenAI / ChatGPT", accent: "#10A37F" },
   { value: "anthropic", label: "Anthropic", accent: "#D97757" },
   { value: "claude-ai", label: "Claude AI", accent: "#D97757" },

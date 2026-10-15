@@ -50,7 +50,7 @@ const API_MODES: readonly ApiModeType[] = [
  *   - the "Add Custom Endpoint" panel, including the new provider logo picker.
  *
  * The provider logo is persisted alongside each endpoint under the
- * `providerLogo` key so that user-created providers visually match the
+ * `badge` key so that user-created providers visually match the
  * built-in ones on subsequent renders.
  */
 export function CustomEndpointsTab({
@@ -76,7 +76,7 @@ export function CustomEndpointsTab({
       type: "",
       savedModels: ce.savedModels || [],
       isCustom: true,
-      providerLogo: ce.providerLogo,
+      badge: ce.badge,
     });
   };
 
@@ -110,8 +110,8 @@ export function CustomEndpointsTab({
         ) : (
           customEndpoints.map((ce) => {
             const withLogo = ce as CustomEndpointWithLogo;
-            const iconName = withLogo.providerLogo
-              ? withLogo.providerLogo
+            const iconName = withLogo.badge
+              ? withLogo.badge
               : resolveProviderIcon(ce.providerId || ce.name);
 
             return (
@@ -253,9 +253,9 @@ export function CustomEndpointsTab({
             </div>
 
             <ProviderIconPicker
-              value={endpointForm.providerLogo}
+              value={endpointForm.badge}
               onChange={(iconName) =>
-                setEndpointForm({ ...endpointForm, providerLogo: iconName })
+                setEndpointForm({ ...endpointForm, badge: iconName })
               }
             />
           </div>

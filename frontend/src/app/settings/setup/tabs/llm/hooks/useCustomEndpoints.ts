@@ -71,7 +71,7 @@ function persistCustomEndpoints(endpoints: CustomEndpoint[]): void {
 
 /**
  * Encapsulates the entire lifecycle of user-defined custom endpoints:
- *   - form state for creating a new endpoint (including the new `providerLogo`),
+ *   - form state for creating a new endpoint (including the new `badge`),
  *   - create / delete operations,
  *   - connectivity probing for the in-progress form,
  *   - merging of models discovered through the discovery modal.
@@ -137,7 +137,7 @@ export function useCustomEndpoints({
       status: "untested",
       useForNewChats: endpointForm.useForNewChats,
       savedModels: [],
-      providerLogo: endpointForm.providerLogo,
+      badge: endpointForm.badge,
     };
 
     setCustomEndpoints((prev) => {
