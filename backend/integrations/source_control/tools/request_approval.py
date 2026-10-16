@@ -1,272 +1,323 @@
+# backend/integrations/source_control/tools/request_approval.py
+"""
+The `source_control.request_approval` tool.
+
+Creates a pending approval ticket for a remote side effect. The
+ticket is NOT an approval: the user must still grant it through the
+PELDRUN UI. This tool only creates the request.
+
+The tool deliberately does NOT accept `base_sha` or `diff_sha256`
+from the caller. Those values are read from the operation record,
+which the application populates through the reviewed diff flow.
+This prevents the agent from binding an approval to content that
+was never reviewed.
+
+Design rules:
+    - The tool MUST NOT grant, reject, or consume approvals.
+    - The tool MUST NOT accept a diff hash or base SHA from the
+      caller.
+    - The tool MUST require an existing operation with a populated
+      `base_sha` and `diff_sha256`. If either is missing, the
+      caller must first run `source_control.get_diff` and let the
+      application attach the diff to the operation.
+    - The tool MUST be idempotent in the sense that creating an
+      approval ticket twice for the same operation is a no-op after
+      the first success.
+"""
+
 from __future__ import annotations
 
-import os
-from pathlib import Path
+import logging
 from typing import Any, Mapping, Optional
-from pydantic import BaseModel, Field
 
-from ..domain.enums import ProviderId
-from ..domain.models import DiffSummary
-from ..domain.policies import is_protected_branch, is_workflow_path
-from ..errors import (
-    NotFoundError,
-    PermissionDeniedError,
-    SourceControlError,
-    ValidationError,
+from ..domain.enums import OperationStatus
+from ..errors import to_source_control_error
+from ..operations.service import (
+    OperationService,
+    get_default_operation_service,
 )
-from ..git.diff import GitDiffEngine
-from ..git.path_policy import validate_branch_name
-from ..git.workspace import GitWorkspaceManager
 from ..security.approval import (
     ApprovalGate,
-    ApprovalTicket,
-    compute_diff_sha256,
+    get_default_approval_gate,
 )
-from ..security.policy_engine import PolicyEngine, get_default_policy_engine
-from ..security.redaction import redact_text
+from .base import SourceControlTool, ToolContext, ToolResult
 
-# Resilient import for default approval gate and operation service
-try:
-    from ..security.approval import get_default_approval_gate
-except ImportError:
-    def get_default_approval_gate() -> ApprovalGate:
-        return ApprovalGate()
-
-try:
-    from ..operations.service import OperationService, get_default_operation_service
-except ImportError:
-    OperationService = None  # type: ignore[assignment, misc]
-    def get_default_operation_service() -> Any:
-        return None
+__all__ = [
+    "RequestApprovalTool",
+    "SUPPORTED_OPERATIONS",
+    "DEFAULT_TTL_SECONDS",
+]
 
 
-class RequestApprovalArgs(BaseModel):
-    """Input argument schema for the request approval tool."""
-
-    operation_type: str = Field(
-        ...,
-        description="The remote operation requiring approval (e.g., 'push_branch', 'create_change_request').",
-    )
-    target_branch: str = Field(
-        ...,
-        description="Target branch on the remote repository (e.g., 'feature/my-task' or 'main').",
-    )
-    workspace_id: Optional[str] = Field(
-        default=None,
-        description="Unique identifier of the isolated Git workspace containing the changes.",
-    )
-    workspace_path: Optional[str] = Field(
-        default=None,
-        description="Local directory path of the git repository/workspace (alternative to workspace_id).",
-    )
-    operation_id: Optional[str] = Field(
-        default=None,
-        description="Optional durable operation identifier to bind this approval request to.",
-    )
-    commit_message: Optional[str] = Field(
-        default=None,
-        description="Proposed commit message for the changes.",
-    )
-    title: Optional[str] = Field(
-        default=None,
-        description="Proposed title for the pull/merge request.",
-    )
-    description: Optional[str] = Field(
-        default=None,
-        description="Summary or rationale explaining the proposed modifications.",
-    )
-    base_ref: Optional[str] = Field(
-        default=None,
-        description="Optional base Git revision or branch to compare against. Defaults to workspace base or HEAD.",
-    )
+logger = logging.getLogger(__name__)
 
 
-class RequestApprovalTool:
-    """Agent tool that creates a cryptographically bound approval ticket for human review."""
+#: Operations for which approval can be requested. The set is
+#: deliberately small: every entry corresponds to a remote side
+#: effect that PELDRUN treats as requiring explicit consent.
+SUPPORTED_OPERATIONS: tuple[str, ...] = (
+    "push_branch",
+    "create_change_request",
+    "delete_remote_branch",
+    "merge_change_request",
+)
 
-    name: str = "source_control_request_approval"
-    description: str = (
-        "Submits local workspace changes for explicit human review and approval before any remote write. "
-        "Calculates the cryptographic diff SHA-256 fingerprint, freezes the proposal, and halts execution. "
-        "The agent cannot self-approve; execution pauses until the user approves the ticket via the UI."
-    )
-    args_schema: type[BaseModel] = RequestApprovalArgs
+
+#: Default TTL for an approval ticket, in seconds. The value matches
+#: the policy default and is only used when the caller does not
+#: specify one.
+DEFAULT_TTL_SECONDS: int = 15 * 60
+
+
+class RequestApprovalTool(SourceControlTool):
+    """
+    Create a pending approval ticket for a remote side effect.
+
+    Inputs:
+        operation_id:  Identifier of the operation the approval is
+                       for. Required.
+        operation:     The remote side effect the approval covers
+                       (e.g. `"push_branch"`). Required.
+        target_branch: The remote branch the operation targets.
+                       Required.
+        ttl_seconds:   Optional TTL override.
+
+    Output:
+        `{"approval_id": <str>, "expires_at": <iso8601>, "status":
+        "pending"}`. The approval is NOT granted; the user must
+        grant it through the UI.
+    """
 
     def __init__(
         self,
+        *,
+        operation_service: Optional[OperationService] = None,
         approval_gate: Optional[ApprovalGate] = None,
-        policy_engine: Optional[PolicyEngine] = None,
-        workspace_manager: Optional[GitWorkspaceManager] = None,
-        diff_engine: Optional[GitDiffEngine] = None,
-        operation_service: Optional[Any] = None,
-        default_workspace_dir: Optional[str | Path] = None,
+        audit_logger: Any = None,
     ) -> None:
-        base_dir = Path(default_workspace_dir or os.getcwd()).resolve()
-        self.approval_gate = approval_gate or get_default_approval_gate()
-        self.policy_engine = policy_engine or get_default_policy_engine()
-        self.workspace_manager = workspace_manager or GitWorkspaceManager(base_workspace_dir=base_dir)
-        self.diff_engine = diff_engine or GitDiffEngine()
-        self.operation_service = operation_service or get_default_operation_service()
+        super().__init__(audit_logger=audit_logger)
+        self._explicit_operation_service = operation_service
+        self._explicit_approval_gate = approval_gate
 
-    async def _arun(
-        self,
-        operation_type: str,
-        target_branch: str,
-        workspace_id: Optional[str] = None,
-        workspace_path: Optional[str] = None,
-        operation_id: Optional[str] = None,
-        commit_message: Optional[str] = None,
-        title: Optional[str] = None,
-        description: Optional[str] = None,
-        base_ref: Optional[str] = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Asynchronously computes the diff fingerprint and generates a pending approval ticket."""
-        # 1. Normalize and validate operation and target branch syntax
-        clean_op = operation_type.strip().lower()
-        if clean_op not in {"push_branch", "create_change_request", "merge_change_request"}:
-            raise ValidationError(
-                f"Unsupported operation type '{operation_type}'. Must be 'push_branch' or 'create_change_request'."
-            )
+    # --- Metadata -------------------------------------------------------
 
-        clean_target_branch = validate_branch_name(target_branch)
+    @property
+    def name(self) -> str:
+        return "source_control.request_approval"
 
-        # 2. Resolve workspace directory
-        target_dir: Optional[Path] = None
-        resolved_base: Optional[str] = base_ref.strip() if base_ref and base_ref.strip() else None
-        repository_id: str = "local"
-
-        if workspace_id and workspace_id.strip():
-            clean_ws_id = workspace_id.strip()
-            ws_ref = self.workspace_manager.get_workspace(clean_ws_id)
-            if ws_ref is None:
-                raise NotFoundError(f"Workspace with ID '{clean_ws_id}' was not found.")
-            target_dir = Path(ws_ref.workspace_path)
-            repository_id = ws_ref.repository_id
-            if not resolved_base:
-                resolved_base = ws_ref.base_sha
-        elif workspace_path and workspace_path.strip():
-            raw_path = Path(workspace_path.strip())
-            if not raw_path.exists():
-                raise NotFoundError(f"Specified workspace directory '{workspace_path}' does not exist.")
-            target_dir = raw_path.resolve()
-        else:
-            raise ValidationError("Either 'workspace_id' or 'workspace_path' must be provided.")
-
-        if not target_dir.is_dir():
-            raise ValidationError(f"Target workspace path '{target_dir}' is not a directory.")
-
-        # 3. Compute unified diff and cryptographic fingerprint
-        effective_base = resolved_base or "HEAD"
-        try:
-            diff_summary: DiffSummary = await self.diff_engine.compute_diff(
-                cwd=target_dir,
-                base_ref=effective_base,
-            )
-        except SourceControlError:
-            raise
-        except Exception as exc:
-            raise SourceControlError(
-                f"Failed to inspect diff for approval in '{target_dir}': {exc}"
-            ) from exc
-
-        if diff_summary.total_files == 0:
-            raise ValidationError(
-                f"No changes detected in workspace '{target_dir}' compared to '{effective_base}'. "
-                "Cannot create an approval request for an empty diff."
-            )
-
-        # 4. Enforce policy and detect elevated security risks
-        touches_workflow = self.diff_engine.contains_workflow_changes(diff_summary)
-        is_protected = is_protected_branch(clean_target_branch)
-
-        allowed, reason = self.policy_engine.is_operation_allowed(
-            operation=clean_op,
-            target_branch=clean_target_branch,
-            workspace=str(target_dir),
+    @property
+    def description(self) -> str:
+        return (
+            "Create a pending approval request for a remote side "
+            "effect. The approval is NOT granted by this tool; the "
+            "user must grant it through the PELDRUN UI."
         )
-        if not allowed:
-            raise PermissionDeniedError(
-                f"Policy prohibits requesting approval for '{clean_op}': {reason}",
-                details={
-                    "operation": clean_op,
-                    "target_branch": clean_target_branch,
-                    "reason": reason,
+
+    @property
+    def input_schema(self) -> Mapping[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "operation_id": {
+                    "type": "string",
+                    "description": (
+                        "Identifier of the operation the approval is "
+                        "for."
+                    ),
+                },
+                "operation": {
+                    "type": "string",
+                    "enum": list(SUPPORTED_OPERATIONS),
+                    "description": (
+                        "The remote side effect the approval covers."
+                    ),
+                },
+                "target_branch": {
+                    "type": "string",
+                    "description": (
+                        "The remote branch the operation targets."
+                    ),
+                },
+                "ttl_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": (
+                        "Optional TTL for the approval, in seconds."
+                    ),
+                },
+            },
+            "required": ["operation_id", "operation", "target_branch"],
+            "additionalProperties": False,
+        }
+
+    # --- Execution ------------------------------------------------------
+
+    async def execute(
+        self, context: ToolContext, **kwargs: Any
+    ) -> ToolResult:
+        # --- Parse inputs ----------------------------------------------
+        operation_id = kwargs.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message=(
+                    "`operation_id` must be a non-empty string."
+                ),
+            )
+        operation_id = operation_id.strip()
+
+        operation = kwargs.get("operation")
+        if (
+            not isinstance(operation, str)
+            or operation not in SUPPORTED_OPERATIONS
+        ):
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message=(
+                    f"`operation` must be one of: "
+                    f"{', '.join(SUPPORTED_OPERATIONS)}."
+                ),
+            )
+
+        target_branch = kwargs.get("target_branch")
+        if (
+            not isinstance(target_branch, str)
+            or not target_branch.strip()
+        ):
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message=(
+                    "`target_branch` must be a non-empty string."
+                ),
+            )
+        target_branch = target_branch.strip()
+
+        ttl_raw = kwargs.get("ttl_seconds")
+        ttl_seconds: Optional[int] = None
+        if ttl_raw is not None and ttl_raw != "":
+            try:
+                ttl_seconds = int(ttl_raw)
+            except (TypeError, ValueError):
+                return self.failure_result(
+                    error_code="VALIDATION_ERROR",
+                    error_message="`ttl_seconds` must be an integer.",
+                )
+            if ttl_seconds < 1:
+                return self.failure_result(
+                    error_code="VALIDATION_ERROR",
+                    error_message="`ttl_seconds` must be at least 1.",
+                )
+
+        # --- Resolve services ------------------------------------------
+        operation_service = (
+            self._explicit_operation_service
+            or get_default_operation_service()
+        )
+        approval_gate = (
+            self._explicit_approval_gate or get_default_approval_gate()
+        )
+
+        # --- Fetch the operation record --------------------------------
+        try:
+            record = await operation_service.get_operation(operation_id)
+        except Exception as exc:  # noqa: BLE001
+            normalized = to_source_control_error(exc)
+            return self.failure_result(
+                error_code=normalized.code.value,
+                error_message=normalized.message,
+                metadata={"operation_id": operation_id},
+            )
+
+        # --- Validate the operation state ------------------------------
+        if record.status in {
+            OperationStatus.CANCELLED,
+            OperationStatus.FAILED_FINAL,
+            OperationStatus.REJECTED,
+        }:
+            return self.failure_result(
+                error_code="CONFLICT",
+                error_message=(
+                    f"Operation is in status '{record.status.value}' "
+                    "and cannot request approval."
+                ),
+                metadata={
+                    "operation_id": operation_id,
+                    "status": record.status.value,
                 },
             )
 
-        # 5. Sanitize text payloads
-        clean_commit_msg = redact_text(commit_message.strip()) if commit_message else ""
-        clean_title = redact_text(title.strip()) if title else ""
-        clean_desc = redact_text(description.strip()) if description else ""
-
-        # 6. Create cryptographic approval ticket
-        bound_op_id = operation_id.strip() if operation_id and operation_id.strip() else f"op_{os.urandom(6).hex()}"
-
-        try:
-            ticket: ApprovalTicket = self.approval_gate.create_ticket(
-                operation_id=bound_op_id,
-                repository_id=repository_id,
-                operation=clean_op,
-                base_sha=diff_summary.base_sha,
-                diff_sha256=diff_summary.diff_sha256,
-                target_branch=clean_target_branch,
+        if not record.base_sha:
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message=(
+                    "Operation has no base SHA attached. Run "
+                    "`source_control.get_diff` first."
+                ),
+                metadata={"operation_id": operation_id},
             )
-        except Exception as exc:
-            raise SourceControlError(f"Failed to register approval ticket: {exc}") from exc
+        if not record.diff_sha256:
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message=(
+                    "Operation has no reviewed diff attached. Run "
+                    "`source_control.get_diff` first."
+                ),
+                metadata={"operation_id": operation_id},
+            )
 
-        # 7. Transition durable operation if service is wired
-        if self.operation_service and operation_id:
-            try:
-                from ..operations.models import OperationState
+        # --- Create the ticket -----------------------------------------
+        try:
+            ticket = approval_gate.create_ticket(
+                operation_id=operation_id,
+                repository_id=record.repository_id,
+                operation=operation,
+                base_sha=record.base_sha,
+                diff_sha256=record.diff_sha256,
+                target_branch=target_branch,
+                ttl_seconds=ttl_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001
+            normalized = to_source_control_error(exc)
+            return self.failure_result(
+                error_code=normalized.code.value,
+                error_message=normalized.message,
+                metadata={
+                    "operation_id": operation_id,
+                    "operation": operation,
+                    "retryable": normalized.is_retryable,
+                },
+            )
 
-                await self.operation_service.transition_state(
-                    operation_id=bound_op_id,
-                    target_state=OperationState.REVIEW_REQUIRED,
-                    metadata={
-                        "approval_id": ticket.approval_id,
-                        "diff_sha256": ticket.diff_sha256,
-                        "base_sha": ticket.base_sha,
-                        "target_branch": ticket.target_branch,
-                        "commit_message": clean_commit_msg,
-                        "title": clean_title,
-                        "description": clean_desc,
-                        "touches_workflow_files": touches_workflow,
-                    },
-                )
-            except Exception:
-                # Do not block approval ticket creation if operation journaling fails non-fatally
-                pass
+        # --- Attach the approval to the operation ----------------------
+        # Best-effort: attaching makes the operation display the
+        # pending approval in the UI. Failures here MUST NOT mask
+        # the successful ticket creation.
+        try:
+            await operation_service.attach_approval(
+                operation_id, ticket.approval_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Failed to attach approval '%s' to operation '%s': %s",
+                ticket.approval_id,
+                operation_id,
+                type(exc).__name__,
+            )
 
-        return {
-            "status": "pending_approval",
-            "approval_id": ticket.approval_id,
-            "operation_id": bound_op_id,
-            "operation_type": clean_op,
-            "repository_id": repository_id,
-            "target_branch": clean_target_branch,
-            "base_sha": ticket.base_sha,
-            "diff_sha256": ticket.diff_sha256,
-            "total_files": diff_summary.total_files,
-            "insertions": diff_summary.insertions,
-            "deletions": diff_summary.deletions,
-            "touches_workflow_files": touches_workflow,
-            "is_protected_target": is_protected,
-            "expires_at": ticket.expires_at.isoformat(),
-            "message": (
-                f"Approval ticket '{ticket.approval_id}' created successfully. "
-                "Autonomous agent execution is now paused. A human user must review the diff "
-                "and explicitly approve this ticket before any remote push or change request can be performed."
-            ),
-        }
-
-    async def aexecute(self, **kwargs: Any) -> dict[str, Any]:
-        """Public async execution adapter conforming to standard agent tool calling contracts."""
-        validated_args = self.args_schema(**kwargs)
-        return await self._arun(**validated_args.model_dump())
-
-    def execute(self, **kwargs: Any) -> dict[str, Any]:
-        """Synchronous wrapper raising an error to enforce non-blocking execution."""
-        raise NotImplementedError(
-            "RequestApprovalTool only supports asynchronous execution via aexecute() or _arun()."
+        return self.success_result(
+            {
+                "approval_id": ticket.approval_id,
+                "operation_id": ticket.operation_id,
+                "operation": ticket.operation,
+                "target_branch": ticket.target_branch,
+                "base_sha": ticket.base_sha,
+                "diff_sha256": ticket.diff_sha256,
+                "status": ticket.status.value,
+                "expires_at": ticket.expires_at.isoformat(),
+                "requires_user_action": True,
+            },
+            metadata={
+                "operation_id": operation_id,
+                "operation": operation,
+            },
         )

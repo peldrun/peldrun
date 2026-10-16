@@ -1,347 +1,909 @@
+# backend/integrations/source_control/operations/journal.py
+"""
+Durable operation journal for the Source Control Integration
+subsystem.
+
+The journal is the single source of truth for the state of every
+operation. It stores two kinds of data:
+
+    - `OperationRecord`: the current state of an operation. There is
+      exactly one record per operation, stored as JSON.
+    - `OperationEvent`: append-only event log for an operation, stored
+      as JSON Lines (one event per line).
+
+Both kinds are written through an async API. The on-disk layout is::
+
+    <journal_root>/
+        operations/
+            <operation_id>.json      # OperationRecord
+            <operation_id>.jsonl     # OperationEvent stream
+
+The journal never stores secrets. Operation IDs are validated to
+prevent path traversal.
+
+Design rules:
+    - Every public method is `async`. There is no synchronous
+      counterpart. Callers that need to run a journal operation from
+      a synchronous context MUST wrap it in `asyncio.run` or use an
+      async wrapper.
+    - The journal MUST tolerate corrupt files: a single malformed
+      record MUST NOT crash the application. Corrupt entries are
+      skipped with a warning.
+    - The journal MUST be safe to use from multiple threads and
+      coroutines. File I/O is offloaded to a thread via
+      `asyncio.to_thread`.
+    - The journal MUST NOT import from any provider adapter or from
+      the application layer. It depends only on `domain` and
+      `operations.models`.
+"""
+
 from __future__ import annotations
 
-import dataclasses
+import asyncio
 import json
-import os
+import logging
+import re
 import threading
-from datetime import datetime
+from abc import ABC, abstractmethod
+from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Union
 
-from ..domain.enums import SourceControlErrorCode
-from ..errors import SourceControlError
-from .models import (
-    IdempotencyRecord,
-    OperationEvent,
-    OperationRecord,
-    OperationState,
-)
-
-
-class JournalError(SourceControlError):
-    """Raised when an operation against the journal persistence fails."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        details: Optional[dict[str, str]] = None,
-    ) -> None:
-        super().__init__(
-            message=message,
-            code=SourceControlErrorCode.PROVIDER_ERROR,
-            retryable=False,
-            details=details,
-        )
-
-
-class OperationJournal:
-    """Thread-safe durable journal managing operation persistence, event logs, and idempotency."""
-
-    def __init__(
-        self,
-        journal_dir: Optional[str | Path] = None,
-        db_path: Optional[str] = None,
-    ) -> None:
-        self.journal_dir: Optional[Path] = Path(journal_dir) if journal_dir else None
-        self.db_path = db_path
-        self._operations: dict[str, OperationRecord] = {}
-        self._events: dict[str, list[OperationEvent]] = {}
-        self._idempotency: dict[str, IdempotencyRecord] = {}
-        self._lock = threading.Lock()
-
-        if self.journal_dir:
-            self.journal_dir.mkdir(parents=True, exist_ok=True)
-            self._recover_from_disk_locked()
-
-    def _recover_from_disk_locked(self) -> None:
-        """Restores operations and event history from persisted JSON/JSONL files."""
-        if not self.journal_dir or not self.journal_dir.exists():
-            return
-
-        # 1. Recover operations from JSON snapshots
-        for json_file in self.journal_dir.glob("*.json"):
-            if json_file.name.startswith("op_") or not json_file.name.endswith(".json"):
-                continue
-            try:
-                data = json.loads(json_file.read_text(encoding="utf-8"))
-                if isinstance(data, dict) and "operation_id" in data:
-                    record = OperationRecord.from_dict(data)
-                    self._operations[record.operation_id] = record
-            except Exception:
-                continue
-
-        # 2. Recover event logs from JSONL files
-        for jsonl_file in self.journal_dir.glob("*.jsonl"):
-            try:
-                lines = jsonl_file.read_text(encoding="utf-8").strip().splitlines()
-                for line in lines:
-                    line_str = line.strip()
-                    if not line_str:
-                        continue
-                    event_data = json.loads(line_str)
-                    event = OperationEvent.from_dict(event_data)
-                    op_id = event.operation_id or jsonl_file.stem.replace("_events", "")
-                    if op_id:
-                        if op_id not in self._events:
-                            self._events[op_id] = []
-                        if not any(e.event_id == event.event_id for e in self._events[op_id]):
-                            self._events[op_id].append(event)
-            except Exception:
-                continue
-
-        # 3. Synchronize reloaded events with in-memory operations
-        for op_id, op_record in list(self._operations.items()):
-            if op_id in self._events and self._events[op_id]:
-                sorted_events = sorted(self._events[op_id], key=lambda e: e.timestamp)
-                self._events[op_id] = sorted_events
-                self._operations[op_id] = dataclasses.replace(
-                    op_record, events=tuple(sorted_events)
-                )
-
-    # ---------------------------------------------------------------------------
-    # Async Methods (Conforming to test_operations_journal.py contracts)
-    # ---------------------------------------------------------------------------
-
-    async def save_record(self, record: OperationRecord) -> None:
-        """Asynchronously persists an OperationRecord to disk and memory."""
-        self.save_operation(record)
-
-    async def get_record(self, operation_id: str) -> Optional[OperationRecord]:
-        """Asynchronously retrieves an OperationRecord by ID."""
-        return self.get_operation(operation_id)
-
-    async def append_event(self, operation_id: str, event: OperationEvent) -> None:
-        """Asynchronously appends a transition event and writes it to a JSONL log file."""
-        with self._lock:
-            # Bind operation_id to event if not already set
-            effective_event = (
-                dataclasses.replace(event, operation_id=operation_id)
-                if event.operation_id != operation_id
-                else event
-            )
-
-            if operation_id not in self._events:
-                self._events[operation_id] = []
-            self._events[operation_id].append(effective_event)
-
-            # Update parent OperationRecord with the latest event snapshot
-            if operation_id in self._operations:
-                op = self._operations[operation_id]
-                updated_events = tuple(self._events[operation_id])
-                latest_state = effective_event.to_state
-                self._operations[operation_id] = dataclasses.replace(
-                    op,
-                    current_state=latest_state,
-                    status=latest_state,
-                    events=updated_events,
-                    updated_at=datetime.utcnow(),
-                )
-                self._persist_operation_locked(self._operations[operation_id])
-
-            # Persist event entry to JSONL
-            if self.journal_dir:
-                event_line = json.dumps(effective_event.to_dict(), ensure_ascii=False) + "\n"
-                target_jsonl = self.journal_dir / f"{operation_id}.jsonl"
-                with open(target_jsonl, "a", encoding="utf-8") as f:
-                    f.write(event_line)
-
-                # Maintain an aggregate events.jsonl ledger
-                aggregate_jsonl = self.journal_dir / "events.jsonl"
-                with open(aggregate_jsonl, "a", encoding="utf-8") as f:
-                    f.write(event_line)
-
-    # ---------------------------------------------------------------------------
-    # Synchronous Core Operations Interface
-    # ---------------------------------------------------------------------------
-
-    def save_operation(self, operation: OperationRecord) -> None:
-        """Persists or updates an OperationRecord in memory and filesystem."""
-        with self._lock:
-            # Preserve existing events if incoming record omits them
-            existing_events = self._events.get(operation.operation_id, [])
-            effective_events = (
-                operation.events if operation.events else tuple(existing_events)
-            )
-
-            updated_op = dataclasses.replace(operation, events=effective_events)
-            self._operations[operation.operation_id] = updated_op
-
-            if operation.operation_id not in self._events:
-                self._events[operation.operation_id] = list(effective_events)
-
-            self._persist_operation_locked(updated_op)
-
-    def _persist_operation_locked(self, operation: OperationRecord) -> None:
-        """Internal helper writing operation state to disk. Assumes lock is held."""
-        if not self.journal_dir:
-            return
-
-        file_path = self.journal_dir / f"{operation.operation_id}.json"
-        temp_file = self.journal_dir / f"{operation.operation_id}.json.tmp"
-        payload = json.dumps(operation.to_dict(), indent=2, ensure_ascii=False)
-
-        with open(temp_file, "w", encoding="utf-8") as f:
-            f.write(payload)
-        temp_file.replace(file_path)
-
-    def get_operation(self, operation_id: str) -> Optional[OperationRecord]:
-        """Retrieves an OperationRecord by ID, attempting disk lookup if unbuffered."""
-        with self._lock:
-            record = self._operations.get(operation_id)
-            if record is not None:
-                return record
-
-            if self.journal_dir:
-                file_path = self.journal_dir / f"{operation_id}.json"
-                if file_path.exists():
-                    try:
-                        data = json.loads(file_path.read_text(encoding="utf-8"))
-                        op = OperationRecord.from_dict(data)
-                        self._operations[operation_id] = op
-                        return op
-                    except Exception:
-                        pass
-            return None
-
-    def list_operations(
-        self,
-        repository_id: Optional[str] = None,
-        run_id: Optional[str] = None,
-        status: Optional[Any] = None,
-        limit: int = 100,
-    ) -> Sequence[OperationRecord]:
-        """Lists operations matching filter criteria ordered by creation date descending."""
-        with self._lock:
-            matched: list[OperationRecord] = []
-            target_status_val = (
-                status.value if hasattr(status, "value") else str(status)
-            ) if status is not None else None
-
-            for op in reversed(list(self._operations.values())):
-                if repository_id and op.repository_id != repository_id:
-                    continue
-                if run_id and op.run_id != run_id:
-                    continue
-                if target_status_val is not None:
-                    op_status_val = (
-                        op.current_state.value
-                        if hasattr(op.current_state, "value")
-                        else str(op.current_state)
-                    )
-                    if op_status_val != target_status_val:
-                        continue
-                matched.append(op)
-                if len(matched) >= limit:
-                    break
-            return tuple(matched)
-
-    def record_event(self, event: OperationEvent) -> None:
-        """Synchronously records an OperationEvent."""
-        op_id = event.operation_id or "default"
-        with self._lock:
-            if op_id not in self._events:
-                self._events[op_id] = []
-            self._events[op_id].append(event)
-
-            if op_id in self._operations:
-                op = self._operations[op_id]
-                updated_events = tuple(self._events[op_id])
-                latest_state = event.to_state
-                self._operations[op_id] = dataclasses.replace(
-                    op,
-                    current_state=latest_state,
-                    status=latest_state,
-                    events=updated_events,
-                    updated_at=datetime.utcnow(),
-                )
-                self._persist_operation_locked(self._operations[op_id])
-
-    def list_events(self, operation_id: str) -> Sequence[OperationEvent]:
-        """Retrieves all transition events for an operation ordered chronologically."""
-        with self._lock:
-            events = self._events.get(operation_id, [])
-            return tuple(sorted(events, key=lambda e: e.timestamp))
-
-    def save_idempotency_record(self, record: IdempotencyRecord) -> None:
-        """Saves an idempotency record for mutation deduplication."""
-        with self._lock:
-            self._idempotency[record.idempotency_key] = record
-
-    def get_idempotency_record(self, idempotency_key: str) -> Optional[IdempotencyRecord]:
-        """Retrieves an idempotency record by key."""
-        with self._lock:
-            return self._idempotency.get(idempotency_key)
-
-    def delete_operation(self, operation_id: str) -> bool:
-        """Deletes an operation and purges its stored files."""
-        with self._lock:
-            self._events.pop(operation_id, None)
-            deleted = self._operations.pop(operation_id, None) is not None
-
-            if self.journal_dir:
-                json_file = self.journal_dir / f"{operation_id}.json"
-                if json_file.exists():
-                    json_file.unlink(missing_ok=True)
-                jsonl_file = self.journal_dir / f"{operation_id}.jsonl"
-                if jsonl_file.exists():
-                    jsonl_file.unlink(missing_ok=True)
-
-            return deleted
-
-    def clear(self) -> None:
-        """Clears all records in memory and test files (test teardown helper)."""
-        with self._lock:
-            self._operations.clear()
-            self._events.clear()
-            self._idempotency.clear()
-
-
-# Canonical aliases ensuring backwards-compatible imports across subsystem packages
-InMemoryOperationJournal = OperationJournal
-SQLiteOperationJournal = OperationJournal
-
-_DEFAULT_OPERATION_JOURNAL: Optional[OperationJournal] = None
-_JOURNAL_LOCK = threading.Lock()
-
-
-def get_default_operation_journal(
-    journal_dir: Optional[str | Path] = None,
-    db_path: Optional[str] = None,
-) -> OperationJournal:
-    """Returns the process-wide default OperationJournal singleton."""
-    global _DEFAULT_OPERATION_JOURNAL
-    if _DEFAULT_OPERATION_JOURNAL is None:
-        with _JOURNAL_LOCK:
-            if _DEFAULT_OPERATION_JOURNAL is None:
-                _DEFAULT_OPERATION_JOURNAL = OperationJournal(
-                    journal_dir=journal_dir, db_path=db_path
-                )
-    return _DEFAULT_OPERATION_JOURNAL
-
-
-def set_default_operation_journal(journal: OperationJournal) -> None:
-    """Explicitly injects an OperationJournal instance (used during testing)."""
-    global _DEFAULT_OPERATION_JOURNAL
-    with _JOURNAL_LOCK:
-        _DEFAULT_OPERATION_JOURNAL = journal
-
-
-def reset_default_operation_journal() -> None:
-    """Resets the process-wide default OperationJournal (used during testing)."""
-    global _DEFAULT_OPERATION_JOURNAL
-    with _JOURNAL_LOCK:
-        if _DEFAULT_OPERATION_JOURNAL is not None:
-            _DEFAULT_OPERATION_JOURNAL.clear()
-        _DEFAULT_OPERATION_JOURNAL = None
-
+from ..domain.enums import OperationEventType, OperationStatus
+from ..domain.models import OperationEvent, OperationRecord
+from ..errors import NotFoundError, ValidationError
+from .models import _utc_now  # re-exported from domain.models
 
 __all__ = [
-    "JournalError",
     "OperationJournal",
     "InMemoryOperationJournal",
-    "SQLiteOperationJournal",
+    "FileOperationJournal",
+    "NullOperationJournal",
     "get_default_operation_journal",
     "set_default_operation_journal",
     "reset_default_operation_journal",
+    "MAX_EVENTS_PER_OPERATION",
+    "MAX_RECORDS_IN_MEMORY",
 ]
+
+
+logger = logging.getLogger(__name__)
+
+
+#: Maximum number of events retained per operation. Prevents
+#: unbounded growth of the event log.
+MAX_EVENTS_PER_OPERATION: int = 10_000
+
+#: Default cap for the in-memory implementation and for
+#: `list_records`.
+MAX_RECORDS_IN_MEMORY: int = 1_000
+
+#: Schema version written into every persisted record and event. The
+#: version allows future migrations without ambiguity.
+SCHEMA_VERSION: int = 1
+
+
+#: Operations IDs are generated by PELDRUN and are always hexadecimal
+#: (optionally with hyphens). Any deviation is treated as an invalid
+#: ID, which protects the journal against path traversal.
+_VALID_OPERATION_ID = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
+
+
+def _validate_operation_id(operation_id: str) -> str:
+    """
+    Return a validated operation identifier.
+
+    Raises `ValidationError` for empty, malformed, or
+    path-traversal-prone IDs.
+    """
+    if not operation_id or not isinstance(operation_id, str):
+        raise ValidationError("operation_id must be a non-empty string.")
+    trimmed = operation_id.strip()
+    if not _VALID_OPERATION_ID.match(trimmed):
+        raise ValidationError(
+            "operation_id contains forbidden characters.",
+            details={"operation_id_length": len(trimmed)},
+        )
+    return trimmed
+
+
+# ---------------------------------------------------------------------------
+# Abstract interface
+# ---------------------------------------------------------------------------
+
+
+class OperationJournal(ABC):
+    """
+    Abstract operation journal.
+
+    All methods are `async`. Implementations MUST be safe to call
+    concurrently from multiple coroutines and threads.
+    """
+
+    backend_name: str = "unknown"
+
+    # --- Records --------------------------------------------------------
+
+    @abstractmethod
+    async def save_record(self, record: OperationRecord) -> None:
+        """
+        Persist `record`, overwriting any existing record with the
+        same `operation_id`.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_record(
+        self, operation_id: str
+    ) -> Optional[OperationRecord]:
+        """
+        Return the record for `operation_id`, or `None` if absent.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def list_records(
+        self, *, limit: int = MAX_RECORDS_IN_MEMORY
+    ) -> Sequence[OperationRecord]:
+        """
+        Return up to `limit` records, newest first.
+
+        The sort key is `created_at`. Records with the same timestamp
+        are ordered lexicographically by `operation_id` for
+        determinism.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def delete_record(self, operation_id: str) -> bool:
+        """
+        Delete the record for `operation_id`.
+
+        Returns True if a record was present, False otherwise. Never
+        raises for a missing record.
+        """
+        raise NotImplementedError
+
+    # --- Events ---------------------------------------------------------
+
+    @abstractmethod
+    async def append_event(self, event: OperationEvent) -> None:
+        """
+        Append `event` to the operation's event log.
+
+        Events are append-only. The journal does NOT enforce
+        monotonicity of the `sequence` field; the caller is
+        responsible for assigning a strictly increasing sequence
+        number per operation.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def list_events(
+        self, operation_id: str
+    ) -> Sequence[OperationEvent]:
+        """
+        Return every event for `operation_id`, oldest first.
+
+        Returns an empty tuple for an unknown operation. Never raises
+        for a missing operation.
+        """
+        raise NotImplementedError
+
+    # --- Maintenance ---------------------------------------------------
+
+    async def clear(self) -> None:
+        """
+        Remove every record and event.
+
+        Intended for tests. Production implementations MUST either
+        override this to be a no-op or delete only their own files.
+        """
+        return None
+
+    # --- Backward-compatible aliases ----------------------------------
+
+    async def save_operation(self, operation: OperationRecord) -> None:
+        """
+        Alias for `save_record`.
+
+        Retained for backward compatibility with callers that used the
+        older `save_operation` name. New code SHOULD call
+        `save_record` directly.
+        """
+        await self.save_record(operation)
+
+    async def get_operation(
+        self, operation_id: str
+    ) -> Optional[OperationRecord]:
+        """Alias for `get_record`."""
+        return await self.get_record(operation_id)
+
+    async def require_record(self, operation_id: str) -> OperationRecord:
+        """
+        Return the record for `operation_id`, raising
+        `NotFoundError` when absent.
+        """
+        record = await self.get_record(operation_id)
+        if record is None:
+            raise NotFoundError(
+                f"Operation '{operation_id}' was not found.",
+                details={"operation_id": operation_id},
+            )
+        return record
+
+    # --- Serialization helpers -----------------------------------------
+
+    @staticmethod
+    def _record_to_dict(record: OperationRecord) -> Dict[str, object]:
+        """Serialize an `OperationRecord` to a JSON-safe mapping."""
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "operation_id": record.operation_id,
+            "run_id": record.run_id,
+            "provider": record.provider.value,
+            "repository_id": record.repository_id,
+            "kind": record.kind,
+            "status": record.status.value,
+            "base_sha": record.base_sha,
+            "source_branch": record.source_branch,
+            "target_branch": record.target_branch,
+            "workspace_id": record.workspace_id,
+            "diff_sha256": record.diff_sha256,
+            "approval_id": record.approval_id,
+            "created_at": record.created_at.isoformat(),
+            "updated_at": record.updated_at.isoformat(),
+            "error_code": record.error_code,
+            "error_message": record.error_message,
+            "change_request": (
+                None
+                if record.change_request is None
+                else {
+                    "provider": record.change_request.provider.value,
+                    "repository_id": record.change_request.repository_id,
+                    "number_or_iid": record.change_request.number_or_iid,
+                    "web_url": record.change_request.web_url,
+                    "state": record.change_request.state.value,
+                    "source_branch": record.change_request.source_branch,
+                    "target_branch": record.change_request.target_branch,
+                    "title": record.change_request.title,
+                    "is_draft": record.change_request.is_draft,
+                }
+            ),
+            "metadata": dict(record.metadata),
+        }
+
+    @staticmethod
+    def _record_from_dict(data: Dict[str, object]) -> Optional[OperationRecord]:
+        """
+        Deserialize an `OperationRecord` from a mapping.
+
+        Returns `None` for malformed data. The caller is responsible
+        for logging and skipping such records.
+        """
+        try:
+            from ..domain.enums import ProviderId
+
+            operation_id = str(data["operation_id"])
+            run_id = str(data.get("run_id") or "")
+            provider = ProviderId(str(data["provider"]))
+            repository_id = str(data["repository_id"])
+            kind = str(data["kind"])
+            status = OperationStatus(str(data["status"]))
+            created_at = _parse_iso(data.get("created_at")) or _utc_now()
+            updated_at = _parse_iso(data.get("updated_at")) or created_at
+
+            change_request = None
+            cr_data = data.get("change_request")
+            if isinstance(cr_data, dict):
+                change_request = _change_request_from_dict(cr_data)
+
+            return OperationRecord(
+                operation_id=operation_id,
+                run_id=run_id,
+                provider=provider,
+                repository_id=repository_id,
+                kind=kind,
+                status=status,
+                base_sha=str(data.get("base_sha") or ""),
+                source_branch=_opt_str(data.get("source_branch")),
+                target_branch=_opt_str(data.get("target_branch")),
+                workspace_id=_opt_str(data.get("workspace_id")),
+                diff_sha256=_opt_str(data.get("diff_sha256")),
+                approval_id=_opt_str(data.get("approval_id")),
+                created_at=created_at,
+                updated_at=updated_at,
+                error_code=_opt_str(data.get("error_code")),
+                error_message=_opt_str(data.get("error_message")),
+                change_request=change_request,
+                metadata=dict(data.get("metadata") or {}),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _event_to_dict(event: OperationEvent) -> Dict[str, object]:
+        """Serialize an `OperationEvent` to a JSON-safe mapping."""
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "operation_id": event.operation_id,
+            "sequence": event.sequence,
+            "event_type": event.event_type.value,
+            "occurred_at": event.occurred_at.isoformat(),
+            "payload": dict(event.payload),
+        }
+
+    @staticmethod
+    def _event_from_dict(data: Dict[str, object]) -> Optional[OperationEvent]:
+        """Deserialize an `OperationEvent` from a mapping."""
+        try:
+            operation_id = str(data["operation_id"])
+            sequence = int(data["sequence"])
+            event_type = OperationEventType(str(data["event_type"]))
+            occurred_at = _parse_iso(data.get("occurred_at")) or _utc_now()
+            payload = dict(data.get("payload") or {})
+            return OperationEvent(
+                operation_id=operation_id,
+                sequence=sequence,
+                event_type=event_type,
+                occurred_at=occurred_at,
+                payload=payload,
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+
+# ---------------------------------------------------------------------------
+# In-memory implementation
+# ---------------------------------------------------------------------------
+
+
+class InMemoryOperationJournal(OperationJournal):
+    """
+    Bounded in-memory journal.
+
+    Records are stored in an `OrderedDict` with a bounded size. When
+    the bound is exceeded, the oldest record is evicted. Events are
+    stored in per-operation lists, also bounded by
+    `MAX_EVENTS_PER_OPERATION`.
+
+    This implementation is used by tests and by short-lived runs. It
+    is NOT suitable for production because nothing is persisted
+    across restarts.
+    """
+
+    backend_name = "memory"
+
+    def __init__(self, max_records: int = MAX_RECORDS_IN_MEMORY) -> None:
+        if max_records <= 0:
+            raise ValidationError("max_records must be positive.")
+        self._records: "OrderedDict[str, OperationRecord]" = OrderedDict()
+        self._events: Dict[str, List[OperationEvent]] = {}
+        self._lock = threading.RLock()
+        self._max_records = int(max_records)
+
+    # --- Records --------------------------------------------------------
+
+    async def save_record(self, record: OperationRecord) -> None:
+        if not isinstance(record, OperationRecord):
+            raise ValidationError(
+                "save_record expects an OperationRecord.",
+                details={"type": type(record).__name__},
+            )
+        operation_id = _validate_operation_id(record.operation_id)
+        with self._lock:
+            # Move to the end so the record counts as "most recently
+            # updated" for eviction purposes.
+            self._records.pop(operation_id, None)
+            self._records[operation_id] = record
+            while len(self._records) > self._max_records:
+                self._records.popitem(last=False)
+
+    async def get_record(
+        self, operation_id: str
+    ) -> Optional[OperationRecord]:
+        try:
+            key = _validate_operation_id(operation_id)
+        except ValidationError:
+            return None
+        with self._lock:
+            return self._records.get(key)
+
+    async def list_records(
+        self, *, limit: int = MAX_RECORDS_IN_MEMORY
+    ) -> Sequence[OperationRecord]:
+        if limit <= 0:
+            return ()
+        with self._lock:
+            records = list(self._records.values())
+        records.sort(
+            key=lambda r: (r.created_at, r.operation_id),
+            reverse=True,
+        )
+        return tuple(records[:limit])
+
+    async def delete_record(self, operation_id: str) -> bool:
+        try:
+            key = _validate_operation_id(operation_id)
+        except ValidationError:
+            return False
+        with self._lock:
+            existed = self._records.pop(key, None) is not None
+            self._events.pop(key, None)
+            return existed
+
+    # --- Events ---------------------------------------------------------
+
+    async def append_event(self, event: OperationEvent) -> None:
+        if not isinstance(event, OperationEvent):
+            raise ValidationError(
+                "append_event expects an OperationEvent.",
+                details={"type": type(event).__name__},
+            )
+        operation_id = _validate_operation_id(event.operation_id)
+        with self._lock:
+            bucket = self._events.setdefault(operation_id, [])
+            bucket.append(event)
+            if len(bucket) > MAX_EVENTS_PER_OPERATION:
+                # Drop the oldest events. Preserve order.
+                overflow = len(bucket) - MAX_EVENTS_PER_OPERATION
+                del bucket[:overflow]
+
+    async def list_events(
+        self, operation_id: str
+    ) -> Sequence[OperationEvent]:
+        try:
+            key = _validate_operation_id(operation_id)
+        except ValidationError:
+            return ()
+        with self._lock:
+            bucket = self._events.get(key)
+            if not bucket:
+                return ()
+            return tuple(bucket)
+
+    # --- Maintenance ---------------------------------------------------
+
+    async def clear(self) -> None:
+        with self._lock:
+            self._records.clear()
+            self._events.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._records)
+
+
+# ---------------------------------------------------------------------------
+# File-based implementation
+# ---------------------------------------------------------------------------
+
+
+class FileOperationJournal(OperationJournal):
+    """
+    Durable journal backed by JSON files.
+
+    Layout::
+
+        <root>/
+            operations/
+                <operation_id>.json      # OperationRecord
+                <operation_id>.jsonl     # OperationEvent stream
+
+    The `.json` file is overwritten on every `save_record`. The
+    `.jsonl` file is appended to on every `append_event`. Both files
+    are written with `fsync` to ensure durability.
+
+    Corrupt files are skipped with a warning. A single malformed
+    record MUST NOT prevent the journal from loading.
+    """
+
+    backend_name = "file"
+
+    def __init__(
+        self,
+        root: Union[str, Path],
+        *,
+        create_parents: bool = True,
+    ) -> None:
+        self._root = Path(root).expanduser()
+        if create_parents:
+            (self._root / "operations").mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+
+    @property
+    def root(self) -> Path:
+        """Return the journal root directory."""
+        return self._root
+
+    # --- Paths ----------------------------------------------------------
+
+    def _operations_dir(self) -> Path:
+        return self._root / "operations"
+
+    def _record_path(self, operation_id: str) -> Path:
+        return self._operations_dir() / f"{operation_id}.json"
+
+    def _events_path(self, operation_id: str) -> Path:
+        return self._operations_dir() / f"{operation_id}.jsonl"
+
+    # --- Records --------------------------------------------------------
+
+    async def save_record(self, record: OperationRecord) -> None:
+        if not isinstance(record, OperationRecord):
+            raise ValidationError(
+                "save_record expects an OperationRecord.",
+                details={"type": type(record).__name__},
+            )
+        operation_id = _validate_operation_id(record.operation_id)
+        payload = self._record_to_dict(record)
+        path = self._record_path(operation_id)
+        text = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        await self._write_atomic(path, text)
+
+    async def get_record(
+        self, operation_id: str
+    ) -> Optional[OperationRecord]:
+        try:
+            key = _validate_operation_id(operation_id)
+        except ValidationError:
+            return None
+        path = self._record_path(key)
+        text = await self._read_file(path)
+        if text is None:
+            return None
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            logger.warning("Corrupt record file: %s", path.name)
+            return None
+        if not isinstance(data, dict):
+            return None
+        return self._record_from_dict(data)
+
+    async def list_records(
+        self, *, limit: int = MAX_RECORDS_IN_MEMORY
+    ) -> Sequence[OperationRecord]:
+        if limit <= 0:
+            return ()
+        directory = self._operations_dir()
+        if not directory.is_dir():
+            return ()
+        paths = await asyncio.to_thread(
+            lambda: sorted(directory.glob("*.json"))
+        )
+        records: List[OperationRecord] = []
+        for path in paths:
+            text = await self._read_file(path)
+            if text is None:
+                continue
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                logger.warning("Corrupt record file: %s", path.name)
+                continue
+            if not isinstance(data, dict):
+                continue
+            record = self._record_from_dict(data)
+            if record is not None:
+                records.append(record)
+        records.sort(
+            key=lambda r: (r.created_at, r.operation_id),
+            reverse=True,
+        )
+        return tuple(records[:limit])
+
+    async def delete_record(self, operation_id: str) -> bool:
+        try:
+            key = _validate_operation_id(operation_id)
+        except ValidationError:
+            return False
+        record_path = self._record_path(key)
+        events_path = self._events_path(key)
+
+        existed = False
+        if record_path.exists():
+            existed = True
+        await self._unlink(record_path)
+        await self._unlink(events_path)
+        return existed
+
+    # --- Events ---------------------------------------------------------
+
+    async def append_event(self, event: OperationEvent) -> None:
+        if not isinstance(event, OperationEvent):
+            raise ValidationError(
+                "append_event expects an OperationEvent.",
+                details={"type": type(event).__name__},
+            )
+        operation_id = _validate_operation_id(event.operation_id)
+        payload = self._event_to_dict(event)
+        line = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        path = self._events_path(operation_id)
+        await self._append_line(path, line)
+
+    async def list_events(
+        self, operation_id: str
+    ) -> Sequence[OperationEvent]:
+        try:
+            key = _validate_operation_id(operation_id)
+        except ValidationError:
+            return ()
+        path = self._events_path(key)
+        text = await self._read_file(path)
+        if not text:
+            return ()
+        events: List[OperationEvent] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Skipping corrupt event line in %s", path.name
+                )
+                continue
+            if not isinstance(data, dict):
+                continue
+            event = self._event_from_dict(data)
+            if event is not None:
+                events.append(event)
+        # Ensure deterministic order even if the file was written out
+        # of sequence for some reason.
+        events.sort(key=lambda e: e.sequence)
+        return tuple(events)
+
+    # --- Maintenance ---------------------------------------------------
+
+    async def clear(self) -> None:
+        directory = self._operations_dir()
+        if not directory.is_dir():
+            return
+
+        def _delete_all() -> None:
+            for child in directory.iterdir():
+                if child.is_file() and child.suffix in (".json", ".jsonl"):
+                    try:
+                        child.unlink()
+                    except OSError:
+                        logger.warning(
+                            "Failed to delete journal file: %s",
+                            child.name,
+                        )
+
+        await asyncio.to_thread(_delete_all)
+
+    # --- File I/O -------------------------------------------------------
+
+    async def _write_atomic(self, path: Path, text: str) -> None:
+        """
+        Write `text` to `path` atomically.
+
+        The content is first written to a temporary file in the same
+        directory and then renamed onto the target, so a crash during
+        write does not leave a partial record.
+        """
+
+        def _write() -> None:
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with tmp.open("w", encoding="utf-8") as fh:
+                fh.write(text)
+                fh.flush()
+                try:
+                    import os
+
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+            tmp.replace(path)
+
+        await asyncio.to_thread(_write)
+
+    async def _append_line(self, path: Path, line: str) -> None:
+        """
+        Append a single JSON line to `path`.
+
+        A trailing newline is added. The file is `fsync`ed to ensure
+        durability.
+        """
+
+        def _append() -> None:
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+                fh.write("\n")
+                fh.flush()
+                try:
+                    import os
+
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+
+        await asyncio.to_thread(_append)
+
+    async def _read_file(self, path: Path) -> Optional[str]:
+        """
+        Read `path` as UTF-8 text, or return `None` when the file
+        does not exist.
+        """
+
+        def _read() -> Optional[str]:
+            try:
+                return path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                logger.warning(
+                    "Failed to read journal file %s: %s",
+                    path.name,
+                    type(exc).__name__,
+                )
+                return None
+
+        return await asyncio.to_thread(_read)
+
+    async def _unlink(self, path: Path) -> None:
+        """Delete `path`, ignoring missing files."""
+
+        def _unlink() -> None:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                logger.warning(
+                    "Failed to delete journal file %s: %s",
+                    path.name,
+                    type(exc).__name__,
+                )
+
+        await asyncio.to_thread(_unlink)
+
+
+# ---------------------------------------------------------------------------
+# Null implementation
+# ---------------------------------------------------------------------------
+
+
+class NullOperationJournal(OperationJournal):
+    """
+    Journal that discards every write and returns empty results.
+
+    Intended for environments where the journal is intentionally
+    disabled, for example short-lived scripts and unit tests that do
+    not exercise persistence.
+    """
+
+    backend_name = "null"
+
+    async def save_record(self, record: OperationRecord) -> None:
+        return None
+
+    async def get_record(
+        self, operation_id: str
+    ) -> Optional[OperationRecord]:
+        return None
+
+    async def list_records(
+        self, *, limit: int = MAX_RECORDS_IN_MEMORY
+    ) -> Sequence[OperationRecord]:
+        return ()
+
+    async def delete_record(self, operation_id: str) -> bool:
+        return False
+
+    async def append_event(self, event: OperationEvent) -> None:
+        return None
+
+    async def list_events(
+        self, operation_id: str
+    ) -> Sequence[OperationEvent]:
+        return ()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_iso(value: object):
+    """Parse an ISO 8601 string into a timezone-aware datetime."""
+    from datetime import datetime, timezone
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _opt_str(value: object) -> Optional[str]:
+    """Return `value` as a string, or `None` when the value is empty."""
+    if value is None:
+        return None
+    text = str(value)
+    return text or None
+
+
+def _change_request_from_dict(data: Dict[str, object]):
+    """Deserialize a `ChangeRequestRef` from a mapping."""
+    try:
+        from ..domain.enums import ChangeRequestState, ProviderId
+        from ..domain.models import ChangeRequestRef
+
+        return ChangeRequestRef(
+            provider=ProviderId(str(data["provider"])),
+            repository_id=str(data["repository_id"]),
+            number_or_iid=str(data["number_or_iid"]),
+            web_url=str(data["web_url"]),
+            state=ChangeRequestState(str(data["state"])),
+            source_branch=str(data["source_branch"]),
+            target_branch=str(data["target_branch"]),
+            title=str(data.get("title") or ""),
+            is_draft=bool(data.get("is_draft", False)),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Default journal singleton
+# ---------------------------------------------------------------------------
+
+
+_DEFAULT_JOURNAL: Optional[OperationJournal] = None
+_DEFAULT_LOCK = threading.RLock()
+
+
+def get_default_operation_journal() -> OperationJournal:
+    """
+    Return the process-wide default journal, creating it on first
+    use.
+
+    The default is `InMemoryOperationJournal`. Applications that need
+    persistence SHOULD call `set_default_operation_journal` with a
+    `FileOperationJournal` at startup.
+    """
+    global _DEFAULT_JOURNAL
+    with _DEFAULT_LOCK:
+        if _DEFAULT_JOURNAL is None:
+            _DEFAULT_JOURNAL = InMemoryOperationJournal()
+        return _DEFAULT_JOURNAL
+
+
+def set_default_operation_journal(journal: OperationJournal) -> None:
+    """
+    Replace the process-wide default journal.
+
+    Intended for application startup and for tests.
+    """
+    if not isinstance(journal, OperationJournal):
+        raise TypeError(
+            "set_default_operation_journal expects an OperationJournal."
+        )
+    global _DEFAULT_JOURNAL
+    with _DEFAULT_LOCK:
+        _DEFAULT_JOURNAL = journal
+
+
+def reset_default_operation_journal(
+    max_records: int = MAX_RECORDS_IN_MEMORY,
+) -> OperationJournal:
+    """
+    Replace the default journal with a fresh in-memory journal.
+
+    Used by tests to guarantee isolation between test cases.
+    """
+    global _DEFAULT_JOURNAL
+    with _DEFAULT_LOCK:
+        _DEFAULT_JOURNAL = InMemoryOperationJournal(max_records=max_records)
+        return _DEFAULT_JOURNAL

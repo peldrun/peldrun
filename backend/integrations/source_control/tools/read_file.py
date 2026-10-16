@@ -1,207 +1,414 @@
+# backend/integrations/source_control/tools/read_file.py
+"""
+The `source_control.read_file` tool.
+
+Reads a text file from a remote repository at a specific ref
+(branch, tag, or commit SHA) using the provider's contents API. The
+result is returned to the agent as a string.
+
+Design rules:
+    - The tool resolves the credential from the OS vault, never
+      from the caller's arguments.
+    - The tool MUST NOT return binary content. When the provider
+      cannot tell whether a file is text, the tool attempts a UTF-8
+      decode and rejects content that contains NUL bytes, which is
+      the standard signal of a binary file.
+    - The tool bounds the size of the returned content at
+      `MAX_FILE_BYTES`. Larger files are refused with a clear error
+      so that the model's context is not blown by an accidental
+      request for a multi-megabyte file.
+    - The tool is read-only and requires no approval.
+"""
+
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional
-from pydantic import BaseModel, Field
+import logging
+from typing import Any, Dict, Mapping, Optional
 
 from ..domain.enums import ProviderId
 from ..domain.models import RepositoryRef
-from ..errors import (
-    AuthRequiredError,
-    NotFoundError,
-    PermissionDeniedError,
-    SourceControlError,
-    ValidationError,
-)
+from ..errors import to_source_control_error
 from ..registry import ProviderRegistry, get_default_registry
-from ..security.policy_engine import PolicyEngine, get_default_policy_engine
-from ..security.token_service import TokenService, get_default_token_service
+from ..security.token_service import (
+    TokenService,
+    get_default_token_service,
+)
+from .base import SourceControlTool, ToolContext, ToolResult
+
+__all__ = [
+    "ReadFileTool",
+    "MAX_FILE_BYTES",
+]
 
 
-class ReadFileArgs(BaseModel):
-    """Input argument schema for the read file tool."""
-
-    repository_id: str = Field(
-        ...,
-        description="Target repository identifier (numeric ID or 'owner/repo' slug).",
-    )
-    file_path: str = Field(
-        ...,
-        description="Relative file path within the repository to inspect.",
-    )
-    provider: Optional[str] = Field(
-        default="github",
-        description="Source control provider identifier (e.g., 'github'). Defaults to 'github'.",
-    )
-    ref: Optional[str] = Field(
-        default=None,
-        description="Optional Git revision, commit SHA, branch, or tag. Defaults to repository default branch.",
-    )
-    max_bytes: int = Field(
-        default=100_000,
-        ge=1024,
-        le=500_000,
-        description="Maximum byte length of text content to return to avoid context overflow. Defaults to 100KB.",
-    )
+logger = logging.getLogger(__name__)
 
 
-class ReadFileTool:
-    """Agent tool that reads and inspects file contents from a remote repository at a specified ref."""
+#: Maximum number of bytes the tool will return to the agent. The
+#: cap is deliberately lower than the provider's own limits so that
+#: a single tool call cannot flood the model's context.
+MAX_FILE_BYTES: int = 200_000
 
-    name: str = "source_control_read_file"
-    description: str = (
-        "Reads file contents from a source repository at a specified commit, branch, or tag. "
-        "Automatically handles character encoding, binary detection, and context window truncation. "
-        "Never requires or accepts raw credentials."
-    )
-    args_schema: type[BaseModel] = ReadFileArgs
+
+class ReadFileTool(SourceControlTool):
+    """
+    Read a single file from a remote repository.
+
+    Inputs:
+        provider:      Provider identifier. Defaults to `"github"`.
+        repository_id: Stable repository identifier.
+        file_path:     Path of the file within the repository.
+        ref:           Optional branch, tag, or commit SHA.
+        account_id:    Optional stable account ID.
+    """
 
     def __init__(
         self,
+        *,
         registry: Optional[ProviderRegistry] = None,
         token_service: Optional[TokenService] = None,
-        policy_engine: Optional[PolicyEngine] = None,
+        audit_logger: Any = None,
     ) -> None:
-        self.registry = registry or get_default_registry()
-        self.token_service = token_service or get_default_token_service()
-        self.policy_engine = policy_engine or get_default_policy_engine()
+        super().__init__(audit_logger=audit_logger)
+        self._explicit_registry = registry
+        self._explicit_token_service = token_service
 
-    async def _arun(
-        self,
-        repository_id: str,
-        file_path: str,
-        provider: Optional[str] = "github",
-        ref: Optional[str] = None,
-        max_bytes: int = 100_000,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Asynchronously reads a remote file using the appropriate provider adapter."""
-        # 1. Validate and resolve provider identity
-        provider_str = (provider or "github").strip().lower()
-        try:
-            provider_id = ProviderId(provider_str)
-        except ValueError:
-            raise ValidationError(
-                f"Unsupported source control provider '{provider_str}'. Supported providers: {[p.value for p in ProviderId]}"
+    # --- Metadata -------------------------------------------------------
+
+    @property
+    def name(self) -> str:
+        return "source_control.read_file"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Read a text file from a remote repository at a given "
+            "ref (branch, tag, or commit SHA)."
+        )
+
+    @property
+    def input_schema(self) -> Mapping[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "provider": {
+                    "type": "string",
+                    "enum": ["github", "gitlab", "bitbucket"],
+                    "default": "github",
+                },
+                "repository_id": {
+                    "type": "string",
+                    "description": "Stable repository identifier.",
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": (
+                        "Path of the file within the repository."
+                    ),
+                },
+                "ref": {
+                    "type": "string",
+                    "description": (
+                        "Optional branch, tag, or commit SHA. When "
+                        "omitted, the repository's default branch "
+                        "is used."
+                    ),
+                },
+                "account_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional stable account identifier."
+                    ),
+                },
+            },
+            "required": ["repository_id", "file_path"],
+            "additionalProperties": False,
+        }
+
+    # --- Execution ------------------------------------------------------
+
+    async def execute(
+        self, context: ToolContext, **kwargs: Any
+    ) -> ToolResult:
+        # --- Parse inputs ----------------------------------------------
+        provider = self._parse_provider(kwargs.get("provider"))
+        if isinstance(provider, ToolResult):
+            return provider
+
+        repository_id = kwargs.get("repository_id")
+        if not isinstance(repository_id, str) or not repository_id.strip():
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message=(
+                    "`repository_id` must be a non-empty string."
+                ),
+            )
+        repository_id = repository_id.strip()
+
+        file_path = kwargs.get("file_path")
+        if not isinstance(file_path, str) or not file_path.strip():
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message=(
+                    "`file_path` must be a non-empty string."
+                ),
+            )
+        file_path = file_path.strip().lstrip("/")
+
+        ref = kwargs.get("ref")
+        if ref is not None and not isinstance(ref, str):
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message="`ref` must be a string.",
+            )
+        if isinstance(ref, str):
+            ref = ref.strip() or None
+
+        account_id_override = kwargs.get("account_id")
+        if account_id_override is not None and not isinstance(
+            account_id_override, str
+        ):
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message="`account_id` must be a string.",
+            )
+        if isinstance(account_id_override, str):
+            account_id_override = account_id_override.strip() or None
+
+        # --- Resolve adapter -------------------------------------------
+        registry = self._explicit_registry or get_default_registry()
+        adapter = registry.try_get(provider)
+        if adapter is None:
+            return self.failure_result(
+                error_code="NOT_FOUND",
+                error_message=(
+                    f"Provider '{provider.value}' is not registered."
+                ),
+                metadata={"provider": provider.value},
             )
 
-        clean_repo_id = repository_id.strip()
-        clean_file_path = file_path.strip().lstrip("/")
-        clean_ref = ref.strip() if ref and ref.strip() else None
-
-        if not clean_repo_id:
-            raise ValidationError("Repository ID cannot be empty.")
-        if not clean_file_path:
-            raise ValidationError("File path cannot be empty.")
-
-        # 2. Enforce operational policy
-        allowed, reason = self.policy_engine.is_operation_allowed(
-            operation="read_file",
-            provider=provider_id.value,
-            repository=clean_repo_id,
+        # --- Resolve credential ----------------------------------------
+        token_service = (
+            self._explicit_token_service or get_default_token_service()
         )
-        if not allowed:
-            raise PermissionDeniedError(
-                f"Policy prohibits reading files from repository '{clean_repo_id}': {reason}",
-                details={
-                    "provider": provider_id.value,
-                    "repository_id": clean_repo_id,
-                    "reason": reason,
+        resolved = self._resolve_account(
+            token_service=token_service,
+            provider=provider,
+            account_id_override=account_id_override,
+        )
+        if isinstance(resolved, ToolResult):
+            return resolved
+        account_id, base_url = resolved
+
+        token = token_service.get_access_token(
+            provider, account_id, base_url
+        )
+        if not token:
+            return self.failure_result(
+                error_code="AUTH_REQUIRED",
+                error_message=(
+                    "No credential is stored for the selected account."
+                ),
+                metadata={
+                    "provider": provider.value,
+                    "account_id": account_id,
                 },
             )
 
-        # 3. Retrieve ephemeral credentials from secure vault
-        token = await self.token_service.get_access_token(provider_id)
-        if not token:
-            raise AuthRequiredError(
-                f"No active credentials found for '{provider_id.value}'. Please connect your account first in Settings.",
-                details={"provider": provider_id.value},
-            )
-
-        # 4. Resolve provider adapter from registry
-        adapter = self.registry.get(provider_id.value)
-
-        # 5. Retrieve repository metadata
+        # --- Resolve the repository ------------------------------------
         try:
-            repo = await adapter.get_repository(clean_repo_id, token=token)
-        except SourceControlError:
-            raise
-        except Exception as exc:
-            raise SourceControlError(
-                f"Failed to resolve repository '{clean_repo_id}': {exc}"
-            ) from exc
-
-        # 6. Fetch raw file bytes from remote provider
-        try:
-            raw_bytes = await adapter.read_file(
-                repo=repo,
-                file_path=clean_file_path,
-                ref=clean_ref,
+            repo = await self._resolve_repository(
+                adapter=adapter,
+                provider=provider,
+                account_id=account_id,
+                base_url=base_url,
+                repository_id=repository_id,
                 token=token,
             )
-        except SourceControlError:
-            raise
-        except Exception as exc:
-            raise SourceControlError(
-                f"Failed to read file '{clean_file_path}' from repository '{repo.namespace}/{repo.name}': {exc}"
-            ) from exc
-
-        effective_ref = clean_ref or repo.default_branch
-        size_bytes = len(raw_bytes)
-
-        # 7. Detect binary file by checking for null bytes
-        if b"\x00" in raw_bytes:
-            return {
-                "status": "success",
-                "provider": provider_id.value,
-                "repository_id": repo.repository_id,
-                "full_name": f"{repo.namespace}/{repo.name}",
-                "file_path": clean_file_path,
-                "ref": effective_ref,
-                "is_binary": True,
-                "size_bytes": size_bytes,
-                "truncated": False,
-                "content": None,
-                "message": f"File '{clean_file_path}' is a binary asset ({size_bytes} bytes) and cannot be displayed as text.",
-            }
-
-        # 8. Decode text with fallback
-        try:
-            text_content = raw_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            text_content = raw_bytes.decode("latin-1", errors="replace")
-
-        # 9. Apply context budget truncation
-        truncated = False
-        clamped_max_bytes = max(1024, min(max_bytes, 500_000))
-
-        if len(text_content.encode("utf-8")) > clamped_max_bytes:
-            # Simple character-level slice with boundary notice
-            text_content = (
-                text_content[:clamped_max_bytes]
-                + "\n\n... [Content truncated due to context window size limit] ..."
+        except Exception as exc:  # noqa: BLE001
+            normalized = to_source_control_error(exc)
+            return self.failure_result(
+                error_code=normalized.code.value,
+                error_message=normalized.message,
+                metadata={"provider": provider.value},
             )
-            truncated = True
 
-        return {
-            "status": "success",
-            "provider": provider_id.value,
-            "repository_id": repo.repository_id,
-            "full_name": f"{repo.namespace}/{repo.name}",
-            "file_path": clean_file_path,
-            "ref": effective_ref,
-            "is_binary": False,
-            "size_bytes": size_bytes,
-            "truncated": truncated,
-            "content": text_content,
-        }
+        if repo is None:
+            return self.failure_result(
+                error_code="NOT_FOUND",
+                error_message=(
+                    f"Repository '{repository_id}' was not found."
+                ),
+                metadata={
+                    "provider": provider.value,
+                    "repository_id": repository_id,
+                },
+            )
 
-    async def aexecute(self, **kwargs: Any) -> dict[str, Any]:
-        """Public async execution adapter conforming to standard agent tool calling contracts."""
-        validated_args = self.args_schema(**kwargs)
-        return await self._arun(**validated_args.model_dump())
+        # --- Read the file ---------------------------------------------
+        try:
+            content = await adapter.read_file(
+                repo=repo,
+                file_path=file_path,
+                ref=ref,
+                token=token,
+            )
+        except Exception as exc:  # noqa: BLE001
+            normalized = to_source_control_error(exc)
+            return self.failure_result(
+                error_code=normalized.code.value,
+                error_message=normalized.message,
+                metadata={
+                    "provider": provider.value,
+                    "repository_id": repository_id,
+                    "file_path": file_path,
+                    "ref": ref,
+                    "retryable": normalized.is_retryable,
+                },
+            )
 
-    def execute(self, **kwargs: Any) -> dict[str, Any]:
-        """Synchronous wrapper raising an error to enforce non-blocking execution."""
-        raise NotImplementedError(
-            "ReadFileTool only supports asynchronous execution via aexecute() or _arun()."
+        if not isinstance(content, str):
+            return self.failure_result(
+                error_code="PROVIDER_ERROR",
+                error_message=(
+                    "Provider returned a non-string file payload."
+                ),
+            )
+
+        # --- Validate content ------------------------------------------
+        encoded = content.encode("utf-8", errors="replace")
+        if len(encoded) > MAX_FILE_BYTES:
+            return self.failure_result(
+                error_code="UNSUPPORTED_CAPABILITY",
+                error_message=(
+                    f"File exceeds the {MAX_FILE_BYTES}-byte limit "
+                    "for this tool."
+                ),
+                metadata={
+                    "size_bytes": len(encoded),
+                    "max_bytes": MAX_FILE_BYTES,
+                },
+            )
+
+        # Detect obvious binary content: NUL byte in the first few
+        # kilobytes. This catches most images and archives without
+        # pulling in a full binary-detection library.
+        if _looks_binary(content):
+            return self.failure_result(
+                error_code="UNSUPPORTED_CAPABILITY",
+                error_message=(
+                    "File appears to be binary and cannot be read as "
+                    "text."
+                ),
+                metadata={"file_path": file_path},
+            )
+
+        return self.success_result(
+            {
+                "content": content,
+                "size_bytes": len(encoded),
+                "ref": ref or repo.default_branch or None,
+            },
+            metadata={
+                "provider": provider.value,
+                "repository_id": repository_id,
+                "file_path": file_path,
+            },
         )
+
+    # --- Internal: repository resolution -------------------------------
+
+    @staticmethod
+    async def _resolve_repository(
+        *,
+        adapter: Any,
+        provider: ProviderId,
+        account_id: str,
+        base_url: str,
+        repository_id: str,
+        token: str,
+    ) -> Optional[RepositoryRef]:
+        """
+        Return the `RepositoryRef` for `repository_id`.
+
+        The adapter's `read_file` expects a `RepositoryRef` with a
+        valid `namespace`/`name`, but the caller supplies only the
+        stable ID. We therefore list repositories and match by ID.
+        """
+        listing = await adapter.list_repositories(
+            page=1, page_size=100, token=token
+        )
+        for repo in listing:
+            if (
+                isinstance(repo, RepositoryRef)
+                and repo.repository_id == repository_id
+            ):
+                return repo
+        return None
+
+    # --- Account resolution --------------------------------------------
+
+    @staticmethod
+    def _resolve_account(
+        *,
+        token_service: TokenService,
+        provider: ProviderId,
+        account_id_override: Optional[str],
+    ) -> tuple[str, str] | ToolResult:
+        stored = token_service.list_stored()
+        for_provider = [
+            entry for entry in stored if entry.provider == provider
+        ]
+        if not for_provider:
+            return ToolResult.fail(
+                error_code="AUTH_REQUIRED",
+                error_message=(
+                    f"No credential is stored for provider "
+                    f"'{provider.value}'."
+                ),
+            )
+        if account_id_override:
+            for entry in for_provider:
+                if entry.account_id == account_id_override:
+                    return entry.account_id, entry.base_url
+            return ToolResult.fail(
+                error_code="AUTH_REQUIRED",
+                error_message=(
+                    f"No credential is stored for account "
+                    f"'{account_id_override}'."
+                ),
+            )
+        chosen = for_provider[0]
+        return chosen.account_id, chosen.base_url
+
+    # --- Helpers --------------------------------------------------------
+
+    @staticmethod
+    def _parse_provider(value: Any) -> ProviderId | ToolResult:
+        if value is None or value == "":
+            return ProviderId.GITHUB
+        try:
+            return ProviderId(str(value).strip().lower())
+        except ValueError:
+            return ToolResult.fail(
+                error_code="VALIDATION_ERROR",
+                error_message=(
+                    f"Unsupported provider: {value!r}."
+                ),
+            )
+
+
+def _looks_binary(content: str) -> bool:
+    """
+    Return True when `content` looks like binary data.
+
+    The check is intentionally simple: a NUL byte within the first
+    8 KiB of the decoded content is a strong indicator of a binary
+    file. The decoding step in the adapter already replaced invalid
+    UTF-8 sequences with the replacement character, so a legitimate
+    text file will never contain a NUL byte.
+    """
+    if not content:
+        return False
+    sample = content[:8192]
+    return "\x00" in sample

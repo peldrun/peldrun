@@ -1,203 +1,265 @@
+# backend/integrations/source_control/tools/inspect_diff.py
+"""
+The `source_control.get_diff` tool.
+
+Computes the diff of a workspace against a base commit and returns
+a normalized summary to the agent. The summary includes the
+canonical SHA-256 of the diff, which is the value bound into
+approval tickets.
+
+This tool is entirely local. It does not contact the provider and
+does not require a credential.
+
+Design rules:
+    - The tool operates on a workspace identifier, not on an
+      arbitrary path. The workspace path is resolved from the
+      workspace manager.
+    - The tool computes the diff using the same engine that the
+      approval flow uses, so that the SHA the agent sees and the
+      SHA bound into an approval ticket are always identical.
+    - The tool bounds the size of the returned payload. Very large
+      diffs are summarized; full patches are truncated by the
+      engine itself.
+    - The tool is read-only and requires no approval.
+"""
+
 from __future__ import annotations
 
-import os
-from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
-from pydantic import BaseModel, Field
+import logging
+from typing import Any, Dict, List, Mapping, Optional
 
-from ..domain.enums import FileChangeType, ProviderId
-from ..domain.models import DiffSummary, FileDiff
-from ..domain.policies import is_workflow_path
-from ..errors import (
-    NotFoundError,
-    PermissionDeniedError,
-    SourceControlError,
-    ValidationError,
+from ..domain.models import DiffSummary, FileDiff, WorkspaceRef
+from ..errors import to_source_control_error
+from ..git.diff import (
+    GitDiffEngine,
+    MAX_PATCH_SIZE,
+    get_default_diff_engine,
 )
-from ..git.diff import GitDiffEngine
-from ..git.path_policy import secure_resolve_path
-from ..git.workspace import GitWorkspaceManager
-from ..security.approval import compute_diff_sha256
-from ..security.policy_engine import PolicyEngine, get_default_policy_engine
-from ..security.redaction import redact_text
+from ..git.workspace import (
+    GitWorkspaceManager,
+    get_default_workspace_manager,
+)
+from .base import SourceControlTool, ToolContext, ToolResult
+
+__all__ = [
+    "InspectDiffTool",
+    "DEFAULT_MAX_FILES_IN_RESULT",
+]
 
 
-class InspectDiffArgs(BaseModel):
-    """Input argument schema for the inspect diff tool."""
-
-    workspace_id: Optional[str] = Field(
-        default=None,
-        description="Unique identifier of the isolated Git workspace to inspect.",
-    )
-    workspace_path: Optional[str] = Field(
-        default=None,
-        description="Local directory path of the git repository/workspace to inspect (alternative to workspace_id).",
-    )
-    base_ref: Optional[str] = Field(
-        default=None,
-        description="Optional base Git revision, branch, or commit SHA to compare against. Defaults to workspace base_sha or HEAD.",
-    )
-    target_ref: Optional[str] = Field(
-        default=None,
-        description="Optional target Git revision or branch. Defaults to current working tree.",
-    )
-    max_diff_lines: int = Field(
-        default=300,
-        ge=10,
-        le=1000,
-        description="Maximum number of unified diff lines to include in the output sample. Defaults to 300.",
-    )
+logger = logging.getLogger(__name__)
 
 
-class InspectDiffTool:
-    """Agent tool that computes unified diffs, extracts file metrics, and calculates cryptographic fingerprints."""
+#: Maximum number of file entries included in the result. The full
+#: diff is still hashed; only the visible list is bounded.
+DEFAULT_MAX_FILES_IN_RESULT: int = 500
 
-    name: str = "source_control_inspect_diff"
-    description: str = (
-        "Computes unified diffs and file change summaries for a local workspace or repository. "
-        "Produces a cryptographic SHA-256 fingerprint for approval gating, detects CI/CD workflow modifications, "
-        "and flags binary files. Never requires or accepts raw credentials."
-    )
-    args_schema: type[BaseModel] = InspectDiffArgs
+
+class InspectDiffTool(SourceControlTool):
+    """
+    Compute the diff of a workspace.
+
+    Inputs:
+        workspace_id:   The workspace to inspect. Required.
+        base_sha:       Optional base commit. When omitted, the
+                        engine compares against the workspace's
+                        current HEAD.
+        include_patch:  When True (default), each file carries its
+                        unified patch text. When False, only
+                        metadata is returned (faster, smaller).
+    """
 
     def __init__(
         self,
+        *,
         workspace_manager: Optional[GitWorkspaceManager] = None,
         diff_engine: Optional[GitDiffEngine] = None,
-        policy_engine: Optional[PolicyEngine] = None,
-        default_workspace_dir: Optional[str | Path] = None,
+        audit_logger: Any = None,
     ) -> None:
-        base_dir = Path(default_workspace_dir or os.getcwd()).resolve()
-        self.workspace_manager = workspace_manager or GitWorkspaceManager(base_workspace_dir=base_dir)
-        self.diff_engine = diff_engine or GitDiffEngine()
-        self.policy_engine = policy_engine or get_default_policy_engine()
+        super().__init__(audit_logger=audit_logger)
+        self._explicit_workspace_manager = workspace_manager
+        self._explicit_diff_engine = diff_engine
 
-    async def _arun(
-        self,
-        workspace_id: Optional[str] = None,
-        workspace_path: Optional[str] = None,
-        base_ref: Optional[str] = None,
-        target_ref: Optional[str] = None,
-        max_diff_lines: int = 300,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Asynchronously computes unified diff and metrics for the specified workspace."""
-        target_dir: Optional[Path] = None
-        resolved_base: Optional[str] = base_ref.strip() if base_ref and base_ref.strip() else None
+    # --- Metadata -------------------------------------------------------
 
-        # 1. Resolve workspace directory from ID or explicit path
-        if workspace_id and workspace_id.strip():
-            clean_id = workspace_id.strip()
-            ws_ref = self.workspace_manager.get_workspace(clean_id)
-            if ws_ref is None:
-                raise NotFoundError(f"Workspace with ID '{clean_id}' was not found.")
-            target_dir = Path(ws_ref.workspace_path)
-            if not resolved_base:
-                resolved_base = ws_ref.base_sha
-        elif workspace_path and workspace_path.strip():
-            raw_path = Path(workspace_path.strip())
-            # Enforce absolute resolution and existence
-            if not raw_path.exists():
-                raise NotFoundError(f"Specified workspace directory '{workspace_path}' does not exist.")
-            target_dir = raw_path.resolve()
-        else:
-            raise ValidationError("Either 'workspace_id' or 'workspace_path' must be provided.")
+    @property
+    def name(self) -> str:
+        return "source_control.get_diff"
 
-        if not target_dir.is_dir():
-            raise ValidationError(f"Target path '{target_dir}' is not a directory.")
-
-        # 2. Enforce operational policy
-        allowed, reason = self.policy_engine.is_operation_allowed(
-            operation="inspect_diff",
-            workspace=str(target_dir),
+    @property
+    def description(self) -> str:
+        return (
+            "Compute the diff of a workspace against a base commit, "
+            "returning the list of changed files and the canonical "
+            "diff hash."
         )
-        if not allowed:
-            raise PermissionDeniedError(
-                f"Policy prohibits inspecting diff on workspace '{target_dir}': {reason}",
-                details={"workspace": str(target_dir), "reason": reason},
-            )
 
-        # 3. Default base_ref if unresolved
-        effective_base = resolved_base or "HEAD"
-        effective_target = target_ref.strip() if target_ref and target_ref.strip() else None
-
-        # 4. Compute structured diff metrics and cryptographic fingerprint
-        try:
-            diff_summary: DiffSummary = await self.diff_engine.compute_diff(
-                cwd=target_dir,
-                base_ref=effective_base,
-                target_ref=effective_target,
-            )
-            raw_diff: str = await self.diff_engine.get_raw_diff(
-                cwd=target_dir,
-                base_ref=effective_base,
-                target_ref=effective_target,
-            )
-        except SourceControlError:
-            raise
-        except Exception as exc:
-            raise SourceControlError(
-                f"Failed to compute diff in workspace '{target_dir}': {exc}"
-            ) from exc
-
-        # 5. Inspect for CI/CD workflow files and binary assets
-        touches_workflow = self.diff_engine.contains_workflow_changes(diff_summary)
-        workflow_files = list(self.diff_engine.get_workflow_files(diff_summary))
-        has_binary = self.diff_engine.contains_binary_files(diff_summary)
-
-        # 6. Apply secret redaction and budget-friendly line truncation
-        clean_raw_diff = redact_text(raw_diff)
-        diff_lines = clean_raw_diff.splitlines()
-        clamped_max_lines = max(10, min(max_diff_lines, 1000))
-
-        truncated = False
-        if len(diff_lines) > clamped_max_lines:
-            truncated = True
-            diff_sample = "\n".join(diff_lines[:clamped_max_lines]) + (
-                f"\n\n... [Diff truncated: showing {clamped_max_lines} of {len(diff_lines)} lines] ..."
-            )
-        else:
-            diff_sample = clean_raw_diff
-
-        # 7. Format structured file metrics list
-        files_summary = [
-            {
-                "path": f.path,
-                "change_type": f.change_type.value,
-                "insertions": f.insertions,
-                "deletions": f.deletions,
-                "old_path": f.old_path,
-                "is_binary": f.is_binary,
-                "is_workflow": is_workflow_path(f.path),
-            }
-            for f in diff_summary.files
-        ]
-
+    @property
+    def input_schema(self) -> Mapping[str, Any]:
         return {
-            "status": "success",
-            "workspace_id": workspace_id,
-            "workspace_path": str(target_dir),
-            "base_sha": diff_summary.base_sha,
-            "head_sha": diff_summary.head_sha,
-            "diff_sha256": diff_summary.diff_sha256,
-            "total_files": diff_summary.total_files,
-            "insertions": diff_summary.insertions,
-            "deletions": diff_summary.deletions,
-            "touches_workflow_files": touches_workflow,
-            "workflow_files": workflow_files,
-            "has_binary_files": has_binary,
-            "is_truncated": truncated,
-            "files": files_summary,
-            "diff_sample": diff_sample,
+            "type": "object",
+            "properties": {
+                "workspace_id": {
+                    "type": "string",
+                    "description": "Workspace to inspect.",
+                },
+                "base_sha": {
+                    "type": "string",
+                    "description": (
+                        "Optional base commit SHA. Defaults to the "
+                        "workspace's current HEAD."
+                    ),
+                },
+                "include_patch": {
+                    "type": "boolean",
+                    "description": (
+                        "When true (default), include each file's "
+                        "unified patch text."
+                    ),
+                    "default": True,
+                },
+            },
+            "required": ["workspace_id"],
+            "additionalProperties": False,
         }
 
-    async def aexecute(self, **kwargs: Any) -> dict[str, Any]:
-        """Public async execution adapter conforming to standard agent tool calling contracts."""
-        validated_args = self.args_schema(**kwargs)
-        return await self._arun(**validated_args.model_dump())
+    # --- Execution ------------------------------------------------------
 
-    def execute(self, **kwargs: Any) -> dict[str, Any]:
-        """Synchronous wrapper raising an error to enforce non-blocking execution."""
-        raise NotImplementedError(
-            "InspectDiffTool only supports asynchronous execution via aexecute() or _arun()."
+    async def execute(
+        self, context: ToolContext, **kwargs: Any
+    ) -> ToolResult:
+        # --- Parse inputs ----------------------------------------------
+        workspace_id = kwargs.get("workspace_id")
+        if not isinstance(workspace_id, str) or not workspace_id.strip():
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message=(
+                    "`workspace_id` must be a non-empty string."
+                ),
+            )
+        workspace_id = workspace_id.strip()
+
+        base_sha = kwargs.get("base_sha")
+        if base_sha is not None and not isinstance(base_sha, str):
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message="`base_sha` must be a string.",
+            )
+        if isinstance(base_sha, str):
+            base_sha = base_sha.strip() or None
+
+        include_patch = bool(kwargs.get("include_patch", True))
+
+        # --- Resolve workspace -----------------------------------------
+        workspace_manager = (
+            self._explicit_workspace_manager
+            or get_default_workspace_manager()
         )
+        workspace = workspace_manager.get_workspace(workspace_id)
+        if workspace is None:
+            return self.failure_result(
+                error_code="WORKSPACE_NOT_FOUND",
+                error_message=(
+                    f"Workspace '{workspace_id}' is not registered."
+                ),
+                metadata={"workspace_id": workspace_id},
+            )
+        if not isinstance(workspace, WorkspaceRef):
+            return self.failure_result(
+                error_code="PROVIDER_ERROR",
+                error_message="Workspace record is malformed.",
+            )
+
+        # --- Compute the diff ------------------------------------------
+        diff_engine = (
+            self._explicit_diff_engine or get_default_diff_engine()
+        )
+
+        try:
+            summary = await diff_engine.compute_diff(
+                workspace_id=workspace_id,
+                base_sha=base_sha,
+                include_patch=include_patch,
+                max_file_size_bytes=MAX_PATCH_SIZE,
+                workspace_path=workspace.workspace_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            normalized = to_source_control_error(exc)
+            return self.failure_result(
+                error_code=normalized.code.value,
+                error_message=normalized.message,
+                metadata={
+                    "workspace_id": workspace_id,
+                    "retryable": normalized.is_retryable,
+                },
+            )
+
+        if not isinstance(summary, DiffSummary):
+            return self.failure_result(
+                error_code="PROVIDER_ERROR",
+                error_message=(
+                    "Diff engine returned an unexpected payload."
+                ),
+            )
+
+        # --- Serialize ------------------------------------------------
+        diff_sha256 = summary.sha256()
+        files_payload = self._serialize_files(
+            summary.files,
+            limit=DEFAULT_MAX_FILES_IN_RESULT,
+            include_patch=include_patch,
+        )
+
+        return self.success_result(
+            {
+                "workspace_id": workspace_id,
+                "base_sha": summary.base_sha,
+                "head_sha": summary.head_sha,
+                "diff_sha256": diff_sha256,
+                "total_files": len(summary.files),
+                "total_additions": summary.total_additions,
+                "total_deletions": summary.total_deletions,
+                "files": files_payload,
+                "files_truncated": len(summary.files)
+                > DEFAULT_MAX_FILES_IN_RESULT,
+            },
+            metadata={
+                "workspace_id": workspace_id,
+                "include_patch": include_patch,
+            },
+        )
+
+    # --- Serialization --------------------------------------------------
+
+    @staticmethod
+    def _serialize_files(
+        files: Any,
+        *,
+        limit: int,
+        include_patch: bool,
+    ) -> List[Dict[str, Any]]:
+        """
+        Serialize up to `limit` file entries.
+
+        The order is the order produced by the engine, which is
+        already stable (sorted by path).
+        """
+        serialized: List[Dict[str, Any]] = []
+        for item in files:
+            if not isinstance(item, FileDiff):
+                continue
+            serialized.append(
+                {
+                    "path": item.path,
+                    "change_type": item.change_type.value,
+                    "additions": item.additions,
+                    "deletions": item.deletions,
+                    "old_path": item.old_path,
+                    "is_binary": item.is_binary,
+                    "is_truncated": item.is_truncated,
+                    "patch": item.patch if include_patch else None,
+                }
+            )
+            if len(serialized) >= limit:
+                break
+        return serialized

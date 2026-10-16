@@ -1,187 +1,224 @@
+# backend/integrations/source_control/tools/create_branch.py
+"""
+The `source_control.create_branch` tool.
+
+Creates a local branch inside an existing workspace. The workspace
+MUST already exist; use `source_control.create_workspace` first if
+it does not.
+
+This tool is entirely local. It does not contact the provider, does
+not require a credential, and does not modify any remote state. It
+is safe to run without approval.
+
+Design rules:
+    - The tool operates on a workspace identifier, not on an
+      arbitrary path. The workspace path is resolved by the
+      workspace manager, which enforces the configured workspace
+      root via the path policy.
+    - The tool NEVER accepts a filesystem path from the caller. All
+      paths are resolved server-side.
+    - The tool uses `GitBranchManager`, which validates branch
+      names before invoking Git. Invalid names produce a clear
+      `VALIDATION_ERROR`.
+    - The tool is idempotent only in the `force=True` sense: by
+      default, creating a branch that already exists is a conflict.
+"""
+
 from __future__ import annotations
 
+import logging
 from typing import Any, Mapping, Optional
-from pydantic import BaseModel, Field
 
-from ..domain.enums import ProviderId
-from ..domain.models import BranchRef, RepositoryRef
-from ..domain.policies import is_protected_branch
-from ..errors import (
-    AuthRequiredError,
-    ConflictError,
-    NotFoundError,
-    PermissionDeniedError,
-    SourceControlError,
-    ValidationError,
-)
-from ..git.path_policy import validate_branch_name
-from ..registry import ProviderRegistry, get_default_registry
-from ..security.policy_engine import PolicyEngine, get_default_policy_engine
-from ..security.token_service import TokenService, get_default_token_service
+from ..domain.models import BranchRef, WorkspaceRef
+from ..errors import to_source_control_error
+from ..git.branch import GitBranchManager, get_default_branch_manager
+from ..git.workspace import GitWorkspaceManager, get_default_workspace_manager
+from .base import SourceControlTool, ToolContext, ToolResult
+
+__all__ = ["CreateBranchTool"]
 
 
-class CreateBranchArgs(BaseModel):
-    """Input argument schema for the create branch tool."""
-
-    repository_id: str = Field(
-        ...,
-        description="Target repository identifier (numeric ID or 'owner/repo' slug).",
-    )
-    branch_name: str = Field(
-        ...,
-        description="Name of the new branch to create (must follow git ref naming rules, e.g. 'feature/task-1').",
-    )
-    from_sha: Optional[str] = Field(
-        default=None,
-        description="Optional starting commit SHA or base ref. Defaults to repository default branch HEAD.",
-    )
-    provider: Optional[str] = Field(
-        default="github",
-        description="Source control provider identifier (e.g., 'github'). Defaults to 'github'.",
-    )
+logger = logging.getLogger(__name__)
 
 
-class CreateBranchTool:
-    """Agent tool that creates a new working branch in a source repository."""
+class CreateBranchTool(SourceControlTool):
+    """
+    Create a local branch inside a workspace.
 
-    name: str = "source_control_create_branch"
-    description: str = (
-        "Creates a new Git branch in a target source repository starting from a commit SHA or default branch HEAD. "
-        "Validates branch naming syntax, checks branch protection policies, and resolves credentials securely. "
-        "Never requires or accepts raw credentials."
-    )
-    args_schema: type[BaseModel] = CreateBranchArgs
+    Inputs:
+        workspace_id: The workspace to operate on. Required.
+        branch_name:  Name of the branch to create. Required.
+        from_sha:     Optional starting commit. When omitted, the
+                      workspace's current HEAD is used.
+        force:        When True, reset an existing branch to the
+                      new starting point. Defaults to False.
+    """
 
     def __init__(
         self,
-        registry: Optional[ProviderRegistry] = None,
-        token_service: Optional[TokenService] = None,
-        policy_engine: Optional[PolicyEngine] = None,
+        *,
+        workspace_manager: Optional[GitWorkspaceManager] = None,
+        branch_manager: Optional[GitBranchManager] = None,
+        audit_logger: Any = None,
     ) -> None:
-        self.registry = registry or get_default_registry()
-        self.token_service = token_service or get_default_token_service()
-        self.policy_engine = policy_engine or get_default_policy_engine()
+        super().__init__(audit_logger=audit_logger)
+        self._explicit_workspace_manager = workspace_manager
+        self._explicit_branch_manager = branch_manager
 
-    async def _arun(
-        self,
-        repository_id: str,
-        branch_name: str,
-        from_sha: Optional[str] = None,
-        provider: Optional[str] = "github",
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Asynchronously creates a new branch using the appropriate provider adapter."""
-        # 1. Validate and resolve provider identity
-        provider_str = (provider or "github").strip().lower()
-        try:
-            provider_id = ProviderId(provider_str)
-        except ValueError:
-            raise ValidationError(
-                f"Unsupported source control provider '{provider_str}'. Supported providers: {[p.value for p in ProviderId]}"
-            )
+    # --- Metadata -------------------------------------------------------
 
-        clean_repo_id = repository_id.strip()
-        if not clean_repo_id:
-            raise ValidationError("Repository ID cannot be empty.")
+    @property
+    def name(self) -> str:
+        return "source_control.create_branch"
 
-        # 2. Validate branch name syntax and reject protected names
-        clean_branch_name = validate_branch_name(branch_name)
-        if is_protected_branch(clean_branch_name):
-            raise PermissionDeniedError(
-                f"Cannot create branch with protected name '{clean_branch_name}'. "
-                "Please choose an isolated feature branch name (e.g. 'feature/...', 'fix/...').",
-                details={"branch_name": clean_branch_name},
-            )
-
-        # 3. Enforce operational policy
-        allowed, reason = self.policy_engine.is_operation_allowed(
-            operation="create_branch",
-            provider=provider_id.value,
-            repository=clean_repo_id,
-            target_branch=clean_branch_name,
+    @property
+    def description(self) -> str:
+        return (
+            "Create a local Git branch inside an existing workspace, "
+            "optionally starting from a specific commit."
         )
-        if not allowed:
-            raise PermissionDeniedError(
-                f"Policy prohibits branch creation in repository '{clean_repo_id}': {reason}",
-                details={
-                    "provider": provider_id.value,
-                    "repository_id": clean_repo_id,
-                    "branch_name": clean_branch_name,
-                    "reason": reason,
+
+    @property
+    def input_schema(self) -> Mapping[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "workspace_id": {
+                    "type": "string",
+                    "description": (
+                        "Identifier of the workspace to operate on."
+                    ),
+                },
+                "branch_name": {
+                    "type": "string",
+                    "description": "Name of the branch to create.",
+                },
+                "from_sha": {
+                    "type": "string",
+                    "description": (
+                        "Optional starting commit. Defaults to the "
+                        "workspace's current HEAD."
+                    ),
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": (
+                        "When true, reset an existing branch to the "
+                        "new starting point."
+                    ),
+                    "default": False,
+                },
+            },
+            "required": ["workspace_id", "branch_name"],
+            "additionalProperties": False,
+        }
+
+    # --- Execution ------------------------------------------------------
+
+    async def execute(
+        self, context: ToolContext, **kwargs: Any
+    ) -> ToolResult:
+        # --- Parse inputs ----------------------------------------------
+        workspace_id = kwargs.get("workspace_id")
+        if not isinstance(workspace_id, str) or not workspace_id.strip():
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message=(
+                    "`workspace_id` must be a non-empty string."
+                ),
+            )
+        workspace_id = workspace_id.strip()
+
+        branch_name = kwargs.get("branch_name")
+        if not isinstance(branch_name, str) or not branch_name.strip():
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message=(
+                    "`branch_name` must be a non-empty string."
+                ),
+            )
+        branch_name = branch_name.strip()
+
+        from_sha = kwargs.get("from_sha")
+        if from_sha is not None and not isinstance(from_sha, str):
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message="`from_sha` must be a string.",
+            )
+        if isinstance(from_sha, str):
+            from_sha = from_sha.strip() or None
+
+        force = bool(kwargs.get("force", False))
+
+        # --- Resolve workspace -----------------------------------------
+        workspace_manager = (
+            self._explicit_workspace_manager
+            or get_default_workspace_manager()
+        )
+
+        workspace = workspace_manager.get_workspace(workspace_id)
+        if workspace is None:
+            return self.failure_result(
+                error_code="WORKSPACE_NOT_FOUND",
+                error_message=(
+                    f"Workspace '{workspace_id}' is not registered."
+                ),
+                metadata={"workspace_id": workspace_id},
+            )
+
+        if not isinstance(workspace, WorkspaceRef):
+            return self.failure_result(
+                error_code="PROVIDER_ERROR",
+                error_message=(
+                    "Workspace record is malformed."
+                ),
+            )
+
+        # --- Create the branch -----------------------------------------
+        branch_manager = (
+            self._explicit_branch_manager
+            or get_default_branch_manager()
+        )
+
+        try:
+            branch = await branch_manager.create_local_branch(
+                workspace_id=workspace_id,
+                branch_name=branch_name,
+                from_sha=from_sha,
+                workspace_path=workspace.workspace_path,
+                force=force,
+            )
+        except Exception as exc:  # noqa: BLE001
+            normalized = to_source_control_error(exc)
+            return self.failure_result(
+                error_code=normalized.code.value,
+                error_message=normalized.message,
+                metadata={
+                    "workspace_id": workspace_id,
+                    "branch_name": branch_name,
+                    "retryable": normalized.is_retryable,
                 },
             )
 
-        # 4. Retrieve ephemeral credentials from secure vault
-        token = await self.token_service.get_access_token(provider_id)
-        if not token:
-            raise AuthRequiredError(
-                f"No active credentials found for '{provider_id.value}'. Please connect your account first in Settings.",
-                details={"provider": provider_id.value},
+        if not isinstance(branch, BranchRef):
+            return self.failure_result(
+                error_code="PROVIDER_ERROR",
+                error_message=(
+                    "Branch manager returned an unexpected payload."
+                ),
             )
 
-        # 5. Resolve provider adapter and repository metadata
-        adapter = self.registry.get(provider_id.value)
-        try:
-            repo = await adapter.get_repository(clean_repo_id, token=token)
-        except SourceControlError:
-            raise
-        except Exception as exc:
-            raise SourceControlError(
-                f"Failed to resolve repository '{clean_repo_id}': {exc}"
-            ) from exc
-
-        # 6. Determine starting commit SHA if omitted
-        effective_sha = from_sha.strip() if from_sha and from_sha.strip() else None
-        if not effective_sha:
-            try:
-                default_branch_ref = await adapter.get_branch(
-                    repo, repo.default_branch, token=token
-                )
-                effective_sha = default_branch_ref.head_sha
-            except Exception as exc:
-                raise SourceControlError(
-                    f"Failed to resolve base commit SHA from default branch '{repo.default_branch}': {exc}"
-                ) from exc
-
-        if not effective_sha:
-            raise ValidationError(
-                f"Could not determine a valid starting commit SHA for branch '{clean_branch_name}'."
-            )
-
-        # 7. Execute remote branch creation
-        try:
-            branch_ref: BranchRef = await adapter.create_branch(
-                repo=repo,
-                branch_name=clean_branch_name,
-                from_sha=effective_sha,
-                token=token,
-            )
-        except SourceControlError:
-            raise
-        except Exception as exc:
-            raise SourceControlError(
-                f"Failed to create branch '{clean_branch_name}' in repository '{repo.namespace}/{repo.name}': {exc}"
-            ) from exc
-
-        return {
-            "status": "success",
-            "provider": provider_id.value,
-            "repository_id": repo.repository_id,
-            "full_name": f"{repo.namespace}/{repo.name}",
-            "branch_name": branch_ref.name,
-            "head_sha": branch_ref.head_sha,
-            "is_default": branch_ref.is_default,
-            "from_sha": effective_sha,
-            "message": f"Branch '{branch_ref.name}' created successfully at commit {effective_sha[:7] if effective_sha else ''}.",
-        }
-
-    async def aexecute(self, **kwargs: Any) -> dict[str, Any]:
-        """Public async execution adapter conforming to standard agent tool calling contracts."""
-        validated_args = self.args_schema(**kwargs)
-        return await self._arun(**validated_args.model_dump())
-
-    def execute(self, **kwargs: Any) -> dict[str, Any]:
-        """Synchronous wrapper raising an error to enforce non-blocking execution."""
-        raise NotImplementedError(
-            "CreateBranchTool only supports asynchronous execution via aexecute() or _arun()."
+        return self.success_result(
+            {
+                "workspace_id": workspace_id,
+                "branch_name": branch.name,
+                "head_sha": branch.head_sha,
+                "is_default": branch.is_default,
+                "is_protected": branch.is_protected,
+            },
+            metadata={
+                "workspace_id": workspace_id,
+                "from_sha": from_sha,
+                "force": force,
+            },
         )

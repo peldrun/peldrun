@@ -1,226 +1,706 @@
+# backend/integrations/source_control/operations/idempotency.py
+"""
+Idempotency tracking for the Source Control Integration subsystem.
+
+The idempotency registry prevents the same logical operation from
+being executed twice, even if the caller retries after a transient
+failure or an ambiguous timeout.
+
+The registry is keyed by a deterministic `IdempotencyKey` derived
+from the operation's parameters. The key is a SHA-256 digest of a
+canonical JSON representation, which means:
+
+    - The same inputs always produce the same key.
+    - The key reveals nothing about the inputs (no secrets in the
+      digest).
+    - The key is a fixed 64-character hex string, safe to store in
+      logs, in the journal, and in the UI.
+
+The registry tracks a small state machine per key:
+
+    IN_PROGRESS -> SUCCEEDED
+                -> FAILED
+                -> AMBIGUOUS -> SUCCEEDED | FAILED
+
+Design rules:
+    - `register` MUST be called before the operation starts. It
+      refuses to proceed when the key is already in `IN_PROGRESS` or
+      `SUCCEEDED`.
+    - `lookup` never raises. It returns `None` for unknown keys.
+    - Entries expire after `TTL_SECONDS` (default: 7 days) and are
+      pruned automatically when the registry is written to.
+    - The registry MUST NOT store secrets. Only identifiers and
+      hashes are retained.
+    - The registry is thread-safe. All mutations hold a reentrant
+      lock.
+"""
+
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any, Mapping, Optional
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from ..domain.enums import OperationStatus, ProviderId
 from ..errors import ConflictError, ValidationError
-from .journal import OperationJournal, get_default_operation_journal
-from .models import IdempotencyRecord
+from .models import _utc_now
+
+__all__ = [
+    "IdempotencyKey",
+    "IdempotencyEntry",
+    "IdempotencyOutcome",
+    "IdempotencyRegistry",
+    "compute_key",
+    "generate_key_from_operation",
+    "get_default_idempotency_registry",
+    "set_default_idempotency_registry",
+    "reset_default_idempotency_registry",
+    "TTL_SECONDS",
+    "MAX_ENTRIES",
+]
 
 
-def compute_request_hash(payload: Any) -> str:
-    """Computes a deterministic SHA-256 fingerprint for arbitrary mutation payloads."""
-    if payload is None:
-        return hashlib.sha256(b"").hexdigest()
+logger = logging.getLogger(__name__)
 
-    if isinstance(payload, bytes):
-        raw_bytes = payload
-    elif isinstance(payload, str):
-        raw_bytes = payload.encode("utf-8")
-    elif isinstance(payload, Mapping):
-        # Canonical deterministic JSON sorting
-        serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-        raw_bytes = serialized.encode("utf-8")
-    else:
-        raw_bytes = str(payload).encode("utf-8")
 
-    return hashlib.sha256(raw_bytes).hexdigest()
+#: How long an entry remains valid. After this window, the same
+#: logical operation MAY be retried. Seven days is long enough to
+#: cover realistic user sessions and short enough to bound the
+#: registry's growth.
+TTL_SECONDS: int = 7 * 24 * 60 * 60
+
+#: Maximum number of entries retained in memory. When the cap is
+#: exceeded, the oldest entries are evicted.
+MAX_ENTRIES: int = 10_000
+
+
+# ---------------------------------------------------------------------------
+# Outcome enum
+# ---------------------------------------------------------------------------
+
+
+class IdempotencyOutcome(str):
+    """
+    Lifecycle state of an idempotency entry.
+
+    Defined as a `str` subclass so that it serializes transparently
+    and compares to literal strings without importing this module.
+    """
+
+    IN_PROGRESS = "in_progress"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    AMBIGUOUS = "ambiguous"
+
+
+# ---------------------------------------------------------------------------
+# Key
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class IdempotencyCheckResult:
-    """Outcome of evaluating an idempotency key prior to mutation execution."""
+class IdempotencyKey:
+    """
+    Deterministic identifier for a logical operation.
 
-    is_new: bool
-    is_completed: bool
-    record: IdempotencyRecord
-    cached_response: Optional[dict[str, Any]] = None
+    The `value` field is a 64-character lowercase hex digest. It is
+    computed from the canonical JSON of `fields`. Two `IdempotencyKey`
+    instances are equal when their `value` matches, regardless of the
+    exact shape of `fields`.
+
+    Fields:
+        value:  The SHA-256 digest.
+        kind:   Operation kind (e.g. `"push_branch"`).
+        provider: Provider identifier, when applicable.
+        repository_id: Repository identifier, when applicable.
+    """
+
+    value: str
+    kind: str
+    provider: Optional[ProviderId] = None
+    repository_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not self.value or len(self.value) != 64:
+            raise ValidationError(
+                "IdempotencyKey.value must be a 64-character hex digest.",
+                details={"length": len(self.value or "")},
+            )
+        if not self.kind:
+            raise ValidationError("IdempotencyKey.kind must not be empty.")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize for logs and API responses (no secrets)."""
+        return {
+            "value": self.value,
+            "kind": self.kind,
+            "provider": self.provider.value if self.provider else None,
+            "repository_id": self.repository_id,
+        }
 
 
-class IdempotencyManager:
-    """Thread-safe manager coordinating mutation deduplication, request fingerprinting, and response replay."""
+def compute_key(
+    *,
+    kind: str,
+    provider: Optional[ProviderId] = None,
+    repository_id: Optional[str] = None,
+    source_branch: Optional[str] = None,
+    target_branch: Optional[str] = None,
+    base_sha: Optional[str] = None,
+    diff_sha256: Optional[str] = None,
+    extra: Optional[Mapping[str, Any]] = None,
+) -> IdempotencyKey:
+    """
+    Compute an `IdempotencyKey` from the given fields.
+
+    The digest is `SHA-256(canonical_json({fields}))`. Fields that
+    are `None` are omitted, so that callers may supply only the
+    parameters relevant to their operation.
+
+    The function is pure and deterministic. Calling it twice with the
+    same arguments produces the same key, on every platform and
+    Python version.
+
+    Args:
+        kind: Operation kind. Required and non-empty.
+        provider: Provider identifier.
+        repository_id: Repository identifier.
+        source_branch: Source branch name.
+        target_branch: Target branch name.
+        base_sha: Base commit SHA.
+        diff_sha256: Canonical diff hash.
+        extra: Optional mapping of additional fields to include.
+
+    Raises:
+        ValidationError: If `kind` is empty, or if `extra` contains
+            non-serializable values.
+    """
+    if not kind or not isinstance(kind, str):
+        raise ValidationError("kind must be a non-empty string.")
+
+    payload: Dict[str, Any] = {"kind": kind.strip()}
+    if provider is not None:
+        payload["provider"] = (
+            provider.value if isinstance(provider, ProviderId) else str(provider)
+        )
+    if repository_id:
+        payload["repository_id"] = str(repository_id)
+    if source_branch:
+        payload["source_branch"] = str(source_branch)
+    if target_branch:
+        payload["target_branch"] = str(target_branch)
+    if base_sha:
+        payload["base_sha"] = str(base_sha)
+    if diff_sha256:
+        payload["diff_sha256"] = str(diff_sha256)
+    if extra:
+        for key, value in extra.items():
+            if not isinstance(key, str):
+                raise ValidationError(
+                    "extra keys must be strings.",
+                    details={"type": type(key).__name__},
+                )
+            payload[key] = value
+
+    try:
+        canonical = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), default=str
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(
+            "Failed to serialize idempotency payload.",
+            details={"reason": type(exc).__name__},
+        ) from exc
+
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return IdempotencyKey(
+        value=digest,
+        kind=payload["kind"],
+        provider=provider if isinstance(provider, ProviderId) else None,
+        repository_id=repository_id,
+    )
+
+
+def generate_key_from_operation(operation: Any) -> IdempotencyKey:
+    """
+    Build an `IdempotencyKey` from an `OperationRecord`.
+
+    Convenience helper for the operation service. The operation's
+    `kind`, `provider`, `repository_id`, `source_branch`,
+    `target_branch`, and `diff_sha256` are used. `base_sha` is
+    included when present.
+    """
+    kind = getattr(operation, "kind", None)
+    if not kind:
+        raise ValidationError(
+            "Operation is missing a kind and cannot be keyed."
+        )
+    return compute_key(
+        kind=str(kind),
+        provider=getattr(operation, "provider", None),
+        repository_id=getattr(operation, "repository_id", None),
+        source_branch=getattr(operation, "source_branch", None),
+        target_branch=getattr(operation, "target_branch", None),
+        base_sha=getattr(operation, "base_sha", None) or None,
+        diff_sha256=getattr(operation, "diff_sha256", None) or None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Entry
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class IdempotencyEntry:
+    """
+    A record of one idempotency key.
+
+    Fields:
+        key:          The `IdempotencyKey`.
+        operation_id: The operation that produced this entry.
+        outcome:      Current outcome.
+        created_at:   When the entry was created.
+        updated_at:   When the entry was last updated.
+        expires_at:   When the entry should be considered stale.
+        remote_ref:   Optional remote reference produced by the
+                      operation (e.g. a change request URL). MUST NOT
+                      contain secrets.
+        error_code:   Optional error code when the outcome is
+                      `FAILED`.
+        message:      Optional human-readable detail.
+    """
+
+    key: IdempotencyKey
+    operation_id: str
+    outcome: str = IdempotencyOutcome.IN_PROGRESS
+    created_at: datetime = field(default_factory=_utc_now)
+    updated_at: datetime = field(default_factory=_utc_now)
+    expires_at: Optional[datetime] = None
+    remote_ref: Optional[str] = None
+    error_code: Optional[str] = None
+    message: Optional[str] = None
+
+    def is_expired(self, now: Optional[datetime] = None) -> bool:
+        """Return True when the entry has passed its TTL."""
+        if self.expires_at is None:
+            return False
+        moment = now or _utc_now()
+        return moment >= self.expires_at
+
+    def is_terminal(self) -> bool:
+        """Return True when the outcome is `SUCCEEDED` or `FAILED`."""
+        return self.outcome in (
+            IdempotencyOutcome.SUCCEEDED,
+            IdempotencyOutcome.FAILED,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize for logs and API responses (no secrets)."""
+        return {
+            "key": self.key.to_dict(),
+            "operation_id": self.operation_id,
+            "outcome": self.outcome,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "expires_at": (
+                self.expires_at.isoformat() if self.expires_at else None
+            ),
+            "remote_ref": self.remote_ref,
+            "error_code": self.error_code,
+            "message": self.message,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+
+class IdempotencyRegistry:
+    """
+    Thread-safe registry of idempotency entries.
+
+    The registry holds every live entry in memory and enforces the
+    TTL and the capacity constraints. It does not persist entries to
+    disk; durability is provided by the operation journal, which the
+    application layer consults during recovery.
+    """
 
     def __init__(
         self,
-        journal: Optional[OperationJournal] = None,
-        default_ttl_minutes: int = 1440,  # 24 hours
+        *,
+        ttl_seconds: int = TTL_SECONDS,
+        max_entries: int = MAX_ENTRIES,
     ) -> None:
-        self._journal = journal
-        self.default_ttl_minutes = default_ttl_minutes
-        self._lock = threading.Lock()
+        if ttl_seconds <= 0:
+            raise ValidationError("ttl_seconds must be positive.")
+        if max_entries <= 0:
+            raise ValidationError("max_entries must be positive.")
+        self._entries: Dict[str, IdempotencyEntry] = {}
+        self._lock = threading.RLock()
+        self._ttl_seconds = int(ttl_seconds)
+        self._max_entries = int(max_entries)
 
-    @property
-    def journal(self) -> OperationJournal:
-        if self._journal is None:
-            self._journal = get_default_operation_journal()
-        return self._journal
+    # --- Registration ---------------------------------------------------
 
-    @staticmethod
-    def generate_key(
-        operation_id: str, action_type: str, disambiguator: str = ""
-    ) -> str:
-        """Generates a stable, scoped idempotency key."""
-        clean_op = operation_id.strip()
-        clean_act = action_type.strip().lower()
-        if disambiguator:
-            clean_dis = disambiguator.strip()
-            return f"sc_idem:{clean_op}:{clean_act}:{clean_dis}"
-        return f"sc_idem:{clean_op}:{clean_act}"
-
-    def check_or_reserve(
+    def register(
         self,
-        idempotency_key: str,
+        key: IdempotencyKey,
         operation_id: str,
-        action_type: str,
-        request_payload: Any,
-        ttl_minutes: Optional[int] = None,
-    ) -> IdempotencyCheckResult:
-        """Atomically checks an idempotency key or reserves it if new.
+        *,
+        force: bool = False,
+    ) -> IdempotencyEntry:
+        """
+        Claim an idempotency key for a new operation.
+
+        Creates an entry with outcome `IN_PROGRESS`. Refuses to
+        proceed when the key already exists in `IN_PROGRESS` or
+        `SUCCEEDED`, unless `force=True` is passed.
+
+        Args:
+            key: The idempotency key.
+            operation_id: The operation that will perform the work.
+            force: When True, an existing entry is overwritten. Use
+                with caution; `force` is intended for tests and for
+                explicit user-driven retries after a failure.
 
         Raises:
-            ValidationError: If key or payload is invalid.
-            ConflictError: If the key was previously used with a different request payload.
+            ValidationError: If inputs are malformed.
+            ConflictError: If the key already exists and `force` is
+                False.
         """
-        if not idempotency_key or not idempotency_key.strip():
-            raise ValidationError("Idempotency key cannot be empty.")
+        if not isinstance(key, IdempotencyKey):
+            raise ValidationError(
+                "key must be an IdempotencyKey.",
+                details={"type": type(key).__name__},
+            )
+        if not operation_id or not isinstance(operation_id, str):
+            raise ValidationError("operation_id must be a non-empty string.")
 
-        request_hash = compute_request_hash(request_payload)
-        now = datetime.utcnow()
-        ttl = ttl_minutes if ttl_minutes is not None else self.default_ttl_minutes
-        expires_at = now + timedelta(minutes=ttl)
+        now = _utc_now()
+        expires_at = now + timedelta(seconds=self._ttl_seconds)
 
         with self._lock:
-            existing = self.journal.get_idempotency_record(idempotency_key)
+            self._prune_locked(now)
 
-            if existing is not None:
-                # Check expiration
-                if existing.expires_at is not None and now >= existing.expires_at:
-                    # Expired record can be replaced
-                    new_record = IdempotencyRecord(
-                        idempotency_key=idempotency_key,
-                        operation_id=operation_id,
-                        action_type=action_type,
-                        request_hash=request_hash,
-                        response_payload=None,
-                        created_at=now,
-                        expires_at=expires_at,
-                    )
-                    self.journal.save_idempotency_record(new_record)
-                    return IdempotencyCheckResult(
-                        is_new=True,
-                        is_completed=False,
-                        record=new_record,
-                    )
-
-                # Validate payload fingerprint
-                if existing.request_hash != request_hash:
+            existing = self._entries.get(key.value)
+            if existing is not None and not force:
+                if existing.outcome in (
+                    IdempotencyOutcome.IN_PROGRESS,
+                    IdempotencyOutcome.SUCCEEDED,
+                ):
                     raise ConflictError(
-                        f"Idempotency key '{idempotency_key}' was already registered with a "
-                        "different request fingerprint. Mutating payload under identical key is forbidden.",
+                        "An operation with the same idempotency key "
+                        "already exists.",
                         details={
-                            "idempotency_key": idempotency_key,
-                            "existing_hash": existing.request_hash,
-                            "submitted_hash": request_hash,
+                            "key": key.value,
+                            "existing_operation_id": existing.operation_id,
+                            "existing_outcome": existing.outcome,
+                        },
+                    )
+                # An entry with outcome FAILED or AMBIGUOUS may be
+                # replaced only when explicitly forced. We refuse
+                # AMBIGUOUS without force because the state is
+                # genuinely unknown.
+                if existing.outcome == IdempotencyOutcome.AMBIGUOUS:
+                    raise ConflictError(
+                        "The idempotency key is in an ambiguous state. "
+                        "Reconcile the previous operation before "
+                        "retrying.",
+                        details={
+                            "key": key.value,
+                            "existing_operation_id": existing.operation_id,
                         },
                     )
 
-                # If completed with payload, return cached response
-                if existing.response_payload is not None:
-                    return IdempotencyCheckResult(
-                        is_new=False,
-                        is_completed=True,
-                        record=existing,
-                        cached_response=dict(existing.response_payload),
-                    )
-
-                # Still in-flight or timed out ambiguously
-                return IdempotencyCheckResult(
-                    is_new=False,
-                    is_completed=False,
-                    record=existing,
-                )
-
-            # Completely new record
-            record = IdempotencyRecord(
-                idempotency_key=idempotency_key,
+            entry = IdempotencyEntry(
+                key=key,
                 operation_id=operation_id,
-                action_type=action_type,
-                request_hash=request_hash,
-                response_payload=None,
+                outcome=IdempotencyOutcome.IN_PROGRESS,
                 created_at=now,
+                updated_at=now,
                 expires_at=expires_at,
             )
-            self.journal.save_idempotency_record(record)
-            return IdempotencyCheckResult(
-                is_new=True,
-                is_completed=False,
-                record=record,
-            )
+            self._entries[key.value] = entry
+            self._enforce_capacity_locked()
 
-    def complete(
-        self,
-        idempotency_key: str,
-        response_payload: Mapping[str, Any],
-    ) -> IdempotencyRecord:
-        """Stores the response payload for a reserved idempotency record upon successful mutation."""
-        now = datetime.utcnow()
+        return entry
+
+    # --- Lookup ---------------------------------------------------------
+
+    def lookup(self, key: IdempotencyKey) -> Optional[IdempotencyEntry]:
+        """
+        Return the entry for `key`, or `None` when absent.
+
+        Expired entries are treated as absent.
+        """
+        if not isinstance(key, IdempotencyKey):
+            return None
+        now = _utc_now()
         with self._lock:
-            existing = self.journal.get_idempotency_record(idempotency_key)
-            if existing is None:
-                raise ValidationError(
-                    f"Cannot complete unreserved idempotency key '{idempotency_key}'."
-                )
+            entry = self._entries.get(key.value)
+            if entry is None:
+                return None
+            if entry.is_expired(now):
+                return None
+            return entry
 
-            updated = IdempotencyRecord(
-                idempotency_key=existing.idempotency_key,
-                operation_id=existing.operation_id,
-                action_type=existing.action_type,
-                request_hash=existing.request_hash,
-                response_payload=dict(response_payload),
-                created_at=existing.created_at,
-                expires_at=existing.expires_at,
+    def is_duplicate(self, key: IdempotencyKey) -> bool:
+        """
+        Return True when the key has already been claimed.
+
+        A key is considered a duplicate when an entry exists with
+        outcome `IN_PROGRESS` or `SUCCEEDED`. `FAILED` and `AMBIGUOUS`
+        entries are NOT considered duplicates; the caller is expected
+        to reconcile or retry.
+        """
+        entry = self.lookup(key)
+        if entry is None:
+            return False
+        return entry.outcome in (
+            IdempotencyOutcome.IN_PROGRESS,
+            IdempotencyOutcome.SUCCEEDED,
+        )
+
+    # --- Outcome updates ------------------------------------------------
+
+    def complete_success(
+        self,
+        key: IdempotencyKey,
+        *,
+        remote_ref: Optional[str] = None,
+        message: Optional[str] = None,
+    ) -> IdempotencyEntry:
+        """
+        Mark the entry as `SUCCEEDED`.
+
+        `remote_ref` carries a provider-neutral reference to the
+        remote artifact produced by the operation, such as a change
+        request URL. It MUST NOT contain secrets.
+        """
+        return self._set_outcome(
+            key,
+            outcome=IdempotencyOutcome.SUCCEEDED,
+            remote_ref=remote_ref,
+            message=message,
+        )
+
+    def complete_failure(
+        self,
+        key: IdempotencyKey,
+        *,
+        error_code: Optional[str] = None,
+        message: Optional[str] = None,
+    ) -> IdempotencyEntry:
+        """Mark the entry as `FAILED`."""
+        return self._set_outcome(
+            key,
+            outcome=IdempotencyOutcome.FAILED,
+            error_code=error_code,
+            message=message,
+        )
+
+    def mark_ambiguous(
+        self,
+        key: IdempotencyKey,
+        *,
+        message: Optional[str] = None,
+    ) -> IdempotencyEntry:
+        """
+        Mark the entry as `AMBIGUOUS`.
+
+        Used when the caller cannot determine whether the remote
+        operation succeeded, for example after a timeout. An
+        ambiguous entry blocks new registrations for the same key
+        until it is reconciled via `complete_success` or
+        `complete_failure`.
+        """
+        return self._set_outcome(
+            key,
+            outcome=IdempotencyOutcome.AMBIGUOUS,
+            message=message,
+        )
+
+    # --- Maintenance ----------------------------------------------------
+
+    def prune_expired(self) -> int:
+        """
+        Remove every expired entry. Returns the number removed.
+        """
+        now = _utc_now()
+        with self._lock:
+            return self._prune_locked(now)
+
+    def clear(self) -> None:
+        """Remove every entry. Intended for tests."""
+        with self._lock:
+            self._entries.clear()
+
+    def list_recent(
+        self, *, limit: int = 100
+    ) -> Sequence[IdempotencyEntry]:
+        """
+        Return the most recently updated entries, newest first.
+        """
+        if limit <= 0:
+            return ()
+        with self._lock:
+            entries = list(self._entries.values())
+        entries.sort(key=lambda e: e.updated_at, reverse=True)
+        return tuple(entries[:limit])
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    def __contains__(self, key: object) -> bool:
+        if not isinstance(key, IdempotencyKey):
+            return False
+        return self.lookup(key) is not None
+
+    # --- Internal -------------------------------------------------------
+
+    def _set_outcome(
+        self,
+        key: IdempotencyKey,
+        *,
+        outcome: str,
+        remote_ref: Optional[str] = None,
+        error_code: Optional[str] = None,
+        message: Optional[str] = None,
+    ) -> IdempotencyEntry:
+        if not isinstance(key, IdempotencyKey):
+            raise ValidationError("key must be an IdempotencyKey.")
+
+        now = _utc_now()
+        with self._lock:
+            entry = self._entries.get(key.value)
+            if entry is None:
+                raise ValidationError(
+                    "No idempotency entry exists for the given key.",
+                    details={"key": key.value},
+                )
+            if entry.is_terminal() and not entry.is_expired(now):
+                # Allow transition from AMBIGUOUS, but refuse to
+                # flip a terminal outcome to a different terminal
+                # outcome.
+                if outcome != entry.outcome:
+                    raise ConflictError(
+                        "The idempotency entry is already in a "
+                        "terminal state.",
+                        details={
+                            "key": key.value,
+                            "current_outcome": entry.outcome,
+                            "requested_outcome": outcome,
+                        },
+                    )
+            updated = replace(
+                entry,
+                outcome=outcome,
+                updated_at=now,
+                remote_ref=remote_ref or entry.remote_ref,
+                error_code=error_code or entry.error_code,
+                message=message or entry.message,
             )
-            self.journal.save_idempotency_record(updated)
+            self._entries[key.value] = updated
             return updated
 
+    def _prune_locked(self, now: datetime) -> int:
+        """
+        Remove expired entries. Caller MUST hold the lock.
+        """
+        stale = [
+            key
+            for key, entry in self._entries.items()
+            if entry.is_expired(now)
+        ]
+        for key in stale:
+            self._entries.pop(key, None)
+        return len(stale)
 
-# ============================================================
-# Default IdempotencyManager Singleton Accessors
-# ============================================================
+    def _enforce_capacity_locked(self) -> None:
+        """
+        Bound the number of entries. Caller MUST hold the lock.
 
-_DEFAULT_IDEMPOTENCY_MANAGER: Optional[IdempotencyManager] = None
-_IDEM_LOCK = threading.Lock()
+        When the cap is exceeded, the oldest entries are evicted.
+        Entries with outcome `IN_PROGRESS` are preferred for
+        eviction last, because removing them could allow a duplicate
+        execution.
+        """
+        if len(self._entries) <= self._max_entries:
+            return
+
+        # Order candidates: terminal entries first (they are safe to
+        # remove), then ambiguous, then in-progress last.
+        priority = {
+            IdempotencyOutcome.SUCCEEDED: 0,
+            IdempotencyOutcome.FAILED: 0,
+            IdempotencyOutcome.AMBIGUOUS: 1,
+            IdempotencyOutcome.IN_PROGRESS: 2,
+        }
+        overflow = len(self._entries) - self._max_entries
+        candidates = sorted(
+            self._entries.items(),
+            key=lambda item: (
+                priority.get(item[1].outcome, 1),
+                item[1].updated_at,
+            ),
+        )
+        for key, _entry in candidates[:overflow]:
+            self._entries.pop(key, None)
 
 
-def get_default_idempotency_manager(
-    journal: Optional[OperationJournal] = None,
-) -> IdempotencyManager:
-    """Returns the process-wide default IdempotencyManager singleton."""
-    global _DEFAULT_IDEMPOTENCY_MANAGER
-    if _DEFAULT_IDEMPOTENCY_MANAGER is not None:
-        return _DEFAULT_IDEMPOTENCY_MANAGER
-
-    with _IDEM_LOCK:
-        if _DEFAULT_IDEMPOTENCY_MANAGER is not None:
-            return _DEFAULT_IDEMPOTENCY_MANAGER
-
-        _DEFAULT_IDEMPOTENCY_MANAGER = IdempotencyManager(journal=journal)
-        return _DEFAULT_IDEMPOTENCY_MANAGER
+# ---------------------------------------------------------------------------
+# Default registry singleton
+# ---------------------------------------------------------------------------
 
 
-def set_default_idempotency_manager(manager: IdempotencyManager) -> None:
-    """Explicitly injects an IdempotencyManager instance (used during testing)."""
-    global _DEFAULT_IDEMPOTENCY_MANAGER
-    with _IDEM_LOCK:
-        _DEFAULT_IDEMPOTENCY_MANAGER = manager
+_DEFAULT_REGISTRY: Optional[IdempotencyRegistry] = None
+_DEFAULT_LOCK = threading.RLock()
 
 
-def reset_default_idempotency_manager() -> None:
-    """Resets the process-wide default IdempotencyManager (used during testing)."""
-    global _DEFAULT_IDEMPOTENCY_MANAGER
-    with _IDEM_LOCK:
-        _DEFAULT_IDEMPOTENCY_MANAGER = None
+def get_default_idempotency_registry() -> IdempotencyRegistry:
+    """
+    Return the process-wide default idempotency registry, creating it
+    on first use.
+    """
+    global _DEFAULT_REGISTRY
+    with _DEFAULT_LOCK:
+        if _DEFAULT_REGISTRY is None:
+            _DEFAULT_REGISTRY = IdempotencyRegistry()
+        return _DEFAULT_REGISTRY
+
+
+def set_default_idempotency_registry(
+    registry: IdempotencyRegistry,
+) -> None:
+    """
+    Replace the process-wide default registry.
+
+    Intended for application startup and for tests.
+    """
+    if not isinstance(registry, IdempotencyRegistry):
+        raise TypeError(
+            "set_default_idempotency_registry expects an "
+            "IdempotencyRegistry."
+        )
+    global _DEFAULT_REGISTRY
+    with _DEFAULT_LOCK:
+        _DEFAULT_REGISTRY = registry
+
+
+def reset_default_idempotency_registry() -> IdempotencyRegistry:
+    """
+    Replace the default registry with a fresh one.
+
+    Used by tests to guarantee isolation between test cases.
+    """
+    global _DEFAULT_REGISTRY
+    with _DEFAULT_LOCK:
+        _DEFAULT_REGISTRY = IdempotencyRegistry()
+        return _DEFAULT_REGISTRY

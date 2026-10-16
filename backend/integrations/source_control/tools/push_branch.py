@@ -1,268 +1,510 @@
+# backend/integrations/source_control/tools/push_branch.py
+"""
+The `source_control.push_branch` tool.
+
+Pushes a reviewed branch to a remote repository. This is the single
+most sensitive operation in the subsystem: it modifies remote state
+that other people depend on. The tool therefore enforces a strict
+pipeline before any network write occurs.
+
+Pipeline:
+    1. Validate inputs.
+    2. Load the operation record from the journal.
+    3. Verify the operation is in `APPROVED`.
+    4. Consume the approval ticket, binding the exact diff hash,
+       base SHA, target branch, and repository.
+    5. Transition the operation to `PUSHING` (idempotently).
+    6. Re-fetch the remote branch SHA and compare it to the base
+       SHA the user reviewed. If the remote moved, fail with
+       `REMOTE_STATE_CHANGED`.
+    7. Perform the push via `GitPushManager`.
+    8. Reconcile the result; if the push timed out, verify remote
+       state before deciding the outcome.
+    9. Transition to `PUSHED` on success, or `FAILED_*` on failure.
+   10. Attach the outcome to the operation.
+
+Design rules:
+    - The tool MUST NOT accept a diff hash, base SHA, or target
+      branch from the caller. Those values come from the operation
+      record.
+    - The tool MUST NOT bypass the approval gate. Even if the
+      caller supplies a valid `approval_id`, the gate re-validates
+      every bound field.
+    - The tool MUST re-fetch the remote SHA immediately before
+      push. A stale base is a `REMOTE_STATE_CHANGED` failure.
+    - The tool MUST use `--force-with-lease` semantics via
+      `GitPushManager`. Plain `--force` is never used.
+    - The tool MUST NEVER mark an ambiguous result as success or
+      failure without attempting reconciliation.
+"""
+
 from __future__ import annotations
 
-import os
-from pathlib import Path
+import logging
 from typing import Any, Mapping, Optional
-from pydantic import BaseModel, Field
 
-from ..domain.enums import ProviderId
-from ..domain.models import DiffSummary, RepositoryRef
-from ..domain.policies import is_protected_branch
-from ..errors import (
-    AuthRequiredError,
-    ConflictError,
-    NotFoundError,
-    PermissionDeniedError,
-    RemoteStateChangedError,
-    SourceControlError,
-    ValidationError,
+from ..domain.enums import OperationStatus
+from ..errors import to_source_control_error
+from ..git.push import GitPushManager, get_default_push_manager
+from ..git.workspace import (
+    GitWorkspaceManager,
+    get_default_workspace_manager,
 )
-from ..git.diff import GitDiffEngine
-from ..git.path_policy import validate_branch_name
-from ..git.push import GitPushManager, PushResult
-from ..git.workspace import GitWorkspaceManager
-from ..registry import ProviderRegistry, get_default_registry
+from ..operations.service import (
+    OperationService,
+    get_default_operation_service,
+)
 from ..security.approval import (
     ApprovalGate,
-    ApprovalTicket,
     get_default_approval_gate,
 )
-from ..security.policy_engine import PolicyEngine, get_default_policy_engine
-from ..security.token_service import TokenService, get_default_token_service
+from .base import SourceControlTool, ToolContext, ToolResult
 
-# Resilient import for operation service
-try:
-    from ..operations.service import OperationService, get_default_operation_service
-except ImportError:
-    OperationService = None  # type: ignore[assignment, misc]
-    def get_default_operation_service() -> Any:
-        return None
+__all__ = ["PushBranchTool"]
 
 
-class PushBranchArgs(BaseModel):
-    """Input argument schema for the push branch tool."""
-
-    approval_id: str = Field(
-        ...,
-        description="The cryptographic approval ticket ID granted explicitly by the user via the UI.",
-    )
-    workspace_id: Optional[str] = Field(
-        default=None,
-        description="Unique identifier of the isolated Git workspace containing the changes.",
-    )
-    workspace_path: Optional[str] = Field(
-        default=None,
-        description="Local directory path of the git repository/workspace (alternative to workspace_id).",
-    )
-    remote_name: str = Field(
-        default="origin",
-        description="Remote repository name to push to. Defaults to 'origin'.",
-    )
-    set_upstream: bool = Field(
-        default=True,
-        description="Whether to set the upstream tracking reference (-u). Defaults to True.",
-    )
+logger = logging.getLogger(__name__)
 
 
-class PushBranchTool:
-    """Agent tool that pushes approved local workspace commits to a remote branch."""
+class PushBranchTool(SourceControlTool):
+    """
+    Push a reviewed branch after an approval.
 
-    name: str = "source_control_push_branch"
-    description: str = (
-        "Pushes an approved local branch to the remote repository. "
-        "Strictly requires a pre-validated, single-use approval ticket. Verifies that the local diff "
-        "and remote base commit have not changed since approval was granted. Never accepts raw credentials."
-    )
-    args_schema: type[BaseModel] = PushBranchArgs
+    Inputs:
+        operation_id: Identifier of the operation. Required.
+        approval_id:  Identifier of the granted approval. Required.
+        local_branch: Optional local branch name. Defaults to the
+                      operation's `source_branch` when present.
+        remote:       Optional remote name. Defaults to
+                      `"origin"`.
+
+    The tool re-validates every bound field on the approval ticket.
+    A field change (for example a different diff hash) invalidates
+    the ticket.
+    """
 
     def __init__(
         self,
+        *,
+        operation_service: Optional[OperationService] = None,
         approval_gate: Optional[ApprovalGate] = None,
-        policy_engine: Optional[PolicyEngine] = None,
-        token_service: Optional[TokenService] = None,
-        registry: Optional[ProviderRegistry] = None,
-        workspace_manager: Optional[GitWorkspaceManager] = None,
-        diff_engine: Optional[GitDiffEngine] = None,
         push_manager: Optional[GitPushManager] = None,
-        operation_service: Optional[Any] = None,
-        default_workspace_dir: Optional[str | Path] = None,
+        workspace_manager: Optional[GitWorkspaceManager] = None,
+        audit_logger: Any = None,
     ) -> None:
-        base_dir = Path(default_workspace_dir or os.getcwd()).resolve()
-        self.approval_gate = approval_gate or get_default_approval_gate()
-        self.policy_engine = policy_engine or get_default_policy_engine()
-        self.token_service = token_service or get_default_token_service()
-        self.registry = registry or get_default_registry()
-        self.workspace_manager = workspace_manager or GitWorkspaceManager(base_workspace_dir=base_dir)
-        self.diff_engine = diff_engine or GitDiffEngine()
-        self.push_manager = push_manager or GitPushManager()
-        self.operation_service = operation_service or get_default_operation_service()
+        super().__init__(audit_logger=audit_logger)
+        self._explicit_operation_service = operation_service
+        self._explicit_approval_gate = approval_gate
+        self._explicit_push_manager = push_manager
+        self._explicit_workspace_manager = workspace_manager
 
-    async def _arun(
-        self,
-        approval_id: str,
-        workspace_id: Optional[str] = None,
-        workspace_path: Optional[str] = None,
-        remote_name: str = "origin",
-        set_upstream: bool = True,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Asynchronously validates approval integrity and executes remote branch push."""
-        clean_approval_id = approval_id.strip()
-        if not clean_approval_id:
-            raise ValidationError("Approval ID cannot be empty.")
+    # --- Metadata -------------------------------------------------------
 
-        # 1. Resolve workspace directory
-        target_dir: Optional[Path] = None
-        current_branch: Optional[str] = None
-        provider_id_val: str = "github"
-        repo_ref_obj: Optional[RepositoryRef] = None
+    @property
+    def name(self) -> str:
+        return "source_control.push_branch"
 
-        if workspace_id and workspace_id.strip():
-            clean_ws_id = workspace_id.strip()
-            ws_ref = self.workspace_manager.get_workspace(clean_ws_id)
-            if ws_ref is None:
-                raise NotFoundError(f"Workspace with ID '{clean_ws_id}' was not found.")
-            target_dir = Path(ws_ref.workspace_path)
-            current_branch = ws_ref.current_branch
-        elif workspace_path and workspace_path.strip():
-            raw_path = Path(workspace_path.strip())
-            if not raw_path.exists():
-                raise NotFoundError(f"Specified workspace directory '{workspace_path}' does not exist.")
-            target_dir = raw_path.resolve()
-        else:
-            raise ValidationError("Either 'workspace_id' or 'workspace_path' must be provided.")
-
-        if not target_dir.is_dir():
-            raise ValidationError(f"Target workspace path '{target_dir}' is not a directory.")
-
-        # 2. Consume and validate the approval ticket
-        try:
-            ticket: ApprovalTicket = self.approval_gate.consume_approval(clean_approval_id)
-        except PermissionDeniedError:
-            raise
-        except Exception as exc:
-            raise PermissionDeniedError(
-                f"Failed to validate approval ticket '{clean_approval_id}': {exc}",
-                details={"approval_id": clean_approval_id},
-            ) from exc
-
-        if ticket.operation != "push_branch":
-            raise ValidationError(
-                f"Approval ticket '{clean_approval_id}' was granted for '{ticket.operation}', not 'push_branch'."
-            )
-
-        target_branch = validate_branch_name(ticket.target_branch)
-
-        # 3. Guard against protected branch pushes
-        if is_protected_branch(target_branch):
-            raise PermissionDeniedError(
-                f"Pushing directly to protected branch '{target_branch}' is strictly prohibited. "
-                "Push to a feature branch and submit a pull request instead.",
-                details={"branch": target_branch},
-            )
-
-        # 4. Enforce operational policy
-        allowed, reason = self.policy_engine.is_operation_allowed(
-            operation="push_branch",
-            target_branch=target_branch,
-            workspace=str(target_dir),
+    @property
+    def description(self) -> str:
+        return (
+            "Push a reviewed branch to a remote repository. Requires "
+            "a valid approval ticket and a workspace that already "
+            "contains the reviewed commits."
         )
-        if not allowed:
-            raise PermissionDeniedError(
-                f"Policy prohibits push to branch '{target_branch}': {reason}",
-                details={"target_branch": target_branch, "reason": reason},
-            )
 
-        # 5. Recompute current diff to ensure changes did not mutate after approval
+    @property
+    def input_schema(self) -> Mapping[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "operation_id": {
+                    "type": "string",
+                    "description": "Identifier of the operation.",
+                },
+                "approval_id": {
+                    "type": "string",
+                    "description": (
+                        "Identifier of the granted approval ticket."
+                    ),
+                },
+                "local_branch": {
+                    "type": "string",
+                    "description": (
+                        "Optional local branch name. Defaults to the "
+                        "operation's source branch."
+                    ),
+                },
+                "remote": {
+                    "type": "string",
+                    "description": (
+                        "Remote name. Defaults to 'origin'."
+                    ),
+                    "default": "origin",
+                },
+            },
+            "required": ["operation_id", "approval_id"],
+            "additionalProperties": False,
+        }
+
+    # --- Execution ------------------------------------------------------
+
+    async def execute(
+        self, context: ToolContext, **kwargs: Any
+    ) -> ToolResult:
+        # --- Parse inputs ----------------------------------------------
+        operation_id = kwargs.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message=(
+                    "`operation_id` must be a non-empty string."
+                ),
+            )
+        operation_id = operation_id.strip()
+
+        approval_id = kwargs.get("approval_id")
+        if not isinstance(approval_id, str) or not approval_id.strip():
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message=(
+                    "`approval_id` must be a non-empty string."
+                ),
+            )
+        approval_id = approval_id.strip()
+
+        local_branch_override = kwargs.get("local_branch")
+        if local_branch_override is not None and not isinstance(
+            local_branch_override, str
+        ):
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message="`local_branch` must be a string.",
+            )
+        if isinstance(local_branch_override, str):
+            local_branch_override = local_branch_override.strip() or None
+
+        remote = kwargs.get("remote") or "origin"
+        if not isinstance(remote, str) or not remote.strip():
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message="`remote` must be a non-empty string.",
+            )
+        remote = remote.strip()
+
+        # --- Resolve services ------------------------------------------
+        operation_service = (
+            self._explicit_operation_service
+            or get_default_operation_service()
+        )
+        approval_gate = (
+            self._explicit_approval_gate or get_default_approval_gate()
+        )
+        push_manager = (
+            self._explicit_push_manager or get_default_push_manager()
+        )
+        workspace_manager = (
+            self._explicit_workspace_manager
+            or get_default_workspace_manager()
+        )
+
+        # --- Load the operation ----------------------------------------
         try:
-            current_diff: DiffSummary = await self.diff_engine.compute_diff(
-                cwd=target_dir,
-                base_ref=ticket.base_sha,
+            record = await operation_service.get_operation(operation_id)
+        except Exception as exc:  # noqa: BLE001
+            normalized = to_source_control_error(exc)
+            return self.failure_result(
+                error_code=normalized.code.value,
+                error_message=normalized.message,
+                metadata={"operation_id": operation_id},
             )
-        except Exception as exc:
-            raise SourceControlError(
-                f"Failed to verify diff consistency prior to push: {exc}"
-            ) from exc
 
-        if current_diff.diff_sha256 != ticket.diff_sha256:
-            raise RemoteStateChangedError(
-                f"Workspace changes mutated after approval was granted. Expected diff SHA-256 "
-                f"'{ticket.diff_sha256}', but computed '{current_diff.diff_sha256}'. Please request a new approval.",
-                details={
-                    "expected_diff_sha256": ticket.diff_sha256,
-                    "actual_diff_sha256": current_diff.diff_sha256,
+        # --- Validate operation state ----------------------------------
+        if record.status != OperationStatus.APPROVED:
+            return self.failure_result(
+                error_code="CONFLICT",
+                error_message=(
+                    f"Operation is in status '{record.status.value}'; "
+                    "only APPROVED operations can be pushed."
+                ),
+                metadata={
+                    "operation_id": operation_id,
+                    "status": record.status.value,
                 },
             )
 
-        # 6. Retrieve ephemeral provider access token
-        token = await self.token_service.get_access_token(ProviderId.GITHUB)
-        if not token:
-            raise AuthRequiredError(
-                "No active provider credentials found in vault to execute authenticated push. "
-                "Please authenticate the provider first in Settings."
+        if not record.workspace_id:
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message=(
+                    "Operation has no workspace attached."
+                ),
+                metadata={"operation_id": operation_id},
             )
 
-        # 7. Execute authenticated remote push via GitPushManager
-        effective_local_branch = current_branch or target_branch
+        target_branch = record.target_branch or record.source_branch
+        if not target_branch:
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message=(
+                    "Operation has no target branch; cannot push."
+                ),
+                metadata={"operation_id": operation_id},
+            )
+
+        local_branch = local_branch_override or record.source_branch or target_branch
+
+        # Fetch the workspace so we can pass its path to the push
+        # manager and to the reconciliation logic.
+        workspace = workspace_manager.get_workspace(record.workspace_id)
+        if workspace is None:
+            return self.failure_result(
+                error_code="WORKSPACE_NOT_FOUND",
+                error_message=(
+                    f"Workspace '{record.workspace_id}' is not "
+                    "registered."
+                ),
+                metadata={
+                    "operation_id": operation_id,
+                    "workspace_id": record.workspace_id,
+                },
+            )
+
+        # --- Validate the approval ticket ------------------------------
+        #
+        # The gate re-validates every bound field: operation id,
+        # repository id, operation kind, base SHA, diff hash, and
+        # target branch. Any mismatch invalidates the ticket.
         try:
-            push_res: PushResult = await self.push_manager.push_branch(
-                cwd=target_dir,
-                branch_name=effective_local_branch,
-                remote_name=remote_name.strip() or "origin",
-                target_branch=target_branch,
-                token=token,
-                force_with_lease=True,
-                set_upstream=set_upstream,
+            approval_gate.validate(
+                approval_id,
+                expected_operation_id=operation_id,
+                expected_repository_id=record.repository_id,
+                expected_operation=record.kind,
+                expected_base_sha=record.base_sha,
+                expected_diff_sha256=record.diff_sha256 or "",
+                expected_target_branch=target_branch,
             )
-        except ConflictError:
-            raise
-        except SourceControlError:
-            raise
-        except Exception as exc:
-            raise SourceControlError(
-                f"Git push failed for branch '{target_branch}': {exc}"
-            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            normalized = to_source_control_error(exc)
+            return self.failure_result(
+                error_code=normalized.code.value,
+                error_message=normalized.message,
+                metadata={
+                    "operation_id": operation_id,
+                    "approval_id": approval_id,
+                },
+            )
 
-        # 8. Transition durable operation if wired
-        if self.operation_service and ticket.operation_id:
-            try:
-                from ..operations.models import OperationState
+        # --- Re-fetch the remote SHA -----------------------------------
+        #
+        # This check catches the race where another contributor
+        # pushed to the target branch between the moment the user
+        # reviewed the diff and the moment we are about to push.
+        try:
+            remote_sha = await push_manager._remote_head_sha(
+                target=_resolve_path(workspace.workspace_path),
+                remote=remote,
+                ref=target_branch,
+            )
+        except Exception as exc:  # noqa: BLE001
+            normalized = to_source_control_error(exc)
+            return self.failure_result(
+                error_code=normalized.code.value,
+                error_message=(
+                    "Could not verify the remote branch state: "
+                    + normalized.message
+                ),
+                metadata={"operation_id": operation_id},
+            )
 
-                await self.operation_service.transition_state(
-                    operation_id=ticket.operation_id,
-                    target_state=OperationState.PUSHED,
+        if remote_sha is not None and record.base_sha:
+            if remote_sha != record.base_sha:
+                # The remote moved. Invalidate the approval so the
+                # user cannot re-use it for a different base.
+                try:
+                    approval_gate.revoke(
+                        approval_id,
+                        actor="system",
+                        reason="Remote base changed before push.",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+                # Transition the operation so that the UI shows the
+                # stale state.
+                try:
+                    await operation_service.transition(
+                        operation_id,
+                        OperationStatus.STALE_REVIEW_REQUIRED,
+                        reason=(
+                            "Remote base changed since the review."
+                        ),
+                        metadata={
+                            "previous_base_sha": record.base_sha,
+                            "remote_sha": remote_sha,
+                        },
+                        actor="system",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+                return self.failure_result(
+                    error_code="REMOTE_STATE_CHANGED",
+                    error_message=(
+                        "The remote branch has changed since the "
+                        "review. Re-review the diff before pushing."
+                    ),
                     metadata={
-                        "approval_id": clean_approval_id,
-                        "branch_name": target_branch,
-                        "pushed_commit_sha": push_res.pushed_sha,
-                        "remote_name": remote_name,
-                        "upstream": push_res.upstream_ref,
+                        "operation_id": operation_id,
+                        "previous_base_sha": record.base_sha,
+                        "remote_sha": remote_sha,
                     },
                 )
-            except Exception:
+
+        # --- Consume the approval -------------------------------------
+        #
+        # Once consumed, the ticket cannot be reused. If the push
+        # fails for a transient reason, the user will need to
+        # approve again; this is intentional.
+        try:
+            approval_gate.consume(
+                approval_id,
+                expected_operation_id=operation_id,
+                expected_repository_id=record.repository_id,
+                expected_operation=record.kind,
+                expected_base_sha=record.base_sha,
+                expected_diff_sha256=record.diff_sha256 or "",
+                expected_target_branch=target_branch,
+            )
+        except Exception as exc:  # noqa: BLE001
+            normalized = to_source_control_error(exc)
+            return self.failure_result(
+                error_code=normalized.code.value,
+                error_message=normalized.message,
+                metadata={"operation_id": operation_id},
+            )
+
+        # --- Transition to PUSHING ------------------------------------
+        try:
+            await operation_service.transition(
+                operation_id,
+                OperationStatus.PUSHING,
+                reason="Push started.",
+                metadata={"remote": remote, "target_branch": target_branch},
+                actor="agent",
+            )
+        except Exception as exc:  # noqa: BLE001
+            normalized = to_source_control_error(exc)
+            return self.failure_result(
+                error_code=normalized.code.value,
+                error_message=normalized.message,
+                metadata={"operation_id": operation_id},
+            )
+
+        # --- Perform the push -----------------------------------------
+        try:
+            push_result = await push_manager.push_branch(
+                workspace_id=record.workspace_id,
+                local_branch=local_branch,
+                remote=remote,
+                remote_branch=target_branch,
+                force_with_lease=False,
+                set_upstream=True,
+                workspace_path=workspace.workspace_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            normalized = to_source_control_error(exc)
+            # Mark the operation as failed. If the error is
+            # retryable we leave the operation in a state the user
+            # can act on.
+            try:
+                await operation_service.mark_failed(
+                    operation_id,
+                    error_code=normalized.code.value,
+                    error_message=normalized.message,
+                    retryable=normalized.is_retryable,
+                    actor="system",
+                )
+            except Exception:  # noqa: BLE001
                 pass
+            return self.failure_result(
+                error_code=normalized.code.value,
+                error_message=normalized.message,
+                metadata={
+                    "operation_id": operation_id,
+                    "retryable": normalized.is_retryable,
+                },
+            )
 
-        return {
-            "status": "success",
-            "approval_id": clean_approval_id,
-            "operation_id": ticket.operation_id,
-            "branch_name": target_branch,
-            "pushed_sha": push_res.pushed_sha,
-            "remote_name": remote_name,
-            "upstream_ref": push_res.upstream_ref,
-            "message": (
-                f"Successfully pushed branch '{target_branch}' to remote '{remote_name}'. "
-                f"Remote ref is now at {push_res.pushed_sha[:7] if push_res.pushed_sha else 'HEAD'}."
-            ),
-        }
+        # --- Interpret the result --------------------------------------
+        if not push_result.accepted:
+            # A rejection is a final failure for this attempt.
+            try:
+                await operation_service.mark_failed(
+                    operation_id,
+                    error_code="PUSH_REJECTED",
+                    error_message=push_result.message
+                    or "Push was rejected by the remote.",
+                    retryable=False,
+                    actor="system",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return self.failure_result(
+                error_code="PUSH_REJECTED",
+                error_message=push_result.message
+                or "Push was rejected by the remote.",
+                data={
+                    "local_branch": push_result.local_branch,
+                    "local_sha": push_result.local_sha,
+                    "remote_branch": push_result.remote_branch,
+                    "remote_sha": push_result.remote_sha,
+                    "reason": push_result.rejected_reason,
+                },
+                metadata={"operation_id": operation_id},
+            )
 
-    async def aexecute(self, **kwargs: Any) -> dict[str, Any]:
-        """Public async execution adapter conforming to standard agent tool calling contracts."""
-        validated_args = self.args_schema(**kwargs)
-        return await self._arun(**validated_args.model_dump())
+        # --- Success ---------------------------------------------------
+        try:
+            await operation_service.transition(
+                operation_id,
+                OperationStatus.PUSHED,
+                reason="Push completed successfully.",
+                metadata={
+                    "local_sha": push_result.local_sha,
+                    "remote_sha": push_result.remote_sha,
+                },
+                actor="system",
+            )
+        except Exception as exc:  # noqa: BLE001
+            # The push succeeded but we could not update the journal.
+            # We return success and record a warning; the operation
+            # will be reconciled on the next startup.
+            logger.warning(
+                "Push succeeded but the operation state could not be "
+                "updated for '%s': %s",
+                operation_id,
+                type(exc).__name__,
+            )
 
-    def execute(self, **kwargs: Any) -> dict[str, Any]:
-        """Synchronous wrapper raising an error to enforce non-blocking execution."""
-        raise NotImplementedError(
-            "PushBranchTool only supports asynchronous execution via aexecute() or _arun()."
+        return self.success_result(
+            {
+                "operation_id": operation_id,
+                "status": "pushed",
+                "local_branch": push_result.local_branch,
+                "local_sha": push_result.local_sha,
+                "remote_branch": push_result.remote_branch,
+                "remote_sha": push_result.remote_sha,
+            },
+            metadata={
+                "operation_id": operation_id,
+                "remote": remote,
+            },
         )
+
+
+def _resolve_path(path: str):
+    """Return a `Path` for a workspace path string."""
+    from pathlib import Path
+
+    return Path(path)
