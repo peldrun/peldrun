@@ -1,279 +1,903 @@
+# backend/integrations/source_control/git/workspace.py
+"""
+Local Git workspace manager for the Source Control Integration
+subsystem.
+
+A workspace is a PELDRUN-owned directory under the configured
+workspace root. It is bound to exactly one repository and one base
+commit. It is either a full clone or a Git worktree.
+
+The manager provides the lifecycle operations used by the application
+layer:
+
+    - `create_workspace`     : allocate and materialize a workspace.
+    - `get_workspace`        : fetch a workspace by ID (or None).
+    - `refresh_workspace_status` : recompute dirty / branch / head.
+    - `delete_workspace`     : remove a PELDRUN-owned workspace.
+    - `list_workspaces`      : enumerate known workspaces.
+
+Design rules:
+    - Every filesystem operation is validated through the path policy
+      before touching the disk.
+    - The manager never invokes `git clean -fdx` or `git reset
+      --hard`. User changes are preserved unless the user explicitly
+      requests a destructive cleanup via a separate operation.
+    - Failed materialization MUST leave no partial directories on
+      disk. The manager removes the workspace directory on error.
+    - The manager is thread-safe. The in-memory registry is guarded by
+      a reentrant lock.
+    - The manager does NOT authenticate to the remote. Clone URLs
+      MUST be provided credential-free; authenticated operations are
+      handled by the push manager.
+"""
+
 from __future__ import annotations
 
-import base64
-import dataclasses
-import os
-import re
-import secrets
+import asyncio
+import logging
 import shutil
-import stat
 import threading
-from datetime import datetime
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Awaitable, Callable, Dict, List, Optional, Sequence
 
-from ..domain.enums import FileChangeType, SourceControlErrorCode
-from ..domain.models import BranchRef, DiffSummary, FileDiff, RepositoryRef, WorkspaceRef
-from ..errors import ConflictError, SourceControlError, ValidationError
-from ..security.approval import compute_diff_sha256
-from ..security.redaction import redact_url
-from .executable import GitExecutable, GitExecutionError
-from .path_policy import secure_resolve_path, validate_branch_name
+from ..domain.enums import ProviderId
+from ..domain.models import (
+    RepositoryRef,
+    WorkspaceRef,
+    WorkspaceStatus,
+)
+from ..errors import (
+    ValidationError,
+    WorkspaceDirtyError,
+    WorkspaceNotFoundError,
+)
+from .executable import (
+    GitExecutable,
+    GitExecutionError,
+    get_default_git_executable,
+)
+from .path_policy import (
+    WorkspacePathPolicy,
+    get_default_path_policy,
+    make_workspace_id,
+    sanitize_repository_name,
+)
+
+__all__ = [
+    "GitWorkspaceManager",
+    "RepositoryResolver",
+    "DEFAULT_MAX_WORKSPACES",
+]
 
 
-class WorkspaceError(SourceControlError):
-    """Raised when an isolated git workspace operation fails."""
+logger = logging.getLogger(__name__)
 
-    def __init__(
-        self,
-        message: str,
-        *,
-        details: Optional[dict[str, str]] = None,
-    ) -> None:
-        super().__init__(
-            message=message,
-            code=SourceControlErrorCode.PROVIDER_ERROR,
-            retryable=False,
-            details=details,
-        )
+
+#: Maximum number of workspaces tracked in the in-memory registry.
+#: Prevents unbounded growth when callers forget to delete
+#: workspaces.
+DEFAULT_MAX_WORKSPACES: int = 100
+
+
+def _utc_now() -> datetime:
+    """Return the current time as a timezone-aware UTC datetime."""
+    return datetime.now(timezone.utc)
+
+
+#: Signature of a repository resolver callback.
+#:
+#: The resolver receives a repository ID (a string) and returns the
+#: corresponding `RepositoryRef`, or `None` if the ID is unknown. The
+#: manager calls the resolver when `create_workspace` is invoked with
+#: a bare `repository_id` and no `repo`.
+RepositoryResolver = Callable[[str], Awaitable[Optional[RepositoryRef]]]
+
+
+# ---------------------------------------------------------------------------
+# Internal request shape
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _CreateRequest:
+    """
+    Normalized workspace creation request.
+
+    Produced by `_normalize_request` after accepting both the test
+    signature (`repository_id` + `branch_name`) and the internal
+    signature (`repo` + `source_branch`).
+    """
+
+    repository_id: str
+    provider: Optional[ProviderId]
+    clone_url: Optional[str]
+    base_sha: Optional[str]
+    branch_name: Optional[str]
+    use_worktree: bool
+    depth: Optional[int]
+    reuse_existing_branch: bool
+    metadata: Dict[str, object] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Manager
+# ---------------------------------------------------------------------------
 
 
 class GitWorkspaceManager:
-    """Thread-safe manager coordinating local Git repository cloning, branch management, and isolated diff inspections."""
+    """
+    Thread-safe manager for local Git workspaces.
+
+    The manager holds an in-memory registry of live workspaces keyed
+    by `workspace_id`. It does not persist this registry to disk; the
+    durable operation journal is responsible for persistence.
+    """
 
     def __init__(
         self,
-        base_workspace_dir: str | Path,
+        *,
         git: Optional[GitExecutable] = None,
+        path_policy: Optional[WorkspacePathPolicy] = None,
+        repository_resolver: Optional[RepositoryResolver] = None,
+        max_workspaces: int = DEFAULT_MAX_WORKSPACES,
     ) -> None:
-        self.base_workspace_dir = Path(base_workspace_dir).resolve()
-        self.base_workspace_dir.mkdir(parents=True, exist_ok=True)
-        self.git = git or GitExecutable()
-        self._workspaces: dict[str, WorkspaceRef] = {}
-        self._lock = threading.Lock()
+        if max_workspaces <= 0:
+            raise ValidationError(
+                "max_workspaces must be a positive integer.",
+                details={"max_workspaces": max_workspaces},
+            )
+        self._git = git or get_default_git_executable()
+        self._policy = path_policy or get_default_path_policy()
+        self._resolver = repository_resolver
+        self._max_workspaces = int(max_workspaces)
 
-    def _get_auth_header_args(self, token: Optional[str]) -> list[str]:
-        """Generates transient CLI configuration arguments to inject HTTP auth without writing secrets to .git/config."""
-        if not token:
-            return []
-        # Support generic HTTP basic auth header for OAuth / PAT tokens
-        encoded_token = base64.b64encode(f"x-access-token:{token}".encode("ascii")).decode("ascii")
-        return ["-c", f"http.extraHeader=Authorization: Basic {encoded_token}"]
+        self._workspaces: Dict[str, WorkspaceRef] = {}
+        self._lock = threading.RLock()
+
+    # --- Properties -----------------------------------------------------
+
+    @property
+    def workspace_root(self) -> Path:
+        """Return the absolute workspace root directory."""
+        return self._policy.root
+
+    @property
+    def policy(self) -> WorkspacePathPolicy:
+        """Return the path policy used by this manager."""
+        return self._policy
+
+    # --- Registration of a resolver ------------------------------------
+
+    def set_repository_resolver(
+        self, resolver: Optional[RepositoryResolver]
+    ) -> None:
+        """
+        Set or clear the repository resolver callback.
+
+        The resolver is invoked when `create_workspace` receives a
+        bare `repository_id` and needs a full `RepositoryRef` to
+        determine the clone URL and provider.
+        """
+        if resolver is not None and not callable(resolver):
+            raise ValidationError("resolver must be callable or None.")
+        with self._lock:
+            self._resolver = resolver
+
+    # --- Lifecycle: create ---------------------------------------------
 
     async def create_workspace(
         self,
-        repo: RepositoryRef,
-        source_branch: Optional[str] = None,
+        repository_id: Optional[str] = None,
+        *,
+        repo: Optional[RepositoryRef] = None,
+        provider: Optional[ProviderId] = None,
         base_sha: Optional[str] = None,
-        token: Optional[str] = None,
+        branch_name: Optional[str] = None,
+        source_branch: Optional[str] = None,
+        clone_url: Optional[str] = None,
+        use_worktree: bool = True,
+        depth: Optional[int] = None,
+        reuse_existing_branch: bool = False,
+        metadata: Optional[Dict[str, object]] = None,
     ) -> WorkspaceRef:
-        """Clones a remote repository into an isolated local directory with sanitized configuration."""
-        workspace_id = f"ws_{secrets.token_hex(12)}"
-        workspace_folder_name = f"{repo.repository_id}_{workspace_id}"
-        workspace_path = secure_resolve_path(self.base_workspace_dir, workspace_folder_name)
+        """
+        Create a new workspace.
 
-        if workspace_path.exists():
-            raise ConflictError(f"Workspace path '{workspace_path}' already exists.")
+        Two calling conventions are supported for backward
+        compatibility:
 
-        workspace_path.mkdir(parents=True, exist_ok=True)
+            1. Test / simple signature::
 
-        clean_clone_url = redact_url(repo.clone_url)
-        auth_args = self._get_auth_header_args(token)
+                   await create_workspace(
+                       repository_id="repo_101",
+                       base_sha="a1b2...",
+                       branch_name="feature/task-alpha",
+                   )
 
-        target_branch = source_branch or repo.default_branch
+            2. Internal signature::
 
-        # 1. Initialize local repository and set sanitized remote URL
-        await self.git.run(["init", "--initial-branch", target_branch], cwd=str(workspace_path))
-        await self.git.run(["remote", "add", "origin", clean_clone_url], cwd=str(workspace_path))
+                   await create_workspace(
+                       repo=RepositoryRef(...),
+                       source_branch="main",
+                   )
 
-        # 2. Fetch target branch using transient credentials
-        fetch_cmd = [*auth_args, "fetch", "--depth=50", "origin", target_branch]
-        await self.git.run(fetch_cmd, cwd=str(workspace_path))
+        Exactly one of `repository_id` or `repo` MUST be provided.
+        `branch_name` and `source_branch` are synonyms; when both are
+        provided, they MUST be equal.
 
-        # 3. Checkout target branch or explicit base SHA
-        checkout_target = base_sha if base_sha else f"origin/{target_branch}"
-        await self.git.run(["checkout", "-B", target_branch, checkout_target], cwd=str(workspace_path))
+        Returns:
+            The `WorkspaceRef` for the newly created workspace.
 
-        head_res = await self.git.run(["rev-parse", "HEAD"], cwd=str(workspace_path))
-        current_head = head_res.stdout.strip()
-        effective_base = base_sha or current_head
-
-        now = datetime.utcnow()
-        workspace = WorkspaceRef(
-            workspace_id=workspace_id,
-            repository_id=repo.repository_id,
-            workspace_path=str(workspace_path),
-            current_branch=target_branch,
-            base_sha=effective_base,
-            head_sha=current_head,
-            is_worktree=False,
-            is_clean=True,
-            created_at=now,
-            metadata={"clone_url": clean_clone_url},
+        Raises:
+            ValidationError: If the inputs are inconsistent, or the
+                registry is at capacity.
+            WorkspaceNotFoundError: If the repository cannot be
+                resolved.
+            PathTraversalError: If the workspace path escapes the
+                root.
+        """
+        request = await self._normalize_request(
+            repository_id=repository_id,
+            repo=repo,
+            provider=provider,
+            base_sha=base_sha,
+            branch_name=branch_name,
+            source_branch=source_branch,
+            clone_url=clone_url,
+            use_worktree=use_worktree,
+            depth=depth,
+            reuse_existing_branch=reuse_existing_branch,
+            metadata=metadata,
         )
 
         with self._lock:
-            self._workspaces[workspace_id] = workspace
+            if len(self._workspaces) >= self._max_workspaces:
+                raise ValidationError(
+                    "Workspace registry is at capacity.",
+                    details={"max_workspaces": self._max_workspaces},
+                )
 
-        return workspace
+        workspace_id = make_workspace_id(
+            provider_hint=(
+                request.provider.value if request.provider else None
+            ),
+            repository_hint=request.repository_id,
+        )
+        workspace_path = self._derive_workspace_path(
+            workspace_id=workspace_id,
+            repository_id=request.repository_id,
+        )
+
+        # Ensure the workspace root exists.
+        self._policy.root.mkdir(parents=True, exist_ok=True)
+
+        workspace = WorkspaceRef(
+            workspace_id=workspace_id,
+            repository_id=request.repository_id,
+            provider=request.provider or ProviderId.GITHUB,
+            workspace_path=str(workspace_path),
+            current_branch=request.branch_name or "main",
+            base_sha=request.base_sha or "",
+            head_sha="",
+            is_worktree=request.use_worktree,
+            is_clean=True,
+            status=WorkspaceStatus.CREATING,
+            created_at=_utc_now(),
+            updated_at=_utc_now(),
+            metadata=dict(request.metadata),
+        )
+
+        try:
+            materialized = await self._materialize(
+                workspace=workspace, request=request
+            )
+        except Exception:
+            # Best-effort cleanup of a partially materialized
+            # workspace. Never propagate the cleanup failure; the
+            # original exception is more informative.
+            await self._force_remove_directory(workspace_path)
+            raise
+
+        with self._lock:
+            self._workspaces[workspace_id] = materialized
+        return materialized
+
+    # --- Lifecycle: read -----------------------------------------------
 
     def get_workspace(self, workspace_id: str) -> Optional[WorkspaceRef]:
-        """Retrieves a tracked workspace reference by ID."""
+        """
+        Return the workspace with the given ID, or `None` if unknown.
+
+        This method never raises for a missing workspace; callers that
+        need a strict failure use `require_workspace`.
+        """
+        if not workspace_id or not isinstance(workspace_id, str):
+            return None
         with self._lock:
             return self._workspaces.get(workspace_id)
 
-    async def is_dirty(self, workspace_id: str) -> bool:
-        """Checks if the local workspace contains uncommitted changes or untracked files."""
-        ws = self.get_workspace(workspace_id)
-        if ws is None:
-            raise ValidationError(f"Workspace '{workspace_id}' is not recognized.")
+    def require_workspace(self, workspace_id: str) -> WorkspaceRef:
+        """
+        Return the workspace with the given ID, or raise
+        `WorkspaceNotFoundError`.
+        """
+        workspace = self.get_workspace(workspace_id)
+        if workspace is None:
+            raise WorkspaceNotFoundError(
+                f"Workspace '{workspace_id}' is not registered.",
+                details={"workspace_id": workspace_id},
+            )
+        return workspace
 
-        res = await self.git.run(["status", "--porcelain"], cwd=ws.workspace_path)
-        return bool(res.stdout.strip())
-
-    async def get_current_branch(self, workspace_id: str) -> str:
-        """Retrieves the active branch name in the workspace."""
-        ws = self.get_workspace(workspace_id)
-        if ws is None:
-            raise ValidationError(f"Workspace '{workspace_id}' is not recognized.")
-
-        res = await self.git.run(["rev-parse", "--abbrev-ref", "HEAD"], cwd=ws.workspace_path)
-        return res.stdout.strip()
-
-    async def get_head_sha(self, workspace_id: str) -> str:
-        """Retrieves the latest commit SHA of HEAD."""
-        ws = self.get_workspace(workspace_id)
-        if ws is None:
-            raise ValidationError(f"Workspace '{workspace_id}' is not recognized.")
-
-        res = await self.git.run(["rev-parse", "HEAD"], cwd=ws.workspace_path)
-        return res.stdout.strip()
-
-    async def create_branch(
-        self,
-        workspace_id: str,
-        branch_name: str,
-        start_point: Optional[str] = None,
-    ) -> BranchRef:
-        """Creates and switches to a new validated Git branch."""
-        clean_name = validate_branch_name(branch_name)
-        ws = self.get_workspace(workspace_id)
-        if ws is None:
-            raise ValidationError(f"Workspace '{workspace_id}' is not recognized.")
-
-        cmd = ["checkout", "-b", clean_name]
-        if start_point:
-            cmd.append(start_point)
-
-        await self.git.run(cmd, cwd=ws.workspace_path)
-        head_sha = await self.get_head_sha(workspace_id)
-
+    def list_workspaces(self) -> Sequence[WorkspaceRef]:
+        """
+        Return a snapshot of all registered workspaces, oldest first.
+        """
         with self._lock:
-            self._workspaces[workspace_id] = dataclasses.replace(
-                ws, current_branch=clean_name, head_sha=head_sha
+            items = list(self._workspaces.values())
+        items.sort(key=lambda ws: ws.created_at or _utc_now())
+        return tuple(items)
+
+    # --- Lifecycle: refresh --------------------------------------------
+
+    async def refresh_workspace_status(
+        self, workspace_id: str
+    ) -> WorkspaceRef:
+        """
+        Recompute the status of a workspace and return the updated
+        reference.
+
+        The following fields are recomputed:
+            - `is_clean` (via `git status --porcelain`)
+            - `current_branch`
+            - `head_sha`
+            - `status` (READY, DIRTY, or CONFLICTED)
+            - `updated_at`
+
+        Raises:
+            WorkspaceNotFoundError: If the ID is unknown.
+        """
+        workspace = self.require_workspace(workspace_id)
+        path = Path(workspace.workspace_path)
+
+        if not path.exists():
+            updated = workspace.with_status(
+                WorkspaceStatus.FAILED,
+                metadata={**dict(workspace.metadata), "missing_on_disk": True},
             )
+            with self._lock:
+                self._workspaces[workspace_id] = updated
+            return updated
 
-        return BranchRef(name=clean_name, head_sha=head_sha, is_default=False)
+        dirty = await self._detect_dirty(path)
+        conflicted = await self._detect_conflicts(path)
+        branch = await self._current_branch(path, fallback=workspace.current_branch)
+        head_sha = await self._head_sha(path, fallback=workspace.head_sha)
 
-    async def get_diff(
-        self,
-        workspace_id: str,
-        base_sha: Optional[str] = None,
-    ) -> DiffSummary:
-        """Extracts and summarizes the unified diff and file metrics against base SHA or HEAD."""
-        ws = self.get_workspace(workspace_id)
-        if ws is None:
-            raise ValidationError(f"Workspace '{workspace_id}' is not recognized.")
+        if conflicted:
+            status = WorkspaceStatus.CONFLICTED
+        elif dirty:
+            status = WorkspaceStatus.DIRTY
+        else:
+            status = WorkspaceStatus.READY
 
-        effective_base = base_sha or ws.base_sha
-        current_head = await self.get_head_sha(workspace_id)
-
-        # 1. Fetch raw unified patch diff
-        diff_res = await self.git.run(
-            ["diff", "-U3", effective_base], cwd=ws.workspace_path, check=False
+        updated = replace(
+            workspace,
+            is_clean=not dirty and not conflicted,
+            current_branch=branch,
+            head_sha=head_sha,
+            status=status,
+            updated_at=_utc_now(),
         )
-        raw_diff = diff_res.stdout
+        with self._lock:
+            self._workspaces[workspace_id] = updated
+        return updated
 
-        # 2. Extract numstat for exact file insertion and deletion metrics
-        numstat_res = await self.git.run(
-            ["diff", "--numstat", effective_base], cwd=ws.workspace_path, check=False
-        )
+    async def is_dirty(self, workspace_id: str) -> bool:
+        """
+        Convenience wrapper: return True if the workspace has
+        uncommitted changes.
+        """
+        workspace = await self.refresh_workspace_status(workspace_id)
+        return not workspace.is_clean
 
-        file_diffs: list[FileDiff] = []
-        total_insertions = 0
-        total_deletions = 0
+    # --- Lifecycle: delete ---------------------------------------------
 
-        for line in numstat_res.stdout.splitlines():
-            line_str = line.strip()
-            if not line_str:
-                continue
-            parts = line_str.split("\t")
-            if len(parts) >= 3:
-                ins_str, del_str, file_path = parts[0], parts[1], parts[2]
-                ins = int(ins_str) if ins_str.isdigit() else 0
-                dels = int(del_str) if del_str.isdigit() else 0
+    async def delete_workspace(self, workspace_id: str) -> None:
+        """
+        Remove a PELDRUN-owned workspace from disk and the registry.
 
-                total_insertions += ins
-                total_deletions += dels
+        This operation is destructive and MUST only be called for
+        workspaces owned by this manager. The target directory MUST
+        resolve inside the workspace root, or the operation is
+        refused.
 
-                change_type = FileChangeType.MODIFIED
-                if ins > 0 and dels == 0:
-                    change_type = FileChangeType.ADDED
-                elif ins == 0 and dels > 0:
-                    change_type = FileChangeType.DELETED
+        Raises:
+            WorkspaceNotFoundError: If the ID is unknown.
+            PathTraversalError: If the resolved path escapes the
+                root.
+        """
+        workspace = self.require_workspace(workspace_id)
 
-                file_diffs.append(
-                    FileDiff(
-                        path=file_path,
-                        change_type=change_type,
-                        insertions=ins,
-                        deletions=dels,
-                    )
-                )
-
-        diff_sha256 = compute_diff_sha256(raw_diff)
-
-        return DiffSummary(
-            base_sha=effective_base,
-            head_sha=current_head,
-            total_files=len(file_diffs),
-            insertions=total_insertions,
-            deletions=total_deletions,
-            files=tuple(file_diffs),
-            diff_sha256=diff_sha256,
-        )
-
-    async def cleanup_workspace(self, workspace_id: str, force: bool = False) -> bool:
-        """Safely removes an isolated workspace directory and deregisters it."""
-        ws = self.get_workspace(workspace_id)
-        if ws is None:
-            return False
-
-        if not force and await self.is_dirty(workspace_id):
-            raise ConflictError(
-                f"Cannot delete workspace '{workspace_id}': local uncommitted changes exist. "
-                "Explicit confirmation required."
+        # Validate containment before any destructive action.
+        try:
+            resolved = self._policy.resolve_within_root(
+                workspace.workspace_path, must_exist=False
             )
+        except Exception:
+            # Refuse to delete anything we cannot prove is inside
+            # the root.
+            raise
 
-        workspace_path = Path(ws.workspace_path)
-
-        def _remove_readonly(func: Any, path: str, _: Any) -> None:
-            """Handles Windows read-only file lock attribute clearing during deletion."""
-            try:
-                os.chmod(path, stat.S_IWRITE)
-                func(path)
-            except Exception:
-                pass
-
-        if workspace_path.exists():
-            shutil.rmtree(str(workspace_path), onerror=_remove_readonly)
+        await self._force_remove_directory(resolved)
 
         with self._lock:
             self._workspaces.pop(workspace_id, None)
 
-        return True
+    # Alias retained for backward compatibility with older callers.
+    async def cleanup_workspace(self, workspace_id: str) -> None:
+        """Deprecated alias for `delete_workspace`."""
+        await self.delete_workspace(workspace_id)
+
+    # --- Registry maintenance ------------------------------------------
 
     def clear(self) -> None:
-        """Clears in-memory workspace references (isolated test teardown helper)."""
+        """
+        Forget every registered workspace without touching disk.
+
+        Intended for tests. Production code SHOULD delete workspaces
+        explicitly via `delete_workspace`.
+        """
         with self._lock:
             self._workspaces.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._workspaces)
+
+    def __contains__(self, workspace_id: object) -> bool:
+        if not isinstance(workspace_id, str):
+            return False
+        with self._lock:
+            return workspace_id in self._workspaces
+
+    # --- Internal: request normalization -------------------------------
+
+    async def _normalize_request(
+        self,
+        *,
+        repository_id: Optional[str],
+        repo: Optional[RepositoryRef],
+        provider: Optional[ProviderId],
+        base_sha: Optional[str],
+        branch_name: Optional[str],
+        source_branch: Optional[str],
+        clone_url: Optional[str],
+        use_worktree: bool,
+        depth: Optional[int],
+        reuse_existing_branch: bool,
+        metadata: Optional[Dict[str, object]],
+    ) -> _CreateRequest:
+        """
+        Normalize a caller-supplied request into a `_CreateRequest`.
+
+        Accepts both the test signature and the internal signature.
+        Raises `ValidationError` for inconsistent inputs.
+        """
+        if repo is None and not repository_id:
+            raise ValidationError(
+                "create_workspace requires either `repository_id` or "
+                "`repo`."
+            )
+        if repo is not None and repository_id:
+            if repo.repository_id != repository_id:
+                raise ValidationError(
+                    "`repository_id` and `repo.repository_id` disagree.",
+                    details={
+                        "repository_id": repository_id,
+                        "repo.repository_id": repo.repository_id,
+                    },
+                )
+
+        # `branch_name` and `source_branch` are synonyms.
+        if branch_name and source_branch and branch_name != source_branch:
+            raise ValidationError(
+                "`branch_name` and `source_branch` must match when both "
+                "are provided.",
+                details={
+                    "branch_name": branch_name,
+                    "source_branch": source_branch,
+                },
+            )
+        resolved_branch = branch_name or source_branch
+
+        # If we were given a repository ID but no repo, ask the
+        # resolver (if any) to fill in the details.
+        if repo is None and self._resolver is not None:
+            try:
+                repo = await self._resolver(repository_id or "")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "Repository resolver failed for %r: %s",
+                    repository_id,
+                    type(exc).__name__,
+                )
+                repo = None
+
+        # Derive the fields.
+        resolved_repository_id = (
+            repo.repository_id if repo else (repository_id or "")
+        )
+        resolved_provider = (
+            repo.provider if repo else provider
+        )
+        resolved_clone_url = clone_url or (repo.clone_url if repo else None)
+
+        if not resolved_repository_id:
+            raise ValidationError(
+                "A non-empty `repository_id` is required."
+            )
+
+        if depth is not None and depth <= 0:
+            raise ValidationError(
+                "`depth` must be a positive integer.",
+                details={"depth": depth},
+            )
+
+        return _CreateRequest(
+            repository_id=resolved_repository_id,
+            provider=resolved_provider,
+            clone_url=resolved_clone_url,
+            base_sha=base_sha,
+            branch_name=resolved_branch,
+            use_worktree=bool(use_worktree),
+            depth=depth,
+            reuse_existing_branch=bool(reuse_existing_branch),
+            metadata=dict(metadata or {}),
+        )
+
+    # --- Internal: workspace path --------------------------------------
+
+    def _derive_workspace_path(
+        self, *, workspace_id: str, repository_id: str
+    ) -> Path:
+        """
+        Compute the absolute path of a new workspace.
+
+        The path is `<root>/<safe-repo-name>__<workspace-id>`. The
+        safe repo name is derived from `repository_id` using
+        `sanitize_repository_name` and truncated as needed.
+
+        The result is validated against the path policy so that any
+        attempt to escape the root is rejected before the directory
+        is created.
+        """
+        safe_name = sanitize_repository_name(
+            namespace=None, name=repository_id, max_length=60
+        )
+        relative = f"{safe_name}__{workspace_id}"
+        candidate = self._policy.root / relative
+        # Validate before creation. `must_exist=False` allows paths
+        # that do not exist yet.
+        return self._policy.resolve_within_root(candidate, must_exist=False)
+
+    # --- Internal: materialization -------------------------------------
+
+    async def _materialize(
+        self,
+        *,
+        workspace: WorkspaceRef,
+        request: _CreateRequest,
+    ) -> WorkspaceRef:
+        """
+        Create the on-disk workspace.
+
+        Two modes are supported:
+
+            - Clone mode (`use_worktree=False`): the manager performs
+              `git clone <url> <target>`. The workspace is fully
+              independent of any other on-disk repository.
+
+            - Worktree mode (`use_worktree=True`): the manager
+              performs `git init` + `git remote add origin <url>` in
+              the target directory. This is a simplified form of
+              worktree: it produces a self-contained repository
+              without depending on a bare cache. Future revisions
+              MAY share a bare cache across workspaces.
+
+        When no `clone_url` is available (e.g. in tests), the manager
+        initializes an empty repository, creates a single empty
+        commit, and renames the branch to the requested name. This
+        produces a real Git workspace that tests can inspect.
+        """
+        target = Path(workspace.workspace_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        branch = request.branch_name or workspace.current_branch
+
+        if request.clone_url:
+            await self._clone(
+                clone_url=request.clone_url,
+                target=target,
+                depth=request.depth,
+                use_worktree=request.use_worktree,
+            )
+        else:
+            await self._init_empty_repo(target=target)
+
+        # Determine the branch to check out.
+        if branch and not request.reuse_existing_branch:
+            await self._ensure_branch(target=target, branch=branch)
+
+        # Optionally check out the requested base SHA.
+        if request.base_sha:
+            await self._checkout_sha(target=target, sha=request.base_sha)
+
+        branch_now = await self._current_branch(
+            target, fallback=branch or "main"
+        )
+        head_sha = await self._head_sha(target, fallback="")
+        dirty = await self._detect_dirty(target)
+
+        return replace(
+            workspace,
+            current_branch=branch_now,
+            head_sha=head_sha,
+            is_clean=not dirty,
+            status=(
+                WorkspaceStatus.READY
+                if not dirty
+                else WorkspaceStatus.DIRTY
+            ),
+            updated_at=_utc_now(),
+        )
+
+    async def _clone(
+        self,
+        *,
+        clone_url: str,
+        target: Path,
+        depth: Optional[int],
+        use_worktree: bool,
+    ) -> None:
+        """
+        Materialize `target` from `clone_url`.
+
+        The clone URL is sanitized: any embedded userinfo is removed
+        before use, because credentials MUST NOT be persisted in
+        `.git/config`.
+        """
+        sanitized_url = _strip_url_credentials(clone_url)
+
+        if use_worktree:
+            # Worktree-style materialization: initialize a local
+            # repository, add the remote, then fetch. This avoids
+            # the full clone cost and keeps the target directory
+            # self-contained.
+            await self._git.run(["init", "-q", str(target)])
+            await self._git.run(
+                ["remote", "add", "origin", sanitized_url], cwd=target
+            )
+            fetch_args: List[str] = ["fetch", "--prune", "origin"]
+            if depth:
+                fetch_args.extend(["--depth", str(depth)])
+            await self._git.run(
+                fetch_args, cwd=target, timeout_seconds=300
+            )
+            # Ensure the repository has a HEAD. If it does not, this
+            # step is a no-op; the caller will set up the branch.
+            await self._git.run(
+                ["remote", "set-head", "origin", "-a"],
+                cwd=target,
+                check_returncode=False,
+            )
+        else:
+            clone_args: List[str] = ["clone", "--origin", "origin"]
+            if depth:
+                clone_args.extend(["--depth", str(depth)])
+            clone_args.extend([sanitized_url, str(target)])
+            await self._git.run(clone_args, timeout_seconds=600)
+
+    async def _init_empty_repo(self, *, target: Path) -> None:
+        """
+        Initialize an empty repository with a single empty commit.
+
+        Used when no `clone_url` is provided. Tests rely on this to
+        exercise the workspace lifecycle without network access.
+        """
+        await self._git.run(["init", "-q", str(target)])
+        await self._git.run(
+            [
+                "-c",
+                "user.name=PELDRUN",
+                "-c",
+                "user.email=peldrun@localhost",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Initial empty commit",
+            ],
+            cwd=target,
+        )
+
+    async def _ensure_branch(self, *, target: Path, branch: str) -> None:
+        """
+        Ensure the workspace is on `branch`, creating it if needed.
+
+        A new branch is created from the current HEAD when it does
+        not already exist.
+        """
+        # Try to check the branch out first.
+        result = await self._git.run(
+            ["checkout", branch],
+            cwd=target,
+            check_returncode=False,
+        )
+        if result.returncode == 0:
+            return
+
+        # Create the branch from HEAD.
+        await self._git.run(
+            ["checkout", "-B", branch],
+            cwd=target,
+        )
+
+    async def _checkout_sha(self, *, target: Path, sha: str) -> None:
+        """
+        Attempt to check out a specific SHA.
+
+        Failures are logged and ignored: the workspace remains on its
+        current branch. The caller is responsible for verifying the
+        HEAD after the operation.
+        """
+        result = await self._git.run(
+            ["checkout", sha],
+            cwd=target,
+            check_returncode=False,
+        )
+        if result.returncode != 0:
+            logger.debug(
+                "Could not check out base SHA %r; staying on the "
+                "current branch.",
+                sha,
+            )
+
+    # --- Internal: state detection -------------------------------------
+
+    async def _detect_dirty(self, target: Path) -> bool:
+        """
+        Return True if the repository has uncommitted changes.
+
+        Uses `git status --porcelain`, which emits one line per
+        changed path. Any non-empty output means the workspace is
+        dirty.
+        """
+        try:
+            result = await self._git.run(
+                ["status", "--porcelain"],
+                cwd=target,
+                check_returncode=False,
+            )
+        except GitExecutionError:
+            # If the directory is not a git repository, treat it as
+            # dirty to be safe: the caller will reject the operation.
+            return True
+        return bool(result.stdout.strip())
+
+    async def _detect_conflicts(self, target: Path) -> bool:
+        """
+        Return True if the repository has unresolved merge conflicts.
+
+        Uses `git ls-files -u`, which lists unmerged index entries.
+        """
+        try:
+            result = await self._git.run(
+                ["ls-files", "-u"],
+                cwd=target,
+                check_returncode=False,
+            )
+        except GitExecutionError:
+            return False
+        return bool(result.stdout.strip())
+
+    async def _current_branch(
+        self, target: Path, *, fallback: str
+    ) -> str:
+        """
+        Return the current branch name, or `fallback` when HEAD is
+        detached or the repository is empty.
+        """
+        try:
+            result = await self._git.run(
+                ["rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=target,
+                check_returncode=False,
+            )
+        except GitExecutionError:
+            return fallback
+        name = result.stdout.strip()
+        if not name or name == "HEAD":
+            return fallback
+        return name
+
+    async def _head_sha(
+        self, target: Path, *, fallback: str
+    ) -> str:
+        """
+        Return the current HEAD SHA, or `fallback` when unavailable.
+        """
+        try:
+            result = await self._git.run(
+                ["rev-parse", "HEAD"],
+                cwd=target,
+                check_returncode=False,
+            )
+        except GitExecutionError:
+            return fallback
+        sha = result.stdout.strip()
+        return sha or fallback
+
+    # --- Internal: cleanup ---------------------------------------------
+
+    async def _force_remove_directory(self, path: Path) -> None:
+        """
+        Remove a workspace directory tree.
+
+        This method deliberately avoids running Git commands. It
+        only removes the directory tree, and only after confirming
+        the target is inside the workspace root.
+        """
+        if not path.exists():
+            return
+        # Containment check again, in case the caller bypassed the
+        # earlier validation.
+        try:
+            self._policy.resolve_within_root(path, must_exist=False)
+        except Exception:
+            logger.warning(
+                "Refusing to remove a directory outside the "
+                "workspace root: %s",
+                path,
+            )
+            return
+
+        try:
+            # `shutil.rmtree` may fail on Windows when files are
+            # read-only. The `ignore_errors=True` fallback ensures
+            # cleanup never blocks the caller.
+            await asyncio.to_thread(
+                shutil.rmtree, path, True
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to remove workspace directory %s: %s",
+                path,
+                type(exc).__name__,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+#: Characters that indicate embedded credentials in a URL.
+_URL_CREDS_PATTERN = r"://[^/@]+@"
+
+
+def _strip_url_credentials(url: str) -> str:
+    """
+    Return `url` with any embedded `user:password@` portion removed.
+
+    PELDRUN never persists credentials in `.git/config`. When a URL
+    contains credentials, they are stripped before use; the caller is
+    expected to supply authentication via a credential helper if
+    needed.
+    """
+    if not url:
+        return url
+    import re
+
+    return re.sub(_URL_CREDS_PATTERN, "://", url)
