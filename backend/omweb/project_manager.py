@@ -399,10 +399,17 @@ class ProjectManager:
         turn_id: str,
         turn_usage: Dict[str, Any],
         project_id: str = "default_project",
+        context_refs: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Record turn-level token metrics and atomically re-project session summary.
         Defensively handles corrupted turns and missing/None usage keys.
+
+        [FIX-5.4] Accepts an optional `context_refs` list containing the
+        workspace files that were injected as trusted context for this turn.
+        When provided, the refs are persisted into the turn record so that
+        `session.json` retains a complete audit trail of what the agent was
+        told to look at.
         """
         chat = self.get_chat(chat_id)
         resolved_pid = (
@@ -428,15 +435,26 @@ class ProjectManager:
         for t in turns:
             if t.get("turn_id") == turn_id:
                 t["usage"] = turn_usage
+                # [FIX-5.4] Persist context_refs into the turn record. Only
+                # overwrite when explicitly provided so that legacy call-sites
+                # (without refs) do not accidentally erase a value that was
+                # already recorded by a previous invocation.
+                if context_refs is not None:
+                    t["context_refs"] = context_refs
                 turn_found = True
                 break
 
         if not turn_found:
-            turns.append({
+            turn_record: Dict[str, Any] = {
                 "turn_id": turn_id,
                 "timestamp": time.time(),
                 "usage": turn_usage,
-            })
+            }
+            # [FIX-5.4] Attach context_refs only when non-empty to keep the
+            # turn record lean for the common case (no file references).
+            if context_refs:
+                turn_record["context_refs"] = context_refs
+            turns.append(turn_record)
 
         # Re-aggregate usage_summary defensively to prevent NoneType attribute access
         tot_inp = 0

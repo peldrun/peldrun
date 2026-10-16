@@ -20,6 +20,11 @@ export interface SlashCommandItem {
 
 export type MentionCategory = 'agent' | 'tool' | 'skill' | 'file' | 'custom';
 
+// [FIX-1.1] Add explicit mentionToken field for reliable matching.
+// `insertText` is what gets inserted into the editor (no @ prefix).
+// `mentionToken` is the bare identifier used for existence checks.
+// `label` stays user-facing (with @) for display in the menu.
+// `metadata` carries canonical file info (relPath, fileName, origin).
 export interface MentionItem {
   id: string;
   label: string;
@@ -27,6 +32,15 @@ export interface MentionItem {
   category: MentionCategory;
   icon?: string;
   insertText: string;
+  /**
+   * Optional bare identifier used for existence checks.
+   * When omitted, `containsMention` falls back to `insertText` with
+   * @/backtick characters stripped.
+   *
+   * New code (as of the mention-refactor) SHOULD always populate this.
+   * Legacy call sites may omit it during the transition period.
+   */
+  mentionToken?: string;   // ← [FIX-1.1b] أصبح اختياريًا
   metadata?: Record<string, unknown>;
 }
 
@@ -47,6 +61,10 @@ export interface ExecutionDirectives {
 /**
  * Extracts the canonical runtime execution identifier from a mention item.
  * Strictly uses source metadata identifiers rather than UI labels or descriptions.
+ *
+ * [FIX-1.7] Extended to support `category === 'file'`. Returns the canonical
+ * relative path within the workspace, which is what the backend needs to
+ * resolve and inject the file content.
  */
 export function getMentionId(item: MentionItem): string | undefined {
   if (item.category === 'agent') {
@@ -71,22 +89,66 @@ export function getMentionId(item: MentionItem): string | undefined {
     return undefined;
   }
 
+  // [FIX-1.7] File mentions: return the canonical relative path.
+  // Preferred source: metadata.relPath (set by the workspace files provider).
+  // Fallback: strip the `file-` prefix from the auto-generated id.
+  if (item.category === 'file') {
+    const relPath = item.metadata?.relPath;
+    if (typeof relPath === 'string' && relPath.trim()) {
+      return relPath.trim();
+    }
+    if (typeof item.id === 'string' && item.id.startsWith('file-')) {
+      return item.id.replace(/^file-/, '');
+    }
+    return undefined;
+  }
+
   return undefined;
 }
 
 /**
  * Checks whether the draft prompt text currently contains the mention token.
+ *
+ * [FIX-1.6] Now matches THREE representations for backward compatibility:
+ *   1. New bare form:      "report.md"
+ *   2. Legacy @-form:      "@report.md"
+ *   3. Backtick form:      "`report.md`"
+ *
+ * This ensures that:
+ *   - Prompts produced by the new composer (no @) still resolve correctly.
+ *   - Prompts copied from older chats / pasted from other apps still resolve.
+ *   - Prompts where the user typed backticks manually still resolve.
  */
 export function containsMention(text: string, item: MentionItem): boolean {
-  const token = item.insertText.trim();
+  const token = (item.mentionToken || item.insertText || '').trim();
   if (!token) return false;
 
-  return text.split(/\s+/).includes(token);
+  // Strip any leading/trailing @, `, [, or ] characters from the token.
+  // Also strip a leading `@[` and trailing `]` for the bracketed form.
+  const bare = token
+    .replace(/^@\[|\]$/g, '')       // strip @[ ... ] wrapper if present
+    .replace(/^[@`]+|[@`]+$/g, '')   // strip any residual @ or ` chars
+    .trim();
+  if (!bare) return false;
+
+  const words = text.split(/\s+/);
+  return (
+    words.includes(bare) ||
+    words.includes(`@${bare}`) ||
+    words.includes(`\`${bare}\``) ||
+    words.includes(`\`${bare}`) ||
+    words.includes(`${bare}\``) ||
+    words.includes(`@[${bare}]`)   // [FIX-5.5] bracketed marker
+  );
 }
 
 /**
  * Resolves verified execution directives from active user selections still present in the text.
  * Enforces single target agent policy (latest selected) and deduplicated tools.
+ *
+ * NOTE: Files are NOT resolved here — they travel separately via `context_refs`
+ * in the run payload. This function remains the source of truth for agent/tool
+ * directives only.
  */
 export function resolveExecutionDirectives(
   text: string,
@@ -111,6 +173,16 @@ export function resolveExecutionDirectives(
 
 /**
  * Client-side Workspace Files Provider.
+ *
+ * [FIX-1.2]
+ *   - `insertText` now uses the bare filename wrapped in backticks, WITHOUT
+ *     the @ prefix. The editor stores a plain, human-readable token that the
+ *     LLM will treat as a literal filename reference.
+ *   - `mentionToken` carries the bare filename for existence checks.
+ *   - `metadata` carries canonical file information (relPath, fileName, origin)
+ *     so the composer can build a `context_refs` array without re-parsing.
+ *   - `id` now uses the full path (not just the name) to disambiguate files
+ *     with identical basenames in different subdirectories.
  */
 async function sessionWorkspaceFilesProvider(
   query = '',
@@ -133,25 +205,51 @@ async function sessionWorkspaceFilesProvider(
       const normalizedPath = (f.path || f.rel_root || '').replace(/\\/g, '/');
 
       if (targetChatId) {
-        const isThisChatFile = normalizedPath.includes(`chats/${targetChatId}/files/`);
-        const isWorkspaceFile = f.origin === 'workspace' || normalizedPath.startsWith('workspace/');
-        if (!isThisChatFile && !isWorkspaceFile) return false;
+        // [FIX-5.3] When a chat is active, restrict the @ mention menu to
+        // files belonging to this specific chat. This prevents legacy
+        // workspace/ duplicates (created by the old mirror-upload behavior)
+        // from appearing twice.
+        //
+        // Legacy files that were uploaded BEFORE the mirror-upload removal
+        // exist in BOTH `workspace/` and `chats/<cid>/files/`. The chat
+        // copy is canonical; the workspace copy is discarded here.
+        const isThisChatFile = normalizedPath.includes(
+          `chats/${targetChatId}/files/`
+        );
+        if (!isThisChatFile) return false;
       } else {
-        const isWorkspaceFile = f.origin === 'workspace' || normalizedPath.startsWith('workspace/');
+        // No chat context yet (fresh session): fall back to workspace files
+        // so the user can reference previously uploaded material.
+        const isWorkspaceFile =
+          f.origin === 'workspace' || normalizedPath.startsWith('workspace/');
         if (!isWorkspaceFile) return false;
       }
 
       return !lower || f.name.toLowerCase().includes(lower);
     });
 
-    return filtered.map((f) => ({
-      id: `file-${f.name}`,
-      label: `@${f.name}`,
-      description: f.path ? `Workspace: ${f.path}` : 'Workspace file',
-      category: 'file' as MentionCategory,
-      insertText: `@${f.name} `,
-      icon: 'FileText',
-    }));
+    return filtered.map((f) => {
+      const normalizedRelPath = (f.path || f.rel_root || f.name).replace(/\\/g, '/');
+      return {
+        // [FIX-1.2a] Use full relative path as the unique id.
+        id: `file-${normalizedRelPath}`,
+        // [FIX-1.2b] Label stays with @ for the menu UI.
+        label: `@${f.name}`,
+        description: f.path ? `Workspace: ${f.path}` : 'Workspace file',
+        category: 'file' as MentionCategory,
+        // [FIX-1.2c] Insert the bare filename in backticks — NO @ prefix.
+        insertText: `@[${f.name}] `,
+        // [FIX-1.2d] Bare token for existence checks.
+        mentionToken: f.name,
+        icon: 'FileText',
+        // [FIX-1.2e] Canonical metadata for downstream context_refs.
+        metadata: {
+          relPath: normalizedRelPath,
+          fileName: f.name,
+          origin: f.origin || 'unknown',
+        },
+      };
+    });
   } catch (err) {
     console.error('[CommandRegistry] Error fetching workspace files:', err);
     return [];
@@ -161,6 +259,9 @@ async function sessionWorkspaceFilesProvider(
 /**
  * Dynamic Store & Core Agents Provider:
  * Automatically loads built-in agents and store-installed agents into the @ selector.
+ *
+ * [FIX-1.3] `insertText` no longer contains the @ prefix.
+ * The user sees "@peldrun" in the menu, but the editor receives "peldrun".
  */
 async function storeAgentsProvider(query = ''): Promise<MentionItem[]> {
   if (typeof window === 'undefined') return [];
@@ -186,20 +287,25 @@ async function storeAgentsProvider(query = ''): Promise<MentionItem[]> {
       return !lower || id.includes(lower) || name.includes(lower);
     });
 
-    return filtered.map((a) => ({
-      id: `agent-${a.id}`,
-      label: `@${a.id}`,
-      description: a.name ? `${a.name} — ${a.description || 'Agent'}` : a.description || 'Agent',
-      category: 'agent' as MentionCategory,
-      insertText: `@${a.id} `,
-      icon: 'Bot',
-      metadata: {
-        agentId: String(a.id),
-        name: a.name,
-        systemPrompt: a.system_prompt,
-        tools: a.tools,
-      },
-    }));
+    return filtered.map((a) => {
+      const bareId = String(a.id);
+      return {
+        id: `agent-${bareId}`,
+        label: `@${bareId}`,
+        description: a.name ? `${a.name} — ${a.description || 'Agent'}` : a.description || 'Agent',
+        category: 'agent' as MentionCategory,
+        // [FIX-1.3] No @ prefix; bare token in backticks.
+        insertText: `\`${bareId}\` `,
+        mentionToken: bareId,
+        icon: 'Bot',
+        metadata: {
+          agentId: bareId,
+          name: a.name,
+          systemPrompt: a.system_prompt,
+          tools: a.tools,
+        },
+      };
+    });
   } catch (err) {
     console.debug('[CommandRegistry] Notice: Could not load store agents:', err);
     return [];
@@ -209,6 +315,8 @@ async function storeAgentsProvider(query = ''): Promise<MentionItem[]> {
 /**
  * Dynamic Store & Tools/MCP Provider:
  * Automatically queries active tools, plugins, and MCP capabilities.
+ *
+ * [FIX-1.4] `insertText` no longer contains the @ prefix.
  */
 async function storeToolsProvider(query = ''): Promise<MentionItem[]> {
   if (typeof window === 'undefined') return [];
@@ -241,7 +349,9 @@ async function storeToolsProvider(query = ''): Promise<MentionItem[]> {
         label: `@${toolId}`,
         description: t.description || 'Callable tool capability',
         category: 'tool' as MentionCategory,
-        insertText: `@${toolId} `,
+        // [FIX-1.4] No @ prefix; bare token in backticks.
+        insertText: `\`${toolId}\` `,
+        mentionToken: toolId,
         icon: 'Wrench',
         metadata: {
           toolId: toolId,

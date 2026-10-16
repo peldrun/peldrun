@@ -8,9 +8,42 @@ truth for the public request contract.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+
+# [FIX-3.1] Structured reference to a workspace file the user explicitly
+# mentioned in the prompt. Produced by the frontend composer when the user
+# selects a file from the `@` typeahead menu.
+#
+# Design notes:
+#   - `rel_path` is the canonical workspace-relative path (forward slashes).
+#     This is what the backend needs to resolve, validate, and inject.
+#   - `file_name` and `origin` are optional metadata for diagnostics and for
+#     future UI features (e.g. showing a chip in the message header).
+#   - The alias `relPath` is accepted so the frontend can keep its camelCase
+#     convention without a translation layer.
+class ContextRef(BaseModel):
+    """A single workspace file reference attached to a run request."""
+
+    rel_path: str = Field(
+        ...,
+        alias="relPath",
+        description="Workspace-relative path (forward slashes).",
+    )
+    file_name: Optional[str] = Field(
+        default=None,
+        alias="fileName",
+        description="Display name of the file (basename).",
+    )
+    origin: Optional[str] = Field(
+        default=None,
+        description="Source tier: 'workspace' | 'chats' | 'projects'.",
+    )
+
+    class Config:
+        populate_by_name = True
 
 
 class RunRequest(BaseModel):
@@ -36,12 +69,15 @@ class RunRequest(BaseModel):
     # Ignored entirely in agent mode; never part of llm_override.
     web_search_enabled: Optional[bool] = False
 
+    # [FIX-3.1] Structured file references selected by the user via the `@`
+    # typeahead menu. The dispatcher resolves and injects their contents as
+    # trusted context before invoking the agent engine.
+    context_refs: Optional[List[ContextRef]] = None
+
     # Extensibility for Pause / Resume and Checkpoint Interruption Resumption
     checkpoint_id: Optional[str] = None
     resume_from_checkpoint: Optional[bool] = False
     regenerate_turn_id: Optional[str] = None
-
-
 
 
 class FileContentPayload(BaseModel):

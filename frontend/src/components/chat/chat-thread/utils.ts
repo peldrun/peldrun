@@ -46,6 +46,20 @@ export function parsePromptAndAttachments(
     }
   }
 
+  // [FIX-5.5] Extract @[filename] markers emitted by the composer when the
+  // user selects a file from the `@` typeahead menu. Each marker is moved
+  // into the `attachedFiles` list so it renders as a chip above the message
+  // rather than as inline code (the previous backtick-based behavior).
+  const refPattern = /@\[([^\]]+)\]/g;
+  const refMatches = [...cleanedText.matchAll(refPattern)];
+  for (const m of refMatches) {
+    const refName = m[1].trim();
+    if (refName && !files.some((f) => f.name === refName)) {
+      files.push({ name: refName, path: refName });
+    }
+  }
+  cleanedText = cleanedText.replace(refPattern, "").replace(/\s{2,}/g, " ").trim();
+
   if (cleanedText === "Inspect workspace files:") {
     cleanedText = "";
   }

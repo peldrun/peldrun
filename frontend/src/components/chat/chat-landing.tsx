@@ -96,14 +96,18 @@ export function ChatLanding({
 
   // Dynamically register active built-in agent mentions for autocomplete
   useEffect(() => {
-    const unregisterPeldrun = commandRegistry.registerMentionItem({
-      id: "agent-peldrun",
-      label: "@peldrun",
-      description: "Autonomous Master Agent",
-      category: "agent",
-      insertText: "@peldrun ",
-    });
 
+  const unregisterPeldrun = commandRegistry.registerMentionItem({
+    id: "agent-peldrun",
+    label: "@peldrun",
+    description: "Autonomous Master Agent",
+    category: "agent",
+    insertText: "`peldrun` ",        // ← [FIX-1.5] بدون @
+    mentionToken: "peldrun",          // ← [FIX-1.5] صريح
+    metadata: {
+      agentId: "peldrun",
+    },
+  });
     return () => {
       unregisterPeldrun();
     };

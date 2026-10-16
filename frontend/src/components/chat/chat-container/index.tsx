@@ -513,6 +513,35 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         }
       }
 
+
+            // [FIX-5.7] Merge file references from `context_refs` into the
+      // submitted files list so the UI renders them as chips above the
+      // message. The composer already stripped the markers from the
+      // prompt text, so this is the sole source of truth for chip display.
+      const refsFromOverride: Array<{ relPath?: string; fileName?: string }> =
+        Array.isArray(customOverride?.context_refs)
+          ? customOverride.context_refs
+          : [];
+
+      // [FIX-5.7] Use flatMap instead of map+filter to avoid TypeScript's
+      // type predicate limitation: the produced `{ name, path }` object is
+      // NOT assignable to a type predicate over `AttachedUserFile` (which
+      // declares `path?` as optional). flatMap expresses the same intent
+      // without needing a predicate.
+      const refAttachments: AttachedUserFile[] = refsFromOverride.flatMap(
+        (r) => {
+          const relPath = typeof r?.relPath === "string" ? r.relPath : "";
+          if (!relPath) return [];
+          const fileName =
+            typeof r?.fileName === "string" && r.fileName
+              ? r.fileName
+              : relPath.split("/").pop() || relPath;
+          return [{ name: fileName, path: relPath }];
+        }
+      );
+
+      attachedMetadata = [...attachedMetadata, ...refAttachments];
+
       // Archive the current turn before starting a new one.
       if (submittedPrompt && (finalResult || steps.length > 0)) {
         setHistoryTurns((prev) => [

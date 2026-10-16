@@ -142,6 +142,12 @@ async def list_workspace_files():
     }
 
 
+# [FIX-5.2] When True, files are also mirrored to WORKSPACE_DIR for
+# backward compatibility with tooling that still references it.
+# Set to False once the transition to per-chat storage is complete.
+MIRROR_UPLOADS_TO_WORKSPACE = False
+
+
 @router.post("/upload")
 async def upload_workspace_files(
     files: List[UploadFile] = File(...),
@@ -149,11 +155,30 @@ async def upload_workspace_files(
     job_id: Optional[str] = Form(None),
 ):
     """
-    Upload and persist user attachments into the agent workspace and chat storage.
-    Enforces dual-tier storage for seamless immediate tool inspection and historical archiving.
+    Upload and persist user attachments into the agent's per-chat workspace.
+
+    [FIX-5.2] Single source of truth:
+        Files are written ONLY into `storage/chats/<chat_id>/files/` (or the
+        matching project-scoped path when chat_id belongs to a project).
+        This eliminates state divergence between a mirror copy in
+        `workspace/` and the canonical copy consumed by the agent.
+
+    Backward compatibility:
+        While MIRROR_UPLOADS_TO_WORKSPACE is True, a copy is additionally
+        written to `workspace/`. Once all legacy consumers have migrated,
+        flip the flag to False to make the migration complete.
     """
     if not files:
         raise HTTPException(status_code=400, detail="No files provided for upload")
+
+    # Per-chat storage is the canonical target. Fall back to legacy workspace
+    # only when the client did not provide a chat_id (e.g. ad-hoc uploads).
+    if chat_id:
+        primary_dir = CHATS_DIR / chat_id / "files"
+    else:
+        primary_dir = WORKSPACE_DIR
+
+    primary_dir.mkdir(parents=True, exist_ok=True)
 
     uploaded_records: List[Dict[str, Any]] = []
 
@@ -167,22 +192,26 @@ async def upload_workspace_files(
         try:
             content = await file.read()
 
-            # 1. Primary write to workspace root so agent tools can inspect immediately
-            workspace_target = WORKSPACE_DIR / clean_filename
-            workspace_target.write_bytes(content)
+            # 1. Canonical write (single source of truth).
+            primary_target = primary_dir / clean_filename
+            primary_target.write_bytes(content)
 
-            # 2. Secondary write to chat session storage for historical durability
-            if chat_id:
-                chat_files_dir = CHATS_DIR / chat_id / "files"
-                chat_files_dir.mkdir(parents=True, exist_ok=True)
-                chat_target = chat_files_dir / clean_filename
-                chat_target.write_bytes(content)
+            # 2. Optional mirror for legacy consumers during transition.
+            if (
+                MIRROR_UPLOADS_TO_WORKSPACE
+                and chat_id
+                and primary_dir != WORKSPACE_DIR
+            ):
+                mirror_target = WORKSPACE_DIR / clean_filename
+                mirror_target.write_bytes(content)
 
-            rel_workspace_path = str(workspace_target.relative_to(PROJECT_ROOT)).replace("\\", "/")
+            rel_primary_path = str(
+                primary_target.relative_to(PROJECT_ROOT)
+            ).replace("\\", "/")
 
             uploaded_records.append({
                 "name": clean_filename,
-                "path": rel_workspace_path,
+                "path": rel_primary_path,
                 "size": len(content),
                 "type": detect_file_type(clean_filename),
             })

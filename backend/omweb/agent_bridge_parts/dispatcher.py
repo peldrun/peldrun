@@ -47,6 +47,12 @@ from .state import (
     register_job_task,
 )
 
+from .mention_resolver import (
+    inject_referenced_files,
+    resolve_context_refs,
+    resolve_inline_mentions,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -364,6 +370,19 @@ async def run_instrumented(
         cleanup_job_state(job_id)
         return
 
+    # [FIX-3.4a] Pop structured file references BEFORE merging llm_override
+    # into active_llm, so they never leak into the LLM client configuration.
+    # We shallow-copy llm_override to avoid mutating the caller's dict.
+    context_refs: Optional[List[Dict[str, Any]]] = None
+    if isinstance(llm_override, dict):
+        llm_override = dict(llm_override)
+        context_refs = llm_override.pop("context_refs", None)
+        if context_refs:
+            print(
+                f"[BRIDGE] Resolved {len(context_refs)} context reference(s) "
+                f"for job {job_id}"
+            )
+
     toml_cfg = read_active_toml_config()
     active_llm = dict(toml_cfg.get("llm", {}))
     if llm_override:
@@ -457,9 +476,80 @@ async def run_instrumented(
     resolved_max_tokens = _resolve_model_max_output_tokens(model_name, active_llm)
     active_llm["max_tokens"] = resolved_max_tokens
 
+    # ─────────────────────────────────────────────────────────────────
+    # [FIX-4.2] Resolve user file references and inject their contents
+    # as trusted context BEFORE handing the prompt to the engine.
+    #
+    # Two sources are merged:
+    #   1. `context_refs` — structured refs from the frontend composer.
+    #   2. Inline `@filename` tokens — legacy fallback for manual typing.
+    #
+    # The final prompt passed to the engine already contains the file
+    # contents; the engine itself stays agnostic about mentions.
+    # ─────────────────────────────────────────────────────────────────
+    structured_refs = resolve_context_refs(context_refs, project_dir)
+    cleaned_prompt, inline_refs = resolve_inline_mentions(prompt, project_dir)
+
+    merged_refs: List[Dict[str, Any]] = []
+    seen_refs: set = set()
+    for r in structured_refs + inline_refs:
+        rel = r.get("relPath", "")
+        if rel and rel not in seen_refs:
+            seen_refs.add(rel)
+            merged_refs.append(r)
+
+    final_prompt = inject_referenced_files(
+        cleaned_prompt,
+        merged_refs,
+        project_dir,
+    )
+
+    if merged_refs:
+        print(
+            f"[BRIDGE] Injected {len(merged_refs)} file reference(s) "
+            f"into the prompt for job {job_id}"
+        )
+
+        # [FIX-5.2] Emit an SSE event announcing which refs were successfully
+        # resolved. The frontend uses this to render a "Referenced files"
+        # chip in the timeline, giving the user full transparency into what
+        # the agent was told to look at.
+        #
+        # Payload shape:
+        #   {
+        #     "refs": [
+        #       {"relPath": "...", "fileName": "...", "sizeBytes": 1234},
+        #       ...
+        #     ],
+        #     "count": <int>
+        #   }
+        #
+        # Failures here must never break the run. The event is best-effort.
+        try:
+            await dispatch_event(
+                job_id,
+                SSEEvent(
+                    type=SSEEventType.REFS_RESOLVED,
+                    step=0,
+                    data={
+                        "refs": merged_refs,
+                        "count": len(merged_refs),
+                        "model": model_name,
+                    },
+                ),
+            )
+        except Exception as refs_emit_err:
+            logger.debug(
+                "[BRIDGE] Could not emit refs_resolved event for job %s: %s",
+                job_id,
+                refs_emit_err,
+            )
+    else:
+        final_prompt = cleaned_prompt  # preserve any @-rewrite from inline resolver
+
     context = EngineRunContext(
         job_id=job_id,
-        prompt=prompt,
+        prompt=final_prompt,
         agent_id=agent_id,
         active_llm=active_llm,
         model_name=model_name,
@@ -467,6 +557,7 @@ async def run_instrumented(
         project_dir=project_dir,
         chat_id=chat_id,
         manifest=manifest,
+        context_refs=merged_refs,
     )
 
     try:
@@ -510,6 +601,14 @@ async def run_direct_chat(
 
     print(f"\n[BRIDGE DIRECT CHAT] Initializing metered direct chat for job: {job_id}")
     job_scoped_artifacts.setdefault(job_id, [])
+
+    # [FIX-3.4c] Strip context_refs so they don't leak into the LLM config.
+    # Direct chat currently ignores file references (it doesn't build tool
+    # messages), but we pop them here for symmetry and to keep the LLM client
+    # configuration clean across all dispatch paths.
+    if isinstance(llm_override, dict):
+        llm_override = dict(llm_override)
+        llm_override.pop("context_refs", None)
 
     toml_cfg = read_active_toml_config()
     active_llm = dict(toml_cfg.get("llm", {}))

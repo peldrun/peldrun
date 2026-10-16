@@ -648,11 +648,16 @@ class PeldrunEngine(ExecutionEngine):
             "provider": provider_name,
         }
 
+        # [FIX-5.4] Forward the resolved file references (if any) into the
+        # persisted turn record. `context.context_refs` is populated by the
+        # dispatcher after mention resolution, and is None when the user did
+        # not reference any workspace file for this turn.
         session_usage_summary = project_manager.record_turn_usage(
             chat_id=chat_id,
             turn_id=turn_id,
             turn_usage=turn_usage_dict,
             project_id=workspace_ctx.project_id or "default_project",
+            context_refs=context.context_refs,
         )
 
         all_created = sorted([p for p in known_artifact_paths if p not in files_baseline])

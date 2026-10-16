@@ -55,6 +55,13 @@ class SSEEventType(str, Enum):
     CHILD_RUN_FAILED = "child_run_failed"
     CHILD_RUN_CANCELLED = "child_run_cancelled"
 
+    # Context Resolution Events
+    # [FIX-5.1] Emitted by the dispatcher after the user's file references
+    # (`@filename` mentions) have been resolved against the workspace.
+    # The payload carries the list of refs that passed validation, allowing
+    # the frontend to display a "Referenced files" chip in the timeline.
+    REFS_RESOLVED = "refs_resolved"
+
     # Terminal Events
     FINAL = "final"
     ERROR = "error"

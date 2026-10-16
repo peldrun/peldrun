@@ -31,6 +31,7 @@ import { LexicalEditorComponent } from "./composer/lexical-editor";
 import { LexicalEditorHandle } from "./composer/types";
 import {
   commandRegistry,
+  containsMention,
   getMentionId,
   resolveExecutionDirectives,
   MentionItem,
@@ -125,6 +126,12 @@ export function Composer({
   const [text, setText] = useState("");
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
   const [selectedMentions, setSelectedMentions] = useState<MentionItem[]>([]);
+  // [FIX-2.2] Derive the list of file references from the full mentions list.
+  // This is what gets projected into `context_refs` for the backend.
+  const selectedRefs = useMemo(
+    () => selectedMentions.filter((m) => m.category === "file"),
+    [selectedMentions]
+  );
   const [isDragging, setIsDragging] = useState(false);
   const [metadataVault, setMetadataVault] = useState<Record<string, any>>({});
   const [isExpanded, setIsExpanded] = useState(false);
@@ -164,12 +171,14 @@ export function Composer({
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
+
     const unregisterPeldrun = commandRegistry.registerMentionItem({
       id: "agent-peldrun",
       label: "@peldrun",
       description: "Autonomous Master Agent",
       category: "agent",
-      insertText: "@peldrun ",
+      insertText: "`peldrun` ",
+      mentionToken: "peldrun",
       metadata: {
         agentId: "peldrun",
       },
@@ -185,7 +194,14 @@ export function Composer({
       const item = (event as CustomEvent<MentionItem>).detail;
       if (!item) return;
 
-      if (item.category !== "agent" && item.category !== "tool") {
+      // [FIX-2.1] Accept file category in addition to agent and tool.
+      // File mentions are tracked in `selectedMentions` and later projected
+      // into `context_refs` for the run payload.
+      if (
+        item.category !== "agent" &&
+        item.category !== "tool" &&
+        item.category !== "file"
+      ) {
         return;
       }
 
@@ -384,18 +400,80 @@ export function Composer({
     const currentFiles = [...attachedFiles];
     const currentPayload = getActivePayload(trimmedText);
 
-    backupDraftRef.current = {
-      text: trimmedText,
-      files: currentFiles,
+    // [FIX-5.6] Extract @[filename] references directly from the editor
+    // text. This approach is robust against markdown escaping performed by
+    // Lexical's $convertToMarkdownString (which turns `_` into `\_`, etc.),
+    // and against any other transformation of the marker syntax.
+    const unescapeMarkdown = (s: string): string =>
+      s.replace(/\\([_*[\]()~`>#+\-=|{}.!\\])/g, "$1");
+
+    const extractRefsFromText = (
+      text: string
+    ): Array<{ relPath: string; fileName: string }> => {
+      const refs: Array<{ relPath: string; fileName: string }> = [];
+      const seen = new Set<string>();
+      // [FIX-5.7] Tolerate escaped brackets/underscores produced by
+      // Lexical's markdown serializer: `@\[seafood\_report.md\]`.
+      const re = /@\\?\[((?:[^\\\]]|\\.)+?)\\?\]/g;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(text)) !== null) {
+        const clean = unescapeMarkdown(m[1]).trim();
+        if (!clean || seen.has(clean)) continue;
+        seen.add(clean);
+        refs.push({
+          relPath: clean,
+          fileName: clean.split("/").pop() || clean,
+        });
+      }
+      return refs;
     };
+
+    const textRefs = extractRefsFromText(trimmedText);
+
+    // Fallback: if no marker survived in the text, reconstruct refs from
+    // the structured selections (covers the edge case where the marker was
+    // manually deleted by the user).
+    const fallbackRefs = selectedRefs.flatMap((ref) => {
+      const relPath = ref.metadata?.relPath;
+      if (typeof relPath !== "string" || !relPath.trim()) return [];
+      const fileName = ref.metadata?.fileName;
+      return [
+        {
+          relPath: relPath.trim(),
+          fileName:
+            typeof fileName === "string" && fileName.trim()
+              ? fileName.trim()
+              : relPath.trim().split("/").pop() || relPath.trim(),
+        },
+      ];
+    });
+
+    const contextRefs = textRefs.length > 0 ? textRefs : fallbackRefs;
+
+    // [FIX-5.6] Strip the @[filename] markers from the text before dispatch.
+    // References travel separately via `context_refs`; the prompt text
+    // itself stays clean and human-readable.
+    // [FIX-5.7] Strip both the clean and the escaped forms of the marker.
+    const dispatchText = trimmedText
+      .replace(/@\\?\[(?:[^\\\]]|\\.)+?\\?\]\s*/g, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+
+    // Edge case: if the prompt consisted only of the marker, keep the
+    // original text so we don't send an empty prompt.
+    const finalPromptText = dispatchText || trimmedText;
 
     try {
       setIsSubmitting(true);
 
       const sendResult = onSend(
-        trimmedText,
+        finalPromptText,
         currentFiles.length > 0 ? currentFiles : undefined,
-        currentPayload
+        {
+          ...currentPayload,
+          // [FIX-2.3] Attach structured file references for backend resolution.
+          context_refs: contextRefs.length > 0 ? contextRefs : undefined,
+        }
       );
 
       let acceptedResponse: any = sendResult;

@@ -118,8 +118,18 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
         llm_override["reasoning_effort"] = req.reasoning_effort.strip()
     if req.is_reasoning_model is not None:
         llm_override["is_reasoning_model"] = req.is_reasoning_model
-    if req.generative_ui:
-        llm_override["generative_ui"] = req.generative_ui
+    # [FIX-3.2] Forward structured file references selected by the user via the
+    # `@` typeahead menu. The dispatcher resolves and injects their contents as
+    # trusted context before invoking the agent engine.
+    #
+    # `by_alias=True` preserves the original wire format (camelCase: relPath,
+    # fileName) so that log inspection and network trace correlation remain
+    # straightforward. The dispatcher accepts both camelCase and snake_case.
+    if req.context_refs:
+        llm_override["context_refs"] = [
+            ref.model_dump(by_alias=True, exclude_none=True)
+            for ref in req.context_refs
+        ]
 
     # Resolve session turns and context
     if existing_chat:
