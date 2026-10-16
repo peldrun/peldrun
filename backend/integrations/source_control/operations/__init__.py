@@ -22,6 +22,8 @@ from .models import (
     IdempotencyRecord,
     OperationEvent,
     OperationRecord,
+    OperationState,
+    OperationStatus,
 )
 from .recovery import (
     RecoveryActionKind,
@@ -41,6 +43,8 @@ from .service import (
 __all__ = [
     # Durable Operation and Transition Models
     "VALID_TRANSITIONS",
+    "OperationState",
+    "OperationStatus",
     "OperationRecord",
     "OperationEvent",
     "IdempotencyRecord",

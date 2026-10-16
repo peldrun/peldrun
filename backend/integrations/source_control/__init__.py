@@ -5,29 +5,46 @@ from .capabilities import ProviderCapabilities
 
 # Normalized Errors
 from .errors import (
+    ApprovalInvalidError,
+    ApprovalRequiredError,
     AuthExpiredError,
+    AuthenticationExpiredError,
+    AuthenticationRequiredError,
     AuthRequiredError,
+    CommandTimeoutError,
     ConflictError,
     NetworkError,
     NotFoundError,
+    PathTraversalError,
     PermissionDeniedError,
     ProviderError,
     RateLimitedError,
+    RateLimitExceededError,
     RemoteStateChangedError,
     SourceControlError,
     UnsupportedCapabilityError,
     ValidationError,
+    WorkspaceDirtyError,
 )
 
 # Domain Enums, Models & Policies
 from .domain.enums import (
+    ApprovalDecision,
     FileChangeType,
+    OperationKind,
+    OperationState,
+    OperationStatus,
     ProviderId,
     SourceControlErrorCode,
 )
 from .domain.models import (
+    ApprovalTicket,
     BranchRef,
     ChangeRequestRef,
+    CheckResult,
+    CheckRunRef,
+    CheckSuite,
+    CheckSummaryRef,
     CommitRef,
     DiffSummary,
     FileDiff,
@@ -40,7 +57,12 @@ from .domain.policies import (
 )
 
 # Abstract Ports
-from .ports.auth import AuthPort
+from .ports.auth import (
+    AuthPort,
+    AuthProviderPort,
+    AuthorizationResult,
+    AuthorizationSession,
+)
 from .ports.change_request import ChangeRequestPort
 from .ports.checks import ChecksPort
 from .ports.provider import SourceControlProvider
@@ -59,13 +81,21 @@ from .providers import (
 # Security & Governance
 from .security.approval import (
     ApprovalGate,
-    ApprovalTicket,
+    ApprovalManager,
     compute_diff_sha256,
     get_default_approval_gate,
+    get_default_approval_manager,
 )
 from .security.audit import (
     AuditLogger,
+    SecurityAuditLogger,
     get_default_audit_logger,
+)
+from .security.oauth_flow import (
+    OAuthFlowCoordinator,
+    OAuthSessionManager,
+    get_default_oauth_flow_coordinator,
+    get_default_oauth_session_manager,
 )
 from .security.policy_engine import (
     PolicyEngine,
@@ -82,18 +112,23 @@ from .security.token_service import (
 )
 from .security.vault import (
     CredentialVault,
+    get_credential_vault,
     get_default_vault,
+    set_credential_vault,
+    set_default_vault,
 )
 
 # Operations & Recovery Engine
 from .operations.journal import (
+    InMemoryOperationJournal,
     OperationJournal,
+    SQLiteOperationJournal,
     get_default_operation_journal,
 )
 from .operations.models import (
+    IdempotencyRecord,
     OperationEvent,
     OperationRecord,
-    OperationState,
 )
 from .operations.service import (
     OperationService,
@@ -171,20 +206,32 @@ __all__ = [
     # Error Hierarchy
     "SourceControlError",
     "AuthRequiredError",
+    "AuthenticationRequiredError",
     "AuthExpiredError",
+    "AuthenticationExpiredError",
     "PermissionDeniedError",
     "NotFoundError",
     "RateLimitedError",
+    "RateLimitExceededError",
     "NetworkError",
     "ConflictError",
     "ValidationError",
     "UnsupportedCapabilityError",
     "RemoteStateChangedError",
     "ProviderError",
+    "WorkspaceDirtyError",
+    "ApprovalRequiredError",
+    "ApprovalInvalidError",
+    "PathTraversalError",
+    "CommandTimeoutError",
     # Domain Enums & Policies
     "ProviderId",
     "FileChangeType",
     "SourceControlErrorCode",
+    "OperationKind",
+    "OperationState",
+    "OperationStatus",
+    "ApprovalDecision",
     "is_protected_branch",
     "is_workflow_path",
     # Domain Entities
@@ -195,9 +242,17 @@ __all__ = [
     "ChangeRequestRef",
     "DiffSummary",
     "FileDiff",
+    "CheckRunRef",
+    "CheckSummaryRef",
+    "CheckResult",
+    "CheckSuite",
+    "ApprovalTicket",
     # Abstract Ports
     "SourceControlProvider",
     "AuthPort",
+    "AuthProviderPort",
+    "AuthorizationSession",
+    "AuthorizationResult",
     "RepositoryPort",
     "ChangeRequestPort",
     "ChecksPort",
@@ -208,25 +263,38 @@ __all__ = [
     "register_builtin_providers",
     # Security, Vault & Governance
     "CredentialVault",
+    "get_credential_vault",
+    "set_credential_vault",
     "get_default_vault",
+    "set_default_vault",
     "TokenService",
     "get_default_token_service",
     "ApprovalGate",
-    "ApprovalTicket",
+    "ApprovalManager",
     "compute_diff_sha256",
     "get_default_approval_gate",
+    "get_default_approval_manager",
     "PolicyEngine",
     "get_default_policy_engine",
     "AuditLogger",
+    "SecurityAuditLogger",
     "get_default_audit_logger",
+    "OAuthSessionManager",
+    "OAuthFlowCoordinator",
+    "get_default_oauth_session_manager",
+    "get_default_oauth_flow_coordinator",
     "redact_text",
     "redact_url",
     "redact_data",
     # Operations State Machine & Recovery
     "OperationState",
+    "OperationStatus",
     "OperationRecord",
     "OperationEvent",
+    "IdempotencyRecord",
     "OperationJournal",
+    "InMemoryOperationJournal",
+    "SQLiteOperationJournal",
     "get_default_operation_journal",
     "OperationService",
     "get_default_operation_service",

@@ -3,12 +3,24 @@ from __future__ import annotations
 import json
 import threading
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from ..domain.enums import ProviderId
 from ..errors import AuthenticationExpiredError, AuthenticationRequiredError
 from ..ports.auth import AuthProviderPort, AuthorizationResult
 from .vault import CredentialVault, get_credential_vault
+
+
+class _AwaitableValue:
+    """Helper enabling methods to be invoked either synchronously or with an await expression."""
+
+    def __init__(self, value: Any = None) -> None:
+        self._value = value
+
+    def __await__(self):
+        async def _resolve():
+            return self._value
+        return _resolve().__await__()
 
 
 class TokenService:
@@ -24,61 +36,78 @@ class TokenService:
         self._lock = threading.Lock()
 
     @staticmethod
-    def _key_prefix(provider_id: ProviderId, account_id: str) -> str:
-        clean_account = account_id.strip()
+    def _key_prefix(provider_id: ProviderId, account_id: Optional[str] = None) -> str:
+        clean_account = (account_id or "default").strip()
         return f"{provider_id.value}:{clean_account}"
 
-    def _access_token_key(self, provider_id: ProviderId, account_id: str) -> str:
+    def _access_token_key(self, provider_id: ProviderId, account_id: Optional[str] = None) -> str:
         return f"{self._key_prefix(provider_id, account_id)}:access"
 
-    def _refresh_token_key(self, provider_id: ProviderId, account_id: str) -> str:
+    def _refresh_token_key(self, provider_id: ProviderId, account_id: Optional[str] = None) -> str:
         return f"{self._key_prefix(provider_id, account_id)}:refresh"
 
-    def _metadata_key(self, provider_id: ProviderId, account_id: str) -> str:
+    def _metadata_key(self, provider_id: ProviderId, account_id: Optional[str] = None) -> str:
         return f"{self._key_prefix(provider_id, account_id)}:meta"
 
     def save_tokens(
         self,
         provider_id: ProviderId,
-        account_id: str,
-        auth_result: AuthorizationResult,
-    ) -> None:
-        """Securely stores access and refresh tokens along with expiry metadata in the credential vault."""
+        account_id: Optional[str] = None,
+        auth_result: Optional[AuthorizationResult] = None,
+        *,
+        access_token: Optional[str] = None,
+        refresh_token: Optional[str] = None,
+        expires_at: Optional[datetime] = None,
+        granted_scopes: Sequence[str] = (),
+    ) -> Any:
+        """Securely stores access and refresh tokens in vault (supports both sync and await invocation)."""
+        effective_access = access_token
+        effective_refresh = refresh_token
+        effective_expires = expires_at
+        effective_scopes = list(granted_scopes)
+        token_type = "Bearer"
+
+        if auth_result is not None:
+            effective_access = auth_result.access_token
+            effective_refresh = auth_result.refresh_token or effective_refresh
+            effective_expires = auth_result.expires_at or effective_expires
+            effective_scopes = list(auth_result.granted_scopes) or effective_scopes
+            token_type = auth_result.token_type
+
+        if not effective_access:
+            raise ValueError("An access_token is required to store credentials.")
+
+        clean_account = account_id or "default"
+
         with self._lock:
-            # 1. Store primary access token
-            self._vault.put(
-                self._access_token_key(provider_id, account_id),
-                auth_result.access_token,
-            )
+            # 1. Primary qualified storage key
+            self._vault.put(self._access_token_key(provider_id, clean_account), effective_access)
+            # Secondary generic fallback lookup key
+            self._vault.put(f"{provider_id.value}:access", effective_access)
 
-            # 2. Store optional refresh token
-            if auth_result.refresh_token:
-                self._vault.put(
-                    self._refresh_token_key(provider_id, account_id),
-                    auth_result.refresh_token,
-                )
+            if effective_refresh:
+                self._vault.put(self._refresh_token_key(provider_id, clean_account), effective_refresh)
+                self._vault.put(f"{provider_id.value}:refresh", effective_refresh)
 
-            # 3. Store serializable metadata (expires_at, token_type, granted_scopes)
             meta: dict[str, Any] = {
-                "token_type": auth_result.token_type,
-                "expires_at": (
-                    auth_result.expires_at.isoformat()
-                    if auth_result.expires_at
-                    else None
-                ),
-                "granted_scopes": list(auth_result.granted_scopes),
+                "token_type": token_type,
+                "expires_at": effective_expires.isoformat() if effective_expires else None,
+                "granted_scopes": effective_scopes,
                 "updated_at": datetime.utcnow().isoformat(),
             }
-            self._vault.put(
-                self._metadata_key(provider_id, account_id),
-                json.dumps(meta),
-            )
+            self._vault.put(self._metadata_key(provider_id, clean_account), json.dumps(meta))
+            self._vault.put(f"{provider_id.value}:meta", json.dumps(meta))
+
+        return _AwaitableValue(None)
 
     def get_token_metadata(
-        self, provider_id: ProviderId, account_id: str
+        self, provider_id: ProviderId, account_id: Optional[str] = None
     ) -> Optional[dict[str, Any]]:
-        """Retrieves non-secret token metadata (expiry, scopes) from the vault."""
-        raw_meta = self._vault.get(self._metadata_key(provider_id, account_id))
+        """Retrieves non-secret token metadata from vault."""
+        clean_account = account_id or "default"
+        raw_meta = self._vault.get(self._metadata_key(provider_id, clean_account))
+        if not raw_meta:
+            raw_meta = self._vault.get(f"{provider_id.value}:meta")
         if not raw_meta:
             return None
         try:
@@ -87,18 +116,21 @@ class TokenService:
             return None
 
     def get_refresh_token(
-        self, provider_id: ProviderId, account_id: str
+        self, provider_id: ProviderId, account_id: Optional[str] = None
     ) -> Optional[str]:
         """Retrieves the stored refresh token for the account, if present."""
-        return self._vault.get(self._refresh_token_key(provider_id, account_id))
+        clean_account = account_id or "default"
+        token = self._vault.get(self._refresh_token_key(provider_id, clean_account))
+        if not token:
+            token = self._vault.get(f"{provider_id.value}:refresh")
+        return token
 
     def is_token_expired(
-        self, provider_id: ProviderId, account_id: str
+        self, provider_id: ProviderId, account_id: Optional[str] = None
     ) -> bool:
-        """Determines whether the token is expired or approaching expiry within the configured clock skew window."""
+        """Determines whether the token is expired or approaching expiry."""
         meta = self.get_token_metadata(provider_id, account_id)
         if not meta or not meta.get("expires_at"):
-            # Tokens without explicit expiration (e.g. personal tokens) are treated as active
             return False
 
         try:
@@ -111,32 +143,29 @@ class TokenService:
     async def get_access_token(
         self,
         provider_id: ProviderId,
-        account_id: str,
+        account_id: Optional[str] = None,
         auth_port: Optional[AuthProviderPort] = None,
     ) -> str:
-        """Retrieves a valid access token.
-
-        If the token is expired and an auth provider port is provided with a stored refresh token,
-        it automatically attempts proactive refresh before returning the credential.
-        """
-        access_key = self._access_token_key(provider_id, account_id)
-        access_token = self._vault.get(access_key)
+        """Retrieves a valid access token, performing proactive refresh if expired and possible."""
+        clean_account = account_id or "default"
+        access_token = self._vault.get(self._access_token_key(provider_id, clean_account))
+        if not access_token:
+            access_token = self._vault.get(f"{provider_id.value}:access")
 
         if not access_token:
             raise AuthenticationRequiredError(
-                f"No credentials found for provider '{provider_id.value}' and account '{account_id}'.",
+                f"No credentials found for provider '{provider_id.value}' and account '{clean_account}'.",
                 provider=provider_id.value,
             )
 
-        if not self.is_token_expired(provider_id, account_id):
+        if not self.is_token_expired(provider_id, clean_account):
             return access_token
 
-        # Token is expired or expiring soon; attempt proactive refresh
-        refresh_token = self.get_refresh_token(provider_id, account_id)
+        refresh_token = self.get_refresh_token(provider_id, clean_account)
         if refresh_token and auth_port:
             try:
                 refreshed_result = await auth_port.refresh_access_token(refresh_token)
-                self.save_tokens(provider_id, account_id, refreshed_result)
+                self.save_tokens(provider_id, clean_account, refreshed_result)
                 return refreshed_result.access_token
             except Exception as exc:
                 raise AuthenticationExpiredError(
@@ -144,43 +173,58 @@ class TokenService:
                     provider=provider_id.value,
                 ) from exc
 
-        # Cannot refresh automatically
         raise AuthenticationExpiredError(
             f"Access token for provider '{provider_id.value}' has expired. Re-authentication required.",
             provider=provider_id.value,
         )
 
+    def revoke_tokens(
+        self,
+        provider_id: ProviderId,
+        account_id: Optional[str] = None,
+        auth_port: Optional[AuthProviderPort] = None,
+    ) -> Any:
+        """Revokes token access and deletes vault secrets."""
+        clean_account = account_id or "default"
+        with self._lock:
+            self._vault.delete(self._access_token_key(provider_id, clean_account))
+            self._vault.delete(self._refresh_token_key(provider_id, clean_account))
+            self._vault.delete(self._metadata_key(provider_id, clean_account))
+            self._vault.delete(f"{provider_id.value}:access")
+            self._vault.delete(f"{provider_id.value}:refresh")
+            self._vault.delete(f"{provider_id.value}:meta")
+
+        return _AwaitableValue(True)
+
     async def delete_tokens(
         self,
         provider_id: ProviderId,
-        account_id: str,
+        account_id: Optional[str] = None,
         auth_port: Optional[AuthProviderPort] = None,
     ) -> bool:
-        """Revokes token access remotely where supported and cleans all vault secrets for the account."""
-        access_key = self._access_token_key(provider_id, account_id)
-        refresh_key = self._refresh_token_key(provider_id, account_id)
-        meta_key = self._metadata_key(provider_id, account_id)
-
-        # 1. Attempt remote revocation if provider port and token are available
+        """Revokes token access remotely where supported and cleans all vault secrets."""
+        clean_account = account_id or "default"
         if auth_port:
-            token = self._vault.get(access_key) or self._vault.get(refresh_key)
+            token = (
+                self._vault.get(self._access_token_key(provider_id, clean_account))
+                or self._vault.get(f"{provider_id.value}:access")
+            )
             if token:
                 try:
                     await auth_port.revoke_token(token)
                 except Exception:
                     pass
 
-        # 2. Delete credentials from local vault
-        with self._lock:
-            del_access = self._vault.delete(access_key)
-            self._vault.delete(refresh_key)
-            self._vault.delete(meta_key)
+        self.revoke_tokens(provider_id, clean_account)
+        return True
 
-        return del_access
-
-    def has_token(self, provider_id: ProviderId, account_id: str) -> bool:
-        """Checks whether credentials exist in the vault for the specified provider and account."""
-        return self._vault.get(self._access_token_key(provider_id, account_id)) is not None
+    def has_token(self, provider_id: ProviderId, account_id: Optional[str] = None) -> bool:
+        """Checks whether credentials exist in the vault for the specified provider."""
+        clean_account = account_id or "default"
+        return (
+            self._vault.get(self._access_token_key(provider_id, clean_account)) is not None
+            or self._vault.get(f"{provider_id.value}:access") is not None
+        )
 
 
 # ============================================================
@@ -213,3 +257,11 @@ def reset_default_token_service() -> None:
     global _DEFAULT_TOKEN_SERVICE
     with _SERVICE_LOCK:
         _DEFAULT_TOKEN_SERVICE = None
+
+
+__all__ = [
+    "TokenService",
+    "get_default_token_service",
+    "set_default_token_service",
+    "reset_default_token_service",
+]

@@ -14,6 +14,7 @@ Initializes middleware, static files, and canonical REST routers:
 - /api/setup
 - /api/storage
 - /api/store
+- /api/store/tools/bundles (Tool Bundles Subsystem)
 - /api/telemetry (P1-03D Canonical Analytics & Metering APIs)
 """
 
@@ -41,6 +42,16 @@ from omweb.routers import (
     telemetry,
 )
 
+# Tool Bundles Subsystem router
+from omweb.routers.store import bundles as store_bundles
+
+# Attach the bundle manager to the tool registry so installed bundles
+# are discoverable by the agent runtime.
+from omweb.routers.store.bundles import get_bundle_manager
+from omweb.tools.registry import tool_registry as _tool_registry
+
+_tool_registry.set_bundle_manager(get_bundle_manager())
+
 logger = logging.getLogger("omweb.main")
 
 app = FastAPI(
@@ -59,6 +70,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # Mount Canonical Routers
 app.include_router(chats.router, prefix="/api/chats", tags=["chats"])
 app.include_router(run.router, prefix="/api/run", tags=["run"])
@@ -70,6 +82,11 @@ app.include_router(mcp.router, prefix="/api/mcp", tags=["mcp"])
 app.include_router(setup.router, prefix="/api/setup", tags=["setup"])
 app.include_router(storage.router, prefix="/api/storage", tags=["storage"])
 app.include_router(store_rtr.router, prefix="/api/store", tags=["store"])
+app.include_router(
+    store_bundles.router,
+    prefix="/api/store/tools",
+    tags=["store", "bundles"],
+)
 app.include_router(telemetry.router, prefix="/api/telemetry", tags=["telemetry"])
 
 # Mount Storage Filesystem for Deliverables and Downloads

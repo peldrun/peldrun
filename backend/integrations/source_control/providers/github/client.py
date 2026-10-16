@@ -81,6 +81,11 @@ class GitHubClient:
             await self._session.aclose()
             self._session = None
 
+    def _build_headers(self, token: Optional[str] = None) -> dict[str, str]:
+        """Constructs standard HTTP headers for GitHub REST API requests."""
+        effective_token = token or self.token
+        return self.manifest.build_default_headers(effective_token)
+
     def _resolve_url(self, path_or_url: str) -> str:
         """Resolves relative endpoint path or verifies absolute URL against API host."""
         if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
@@ -95,6 +100,7 @@ class GitHubClient:
         *,
         params: Optional[Mapping[str, Any]] = None,
         json_data: Optional[Any] = None,
+        json: Optional[Any] = None,
         token: Optional[str] = None,
         headers: Optional[Mapping[str, str]] = None,
     ) -> GitHubResponse:
@@ -107,8 +113,9 @@ class GitHubClient:
         session = await self._ensure_session()
         full_url = self._resolve_url(path_or_url)
         effective_token = token or self.token
+        effective_json = json if json is not None else json_data
 
-        request_headers = self.manifest.build_default_headers(effective_token)
+        request_headers = self._build_headers(effective_token)
         if headers:
             request_headers.update(headers)
 
@@ -118,7 +125,7 @@ class GitHubClient:
                 method=method.upper(),
                 url=full_url,
                 params=params,
-                json=json_data,
+                json=effective_json,
                 headers=request_headers,
             )
         except httpx.TimeoutException as exc:
@@ -175,33 +182,39 @@ class GitHubClient:
         path_or_url: str,
         *,
         json_data: Optional[Any] = None,
+        json: Optional[Any] = None,
         token: Optional[str] = None,
         headers: Optional[Mapping[str, str]] = None,
     ) -> GitHubResponse:
         """Convenience POST request."""
-        return await self.request("POST", path_or_url, json_data=json_data, token=token, headers=headers)
+        payload = json if json is not None else json_data
+        return await self.request("POST", path_or_url, json_data=payload, json=payload, token=token, headers=headers)
 
     async def patch(
         self,
         path_or_url: str,
         *,
         json_data: Optional[Any] = None,
+        json: Optional[Any] = None,
         token: Optional[str] = None,
         headers: Optional[Mapping[str, str]] = None,
     ) -> GitHubResponse:
         """Convenience PATCH request."""
-        return await self.request("PATCH", path_or_url, json_data=json_data, token=token, headers=headers)
+        payload = json if json is not None else json_data
+        return await self.request("PATCH", path_or_url, json_data=payload, json=payload, token=token, headers=headers)
 
     async def put(
         self,
         path_or_url: str,
         *,
         json_data: Optional[Any] = None,
+        json: Optional[Any] = None,
         token: Optional[str] = None,
         headers: Optional[Mapping[str, str]] = None,
     ) -> GitHubResponse:
         """Convenience PUT request."""
-        return await self.request("PUT", path_or_url, json_data=json_data, token=token, headers=headers)
+        payload = json if json is not None else json_data
+        return await self.request("PUT", path_or_url, json_data=payload, json=payload, token=token, headers=headers)
 
     async def delete(
         self,

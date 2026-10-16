@@ -55,6 +55,8 @@
     --user-message: #e8f3fe;
     --t-user-message:#0c274a;
     --gigbg: #f5f5f5;
+    --rb:  224.83  72.5% 52.94% ;
+    --rby: 44.83 72.5% 52.94%;
 
     --font-sans: 'DM Sans', sans-serif;
     --font-serif: 'Libre Baskerville', serif;
@@ -98,8 +100,15 @@
     --user-message: #101010;
     --t-user-message:#fff;
     --gigbg: #191919;
+    --rb:  224.83  72.5% 52.94%;
+    --rby: 44.83 72.5% 52.94%;
+
 
   }
+}
+
+:root{
+  --cgood:#54be6f;
 }
 
 @layer base {

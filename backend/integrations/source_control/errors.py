@@ -52,6 +52,25 @@ class SourceControlError(Exception):
         return f"{prefix} {self.message}"
 
 
+class PermissionDeniedError(SourceControlError):
+    """Raised when an operation is rejected due to insufficient privileges or policy denial."""
+
+    def __init__(
+        self,
+        message: str = "Permission denied for the requested repository operation.",
+        *,
+        provider: Optional[str] = None,
+        details: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        super().__init__(
+            message=message,
+            code=SourceControlErrorCode.PERMISSION_DENIED,
+            provider=provider,
+            retryable=False,
+            details=details,
+        )
+
+
 class AuthenticationRequiredError(SourceControlError):
     """Raised when an operation requires an authenticated provider account."""
 
@@ -84,25 +103,6 @@ class AuthenticationExpiredError(SourceControlError):
         super().__init__(
             message=message,
             code=SourceControlErrorCode.AUTH_EXPIRED,
-            provider=provider,
-            retryable=False,
-            details=details,
-        )
-
-
-class PermissionDeniedError(SourceControlError):
-    """Raised when the provider rejects an action due to insufficient token scopes or role."""
-
-    def __init__(
-        self,
-        message: str = "Permission denied for the requested repository operation.",
-        *,
-        provider: Optional[str] = None,
-        details: Optional[Mapping[str, Any]] = None,
-    ) -> None:
-        super().__init__(
-            message=message,
-            code=SourceControlErrorCode.PERMISSION_DENIED,
             provider=provider,
             retryable=False,
             details=details,
@@ -315,7 +315,7 @@ class WorkspaceDirtyError(SourceControlError):
         )
 
 
-class ApprovalRequiredError(SourceControlError):
+class ApprovalRequiredError(PermissionDeniedError):
     """Raised when a mutating operation is attempted without an approved ticket."""
 
     def __init__(
@@ -331,15 +331,14 @@ class ApprovalRequiredError(SourceControlError):
 
         super().__init__(
             message=message,
-            code=SourceControlErrorCode.APPROVAL_REQUIRED,
-            retryable=False,
             details=merged_details,
         )
+        self.code = SourceControlErrorCode.APPROVAL_REQUIRED
         self.operation_id = operation_id
 
 
-class ApprovalInvalidError(SourceControlError):
-    """Raised when an approval ticket is expired, modified, or has an invalid diff hash."""
+class ApprovalInvalidError(PermissionDeniedError):
+    """Raised when an approval ticket is expired, invalidated, or does not match current diff."""
 
     def __init__(
         self,
@@ -349,10 +348,9 @@ class ApprovalInvalidError(SourceControlError):
     ) -> None:
         super().__init__(
             message=message,
-            code=SourceControlErrorCode.APPROVAL_INVALID,
-            retryable=False,
             details=details,
         )
+        self.code = SourceControlErrorCode.APPROVAL_INVALID
 
 
 class PathTraversalError(SourceControlError):
@@ -401,3 +399,32 @@ class CommandTimeoutError(SourceControlError):
         )
         self.command = command
         self.timeout_seconds = timeout_seconds
+
+
+# Canonical aliases ensuring backwards-compatible imports across subsystem packages
+AuthRequiredError = AuthenticationRequiredError
+AuthExpiredError = AuthenticationExpiredError
+RateLimitedError = RateLimitExceededError
+
+__all__ = [
+    "SourceControlError",
+    "AuthenticationRequiredError",
+    "AuthenticationExpiredError",
+    "AuthRequiredError",
+    "AuthExpiredError",
+    "PermissionDeniedError",
+    "NotFoundError",
+    "RateLimitExceededError",
+    "RateLimitedError",
+    "NetworkError",
+    "ConflictError",
+    "RemoteStateChangedError",
+    "ValidationError",
+    "UnsupportedCapabilityError",
+    "ProviderError",
+    "WorkspaceDirtyError",
+    "ApprovalRequiredError",
+    "ApprovalInvalidError",
+    "PathTraversalError",
+    "CommandTimeoutError",
+]

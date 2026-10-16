@@ -5,6 +5,7 @@ from typing import Optional, Sequence
 from ..domain.enums import ProviderId
 from ..ports.provider import SourceControlProvider
 from ..registry import ProviderRegistry, get_default_registry
+from .github import GitHubProviderAdapter
 
 # Manifest list of officially supported provider IDs in this release
 BUILTIN_PROVIDERS: tuple[ProviderId, ...] = (ProviderId.GITHUB,)
@@ -28,15 +29,8 @@ def register_builtin_providers(registry: Optional[ProviderRegistry] = None) -> N
     """
     target_registry = registry or get_default_registry()
 
-    # 1. Register GitHub official adapter
-    try:
-        from .github import GitHubProviderAdapter  # type: ignore[import-not-found]
-
-        if not target_registry.has_provider(ProviderId.GITHUB):
-            target_registry.register(GitHubProviderAdapter())
-    except (ImportError, AttributeError):
-        # Gracefully handle intermediate loading phases during file-by-file assembly
-        pass
+    if not target_registry.has_provider(ProviderId.GITHUB):
+        target_registry.register(GitHubProviderAdapter())
 
 
 __all__ = [
@@ -44,4 +38,5 @@ __all__ = [
     "get_supported_provider_ids",
     "is_provider_supported",
     "register_builtin_providers",
+    "GitHubProviderAdapter",
 ]

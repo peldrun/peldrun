@@ -222,6 +222,23 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     }
   }, [initialJobId, fetchJobDetails]);
 
+  // Listen for file-mention clicks dispatched from the composer. Opens the
+  // referenced file in the workspace panel by selecting it and forcing the
+  // right-hand panel visible.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const ce = e as CustomEvent<{ path?: string; source?: string }>;
+      const path = ce.detail?.path;
+      if (!path) return;
+
+      setSelectedFileForEditor(path);
+      setShowRightPanel(true);
+    };
+    window.addEventListener("peldrun:open-file-in-workspace", handler);
+    return () =>
+      window.removeEventListener("peldrun:open-file-in-workspace", handler);
+  }, [setShowRightPanel]);
+
   // --- Mode / engine handlers ----------------------------------------------
   const handleModeChange = useCallback(
     (newMode: "agent" | "chat") => {
@@ -528,17 +545,24 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       // NOT assignable to a type predicate over `AttachedUserFile` (which
       // declares `path?` as optional). flatMap expresses the same intent
       // without needing a predicate.
-      const refAttachments: AttachedUserFile[] = refsFromOverride.flatMap(
-        (r) => {
-          const relPath = typeof r?.relPath === "string" ? r.relPath : "";
-          if (!relPath) return [];
-          const fileName =
-            typeof r?.fileName === "string" && r.fileName
-              ? r.fileName
-              : relPath.split("/").pop() || relPath;
-          return [{ name: fileName, path: relPath }];
-        }
-      );
+      // [FIX-DEDUP] Deduplicate by canonical path. Even though the composer
+      // now deduplicates `context_refs` before dispatch, this is a defensive
+      // safeguard for older payloads (stale sessionStorage drafts, replays,
+      // or third-party integrations). Each file appears exactly once in the
+      // chip row, mirroring the backend's own deduplication before content
+      // injection.
+      const seenRefPaths = new Set<string>();
+      const refAttachments: AttachedUserFile[] = [];
+      for (const r of refsFromOverride) {
+        const relPath = typeof r?.relPath === "string" ? r.relPath : "";
+        if (!relPath || seenRefPaths.has(relPath)) continue;
+        seenRefPaths.add(relPath);
+        const fileName =
+          typeof r?.fileName === "string" && r.fileName
+            ? r.fileName
+            : relPath.split("/").pop() || relPath;
+        refAttachments.push({ name: fileName, path: relPath });
+      }
 
       attachedMetadata = [...attachedMetadata, ...refAttachments];
 

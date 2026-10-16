@@ -4,7 +4,7 @@ import ctypes
 import os
 import sys
 import threading
-from typing import Optional, Protocol, runtime_checkable
+from typing import Any, Optional, Protocol, runtime_checkable
 
 from ..domain.enums import SourceControlErrorCode
 from ..errors import SourceControlError
@@ -39,8 +39,8 @@ class CredentialVault(Protocol):
         """Retrieves a secret by key. Returns None if key does not exist."""
         ...
 
-    def delete(self, key: str) -> bool:
-        """Deletes a secret by key. Returns True if deleted, False if not found."""
+    def delete(self, key: str) -> Any:
+        """Deletes a secret by key."""
         ...
 
 
@@ -237,10 +237,11 @@ def get_credential_vault() -> CredentialVault:
             except Exception:
                 pass
 
-        # If running in development/headless environment without OS vault, log a warning
-        # and provide InMemory vault with explicit notice.
         _ACTIVE_VAULT = InMemoryCredentialVault()
         return _ACTIVE_VAULT
+
+
+get_default_vault = get_credential_vault
 
 
 def set_credential_vault(vault: CredentialVault) -> None:
@@ -248,3 +249,18 @@ def set_credential_vault(vault: CredentialVault) -> None:
     global _ACTIVE_VAULT
     with _VAULT_LOCK:
         _ACTIVE_VAULT = vault
+
+
+set_default_vault = set_credential_vault
+
+__all__ = [
+    "CredentialVault",
+    "InMemoryCredentialVault",
+    "KeyringCredentialVault",
+    "WindowsNativeCredentialVault",
+    "VaultError",
+    "get_credential_vault",
+    "set_credential_vault",
+    "get_default_vault",
+    "set_default_vault",
+]

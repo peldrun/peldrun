@@ -31,7 +31,6 @@ import { LexicalEditorComponent } from "./composer/lexical-editor";
 import { LexicalEditorHandle } from "./composer/types";
 import {
   commandRegistry,
-  containsMention,
   getMentionId,
   resolveExecutionDirectives,
   MentionItem,
@@ -126,12 +125,6 @@ export function Composer({
   const [text, setText] = useState("");
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
   const [selectedMentions, setSelectedMentions] = useState<MentionItem[]>([]);
-  // [FIX-2.2] Derive the list of file references from the full mentions list.
-  // This is what gets projected into `context_refs` for the backend.
-  const selectedRefs = useMemo(
-    () => selectedMentions.filter((m) => m.category === "file"),
-    [selectedMentions]
-  );
   const [isDragging, setIsDragging] = useState(false);
   const [metadataVault, setMetadataVault] = useState<Record<string, any>>({});
   const [isExpanded, setIsExpanded] = useState(false);
@@ -400,67 +393,34 @@ export function Composer({
     const currentFiles = [...attachedFiles];
     const currentPayload = getActivePayload(trimmedText);
 
-    // [FIX-5.6] Extract @[filename] references directly from the editor
-    // text. This approach is robust against markdown escaping performed by
-    // Lexical's $convertToMarkdownString (which turns `_` into `\_`, etc.),
-    // and against any other transformation of the marker syntax.
-    const unescapeMarkdown = (s: string): string =>
-      s.replace(/\\([_*[\]()~`>#+\-=|{}.!\\])/g, "$1");
+    // Read file mentions directly from the editor node tree. This is the
+    // authoritative source: it preserves the canonical workspace-relative
+    // path of each referenced file, avoiding the lossy basename extraction
+    // that regex-on-text would produce for files in subdirectories.
+    // Read file mentions directly from the editor node tree.
+    const editorMentions: Array<{ display: string; path: string }> =
+      editorRef.current?.getFileMentions?.() ?? [];
 
-    const extractRefsFromText = (
-      text: string
-    ): Array<{ relPath: string; fileName: string }> => {
-      const refs: Array<{ relPath: string; fileName: string }> = [];
-      const seen = new Set<string>();
-      // [FIX-5.7] Tolerate escaped brackets/underscores produced by
-      // Lexical's markdown serializer: `@\[seafood\_report.md\]`.
-      const re = /@\\?\[((?:[^\\\]]|\\.)+?)\\?\]/g;
-      let m: RegExpExecArray | null;
-      while ((m = re.exec(text)) !== null) {
-        const clean = unescapeMarkdown(m[1]).trim();
-        if (!clean || seen.has(clean)) continue;
-        seen.add(clean);
-        refs.push({
-          relPath: clean,
-          fileName: clean.split("/").pop() || clean,
-        });
-      }
-      return refs;
-    };
+    // Deduplicate by canonical path. The user may legitimately reference
+    // the same file at multiple points in the message, but the payload
+    // (and the resulting chip row) must contain each file only once.
+    // This mirrors the deduplication the backend already performs before
+    // injecting file contents into the prompt.
+    const seenPaths = new Set<string>();
+    const contextRefs: Array<{ relPath: string; fileName: string }> = [];
+    for (const m of editorMentions) {
+      const path = m.path.trim();
+      if (!path || seenPaths.has(path)) continue;
+      seenPaths.add(path);
+      const fileName = path.split("/").pop() || path;
+      contextRefs.push({ relPath: path, fileName });
+    }
 
-    const textRefs = extractRefsFromText(trimmedText);
-
-    // Fallback: if no marker survived in the text, reconstruct refs from
-    // the structured selections (covers the edge case where the marker was
-    // manually deleted by the user).
-    const fallbackRefs = selectedRefs.flatMap((ref) => {
-      const relPath = ref.metadata?.relPath;
-      if (typeof relPath !== "string" || !relPath.trim()) return [];
-      const fileName = ref.metadata?.fileName;
-      return [
-        {
-          relPath: relPath.trim(),
-          fileName:
-            typeof fileName === "string" && fileName.trim()
-              ? fileName.trim()
-              : relPath.trim().split("/").pop() || relPath.trim(),
-        },
-      ];
-    });
-
-    const contextRefs = textRefs.length > 0 ? textRefs : fallbackRefs;
-
-    // [FIX-5.6] Strip the @[filename] markers from the text before dispatch.
-    // References travel separately via `context_refs`; the prompt text
-    // itself stays clean and human-readable.
-    // [FIX-5.7] Strip both the clean and the escaped forms of the marker.
     const dispatchText = trimmedText
       .replace(/@\\?\[(?:[^\\\]]|\\.)+?\\?\]\s*/g, "")
       .replace(/\s{2,}/g, " ")
       .trim();
 
-    // Edge case: if the prompt consisted only of the marker, keep the
-    // original text so we don't send an empty prompt.
     const finalPromptText = dispatchText || trimmedText;
 
     try {

@@ -128,6 +128,9 @@ class OAuthSessionManager:
             self._sessions_by_state.clear()
 
 
+# Canonical alias ensuring backwards-compatible imports across subsystem packages
+OAuthFlowCoordinator = OAuthSessionManager
+
 # ============================================================
 # OAuthSessionManager Singleton Accessors
 # ============================================================
@@ -146,11 +149,17 @@ def get_default_oauth_session_manager() -> OAuthSessionManager:
     return _DEFAULT_SESSION_MANAGER
 
 
+get_default_oauth_flow_coordinator = get_default_oauth_session_manager
+
+
 def set_default_oauth_session_manager(manager: OAuthSessionManager) -> None:
     """Explicitly injects an OAuthSessionManager instance (used during testing)."""
     global _DEFAULT_SESSION_MANAGER
     with _OAUTH_LOCK:
         _DEFAULT_SESSION_MANAGER = manager
+
+
+set_default_oauth_flow_coordinator = set_default_oauth_session_manager
 
 
 def reset_default_oauth_session_manager() -> None:
@@ -160,3 +169,20 @@ def reset_default_oauth_session_manager() -> None:
         if _DEFAULT_SESSION_MANAGER is not None:
             _DEFAULT_SESSION_MANAGER.clear()
         _DEFAULT_SESSION_MANAGER = None
+
+
+reset_default_oauth_flow_coordinator = reset_default_oauth_session_manager
+
+__all__ = [
+    "generate_pkce_verifier",
+    "compute_pkce_challenge",
+    "generate_state_token",
+    "OAuthSessionManager",
+    "OAuthFlowCoordinator",
+    "get_default_oauth_session_manager",
+    "get_default_oauth_flow_coordinator",
+    "set_default_oauth_session_manager",
+    "set_default_oauth_flow_coordinator",
+    "reset_default_oauth_session_manager",
+    "reset_default_oauth_flow_coordinator",
+]

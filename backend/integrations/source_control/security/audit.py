@@ -6,6 +6,7 @@ import secrets
 import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 from .redaction import redact_data
@@ -67,7 +68,7 @@ class AuditSink(Protocol):
 
 
 class InMemoryAuditSink:
-    """Thread-safe in-memory audit sink intended for isolated testing and local fast queries."""
+    """Thread-safe in-memory audit sink intended for isolated testing and fast local queries."""
 
     def __init__(self, capacity: int = 1000) -> None:
         self.capacity = capacity
@@ -110,10 +111,10 @@ class InMemoryAuditSink:
 class FileAppendOnlyAuditSink:
     """Persistent, append-only JSON Lines audit file sink."""
 
-    def __init__(self, log_path: str) -> None:
-        self.log_path = log_path
+    def __init__(self, log_path: str | Path) -> None:
+        self.log_path = str(log_path)
         self._lock = threading.Lock()
-        log_dir = os.path.dirname(os.path.abspath(log_path))
+        log_dir = os.path.dirname(os.path.abspath(self.log_path))
         if log_dir and not os.path.exists(log_dir):
             os.makedirs(log_dir, exist_ok=True)
 
@@ -178,8 +179,18 @@ class FileAppendOnlyAuditSink:
 class SecurityAuditLogger:
     """High-level audit logging service coordinating security event emission and sink dispatch."""
 
-    def __init__(self, sink: Optional[AuditSink] = None) -> None:
-        self.sink: AuditSink = sink or InMemoryAuditSink()
+    def __init__(
+        self,
+        sink: Optional[AuditSink] = None,
+        *,
+        log_file_path: Optional[str | Path] = None,
+    ) -> None:
+        if sink is not None:
+            self.sink = sink
+        elif log_file_path is not None:
+            self.sink = FileAppendOnlyAuditSink(log_file_path)
+        else:
+            self.sink = InMemoryAuditSink()
 
     def log(
         self,
@@ -215,7 +226,11 @@ class SecurityAuditLogger:
         return event
 
     def log_auth_attempt(
-        self, provider: str, actor: str, success: bool, details: Optional[Mapping[str, Any]] = None
+        self,
+        provider: str,
+        actor: str,
+        success: bool,
+        details: Optional[Mapping[str, Any]] = None,
     ) -> SecurityAuditEvent:
         return self.log(
             event_type="authentication",
@@ -227,7 +242,10 @@ class SecurityAuditLogger:
         )
 
     def log_auth_revocation(
-        self, provider: str, actor: str, details: Optional[Mapping[str, Any]] = None
+        self,
+        provider: str,
+        actor: str,
+        details: Optional[Mapping[str, Any]] = None,
     ) -> SecurityAuditEvent:
         return self.log(
             event_type="authentication",
@@ -303,9 +321,8 @@ class SecurityAuditLogger:
         )
 
 
-# ============================================================
-# SecurityAuditLogger Singleton Accessors
-# ============================================================
+# Canonical alias ensuring backwards-compatible imports across subsystem packages
+AuditLogger = SecurityAuditLogger
 
 _DEFAULT_AUDIT_LOGGER: Optional[SecurityAuditLogger] = None
 _AUDIT_LOCK = threading.Lock()
@@ -333,3 +350,16 @@ def reset_default_audit_logger() -> None:
     global _DEFAULT_AUDIT_LOGGER
     with _AUDIT_LOCK:
         _DEFAULT_AUDIT_LOGGER = None
+
+
+__all__ = [
+    "SecurityAuditEvent",
+    "AuditSink",
+    "InMemoryAuditSink",
+    "FileAppendOnlyAuditSink",
+    "SecurityAuditLogger",
+    "AuditLogger",
+    "get_default_audit_logger",
+    "set_default_audit_logger",
+    "reset_default_audit_logger",
+]

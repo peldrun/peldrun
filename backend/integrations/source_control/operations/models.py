@@ -3,116 +3,143 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Mapping, Optional
+from enum import Enum
+from typing import Any, Mapping, Optional, Sequence
 
-from ..domain.enums import OperationKind, OperationStatus, ProviderId
 
-# Explicit valid state machine transitions
-VALID_TRANSITIONS: dict[OperationStatus, frozenset[OperationStatus]] = {
-    OperationStatus.CREATED: frozenset({
-        OperationStatus.REPOSITORY_RESOLVED,
-        OperationStatus.BLOCKED,
-        OperationStatus.CANCEL_REQUESTED,
-        OperationStatus.CANCELLED,
-        OperationStatus.FAILED_FINAL,
+class OperationState(str, Enum):
+    """Authoritative lifecycle states for source control operations."""
+
+    CREATED = "created"
+    REPOSITORY_RESOLVED = "repository_resolved"
+    WORKSPACE_READY = "workspace_ready"
+    EDITING = "editing"
+    CHECKING = "checking"
+    REVIEW_REQUIRED = "review_required"
+    STALE_REVIEW_REQUIRED = "stale_review_required"
+    APPROVED = "approved"
+    PUSHING = "pushing"
+    PUSHED = "pushed"
+    CHANGE_REQUEST_CREATED = "change_request_created"
+    FAILED_RETRYABLE = "failed_retryable"
+    CANCEL_REQUESTED = "cancel_requested"
+    COMPLETED = "completed"
+    BLOCKED = "blocked"
+    CANCELLED = "cancelled"
+    FAILED_FINAL = "failed_final"
+
+
+# Canonical alias ensuring backwards compatibility across subsystems
+OperationStatus = OperationState
+
+# Valid state machine transitions governing operation lifecycle
+VALID_TRANSITIONS: dict[OperationState, frozenset[OperationState]] = {
+    OperationState.CREATED: frozenset({
+        OperationState.REPOSITORY_RESOLVED,
+        OperationState.WORKSPACE_READY,
+        OperationState.BLOCKED,
+        OperationState.CANCEL_REQUESTED,
+        OperationState.CANCELLED,
+        OperationState.FAILED_FINAL,
     }),
-    OperationStatus.REPOSITORY_RESOLVED: frozenset({
-        OperationStatus.WORKSPACE_READY,
-        OperationStatus.BLOCKED,
-        OperationStatus.CANCEL_REQUESTED,
-        OperationStatus.CANCELLED,
-        OperationStatus.FAILED_RETRYABLE,
-        OperationStatus.FAILED_FINAL,
+    OperationState.REPOSITORY_RESOLVED: frozenset({
+        OperationState.WORKSPACE_READY,
+        OperationState.BLOCKED,
+        OperationState.CANCEL_REQUESTED,
+        OperationState.CANCELLED,
+        OperationState.FAILED_RETRYABLE,
+        OperationState.FAILED_FINAL,
     }),
-    OperationStatus.WORKSPACE_READY: frozenset({
-        OperationStatus.EDITING,
-        OperationStatus.CHECKING,
-        OperationStatus.REVIEW_REQUIRED,
-        OperationStatus.BLOCKED,
-        OperationStatus.CANCEL_REQUESTED,
-        OperationStatus.CANCELLED,
-        OperationStatus.FAILED_RETRYABLE,
-        OperationStatus.FAILED_FINAL,
+    OperationState.WORKSPACE_READY: frozenset({
+        OperationState.EDITING,
+        OperationState.CHECKING,
+        OperationState.REVIEW_REQUIRED,
+        OperationState.BLOCKED,
+        OperationState.CANCEL_REQUESTED,
+        OperationState.CANCELLED,
+        OperationState.FAILED_RETRYABLE,
+        OperationState.FAILED_FINAL,
     }),
-    OperationStatus.EDITING: frozenset({
-        OperationStatus.CHECKING,
-        OperationStatus.REVIEW_REQUIRED,
-        OperationStatus.WORKSPACE_READY,
-        OperationStatus.BLOCKED,
-        OperationStatus.CANCEL_REQUESTED,
-        OperationStatus.CANCELLED,
-        OperationStatus.FAILED_RETRYABLE,
-        OperationStatus.FAILED_FINAL,
+    OperationState.EDITING: frozenset({
+        OperationState.CHECKING,
+        OperationState.REVIEW_REQUIRED,
+        OperationState.WORKSPACE_READY,
+        OperationState.BLOCKED,
+        OperationState.CANCEL_REQUESTED,
+        OperationState.CANCELLED,
+        OperationState.FAILED_RETRYABLE,
+        OperationState.FAILED_FINAL,
     }),
-    OperationStatus.CHECKING: frozenset({
-        OperationStatus.REVIEW_REQUIRED,
-        OperationStatus.EDITING,
-        OperationStatus.BLOCKED,
-        OperationStatus.CANCEL_REQUESTED,
-        OperationStatus.CANCELLED,
-        OperationStatus.FAILED_RETRYABLE,
-        OperationStatus.FAILED_FINAL,
+    OperationState.CHECKING: frozenset({
+        OperationState.REVIEW_REQUIRED,
+        OperationState.EDITING,
+        OperationState.WORKSPACE_READY,
+        OperationState.BLOCKED,
+        OperationState.CANCEL_REQUESTED,
+        OperationState.CANCELLED,
+        OperationState.FAILED_RETRYABLE,
+        OperationState.FAILED_FINAL,
     }),
-    OperationStatus.REVIEW_REQUIRED: frozenset({
-        OperationStatus.APPROVED,
-        OperationStatus.STALE_REVIEW_REQUIRED,
-        OperationStatus.BLOCKED,
-        OperationStatus.CANCEL_REQUESTED,
-        OperationStatus.CANCELLED,
-        OperationStatus.FAILED_FINAL,
+    OperationState.REVIEW_REQUIRED: frozenset({
+        OperationState.APPROVED,
+        OperationState.STALE_REVIEW_REQUIRED,
+        OperationState.BLOCKED,
+        OperationState.CANCEL_REQUESTED,
+        OperationState.CANCELLED,
+        OperationState.FAILED_FINAL,
     }),
-    OperationStatus.STALE_REVIEW_REQUIRED: frozenset({
-        OperationStatus.REVIEW_REQUIRED,
-        OperationStatus.BLOCKED,
-        OperationStatus.CANCEL_REQUESTED,
-        OperationStatus.CANCELLED,
-        OperationStatus.FAILED_FINAL,
+    OperationState.STALE_REVIEW_REQUIRED: frozenset({
+        OperationState.REVIEW_REQUIRED,
+        OperationState.BLOCKED,
+        OperationState.CANCEL_REQUESTED,
+        OperationState.CANCELLED,
+        OperationState.FAILED_FINAL,
     }),
-    OperationStatus.APPROVED: frozenset({
-        OperationStatus.PUSHING,
-        OperationStatus.STALE_REVIEW_REQUIRED,
-        OperationStatus.BLOCKED,
-        OperationStatus.CANCEL_REQUESTED,
-        OperationStatus.CANCELLED,
-        OperationStatus.FAILED_FINAL,
+    OperationState.APPROVED: frozenset({
+        OperationState.PUSHING,
+        OperationState.PUSHED,
+        OperationState.STALE_REVIEW_REQUIRED,
+        OperationState.BLOCKED,
+        OperationState.CANCEL_REQUESTED,
+        OperationState.CANCELLED,
+        OperationState.FAILED_FINAL,
     }),
-    OperationStatus.PUSHING: frozenset({
-        OperationStatus.PUSHED,
-        OperationStatus.FAILED_RETRYABLE,
-        OperationStatus.FAILED_FINAL,
+    OperationState.PUSHING: frozenset({
+        OperationState.PUSHED,
+        OperationState.FAILED_RETRYABLE,
+        OperationState.FAILED_FINAL,
     }),
-    OperationStatus.PUSHED: frozenset({
-        OperationStatus.CHANGE_REQUEST_CREATED,
-        OperationStatus.COMPLETED,
-        OperationStatus.FAILED_RETRYABLE,
-        OperationStatus.FAILED_FINAL,
+    OperationState.PUSHED: frozenset({
+        OperationState.CHANGE_REQUEST_CREATED,
+        OperationState.COMPLETED,
+        OperationState.FAILED_RETRYABLE,
+        OperationState.FAILED_FINAL,
     }),
-    OperationStatus.CHANGE_REQUEST_CREATED: frozenset({
-        OperationStatus.COMPLETED,
-        OperationStatus.FAILED_FINAL,
+    OperationState.CHANGE_REQUEST_CREATED: frozenset({
+        OperationState.COMPLETED,
+        OperationState.FAILED_FINAL,
     }),
-    OperationStatus.FAILED_RETRYABLE: frozenset({
-        OperationStatus.REPOSITORY_RESOLVED,
-        OperationStatus.WORKSPACE_READY,
-        OperationStatus.CHECKING,
-        OperationStatus.PUSHING,
-        OperationStatus.CANCEL_REQUESTED,
-        OperationStatus.CANCELLED,
-        OperationStatus.FAILED_FINAL,
+    OperationState.FAILED_RETRYABLE: frozenset({
+        OperationState.REPOSITORY_RESOLVED,
+        OperationState.WORKSPACE_READY,
+        OperationState.CHECKING,
+        OperationState.PUSHING,
+        OperationState.CANCEL_REQUESTED,
+        OperationState.CANCELLED,
+        OperationState.FAILED_FINAL,
     }),
-    OperationStatus.CANCEL_REQUESTED: frozenset({
-        OperationStatus.CANCELLED,
-        OperationStatus.FAILED_FINAL,
+    OperationState.CANCEL_REQUESTED: frozenset({
+        OperationState.CANCELLED,
+        OperationState.FAILED_FINAL,
     }),
-    # Terminal states have no outbound transitions
-    OperationStatus.COMPLETED: frozenset(),
-    OperationStatus.BLOCKED: frozenset({
-        OperationStatus.REVIEW_REQUIRED,
-        OperationStatus.CANCEL_REQUESTED,
-        OperationStatus.CANCELLED,
+    OperationState.COMPLETED: frozenset(),
+    OperationState.BLOCKED: frozenset({
+        OperationState.REVIEW_REQUIRED,
+        OperationState.CANCEL_REQUESTED,
+        OperationState.CANCELLED,
     }),
-    OperationStatus.CANCELLED: frozenset(),
-    OperationStatus.FAILED_FINAL: frozenset(),
+    OperationState.CANCELLED: frozenset(),
+    OperationState.FAILED_FINAL: frozenset(),
 }
 
 
@@ -121,36 +148,84 @@ class OperationEvent:
     """Immutable transition record in the durable operation journal."""
 
     event_id: str
-    operation_id: str
-    from_status: Optional[OperationStatus]
-    to_status: OperationStatus
-    message: str
+    to_state: OperationState = OperationState.CREATED
+    from_state: Optional[OperationState] = None
     timestamp: datetime = field(default_factory=datetime.utcnow)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    operation_id: Optional[str] = None
+    message: str = ""
+    from_status: Optional[OperationState] = None
+    to_status: Optional[OperationState] = None
     details: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        effective_to = self.to_status if self.to_status is not None else self.to_state
+        object.__setattr__(self, "to_state", effective_to)
+        object.__setattr__(self, "to_status", effective_to)
+
+        effective_from = self.from_status if self.from_status is not None else self.from_state
+        object.__setattr__(self, "from_state", effective_from)
+        object.__setattr__(self, "from_status", effective_from)
+
+        merged_meta = dict(self.details) if self.details else dict(self.metadata)
+        object.__setattr__(self, "metadata", merged_meta)
+        object.__setattr__(self, "details", merged_meta)
+
     def to_dict(self) -> dict[str, Any]:
-        """Serializes the operation event to a JSON-compatible dictionary."""
+        """Serializes the event record to a JSON-safe dictionary."""
+        to_val = self.to_state.value if hasattr(self.to_state, "value") else str(self.to_state)
+        from_val = (
+            self.from_state.value
+            if self.from_state and hasattr(self.from_state, "value")
+            else (str(self.from_state) if self.from_state else None)
+        )
         return {
             "event_id": self.event_id,
             "operation_id": self.operation_id,
-            "from_status": self.from_status.value if self.from_status else None,
-            "to_status": self.to_status.value,
+            "from_state": from_val,
+            "to_state": to_val,
+            "from_status": from_val,
+            "to_status": to_val,
+            "state": to_val,
             "message": self.message,
-            "timestamp": self.timestamp.isoformat(),
+            "timestamp": self.timestamp.isoformat() if isinstance(self.timestamp, datetime) else str(self.timestamp),
+            "metadata": self.metadata,
             "details": self.details,
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> OperationEvent:
         """Constructs an OperationEvent from a dictionary record."""
+        raw_to = data.get("to_state") or data.get("to_status") or data.get("state") or "created"
+        raw_from = data.get("from_state") or data.get("from_status")
+        try:
+            to_state = OperationState(str(raw_to))
+        except ValueError:
+            to_state = OperationState.CREATED
+
+        from_state = None
+        if raw_from:
+            try:
+                from_state = OperationState(str(raw_from))
+            except ValueError:
+                from_state = None
+
+        ts = (
+            datetime.fromisoformat(data["timestamp"])
+            if "timestamp" in data and isinstance(data["timestamp"], str)
+            else (data.get("timestamp") or datetime.utcnow())
+        )
+        meta = dict(data.get("metadata") or data.get("details") or {})
+
         return cls(
             event_id=str(data["event_id"]),
-            operation_id=str(data["operation_id"]),
-            from_status=OperationStatus(data["from_status"]) if data.get("from_status") else None,
-            to_status=OperationStatus(data["to_status"]),
+            to_state=to_state,
+            from_state=from_state,
+            timestamp=ts,
+            metadata=meta,
+            operation_id=data.get("operation_id"),
             message=str(data.get("message", "")),
-            timestamp=datetime.fromisoformat(data["timestamp"]) if "timestamp" in data else datetime.utcnow(),
-            details=dict(data.get("details", {})),
+            details=meta,
         )
 
 
@@ -197,50 +272,71 @@ class OperationRecord:
     """Primary durable model representing an active or completed source control operation."""
 
     operation_id: str
-    repository_id: str
-    provider: ProviderId
-    kind: OperationKind
-    status: OperationStatus = OperationStatus.CREATED
+    repository_id: str = ""
+    operation_type: str = "push_branch"
+    provider: Any = "github"
+    target_branch: str = ""
+    current_state: OperationState = OperationState.CREATED
+    workspace_id: Optional[str] = None
     run_id: Optional[str] = None
     source_branch: Optional[str] = None
-    target_branch: Optional[str] = None
     base_sha: Optional[str] = None
     head_sha: Optional[str] = None
     diff_sha256: Optional[str] = None
-    workspace_id: Optional[str] = None
     approval_id: Optional[str] = None
     commit_message: Optional[str] = None
     change_request_title: Optional[str] = None
     change_request_body: Optional[str] = None
     change_request_url: Optional[str] = None
     error_details: Optional[dict[str, Any]] = None
+    events: tuple[OperationEvent, ...] = ()
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
     completed_at: Optional[datetime] = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    kind: Optional[Any] = None
+    status: Optional[OperationState] = None
+
+    def __post_init__(self) -> None:
+        effective_state = self.status if self.status is not None else self.current_state
+        object.__setattr__(self, "current_state", effective_state)
+        object.__setattr__(self, "status", effective_state)
+
+        effective_kind = self.kind if self.kind is not None else self.operation_type
+        kind_str = effective_kind.value if hasattr(effective_kind, "value") else str(effective_kind)
+        object.__setattr__(self, "operation_type", kind_str)
+        object.__setattr__(self, "kind", effective_kind)
+
+        if isinstance(self.events, list):
+            object.__setattr__(self, "events", tuple(self.events))
 
     @property
     def is_terminal(self) -> bool:
         """Returns True if the operation has reached a final, immutable lifecycle state."""
-        return self.status in {
-            OperationStatus.COMPLETED,
-            OperationStatus.CANCELLED,
-            OperationStatus.FAILED_FINAL,
+        return self.current_state in {
+            OperationState.COMPLETED,
+            OperationState.CANCELLED,
+            OperationState.FAILED_FINAL,
         }
 
-    def can_transition_to(self, target_status: OperationStatus) -> bool:
-        """Validates whether a transition from current status to target status is permitted."""
-        allowed = VALID_TRANSITIONS.get(self.status, frozenset())
-        return target_status in allowed
+    def can_transition_to(self, target_state: OperationState) -> bool:
+        """Validates whether a transition from current state to target state is permitted."""
+        allowed = VALID_TRANSITIONS.get(self.current_state, frozenset())
+        return target_state in allowed
 
     def to_dict(self) -> dict[str, Any]:
         """Serializes the OperationRecord to a JSON-compatible dictionary."""
+        provider_val = self.provider.value if hasattr(self.provider, "value") else str(self.provider)
+        state_val = self.current_state.value if hasattr(self.current_state, "value") else str(self.current_state)
+
         return {
             "operation_id": self.operation_id,
+            "operation_type": self.operation_type,
             "repository_id": self.repository_id,
-            "provider": self.provider.value,
-            "kind": self.kind.value,
-            "status": self.status.value,
+            "provider": provider_val,
+            "kind": self.operation_type,
+            "current_state": state_val,
+            "status": state_val,
             "run_id": self.run_id,
             "source_branch": self.source_branch,
             "target_branch": self.target_branch,
@@ -254,36 +350,78 @@ class OperationRecord:
             "change_request_body": self.change_request_body,
             "change_request_url": self.change_request_url,
             "error_details": self.error_details,
-            "created_at": self.created_at.isoformat(),
-            "updated_at": self.updated_at.isoformat(),
-            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "events": [e.to_dict() if hasattr(e, "to_dict") else dict(e) for e in self.events],
+            "created_at": self.created_at.isoformat() if isinstance(self.created_at, datetime) else str(self.created_at),
+            "updated_at": self.updated_at.isoformat() if isinstance(self.updated_at, datetime) else str(self.updated_at),
+            "completed_at": self.completed_at.isoformat() if isinstance(self.completed_at, datetime) else (str(self.completed_at) if self.completed_at else None),
             "metadata": self.metadata,
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> OperationRecord:
         """Constructs an OperationRecord from a dictionary."""
+        state_str = str(data.get("current_state") or data.get("status") or "created")
+        try:
+            state = OperationState(state_str)
+        except ValueError:
+            state = OperationState.CREATED
+
+        raw_events = data.get("events", [])
+        events_list: list[OperationEvent] = []
+        if isinstance(raw_events, (list, tuple)):
+            for ev in raw_events:
+                if isinstance(ev, OperationEvent):
+                    events_list.append(ev)
+                elif isinstance(ev, dict):
+                    events_list.append(OperationEvent.from_dict(ev))
+
+        created_at = (
+            datetime.fromisoformat(data["created_at"])
+            if "created_at" in data and isinstance(data["created_at"], str)
+            else (data.get("created_at") or datetime.utcnow())
+        )
+        updated_at = (
+            datetime.fromisoformat(data["updated_at"])
+            if "updated_at" in data and isinstance(data["updated_at"], str)
+            else (data.get("updated_at") or datetime.utcnow())
+        )
+        completed_at = (
+            datetime.fromisoformat(data["completed_at"])
+            if data.get("completed_at") and isinstance(data["completed_at"], str)
+            else data.get("completed_at")
+        )
+
         return cls(
             operation_id=str(data["operation_id"]),
-            repository_id=str(data["repository_id"]),
-            provider=ProviderId(data["provider"]),
-            kind=OperationKind(data["kind"]),
-            status=OperationStatus(data.get("status", OperationStatus.CREATED.value)),
-            run_id=data.get("run_id"),
+            repository_id=str(data.get("repository_id", "")),
+            operation_type=str(data.get("operation_type") or data.get("kind") or "push_branch"),
+            provider=str(data.get("provider", "github")),
+            target_branch=str(data.get("target_branch", "")),
+            current_state=state,
+            workspace_id=data.get("workspace_id"),
             source_branch=data.get("source_branch"),
-            target_branch=data.get("target_branch"),
             base_sha=data.get("base_sha"),
             head_sha=data.get("head_sha"),
             diff_sha256=data.get("diff_sha256"),
-            workspace_id=data.get("workspace_id"),
             approval_id=data.get("approval_id"),
             commit_message=data.get("commit_message"),
             change_request_title=data.get("change_request_title"),
             change_request_body=data.get("change_request_body"),
             change_request_url=data.get("change_request_url"),
             error_details=dict(data["error_details"]) if data.get("error_details") else None,
-            created_at=datetime.fromisoformat(data["created_at"]) if "created_at" in data else datetime.utcnow(),
-            updated_at=datetime.fromisoformat(data["updated_at"]) if "updated_at" in data else datetime.utcnow(),
-            completed_at=datetime.fromisoformat(data["completed_at"]) if data.get("completed_at") else None,
+            events=tuple(events_list),
+            created_at=created_at,
+            updated_at=updated_at,
+            completed_at=completed_at,
             metadata=dict(data.get("metadata", {})),
         )
+
+
+__all__ = [
+    "OperationState",
+    "OperationStatus",
+    "VALID_TRANSITIONS",
+    "OperationRecord",
+    "OperationEvent",
+    "IdempotencyRecord",
+]

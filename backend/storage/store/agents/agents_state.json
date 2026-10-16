@@ -1,3 +1,5 @@
 {
-  "analyst": "active"
+  "analyst": "active",
+  "code_architect": "disabled",
+  "data_scientist": "active"
 }

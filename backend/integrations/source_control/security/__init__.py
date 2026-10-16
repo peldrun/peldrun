@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 from .approval import (
+    ApprovalGate,
     ApprovalManager,
+    ApprovalTicket,
     compute_diff_sha256,
+    get_default_approval_gate,
     get_default_approval_manager,
+    reset_default_approval_gate,
     reset_default_approval_manager,
+    set_default_approval_gate,
     set_default_approval_manager,
 )
 from .audit import (
+    AuditLogger,
     AuditSink,
     FileAppendOnlyAuditSink,
     InMemoryAuditSink,
@@ -51,7 +57,9 @@ from .vault import (
     VaultError,
     WindowsNativeCredentialVault,
     get_credential_vault,
+    get_default_vault,
     set_credential_vault,
+    set_default_vault,
 )
 
 __all__ = [
@@ -63,6 +71,8 @@ __all__ = [
     "VaultError",
     "get_credential_vault",
     "set_credential_vault",
+    "get_default_vault",
+    "set_default_vault",
     # Redaction Utilities
     "SENSITIVE_KEYS",
     "redact_url",
@@ -70,9 +80,14 @@ __all__ = [
     "redact_data",
     # Approval Gate
     "compute_diff_sha256",
+    "ApprovalTicket",
+    "ApprovalGate",
     "ApprovalManager",
+    "get_default_approval_gate",
     "get_default_approval_manager",
+    "set_default_approval_gate",
     "set_default_approval_manager",
+    "reset_default_approval_gate",
     "reset_default_approval_manager",
     # Policy Engine
     "PolicyEngine",
@@ -98,6 +113,7 @@ __all__ = [
     "InMemoryAuditSink",
     "FileAppendOnlyAuditSink",
     "SecurityAuditLogger",
+    "AuditLogger",
     "get_default_audit_logger",
     "set_default_audit_logger",
     "reset_default_audit_logger",

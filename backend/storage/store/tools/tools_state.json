@@ -4,5 +4,6 @@
   "str_replace_editor": true,
   "web_search": true,
   "browser_use": true,
-  "ask_human": true
+  "ask_human": true,
+  "file_saver": true
 }

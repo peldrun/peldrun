@@ -72,6 +72,11 @@ class MockHTTPResponse:
         return self._json_data
 
     @property
+    def data(self) -> Any:
+        """Exposes raw parsed payload matching GitHubResponse contract."""
+        return self._json_data
+
+    @property
     def text(self) -> str:
         if isinstance(self._json_data, dict) and "message" in self._json_data:
             return self._json_data["message"]

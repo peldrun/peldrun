@@ -37,10 +37,23 @@ import {
   Loader2,
   Upload,
   FileCode2,
-  FileText
+  FileText,
+  FileArchive,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ToastContainer, showToast } from "@/components/ui/ToastNotification";
+
+
+import { BundleUploadModal } from "@/components/store/BundleUploadModal";
+import { BundleCard } from "@/components/store/BundleCard";
+import { BundleDetailsDrawer } from "@/components/store/BundleDetailsDrawer";
+import {
+  BundleEntry,
+  deleteBundle as apiDeleteBundle,
+  listBundles,
+  activateVersion as apiActivateVersion,
+} from "@/lib/bundleApi";
+
 
 export default function StoresPage() {
   const router = useRouter();
@@ -49,6 +62,9 @@ export default function StoresPage() {
   const [activeTab, setActiveTab] = useState<"agents" | "tools" | "extensions">("agents");
   const [agents, setAgents] = useState<AgentManifest[]>([]);
   const [tools, setTools] = useState<ToolDefinition[]>([]);
+  const [bundles, setBundles] = useState<BundleEntry[]>([]);
+  const [isBundleUploadOpen, setIsBundleUploadOpen] = useState(false);
+  const [detailsBundle, setDetailsBundle] = useState<BundleEntry | null>(null);
   const [extensions, setExtensions] = useState<ExtensionDefinition[]>([]);
   const [loading, setLoading] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -89,24 +105,26 @@ export default function StoresPage() {
     return endpoint;
   };
 
-  const loadData = async () => {
-    setLoading(true);
-    try {
-      const [ag, tl, ex] = await Promise.all([
-        fetchStoreAgents(),
-        fetchStoreTools(),
-        fetchStoreExtensions()
-      ]);
-      setAgents(ag || []);
-      setTools(tl || []);
-      setExtensions(ex || []);
-    } catch (err: any) {
-      console.error("Failed to load store catalog:", err);
-      showToast.error("Store Load Error", err.message || "Failed to load store catalog.");
-    } finally {
-      setLoading(false);
-    }
-  };
+const loadData = async () => {
+  setLoading(true);
+  try {
+    const [ag, tl, ex, bd] = await Promise.all([
+      fetchStoreAgents(),
+      fetchStoreTools(),
+      fetchStoreExtensions(),
+      listBundles().catch(() => [] as BundleEntry[]),
+    ]);
+    setAgents(ag || []);
+    setTools(tl || []);
+    setExtensions(ex || []);
+    setBundles(bd || []);
+  } catch (err: any) {
+    console.error("Failed to load store catalog:", err);
+    showToast.error("Store Load Error", err.message || "Failed to load store catalog.");
+  } finally {
+    setLoading(false);
+  }
+};
 
   useEffect(() => {
     loadData();
@@ -198,6 +216,41 @@ export default function StoresPage() {
     }
   };
 
+  // ----------------------------------------------------------------
+// Bundle lifecycle handlers
+// ----------------------------------------------------------------
+
+const handleBundleDelete = async (bundle: BundleEntry) => {
+  const hasMultipleVersions = bundle.installed_versions.length > 1;
+  const confirmed = confirm(
+    hasMultipleVersions
+      ? `Delete ALL versions of bundle '${bundle.id}'? This cannot be undone.`
+      : `Delete bundle '${bundle.id}' v${bundle.active_version}?`
+  );
+  if (!confirmed) return;
+
+  try {
+    await apiDeleteBundle(bundle.id, hasMultipleVersions);
+    showToast.success("Bundle Deleted", `${bundle.id} removed.`);
+    loadData();
+  } catch (err: any) {
+    showToast.error("Delete Failed", err.message || "Could not delete bundle.");
+  }
+};
+
+const handleBundleActivate = async (bundle: BundleEntry, version: string) => {
+  try {
+    await apiActivateVersion(bundle.id, version);
+    showToast.success("Version Activated", `${bundle.id} → v${version}`);
+    loadData();
+    // Refresh drawer if open
+    if (detailsBundle && detailsBundle.id === bundle.id) {
+      setDetailsBundle({ ...bundle, active_version: version });
+    }
+  } catch (err: any) {
+    showToast.error("Activation Failed", err.message || "Could not activate.");
+  }
+};
   // Extension Toggle Action
   const handleToggleExtension = async (extId: string) => {
     setTogglingExtId(extId);
@@ -438,10 +491,10 @@ export default function StoresPage() {
       <ToastContainer />
 
       {/* Header Bar */}
-      <header className="w-full border-b border-border bg-card/80 backdrop-blur-md sticky top-0 z-10">
+      <header className="w-full border-b border-border bg-custom backdrop-blur-md sticky top-0 z-10">
         <div className="mx-auto w-full px-4 sm:px-6 lg:px-8 py-3.5 flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <div className="p-2 rounded-xl bg-primary/10 text-primary border border-primary/20 shadow-xs">
+            <div className="p-2 rounded-sm bg-primary/10 text-primary border border-primary/20 shadow-xs">
               <Store className="h-5 w-5" />
             </div>
             <div>
@@ -475,7 +528,8 @@ export default function StoresPage() {
               <Button
                 size="sm"
                 onClick={handleOpenCreateAgentModal}
-                className="bg-primary hover:bg-primary/90 text-primary hover:text-primary-foreground font-medium text-xs shadow-xs h-8 px-3.5 transition cursor-pointer"
+
+                className="primary bg-rb hover:bg-rb/60 text-primary-foreground hover:text-card font-medium text-xs shadow-xs h-8 px-3.5 transition cursor-pointer"
               >
                 <Plus size={14} className="mr-1.5" />
                 New Agent
@@ -483,18 +537,29 @@ export default function StoresPage() {
             )}
 
             {activeTab === "tools" && (
-              <Button
-                size="sm"
-                onClick={() => {
-                  setUploadCategory("tool");
-                  setSelectedUploadFile(null);
-                  setIsUploadModalOpen(true);
-                }}
-                className="bg-primary hover:bg-primary/90 text-primary hover:text-primary-foreground font-medium text-xs shadow-xs h-8 px-3.5 transition cursor-pointer"
-              >
-                <Upload size={14} className="mr-1.5" />
-                Upload Tool (.py / .json)
-              </Button>
+              <>
+                <Button
+                  size="sm"
+                  onClick={() => setIsBundleUploadOpen(true)}
+                  className="primary bg-rb hover:bg-rb/80 hover:shadow-md text-primary-foreground font-medium text-xs shadow-xs h-8 px-3.5 transition cursor-pointer"
+                >
+                  <FileArchive size={14} className="mr-1.5" />
+                  Install Bundle (.zip)
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    setUploadCategory("tool");
+                    setSelectedUploadFile(null);
+                    setIsUploadModalOpen(true);
+                  }}
+                  className="text-xs border-border hover:bg-muted h-8 px-3 transition cursor-pointer"
+                >
+                  <Upload size={14} className="mr-1.5" />
+                  Upload Single File
+                </Button>
+              </>
             )}
 
             {activeTab === "extensions" && (
@@ -516,7 +581,7 @@ export default function StoresPage() {
       </header>
 
       {/* Navigation Tabs and Search Bar */}
-      <div className="w-full border-b border-border bg-muted/20">
+      <div className="w-full border-b border-border bg-card">
         <div className="max-w-[1240px] mx-auto w-full px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           {/* Main Tabs */}
           <div className="flex items-center gap-1 overflow-x-auto pt-2 scrollbar-none">
@@ -659,7 +724,7 @@ export default function StoresPage() {
       </div>
 
       {/* Content Area */}
-      <main className="w-full flex-1 overflow-y-auto scrollbar-thin">
+      <main className="w-full flex-1 overflow-y-auto scrollbar-thin bg-background">
         <div className="max-w-[1240px] mx-auto w-full px-4 sm:px-6 lg:px-8 py-6">
           {/* TAB 1: Agents Hub */}
           {activeTab === "agents" && (
@@ -681,17 +746,17 @@ export default function StoresPage() {
                     return (
                       <div
                         key={ag.id}
-                        className={`group relative flex flex-col justify-between p-5 rounded-xl border transition-all duration-200 shadow-xs hover:shadow-md ${
+                        className={`group relative flex flex-col justify-between p-5 rounded-sm border transition-all duration-200 shadow-sm hover:shadow-md ${
                           isDisabled
                             ? "bg-muted/30 border-border/60 opacity-80"
-                            : "bg-card border-border hover:border-primary/40"
+                            : "bg-card border-transparent hover:border-muted/40 shadow-md"
                         }`}
                       >
                         <div>
                           {/* Card Header & Status Switch */}
                           <div className="flex items-start justify-between mb-3.5">
                             <div className="flex items-center gap-3">
-                              <div className="p-2.5 rounded-xl bg-muted border border-border shadow-xs group-hover:scale-105 transition-transform">
+                              <div className="p-2.5 rounded-sm bg-muted border border-border shadow-xs group-hover:scale-105 transition-transform">
                                 {renderAgentIcon(ag.icon)}
                               </div>
                               <div>
@@ -712,7 +777,7 @@ export default function StoresPage() {
                                   onClick={() => handleToggleAgent(ag.id)}
                                   disabled={isToggling}
                                   className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                                    !isDisabled ? "bg-primary" : "bg-muted"
+                                    !isDisabled ? "bg-cgood" : "bg-[#777171]"
                                   }`}
                                   title={!isDisabled ? "Disable agent" : "Enable agent"}
                                 >
@@ -801,7 +866,7 @@ export default function StoresPage() {
                             size="sm"
                             disabled={isDisabled}
                             onClick={() => handleStartChatWithAgent(ag)}
-                            className="bg-primary hover:bg-primary/90 text-primary hover:text-primary-foreground text-primary text-xs px-3.5 h-8 font-medium shadow-xs transition group/btn cursor-pointer disabled:opacity-40"
+                            className="bg-primary hover:bg-rb/90 text-primary hover:text-primary-foreground text-primary text-xs px-3.5 h-8 font-medium shadow-xs transition group/btn cursor-pointer disabled:opacity-40"
                           >
                             <span>Start Chat</span>
                             <ArrowRight size={12} className="ml-1 group-hover/btn:translate-x-0.5 transition-transform" />
@@ -817,106 +882,150 @@ export default function StoresPage() {
 
           {/* TAB 2: Sovereign Tools Catalog */}
           {activeTab === "tools" && (
-            <div>
-              {filteredTools.length === 0 ? (
-                <div className="flex flex-col items-center justify-center p-12 text-center rounded-2xl border border-dashed border-border bg-card/40">
-                  <Wrench className="h-10 w-10 text-muted-foreground mb-3" />
-                  <h3 className="text-sm font-semibold text-foreground">No tools found</h3>
-                  <p className="text-xs text-muted-foreground mt-1">
-                    Upload a custom Python tool (.py) or JSON manifest to extend capabilities.
-                  </p>
-                </div>
-              ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-                  {filteredTools.map((tl) => {
-                    const isEnabled = tl.is_enabled !== false && tl.status !== "disabled";
-                    const isToggling = togglingToolId === tl.id;
-
-                    return (
-                      <div
-                        key={tl.id}
-                        className={`p-5 rounded-xl border bg-card shadow-xs hover:shadow-md transition-all flex flex-col justify-between ${
-                          !isEnabled ? "opacity-75 bg-muted/20 border-border/60" : "border-border"
-                        }`}
-                      >
-                        <div>
-                          <div className="flex items-center justify-between mb-3">
-                            <div className="flex items-center gap-2.5">
-                              <div className="p-2 rounded-lg bg-primary/10 text-primary border border-primary/20">
-                                {tl.id.includes("python") ? (
-                                  <Code2 size={15} />
-                                ) : tl.id.includes("bash") ? (
-                                  <Terminal size={15} />
-                                ) : (
-                                  <Wrench size={15} />
-                                )}
-                              </div>
-                              <h3 className="text-sm font-bold text-foreground font-mono">
-                                {tl.name}
-                              </h3>
-                            </div>
-
-                            {/* Enable/Disable Toggle */}
-                            <button
-                              type="button"
-                              onClick={() => handleToggleTool(tl.id)}
-                              disabled={isToggling}
-                              className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                                isEnabled ? "bg-primary" : "bg-muted"
-                              }`}
-                              title={isEnabled ? "Disable tool" : "Enable tool"}
-                            >
-                              <span
-                                className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-background shadow-md ring-0 transition duration-200 ease-in-out ${
-                                  isEnabled ? "translate-x-4" : "translate-x-0"
-                                }`}
-                              />
-                            </button>
-                          </div>
-
-                          <div className="flex items-center gap-2 mb-3">
-                            <span className="px-2 py-0.5 rounded-md text-[10px] font-mono uppercase bg-muted text-muted-foreground border border-border">
-                              {tl.category || "custom"}
-                            </span>
-                            {tl.is_builtin ? (
-                              <span className="px-1.5 py-0.5 rounded text-[10px] font-mono uppercase bg-sky-500/10 text-sky-700 dark:text-sky-300 border border-sky-500/20">
-                                BUILT-IN
-                              </span>
-                            ) : (
-                              <span className="px-1.5 py-0.5 rounded text-[10px] font-mono uppercase bg-primary/10 text-primary border border-primary/20">
-                                CUSTOM
-                              </span>
-                            )}
-                          </div>
-
-                          <p className="text-xs text-muted-foreground leading-relaxed mb-4">
-                            {tl.description}
-                          </p>
-                        </div>
-
-                        {/* Tool Footer */}
-                        <div className="pt-3 border-t border-border flex items-center justify-between text-[11px] font-mono">
-                          <div className="flex items-center gap-1.5 text-muted-foreground">
-                            <Shield size={12} />
-                            <span className="capitalize">{tl.safety_level || "safe"}</span>
-                          </div>
-
-                          {!tl.is_builtin && (
-                            <button
-                              type="button"
-                              onClick={() => handleDeleteTool(tl.id)}
-                              className="p-1 rounded text-muted-foreground hover:text-destructive transition cursor-pointer"
-                              title="Delete custom tool"
-                            >
-                              <Trash2 size={13} />
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
+            <div className="space-y-6">
+              {/* ── Bundle Installs Section ────────────────────────────── */}
+              {bundles.length > 0 && (
+                <div>
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="flex items-center gap-2">
+                      <FileArchive size={14} className="text-primary" />
+                      <h3 className="text-sm font-bold text-foreground">
+                        Installed Bundles
+                      </h3>
+                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground border border-border">
+                        {bundles.length}
+                      </span>
+                    </div>
+                    <span className="text-[10px] text-muted-foreground font-mono">
+                      Content-addressed · Atomic install · Rollback ready
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+                    {bundles.map((bd) => (
+                      <BundleCard
+                        key={bd.id}
+                        bundle={bd}
+                        onActivate={(version) => handleBundleActivate(bd, version)}
+                        onDelete={() => handleBundleDelete(bd)}
+                        onViewDetails={() => setDetailsBundle(bd)}
+                      />
+                    ))}
+                  </div>
                 </div>
               )}
+
+              {/* ── Legacy Tools Section ──────────────────────────────── */}
+              <div>
+                {bundles.length > 0 && (
+                  <div className="flex items-center gap-2 mb-3">
+                    <Wrench size={14} className="text-muted-foreground" />
+                    <h3 className="text-sm font-bold text-foreground">Single-File Tools</h3>
+                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground border border-border">
+                      {filteredTools.length}
+                    </span>
+                  </div>
+                )}
+
+                {filteredTools.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center p-12 text-center rounded-2xl border border-dashed border-border bg-card/40">
+                    <Wrench className="h-10 w-10 text-muted-foreground mb-3" />
+                    <h3 className="text-sm font-semibold text-foreground">No tools found</h3>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Upload a custom Python tool (.py) or JSON manifest to extend capabilities.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+                    {filteredTools.map((tl) => {
+                      const isEnabled = tl.is_enabled !== false && tl.status !== "disabled";
+                      const isToggling = togglingToolId === tl.id;
+
+                      return (
+                        <div
+                          key={tl.id}
+                          className={`p-5 rounded-sm border bg-card shadow-sm hover:shadow-md transition-all flex flex-col justify-between ${
+                            !isEnabled ? "opacity-75 bg-muted/20 border-border/60" : "border-transparent"
+                          }`}
+                        >
+                          <div>
+                            <div className="flex items-center justify-between mb-3">
+                              <div className="flex items-center gap-2.5">
+                                <div className="p-2 rounded-lg bg-primary/10 text-primary border border-primary/20">
+                                  {tl.id.includes("python") ? (
+                                    <Code2 size={15} />
+                                  ) : tl.id.includes("bash") ? (
+                                    <Terminal size={15} />
+                                  ) : (
+                                    <Wrench size={15} />
+                                  )}
+                                </div>
+                                <h3 className="text-sm font-bold text-foreground font-mono">
+                                  {tl.name}
+                                </h3>
+                              </div>
+
+                              {/* Enable/Disable Toggle */}
+                              <button
+                                type="button"
+                                onClick={() => handleToggleTool(tl.id)}
+                                disabled={isToggling}
+                                className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                                  isEnabled ? "bg-cgood" : "bg-[#777171]"
+                                }`}
+                                title={isEnabled ? "Disable tool" : "Enable tool"}
+                              >
+                                <span
+                                  className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-background shadow-md ring-0 transition duration-200 ease-in-out ${
+                                    isEnabled ? "translate-x-4" : "translate-x-0"
+                                  }`}
+                                />
+                              </button>
+                            </div>
+
+                            <div className="flex items-center gap-2 mb-3">
+                              <span className="px-2 py-0.5 rounded-sm text-[10px] font-mono uppercase bg-rby/20 text-black border border-rby">
+                                {tl.category || "custom"}
+                              </span>
+                              {tl.is_builtin ? (
+                                <span className="px-1.5 py-0.5  text-[10px] font-mono uppercase bg-sky-500/10 text-sky-700 dark:text-sky-300 border border-sky-500/20">
+                                  BUILT-IN
+                                </span>
+                              ) : (
+                                <span className="px-1.5 py-0.5 rounded text-[10px] font-mono uppercase bg-primary/10 text-primary border border-primary/20">
+                                  CUSTOM
+                                </span>
+                              )}
+                            </div>
+
+                            <p className="text-xs text-muted-foreground leading-relaxed mb-4">
+                              {tl.description}
+                            </p>
+                          </div>
+
+                          {/* Tool Footer */}
+                          <div className="pt-3 border-t border-border flex items-center justify-between text-[11px] font-mono">
+                            <div className="flex items-center gap-1.5 text-muted-foreground">
+                              <Shield size={12} />
+                              <span className="capitalize">{tl.safety_level || "safe"}</span>
+                            </div>
+
+                            {!tl.is_builtin && (
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteTool(tl.id)}
+                                className="p-1 rounded text-muted-foreground hover:text-destructive transition cursor-pointer"
+                                title="Delete custom tool"
+                              >
+                                <Trash2 size={13} />
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
             </div>
           )}
 
@@ -942,7 +1051,7 @@ export default function StoresPage() {
                     return (
                       <div
                         key={ex.id}
-                        className={`p-5 rounded-xl border bg-card shadow-xs hover:shadow-md transition-all flex flex-col justify-between ${
+                        className={`p-5 rounded-sm border bg-card shadow-xs hover:shadow-md transition-all flex flex-col justify-between ${
                           isActive ? "border-primary/40 bg-primary/5" : "border-border"
                         }`}
                       >
@@ -963,7 +1072,7 @@ export default function StoresPage() {
                               onClick={() => handleToggleExtension(ex.id)}
                               disabled={isToggling}
                               className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                                isActive ? "bg-primary" : "bg-muted"
+                                isActive ? "bg-cgood" : "bg-[#777171]"
                               }`}
                               title={isActive ? "Disable extension" : "Activate extension"}
                             >
@@ -1292,7 +1401,7 @@ export default function StoresPage() {
 
               <div
                 onClick={() => fileInputRef.current?.click()}
-                className="border-2 border-dashed border-border hover:border-primary/50 rounded-xl p-6 flex flex-col items-center justify-center text-center cursor-pointer transition bg-muted/10 hover:bg-muted/30"
+                className="border-2 border-dashed border-border hover:border-primary/50 rounded-sm p-6 flex flex-col items-center justify-center text-center cursor-pointer transition bg-muted/10 hover:bg-muted/30"
               >
                 {uploadCategory === "tool" ? (
                   <FileCode2 size={28} className="text-primary mb-2 opacity-80" />
@@ -1349,7 +1458,28 @@ export default function StoresPage() {
             </form>
           </div>
         </div>
+
+
       )}
+
+     {/* Modal 3: Upload Bundle (.zip) */}
+      <BundleUploadModal
+        open={isBundleUploadOpen}
+        onClose={() => setIsBundleUploadOpen(false)}
+        onSuccess={() => {
+          loadData();
+          setTimeout(() => setIsBundleUploadOpen(false), 1500);
+        }}
+      />
+
+      {/* Drawer: Bundle Details */}
+      <BundleDetailsDrawer
+        open={detailsBundle !== null}
+        bundle={detailsBundle}
+        onClose={() => setDetailsBundle(null)}
+        onUpdated={loadData}
+      />
+
     </div>
   );
 }

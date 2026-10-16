@@ -81,3 +81,14 @@ class AuthProviderPort(Protocol):
     ) -> bool:
         """Revokes token access on the remote provider platform."""
         ...
+
+
+# Canonical alias ensuring backwards-compatible imports across subsystem packages
+AuthPort = AuthProviderPort
+
+__all__ = [
+    "AuthorizationSession",
+    "AuthorizationResult",
+    "AuthProviderPort",
+    "AuthPort",
+]

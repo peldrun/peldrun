@@ -87,6 +87,10 @@ const config: Config = {
         user_message: "var(--user-message)",
         t_user_message: "var(--t-user-message)",
         gigbg: "var(--gigbg)",
+        rb: "hsl(var(--rb))",
+        rby: "hsl(var(--rby))",
+        cgood: "var(--cgood)",
+
 
 
 

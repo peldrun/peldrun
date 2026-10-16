@@ -1,13 +1,17 @@
-// Path: frontend/src/components/chat/composer/plugins/typeahead-menu-plugin.tsx
+// frontend/src/components/chat/composer/plugins/typeahead-menu-plugin.tsx
 
 'use client';
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext';
 import {
-  $createParagraphNode,$getRoot,
-  $getSelection,$isElementNode,
-  $isRangeSelection,$isTextNode,
+  $createParagraphNode,
+  $createTextNode,
+  $getRoot,
+  $getSelection,
+  $isElementNode,
+  $isRangeSelection,
+  $isTextNode,
   COMMAND_PRIORITY_CRITICAL,
   KEY_ARROW_DOWN_COMMAND,
   KEY_ARROW_UP_COMMAND,
@@ -17,7 +21,15 @@ import {
   LexicalEditor,
 } from 'lexical';
 import { Bot, FileText, Sparkles, Terminal, Wrench } from 'lucide-react';
-import { commandRegistry, MentionItem, SlashCommandItem } from '../registry/command-registry';
+import {
+  commandRegistry,
+  MentionItem,
+  SlashCommandItem,
+} from '../registry/command-registry';
+import {
+  $createFileMentionNode,
+  getDisplayPathFromRelPath,
+} from '../nodes/file-mention-node';
 
 interface TypeaheadMenuPluginProps {
   onClearEditor?: () => void;
@@ -34,7 +46,9 @@ function getTextBeforeCaret(editor: LexicalEditor): string {
     const anchor = selection.anchor;
     const anchorNode = anchor.getNode();
 
-    if ($isTextNode(anchorNode)) {       textBeforeCaret = anchorNode.getTextContent().slice(0, anchor.offset);     } else if ($isElementNode(anchorNode)) {
+    if ($isTextNode(anchorNode)) {
+      textBeforeCaret = anchorNode.getTextContent().slice(0, anchor.offset);
+    } else if ($isElementNode(anchorNode)) {
       const children = anchorNode.getChildren();
       let accumulated = '';
       const childIndex = anchor.offset;
@@ -47,10 +61,15 @@ function getTextBeforeCaret(editor: LexicalEditor): string {
   return textBeforeCaret;
 }
 
-export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPluginProps) {
+export function TypeaheadMenuPlugin({
+  onClearEditor,
+  chatId,
+}: TypeaheadMenuPluginProps) {
   const [editor] = useLexicalComposerContext();
   const [isOpen, setIsOpen] = useState(false);
-  const [triggerType, setTriggerType] = useState<'slash' | 'mention' | null>(null);
+  const [triggerType, setTriggerType] = useState<'slash' | 'mention' | null>(
+    null
+  );
   const [queryString, setQueryString] = useState('');
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [dynamicMentions, setDynamicMentions] = useState<MentionItem[]>([]);
@@ -88,7 +107,8 @@ export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPlug
     };
   }, [triggerType, queryString, chatId]);
 
-  const activeResultsCount = triggerType === 'slash' ? slashResults.length : dynamicMentions.length;
+  const activeResultsCount =
+    triggerType === 'slash' ? slashResults.length : dynamicMentions.length;
 
   useEffect(() => {
     return editor.registerUpdateListener(() => {
@@ -103,7 +123,9 @@ export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPlug
         return;
       }
 
-      const mentionMatch = textBeforeCaret.match(/(?:^|\s)@([a-zA-Z0-9_.-]*)$/);
+      const mentionMatch = textBeforeCaret.match(
+        /(?:^|\s)@([a-zA-Z0-9_./-]*)$/
+      );
       if (mentionMatch) {
         setTriggerType('mention');
         setQueryString(mentionMatch[1]);
@@ -120,10 +142,12 @@ export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPlug
   const handleExecuteSelection = useCallback(
     (targetIndex?: number) => {
       if (!isOpen || activeResultsCount === 0) return false;
-      const indexToExecute = typeof targetIndex === 'number' ? targetIndex : selectedIndex;
+      const indexToExecute =
+        typeof targetIndex === 'number' ? targetIndex : selectedIndex;
 
       if (triggerType === 'slash') {
-        const selectedItem: SlashCommandItem | undefined = slashResults[indexToExecute];
+        const selectedItem: SlashCommandItem | undefined =
+          slashResults[indexToExecute];
         if (!selectedItem) return false;
 
         editor.update(() => {
@@ -180,9 +204,94 @@ export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPlug
       }
 
       if (triggerType === 'mention') {
-        const selectedItem: MentionItem | undefined = dynamicMentions[indexToExecute];
+        const selectedItem: MentionItem | undefined =
+          dynamicMentions[indexToExecute];
         if (!selectedItem) return false;
 
+        // File references become structured Lexical nodes so they can be
+        // styled distinctly, clicked, and carry their canonical path as a
+        // node attribute. Non-file mentions (agent / tool) fall through to
+        // the plain-text insertion path below.
+        const isFileMention =
+          selectedItem.category === 'file' &&
+          typeof selectedItem.metadata?.relPath === 'string' &&
+          String(selectedItem.metadata.relPath).trim().length > 0;
+
+        if (isFileMention) {
+          const relPath = String(selectedItem.metadata!.relPath);
+          const displayPath = getDisplayPathFromRelPath(relPath);
+          const mentionText = `@[${displayPath}]`;
+
+          editor.update(() => {
+            const selection = $getSelection();
+            if (!$isRangeSelection(selection)) return;
+
+            const anchorNode = selection.anchor.getNode();
+            if (!$isTextNode(anchorNode)) return;
+
+            // Split the anchor text at the cursor so we can preserve any
+            // content that lives to the right of the caret. This matters
+            // when the user types `@` in the middle of an existing line
+            // (e.g. "file: @ to:") rather than at the end.
+            const fullText = anchorNode.getTextContent();
+            const cursorOffset = selection.anchor.offset;
+            const textBeforeCursor = fullText.slice(0, cursorOffset);
+            const textAfterCursor = fullText.slice(cursorOffset);
+
+            const pattern = new RegExp(`@${queryString}$`);
+            const match = textBeforeCursor.match(pattern);
+            if (!match || match.index === undefined) return;
+
+            const beforeMention = textBeforeCursor.slice(0, match.index);
+
+            const mentionNode = $createFileMentionNode(mentionText, relPath);
+            const spaceNode = $createTextNode(' ');
+
+            if (textAfterCursor.length > 0) {
+              // Preserve trailing text by inserting a fresh TextNode after
+              // the mention's trailing space.
+              const afterNode = $createTextNode(textAfterCursor);
+
+              if (beforeMention.length > 0) {
+                anchorNode.setTextContent(beforeMention);
+                anchorNode.insertAfter(mentionNode);
+                mentionNode.insertAfter(spaceNode);
+                spaceNode.insertAfter(afterNode);
+              } else {
+                anchorNode.replace(mentionNode);
+                mentionNode.insertAfter(spaceNode);
+                spaceNode.insertAfter(afterNode);
+              }
+            } else {
+              // Common case: mention inserted at the end of the node.
+              if (beforeMention.length > 0) {
+                anchorNode.setTextContent(beforeMention);
+                anchorNode.insertAfter(mentionNode);
+                mentionNode.insertAfter(spaceNode);
+              } else {
+                anchorNode.replace(mentionNode);
+                mentionNode.insertAfter(spaceNode);
+              }
+            }
+
+            // Place the cursor immediately after the mention's trailing
+            // space, before any preserved trailing text.
+            spaceNode.select(1, 1);
+          });
+
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(
+              new CustomEvent('peldrun:mention-selected', {
+                detail: selectedItem,
+              })
+            );
+          }
+
+          setIsOpen(false);
+          return true;
+        }
+
+        // Non-file mention: insert plain text as before.
         editor.update(() => {
           const selection = $getSelection();
           if ($isRangeSelection(selection)) {
@@ -197,10 +306,11 @@ export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPlug
           }
         });
 
-        // Emit verified selection with metadata as source of truth
         if (typeof window !== 'undefined') {
           window.dispatchEvent(
-            new CustomEvent('peldrun:mention-selected', { detail: selectedItem })
+            new CustomEvent('peldrun:mention-selected', {
+              detail: selectedItem,
+            })
           );
         }
 
@@ -266,7 +376,9 @@ export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPlug
       (event) => {
         if (isOpen && activeResultsCount > 0) {
           if (event) event.preventDefault();
-          setSelectedIndex((prev) => (prev - 1 + activeResultsCount) % activeResultsCount);
+          setSelectedIndex(
+            (prev) => (prev - 1 + activeResultsCount) % activeResultsCount
+          );
           return true;
         }
         return false;
@@ -304,7 +416,11 @@ export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPlug
       className="absolute bottom-full mb-2 start-0 z-[9999] w-80 max-h-64 overflow-y-auto rounded-xl border border-border/80 bg-popover/95 p-1 text-popover-foreground shadow-2xl backdrop-blur-md animate-in fade-in zoom-in-95 duration-150 font-sans"
     >
       <div className="px-2 py-1 text-[10px] font-semibold tracking-wider text-muted-foreground uppercase flex items-center justify-between border-b border-border/40 mb-1">
-        <span>{triggerType === 'slash' ? 'Slash Commands' : 'Context & Store Mentions'}</span>
+        <span>
+          {triggerType === 'slash'
+            ? 'Slash Commands'
+            : 'Context & Store Mentions'}
+        </span>
         <span className="font-mono text-[9px]">Tab / Enter to select</span>
       </div>
 
@@ -352,10 +468,14 @@ export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPlug
                     )}
                   </div>
                   <div className="flex flex-col min-w-0 flex-1">
-                    <span className="font-mono font-medium truncate">{item.label}</span>
+                    <span className="font-mono font-medium truncate">
+                      {item.label}
+                    </span>
                     <span
                       className={`text-[10px] truncate ${
-                        isSelected ? 'text-primary-foreground/80' : 'text-muted-foreground'
+                        isSelected
+                          ? 'text-primary-foreground/80'
+                          : 'text-muted-foreground'
                       }`}
                     >
                       {item.description}
@@ -401,7 +521,9 @@ export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPlug
                   </div>
                   <div className="flex flex-col min-w-0 flex-1">
                     <div className="flex items-center gap-1.5">
-                      <span className="font-mono font-medium truncate">{item.label}</span>
+                      <span className="font-mono font-medium truncate">
+                        {item.label}
+                      </span>
                       <span className="text-[9px] uppercase px-1 py-0.2 rounded bg-muted/80 text-muted-foreground font-mono">
                         {item.category}
                       </span>
@@ -409,7 +531,9 @@ export function TypeaheadMenuPlugin({ onClearEditor, chatId }: TypeaheadMenuPlug
                     {item.description && (
                       <span
                         className={`text-[10px] truncate ${
-                          isSelected ? 'text-primary-foreground/80' : 'text-muted-foreground'
+                          isSelected
+                            ? 'text-primary-foreground/80'
+                            : 'text-muted-foreground'
                         }`}
                       >
                         {item.description}

@@ -1,4 +1,4 @@
-// Path: frontend/src/components/chat/composer/lexical-editor.tsx
+// frontend/src/components/chat/composer/lexical-editor.tsx
 
 'use client';
 
@@ -27,7 +27,9 @@ import {
   $createTextNode,
   $getRoot,
   EditorState,
+  ElementNode,
   LexicalEditor,
+  LexicalNode,
 } from 'lexical';
 import { $convertFromMarkdownString } from '@lexical/markdown';
 
@@ -37,6 +39,10 @@ import { MarkdownClipboardPlugin } from './plugins/markdown-clipboard-plugin';
 import { FloatingToolbarPlugin } from './plugins/floating-toolbar-plugin';
 import { COMPOSER_TRANSFORMERS, extractCleanText } from './serialization';
 import { LexicalEditorHandle, LexicalEditorProps } from './types';
+import {
+  $isFileMentionNode,
+  FileMentionNode,
+} from './nodes/file-mention-node';
 
 const URL_MATCHER: LinkMatcher = (text: string) => {
   const match = /(?:https?:\/\/|www\.)[^\s<]+[^\s`!()\[\]{};:'".,<>?«»“”‘’]/i.exec(text);
@@ -157,6 +163,28 @@ export const LexicalEditorComponent = forwardRef<
           });
         }
       },
+      getFileMentions: () => {
+        const editor = editorInstanceRef.current;
+        if (!editor) return [];
+        const mentions: Array<{ display: string; path: string }> = [];
+        editor.getEditorState().read(() => {
+          const root = $getRoot();
+          const walk = (node: LexicalNode) => {
+            if ($isFileMentionNode(node)) {
+              mentions.push({
+                display: node.getTextContent(),
+                path: node.getFilePath(),
+              });
+            }
+            const anyNode = node as unknown as ElementNode;
+            if (typeof anyNode.getChildren === 'function') {
+              anyNode.getChildren().forEach(walk);
+            }
+          };
+          walk(root);
+        });
+        return mentions;
+      },
     }),
     []
   );
@@ -177,7 +205,13 @@ export const LexicalEditorComponent = forwardRef<
   const initialConfig = useMemo(
     () => ({
       namespace: 'PeldrunComposer',
-      nodes: [HeadingNode, QuoteNode, LinkNode, AutoLinkNode],
+      nodes: [
+        HeadingNode,
+        QuoteNode,
+        LinkNode,
+        AutoLinkNode,
+        FileMentionNode,
+      ],
       editable: !disabled,
       theme: {
         paragraph: 'mb-0 leading-normal text-start text-foreground',
@@ -202,7 +236,35 @@ export const LexicalEditorComponent = forwardRef<
   );
 
   return (
-    <div className="relative w-full text-start peldrun-composer-root">
+    <div
+      className="relative w-full text-start peldrun-composer-root"
+      onClick={(event) => {
+        // Delegate clicks on file mention spans to the workspace panel by
+        // emitting a custom event. Using event delegation on the wrapper
+        // (rather than per-node listeners) keeps the handler alive across
+        // Lexical DOM mutations.
+        const target = event.target as HTMLElement | null;
+        if (!target) return;
+        const mentionEl = target.closest(
+          '.peldrun-file-mention'
+        ) as HTMLElement | null;
+        if (!mentionEl) return;
+
+        const filePath = mentionEl.dataset.filePath;
+        if (!filePath) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(
+            new CustomEvent('peldrun:open-file-in-workspace', {
+              detail: { path: filePath, source: 'composer' },
+            })
+          );
+        }
+      }}
+    >
       <LexicalComposer initialConfig={initialConfig}>
         <EditorRefPlugin
           onEditorReady={handleEditorReady}
