@@ -1,4 +1,3 @@
-إليك التوثيق التقني الشامل والكامل باللغة الإنجليزية كما طلبت تماماً، بدون أي سكربتات PowerShell، وجاهز للنسخ واللصق المباشر كملف توثيق مرجعي أساسي في مشروعك (مثلاً داخل `docs/SOVEREIGN_AGENTS_AND_TOOLS.md` أو `README.md`):
 
 ---
 
@@ -209,12 +208,12 @@ allowed_tools.extend(["terminate", "ask_human"])
 if hasattr(agent, "tools"):
     if isinstance(agent.tools, list):
         agent.tools = [
-            t for t in agent.tools 
+            t for t in agent.tools
             if getattr(t, "name", t.__class__.__name__).lower() in allowed_tools
         ]
     elif hasattr(agent.tools, "tools") and isinstance(agent.tools.tools, list):
         agent.tools.tools = [
-            t for t in agent.tools.tools 
+            t for t in agent.tools.tools
             if getattr(t, "name", t.__class__.__name__).lower() in allowed_tools
         ]
 

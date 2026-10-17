@@ -11,7 +11,8 @@ The tool performs two steps:
 
     1. Resolve the repository reference (network call to the
        provider).
-    2. Materialize the workspace on disk (local Git operations).
+    2. Materialize the workspace on disk (local Git operations, plus
+       an authenticated clone when the repository is private).
 
 The tool does NOT push, fetch on behalf of the user, or touch the
 remote after the initial clone. It is safe to run without approval
@@ -20,6 +21,12 @@ because it only affects a PELDRUN-owned directory.
 Design rules:
     - The tool resolves the credential from the OS vault, never
       from the caller's arguments.
+    - The tool MUST pass the credential to
+      `GitWorkspaceManager.create_workspace(auth_token=...)` so that
+      private repositories can be cloned. The workspace manager
+      embeds the token in the clone URL only for the duration of the
+      network operation and sanitizes `.git/config` immediately
+      afterwards.
     - The tool MUST refuse to create a workspace outside the
       configured workspace root. The path policy in
       `GitWorkspaceManager` enforces this; the tool does not bypass
@@ -29,19 +36,25 @@ Design rules:
     - The tool is idempotent only in the sense that it will not
       corrupt state; each call creates a new workspace with a new
       ID.
+    - The credential MUST NEVER appear in an error message, a tool
+      result, or the audit log. The base URL is redacted before it
+      is included in any diagnostic.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 from ..domain.enums import ProviderId
 from ..domain.models import RepositoryRef
 from ..errors import to_source_control_error
-from ..git.workspace import GitWorkspaceManager, get_default_git_executable
-from ..git.path_policy import get_default_path_policy
+from ..git.workspace import (
+    GitWorkspaceManager,
+    get_default_workspace_manager,
+)
 from ..registry import ProviderRegistry, get_default_registry
+from ..security.redaction import redact_url
 from ..security.token_service import (
     TokenService,
     get_default_token_service,
@@ -72,6 +85,19 @@ class CreateWorkspaceTool(SourceControlTool):
                        workspace using a lightweight worktree
                        layout instead of a full clone.
         depth:         Optional shallow clone depth.
+
+    The credential is resolved from the OS vault through the
+    `TokenService`. The account is selected with the following
+    precedence:
+
+        1. The `account_id` argument to the tool.
+        2. `context.metadata["account_id"]` when the facade injects
+           an account hint.
+        3. The first stored account for the provider.
+
+    The credential is passed to `GitWorkspaceManager.create_workspace`
+    so that private repositories can be cloned. The token is NEVER
+    persisted in `.git/config`.
     """
 
     def __init__(
@@ -172,11 +198,11 @@ class CreateWorkspaceTool(SourceControlTool):
             )
         repository_id = repository_id.strip()
 
-        account_id_override = self._parse_optional_str(
+        account_id_arg = self._parse_optional_str(
             kwargs.get("account_id"), "account_id"
         )
-        if isinstance(account_id_override, ToolResult):
-            return account_id_override
+        if isinstance(account_id_arg, ToolResult):
+            return account_id_arg
 
         base_sha = self._parse_optional_str(
             kwargs.get("base_sha"), "base_sha"
@@ -221,32 +247,22 @@ class CreateWorkspaceTool(SourceControlTool):
             )
 
         # --- Resolve credential ----------------------------------------
+        #
+        # The credential is resolved BEFORE any network call. If it
+        # is missing, we fail early so the user can fix the
+        # connection and retry without burning state.
         token_service = (
             self._explicit_token_service or get_default_token_service()
         )
-        resolved = self._resolve_account(
+        auth = self._resolve_auth(
             token_service=token_service,
             provider=provider,
-            account_id_override=account_id_override,
+            explicit_account_id=account_id_arg,
+            context=context,
         )
-        if isinstance(resolved, ToolResult):
-            return resolved
-        account_id, base_url = resolved
-
-        token = token_service.get_access_token(
-            provider, account_id, base_url
-        )
-        if not token:
-            return self.failure_result(
-                error_code="AUTH_REQUIRED",
-                error_message=(
-                    "No credential is stored for the selected account."
-                ),
-                metadata={
-                    "provider": provider.value,
-                    "account_id": account_id,
-                },
-            )
+        if isinstance(auth, ToolResult):
+            return auth
+        account_id, base_url, token = auth
 
         # --- Resolve the repository reference --------------------------
         try:
@@ -260,7 +276,11 @@ class CreateWorkspaceTool(SourceControlTool):
             return self.failure_result(
                 error_code=normalized.code.value,
                 error_message=normalized.message,
-                metadata={"provider": provider.value},
+                metadata={
+                    "provider": provider.value,
+                    "account_id": account_id,
+                    "base_url": redact_url(base_url),
+                },
             )
 
         if repo is None:
@@ -276,9 +296,13 @@ class CreateWorkspaceTool(SourceControlTool):
             )
 
         # --- Create the workspace --------------------------------------
-        manager = self._explicit_workspace_manager or GitWorkspaceManager(
-            git=get_default_git_executable(),
-            path_policy=get_default_path_policy(),
+        #
+        # Use the process-wide default manager unless one was
+        # explicitly injected. Constructing a new manager per call
+        # would lose the workspace registry between invocations.
+        manager = (
+            self._explicit_workspace_manager
+            or get_default_workspace_manager()
         )
 
         try:
@@ -295,6 +319,7 @@ class CreateWorkspaceTool(SourceControlTool):
                     "operation_id": context.operation_id or "",
                     "run_id": context.run_id or "",
                 },
+                auth_token=token,
             )
         except Exception as exc:  # noqa: BLE001
             normalized = to_source_control_error(exc)
@@ -317,7 +342,11 @@ class CreateWorkspaceTool(SourceControlTool):
                 "base_sha": workspace.base_sha,
                 "head_sha": workspace.head_sha,
                 "is_clean": workspace.is_clean,
-                "status": workspace.status,
+                "status": (
+                    workspace.status.value
+                    if hasattr(workspace.status, "value")
+                    else str(workspace.status)
+                ),
                 "is_worktree": workspace.is_worktree,
             },
             metadata={
@@ -325,6 +354,98 @@ class CreateWorkspaceTool(SourceControlTool):
                 "account_id": account_id,
             },
         )
+
+    # --- Credential resolution -----------------------------------------
+
+    @staticmethod
+    def _resolve_auth(
+        *,
+        token_service: TokenService,
+        provider: ProviderId,
+        explicit_account_id: Optional[str],
+        context: ToolContext,
+    ) -> Union[Tuple[str, str, str], ToolResult]:
+        """
+        Resolve `(account_id, base_url, token)` for the call.
+
+        Resolution order for the account:
+
+            1. The explicit `account_id` argument to the tool.
+            2. `context.metadata["account_id"]` when the facade
+               injects an account hint.
+            3. The first stored account for the provider.
+
+        Returns a 3-tuple `(account_id, base_url, token)` on success
+        or a failed `ToolResult` when no credential is available.
+        The token MUST NEVER be logged, returned in a tool result,
+        or included in an error message.
+        """
+        stored = token_service.list_stored()
+        for_provider = [
+            entry for entry in stored if entry.provider == provider
+        ]
+        if not for_provider:
+            return ToolResult.fail(
+                error_code="AUTH_REQUIRED",
+                error_message=(
+                    f"No credential is stored for provider "
+                    f"'{provider.value}'. Connect the provider "
+                    "first."
+                ),
+                metadata={"provider": provider.value},
+            )
+
+        # Account hint from context (fallback when the explicit
+        # argument is not provided).
+        context_account: Optional[str] = None
+        if context.metadata:
+            raw = context.metadata.get("account_id")
+            if isinstance(raw, str):
+                context_account = raw.strip() or None
+
+        chosen_override = explicit_account_id or context_account
+
+        chosen = None
+        if chosen_override:
+            for entry in for_provider:
+                if entry.account_id == chosen_override:
+                    chosen = entry
+                    break
+            if chosen is None:
+                return ToolResult.fail(
+                    error_code="AUTH_REQUIRED",
+                    error_message=(
+                        f"No credential is stored for account "
+                        f"'{chosen_override}' on provider "
+                        f"'{provider.value}'."
+                    ),
+                    metadata={
+                        "provider": provider.value,
+                        "account_id": chosen_override,
+                    },
+                )
+        else:
+            chosen = for_provider[0]
+
+        token = token_service.get_access_token(
+            provider, chosen.account_id, chosen.base_url
+        )
+        if not token:
+            return ToolResult.fail(
+                error_code="AUTH_REQUIRED",
+                error_message=(
+                    "The stored credential is missing or expired. "
+                    "Reconnect the provider before creating a "
+                    "workspace."
+                ),
+                metadata={
+                    "provider": provider.value,
+                    "account_id": chosen.account_id,
+                    "base_url": redact_url(chosen.base_url),
+                },
+            )
+
+        return chosen.account_id, chosen.base_url, token
 
     # --- Internal: repository resolution -------------------------------
 
@@ -335,10 +456,34 @@ class CreateWorkspaceTool(SourceControlTool):
         repository_id: str,
         token: str,
     ) -> Optional[RepositoryRef]:
-        """Return the `RepositoryRef` for `repository_id`."""
-        listing = await adapter.list_repositories(
-            page=1, page_size=100, token=token
-        )
+        """
+        Return the `RepositoryRef` for `repository_id`.
+
+        The tool does not know the repository's namespace or name
+        ahead of time, so it uses the provider's listing endpoint
+        and matches by stable ID. The `token` is required; private
+        repositories cannot be resolved without it.
+
+        Adapters in this subsystem accept either `(page, page_size)`
+        or `(limit)`; the method tries `page/page_size` first and
+        falls back to `limit`.
+        """
+        try:
+            listing = await adapter.list_repositories(
+                page=1, page_size=100, token=token
+            )
+        except TypeError:
+            # Some adapters (including the mock used in tests) use
+            # `limit=` instead of `page=`/`page_size=`.
+            try:
+                listing = await adapter.list_repositories(
+                    query=None, limit=100, token=token
+                )
+            except Exception:  # noqa: BLE001
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+
         for repo in listing:
             if (
                 isinstance(repo, RepositoryRef)
@@ -347,45 +492,10 @@ class CreateWorkspaceTool(SourceControlTool):
                 return repo
         return None
 
-    # --- Account resolution --------------------------------------------
-
-    @staticmethod
-    def _resolve_account(
-        *,
-        token_service: TokenService,
-        provider: ProviderId,
-        account_id_override: Optional[str],
-    ) -> tuple[str, str] | ToolResult:
-        stored = token_service.list_stored()
-        for_provider = [
-            entry for entry in stored if entry.provider == provider
-        ]
-        if not for_provider:
-            return ToolResult.fail(
-                error_code="AUTH_REQUIRED",
-                error_message=(
-                    f"No credential is stored for provider "
-                    f"'{provider.value}'."
-                ),
-            )
-        if account_id_override:
-            for entry in for_provider:
-                if entry.account_id == account_id_override:
-                    return entry.account_id, entry.base_url
-            return ToolResult.fail(
-                error_code="AUTH_REQUIRED",
-                error_message=(
-                    f"No credential is stored for account "
-                    f"'{account_id_override}'."
-                ),
-            )
-        chosen = for_provider[0]
-        return chosen.account_id, chosen.base_url
-
     # --- Helpers --------------------------------------------------------
 
     @staticmethod
-    def _parse_provider(value: Any) -> ProviderId | ToolResult:
+    def _parse_provider(value: Any) -> Union[ProviderId, ToolResult]:
         if value is None or value == "":
             return ProviderId.GITHUB
         try:
@@ -401,7 +511,7 @@ class CreateWorkspaceTool(SourceControlTool):
     @staticmethod
     def _parse_optional_str(
         value: Any, field_name: str
-    ) -> Optional[str] | ToolResult:
+    ) -> Union[Optional[str], ToolResult]:
         if value is None:
             return None
         if not isinstance(value, str):

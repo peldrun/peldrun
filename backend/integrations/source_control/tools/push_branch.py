@@ -11,17 +11,20 @@ Pipeline:
     1. Validate inputs.
     2. Load the operation record from the journal.
     3. Verify the operation is in `APPROVED`.
-    4. Consume the approval ticket, binding the exact diff hash,
-       base SHA, target branch, and repository.
-    5. Transition the operation to `PUSHING` (idempotently).
+    4. Resolve the credential for the operation's provider.
+    5. Validate the approval ticket against the operation record.
     6. Re-fetch the remote branch SHA and compare it to the base
        SHA the user reviewed. If the remote moved, fail with
-       `REMOTE_STATE_CHANGED`.
-    7. Perform the push via `GitPushManager`.
-    8. Reconcile the result; if the push timed out, verify remote
+       `REMOTE_STATE_CHANGED` and revoke the approval.
+    7. Consume the approval ticket, binding the exact diff hash,
+       base SHA, target branch, and repository.
+    8. Transition the operation to `PUSHING`.
+    9. Perform the push via `GitPushManager`, supplying the
+       credential resolved in step 4.
+   10. Reconcile the result; if the push timed out, verify remote
        state before deciding the outcome.
-    9. Transition to `PUSHED` on success, or `FAILED_*` on failure.
-   10. Attach the outcome to the operation.
+   11. Transition to `PUSHED` on success, or `FAILED_*` on failure.
+   12. Attach the outcome to the operation.
 
 Design rules:
     - The tool MUST NOT accept a diff hash, base SHA, or target
@@ -30,20 +33,30 @@ Design rules:
     - The tool MUST NOT bypass the approval gate. Even if the
       caller supplies a valid `approval_id`, the gate re-validates
       every bound field.
+    - The tool MUST resolve the credential BEFORE consuming the
+      approval. A missing or expired credential would otherwise
+      burn the approval without performing any push.
+    - The tool MUST pass the credential to both the remote-SHA
+      pre-flight check and the push itself. Without it, private
+      repositories silently fail the stale-base check.
     - The tool MUST re-fetch the remote SHA immediately before
       push. A stale base is a `REMOTE_STATE_CHANGED` failure.
     - The tool MUST use `--force-with-lease` semantics via
       `GitPushManager`. Plain `--force` is never used.
     - The tool MUST NEVER mark an ambiguous result as success or
       failure without attempting reconciliation.
+    - The credential MUST NEVER appear in an error message, a
+      tool result, or the audit log. The base URL is redacted
+      before it is included in any diagnostic.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Mapping, Optional
+from pathlib import Path
+from typing import Any, Mapping, Optional, Tuple, Union
 
-from ..domain.enums import OperationStatus
+from ..domain.enums import OperationStatus, ProviderId
 from ..errors import to_source_control_error
 from ..git.push import GitPushManager, get_default_push_manager
 from ..git.workspace import (
@@ -57,6 +70,11 @@ from ..operations.service import (
 from ..security.approval import (
     ApprovalGate,
     get_default_approval_gate,
+)
+from ..security.redaction import redact_url
+from ..security.token_service import (
+    TokenService,
+    get_default_token_service,
 )
 from .base import SourceControlTool, ToolContext, ToolResult
 
@@ -81,6 +99,18 @@ class PushBranchTool(SourceControlTool):
     The tool re-validates every bound field on the approval ticket.
     A field change (for example a different diff hash) invalidates
     the ticket.
+
+    The credential is resolved from the OS vault through the
+    `TokenService`. The account is selected with the following
+    precedence:
+
+        1. `context.metadata["account_id"]` when the facade injects
+           an account hint.
+        2. The first stored account for the operation's provider.
+
+    Multi-account setups SHOULD inject the correct account through
+    `context.metadata`. Without it, the first stored account is
+    used, which may not have access to the target repository.
     """
 
     def __init__(
@@ -90,6 +120,7 @@ class PushBranchTool(SourceControlTool):
         approval_gate: Optional[ApprovalGate] = None,
         push_manager: Optional[GitPushManager] = None,
         workspace_manager: Optional[GitWorkspaceManager] = None,
+        token_service: Optional[TokenService] = None,
         audit_logger: Any = None,
     ) -> None:
         super().__init__(audit_logger=audit_logger)
@@ -97,6 +128,7 @@ class PushBranchTool(SourceControlTool):
         self._explicit_approval_gate = approval_gate
         self._explicit_push_manager = push_manager
         self._explicit_workspace_manager = workspace_manager
+        self._explicit_token_service = token_service
 
     # --- Metadata -------------------------------------------------------
 
@@ -206,6 +238,9 @@ class PushBranchTool(SourceControlTool):
             self._explicit_workspace_manager
             or get_default_workspace_manager()
         )
+        token_service = (
+            self._explicit_token_service or get_default_token_service()
+        )
 
         # --- Load the operation ----------------------------------------
         try:
@@ -251,7 +286,11 @@ class PushBranchTool(SourceControlTool):
                 metadata={"operation_id": operation_id},
             )
 
-        local_branch = local_branch_override or record.source_branch or target_branch
+        local_branch = (
+            local_branch_override
+            or record.source_branch
+            or target_branch
+        )
 
         # Fetch the workspace so we can pass its path to the push
         # manager and to the reconciliation logic.
@@ -268,6 +307,21 @@ class PushBranchTool(SourceControlTool):
                     "workspace_id": record.workspace_id,
                 },
             )
+
+        # --- Resolve the credential ------------------------------------
+        #
+        # IMPORTANT: this step runs BEFORE approval validation and
+        # BEFORE approval consumption. If the credential is missing,
+        # we fail early and the user can fix the connection and
+        # retry — the approval ticket is preserved.
+        auth = self._resolve_auth(
+            token_service=token_service,
+            record=record,
+            context=context,
+        )
+        if isinstance(auth, ToolResult):
+            return auth
+        _provider_id, _account_id, _base_url, token = auth
 
         # --- Validate the approval ticket ------------------------------
         #
@@ -300,11 +354,16 @@ class PushBranchTool(SourceControlTool):
         # This check catches the race where another contributor
         # pushed to the target branch between the moment the user
         # reviewed the diff and the moment we are about to push.
+        #
+        # The credential is supplied so the check works for private
+        # repositories. Without it, `_remote_head_sha` returns
+        # `None` and the check is silently skipped.
         try:
             remote_sha = await push_manager._remote_head_sha(
-                target=_resolve_path(workspace.workspace_path),
+                target=Path(workspace.workspace_path),
                 remote=remote,
                 ref=target_branch,
+                token=token,
             )
         except Exception as exc:  # noqa: BLE001
             normalized = to_source_control_error(exc)
@@ -390,7 +449,10 @@ class PushBranchTool(SourceControlTool):
                 operation_id,
                 OperationStatus.PUSHING,
                 reason="Push started.",
-                metadata={"remote": remote, "target_branch": target_branch},
+                metadata={
+                    "remote": remote,
+                    "target_branch": target_branch,
+                },
                 actor="agent",
             )
         except Exception as exc:  # noqa: BLE001
@@ -402,6 +464,9 @@ class PushBranchTool(SourceControlTool):
             )
 
         # --- Perform the push -----------------------------------------
+        #
+        # The credential is passed explicitly. Without it, the push
+        # fails on private repositories.
         try:
             push_result = await push_manager.push_branch(
                 workspace_id=record.workspace_id,
@@ -410,6 +475,7 @@ class PushBranchTool(SourceControlTool):
                 remote_branch=target_branch,
                 force_with_lease=False,
                 set_upstream=True,
+                token=token,
                 workspace_path=workspace.workspace_path,
             )
         except Exception as exc:  # noqa: BLE001
@@ -502,9 +568,111 @@ class PushBranchTool(SourceControlTool):
             },
         )
 
+    # --- Credential resolution -----------------------------------------
 
-def _resolve_path(path: str):
-    """Return a `Path` for a workspace path string."""
-    from pathlib import Path
+    @staticmethod
+    def _resolve_auth(
+        *,
+        token_service: TokenService,
+        record: Any,
+        context: ToolContext,
+    ) -> Union[Tuple[ProviderId, str, str, str], ToolResult]:
+        """
+        Resolve `(provider, account_id, base_url, token)` for the push.
 
-    return Path(path)
+        Resolution order for the account:
+
+            1. `context.metadata["account_id"]` when the facade
+               injects an account hint.
+            2. The first stored account for the operation's provider.
+
+        The token is read from the vault. It MUST NEVER be logged,
+        returned in a tool result, or included in an error message.
+
+        Returns:
+            A 4-tuple `(provider, account_id, base_url, token)` on
+            success, or a failed `ToolResult` when no credential is
+            available.
+        """
+        # Normalize the provider.
+        provider_id = record.provider
+        if not isinstance(provider_id, ProviderId):
+            try:
+                provider_id = ProviderId(str(provider_id))
+            except ValueError:
+                return ToolResult.fail(
+                    error_code="VALIDATION_ERROR",
+                    error_message=(
+                        f"Operation references an unknown provider: "
+                        f"{provider_id!r}."
+                    ),
+                    metadata={"operation_id": record.operation_id},
+                )
+
+        # Gather stored credentials for the provider.
+        stored = token_service.list_stored()
+        for_provider = [entry for entry in stored if entry.provider == provider_id]
+        if not for_provider:
+            return ToolResult.fail(
+                error_code="AUTH_REQUIRED",
+                error_message=(
+                    f"No credential is stored for provider "
+                    f"'{provider_id.value}'. Connect the provider "
+                    "first."
+                ),
+                metadata={
+                    "provider": provider_id.value,
+                    "operation_id": record.operation_id,
+                },
+            )
+
+        # Optional account hint from the facade.
+        override: Optional[str] = None
+        if context.metadata:
+            raw = context.metadata.get("account_id")
+            if isinstance(raw, str):
+                override = raw.strip() or None
+
+        chosen = None
+        if override:
+            for entry in for_provider:
+                if entry.account_id == override:
+                    chosen = entry
+                    break
+            if chosen is None:
+                return ToolResult.fail(
+                    error_code="AUTH_REQUIRED",
+                    error_message=(
+                        f"No credential is stored for account "
+                        f"'{override}' on provider "
+                        f"'{provider_id.value}'."
+                    ),
+                    metadata={
+                        "provider": provider_id.value,
+                        "account_id": override,
+                        "operation_id": record.operation_id,
+                    },
+                )
+        else:
+            chosen = for_provider[0]
+
+        # Read the token from the vault.
+        token = token_service.get_access_token(
+            provider_id, chosen.account_id, chosen.base_url
+        )
+        if not token:
+            return ToolResult.fail(
+                error_code="AUTH_REQUIRED",
+                error_message=(
+                    "The stored credential is missing or expired. "
+                    "Reconnect the provider before retrying the push."
+                ),
+                metadata={
+                    "provider": provider_id.value,
+                    "account_id": chosen.account_id,
+                    "base_url": redact_url(chosen.base_url),
+                    "operation_id": record.operation_id,
+                },
+            )
+
+        return provider_id, chosen.account_id, chosen.base_url, token

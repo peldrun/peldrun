@@ -15,10 +15,14 @@ Pipeline:
        the caller is resuming a partially completed flow, in
        `APPROVED`. In either case the source branch MUST have been
        pushed already.
-    4. Consume the approval ticket.
-    5. Create the change request via the provider adapter.
-    6. Attach the change request to the operation.
-    7. Transition the operation to `CHANGE_REQUEST_CREATED`.
+    4. Resolve the credential for the operation's provider.
+    5. Resolve the repository reference using that credential.
+    6. Validate the approval ticket against the operation record.
+    7. Consume the approval ticket.
+    8. Create the change request via the provider adapter, passing
+       the credential resolved in step 4.
+    9. Attach the change request to the operation.
+   10. Transition the operation to `CHANGE_REQUEST_CREATED`.
 
 Design rules:
     - The tool MUST NOT accept `source_branch`, `target_branch`,
@@ -33,14 +37,23 @@ Design rules:
     - The tool MUST NOT modify the branch after push. Only the PR
       metadata (title, body) is provider-visible content the agent
       is allowed to influence.
+    - The credential MUST be resolved BEFORE the approval is
+      consumed. A missing credential would otherwise burn the
+      approval without performing the remote side effect.
+    - The credential MUST be passed to both the repository
+      resolution step and the change-request creation step.
+      Without it, the tool silently fails on private repositories.
+    - The credential MUST NEVER appear in an error message, a tool
+      result, or the audit log. The base URL is redacted before it
+      is included in any diagnostic.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Tuple, Union
 
-from ..domain.enums import OperationStatus
+from ..domain.enums import OperationStatus, ProviderId
 from ..domain.models import ChangeRequestRef
 from ..errors import to_source_control_error
 from ..operations.service import (
@@ -51,6 +64,11 @@ from ..registry import ProviderRegistry, get_default_registry
 from ..security.approval import (
     ApprovalGate,
     get_default_approval_gate,
+)
+from ..security.redaction import redact_url
+from ..security.token_service import (
+    TokenService,
+    get_default_token_service,
 )
 from .base import SourceControlTool, ToolContext, ToolResult
 
@@ -95,12 +113,14 @@ class CreateChangeRequestTool(SourceControlTool):
         operation_service: Optional[OperationService] = None,
         approval_gate: Optional[ApprovalGate] = None,
         registry: Optional[ProviderRegistry] = None,
+        token_service: Optional[TokenService] = None,
         audit_logger: Any = None,
     ) -> None:
         super().__init__(audit_logger=audit_logger)
         self._explicit_operation_service = operation_service
         self._explicit_approval_gate = approval_gate
         self._explicit_registry = registry
+        self._explicit_token_service = token_service
 
     # --- Metadata -------------------------------------------------------
 
@@ -228,6 +248,9 @@ class CreateChangeRequestTool(SourceControlTool):
             self._explicit_approval_gate or get_default_approval_gate()
         )
         registry = self._explicit_registry or get_default_registry()
+        token_service = (
+            self._explicit_token_service or get_default_token_service()
+        )
 
         # --- Load the operation ----------------------------------------
         try:
@@ -298,16 +321,29 @@ class CreateChangeRequestTool(SourceControlTool):
                 metadata={"operation_id": operation_id},
             )
 
+        # --- Resolve the credential ------------------------------------
+        #
+        # IMPORTANT: this step runs BEFORE the approval is consumed.
+        # If the credential is missing, we fail early and the user
+        # can fix the connection and retry — the approval ticket is
+        # preserved.
+        auth = self._resolve_auth(
+            token_service=token_service,
+            record=record,
+            context=context,
+        )
+        if isinstance(auth, ToolResult):
+            return auth
+        _provider_id, _account_id, _base_url, token = auth
+
         # --- Resolve the repository reference --------------------------
         #
         # The change request creation needs a `RepositoryRef`. We
         # rebuild it from the operation and the provider's metadata.
-        # For now, we expect the operation's `metadata` to carry
-        # enough information; otherwise the caller must run
-        # `source_control.get_repository` first.
         repo = await self._resolve_repository(
             adapter=adapter,
             record=record,
+            token=token,
         )
         if repo is None:
             return self.failure_result(
@@ -364,6 +400,9 @@ class CreateChangeRequestTool(SourceControlTool):
             )
 
         # --- Create the change request ---------------------------------
+        #
+        # The credential is passed explicitly. Without it, the call
+        # fails on private repositories.
         try:
             change_request = await adapter.create_change_request(
                 repo=repo,
@@ -372,7 +411,7 @@ class CreateChangeRequestTool(SourceControlTool):
                 title=title,
                 body=body,
                 draft=draft,
-                token=None,
+                token=token,
             )
         except Exception as exc:  # noqa: BLE001
             normalized = to_source_control_error(exc)
@@ -457,13 +496,121 @@ class CreateChangeRequestTool(SourceControlTool):
             },
         )
 
+    # --- Credential resolution -----------------------------------------
+
+    @staticmethod
+    def _resolve_auth(
+        *,
+        token_service: TokenService,
+        record: Any,
+        context: ToolContext,
+    ) -> Union[Tuple[ProviderId, str, str, str], ToolResult]:
+        """
+        Resolve `(provider, account_id, base_url, token)` for the call.
+
+        Resolution order for the account:
+
+            1. `context.metadata["account_id"]` when the facade
+               injects an account hint.
+            2. The first stored account for the operation's provider.
+
+        The token is read from the vault. It MUST NEVER be logged,
+        returned in a tool result, or included in an error message.
+        """
+        # Normalize the provider.
+        provider_id = record.provider
+        if not isinstance(provider_id, ProviderId):
+            try:
+                provider_id = ProviderId(str(provider_id))
+            except ValueError:
+                return ToolResult.fail(
+                    error_code="VALIDATION_ERROR",
+                    error_message=(
+                        f"Operation references an unknown provider: "
+                        f"{provider_id!r}."
+                    ),
+                    metadata={"operation_id": record.operation_id},
+                )
+
+        # Gather stored credentials for the provider.
+        stored = token_service.list_stored()
+        for_provider = [
+            entry for entry in stored if entry.provider == provider_id
+        ]
+        if not for_provider:
+            return ToolResult.fail(
+                error_code="AUTH_REQUIRED",
+                error_message=(
+                    f"No credential is stored for provider "
+                    f"'{provider_id.value}'. Connect the provider "
+                    "first."
+                ),
+                metadata={
+                    "provider": provider_id.value,
+                    "operation_id": record.operation_id,
+                },
+            )
+
+        # Optional account hint from the facade.
+        override: Optional[str] = None
+        if context.metadata:
+            raw = context.metadata.get("account_id")
+            if isinstance(raw, str):
+                override = raw.strip() or None
+
+        chosen = None
+        if override:
+            for entry in for_provider:
+                if entry.account_id == override:
+                    chosen = entry
+                    break
+            if chosen is None:
+                return ToolResult.fail(
+                    error_code="AUTH_REQUIRED",
+                    error_message=(
+                        f"No credential is stored for account "
+                        f"'{override}' on provider "
+                        f"'{provider_id.value}'."
+                    ),
+                    metadata={
+                        "provider": provider_id.value,
+                        "account_id": override,
+                        "operation_id": record.operation_id,
+                    },
+                )
+        else:
+            chosen = for_provider[0]
+
+        # Read the token from the vault.
+        token = token_service.get_access_token(
+            provider_id, chosen.account_id, chosen.base_url
+        )
+        if not token:
+            return ToolResult.fail(
+                error_code="AUTH_REQUIRED",
+                error_message=(
+                    "The stored credential is missing or expired. "
+                    "Reconnect the provider before retrying the "
+                    "change-request creation."
+                ),
+                metadata={
+                    "provider": provider_id.value,
+                    "account_id": chosen.account_id,
+                    "base_url": redact_url(chosen.base_url),
+                    "operation_id": record.operation_id,
+                },
+            )
+
+        return provider_id, chosen.account_id, chosen.base_url, token
+
     # --- Internal: repository resolution -------------------------------
 
+    @staticmethod
     async def _resolve_repository(
-        self,
         *,
         adapter: Any,
         record: Any,
+        token: str,
     ) -> Optional[Any]:
         """
         Resolve the `RepositoryRef` for the operation.
@@ -474,13 +621,25 @@ class CreateChangeRequestTool(SourceControlTool):
         ID. This mirrors the fallback used by the other tools and
         keeps the tool provider-neutral until the protocol exposes a
         direct by-ID lookup.
+
+        The `token` argument is REQUIRED. Without it, private
+        repositories cannot be resolved.
         """
         from ..domain.models import RepositoryRef
 
         try:
             listing = await adapter.list_repositories(
-                page=1, page_size=100, token=None
+                page=1, page_size=100, token=token
             )
+        except TypeError:
+            # Some adapter signatures use `limit=` instead of
+            # `page=`/`page_size=`. Fall back gracefully.
+            try:
+                listing = await adapter.list_repositories(
+                    query=None, limit=100, token=token
+                )
+            except Exception:  # noqa: BLE001
+                return None
         except Exception:  # noqa: BLE001
             return None
 

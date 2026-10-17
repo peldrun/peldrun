@@ -16,6 +16,8 @@ Initializes middleware, static files, and canonical REST routers:
 - /api/store
 - /api/store/tools/bundles (Tool Bundles Subsystem)
 - /api/telemetry (P1-03D Canonical Analytics & Metering APIs)
+- /api/source-control (Source Control Integration: providers,
+  repositories, workspaces, approvals, operations, audit)
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ from omweb.routers import (
     run,
     search_rtr,
     setup,
+    source_control,
     status,
     storage,
     store_rtr,
@@ -88,6 +91,13 @@ app.include_router(
     tags=["store", "bundles"],
 )
 app.include_router(telemetry.router, prefix="/api/telemetry", tags=["telemetry"])
+
+# Source Control Integration router.
+#
+# NOTE: The router itself defines its internal prefix as
+# `/api/source-control` (see `routers/source_control.py`). Do NOT pass
+# a `prefix=` argument here, or the path would be double-prefixed.
+app.include_router(source_control.router)
 
 # Mount Storage Filesystem for Deliverables and Downloads
 STORAGE_ROOT.mkdir(parents=True, exist_ok=True)

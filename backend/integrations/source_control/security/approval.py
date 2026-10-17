@@ -20,25 +20,24 @@ and consume approval tickets. It enforces the following invariants:
 The `ApprovalTicket` model is defined in `domain.models` and is the
 single source of truth. This module MUST NOT redefine it.
 
-Two consumption paths are provided:
+CONSUMPTION PATH (single, mandatory):
+    `consume(approval_id, expected_*)` — the ONLY way to consume a
+    ticket. Every bound field is re-validated against the caller's
+    expectation before the ticket is marked consumed. Any mismatch
+    raises `ApprovalInvalidError`.
 
-    - `consume(approval_id, expected_*)` — the CANONICAL path used by
-      the agent tools (`tools/push_branch.py`, `tools/...`). Every
-      bound field is re-validated against the caller's expectation
-      before the ticket is marked consumed. This is the entry point
-      that MUST be used whenever the caller has the operation
-      snapshot available.
+REMOVED PATH (was a security hole):
+    `consume_approval(approval_id)` — previously marked the ticket
+    as consumed without comparing bound fields, which allowed an
+    approved diff to be swapped for a different diff at execution
+    time. It now raises `NotImplementedError`. Any caller still
+    using it MUST migrate to `consume`.
 
-    - `consume_approval(approval_id)` — a LEGACY path used by the
-      HTTP facade (`omweb/services/source_control_facade.py`). It
-      marks the ticket as consumed after checking that it is
-      consumable (not expired, not already used, granted by the
-      user), but it does NOT compare bound fields. The caller MUST
-      verify `ticket.base_sha` and `ticket.diff_sha256` itself, as
-      the facade does, before performing the remote side effect.
-
-New code SHOULD use `consume`. The legacy path exists only to keep
-the HTTP facade functional while the facade is being migrated.
+DEPRECATED ALIASES (still functional, will be removed):
+    - `approve_ticket(...)` — alias for `grant(...)`. Emits
+      `DeprecationWarning`.
+    - `reject_ticket(...)` — alias for `reject(...)`. Emits
+      `DeprecationWarning`.
 
 Design rules:
     - The gate is thread-safe. All mutations hold a single `RLock`.
@@ -58,6 +57,7 @@ import logging
 import re
 import secrets
 import threading
+import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
@@ -166,7 +166,9 @@ def compute_diff_sha256(diff: Any) -> str:
         if not isinstance(digest, str) or not _SHA256_PATTERN.match(digest):
             raise ValidationError(
                 "Diff.sha256() returned an invalid digest.",
-                details={"length": len(digest) if isinstance(digest, str) else None},
+                details={
+                    "length": len(digest) if isinstance(digest, str) else None
+                },
             )
         return digest
 
@@ -414,12 +416,12 @@ class ApprovalGate:
             extra_payload={"reason": reason} if reason else None,
         )
 
-    # --- Legacy facade-facing API --------------------------------------
+    # --- Deprecated facade-facing aliases ------------------------------
     #
-    # The methods below are used by
-    # `omweb/services/source_control_facade.py`. They are thin wrappers
-    # around the canonical methods, provided so that the HTTP facade
-    # keeps working while it is being migrated to the canonical API.
+    # These aliases keep older callers working but emit a
+    # DeprecationWarning. They are safe (they delegate to the
+    # canonical methods) but should be migrated away from in new
+    # code. They will be removed in a future release.
 
     def approve_ticket(
         self,
@@ -429,12 +431,18 @@ class ApprovalGate:
         notes: Optional[str] = None,
     ) -> ApprovalTicket:
         """
-        LEGACY: approve an approval ticket.
+        DEPRECATED: use `grant()` instead.
 
         Alias for `grant`. The `user_id` argument is mapped to the
         `actor` field of the audit log; `notes` is recorded on the
-        audit event. Prefer `grant` in new code.
+        audit event.
         """
+        warnings.warn(
+            "ApprovalGate.approve_ticket() is deprecated; use "
+            "ApprovalGate.grant() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         if notes:
             # Reject notes that embed an obvious secret; they will be
             # redacted anyway, but a hard failure here surfaces a
@@ -456,11 +464,17 @@ class ApprovalGate:
         reason: Optional[str] = None,
     ) -> ApprovalTicket:
         """
-        LEGACY: reject an approval ticket.
+        DEPRECATED: use `reject()` instead.
 
         Alias for `reject`. The `user_id` argument is mapped to the
-        `actor` field of the audit log. Prefer `reject` in new code.
+        `actor` field of the audit log.
         """
+        warnings.warn(
+            "ApprovalGate.reject_ticket() is deprecated; use "
+            "ApprovalGate.reject() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self.reject(
             approval_id,
             actor=user_id or "user",
@@ -469,67 +483,43 @@ class ApprovalGate:
 
     def consume_approval(self, approval_id: str) -> ApprovalTicket:
         """
-        LEGACY: consume an approval ticket without field validation.
+        DISABLED: legacy consumption path.
 
-        This method marks the ticket as consumed after checking that
-        it is consumable (granted by the user, not expired, not
-        already used), but it does NOT compare the ticket's bound
-        fields against a caller-supplied operation snapshot.
+        This method previously marked a ticket as consumed after
+        verifying only that it was consumable (granted, not expired,
+        not already used). It did NOT compare the ticket's bound
+        fields against the caller's expected values, which meant an
+        attacker or buggy caller could approve one diff and execute a
+        different one.
 
-        Callers using this method MUST verify `ticket.base_sha` and
-        `ticket.diff_sha256` themselves before performing the remote
-        side effect. The HTTP facade does exactly this.
+        The method is retained as a stub that raises
+        `NotImplementedError` with a clear migration message. Every
+        caller MUST migrate to:
 
-        New code SHOULD use `consume(approval_id, expected_*)`, which
-        performs the comparison inside the gate.
-
-        Returns:
-            The consumed `ApprovalTicket`.
+            ApprovalGate.consume(
+                approval_id,
+                expected_operation_id=...,
+                expected_repository_id=...,
+                expected_operation=...,
+                expected_base_sha=...,
+                expected_diff_sha256=...,
+                expected_target_branch=...,
+            )
 
         Raises:
-            ApprovalInvalidError: If the ticket does not exist.
-            ApprovalExpiredError: If the ticket has expired.
-            ApprovalConsumedError: If the ticket was already consumed.
-            ApprovalRequiredError: If the user has not granted the
-                ticket yet.
+            NotImplementedError: Always. This method is disabled.
         """
         self._validate_non_empty(approval_id, "approval_id")
-
-        with self._lock:
-            ticket = self._get_ticket_locked(approval_id)
-            self._assert_consumable_locked(ticket)
-
-            consumed = self._replace_ticket(
-                ticket,
-                status=ApprovalStatus.CONSUMED,
-                consumed_at=_utc_now(),
-            )
-            self._tickets[approval_id] = consumed
-
-        self._audit.record(
-            AuditEventType.APPROVAL_CONSUME,
-            severity=AuditSeverity.INFO,
-            action="consume_legacy",
-            message=(
-                "Approval consumed via the legacy path; the caller is "
-                "responsible for bound-field validation."
-            ),
-            payload={
-                "approval_id": approval_id,
-                "base_sha": ticket.base_sha,
-                "diff_sha256": ticket.diff_sha256,
-                "target_branch": ticket.target_branch,
-                "legacy_path": True,
-            },
-            operation_id=ticket.operation_id,
-            repository_id=ticket.repository_id,
-            approval_id=approval_id,
-            actor="system",
+        raise NotImplementedError(
+            "ApprovalGate.consume_approval() has been disabled: it did "
+            "not validate the ticket's bound fields. Use "
+            "ApprovalGate.consume(approval_id, expected_operation_id=..., "
+            "expected_repository_id=..., expected_operation=..., "
+            "expected_base_sha=..., expected_diff_sha256=..., "
+            "expected_target_branch=...) instead."
         )
 
-        return consumed
-
-    # --- Consumption ----------------------------------------------------
+    # --- Canonical consumption -----------------------------------------
 
     def consume(
         self,
@@ -559,16 +549,23 @@ class ApprovalGate:
 
         Raises:
             ValidationError: If any input is empty or malformed.
-            ApprovalRequiredError: If the ticket does not exist.
+            ApprovalInvalidError: If the ticket does not exist, or if
+                any bound field does not match.
             ApprovalExpiredError: If the ticket has expired.
             ApprovalConsumedError: If the ticket was already consumed.
-            ApprovalInvalidError: If any bound field does not match.
+            ApprovalRequiredError: If the ticket has not been granted.
         """
         # Validate inputs first (fail fast on caller bugs).
-        self._validate_non_empty(expected_operation_id, "expected_operation_id")
-        self._validate_non_empty(expected_repository_id, "expected_repository_id")
+        self._validate_non_empty(
+            expected_operation_id, "expected_operation_id"
+        )
+        self._validate_non_empty(
+            expected_repository_id, "expected_repository_id"
+        )
         self._validate_non_empty(expected_operation, "expected_operation")
-        self._validate_non_empty(expected_target_branch, "expected_target_branch")
+        self._validate_non_empty(
+            expected_target_branch, "expected_target_branch"
+        )
         self._validate_diff_sha256(expected_diff_sha256)
         self._validate_base_sha(expected_base_sha)
 
@@ -633,10 +630,16 @@ class ApprovalGate:
         ticket's status. Use this before starting a long-running
         operation to fail fast.
         """
-        self._validate_non_empty(expected_operation_id, "expected_operation_id")
-        self._validate_non_empty(expected_repository_id, "expected_repository_id")
+        self._validate_non_empty(
+            expected_operation_id, "expected_operation_id"
+        )
+        self._validate_non_empty(
+            expected_repository_id, "expected_repository_id"
+        )
         self._validate_non_empty(expected_operation, "expected_operation")
-        self._validate_non_empty(expected_target_branch, "expected_target_branch")
+        self._validate_non_empty(
+            expected_target_branch, "expected_target_branch"
+        )
         self._validate_diff_sha256(expected_diff_sha256)
         self._validate_base_sha(expected_base_sha)
 
@@ -875,7 +878,10 @@ class ApprovalGate:
                     "Cannot modify a revoked approval ticket.",
                     details={"approval_id": approval_id},
                 )
-            if ticket.expires_at <= _utc_now() and target_status == ApprovalStatus.GRANTED:
+            if (
+                ticket.expires_at <= _utc_now()
+                and target_status == ApprovalStatus.GRANTED
+            ):
                 # Mark the ticket as expired and refuse the grant.
                 expired = self._replace_ticket(
                     ticket, status=ApprovalStatus.EXPIRED
@@ -1027,9 +1033,6 @@ class ApprovalGate:
 #: Alias for `ApprovalGate`.
 ApprovalManager = ApprovalGate
 
-#: Alias for `get_default_approval_gate`.
-get_default_approval_manager = None  # replaced below, after the function is defined
-
 
 # ---------------------------------------------------------------------------
 # Default gate singleton
@@ -1079,14 +1082,7 @@ def reset_default_approval_gate() -> ApprovalGate:
         return _DEFAULT_GATE
 
 
-# Rebind the aliases now that the canonical functions exist. These are
-# the single assignments for the `*_approval_manager` names; the
-# earlier placeholder for `get_default_approval_manager` only existed
-# so that `__all__` could be declared up front.
-#
-# Each `*_approval_manager` name refers to the SAME underlying function
-# as its `*_approval_gate` counterpart, so callers may use either pair
-# interchangeably.
+# Rebind the aliases now that the canonical functions exist.
 get_default_approval_manager = get_default_approval_gate
 set_default_approval_manager = set_default_approval_gate
 reset_default_approval_manager = reset_default_approval_gate
@@ -1095,8 +1091,4 @@ reset_default_approval_manager = reset_default_approval_gate
 # single source of truth for the approval snapshot. It is re-exported
 # here so that `security/__init__.py` can import it alongside the
 # `ApprovalGate` without needing a separate domain import.
-#
-# This re-export is intentionally a reference, not a copy: the two
-# names refer to the same class, so `isinstance` checks work across
-# every import path.
 ApprovalTicket = ApprovalTicket

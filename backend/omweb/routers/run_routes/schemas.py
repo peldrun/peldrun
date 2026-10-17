@@ -4,13 +4,19 @@ Pydantic request models for the run router.
 These schemas are shared by several endpoint submodules, so they live in a
 dedicated module to avoid circular imports and to keep a single source of
 truth for the public request contract.
+
+Pydantic V2 migration:
+    Class-based ``class Config:`` blocks are deprecated and will be removed
+    in Pydantic V3. Every model in this module uses the V2 ``model_config``
+    attribute with a ``ConfigDict`` instead. The behavior is identical; only
+    the syntax changed.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # [FIX-3.1] Structured reference to a workspace file the user explicitly
@@ -27,6 +33,8 @@ from pydantic import BaseModel, Field
 class ContextRef(BaseModel):
     """A single workspace file reference attached to a run request."""
 
+    model_config = ConfigDict(populate_by_name=True)
+
     rel_path: str = Field(
         ...,
         alias="relPath",
@@ -41,9 +49,6 @@ class ContextRef(BaseModel):
         default=None,
         description="Source tier: 'workspace' | 'chats' | 'projects'.",
     )
-
-    class Config:
-        populate_by_name = True
 
 
 class RunRequest(BaseModel):

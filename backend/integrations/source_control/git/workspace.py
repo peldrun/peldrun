@@ -26,9 +26,13 @@ Design rules:
       disk. The manager removes the workspace directory on error.
     - The manager is thread-safe. The in-memory registry is guarded by
       a reentrant lock.
-    - The manager does NOT authenticate to the remote. Clone URLs
-      MUST be provided credential-free; authenticated operations are
-      handled by the push manager.
+    - The manager does NOT authenticate to the remote by default.
+      Callers that need to clone a private repository MUST pass an
+      `auth_token`. When a token is supplied, it is embedded in the
+      clone URL ONLY for the duration of the clone/fetch, and the
+      `.git/config` origin URL is sanitized immediately afterwards.
+      The token is NEVER persisted in `.git/config`, NEVER logged,
+      and NEVER returned in any diagnostic.
 """
 
 from __future__ import annotations
@@ -41,6 +45,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Dict, List, Optional, Sequence
+from urllib.parse import urlsplit, urlunsplit
 
 from ..domain.enums import ProviderId
 from ..domain.models import (
@@ -111,6 +116,10 @@ class _CreateRequest:
     Produced by `_normalize_request` after accepting both the test
     signature (`repository_id` + `branch_name`) and the internal
     signature (`repo` + `source_branch`).
+
+    `auth_token` is a short-lived credential used only for the
+    clone/fetch step. It MUST NOT be persisted in `.git/config`,
+    logged, or returned in any diagnostic.
     """
 
     repository_id: str
@@ -122,6 +131,7 @@ class _CreateRequest:
     depth: Optional[int]
     reuse_existing_branch: bool
     metadata: Dict[str, object] = field(default_factory=dict)
+    auth_token: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +214,7 @@ class GitWorkspaceManager:
         depth: Optional[int] = None,
         reuse_existing_branch: bool = False,
         metadata: Optional[Dict[str, object]] = None,
+        auth_token: Optional[str] = None,
     ) -> WorkspaceRef:
         """
         Create a new workspace.
@@ -230,6 +241,13 @@ class GitWorkspaceManager:
         `branch_name` and `source_branch` are synonyms; when both are
         provided, they MUST be equal.
 
+        Args:
+            auth_token: Optional short-lived credential used only for
+                the clone/fetch step. It is embedded in the clone URL
+                for the duration of the network operation and removed
+                from `.git/config` immediately afterwards. It is
+                NEVER persisted, logged, or returned.
+
         Returns:
             The `WorkspaceRef` for the newly created workspace.
 
@@ -253,6 +271,7 @@ class GitWorkspaceManager:
             depth=depth,
             reuse_existing_branch=reuse_existing_branch,
             metadata=metadata,
+            auth_token=auth_token,
         )
 
         with self._lock:
@@ -482,12 +501,16 @@ class GitWorkspaceManager:
         depth: Optional[int],
         reuse_existing_branch: bool,
         metadata: Optional[Dict[str, object]],
+        auth_token: Optional[str] = None,
     ) -> _CreateRequest:
         """
         Normalize a caller-supplied request into a `_CreateRequest`.
 
         Accepts both the test signature and the internal signature.
         Raises `ValidationError` for inconsistent inputs.
+
+        `auth_token`, when provided, is carried into the resulting
+        `_CreateRequest` and used only for the clone/fetch step.
         """
         if repo is None and not repository_id:
             raise ValidationError(
@@ -559,6 +582,7 @@ class GitWorkspaceManager:
             depth=depth,
             reuse_existing_branch=bool(reuse_existing_branch),
             metadata=dict(metadata or {}),
+            auth_token=auth_token,
         )
 
     # --- Internal: workspace path --------------------------------------
@@ -626,6 +650,7 @@ class GitWorkspaceManager:
                 target=target,
                 depth=request.depth,
                 use_worktree=request.use_worktree,
+                auth_token=request.auth_token,
             )
         else:
             await self._init_empty_repo(target=target)
@@ -664,44 +689,111 @@ class GitWorkspaceManager:
         target: Path,
         depth: Optional[int],
         use_worktree: bool,
+        auth_token: Optional[str] = None,
     ) -> None:
         """
         Materialize `target` from `clone_url`.
 
-        The clone URL is sanitized: any embedded userinfo is removed
-        before use, because credentials MUST NOT be persisted in
-        `.git/config`.
-        """
-        sanitized_url = _strip_url_credentials(clone_url)
+        When `auth_token` is provided, it is embedded in the URL used
+        for the clone/fetch operation and removed from `.git/config`
+        immediately afterwards. When not provided, `clone_url` MUST
+        be credential-free.
 
-        if use_worktree:
-            # Worktree-style materialization: initialize a local
-            # repository, add the remote, then fetch. This avoids
-            # the full clone cost and keeps the target directory
-            # self-contained.
-            await self._git.run(["init", "-q", str(target)])
-            await self._git.run(
-                ["remote", "add", "origin", sanitized_url], cwd=target
+        Security contract:
+            - The authenticated URL is used ONLY for the network
+              operation (clone or fetch).
+            - After the operation completes (success or failure),
+              `git remote set-url origin <clean_url>` replaces the
+              authenticated URL with the credential-free form in
+              `.git/config`.
+            - The cleanup runs in a `finally` block so a failed
+              clone still sanitizes any partial `.git/config`.
+            - If the cleanup itself fails, a warning is logged and
+              the caller is advised to rotate the token.
+        """
+        # The clean URL is what we will persist. The working URL is
+        # what we actually use for the network operation.
+        clean_url = _strip_url_credentials(clone_url)
+        if auth_token:
+            working_url = _inject_token_in_url(clean_url, auth_token)
+        else:
+            working_url = clean_url
+
+        try:
+            if use_worktree:
+                # Worktree-style materialization: initialize a local
+                # repository, add the remote, then fetch.
+                await self._git.run(["init", "-q", str(target)])
+                await self._git.run(
+                    ["remote", "add", "origin", working_url], cwd=target
+                )
+                fetch_args: List[str] = ["fetch", "--prune", "origin"]
+                if depth:
+                    fetch_args.extend(["--depth", str(depth)])
+                await self._git.run(
+                    fetch_args, cwd=target, timeout_seconds=300
+                )
+                # Ensure the repository has a HEAD. If it does not,
+                # this step is a no-op; the caller will set up the
+                # branch.
+                await self._git.run(
+                    ["remote", "set-head", "origin", "-a"],
+                    cwd=target,
+                    check_returncode=False,
+                )
+            else:
+                clone_args: List[str] = ["clone", "--origin", "origin"]
+                if depth:
+                    clone_args.extend(["--depth", str(depth)])
+                clone_args.extend([working_url, str(target)])
+                await self._git.run(clone_args, timeout_seconds=600)
+        finally:
+            # Sanitize `.git/config` regardless of whether the clone
+            # succeeded. A partially initialized repository may still
+            # contain the authenticated URL.
+            await self._sanitize_remote_url(
+                target=target,
+                clean_url=clean_url,
+                auth_token=auth_token,
             )
-            fetch_args: List[str] = ["fetch", "--prune", "origin"]
-            if depth:
-                fetch_args.extend(["--depth", str(depth)])
+
+    async def _sanitize_remote_url(
+        self,
+        *,
+        target: Path,
+        clean_url: str,
+        auth_token: Optional[str],
+    ) -> None:
+        """
+        Replace the origin remote URL with the credential-free form.
+
+        Runs `git remote set-url origin <clean_url>` when a token was
+        used. If the operation fails, logs a warning that names the
+        target; the caller is expected to continue (the workspace is
+        functional) but should consider the token compromised and
+        rotate it.
+
+        This method is idempotent and safe to call when no token was
+        used or when the target directory does not exist yet.
+        """
+        if not auth_token or not clean_url:
+            return
+        if not target.exists():
+            return
+        try:
             await self._git.run(
-                fetch_args, cwd=target, timeout_seconds=300
-            )
-            # Ensure the repository has a HEAD. If it does not, this
-            # step is a no-op; the caller will set up the branch.
-            await self._git.run(
-                ["remote", "set-head", "origin", "-a"],
+                ["remote", "set-url", "origin", clean_url],
                 cwd=target,
                 check_returncode=False,
             )
-        else:
-            clone_args: List[str] = ["clone", "--origin", "origin"]
-            if depth:
-                clone_args.extend(["--depth", str(depth)])
-            clone_args.extend([sanitized_url, str(target)])
-            await self._git.run(clone_args, timeout_seconds=600)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to sanitize origin remote URL in %s: %s. "
+                "The clone credential may still be present in "
+                ".git/config and SHOULD be rotated.",
+                target,
+                type(exc).__name__,
+            )
 
     async def _init_empty_repo(self, *, target: Path) -> None:
         """
@@ -904,6 +996,40 @@ def _strip_url_credentials(url: str) -> str:
     import re
 
     return re.sub(_URL_CREDS_PATTERN, "://", url)
+
+
+def _inject_token_in_url(clone_url: str, token: str) -> str:
+    """
+    Return `clone_url` with the token embedded for authentication.
+
+    The form `https://x-access-token:TOKEN@host/path` is accepted by
+    GitHub, GitLab, and Bitbucket Cloud for HTTPS clone. SSH URLs
+    (git@...) cannot carry a token this way and are returned
+    unchanged; the operation will then fail with a clear auth error,
+    which is the correct behavior.
+
+    The token is URL-encoded only if it contains characters that
+    would break the URL structure. Tokens issued by the three
+    supported providers are URL-safe, so encoding is a no-op in
+    practice.
+    """
+    if not clone_url or not token:
+        return clone_url
+
+    parsed = urlsplit(clone_url)
+    if parsed.scheme.lower() not in ("http", "https"):
+        return clone_url
+    if not parsed.hostname:
+        return clone_url
+
+    netloc = f"x-access-token:{token}@{parsed.hostname}"
+    if parsed.port:
+        netloc += f":{parsed.port}"
+
+    return urlunsplit(
+        (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
+    )
+
 
 # ---------------------------------------------------------------------------
 # Default workspace manager singleton

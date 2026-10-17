@@ -9,8 +9,10 @@ Git process. Every Git operation flows through `GitExecutable.run` or
 
     - Commands are executed with `asyncio.create_subprocess_exec`
       using an argument array. `shell=True` is never used.
-    - The Git binary path is validated to contain no shell
-      metacharacters.
+    - The Git binary path is validated to exclude control characters
+      and shell-injection sequences. Windows path separators (`\\`)
+      are explicitly permitted because they are not interpreted by
+      `create_subprocess_exec`.
     - The environment is sanitized: dangerous variables
       (`GIT_TRACE`, `GIT_ASKPASS`, `GIT_CURL_VERBOSE`,
       `GIT_CONFIG_PARAMETERS`, and the SSH equivalents) are removed,
@@ -92,7 +94,22 @@ DEFAULT_TIMEOUT_SECONDS: int = 60
 MINIMUM_GIT_VERSION: Tuple[int, int, int] = (2, 20, 0)
 
 #: Shell metacharacters that MUST NOT appear in the Git binary path.
-_SHELL_METACHARACTERS = re.compile(r"[;&|`$<>\n\r\t\"'\\*?\[\]{}()]")
+#:
+#: IMPORTANT: The backslash character `\` is deliberately EXCLUDED
+#: from this set because:
+#:
+#:     1. It is the Windows path separator, so every Windows Git
+#:        installation path (e.g. `C:\Program Files\Git\cmd\git.exe`)
+#:        would be rejected.
+#:     2. `asyncio.create_subprocess_exec` does NOT interpret the
+#:        binary path through a shell, so backslashes carry no
+#:        injection risk.
+#:
+#: The forbidden characters are limited to shell operators, control
+#: characters, and quotes — all of which could break logging or mask
+#: an attempt to smuggle a shell command through an environment
+#: variable.
+_SHELL_METACHARACTERS = re.compile(r"[;&|`$<>\n\r\t\"'*?\[\]{}()]")
 
 #: Environment variables that are removed before spawning Git.
 _UNSAFE_ENV_VARS: Tuple[str, ...] = (
@@ -759,12 +776,20 @@ class GitExecutable:
         """
         Locate the Git binary and validate its path.
 
-        When `git_binary` is provided, it is validated and used as-is.
-        Otherwise, `shutil.which("git")` is used to search `PATH`.
+        When `git_binary` is provided, it is validated and used as-is
+        (resolved to an absolute path when possible). Otherwise,
+        `shutil.which("git")` is used to search `PATH`.
+
+        Validation rules:
+            - The path MUST be a non-empty string.
+            - The path MUST NOT contain shell metacharacters that
+              could break logging or mask an injection attempt. The
+              Windows path separator (`\\`) is explicitly permitted;
+              see `_SHELL_METACHARACTERS` for the rationale.
 
         Raises:
-            ValidationError: If the supplied path contains shell
-                metacharacters.
+            ValidationError: If the supplied path is empty or contains
+                forbidden characters.
             GitNotAvailableError: If no Git binary can be found.
         """
         if git_binary is None:
@@ -773,7 +798,13 @@ class GitExecutable:
                 raise GitNotAvailableError(
                     "Git binary could not be located on PATH."
                 )
-            git_binary = located
+            return os.path.abspath(located)
+
+        if not isinstance(git_binary, str) or not git_binary.strip():
+            raise ValidationError(
+                "git_binary must be a non-empty string.",
+                details={"type": type(git_binary).__name__},
+            )
 
         if _SHELL_METACHARACTERS.search(git_binary):
             raise ValidationError(
@@ -783,11 +814,11 @@ class GitExecutable:
 
         resolved = Path(git_binary).expanduser()
         if not resolved.is_absolute():
-            # Resolve to an absolute path if possible.
             located = shutil.which(git_binary)
             if located:
                 resolved = Path(located)
-
+            else:
+                resolved = resolved.absolute()
         return str(resolved)
 
     def _check_version(self) -> None:
