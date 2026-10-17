@@ -43,6 +43,7 @@ from ..domain.enums import (  # noqa: F401 (re-exported)
     OperationEventType,
     OperationStatus,
 )
+from ..domain.enums import ProviderId  # noqa: F401 (re-exported)
 from ..domain.models import (  # noqa: F401 (re-exported)
     OperationEvent,
     OperationRecord,
@@ -54,13 +55,16 @@ __all__ = [
     "OperationRecord",
     "OperationEvent",
     "OperationStatus",
+    "OperationState",
     "OperationEventType",
+    "IdempotencyRecord",
     "_utc_now",
     # Operation-specific value objects
     "OperationTransition",
     # State-machine constants and predicates
     "TERMINAL_STATUSES",
     "ALLOWED_TRANSITIONS",
+    "VALID_TRANSITIONS",
     "is_terminal_status",
     "is_valid_transition",
     "allowed_next_statuses",
@@ -346,3 +350,67 @@ def allowed_next_statuses(
     Empty for terminal statuses.
     """
     return ALLOWED_TRANSITIONS.get(status, frozenset())
+# ---------------------------------------------------------------------------
+# Backward-compatibility aliases
+# ---------------------------------------------------------------------------
+
+#: Alias for `OperationStatus`.
+#:
+#: The HTTP facade and the schemas were written against an
+#: `OperationState` vocabulary. This alias keeps them working without
+#: renaming the canonical enum.
+OperationState = OperationStatus
+
+#: Alias for `ALLOWED_TRANSITIONS`.
+#:
+#: Some callers prefer the name "valid transitions" when inspecting
+#: the state machine directly.
+VALID_TRANSITIONS: Dict[OperationStatus, FrozenSet[OperationStatus]] = (
+    ALLOWED_TRANSITIONS
+)
+
+
+# ---------------------------------------------------------------------------
+# Idempotency record
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class IdempotencyRecord:
+    """
+    Lightweight snapshot of an idempotency entry.
+
+    This is a mirror of `operations.idempotency.IdempotencyEntry`
+    exposed through the `operations.models` namespace so that
+    `operations/__init__.py` can re-export a stable name without
+    creating a circular import between `models` and `idempotency`.
+
+    The canonical class remains `IdempotencyEntry`. This record is
+    intentionally schema-light: it carries only the fields that
+    callers typically read when listing or auditing idempotent
+    requests.
+
+    Fields:
+        key:         The 64-character hex digest of the request.
+        operation_id: The operation that produced the entry.
+        outcome:     Current outcome (`in_progress`, `succeeded`,
+                     `failed`, or `ambiguous`).
+        created_at:  When the entry was created.
+        updated_at:  When the entry was last updated.
+        expires_at:  When the entry becomes stale.
+        remote_ref:  Optional remote reference produced by the
+                     operation (e.g. a change request URL).
+        error_code:  Optional error code when the outcome is
+                     `failed`.
+        message:     Optional human-readable detail.
+    """
+
+    key: str
+    operation_id: str
+    outcome: str = "in_progress"
+    created_at: datetime = field(default_factory=_utc_now)
+    updated_at: datetime = field(default_factory=_utc_now)
+    expires_at: Optional[datetime] = None
+    remote_ref: Optional[str] = None
+    error_code: Optional[str] = None
+    message: Optional[str] = None

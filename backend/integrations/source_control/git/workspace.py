@@ -69,6 +69,9 @@ __all__ = [
     "GitWorkspaceManager",
     "RepositoryResolver",
     "DEFAULT_MAX_WORKSPACES",
+    "get_default_workspace_manager",
+    "set_default_workspace_manager",
+    "reset_default_workspace_manager",
 ]
 
 
@@ -901,3 +904,62 @@ def _strip_url_credentials(url: str) -> str:
     import re
 
     return re.sub(_URL_CREDS_PATTERN, "://", url)
+
+# ---------------------------------------------------------------------------
+# Default workspace manager singleton
+# ---------------------------------------------------------------------------
+#
+# The agent tools and the HTTP facade reach for a process-wide default
+# `GitWorkspaceManager`. It uses the default `GitExecutable` and the
+# default `WorkspacePathPolicy`, which are themselves process-wide
+# singletons. Tests can replace the manager via
+# `set_default_workspace_manager` or discard it via
+# `reset_default_workspace_manager`.
+
+_DEFAULT_WORKSPACE_MANAGER: Optional[GitWorkspaceManager] = None
+_WORKSPACE_MANAGER_LOCK = threading.RLock()
+
+
+def get_default_workspace_manager() -> GitWorkspaceManager:
+    """
+    Return the process-wide default `GitWorkspaceManager`, creating it
+    on first use.
+
+    The manager uses the process-wide default `GitExecutable` and
+    `WorkspacePathPolicy`. Tests that need an isolated workspace root
+    SHOULD construct a manager explicitly with their own policy.
+    """
+    global _DEFAULT_WORKSPACE_MANAGER
+    with _WORKSPACE_MANAGER_LOCK:
+        if _DEFAULT_WORKSPACE_MANAGER is None:
+            _DEFAULT_WORKSPACE_MANAGER = GitWorkspaceManager()
+        return _DEFAULT_WORKSPACE_MANAGER
+
+
+def set_default_workspace_manager(manager: GitWorkspaceManager) -> None:
+    """
+    Replace the process-wide default workspace manager.
+
+    Intended for application startup and for tests.
+    """
+    if not isinstance(manager, GitWorkspaceManager):
+        raise TypeError(
+            "set_default_workspace_manager expects a "
+            "GitWorkspaceManager instance."
+        )
+    global _DEFAULT_WORKSPACE_MANAGER
+    with _WORKSPACE_MANAGER_LOCK:
+        _DEFAULT_WORKSPACE_MANAGER = manager
+
+
+def reset_default_workspace_manager() -> GitWorkspaceManager:
+    """
+    Replace the default manager with a fresh one.
+
+    Used by tests to guarantee isolation between test cases. The new
+    manager uses the current default path policy and Git executable.
+    """
+    global _DEFAULT_WORKSPACE_MANAGER
+    with _WORKSPACE_MANAGER_LOCK:
+        _DEFAULT_WORKSPACE_MANAGER = GitWorkspaceManager()
+        return _DEFAULT_WORKSPACE_MANAGER

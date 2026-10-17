@@ -17,6 +17,15 @@ Policies are pure functions of their inputs. They MUST NOT perform
 I/O, read environment variables, or depend on any infrastructure. The
 `security.policy_engine` module is responsible for evaluating policies
 against a concrete operation and producing an auditable decision.
+
+Naming:
+    - `WorkflowPolicy` is the canonical name; `WorkflowProtectionPolicy`
+      is a backward-compatibility alias used by `domain/__init__.py`.
+    - `PolicyDecision` is the canonical name; `PolicyEvaluationResult`
+      is a backward-compatibility alias.
+    - `evaluate_policy` is the canonical evaluator; `evaluate_operation`
+      is a keyword-argument wrapper for callers that prefer the longer
+      name.
 """
 
 from __future__ import annotations
@@ -29,15 +38,23 @@ from .enums import ProviderId
 from .models import BranchRef, RepositoryRef
 
 __all__ = [
+    # Policy dataclasses
     "BranchPolicy",
     "WorkflowPolicy",
     "ApprovalPolicy",
     "SourceControlPolicy",
+    # Result type
     "PolicyDecision",
+    "PolicyEvaluationResult",
+    # Free functions
     "is_protected_branch",
     "is_workflow_path",
     "is_always_allowed_path",
     "evaluate_policy",
+    "evaluate_operation",
+    # Aliases
+    "WorkflowProtectionPolicy",
+    # Default pattern tables
     "DEFAULT_PROTECTED_BRANCH_PATTERNS",
     "DEFAULT_WORKFLOW_PATH_PATTERNS",
     "DEFAULT_SECRET_PATH_PATTERNS",
@@ -224,6 +241,9 @@ class BranchPolicy:
 class WorkflowPolicy:
     """
     Rules for CI/workflow files and secret-bearing paths.
+
+    Note: this class is aliased below as `WorkflowProtectionPolicy` for
+    callers that prefer the longer name.
     """
 
     workflow_patterns: Sequence[str] = field(
@@ -319,12 +339,39 @@ class PolicyDecision:
     `allowed` reflects the policy outcome only. It does NOT mean the
     operation may proceed: the approval layer is evaluated separately.
     The two decisions are combined by the application service.
+
+    Fields:
+        allowed:            Whether the operation is permitted by
+                            policy.
+        reason:             Human-readable explanation when the
+                            operation is denied.
+        requires_approval:  Whether human approval is required before
+                            the operation may run.
+        warnings:           Non-fatal messages shown to the user.
     """
 
     allowed: bool
     reason: Optional[str] = None
     requires_approval: bool = False
     warnings: Sequence[str] = field(default_factory=tuple)
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility aliases
+# ---------------------------------------------------------------------------
+
+#: Alias for `WorkflowPolicy`.
+#:
+#: The `domain/__init__.py` file re-exports this longer name; both
+#: names refer to the same class, so `isinstance` checks are
+#: interchangeable.
+WorkflowProtectionPolicy = WorkflowPolicy
+
+#: Alias for `PolicyDecision`.
+#:
+#: Some callers prefer a name that reads as "the result of evaluating
+#: a policy". Both names refer to the same dataclass.
+PolicyEvaluationResult = PolicyDecision
 
 
 # ---------------------------------------------------------------------------
@@ -558,6 +605,37 @@ def evaluate_policy(
     return PolicyDecision(
         allowed=False,
         reason=f"Unknown operation '{operation}'.",
+    )
+
+
+def evaluate_operation(
+    policy: SourceControlPolicy,
+    operation: str,
+    *,
+    repository: Optional[RepositoryRef] = None,
+    target_branch: Optional[str] = None,
+    source_branch: Optional[str] = None,
+    target_branch_ref: Optional[BranchRef] = None,
+    changed_paths: Sequence[str] = (),
+) -> PolicyDecision:
+    """
+    Positional-argument wrapper around `evaluate_policy`.
+
+    This function exists for callers that prefer `operation` as the
+    second positional argument rather than a keyword. It delegates to
+    `evaluate_policy` with the same keyword arguments and returns the
+    same `PolicyDecision`.
+
+    New code SHOULD use `evaluate_policy`.
+    """
+    return evaluate_policy(
+        policy,
+        operation=operation,
+        repository=repository,
+        target_branch=target_branch,
+        source_branch=source_branch,
+        target_branch_ref=target_branch_ref,
+        changed_paths=changed_paths,
     )
 
 

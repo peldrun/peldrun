@@ -32,6 +32,14 @@ Design rules:
       carries only metadata.
     - All callbacks are registered per provider at application
       startup. This module has no provider-specific knowledge.
+
+Singleton accessors:
+    - `get_default_oauth_flow_coordinator()` returns the process-wide
+      coordinator.
+    - `get_default_oauth_session_manager()` returns the coordinator's
+      session store, so that callers inspecting or pruning sessions
+      observe exactly the sessions the coordinator manages. Both
+      accessors operate on the same underlying object.
 """
 
 from __future__ import annotations
@@ -80,8 +88,15 @@ __all__ = [
     "get_default_oauth_flow_coordinator",
     "set_default_oauth_flow_coordinator",
     "reset_default_oauth_flow_coordinator",
+    "get_default_oauth_session_manager",
     "SESSION_TTL_SECONDS",
     "LOOPBACK_HOSTS",
+    "generate_pkce_verifier",
+    "compute_pkce_challenge",
+    "generate_state_token",
+    "get_default_oauth_session_manager",
+    "set_default_oauth_session_manager",
+    "reset_default_oauth_session_manager",
 ]
 
 
@@ -283,6 +298,26 @@ class OAuthFlowCoordinator(OAuthFlowPort):
         self._providers: Dict[str, OAuthProviderCallbacks] = {}
         self._lock = threading.RLock()
         self._session_ttl_seconds = max(1, int(session_ttl_seconds))
+
+    # --- Public accessors ----------------------------------------------
+
+    @property
+    def sessions(self) -> OAuthSessionManager:
+        """
+        Return the session manager backing this coordinator.
+
+        Callers that want to inspect, prune, or clear pending OAuth
+        sessions SHOULD use this property rather than accessing the
+        private attribute. The returned object is the same instance
+        the coordinator uses internally; there is a single source of
+        truth for pending sessions.
+        """
+        return self._sessions
+
+    @property
+    def session_ttl_seconds(self) -> int:
+        """Return the configured TTL for new pending sessions."""
+        return self._session_ttl_seconds
 
     # --- Provider registration -----------------------------------------
 
@@ -713,7 +748,13 @@ class OAuthFlowCoordinator(OAuthFlowPort):
 # Helpers
 # ---------------------------------------------------------------------------
 
-
+# Public aliases for the internal PKCE and state helpers. These are
+# used by external callers (tests, custom authentication flows, and
+# provider adapters) that need to build or verify PKCE parameters
+# without instantiating the full coordinator.
+#
+# The aliases are simple references; the underlying implementations
+# remain the single source of truth.
 def _generate_state() -> str:
     """
     Generate a cryptographically random state value.
@@ -827,6 +868,24 @@ def _provider_value(provider: ProviderId | str) -> str:
     """Return the string form of a provider identifier."""
     return _provider_key(provider)
 
+# ---------------------------------------------------------------------------
+# Public PKCE and state helpers
+# ---------------------------------------------------------------------------
+#
+# These are aliases for the internal helpers above. They are part of
+# the public API because external callers (tests, custom auth flows,
+# provider adapters) frequently need to generate a PKCE verifier,
+# derive its S256 challenge, or generate a random state token without
+# instantiating the full coordinator.
+
+#: Generate a PKCE `code_verifier` per RFC 7636.
+generate_pkce_verifier = _generate_code_verifier
+
+#: Derive the S256 `code_challenge` from a `code_verifier`.
+compute_pkce_challenge = _derive_code_challenge
+
+#: Generate a cryptographically random OAuth `state` value.
+generate_state_token = _generate_state
 
 # ---------------------------------------------------------------------------
 # Default coordinator singleton
@@ -877,3 +936,83 @@ def reset_default_oauth_flow_coordinator() -> OAuthFlowCoordinator:
     with _DEFAULT_LOCK:
         _DEFAULT_COORDINATOR = OAuthFlowCoordinator()
         return _DEFAULT_COORDINATOR
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility aliases for the session manager accessors
+# ---------------------------------------------------------------------------
+#
+# `get_default_oauth_session_manager` is the only accessor for the
+# session manager (see its docstring above for why there is no
+# separate setter). The `set_*` and `reset_*` aliases below are kept
+# for callers that expect a symmetric API. They intentionally operate
+# on the coordinator, because the session manager is a property of
+# the coordinator and cannot be replaced in isolation.
+
+def set_default_oauth_session_manager(
+    manager: OAuthSessionManager,
+) -> None:
+    """
+    Replace the coordinator's session manager.
+
+    This is a convenience wrapper that constructs a new coordinator
+    around the supplied session manager and installs it as the
+    default. It exists so that callers familiar with the
+    `get_default_*` / `set_default_*` pattern can swap the manager
+    without worrying about the coordinator's identity.
+    """
+    if not isinstance(manager, OAuthSessionManager):
+        raise TypeError(
+            "set_default_oauth_session_manager expects an "
+            "OAuthSessionManager instance."
+        )
+    global _DEFAULT_COORDINATOR
+    with _DEFAULT_LOCK:
+        previous = _DEFAULT_COORDINATOR
+        coordinator = OAuthFlowCoordinator(session_manager=manager)
+        if previous is not None:
+            # Preserve the provider registrations and the account
+            # resolvers so that the swap does not lose configuration.
+            with previous._lock:
+                coordinator._providers = dict(previous._providers)
+                if hasattr(previous, "_account_resolvers"):
+                    coordinator._account_resolvers = dict(
+                        previous._account_resolvers
+                    )
+        _DEFAULT_COORDINATOR = coordinator
+
+
+def reset_default_oauth_session_manager() -> OAuthSessionManager:
+    """
+    Replace the default coordinator's session manager with a fresh
+    one and return it.
+
+    Used by tests to guarantee isolation between test cases. The
+    coordinator itself is replaced as well, so that no stale
+    registrations leak across tests.
+    """
+    global _DEFAULT_COORDINATOR
+    with _DEFAULT_LOCK:
+        coordinator = OAuthFlowCoordinator()
+        _DEFAULT_COORDINATOR = coordinator
+        return coordinator.sessions
+# ---------------------------------------------------------------------------
+# Default session manager accessor
+# ---------------------------------------------------------------------------
+
+
+def get_default_oauth_session_manager() -> OAuthSessionManager:
+    """
+    Return the session manager used by the default OAuth coordinator.
+
+    This is the SAME instance the coordinator uses internally, so
+    sessions created via `get_default_oauth_flow_coordinator().begin_authorization(...)`
+    are immediately visible through this accessor. Callers that need
+    to inspect, prune, or clear pending sessions SHOULD use this
+    function rather than accessing coordinator internals.
+
+    There is no separate setter: replacing the coordinator via
+    `set_default_oauth_flow_coordinator` also replaces the session
+    manager returned here, because the manager is a property of the
+    coordinator.
+    """
+    return get_default_oauth_flow_coordinator().sessions

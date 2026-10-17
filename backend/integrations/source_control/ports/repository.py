@@ -18,6 +18,14 @@ application layer (`operations/service.py`). They MUST NOT accept or
 return raw credentials; authentication for push is provided by the
 facade through a secure credential helper.
 
+Re-exports:
+    This module also re-exports `RepositoryPort` from
+    `ports.provider`. The canonical definition lives in the provider
+    module, but callers frequently reach for it through
+    `ports.repository` because the concept belongs to the repository
+    domain. Re-exporting keeps both import paths working and avoids
+    a spurious import error in `ports/__init__.py`.
+
 Design rules:
     - All methods that perform I/O MUST be `async`.
     - No method may spawn a shell. Implementations MUST use
@@ -41,6 +49,8 @@ from ..domain.models import (
     RepositoryRef,
     WorkspaceRef,
 )
+# Re-exported from `ports.provider`. See module docstring.
+from .provider import RepositoryPort
 
 __all__ = [
     # Re-exports (for convenience)
@@ -49,6 +59,7 @@ __all__ = [
     "WorkspaceRef",
     "DiffSummary",
     "CommitRef",
+    "RepositoryPort",
     # Value objects
     "LocalGitStatus",
     "PushResult",

@@ -35,6 +35,19 @@ Design rules:
     - The journal MUST NOT import from any provider adapter or from
       the application layer. It depends only on `domain` and
       `operations.models`.
+
+Storage backends:
+    - `InMemoryOperationJournal` : bounded ring buffer, tests only.
+    - `FileOperationJournal`     : JSON + JSONL on disk, production.
+    - `NullOperationJournal`     : discards everything, tests only.
+
+The name `SQLiteOperationJournal` is provided as a backward-compatible
+alias for `FileOperationJournal`. The current implementation stores
+data as JSON and JSONL files rather than in a SQLite database; the
+alias exists because the HTTP facade and the package `__init__` were
+written against a name that no longer matches the storage mechanism.
+A real SQLite implementation can be added later as a sibling class
+without changing the public interface.
 """
 
 from __future__ import annotations
@@ -52,14 +65,45 @@ from typing import Dict, List, Optional, Sequence, Union
 
 from ..domain.enums import OperationEventType, OperationStatus
 from ..domain.models import OperationEvent, OperationRecord
-from ..errors import NotFoundError, ValidationError
+
+
+from ..errors import (
+    NotFoundError,
+    ProviderError as _ProviderError,
+    ValidationError,
+)
+
 from .models import _utc_now  # re-exported from domain.models
+
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+
+class JournalError(_ProviderError):
+    """
+    Raised when the journal cannot complete an operation.
+
+    Wraps low-level storage failures (disk full, permission denied,
+    corrupt payload) so that callers receive a `SourceControlError`
+    subclass instead of a raw `OSError` or `json.JSONDecodeError`.
+
+    The exception NEVER carries the operation content itself; only a
+    short, redacted message and non-sensitive identifiers.
+    """
+
+    default_retryable = False
+    default_http_status = 500
 
 __all__ = [
     "OperationJournal",
     "InMemoryOperationJournal",
     "FileOperationJournal",
     "NullOperationJournal",
+    # Backward-compatible alias; see module docstring for the rationale.
+    "SQLiteOperationJournal",
+    "JournalError",
     "get_default_operation_journal",
     "set_default_operation_journal",
     "reset_default_operation_journal",
@@ -802,6 +846,24 @@ class NullOperationJournal(OperationJournal):
         self, operation_id: str
     ) -> Sequence[OperationEvent]:
         return ()
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility alias
+# ---------------------------------------------------------------------------
+#
+# The package `__init__.py` and the HTTP facade were written against a
+# name (`SQLiteOperationJournal`) that no longer matches the storage
+# mechanism. The current implementation persists operations as JSON
+# and JSONL files under the configured journal root, which is
+# sufficient for the local-first PELDRUN model.
+#
+# This alias keeps existing imports working. A real SQLite-backed
+# implementation can be added later as a sibling class and the alias
+# can then be pointed at it without changing the public interface.
+
+#: Alias for `FileOperationJournal`. See module docstring.
+SQLiteOperationJournal = FileOperationJournal
 
 
 # ---------------------------------------------------------------------------

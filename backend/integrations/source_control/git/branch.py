@@ -35,7 +35,7 @@ import unicodedata
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple, Union
 
-from ...ports.repository import LocalBranchPort
+from ..ports.repository import LocalBranchPort
 from ..domain.models import BranchRef
 from ..errors import (
     ConflictError,

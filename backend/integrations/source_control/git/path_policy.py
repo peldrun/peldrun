@@ -25,6 +25,19 @@ filesystem. The policy enforces:
     - Reserved Windows device names (`CON`, `NUL`, ...) are
       rejected.
 
+Additionally, this module provides Git branch name validation:
+
+    - `is_valid_branch_name` : predicate returning a boolean.
+    - `validate_branch_name` : raising variant used by Pydantic
+      field validators in the schema layer. It raises a plain
+      `ValueError` (not `ValidationError`) because Pydantic v2 only
+      catches `ValueError` and `AssertionError`.
+
+The branch-name implementation lives here rather than in
+`git/branch.py` to keep the rules co-located with the path rules and
+to avoid a circular import: `branch.py` imports from this module, so
+this module must not import from `branch.py`.
+
 Design rules:
     - The policy is immutable after construction. The root cannot be
       changed; create a new policy instead.
@@ -51,6 +64,7 @@ from typing import Iterable, Optional, Union
 from ..errors import PathTraversalError, ValidationError
 
 __all__ = [
+    # Policy class and helpers
     "WorkspacePathPolicy",
     "get_default_path_policy",
     "set_default_path_policy",
@@ -59,12 +73,25 @@ __all__ = [
     "make_workspace_id",
     "sanitize_component",
     "sanitize_repository_name",
+    # Branch name validation
+    "is_valid_branch_name",
+    "validate_branch_name",
+    "PROTECTED_LOCAL_BRANCH_NAMES",
+    "MAX_BRANCH_NAME_LENGTH",
+    # Secure path resolution convenience
+    "secure_resolve_path",
+    # Constants
     "MAX_PATH_LENGTH",
     "MAX_COMPONENT_LENGTH",
 ]
 
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Constants: workspace paths
+# ---------------------------------------------------------------------------
 
 
 #: Maximum total length of an absolute path. Chosen conservatively to
@@ -123,6 +150,50 @@ _BIDI_CHARS = re.compile(
 #: Control characters (except tab and newline, which are separately
 #: rejected by the component sanitizer).
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+# ---------------------------------------------------------------------------
+# Constants: branch names
+# ---------------------------------------------------------------------------
+
+
+#: Maximum length of a branch name accepted by the subsystem. Git
+#: itself allows longer names, but we cap at a value that is
+#: comfortably below every filesystem and UI limit.
+MAX_BRANCH_NAME_LENGTH: int = 200
+
+
+#: Branch names that are treated as protected by default. These
+#: cannot be deleted or renamed without `force=True`. The set is
+#: duplicated from `git/branch.py` intentionally: `path_policy` is
+#: the lower-level module and must not import from `branch.py`.
+PROTECTED_LOCAL_BRANCH_NAMES: frozenset[str] = frozenset(
+    {
+        "main",
+        "master",
+        "trunk",
+        "develop",
+        "development",
+        "dev",
+        "release",
+        "stage",
+        "staging",
+        "prod",
+        "production",
+    }
+)
+
+
+#: Character sequences that Git forbids in a ref name. Mirrored here
+#: so that callers receive a clear error before Git runs.
+_FORBIDDEN_BRANCH_SEQUENCES = (
+    "..",
+    "@{",
+    "\\",
+)
+
+#: Individual characters that Git forbids in a ref name.
+_FORBIDDEN_BRANCH_CHARS = re.compile(r"[\x00-\x1f\x7f ~^:?*\[\]]")
 
 
 def _utc_seed() -> str:
@@ -547,6 +618,133 @@ def sanitize_repository_name(
     head_budget = max(1, max_length - 9)
     head = combined[:head_budget]
     return f"{head}-{digest}"
+
+
+# ---------------------------------------------------------------------------
+# Branch name validation
+# ---------------------------------------------------------------------------
+#
+# These functions are the single source of truth for branch name
+# validity. `git/branch.py` re-exports them and adds manager methods
+# on top. `schemas/requests.py` uses `validate_branch_name` inside
+# Pydantic field validators.
+
+
+def is_valid_branch_name(name: str) -> bool:
+    """
+    Return True if `name` is a valid Git branch name.
+
+    Rules (subset of `git check-ref-format`):
+        - Non-empty, no leading or trailing whitespace.
+        - No leading `-`, `.`, or `/`.
+        - No trailing `.`, `/`, or `.lock`.
+        - No `..`, `@{`, or `\\`.
+        - No control characters, spaces, or `~^:?*[`.
+        - Length <= `MAX_BRANCH_NAME_LENGTH`.
+        - The name cannot consist solely of dots or slashes.
+    """
+    if not name or not isinstance(name, str):
+        return False
+    # Unicode NFC normalization for stability.
+    normalized = unicodedata.normalize("NFC", name)
+    if len(normalized) > MAX_BRANCH_NAME_LENGTH:
+        return False
+    if normalized != normalized.strip():
+        return False
+    if normalized[0] in "-./":
+        return False
+    if normalized.endswith(("/", ".")):
+        return False
+    if normalized.endswith(".lock"):
+        return False
+    for seq in _FORBIDDEN_BRANCH_SEQUENCES:
+        if seq in normalized:
+            return False
+    if _FORBIDDEN_BRANCH_CHARS.search(normalized):
+        return False
+    # A branch name must not consist solely of dots or slashes.
+    if set(normalized) <= {".", "/"}:
+        return False
+    return True
+
+
+def validate_branch_name(name: str) -> str:
+    """
+    Validate a branch name and return its normalized form.
+
+    This function exists for callers that need a value back (for
+    example Pydantic field validators). It raises a plain
+    `ValueError`, not `ValidationError`, because Pydantic v2 only
+    catches `ValueError` and `AssertionError` inside field
+    validators. Callers that want a `SourceControlError` subclass
+    SHOULD wrap this call.
+
+    Returns:
+        The NFC-normalized, stripped branch name.
+
+    Raises:
+        ValueError: If the name is empty, not a string, or fails any
+            of the rules enforced by `is_valid_branch_name`.
+    """
+    if not name or not isinstance(name, str):
+        raise ValueError("Branch name must be a non-empty string.")
+    trimmed = name.strip()
+    if not trimmed:
+        raise ValueError("Branch name must not be blank.")
+    normalized = unicodedata.normalize("NFC", trimmed)
+    if not is_valid_branch_name(normalized):
+        raise ValueError(
+            f"Invalid branch name: {name!r}. "
+            "Branch names must not contain whitespace, control "
+            "characters, '..', '@{', '\\\\', '~', '^', ':', '?', "
+            "'*', or '[', and must not start with '-', '.', or '/'."
+        )
+    return normalized
+
+
+def is_protected_local_branch(name: str) -> bool:
+    """
+    Return True if `name` is a protected local branch.
+
+    Comparison is case-insensitive, and compound names such as
+    `release/1.2` are considered protected when their prefix matches
+    a protected name. The function is exposed here so that callers
+    (for example the schema layer) can validate branch names without
+    importing `git/branch.py`.
+    """
+    if not name:
+        return False
+    lowered = name.strip().lower()
+    if lowered in PROTECTED_LOCAL_BRANCH_NAMES:
+        return True
+    prefix = lowered.split("/", 1)[0]
+    return prefix in PROTECTED_LOCAL_BRANCH_NAMES
+
+
+# ---------------------------------------------------------------------------
+# Secure path resolution convenience
+# ---------------------------------------------------------------------------
+
+
+def secure_resolve_path(
+    candidate: Union[str, Path],
+    *,
+    must_exist: Optional[bool] = None,
+) -> Path:
+    """
+    Resolve `candidate` against the process-wide default policy.
+
+    This is a convenience wrapper for callers that do not hold a
+    `WorkspacePathPolicy` instance. It delegates to
+    `WorkspacePathPolicy.resolve_within_root` on the default policy.
+
+    Raises:
+        PathTraversalError: If the resolved path escapes the root.
+        ValidationError: If the input is malformed or the path does
+            not exist (when `must_exist` is True).
+    """
+    policy = get_default_path_policy()
+    return policy.resolve_within_root(candidate, must_exist=must_exist)
 
 
 # ---------------------------------------------------------------------------

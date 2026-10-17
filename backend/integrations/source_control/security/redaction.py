@@ -10,6 +10,7 @@ strings, mappings, URLs, headers, and byte streams. It is used by:
     - The audit log before persisting events.
     - The Git subprocess wrapper before returning stdout/stderr.
     - The HTTP layer before sending responses to the frontend.
+    - The GitHub provider adapters before surfacing payloads.
 
 Design rules:
     - This module MUST NOT import from anywhere else in the package.
@@ -26,19 +27,31 @@ Design rules:
 
 The module intentionally errs on the side of redacting too much. It is
 safer to hide a non-secret than to leak a credential.
+
+Functions:
+    - `redact_text`     : redact a string.
+    - `redact_bytes`    : redact a byte stream (decoded as UTF-8).
+    - `redact_mapping`  : redact a `Mapping` recursively.
+    - `redact_sequence` : redact an iterable of values.
+    - `redact_data`     : redact an arbitrary JSON-like value,
+                          preserving the input's type where possible.
+    - `redact_url`      : redact a URL (credentials + query params).
+    - `redact_headers`  : redact HTTP headers by name.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any, Iterable, Mapping, MutableMapping, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 __all__ = [
     "REDACTED",
     "MAX_REDACTION_INPUT",
+    "SENSITIVE_KEYS",
     "redact_text",
     "redact_mapping",
     "redact_sequence",
+    "redact_data",
     "redact_url",
     "redact_headers",
     "redact_bytes",
@@ -245,6 +258,14 @@ _SENSITIVE_KEYS: frozenset[str] = frozenset(
     }
 )
 
+#: Public alias for `_SENSITIVE_KEYS`.
+#:
+#: External callers (configuration UIs, provider adapters, tests)
+#: sometimes need to know which keys are treated as secret by the
+#: redaction layer. Exposing the set read-only via a public name
+#: allows them to inspect the policy without reaching into the
+#: module's private namespace.
+SENSITIVE_KEYS: frozenset[str] = _SENSITIVE_KEYS
 
 def redact_mapping(
     mapping: Optional[Mapping[Any, Any]],
@@ -343,6 +364,52 @@ def redact_sequence(
         else:
             result.append(item)
     return result
+
+
+def redact_data(
+    value: Any,
+    *,
+    deep: bool = True,
+) -> Any:
+    """
+    Return a redacted copy of an arbitrary JSON-like value.
+
+    Unlike `redact_mapping`, this function preserves the input's
+    top-level type:
+
+        - `dict` / `Mapping`  -> `dict` (see `redact_mapping`)
+        - `list` / `tuple`    -> `list` (see `redact_sequence`)
+        - `str`               -> `str`  (see `redact_text`)
+        - `bytes`             -> `bytes` (see `redact_bytes`)
+        - `None`              -> `None`
+        - any other scalar    -> returned unchanged
+
+    This is the function the GitHub provider adapters use to sanitize
+    arbitrary payload fragments before surfacing them in errors or in
+    tool results. It never raises; on any internal failure it returns
+    the input unchanged.
+
+    Args:
+        value: The value to redact.
+        deep: When True (default), recurse into nested structures.
+            When False, only the top level is processed.
+    """
+    try:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return redact_text(value)
+        if isinstance(value, bytes):
+            return redact_bytes(value)
+        if isinstance(value, Mapping):
+            return redact_mapping(value, deep=deep)
+        if isinstance(value, (list, tuple)):
+            return redact_sequence(value, deep=deep)
+        # Scalars (int, float, bool, etc.) are returned unchanged.
+        return value
+    except Exception:  # noqa: BLE001
+        # Redaction MUST NOT raise. Degrade to returning the input.
+        return value
 
 
 # ---------------------------------------------------------------------------

@@ -20,6 +20,26 @@ and consume approval tickets. It enforces the following invariants:
 The `ApprovalTicket` model is defined in `domain.models` and is the
 single source of truth. This module MUST NOT redefine it.
 
+Two consumption paths are provided:
+
+    - `consume(approval_id, expected_*)` — the CANONICAL path used by
+      the agent tools (`tools/push_branch.py`, `tools/...`). Every
+      bound field is re-validated against the caller's expectation
+      before the ticket is marked consumed. This is the entry point
+      that MUST be used whenever the caller has the operation
+      snapshot available.
+
+    - `consume_approval(approval_id)` — a LEGACY path used by the
+      HTTP facade (`omweb/services/source_control_facade.py`). It
+      marks the ticket as consumed after checking that it is
+      consumable (not expired, not already used, granted by the
+      user), but it does NOT compare bound fields. The caller MUST
+      verify `ticket.base_sha` and `ticket.diff_sha256` itself, as
+      the facade does, before performing the remote side effect.
+
+New code SHOULD use `consume`. The legacy path exists only to keep
+the HTTP facade functional while the facade is being migrated.
+
 Design rules:
     - The gate is thread-safe. All mutations hold a single `RLock`.
     - The gate never raises on missing or malformed data during
@@ -32,12 +52,14 @@ Design rules:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 import secrets
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from ..domain.enums import ApprovalStatus
 from ..domain.models import ApprovalTicket
@@ -57,10 +79,16 @@ from .audit import (
 
 __all__ = [
     "ApprovalGate",
+    "ApprovalManager",
+    "ApprovalTicket",
     "ApprovalValidationError",
+    "compute_diff_sha256",
     "get_default_approval_gate",
     "set_default_approval_gate",
     "reset_default_approval_gate",
+    "get_default_approval_manager",
+    "set_default_approval_manager",
+    "reset_default_approval_manager",
 ]
 
 
@@ -92,6 +120,85 @@ ApprovalValidationError = ValidationError
 def _utc_now() -> datetime:
     """Return the current time as a timezone-aware UTC datetime."""
     return datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Diff hash computation
+# ---------------------------------------------------------------------------
+
+
+def compute_diff_sha256(diff: Any) -> str:
+    """
+    Compute the canonical SHA-256 of a diff.
+
+    Accepts either:
+
+        - An object with a callable `sha256()` method (for example
+          `domain.models.DiffSummary`). The method's return value is
+          used directly, after validation.
+        - A mapping of diff fields. The mapping is canonicalized
+          (sorted keys, compact separators) and hashed.
+        - A string. The string is encoded as UTF-8 and hashed; this
+          is provided for callers that already have a canonical
+          textual form.
+
+    The function never raises for well-formed inputs. For unexpected
+    input types, a `ValidationError` is raised with a clear message
+    so that programming errors are caught early rather than producing
+    a misleading hash.
+
+    Args:
+        diff: The diff to hash. See above for accepted shapes.
+
+    Returns:
+        A lowercase 64-character hex digest.
+    """
+    # Object with a native `sha256()` method.
+    if hasattr(diff, "sha256") and callable(getattr(diff, "sha256")):
+        try:
+            digest = diff.sha256()
+        except Exception as exc:  # noqa: BLE001
+            raise ValidationError(
+                "Diff.sha256() raised an exception.",
+                details={"reason": type(exc).__name__},
+                cause=exc,
+            ) from exc
+        if not isinstance(digest, str) or not _SHA256_PATTERN.match(digest):
+            raise ValidationError(
+                "Diff.sha256() returned an invalid digest.",
+                details={"length": len(digest) if isinstance(digest, str) else None},
+            )
+        return digest
+
+    # String: assume it is already canonical.
+    if isinstance(diff, str):
+        return hashlib.sha256(diff.encode("utf-8")).hexdigest()
+
+    # Bytes: hash directly.
+    if isinstance(diff, (bytes, bytearray)):
+        return hashlib.sha256(bytes(diff)).hexdigest()
+
+    # Mapping: canonicalize + hash.
+    if isinstance(diff, Mapping):
+        try:
+            canonical = json.dumps(
+                dict(diff),
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                "Diff mapping could not be serialized.",
+                details={"reason": type(exc).__name__},
+                cause=exc,
+            ) from exc
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    raise ValidationError(
+        "Unsupported diff type for hashing.",
+        details={"type": type(diff).__name__},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +414,121 @@ class ApprovalGate:
             extra_payload={"reason": reason} if reason else None,
         )
 
+    # --- Legacy facade-facing API --------------------------------------
+    #
+    # The methods below are used by
+    # `omweb/services/source_control_facade.py`. They are thin wrappers
+    # around the canonical methods, provided so that the HTTP facade
+    # keeps working while it is being migrated to the canonical API.
+
+    def approve_ticket(
+        self,
+        approval_id: str,
+        *,
+        user_id: str = "user",
+        notes: Optional[str] = None,
+    ) -> ApprovalTicket:
+        """
+        LEGACY: approve an approval ticket.
+
+        Alias for `grant`. The `user_id` argument is mapped to the
+        `actor` field of the audit log; `notes` is recorded on the
+        audit event. Prefer `grant` in new code.
+        """
+        if notes:
+            # Reject notes that embed an obvious secret; they will be
+            # redacted anyway, but a hard failure here surfaces a
+            # caller bug earlier.
+            from .redaction import contains_secret
+
+            if contains_secret(notes):
+                raise ValidationError(
+                    "Approval notes appear to contain a secret.",
+                    details={"approval_id": approval_id},
+                )
+        return self.grant(approval_id, actor=user_id or "user")
+
+    def reject_ticket(
+        self,
+        approval_id: str,
+        *,
+        user_id: str = "user",
+        reason: Optional[str] = None,
+    ) -> ApprovalTicket:
+        """
+        LEGACY: reject an approval ticket.
+
+        Alias for `reject`. The `user_id` argument is mapped to the
+        `actor` field of the audit log. Prefer `reject` in new code.
+        """
+        return self.reject(
+            approval_id,
+            actor=user_id or "user",
+            reason=reason,
+        )
+
+    def consume_approval(self, approval_id: str) -> ApprovalTicket:
+        """
+        LEGACY: consume an approval ticket without field validation.
+
+        This method marks the ticket as consumed after checking that
+        it is consumable (granted by the user, not expired, not
+        already used), but it does NOT compare the ticket's bound
+        fields against a caller-supplied operation snapshot.
+
+        Callers using this method MUST verify `ticket.base_sha` and
+        `ticket.diff_sha256` themselves before performing the remote
+        side effect. The HTTP facade does exactly this.
+
+        New code SHOULD use `consume(approval_id, expected_*)`, which
+        performs the comparison inside the gate.
+
+        Returns:
+            The consumed `ApprovalTicket`.
+
+        Raises:
+            ApprovalInvalidError: If the ticket does not exist.
+            ApprovalExpiredError: If the ticket has expired.
+            ApprovalConsumedError: If the ticket was already consumed.
+            ApprovalRequiredError: If the user has not granted the
+                ticket yet.
+        """
+        self._validate_non_empty(approval_id, "approval_id")
+
+        with self._lock:
+            ticket = self._get_ticket_locked(approval_id)
+            self._assert_consumable_locked(ticket)
+
+            consumed = self._replace_ticket(
+                ticket,
+                status=ApprovalStatus.CONSUMED,
+                consumed_at=_utc_now(),
+            )
+            self._tickets[approval_id] = consumed
+
+        self._audit.record(
+            AuditEventType.APPROVAL_CONSUME,
+            severity=AuditSeverity.INFO,
+            action="consume_legacy",
+            message=(
+                "Approval consumed via the legacy path; the caller is "
+                "responsible for bound-field validation."
+            ),
+            payload={
+                "approval_id": approval_id,
+                "base_sha": ticket.base_sha,
+                "diff_sha256": ticket.diff_sha256,
+                "target_branch": ticket.target_branch,
+                "legacy_path": True,
+            },
+            operation_id=ticket.operation_id,
+            repository_id=ticket.repository_id,
+            approval_id=approval_id,
+            actor="system",
+        )
+
+        return consumed
+
     # --- Consumption ----------------------------------------------------
 
     def consume(
@@ -322,7 +544,7 @@ class ApprovalGate:
         actor: str = "system",
     ) -> ApprovalTicket:
         """
-        Consume a ticket, marking it as used.
+        CANONICAL: consume a ticket, marking it as used.
 
         Every bound field on the ticket MUST match the expected
         values. Any mismatch invalidates the ticket and raises the
@@ -795,6 +1017,21 @@ class ApprovalGate:
 
 
 # ---------------------------------------------------------------------------
+# Backward-compatibility aliases
+# ---------------------------------------------------------------------------
+#
+# The package `__init__` and the HTTP facade were written against the
+# names below. They refer to the SAME class and the SAME singleton,
+# respectively, so `isinstance` and identity checks continue to work.
+
+#: Alias for `ApprovalGate`.
+ApprovalManager = ApprovalGate
+
+#: Alias for `get_default_approval_gate`.
+get_default_approval_manager = None  # replaced below, after the function is defined
+
+
+# ---------------------------------------------------------------------------
 # Default gate singleton
 # ---------------------------------------------------------------------------
 
@@ -840,3 +1077,26 @@ def reset_default_approval_gate() -> ApprovalGate:
     with _DEFAULT_LOCK:
         _DEFAULT_GATE = ApprovalGate()
         return _DEFAULT_GATE
+
+
+# Rebind the aliases now that the canonical functions exist. These are
+# the single assignments for the `*_approval_manager` names; the
+# earlier placeholder for `get_default_approval_manager` only existed
+# so that `__all__` could be declared up front.
+#
+# Each `*_approval_manager` name refers to the SAME underlying function
+# as its `*_approval_gate` counterpart, so callers may use either pair
+# interchangeably.
+get_default_approval_manager = get_default_approval_gate
+set_default_approval_manager = set_default_approval_gate
+reset_default_approval_manager = reset_default_approval_gate
+
+# The `ApprovalTicket` model is defined in `domain.models` and is the
+# single source of truth for the approval snapshot. It is re-exported
+# here so that `security/__init__.py` can import it alongside the
+# `ApprovalGate` without needing a separate domain import.
+#
+# This re-export is intentionally a reference, not a copy: the two
+# names refer to the same class, so `isinstance` checks work across
+# every import path.
+ApprovalTicket = ApprovalTicket

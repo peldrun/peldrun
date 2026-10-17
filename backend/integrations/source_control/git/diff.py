@@ -35,7 +35,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
-from ...ports.repository import DiffPort
+from ..ports.repository import DiffPort
 from ..domain.enums import FileChangeType
 from ..domain.models import DiffSummary, FileDiff
 from ..errors import (

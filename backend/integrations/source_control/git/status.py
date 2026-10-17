@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple, Union
 
-from ...ports.repository import LocalGitStatus
+from ..ports.repository import LocalGitStatus
 from ..domain.enums import FileChangeType
 from ..errors import ValidationError, WorkspaceNotFoundError
 from .executable import (

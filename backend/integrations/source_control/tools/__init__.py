@@ -2,10 +2,20 @@
 """
 Built-in source-control tool registration.
 
-This module is the single place where the built-in tools are
-registered with the `ToolRegistry`. Application startup calls
-`register_builtin_tools()` once, after the registry has been
-constructed and before the agent runtime starts.
+This module is the single entry point for the source-control tool
+suite. It exposes:
+
+    - `BUILTIN_TOOL_NAMES` and the registration helpers
+      (`register_builtin_tools`, `unregister_builtin_tools`) used by
+      the application startup code.
+    - The concrete `SourceControlTool` subclasses for callers that
+      need to instantiate them directly (for example the HTTP facade
+      and the test suite).
+    - Lightweight `Args` dataclasses that describe each tool's
+      accepted arguments. The `Args` classes are simple containers;
+      they are NOT Pydantic models and they do NOT perform validation
+      beyond basic type coercion. Validation lives in the tool's own
+      `validate_input` method.
 
 Design rules:
     - The module MUST NOT import any concrete tool at import time.
@@ -20,14 +30,16 @@ Design rules:
     - A failure to import or construct a single tool MUST NOT
       prevent the application from starting. The failure is logged
       and the remaining tools are registered.
-    - The set of built-in tool names is exposed as
-      `BUILTIN_TOOL_NAMES` for callers that need to enumerate them
-      without instantiating the tools.
+    - The `Args` dataclasses exist so that callers can pass
+      structured arguments without reaching into private tool
+      attributes. They are intentionally minimal: they carry the
+      argument values and nothing else.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from ..errors import ValidationError
@@ -39,38 +51,168 @@ from .base import (
 )
 
 __all__ = [
+    # Registry helpers
     "register_builtin_tools",
     "unregister_builtin_tools",
     "register_tool",
     "unregister_tool",
+    "register_source_control_tools",
+    "get_all_source_control_tools",
     "list_builtin_tool_names",
     "list_registered_tools",
     "describe_tools",
     "BUILTIN_TOOL_NAMES",
+    # Args dataclasses
+    "CreateBranchArgs",
+    "CreateChangeRequestArgs",
+    "InspectDiffArgs",
+    "ListRepositoriesArgs",
+    "PushBranchArgs",
+    "ReadFileArgs",
+    "RequestApprovalArgs",
+    "RunChecksArgs",
+    # Concrete tool classes (available via lazy import; may be missing
+    # in partial installations, in which case the symbol is absent)
+    "CreateBranchTool",
+    "CreateChangeRequestTool",
+    "InspectDiffTool",
+    "ListRepositoriesTool",
+    "PushBranchTool",
+    "ReadFileTool",
+    "RequestApprovalTool",
+    "RunChecksTool",
 ]
 
 
 logger = logging.getLogger(__name__)
 
 
-#: Names of every tool that ships with PELDRUN. The list mirrors the
-#: tool table in the source-control integration reference. It is
-#: exposed as a tuple so that callers cannot mutate the canonical
-#: list.
-BUILTIN_TOOL_NAMES: tuple[str, ...] = (
-    "source_control.list_providers",
-    "source_control.list_repositories",
-    "source_control.get_repository",
-    "source_control.read_file",
-    "source_control.list_branches",
-    "source_control.create_workspace",
-    "source_control.create_branch",
-    "source_control.get_diff",
-    "source_control.run_checks",
-    "source_control.request_approval",
-    "source_control.push_branch",
-    "source_control.create_change_request",
-)
+# ---------------------------------------------------------------------------
+# Args dataclasses
+# ---------------------------------------------------------------------------
+#
+# These are lightweight, immutable containers for a tool's arguments.
+# They deliberately do NOT perform validation; the tool is responsible
+# for validating its own inputs in `validate_input` or `execute`. The
+# classes exist so that callers can construct, serialize, and inspect
+# arguments without depending on the tool's internal implementation.
+
+
+@dataclass(frozen=True)
+class CreateBranchArgs:
+    """
+    Arguments for the `source_control.create_branch` tool.
+
+    The tool creates a local branch inside an existing workspace. It
+    does not touch the remote; use `source_control.push_branch` after
+    the local branch is committed.
+    """
+
+    workspace_id: str
+    branch_name: str
+    from_sha: Optional[str] = None
+    force: bool = False
+
+
+@dataclass(frozen=True)
+class CreateChangeRequestArgs:
+    """
+    Arguments for the `source_control.create_change_request` tool.
+
+    The tool creates a pull request or merge request for a branch
+    that has already been pushed. An approval ticket is required.
+    """
+
+    operation_id: str
+    approval_id: str
+    title: str
+    body: str = ""
+    draft: bool = True
+
+
+@dataclass(frozen=True)
+class InspectDiffArgs:
+    """
+    Arguments for the `source_control.get_diff` tool.
+
+    The tool computes the diff of a workspace against a base commit
+    and returns the canonical diff hash used for approvals.
+    """
+
+    workspace_id: str
+    base_sha: Optional[str] = None
+    include_patch: bool = True
+
+
+@dataclass(frozen=True)
+class ListRepositoriesArgs:
+    """
+    Arguments for the `source_control.list_repositories` tool.
+    """
+
+    provider: str = "github"
+    account_id: Optional[str] = None
+    query: Optional[str] = None
+    page: int = 1
+    page_size: int = 30
+
+
+@dataclass(frozen=True)
+class PushBranchArgs:
+    """
+    Arguments for the `source_control.push_branch` tool.
+
+    The tool pushes a reviewed branch to a remote. A valid approval
+    ticket is required; the ticket is consumed before the push runs.
+    """
+
+    operation_id: str
+    approval_id: str
+    local_branch: Optional[str] = None
+    remote: str = "origin"
+
+
+@dataclass(frozen=True)
+class ReadFileArgs:
+    """
+    Arguments for the `source_control.read_file` tool.
+    """
+
+    repository_id: str
+    file_path: str
+    ref: Optional[str] = None
+    provider: str = "github"
+    account_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class RequestApprovalArgs:
+    """
+    Arguments for the `source_control.request_approval` tool.
+
+    The tool creates a pending approval ticket. It does NOT grant the
+    approval; the user must grant it through the UI.
+    """
+
+    operation_id: str
+    operation: str
+    target_branch: str
+    ttl_seconds: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class RunChecksArgs:
+    """
+    Arguments for the `source_control.run_checks` tool.
+
+    The tool runs one or more pre-registered check commands inside a
+    workspace. The commands are configured at application startup;
+    the agent never supplies them.
+    """
+
+    workspace_id: str
+    checks: Sequence[str] = field(default_factory=tuple)
+    fail_fast: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +365,131 @@ _TOOL_FACTORIES: Dict[str, Callable[[], SourceControlTool]] = {
     "source_control.push_branch": _build_push_branch,
     "source_control.create_change_request": _build_create_change_request,
 }
+
+
+#: Names of every tool that ships with PELDRUN. The list mirrors the
+#: tool table in the source-control integration reference. It is
+#: exposed as a tuple so that callers cannot mutate the canonical
+#: list.
+BUILTIN_TOOL_NAMES: tuple[str, ...] = tuple(_TOOL_FACTORIES.keys())
+
+
+# ---------------------------------------------------------------------------
+# Lazy re-exports for the concrete tool classes
+# ---------------------------------------------------------------------------
+#
+# The package `__init__` imports the tool classes by name. The imports
+# below are performed lazily so that a missing or partially-implemented
+# tool does not break the import of this module. Each class is
+# resolved on first access via module-level `__getattr__`, which
+# Python calls for names not found in the module's namespace.
+#
+# Callers that need the class object SHOULD use `from
+# .tools import XxxTool`. This triggers `__getattr__` and either
+# returns the class or raises `AttributeError` with a clear message.
+
+
+_TOOL_CLASS_IMPORTS: Dict[str, tuple[str, str]] = {
+    "ListProvidersTool": (".list_providers", "ListProvidersTool"),
+    "ListRepositoriesTool": (".list_repositories", "ListRepositoriesTool"),
+    "GetRepositoryTool": (".get_repository", "GetRepositoryTool"),
+    "ReadFileTool": (".read_file", "ReadFileTool"),
+    "ListBranchesTool": (".list_branches", "ListBranchesTool"),
+    "CreateWorkspaceTool": (".create_workspace", "CreateWorkspaceTool"),
+    "CreateBranchTool": (".create_branch", "CreateBranchTool"),
+    "InspectDiffTool": (".inspect_diff", "InspectDiffTool"),
+    "RunChecksTool": (".run_checks", "RunChecksTool"),
+    "RequestApprovalTool": (".request_approval", "RequestApprovalTool"),
+    "PushBranchTool": (".push_branch", "PushBranchTool"),
+    "CreateChangeRequestTool": (
+        ".create_change_request",
+        "CreateChangeRequestTool",
+    ),
+}
+
+
+def __getattr__(name: str) -> Any:
+    """
+    Lazily resolve concrete tool classes.
+
+    Python calls this function when an attribute that is not defined
+    in the module's namespace is accessed. We use it to import the
+    concrete tool classes on demand, so that a missing tool module
+    does not prevent the rest of the package from importing.
+
+    When the target class is missing (module not yet implemented, or
+    the class name inside the module has changed), we return a
+    **placeholder class** instead of raising `AttributeError`. The
+    placeholder raises `NotImplementedError` only when someone tries
+    to instantiate it, which gives a clear and late failure instead
+    of breaking the whole package import.
+
+    This behavior is intentional: the top-level
+    `integrations.source_control.__init__` imports the tool classes
+    eagerly, so a missing class MUST NOT abort the entire import.
+    Callers that want a strict existence check SHOULD inspect
+    `_TOOL_CLASS_IMPORTS` or import the concrete module directly.
+    """
+    spec = _TOOL_CLASS_IMPORTS.get(name)
+    if spec is None:
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}"
+        )
+
+    module_name, class_name = spec
+    try:
+        import importlib
+
+        module = importlib.import_module(module_name, package=__name__)
+        return getattr(module, class_name)
+    except (ImportError, AttributeError) as exc:
+        # Return a placeholder that raises only when instantiated.
+        return _make_placeholder_tool(
+            name, module_name=module_name, cause=exc
+        )
+
+
+def _make_placeholder_tool(
+    class_name: str,
+    *,
+    module_name: str,
+    cause: Optional[BaseException] = None,
+) -> type:
+    """
+    Build a placeholder class for a missing tool.
+
+    The returned class has the same name as the missing tool, so
+    `isinstance` and `type()` checks that reference the class by
+    name still work. Instantiating it raises `NotImplementedError`
+    with a clear message that names the missing module.
+    """
+
+    class _PlaceholderTool:
+        """Placeholder for an unimplemented or renamed tool."""
+
+        #: Set so that `ToolRegistry.register` and other tools that
+        #: inspect `provider_id` do not crash on attribute lookup.
+        provider_id: str = "placeholder"
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise NotImplementedError(
+                f"Tool class '{class_name}' could not be imported "
+                f"from '{module_name}'. The tool is either not yet "
+                f"implemented or has been renamed. "
+                f"Underlying error: {type(cause).__name__ if cause else 'unknown'}."
+            )
+
+    _PlaceholderTool.__name__ = class_name
+    _PlaceholderTool.__qualname__ = class_name
+    _PlaceholderTool.__doc__ = (
+        f"Placeholder for the missing tool '{class_name}' from "
+        f"module '{module_name}'."
+    )
+    return _PlaceholderTool
+
+def __dir__() -> Sequence[str]:
+    """Include the lazily-exported names in `dir(tools)`."""
+    return sorted(set(globals()) | set(_TOOL_CLASS_IMPORTS) | set(__all__))
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +671,45 @@ def unregister_builtin_tools(
     for tool_name in _TOOL_FACTORIES.keys():
         results[tool_name] = target.unregister(tool_name)
     return results
+
+
+def register_source_control_tools(
+    *,
+    registry: Optional[ToolRegistry] = None,
+    overwrite: bool = False,
+    tools: Optional[Sequence[str]] = None,
+) -> Dict[str, List[str]]:
+    """
+    Alias for `register_builtin_tools`.
+
+    The HTTP facade and the package `__init__` were written against
+    this name. It refers to the SAME registration logic; only the
+    name differs.
+    """
+    return register_builtin_tools(
+        registry=registry, overwrite=overwrite, tools=tools
+    )
+
+
+def get_all_source_control_tools(
+    *,
+    registry: Optional[ToolRegistry] = None,
+) -> Sequence[SourceControlTool]:
+    """
+    Return every registered source-control tool.
+
+    The function returns the current contents of the registry as a
+    tuple, sorted by tool name. When `registry` is `None`, the
+    process-wide default registry is used.
+
+    This is a read-only helper for callers that need to enumerate
+    the tools the agent runtime can invoke. It does NOT attempt to
+    construct tools that are not registered; use
+    `register_builtin_tools` before calling this function if the
+    application has not yet populated the registry.
+    """
+    target = registry or get_default_tool_registry()
+    return target.list_tools()
 
 
 # ---------------------------------------------------------------------------

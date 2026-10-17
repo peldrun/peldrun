@@ -29,6 +29,14 @@ Design rules:
       OS keychain.
     - The vault never exposes the full secret in its `__repr__` or in
       error details.
+
+Naming:
+    - `get_default_vault` / `set_default_vault` are the canonical
+      singleton accessors.
+    - `get_credential_vault` / `set_credential_vault` are
+      backward-compatibility aliases used by the package `__init__`
+      and by callers that prefer the more explicit name. Both pairs
+      operate on the same process-wide singleton.
 """
 
 from __future__ import annotations
@@ -47,11 +55,16 @@ __all__ = [
     "VaultError",
     "VaultHealth",
     "InMemoryVault",
+    "InMemoryCredentialVault",
     "KeyringVault",
+    "KeyringCredentialVault",
+    "WindowsNativeCredentialVault",
     "FallbackVault",
     "get_default_vault",
     "set_default_vault",
     "reset_default_vault",
+    "get_credential_vault",
+    "set_credential_vault",
 ]
 
 
@@ -678,3 +691,54 @@ def reset_default_vault(
             environment or _ENV_TEST
         )
         return _DEFAULT_VAULT
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility aliases
+# ---------------------------------------------------------------------------
+#
+# The package `__init__` and some callers prefer the name
+# `get_credential_vault` / `set_credential_vault`, which is more
+# explicit about what the vault stores. Both pairs operate on the
+# SAME process-wide singleton: calling `get_credential_vault()` after
+# `set_default_vault(v)` returns `v`.
+
+get_credential_vault = get_default_vault
+set_credential_vault = set_default_vault
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility aliases for the vault implementations
+# ---------------------------------------------------------------------------
+#
+# The class names below were used by earlier callers and remain part
+# of the public API. They refer to the SAME class as their canonical
+# counterpart, so `isinstance` and `type()` checks are interchangeable.
+
+#: Alias for `InMemoryVault`.
+#:
+#: The longer name emphasizes that the vault stores credentials.
+InMemoryCredentialVault = InMemoryVault
+
+#: Alias for `KeyringVault`.
+KeyringCredentialVault = KeyringVault
+
+
+class WindowsNativeCredentialVault(KeyringVault):
+    """
+    Windows-native credential vault.
+
+    On Windows, the `keyring` library delegates to the Windows
+    Credential Manager, which is the OS-native secure store. This
+    class exists as a named specialization so that callers can
+    explicitly request the Windows backend without depending on the
+    `keyring` library's runtime backend selection.
+
+    On non-Windows platforms, instances of this class still function
+    but do NOT provide an OS-native store; they fall back to
+    whichever backend `keyring` selects. Callers that need a
+    platform-specific vault SHOULD inspect `is_available()` before
+    use.
+    """
+
+    backend_name = "windows-native"

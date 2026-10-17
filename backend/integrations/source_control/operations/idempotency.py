@@ -54,11 +54,17 @@ __all__ = [
     "IdempotencyEntry",
     "IdempotencyOutcome",
     "IdempotencyRegistry",
+    "IdempotencyManager",
+    "IdempotencyCheckResult",
     "compute_key",
     "generate_key_from_operation",
+    "compute_request_hash",
     "get_default_idempotency_registry",
     "set_default_idempotency_registry",
     "reset_default_idempotency_registry",
+    "get_default_idempotency_manager",
+    "set_default_idempotency_manager",
+    "reset_default_idempotency_manager",
     "TTL_SECONDS",
     "MAX_ENTRIES",
 ]
@@ -704,3 +710,76 @@ def reset_default_idempotency_registry() -> IdempotencyRegistry:
     with _DEFAULT_LOCK:
         _DEFAULT_REGISTRY = IdempotencyRegistry()
         return _DEFAULT_REGISTRY
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility aliases and helper functions
+# ---------------------------------------------------------------------------
+#
+# The `operations/__init__.py` package exports a "manager"-flavoured
+# vocabulary that predates this module. The names below map to the
+# canonical classes and functions defined above; they exist so that
+# callers using either vocabulary work without changes.
+
+#: Alias for `IdempotencyRegistry`.
+IdempotencyManager = IdempotencyRegistry
+
+#: Alias for `get_default_idempotency_registry`.
+get_default_idempotency_manager = get_default_idempotency_registry
+
+#: Alias for `set_default_idempotency_registry`.
+set_default_idempotency_manager = set_default_idempotency_registry
+
+#: Alias for `reset_default_idempotency_registry`.
+reset_default_idempotency_manager = reset_default_idempotency_registry
+
+
+def compute_request_hash(
+    *,
+    kind: str,
+    provider: Optional[ProviderId] = None,
+    repository_id: Optional[str] = None,
+    source_branch: Optional[str] = None,
+    target_branch: Optional[str] = None,
+    base_sha: Optional[str] = None,
+    diff_sha256: Optional[str] = None,
+    extra: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """
+    Return the 64-character hex digest for a request.
+
+    Thin wrapper around `compute_key` that returns just the digest
+    string instead of a full `IdempotencyKey`. Useful for callers
+    that only need to persist or compare the hash.
+    """
+    return compute_key(
+        kind=kind,
+        provider=provider,
+        repository_id=repository_id,
+        source_branch=source_branch,
+        target_branch=target_branch,
+        base_sha=base_sha,
+        diff_sha256=diff_sha256,
+        extra=extra,
+    ).value
+
+
+@dataclass(frozen=True)
+class IdempotencyCheckResult:
+    """
+    Outcome of checking whether a request is a duplicate.
+
+    Fields:
+        is_duplicate:    True when a live entry exists with an
+                         outcome of `IN_PROGRESS` or `SUCCEEDED`.
+        key:             The idempotency key that was checked. `None`
+                         when the caller did not supply one.
+        existing_entry:  The matching entry, when present. `None`
+                         when the request is not a duplicate.
+        reason:          Optional human-readable explanation of the
+                         decision (useful for logs and the UI).
+    """
+
+    is_duplicate: bool
+    key: Optional[IdempotencyKey] = None
+    existing_entry: Optional[IdempotencyEntry] = None
+    reason: Optional[str] = None

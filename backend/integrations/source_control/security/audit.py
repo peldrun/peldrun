@@ -26,6 +26,13 @@ Design rules:
       they are observational only.
     - The default logger is a process-wide singleton. Tests reset it
       via `reset_default_audit_logger`.
+
+Naming:
+    - `AuditLogger` is the canonical abstract base class.
+    - `SecurityAuditLogger` is a backward-compatibility alias. The
+      HTTP facade and the package `__init__` use the longer name,
+      but every event recorded by this subsystem is by definition
+      security-relevant, so the two names refer to the same class.
 """
 
 from __future__ import annotations
@@ -47,12 +54,17 @@ from .redaction import redact_mapping, redact_text
 
 __all__ = [
     "AuditEvent",
+    "SecurityAuditEvent",
     "AuditEventType",
     "AuditSeverity",
     "AuditLogger",
+    "AuditSink",
     "InMemoryAuditLogger",
+    "InMemoryAuditSink",
     "FileAuditLogger",
+    "FileAppendOnlyAuditSink",
     "NullAuditLogger",
+    "SecurityAuditLogger",
     "get_default_audit_logger",
     "set_default_audit_logger",
     "reset_default_audit_logger",
@@ -710,6 +722,41 @@ def _filter_events(
     if limit > 0:
         matches = matches[:limit]
     return tuple(matches)
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility alias
+# ---------------------------------------------------------------------------
+#
+# The package `__init__` and the HTTP facade were written against a
+# name (`SecurityAuditLogger`) that this module does not define. Every
+# event recorded by this subsystem is by definition security-relevant
+# (authentication, approval, credential, policy, push), so the two
+# names refer to the same abstract class.
+#
+# Aliasing keeps existing imports working without duplicating the ABC
+# or the three concrete implementations.
+
+SecurityAuditLogger = AuditLogger
+
+AuditSink = AuditLogger
+
+#: Alias for `AuditEvent`.
+#:
+#: The name emphasizes that every event produced by this subsystem is
+#: security-relevant. The two names refer to the same class.
+SecurityAuditEvent = AuditEvent
+
+#: Alias for `InMemoryAuditLogger`.
+#:
+#: The "sink" vocabulary describes the storage role. Same class.
+InMemoryAuditSink = InMemoryAuditLogger
+
+#: Alias for `FileAuditLogger`.
+#:
+#: The longer name describes the storage strategy: an append-only
+#: JSONL file. Same class.
+FileAppendOnlyAuditSink = FileAuditLogger
 
 
 # ---------------------------------------------------------------------------

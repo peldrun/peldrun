@@ -52,9 +52,13 @@ __all__ = [
     # Diff + file changes
     "FileDiff",
     "DiffSummary",
-    # Checks
+    # Remote CI checks
     "CheckRunRef",
     "CheckSummary",
+    "CheckSummaryRef",
+    # Local check execution
+    "CheckResult",
+    "CheckSuite",
     # Operation lifecycle
     "OperationRecord",
     "OperationEvent",
@@ -242,13 +246,19 @@ class ChangeRequestRef:
 # ---------------------------------------------------------------------------
 
 
-class WorkspaceStatus(str, str):
+class WorkspaceStatus(str):
     """
-    Lightweight string-typed status for a workspace.
+    Lightweight string-typed namespace for workspace status values.
 
-    Defined as a subclass of `str` (not `enum.Enum`) so that it can be
-    serialized transparently in JSON without needing custom encoders,
-    while still providing named constants for readability.
+    Defined as a subclass of `str` (NOT `enum.Enum`) so that the
+    status can be serialized transparently in JSON without a custom
+    encoder, while still providing named constants for readability.
+
+    Note: this class intentionally has a SINGLE base class (`str`).
+    An earlier revision declared `class WorkspaceStatus(str, str)`,
+    which raises `TypeError: duplicate base class str` at import
+    time. Subclassing `str` alone is sufficient to make instances
+    behave like strings.
     """
 
     CREATING = "creating"
@@ -342,10 +352,11 @@ class DiffSummary:
     """
     A canonical, hashable snapshot of a workspace diff.
 
-    The `sha256` field is computed from the canonical JSON of the file
-    list and MUST be stable across runs, platforms, and orderings. It
-    is used as the binding value in approval tickets: any material
-    change to the diff MUST change this hash.
+    The `sha256()` method computes a stable hash from the canonical
+    JSON of the file list. The hash MUST be stable across runs,
+    platforms, and orderings. It is used as the binding value in
+    approval tickets: any material change to the diff MUST change
+    this hash.
     """
 
     files: Sequence[FileDiff] = field(default_factory=tuple)
@@ -387,14 +398,19 @@ class DiffSummary:
 
 
 # ---------------------------------------------------------------------------
-# Checks (CI status)
+# Remote CI checks
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class CheckRunRef:
     """
-    A reference to a single CI check run.
+    A reference to a single CI check run reported by a remote provider.
+
+    The `status` and `conclusion` fields follow the GitHub Actions
+    vocabulary, which is the most expressive of the three supported
+    providers. Adapters for GitLab and Bitbucket translate their own
+    vocabulary into these values.
     """
 
     name: str
@@ -409,6 +425,10 @@ class CheckRunRef:
 class CheckSummary:
     """
     Aggregated CI status for a commit or branch.
+
+    The `total` field is the number of checks observed. `all_passed()`
+    returns True only when there is at least one check and none failed
+    or is still pending.
     """
 
     total: int = 0
@@ -423,6 +443,137 @@ class CheckSummary:
         if self.total == 0:
             return False
         return self.failed == 0 and self.pending == 0
+
+
+#: Alias for `CheckSummary`.
+#:
+#: Some callers (notably `providers/github/mapper.py`) refer to the
+#: aggregated CI summary as `CheckSummaryRef`. This alias keeps that
+#: name working without introducing a second, structurally identical
+#: class. New code SHOULD use `CheckSummary`.
+CheckSummaryRef = CheckSummary
+
+
+# ---------------------------------------------------------------------------
+# Local check execution
+# ---------------------------------------------------------------------------
+#
+# `CheckResult` and `CheckSuite` describe the outcome of running check
+# commands LOCALLY inside a workspace. They are distinct from the
+# remote-CI types above (`CheckRunRef`, `CheckSummary`):
+#
+#     - `CheckResult` / `CheckSuite` : produced by the
+#       `source_control.run_checks` tool after executing a
+#       pre-registered command.
+#     - `CheckRunRef` / `CheckSummary` : reported by a remote provider
+#       (GitHub Actions, GitLab CI, Bitbucket Pipelines).
+
+
+@dataclass(frozen=True)
+class CheckResult:
+    """
+    Result of a single local check execution.
+
+    Fields:
+        check_id:           Stable identifier for this execution.
+        name:               Name of the registered check that ran.
+        status:             High-level outcome: `"success"`,
+                            `"failure"`, `"skipped"`, or
+                            `"timed_out"`.
+        exit_code:          Process exit status, when available.
+        duration_seconds:   Wall-clock duration of the execution.
+        stdout:             Redacted, truncated standard output.
+        stderr:             Redacted, truncated standard error.
+        summary:            Optional human-readable summary.
+    """
+
+    check_id: str
+    name: str
+    status: str = "skipped"
+    exit_code: Optional[int] = None
+    duration_seconds: Optional[float] = None
+    stdout: Optional[str] = None
+    stderr: Optional[str] = None
+    summary: str = ""
+
+    @property
+    def passed(self) -> bool:
+        """
+        Return True if the check completed successfully.
+
+        A check that was skipped is considered passing for the
+        purposes of suite aggregation, matching the behavior of most
+        CI systems.
+        """
+        return self.status in {"success", "skipped"}
+
+
+@dataclass(frozen=True)
+class CheckSuite:
+    """
+    Collection of local check results for a single workspace.
+
+    Aggregates the results of running multiple checks (typically from
+    a single `run_checks` invocation) into one decision-oriented
+    summary.
+
+    Fields:
+        suite_id:        Stable identifier for this suite execution.
+        overall_status:  `"success"` if every check passed,
+                         `"failure"` if any failed, `"skipped"` if
+                         every check was skipped.
+        checks:          The individual results, in execution order.
+        has_failures:    Convenience flag mirroring `overall_status`.
+    """
+
+    suite_id: str
+    overall_status: str = "skipped"
+    checks: Sequence[CheckResult] = field(default_factory=tuple)
+    has_failures: bool = False
+
+    @classmethod
+    def from_results(
+        cls, suite_id: str, results: Sequence[CheckResult]
+    ) -> "CheckSuite":
+        """
+        Build a suite from a sequence of check results.
+
+        The overall status is computed as:
+            - `"success"` if every check passed or was skipped,
+              with at least one actual pass.
+            - `"failure"` if any check failed.
+            - `"skipped"` if every check was skipped.
+        """
+        results_tuple = tuple(results)
+        if not results_tuple:
+            return cls(
+                suite_id=suite_id,
+                overall_status="skipped",
+                checks=(),
+                has_failures=False,
+            )
+
+        has_failure = any(
+            result.status in {"failure", "timed_out"}
+            for result in results_tuple
+        )
+        has_success = any(
+            result.status == "success" for result in results_tuple
+        )
+
+        if has_failure:
+            overall = "failure"
+        elif has_success:
+            overall = "success"
+        else:
+            overall = "skipped"
+
+        return cls(
+            suite_id=suite_id,
+            overall_status=overall,
+            checks=results_tuple,
+            has_failures=has_failure,
+        )
 
 
 # ---------------------------------------------------------------------------

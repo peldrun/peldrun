@@ -45,7 +45,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple, Union
 
-from ...ports.repository import PushPort, PushResult
+from ..ports.repository import PushPort, PushResult
 from ..errors import (
     AuthRequiredError,
     CommandFailedError,

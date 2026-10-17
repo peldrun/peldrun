@@ -21,6 +21,11 @@ Design rules:
       `except` clauses predictable.
     - The `code` attribute is a `SourceControlErrorCode` enum member,
       not a string, so that HTTP routers can switch on it safely.
+
+Backward-compatibility aliases are provided at the bottom of the module
+so that callers using the older `Authentication*` and `Rate*` names
+continue to work. These names appear in the HTTP layer, in the schemas,
+and in the GitHub adapter's error translation.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ from typing import Any, Mapping, Optional
 from .domain.enums import SourceControlErrorCode
 
 __all__ = [
+    # Base
     "SourceControlError",
     # Authentication / authorization
     "AuthRequiredError",
@@ -66,6 +72,11 @@ __all__ = [
     "error_code_of",
     "is_retryable_error",
     "redact_message",
+    # Backward-compatibility aliases
+    "AuthenticationRequiredError",
+    "AuthenticationExpiredError",
+    "RateLimitedError",
+    "RateLimitExceededError",
 ]
 
 
@@ -561,3 +572,28 @@ def is_retryable_error(exc: BaseException) -> bool:
     if isinstance(exc, SourceControlError):
         return exc.is_retryable
     return to_source_control_error(exc).is_retryable
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility aliases
+# ---------------------------------------------------------------------------
+#
+# The HTTP layer, the schemas, and some adapters were written using the
+# names below. They refer to the SAME classes as their canonical
+# counterparts, so `except` and `isinstance` checks continue to work
+# across the codebase. New code SHOULD use the canonical names.
+
+#: Alias for `AuthRequiredError`.
+#:
+#: Older callers used a more descriptive `Authentication*` prefix.
+AuthenticationRequiredError = AuthRequiredError
+
+#: Alias for `AuthExpiredError`.
+AuthenticationExpiredError = AuthExpiredError
+
+#: Alias for `RateLimitError`.
+#:
+#: Some callers used `RateLimitedError` (past tense), others used
+#: `RateLimitExceededError`. Both point to the canonical class.
+RateLimitedError = RateLimitError
+RateLimitExceededError = RateLimitError

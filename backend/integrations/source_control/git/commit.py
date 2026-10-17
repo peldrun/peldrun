@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple, Union
 
-from ...ports.repository import CommitOptions, CommitPort
+from ..ports.repository import CommitOptions, CommitPort
 from ..domain.models import CommitRef
 from ..errors import (
     ConflictError,

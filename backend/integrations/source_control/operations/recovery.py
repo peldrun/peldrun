@@ -76,14 +76,19 @@ from .service import (
 
 __all__ = [
     "OperationRecoveryService",
+    "RecoveryEngine",
     "RecoveryAction",
     "RecoveryOutcome",
+    "RecoveryActionKind",
     "RecoveryReport",
     "PushReconciler",
     "RemoteShaReader",
     "get_default_recovery_service",
     "set_default_recovery_service",
     "reset_default_recovery_service",
+    "get_default_recovery_engine",
+    "set_default_recovery_engine",
+    "reset_default_recovery_engine",
     "MAX_OPERATIONS_TO_RECOVER",
 ]
 
@@ -892,3 +897,31 @@ def reset_default_recovery_service() -> OperationRecoveryService:
     with _DEFAULT_LOCK:
         _DEFAULT_SERVICE = OperationRecoveryService()
         return _DEFAULT_SERVICE
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility aliases
+# ---------------------------------------------------------------------------
+#
+# The `operations/__init__.py` package exports an "engine"-flavoured
+# vocabulary that predates this module. The names below map to the
+# canonical classes and functions defined above; they exist so that
+# callers using either vocabulary work without changes.
+
+#: Alias for `OperationRecoveryService`.
+RecoveryEngine = OperationRecoveryService
+
+#: Alias for `RecoveryOutcome`.
+#:
+#: Some callers describe the outcome of a recovery action as a
+#: "kind" rather than an "outcome". Both names refer to the same
+#: `str`-typed constant set.
+RecoveryActionKind = RecoveryOutcome
+
+#: Alias for `get_default_recovery_service`.
+get_default_recovery_engine = get_default_recovery_service
+
+#: Alias for `set_default_recovery_service`.
+set_default_recovery_engine = set_default_recovery_service
+
+#: Alias for `reset_default_recovery_service`.
+reset_default_recovery_engine = reset_default_recovery_service

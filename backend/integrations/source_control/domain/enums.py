@@ -14,6 +14,12 @@ Design rules:
       translation happens in adapters.
     - Enums MUST NOT import from any module outside `domain.enums` or
       the Python standard library.
+
+Backward compatibility aliases are provided at the bottom of the module
+so that callers using the older `OperationState`, `OperationKind`, and
+`ApprovalDecision` names continue to work. These names are used by the
+HTTP facade and by the schema layer; new code SHOULD prefer the
+canonical names.
 """
 
 from __future__ import annotations
@@ -21,6 +27,7 @@ from __future__ import annotations
 from enum import Enum
 
 __all__ = [
+    # Canonical names
     "ProviderId",
     "ChangeRequestState",
     "FileChangeType",
@@ -31,6 +38,10 @@ __all__ = [
     "ConnectionStatus",
     "CheckStatus",
     "CheckConclusion",
+    # Aliases and additional enums used by the facade layer
+    "OperationState",
+    "OperationKind",
+    "ApprovalDecision",
 ]
 
 
@@ -140,6 +151,56 @@ class OperationStatus(str, Enum):
     REJECTED = "rejected"
 
 
+class OperationKind(str, Enum):
+    """
+    The kind of a source-control operation.
+
+    This enum identifies which remote side effect an operation is
+    intended to perform. It is separate from `OperationStatus`: a
+    single operation kind can pass through many statuses.
+
+    The values match the string identifiers used in the HTTP schemas
+    and in the operation journal. Adding a new operation kind
+    requires a new member here and a corresponding handler in the
+    operation service.
+    """
+
+    PUSH_BRANCH = "push_branch"
+    CREATE_CHANGE_REQUEST = "create_change_request"
+    MERGE_CHANGE_REQUEST = "merge_change_request"
+    DELETE_BRANCH = "delete_branch"
+
+    # Local-only operation kinds. These do not require approval and
+    # do not touch the remote.
+    CREATE_BRANCH = "create_branch"
+    CREATE_WORKSPACE = "create_workspace"
+    READ_FILE = "read_file"
+
+    @classmethod
+    def from_string(cls, value: str) -> "OperationKind":
+        """
+        Parse a string into an `OperationKind`.
+
+        Unknown values raise `ValueError`, matching the behavior of
+        the underlying `Enum` constructor. Callers that need a
+        non-raising variant SHOULD catch and handle explicitly.
+        """
+        return cls(value.strip().lower())
+
+    @property
+    def touches_remote(self) -> bool:
+        """
+        Return True when the operation modifies remote state and
+        therefore requires approval.
+        """
+        return self in {
+            OperationKind.PUSH_BRANCH,
+            OperationKind.CREATE_CHANGE_REQUEST,
+            OperationKind.MERGE_CHANGE_REQUEST,
+            OperationKind.DELETE_BRANCH,
+        }
+
+
 class OperationEventType(str, Enum):
     """
     Type of an entry in the durable operation event journal.
@@ -234,6 +295,52 @@ class ApprovalStatus(str, Enum):
     REVOKED = "revoked"
 
 
+class ApprovalDecision(str, Enum):
+    """
+    User-facing approval decision vocabulary.
+
+    The HTTP layer and the schemas use this enum instead of
+    `ApprovalStatus` because the vocabulary differs slightly:
+    "granted" is surfaced to the UI as "approved", and "revoked" is
+    surfaced as "invalidated". The `from_status` classmethod performs
+    the translation.
+    """
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+    INVALIDATED = "invalidated"
+
+    @classmethod
+    def from_status(cls, status: ApprovalStatus) -> "ApprovalDecision":
+        """
+        Translate an `ApprovalStatus` into the user-facing decision.
+
+        A consumed ticket is reported as `APPROVED` because the user
+        did approve it; the fact that it was consumed is internal.
+        """
+        mapping = {
+            ApprovalStatus.PENDING: cls.PENDING,
+            ApprovalStatus.GRANTED: cls.APPROVED,
+            ApprovalStatus.REJECTED: cls.REJECTED,
+            ApprovalStatus.EXPIRED: cls.EXPIRED,
+            ApprovalStatus.CONSUMED: cls.APPROVED,
+            ApprovalStatus.REVOKED: cls.INVALIDATED,
+        }
+        return mapping.get(status, cls.PENDING)
+
+    @property
+    def is_terminal(self) -> bool:
+        """Return True when no further user action is expected."""
+        return self in {
+            ApprovalDecision.APPROVED,
+            ApprovalDecision.REJECTED,
+            ApprovalDecision.EXPIRED,
+            ApprovalDecision.INVALIDATED,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Connection lifecycle
 # ---------------------------------------------------------------------------
@@ -289,3 +396,19 @@ class CheckConclusion(str, Enum):
     ACTION_REQUIRED = "action_required"
     STALE = "stale"
     UNKNOWN = "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility aliases
+# ---------------------------------------------------------------------------
+#
+# The HTTP facade and the schemas use the older names below. They are
+# simple aliases so that a single import statement in `__init__.py`
+# works regardless of which name the caller prefers.
+
+#: Deprecated alias for `OperationStatus`.
+#:
+#: New code SHOULD use `OperationStatus`. The alias exists because
+#: `omweb/services/source_control_facade.py` and the frontend call
+#: this concept "operation state".
+OperationState = OperationStatus

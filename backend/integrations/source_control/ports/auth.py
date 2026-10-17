@@ -24,6 +24,15 @@ Design rules:
 The ports in this module are implemented in `security/` and consumed
 by `omweb/services/source_control_facade.py` and the provider
 adapters.
+
+Naming:
+    - `AuthPort` is the canonical authentication port.
+    - `AuthResult` / `OAuthState` are the canonical result types for
+      the OAuth callback flow.
+    - `AuthProviderPort`, `AuthorizationResult`, and
+      `AuthorizationSession` are backward-compatibility aliases used
+      by the package `__init__` and by some callers. They refer to the
+      same objects as their canonical counterparts.
 """
 
 from __future__ import annotations
@@ -49,6 +58,10 @@ __all__ = [
     "TokenServicePort",
     # Helpers
     "make_vault_key",
+    # Backward-compatibility aliases
+    "AuthProviderPort",
+    "AuthorizationResult",
+    "AuthorizationSession",
 ]
 
 
@@ -98,6 +111,10 @@ class OAuthState:
     The `state` value MUST be cryptographically random and single-use.
     The `code_verifier` MUST NOT be logged. `redirect_uri` is used to
     validate the callback URI exactly.
+
+    Note: this dataclass is aliased below as `AuthorizationSession` for
+    callers that prefer a name describing the in-flight authorization
+    attempt rather than the CSRF token it carries.
     """
 
     state: str
@@ -388,3 +405,32 @@ def make_vault_key(
     """
     safe_base = (base_url or "default").rstrip("/")
     return f"peldrun.sc.{kind}.{provider.value}.{safe_base}.{account_id}"
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility aliases
+# ---------------------------------------------------------------------------
+#
+# The package `__init__` and `ports/__init__` were written against the
+# names below. They refer to the SAME objects as their canonical
+# counterparts, so `isinstance`, `is`, and identity checks continue to
+# work across the codebase.
+
+#: Alias for `AuthPort`.
+#:
+#: The longer name clarifies that this port represents a *provider of
+#: authentication*, but the underlying protocol is identical.
+AuthProviderPort = AuthPort
+
+#: Alias for `AuthResult`.
+#:
+#: Some callers prefer a name that emphasizes the OAuth callback
+#: context rather than the abstract "auth" result.
+AuthorizationResult = AuthResult
+
+#: Alias for `OAuthState`.
+#:
+#: The name `AuthorizationSession` describes the in-flight
+#: authorization attempt (state + PKCE verifier + redirect URI),
+#: which is exactly what `OAuthState` represents.
+AuthorizationSession = OAuthState
