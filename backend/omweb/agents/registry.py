@@ -51,7 +51,7 @@ class AgentRegistry:
     def _init_builtin_agents(self) -> Dict[str, Dict[str, Any]]:
         """
         Load system built-in agent manifests dynamically from `builtins/*.json`.
-        
+
         Falls back safely to canonical baseline definitions if manifest files are absent.
         """
         agents: Dict[str, Dict[str, Any]] = {}
@@ -84,7 +84,7 @@ class AgentRegistry:
                     "bash",
                     "str_replace_editor",
                     "web_search",
-                    "browser_use",
+                    "http_fetch",
                     "ask_human",
                     "mcp",
                 ],

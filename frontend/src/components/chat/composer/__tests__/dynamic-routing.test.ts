@@ -68,17 +68,17 @@ describe('P0-01 Dynamic Routing Acceptance Tests', () => {
     };
 
     const toolBrowser: MentionItem = {
-      id: 'tool-browser_use',
-      label: '@browser_use',
+      id: 'tool-http_fetch',
+      label: '@http_fetch',
       category: 'tool',
-      insertText: '@browser_use ',
-      metadata: { toolId: 'browser_use' },
+      insertText: '@http_fetch',
+      metadata: { toolId: 'http_fetch' },
     };
 
-    const text = 'Use @bash and @browser_use and again @bash';
+    const text = 'Use @bash and @http_fetchand again @bash';
     const directives = resolveExecutionDirectives(text, [toolBash, toolBrowser, toolBash]);
 
-    expect(directives.toolIds).toEqual(['bash', 'browser_use']);
+    expect(directives.toolIds).toEqual(['bash', 'http_fetch']);
   });
 
   // Case 5: Deleted tool mention is not dispatched

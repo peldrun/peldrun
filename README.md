@@ -523,7 +523,7 @@ The current built-in tool layer includes capabilities such as:
 | Tool                 | Purpose                       |
 | -------------------- | ----------------------------- |
 | `web_search`         | Search live web information   |
-| `browser_use`        | Navigate and inspect websites |
+| `http_fetch`        | Navigate and inspect websites |
 | `python_execute`     | Run Python code               |
 | `bash`               | Execute terminal commands     |
 | `str_replace_editor` | Inspect and modify files      |

@@ -129,7 +129,7 @@ def test_p0_02_case2_running_turn_captured():
                 "id": "t2",
                 "status": "running",
                 "user": "Active turn",
-                "steps": [{"type": "tool_call", "name": "browser_use"}],
+                "steps": [{"type": "tool_call", "name": "http_fetch"}],
             },
         ],
     }
@@ -137,7 +137,7 @@ def test_p0_02_case2_running_turn_captured():
     assert sidecar.current_execution is not None
     assert sidecar.current_execution.turn_id == "t2"
     assert sidecar.current_execution.status == "running"
-    assert sidecar.current_execution.steps[0].name == "browser_use"
+    assert sidecar.current_execution.steps[0].name == "http_fetch"
 
 
 def test_p0_02_case3_waiting_for_user_resumable():
@@ -214,8 +214,8 @@ def test_p0_02_case7_mismatched_run_id_isolation():
     events = [
         {"type": "tool_call", "run_id": "job_old", "toolName": "str_replace_editor"},
         {"type": "final", "run_id": "job_old"},
-        {"type": "tool_call", "run_id": "job_new", "toolName": "browser_use"},
+        {"type": "tool_call", "run_id": "job_new", "toolName": "http_fetch"},
     ]
     active = select_current_run_events(events)
     assert len(active) == 1
-    assert active[0]["toolName"] == "browser_use"
+    assert active[0]["toolName"] == "http_fetch"

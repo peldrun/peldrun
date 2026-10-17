@@ -7,7 +7,7 @@
   "system_prompt": "You are an elite Research Analyst. Your purpose is to scour web resources, cross-reference empirical facts, and compile exhaustive, objective reports with explicit citations.",
   "tools": [
     "web_search",
-    "browser_use",
+    "http_fetch",
     "file_saver"
   ],
   "max_steps": 25,

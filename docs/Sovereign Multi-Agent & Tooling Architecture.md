@@ -16,7 +16,7 @@
 In native upstream implementations, autonomous agents are often constructed as monolithic generalists (`app.agent.peldrun.peldrun`). A single generalist agent:
 
 * Operates under a generic system prompt ("I am an all-capable assistant").
-* Loads all environment tools indiscriminately (`bash`, `python_execute`, `file_saver`, `browser_use`, `web_search`, and custom MCP plugins).
+* Loads all environment tools indiscriminately (`bash`, `python_execute`, `file_saver`, `http_fetch`, `web_search`, and custom MCP plugins).
 * Suffixes excessive token overhead to LLM reasoning cycles.
 * Suffers from prompt distraction, tool hallucination, and unpredictable step counts.
 
@@ -132,7 +132,7 @@ interface AgentManifest {
 | --- | --- | --- | --- | --- |
 | `peldrun` | **peldrun Generalist** | Unrestricted, all-purpose autonomous task runner. | All tools in environment | 30 |
 | `code_architect` | **Code Architect** | Production software engineering, refactoring, unit testing, and modular architecture. | `bash`, `python_execute`, `file_saver` | 30 |
-| `deep_researcher` | **Deep Researcher** | Web intelligence, source synthesis, multi-page data extraction, and report compiling. | `web_search`, `browser_use`, `file_saver` | 35 |
+| `deep_researcher` | **Deep Researcher** | Web intelligence, source synthesis, multi-page data extraction, and report compiling. | `web_search`, `http_fetch`, `file_saver` | 35 |
 | `data_scientist` | **Data Scientist** | Statistical exploration, Pandas/NumPy data processing, automated Matplotlib/Seaborn visualization. | `python_execute`, `file_saver` | 25 |
 
 ---

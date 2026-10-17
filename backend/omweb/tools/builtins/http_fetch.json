@@ -1,0 +1,27 @@
+{
+  "id": "http_fetch",
+  "name": "http_fetch",
+  "display_name": "HTTP Content Fetcher",
+  "description": "Fetch static HTML content from a URL and extract its readable text. Performs a single HTTP GET request, follows redirects, strips scripts and styles, and returns the visible text content. Does NOT execute JavaScript, does NOT click elements, does NOT fill forms, and does NOT capture screenshots. Use 'browser_interactive' for dynamic pages that require JavaScript execution or user interaction.",
+  "category": "network",
+  "safety_level": "read_only",
+  "is_builtin": true,
+  "is_enabled": true,
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "url": {
+        "type": "string",
+        "format": "uri",
+        "description": "Target HTTP or HTTPS URL to fetch."
+      },
+      "max_chars": {
+        "type": "integer",
+        "minimum": 500,
+        "maximum": 50000,
+        "description": "Optional maximum number of visible text characters to return. Defaults to 8000."
+      }
+    },
+    "required": ["url"]
+  }
+}

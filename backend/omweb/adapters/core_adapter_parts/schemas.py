@@ -6,6 +6,10 @@ Synchronized with peldrun-core tool argument contracts (Phase 3 — SR-301..SR-3
 - `web_search.properties.max_results` is strictly optional (`required: ["query"]`),
   has no hard-coded `"default": 5`, and uses the centralized bounds
   `MIN_RESULTS_LIMIT` (1) .. `MAX_RESULTS_HARD_CAP` (20).
+- `http_fetch` replaces the deprecated `browser_use`. It declares a
+  single-capability contract: fetch a URL and return visible text.
+  It does not declare `action`, `click`, `scroll`, or `screenshot`,
+  because those capabilities are NOT implemented by the tool.
 """
 
 from __future__ import annotations
@@ -38,8 +42,11 @@ CANONICAL_TOOL_DESCRIPTIONS: Dict[str, str] = {
         "Search the web for up-to-date information, documentation, news, and factual verification. "
         "Omit max_results to use PELDRUN Search Settings."
     ),
-    "browser_use": (
-        "Navigate to a web URL and extract readable page text content."
+    "http_fetch": (
+        "Fetch static HTML content from a URL and extract its readable text. "
+        "Performs a single HTTP GET, follows redirects, strips scripts and styles, "
+        "and returns the visible text. Does NOT execute JavaScript or interact "
+        "with the page. Use 'browser_interactive' for dynamic pages."
     ),
     "ask_human": (
         "Ask the human operator a clarifying question or request approval when blocked."
@@ -168,20 +175,25 @@ CANONICAL_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
         },
         "required": ["query"],
     },
-    "browser_use": {
+    "http_fetch": {
         "type": "object",
         "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["navigate", "open", "extract", "fetch"],
-                "description": "Browser action to perform on the target URL.",
-            },
             "url": {
                 "type": "string",
-                "description": "Target HTTP or HTTPS URL to visit.",
+                "format": "uri",
+                "description": "Target HTTP or HTTPS URL to fetch.",
+            },
+            "max_chars": {
+                "type": "integer",
+                "minimum": 500,
+                "maximum": 50000,
+                "description": (
+                    "Optional maximum number of visible text characters to return. "
+                    "Defaults to 8000; range 500..50000."
+                ),
             },
         },
-        "required": ["action", "url"],
+        "required": ["url"],
     },
     "ask_human": {
         "type": "object",

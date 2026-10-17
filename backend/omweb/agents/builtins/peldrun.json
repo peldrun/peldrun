@@ -9,7 +9,7 @@
     "bash",
     "python_execute",
     "web_search",
-    "browser_use",
+    "http_fetch",
     "file_saver",
     "ask_human",
     "str_replace_editor"

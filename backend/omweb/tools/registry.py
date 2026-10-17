@@ -36,7 +36,7 @@ RESERVED_BUILTIN_IDS: Set[str] = {
     "python_execute",
     "str_replace_editor",
     "web_search",
-    "browser_use",
+    "http_fetch",
     "ask_human",
     "terminate",
     "file_saver",
@@ -110,7 +110,7 @@ class ToolRegistry:
         if not tools:
             fallback_ids = [
                 "python_execute", "bash", "str_replace_editor",
-                "web_search", "browser_use", "ask_human", "file_saver",
+                "web_search", "http_fetch", "ask_human", "file_saver",
             ]
             for fid in fallback_ids:
                 tools[fid] = {
