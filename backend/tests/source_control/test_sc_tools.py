@@ -48,15 +48,28 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 # The dispatcher under test.
-from backend.peldrun.tools.builtins.source_control_tool import (
+#
+# The dispatcher lives at ``peldrun/tools/builtins/source_control_tool.py``
+# and internally imports from ``peldrun.tools.*`` and
+# ``integrations.source_control.*``. Those are the canonical trees
+# that the production runtime (``backend/`` on sys.path) uses. The
+# test imports from the SAME trees so that ``ToolResult``,
+# ``ToolContext``, and every exception class are the same objects the
+# dispatcher produces and catches.
+#
+# Importing via ``backend.peldrun.tools.*`` or
+# ``backend.integrations.source_control.*`` would create a second,
+# incompatible copy of each class, and every ``isinstance`` and
+# ``except`` check would silently fail.
+
+from peldrun.tools.builtins.source_control_tool import (
     SourceControlArgs,
     SourceControlTool,
     get_builtin_source_control_tool,
 )
-from backend.peldrun.tools.contract import ToolResult
+from peldrun.tools.contract import ToolResult
 
-# Errors the dispatcher maps to stable codes.
-from backend.integrations.source_control.errors import (
+from integrations.source_control.errors import (
     AuthExpiredError,
     AuthRequiredError,
     ConflictError,
@@ -67,9 +80,7 @@ from backend.integrations.source_control.errors import (
     SourceControlError,
     ValidationError as IntegrationValidationError,
 )
-
-# Integration-layer types the dispatcher produces and consumes.
-from backend.integrations.source_control.tools.base import (
+from integrations.source_control.tools.base import (
     ToolContext as IntegrationToolContext,
     ToolResult as IntegrationToolResult,
 )
