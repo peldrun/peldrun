@@ -179,10 +179,19 @@ class PolicyEngine:
         default_policy: Optional[SourceControlPolicy] = None,
         audit_logger: Optional[AuditLogger] = None,
     ) -> None:
-        self._default_policy = default_policy or build_default_policy()
+        self._default_policy = (
+            default_policy
+            if default_policy is not None
+            else build_default_policy()
+        )
         self._policies: Dict[str, SourceControlPolicy] = {}
         self._lock = threading.RLock()
-        self._audit = audit_logger or get_default_audit_logger()
+        self._audit = (
+            audit_logger
+            if audit_logger is not None
+            else get_default_audit_logger()
+        )
+
 
     # --- Registration ---------------------------------------------------
 

@@ -239,8 +239,12 @@ class TokenService(TokenServicePort):
         *,
         audit_logger: Optional[AuditLogger] = None,
     ) -> None:
-        self._vault = vault or get_default_vault()
-        self._audit = audit_logger or get_default_audit_logger()
+        self._vault = vault if vault is not None else get_default_vault()
+        self._audit = (
+            audit_logger
+            if audit_logger is not None
+            else get_default_audit_logger()
+        )
         self._refresh_callbacks: Dict[str, RefreshCallback] = {}
         self._record_cache: Dict[str, _TokenRecord] = {}
         self._lock = threading.RLock()

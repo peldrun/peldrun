@@ -5,5 +5,6 @@
   "web_search": true,
   "browser_use": true,
   "ask_human": true,
-  "file_saver": true
+  "file_saver": true,
+  "http_fetch": true
 }

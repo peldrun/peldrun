@@ -303,15 +303,32 @@ class SourceControlFacade:
         base_workspace_dir: Optional[str | Path] = None,
     ) -> None:
         # Provider registry
-        self.registry = registry or get_default_registry()
+        self.registry = (
+            registry if registry is not None else get_default_registry()
+        )
         register_builtin_providers(registry=self.registry)
 
-        # Credential and security services
-        self.vault = vault or get_default_vault()
-        self.token_service = token_service or get_default_token_service()
-        self.policy_engine = policy_engine or get_default_policy_engine()
-        self.approval_gate = approval_gate or get_default_approval_gate()
-        self.audit_logger = audit_logger or get_default_audit_logger()
+        self.vault = vault if vault is not None else get_default_vault()
+        self.token_service = (
+            token_service
+            if token_service is not None
+            else get_default_token_service()
+        )
+        self.policy_engine = (
+            policy_engine
+            if policy_engine is not None
+            else get_default_policy_engine()
+        )
+        self.approval_gate = (
+            approval_gate
+            if approval_gate is not None
+            else get_default_approval_gate()
+        )
+        self.audit_logger = (
+            audit_logger
+            if audit_logger is not None
+            else get_default_audit_logger()
+        )
 
         # Operation service (deferred import to avoid circular import)
         if operation_service is not None:
@@ -1331,9 +1348,38 @@ class SourceControlFacade:
         return await self._map_operation_response(record)
 
     async def request_operation_approval(
-        self, operation_id: str
+        self,
+        operation_id: str,
+        *,
+        operation: Optional[str] = None,
     ) -> ApprovalTicketResponse:
-        """Freeze a diff proposal and open an approval ticket."""
+        """
+        Freeze a diff proposal and open an approval ticket.
+
+        The operation MUST be in a state from which REVIEW_REQUIRED
+        is reachable. The method advances the operation through the
+        canonical intermediate states (REPOSITORY_RESOLVED,
+        WORKSPACE_READY, EDITING) before creating the ticket, because
+        the presence of a workspace with a computable diff is
+        sufficient proof that those states were reached out-of-band.
+
+        If the operation is already in REVIEW_REQUIRED or a later
+        state, the method re-uses the current state and creates a
+        new ticket. This supports the "re-request approval" flow
+        after a rejection or expiry.
+
+        Args:
+            operation_id: Identifier of the operation.
+            operation: Optional operation-kind override for the
+                ticket. When supplied, the ticket is bound to this
+                kind instead of the record's own kind. This is used
+                when a single operation needs multiple approvals for
+                different side effects — for example, a
+                `push_branch` operation that later needs a separate
+                `create_change_request` approval. When omitted, the
+                ticket is bound to `record.kind` (the historical
+                behavior).
+        """
         record = await self.operation_service.try_get_operation(operation_id)
         if record is None:
             raise NotFoundError(
@@ -1351,6 +1397,10 @@ class SourceControlFacade:
                 f"Bound workspace '{record.workspace_id}' was not found."
             )
 
+        # Compute the diff BEFORE touching the state machine, so a
+        # validation failure (empty diff, missing sha256) never
+        # leaves the operation in an intermediate state that has to
+        # be rolled back.
         summary: DiffSummary = await self.diff_engine.compute_diff(
             workspace_id=record.workspace_id,
             base_sha=record.base_sha or None,
@@ -1370,10 +1420,18 @@ class SourceControlFacade:
 
         base_sha = summary.base_sha or record.base_sha or "HEAD"
 
+        # Advance the operation to EDITING (the state from which
+        # REVIEW_REQUIRED is reachable). This is done AFTER the diff
+        # has been validated, so a validation failure does not
+        # advance the state machine.
+        await self._advance_to_editing(operation_id, record)
+
+        effective_operation = operation or record.kind
+
         ticket: ApprovalTicket = self.approval_gate.create_ticket(
             operation_id=record.operation_id,
             repository_id=record.repository_id,
-            operation=record.kind,
+            operation=effective_operation,
             base_sha=base_sha,
             diff_sha256=diff_hash,
             target_branch=record.target_branch or "",
@@ -1388,15 +1446,29 @@ class SourceControlFacade:
             operation_id=record.operation_id,
             approval_id=ticket.approval_id,
         )
-        await self.operation_service.transition(
-            record.operation_id,
-            OperationStatus.REVIEW_REQUIRED,
-            metadata={
-                "approval_id": ticket.approval_id,
-                "diff_sha256": diff_hash,
-            },
-            actor="system",
+
+        # Refetch the record after the state-machine advance; its
+        # status and metadata are now up to date.
+        refreshed = await self.operation_service.try_get_operation(
+            record.operation_id
         )
+        current_status = (
+            refreshed.status if refreshed is not None else record.status
+        )
+
+        # Only transition to REVIEW_REQUIRED when the operation is
+        # not already there. This makes the call idempotent for
+        # re-request scenarios.
+        if current_status != OperationStatus.REVIEW_REQUIRED:
+            await self.operation_service.transition(
+                record.operation_id,
+                OperationStatus.REVIEW_REQUIRED,
+                metadata={
+                    "approval_id": ticket.approval_id,
+                    "diff_sha256": diff_hash,
+                },
+                actor="system",
+            )
 
         self._audit(
             AuditEventType.APPROVAL_REQUEST,
@@ -1430,6 +1502,76 @@ class SourceControlFacade:
             approved_by_user=ticket.approved_by_user,
             expires_at=ticket.expires_at,
         )
+
+    async def _advance_to_editing(
+        self,
+        operation_id: str,
+        record: OperationRecord,
+    ) -> None:
+        """
+        Advance an operation through the canonical intermediate
+        states up to `EDITING`.
+
+        The state machine does NOT allow `CREATED -> REVIEW_REQUIRED`
+        directly; the operation must pass through
+        `REPOSITORY_RESOLVED`, `WORKSPACE_READY`, and `EDITING`. The
+        caller invokes this method only after verifying that the
+        workspace exists and contains reviewable changes — which
+        means those intermediate states were reached out-of-band.
+
+        Each transition is best-effort: if the state machine has
+        already advanced past the target, the corresponding
+        `ConflictError` is swallowed. This makes the method safe to
+        call multiple times.
+        """
+        from backend.integrations.source_control.operations.models import (
+            is_valid_transition,
+        )
+
+        ordered_states = (
+            OperationStatus.REPOSITORY_RESOLVED,
+            OperationStatus.WORKSPACE_READY,
+            OperationStatus.EDITING,
+        )
+
+        current_status = record.status
+
+        # If already at or past EDITING, there is nothing to do.
+        if current_status in (
+            OperationStatus.EDITING,
+            OperationStatus.CHECKING,
+            OperationStatus.REVIEW_REQUIRED,
+            OperationStatus.STALE_REVIEW_REQUIRED,
+            OperationStatus.APPROVED,
+            OperationStatus.PUSHING,
+            OperationStatus.PUSHED,
+            OperationStatus.CHANGE_REQUEST_CREATED,
+        ):
+            return
+
+        for next_state in ordered_states:
+            if current_status == next_state:
+                continue
+            if not is_valid_transition(current_status, next_state):
+                # Cannot jump directly; skip this one and try the
+                # next. In practice, the ordered list is
+                # monotonically advancing, so this is rare.
+                continue
+            try:
+                await self.operation_service.transition(
+                    operation_id, next_state, actor="system"
+                )
+                current_status = next_state
+            except Exception as exc:  # noqa: BLE001
+                # Transition already happened or state machine
+                # rejected it. We log and continue; the caller will
+                # verify the final state.
+                logger.warning(
+                    "Could not advance operation '%s' to '%s': %s",
+                    operation_id,
+                    next_state.value,
+                    type(exc).__name__,
+                )
 
     async def approve_operation(
         self, operation_id: str, payload: ApproveOperationRequest
@@ -1716,12 +1858,31 @@ class SourceControlFacade:
         adapter = self.registry.get(provider_id.value)
         token = self._require_token(provider_id)
 
-        # Consume the ticket with the record's bound fields.
+        # SECURITY: change-request creation MUST consume a ticket
+        # bound to `create_change_request`, NOT to the operation's
+        # own kind. Reusing a push approval for a change request is
+        # a critical security bug (see the reference specification,
+        # section 10). The check below enforces that the ticket was
+        # granted for the correct side effect.
+        ticket = self.approval_gate.get_ticket(approval_id)
+        if ticket is None:
+            raise ValidationError(
+                f"Approval ticket '{approval_id}' is not known."
+            )
+        if ticket.operation != "create_change_request":
+            raise PermissionDeniedError(
+                f"Approval ticket '{approval_id}' was granted for "
+                f"'{ticket.operation}', not for 'create_change_request'. "
+                "A push approval cannot be reused to create a change "
+                "request."
+            )
+
+        # Consume the ticket with the correct expected operation.
         self.approval_gate.consume(
             approval_id=approval_id,
             expected_operation_id=operation_id,
             expected_repository_id=record.repository_id,
-            expected_operation=record.kind,
+            expected_operation="create_change_request",
             expected_base_sha=record.base_sha or "",
             expected_diff_sha256=record.diff_sha256 or "",
             expected_target_branch=record.target_branch

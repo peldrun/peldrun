@@ -233,7 +233,11 @@ class ApprovalGate:
 
         self._tickets: Dict[str, ApprovalTicket] = {}
         self._lock = threading.RLock()
-        self._audit = audit_logger or get_default_audit_logger()
+        self._audit = (
+            audit_logger
+            if audit_logger is not None
+            else get_default_audit_logger()
+        )
         self._default_ttl_seconds = int(default_ttl_seconds)
         self._max_tickets = int(max_tickets)
 

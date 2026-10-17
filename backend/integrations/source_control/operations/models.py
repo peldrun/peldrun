@@ -77,12 +77,18 @@ __all__ = [
 
 
 #: Statuses that end an operation. Once an operation reaches one of
-#: these, no further transitions are permitted (except the
-#: `STALE_REVIEW_REQUIRED` -> `REVIEW_REQUIRED` recovery path, which
-#: is handled separately by the service).
+#: these, no further transitions are permitted and no metadata can be
+#: updated on the record.
+#:
+#: IMPORTANT: `PUSHED` is deliberately NOT in this set. It is an
+#: intermediate state from which `CHANGE_REQUEST_CREATED` is the
+#: canonical successor (see `ALLOWED_TRANSITIONS` below, which
+#: explicitly permits `PUSHED -> CHANGE_REQUEST_CREATED`). Treating
+#: `PUSHED` as terminal would block `attach_change_request` and the
+#: subsequent transition, making `create_change_request` unusable on
+#: a successfully pushed operation.
 TERMINAL_STATUSES: FrozenSet[OperationStatus] = frozenset(
     {
-        OperationStatus.PUSHED,
         OperationStatus.CHANGE_REQUEST_CREATED,
         OperationStatus.CANCELLED,
         OperationStatus.FAILED_FINAL,

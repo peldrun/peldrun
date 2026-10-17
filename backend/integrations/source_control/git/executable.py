@@ -109,7 +109,24 @@ MINIMUM_GIT_VERSION: Tuple[int, int, int] = (2, 20, 0)
 #: characters, and quotes — all of which could break logging or mask
 #: an attempt to smuggle a shell command through an environment
 #: variable.
-_SHELL_METACHARACTERS = re.compile(r"[;&|`$<>\n\r\t\"'*?\[\]{}()]")
+#: Shell metacharacters that MUST NOT appear in the Git binary
+#: path.
+#:
+#: IMPORTANT: The characters `(`, `)`, `{`, and `}` are deliberately
+#: EXCLUDED because:
+#:
+#:     1. They appear in the standard Windows Git installation path
+#:        (`C:\Program Files (x86)\Git\cmd\git.exe`). Rejecting them
+#:        would make PELDRUN unusable on 64-bit Windows systems.
+#:     2. `asyncio.create_subprocess_exec` does NOT interpret these
+#:        characters through a shell, so they carry no injection
+#:        risk.
+#:
+#: The backslash `\\` is also excluded for the same reason (Windows
+#: path separator, not a shell escape). See
+#: `test_shell_metacharacters_do_not_include_backslash` in the test
+#: suite for the regression guard.
+_SHELL_METACHARACTERS = re.compile(r"[;&|`$<>\n\r\t\"'*?\[\]]")
 
 #: Environment variables that are removed before spawning Git.
 _UNSAFE_ENV_VARS: Tuple[str, ...] = (

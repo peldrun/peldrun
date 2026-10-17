@@ -134,10 +134,26 @@ class OperationService:
         approval_gate: Optional[ApprovalGate] = None,
         audit_logger: Optional[AuditLogger] = None,
     ) -> None:
-        self._journal = journal or get_default_operation_journal()
-        self._policy = policy_engine or get_default_policy_engine()
-        self._approvals = approval_gate or get_default_approval_gate()
-        self._audit = audit_logger or get_default_audit_logger()
+        self._journal = (
+            journal
+            if journal is not None
+            else get_default_operation_journal()
+        )
+        self._policy = (
+            policy_engine
+            if policy_engine is not None
+            else get_default_policy_engine()
+        )
+        self._approvals = (
+            approval_gate
+            if approval_gate is not None
+            else get_default_approval_gate()
+        )
+        self._audit = (
+            audit_logger
+            if audit_logger is not None
+            else get_default_audit_logger()
+        )
 
         # Cache of the last used event sequence per operation.
         # Populated lazily; invalidated on service restart.
