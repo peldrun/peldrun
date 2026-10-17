@@ -1,0 +1,63 @@
+{
+  "id": "browser_interactive",
+  "name": "browser_interactive",
+  "display_name": "Interactive Browser",
+  "description": "Control a real Chromium browser to interact with dynamic web pages. Use 'navigate' to open a URL, 'snapshot' to get a token-efficient accessibility tree with element references (refs), 'click' or 'fill' using those refs, 'get_content' for visible text, 'scroll' to reveal more, and 'screenshot' to save a PNG image to the workspace. Does NOT return images to the model (screenshots are saved as artifacts for the user). For simple static text extraction, prefer the lighter 'http_fetch' tool.",
+  "category": "network",
+  "safety_level": "read_only",
+  "is_builtin": true,
+  "is_enabled": true,
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": [
+          "navigate",
+          "snapshot",
+          "get_content",
+          "click",
+          "fill",
+          "scroll",
+          "screenshot",
+          "back",
+          "forward"
+        ],
+        "description": "Operation to perform on the current page or a new URL."
+      },
+      "url": {
+        "type": "string",
+        "format": "uri",
+        "description": "Target URL (required for 'navigate'). Must be http or https."
+      },
+      "ref": {
+        "type": "string",
+        "description": "Element reference ID from a previous 'snapshot' (e.g. 'e7'). Preferred over 'selector' for reliability."
+      },
+      "selector": {
+        "type": "string",
+        "description": "CSS selector for the target element. Use only if 'ref' is not available."
+      },
+      "value": {
+        "type": "string",
+        "description": "Text to enter when 'action' is 'fill'."
+      },
+      "direction": {
+        "type": "string",
+        "enum": ["down", "up", "top", "bottom"],
+        "description": "Scroll direction when 'action' is 'scroll'. Defaults to 'down'."
+      },
+      "full_page": {
+        "type": "boolean",
+        "description": "Capture the entire scrollable page (true) or just the viewport (false) when 'action' is 'screenshot'. Defaults to false."
+      },
+      "max_chars": {
+        "type": "integer",
+        "minimum": 500,
+        "maximum": 50000,
+        "description": "Maximum characters to return for 'get_content' or 'snapshot'. Defaults to 8000."
+      }
+    },
+    "required": ["action"]
+  }
+}

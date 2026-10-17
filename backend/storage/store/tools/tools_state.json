@@ -6,5 +6,5 @@
   "browser_use": true,
   "ask_human": true,
   "file_saver": true,
-  "http_fetch": true
+  "http_fetch": false
 }
