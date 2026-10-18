@@ -178,6 +178,7 @@ class BrowserSessionManager:
 
         if self._browser is not None:
             try:
+                # Explicitly disconnect to prevent Windows Proactor deadlocks
                 await self._browser.close()
             except Exception as exc:
                 logger.warning("Failed to close browser: %s", exc)
@@ -190,8 +191,7 @@ class BrowserSessionManager:
                 logger.warning("Failed to stop Playwright: %s", exc)
             self._playwright = None
 
-        logger.info("BrowserSessionManager shut down.")
-
+        logger.info("BrowserSessionManager shut down cleanly.")
     # ------------------------------------------------------------------
     # Context acquisition
     # ------------------------------------------------------------------

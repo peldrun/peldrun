@@ -1,6 +1,5 @@
-﻿"""
-backend/omweb/main.py
-
+﻿# backend/omweb/main.py
+"""
 PELDRUN Web FastAPI Application Entrypoint.
 
 Initializes middleware, static files, and canonical REST routers:
@@ -18,11 +17,19 @@ Initializes middleware, static files, and canonical REST routers:
 - /api/telemetry (P1-03D Canonical Analytics & Metering APIs)
 - /api/source-control (Source Control Integration: providers,
   repositories, workspaces, approvals, operations, audit)
+
+Lifespan management:
+    The application installs a FastAPI lifespan context manager that
+    gracefully closes the shared BrowserSessionManager on shutdown.
+    This is critical on Windows, where lingering Chromium processes can
+    prevent Uvicorn from exiting and cause the event loop to hang after
+    browser_interactive runs.
 """
 
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -57,11 +64,50 @@ _tool_registry.set_bundle_manager(get_bundle_manager())
 
 logger = logging.getLogger("omweb.main")
 
+
+# ---------------------------------------------------------------------------
+# Lifespan: graceful shutdown of shared subsystems
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Application lifespan context.
+
+    On startup: nothing additional is required beyond what module-level
+    initialization already does.
+
+    On shutdown: close the shared BrowserSessionManager so that any
+    Chromium processes spawned by the browser_interactive tool are
+    terminated cleanly. Without this, Uvicorn on Windows can hang after
+    a browser_interactive invocation because orphaned Chromium children
+    keep the Proactor event loop busy.
+    """
+    yield
+
+    try:
+        from peldrun.tools.builtins.browser_interactive.session import (
+            get_session_manager,
+        )
+
+        await get_session_manager().close()
+        logger.info("BrowserSessionManager closed cleanly on shutdown.")
+    except Exception as exc:
+        logger.warning(
+            "Failed to close BrowserSessionManager on shutdown: %s", exc
+        )
+
+
+# ---------------------------------------------------------------------------
+# FastAPI application
+# ---------------------------------------------------------------------------
+
 app = FastAPI(
     title="PELDRUN Web & Runtime API",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 # CORS Configuration
