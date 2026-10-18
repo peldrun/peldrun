@@ -21,6 +21,26 @@ Design rules:
       surfaced to the caller are `SourceControlError` subclasses.
     - The adapter is stateless with respect to per-request data. It
       is safe to share across coroutines.
+
+Repository identity:
+    Methods that operate on a repository accept either a
+    `RepositoryRef` (when the caller already holds a resolved
+    identity) or a plain repository id string (when the caller only
+    has the numeric id from the HTTP layer). The string form is
+    resolved through GitHub's `GET /repositories/{id}` endpoint,
+    which accepts the numeric id directly. This dual signature
+    avoids forcing every caller to keep a `RepositoryRef` cache.
+
+Declared-but-unimplemented capabilities:
+    `ProviderCapabilities.delete_branch` and
+    `ProviderCapabilities.merge_change_request` are declared `True`
+    for GitHub, but no corresponding adapter methods exist yet. The
+    policy engine blocks these operations by default
+    (`test_default_policy_blocks_delete_remote_branch` and
+    `test_default_policy_blocks_merge_change_request`). Adding the
+    methods here and relaxing the policy is tracked as future work;
+    until then, the capability flags reflect "GitHub supports this"
+    rather than "this adapter exposes it".
 """
 
 from __future__ import annotations
@@ -182,31 +202,215 @@ class GitHubProviderAdapter(BaseSourceControlProvider):
 
     async def get_repository(
         self,
-        repo: RepositoryRef,
+        repo: RepositoryRef | str,
         token: Optional[str] = None,
     ) -> RepositoryRef:
-        """Fetch fresh metadata for a repository."""
+        """
+        Fetch repository metadata.
+
+        Accepts either a `RepositoryRef` (already-resolved identity)
+        or a plain repository id string. The string form is resolved
+        via the GitHub `GET /repositories/{id}` endpoint, which
+        accepts the stable numeric ID that the `repositories` service
+        stores in `RepositoryRef.repository_id`. This dual signature
+        keeps the adapter usable from both the application service
+        (which has only a string id from the HTTP layer) and from
+        lower-level callers that already hold a `RepositoryRef`.
+        """
+        if not token:
+            raise AuthRequiredError(
+                "A non-empty token is required to fetch repository "
+                "details."
+            )
+        if isinstance(repo, RepositoryRef):
+            service = self._get_repository_service()
+            return await service.get_repository(repo=repo, token=token)
+        if isinstance(repo, str):
+            return await self.get_repository_by_id(repo, token=token)
+        raise ValidationError(
+            "repo must be a RepositoryRef or a non-empty repository "
+            "id string.",
+            details={"type": type(repo).__name__},
+        )
+
+    async def get_repository_by_id(
+        self,
+        repository_id: str,
+        token: Optional[str] = None,
+    ) -> RepositoryRef:
+        """
+        Fetch repository metadata by its stable numeric ID.
+
+        GitHub exposes a dedicated endpoint (`GET /repositories/{id}`)
+        that accepts the numeric repository identifier directly. When
+        the underlying `GitHubRepositoryService` later grows a
+        matching method, it is used; otherwise the adapter calls the
+        endpoint itself and reuses the service's private payload
+        mapper, keeping the parsing logic centralized in one place.
+        """
+        if not repository_id or not isinstance(repository_id, str):
+            raise ValidationError(
+                "repository_id must be a non-empty string."
+            )
         if not token:
             raise AuthRequiredError(
                 "A non-empty token is required to fetch repository "
                 "details."
             )
         service = self._get_repository_service()
-        return await service.get_repository(repo=repo, token=token)
+
+        # Prefer the service method when it exists (forward-
+        # compatible with a future `GitHubRepositoryService.
+        # get_repository_by_id`).
+        explicit = getattr(service, "get_repository_by_id", None)
+        if callable(explicit):
+            return await explicit(repository_id, token=token)
+
+        client = self._get_client()
+        encoded = quote(repository_id, safe="")
+        payload = await client.get_json(
+            f"/repositories/{encoded}", token=token
+        )
+        if not isinstance(payload, Mapping):
+            raise ProviderError(
+                "GitHub returned an unexpected payload for the "
+                "repository lookup.",
+                details={"repository_id": repository_id},
+            )
+        mapper = getattr(service, "_map_repository", None)
+        if not callable(mapper):
+            raise UnsupportedCapabilityError(
+                "Repository mapping is unavailable in the current "
+                "service.",
+                details={"provider": self.provider_id},
+            )
+        return mapper(payload)
 
     async def list_branches(
         self,
         repo: RepositoryRef,
         token: Optional[str] = None,
+        limit: Optional[int] = None,
     ) -> Sequence[BranchRef]:
-        """Return every branch in the repository."""
+        """
+        Return branches in the repository, up to `limit`.
+
+        When `limit` is provided, it is passed to the underlying
+        service as `max_branches` so that the caller does not pay for
+        branches that will be discarded, and the result is
+        additionally sliced to guarantee the exact cap even if the
+        service returns more than requested.
+        """
         if not token:
             raise AuthRequiredError(
                 "A non-empty token is required to list branches."
             )
+        if limit is not None and limit <= 0:
+            raise ValidationError("limit must be a positive integer.")
+
         service = self._get_branch_service()
-        return await service.list_branches(
-            repo=repo, token=token, default_branch=repo.default_branch
+        kwargs: dict[str, Any] = {
+            "repo": repo,
+            "token": token,
+            "default_branch": repo.default_branch,
+        }
+        if limit is not None:
+            kwargs["max_branches"] = limit
+
+        branches = await service.list_branches(**kwargs)
+        if limit is not None:
+            return tuple(branches[:limit])
+        return tuple(branches)
+
+    async def create_branch(
+        self,
+        repo: RepositoryRef,
+        branch_name: str,
+        from_sha: str,
+        token: Optional[str] = None,
+    ) -> BranchRef:
+        """
+        Create a new branch on the remote repository.
+
+        The GitHub API represents branches as Git refs under
+        `refs/heads/<name>`; the corresponding write endpoint is
+        `POST /repos/{owner}/{repo}/git/refs`. When the underlying
+        `GitHubBranchService` later grows a matching method, it is
+        used; otherwise the adapter calls the endpoint itself.
+
+        The returned `BranchRef` is constructed optimistically: the
+        branch is brand new, so it is not the default branch and any
+        protection is only enforceable once GitHub has applied its
+        rules. Callers that need authoritative protection state
+        SHOULD call `list_branches` or `get_branch` after creation.
+        """
+        if not token:
+            raise AuthRequiredError(
+                "A non-empty token is required to create a branch."
+            )
+        if not branch_name or not isinstance(branch_name, str):
+            raise ValidationError(
+                "branch_name must be a non-empty string."
+            )
+        if not from_sha or not isinstance(from_sha, str):
+            raise ValidationError(
+                "from_sha must be a non-empty string."
+            )
+
+        service = self._get_branch_service()
+
+        # Prefer the service method when it exists (forward-
+        # compatible with a future `GitHubBranchService.create_branch`).
+        explicit = getattr(service, "create_branch", None)
+        if callable(explicit):
+            return await explicit(
+                repo=repo,
+                branch_name=branch_name,
+                from_sha=from_sha,
+                token=token,
+            )
+
+        owner = quote(repo.namespace, safe="")
+        name = quote(repo.name, safe="")
+        if not owner or not name:
+            raise ValidationError(
+                "Repository namespace and name must not be empty.",
+                details={
+                    "namespace": repo.namespace,
+                    "name": repo.name,
+                },
+            )
+
+        client = self._get_client()
+        endpoint = f"/repos/{owner}/{name}/git/refs"
+        body = {
+            "ref": f"refs/heads/{branch_name}",
+            "sha": from_sha,
+        }
+        response = await client.post_json(
+            endpoint, token=token, json_body=body
+        )
+        if not isinstance(response, Mapping):
+            raise ProviderError(
+                "GitHub returned an unexpected payload when creating "
+                "the branch.",
+                details={"branch_name": branch_name},
+            )
+
+        # The response carries the resolved SHA in `object.sha`. Fall
+        # back to `from_sha` when the field is missing.
+        head_sha = from_sha
+        obj = response.get("object")
+        if isinstance(obj, Mapping):
+            candidate = obj.get("sha")
+            if isinstance(candidate, str) and candidate:
+                head_sha = candidate
+
+        return BranchRef(
+            name=branch_name,
+            head_sha=head_sha,
+            is_default=False,
+            is_protected=False,
         )
 
     async def read_file(

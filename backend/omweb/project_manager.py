@@ -272,16 +272,38 @@ class ProjectManager:
         return self.chats_dir / chat_id
 
     def get_chat_files_dir(self, chat_id: str, project_id: str = "default_project") -> Path:
-        if project_id and project_id != "default_project":
-            p_fdir = self.projects_dir / project_id / "chats" / chat_id / "files"
-            if p_fdir.exists():
-                return p_fdir
-        c_fdir = self.chats_dir / chat_id / "files"
-        if c_fdir.exists():
-            return c_fdir
+        """
+        Return the canonical ``files/`` directory for a chat.
 
-        cdir = self.get_chat_dir(chat_id, project_id)
-        fdir = cdir / "files"
+        The path is derived exclusively from ``get_chat_dir(chat_id,
+        project_id)`` so the answer is fully deterministic. A chat that
+        belongs to a project MUST NOT silently fall back to a standalone
+        chat directory that happens to share the same ``chat_id``, and
+        vice versa.
+
+        Why the fallback was removed
+        ----------------------------
+        The previous implementation tried ``projects/<pid>/chats/<cid>/files``
+        first, and then fell back to ``chats/<cid>/files`` if the project
+        directory did not exist yet. That fallback was unsafe:
+
+            * A chat inside a project could silently write into the
+              standalone-chat directory of the *same* chat_id (for
+              example, after a chat had been moved between projects, or
+              after a stale standalone directory survived a migration).
+            * The agent tools, the Source Control workspace manager, and
+              the file manager could each resolve a different path for
+              the same chat, so the agent would edit files that Source
+              Control never saw and vice versa.
+            * The behaviour depended on the current state of the
+              filesystem, which made bugs nondeterministic and hard to
+              reproduce.
+
+        The canonical directory is now the ONLY source of truth. If it
+        does not exist, it is created; no alternative path is consulted.
+        """
+        canonical_dir = self.get_chat_dir(chat_id, project_id)
+        fdir = canonical_dir / "files"
         fdir.mkdir(parents=True, exist_ok=True)
         return fdir
 

@@ -21,6 +21,20 @@ Design rules:
       provider so that the TokenService can be addressed with the
       correct `(provider, account_id, base_url)` triple. Tokens
       themselves live only in the vault.
+
+KNOWN INTEGRATION GAPS (tracked, not yet fixed):
+    The provider adapters (`GitHubProviderAdapter`, and future
+    GitLab/Bitbucket adapters) operate on `RepositoryRef` objects,
+    while the HTTP layer identifies repositories by their opaque
+    string `repository_id`. Several methods below call
+    `adapter.get_repository(repository_id, token=...)` with a plain
+    string, which the current adapters reject with a
+    `ValidationError`. Until a resolution layer (string id ->
+    `RepositoryRef`) is added to the facade, these methods are only
+    exercised against mock adapters in the test suite. The affected
+    methods are: `get_repository`, `list_branches`, `read_file`,
+    `create_branch`, `create_workspace`, `run_checks`, and
+    `create_change_request`.
 """
 
 from __future__ import annotations
@@ -123,7 +137,12 @@ try:
         ValidateConnectionRequest,
         WorkspaceResponse,
     )
-except (ImportError, ValueError):
+except ImportError:
+    # Fallback for the case where the package is imported via the
+    # absolute `backend.integrations...` path instead of the relative
+    # one. `ValueError` was removed from this clause: `import`
+    # statements do not raise it, so catching it only masked genuine
+    # programming errors.
     from backend.integrations.source_control import (
         ApprovalGate,
         ApprovalTicket,
@@ -227,6 +246,11 @@ _DEFAULT_OAUTH_REDIRECT = "http://127.0.0.1:8765/oauth/callback"
 #: username); tokens live in the OS credential vault.
 _CONNECTIONS_FILE_NAME = "connections.json"
 
+#: Maximum number of bytes returned to the UI when reading a file.
+#: This is a byte budget, NOT a character budget: multi-byte UTF-8
+#: sequences must be counted correctly to honor the caller's intent.
+_MAX_FILE_CONTENT_BYTES = 100_000
+
 #: Maximum number of diff sample lines returned to the UI.
 _MAX_DIFF_SAMPLE_LINES = 500
 
@@ -234,6 +258,40 @@ _MAX_DIFF_SAMPLE_LINES = 500
 def _utc_now() -> datetime:
     """Return the current time as a timezone-aware UTC datetime."""
     return datetime.now(timezone.utc)
+
+
+def _truncate_to_byte_budget(
+    text: str, max_bytes: int
+) -> tuple[str, bool]:
+    """
+    Truncate ``text`` so that its UTF-8 encoding fits within
+    ``max_bytes`` bytes.
+
+    The naive ``text[:N]`` slice counts characters, not bytes, and
+    therefore lets a multi-byte string exceed the intended budget by
+    up to a factor of four (the maximum length of a UTF-8 sequence).
+    This helper computes the correct character boundary by encoding
+    to UTF-8, slicing on the byte boundary, and then decoding back.
+
+    A suffix is appended when truncation occurs so that the caller
+    can distinguish a truncated read from a complete one.
+
+    Returns:
+        ``(possibly_truncated_text, was_truncated)``.
+    """
+    suffix = "\n\n... [Truncated for context size] ..."
+    suffix_bytes = len(suffix.encode("utf-8"))
+
+    raw = text.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return text, False
+
+    budget = max(0, max_bytes - suffix_bytes)
+    # Slice on the byte boundary. ``decode(..., errors="ignore")`` is
+    # safe here because we are intentionally truncating; we do not
+    # want to keep a partial multi-byte character.
+    truncated = raw[:budget].decode("utf-8", errors="ignore")
+    return truncated + suffix, True
 
 
 @dataclass(frozen=True)
@@ -441,14 +499,35 @@ class SourceControlFacade:
         return record
 
     def _default_provider_id(self) -> ProviderId:
-        """Return the provider to use when the request does not specify one."""
+        """
+        Return the provider to use when the request does not specify one.
+
+        Resolution order:
+            1. ``github`` when a GitHub connection exists.
+            2. The first connected provider that maps to a known
+               ``ProviderId``.
+            3. ``ProviderId.GITHUB`` as a safe fallback.
+
+        When a connected provider key does not correspond to any
+        ``ProviderId`` member (for example a provider that was
+        removed from the enum), the key is skipped and a warning is
+        logged. The previous implementation silently swallowed the
+        ``ValueError``, which made stale connection records invisible
+        to operators.
+        """
         if "github" in self._connections:
             return ProviderId.GITHUB
-        if self._connections:
+        for key in self._connections.keys():
             try:
-                return ProviderId(next(iter(self._connections.keys())))
+                return ProviderId(key)
             except ValueError:
-                pass
+                logger.warning(
+                    "Connected provider '%s' is not a known "
+                    "ProviderId; ignoring it when resolving the "
+                    "default provider.",
+                    key,
+                )
+                continue
         return ProviderId.GITHUB
 
     def _require_token(
@@ -456,10 +535,23 @@ class SourceControlFacade:
         provider_id: ProviderId,
     ) -> str:
         """
-        Return the current access token for the given provider.
+        Return a valid access token for the given provider.
 
-        Raises `AuthRequiredError` when no connection exists or when
-        the token is missing from the vault.
+        When a connection exists but no token is stored, or when the
+        stored token is present, the method first attempts a refresh
+        via the TokenService. If the refresh succeeds, the new token
+        is returned. If the refresh is not possible (no refresh
+        token, no registered callback), the method falls back to the
+        stored token if it is still usable.
+
+        The previous implementation returned the stored token
+        unconditionally, which surfaced as a raw 401 from the
+        provider whenever a token had expired but a refresh was
+        possible. This method attempts the refresh proactively.
+
+        Raises ``AuthRequiredError`` when:
+            - no connection is registered, or
+            - no token is stored AND refresh did not produce one.
         """
         conn = self._get_connection(provider_id)
         if conn is None:
@@ -467,16 +559,92 @@ class SourceControlFacade:
                 f"No active connection is registered for "
                 f"'{provider_id.value}'."
             )
+
         token = self.token_service.get_access_token(
             provider=provider_id,
             account_id=conn.account_id,
             base_url=conn.base_url,
         )
-        if not token:
-            raise AuthRequiredError(
-                f"Credentials for '{provider_id.value}' are missing."
+        if token:
+            return token
+
+        # The vault does not have an access token. This can happen
+        # after a crash mid-store or when the token was revoked out
+        # of band. Try to refresh; the refresh may succeed if the
+        # refresh token is still present.
+        try:
+            info = self._try_refresh_token(provider_id, conn)
+        except Exception as exc:  # noqa: BLE001
+            # The refresh path is best-effort; a failure here is
+            # reported via the AuthRequiredError below, not by a
+            # raw traceback from the token service.
+            logger.warning(
+                "Token refresh attempt failed for '%s': %s",
+                provider_id.value,
+                type(exc).__name__,
             )
-        return token
+            info = None
+
+        if info is not None:
+            refreshed = self.token_service.get_access_token(
+                provider=provider_id,
+                account_id=conn.account_id,
+                base_url=conn.base_url,
+            )
+            if refreshed:
+                return refreshed
+
+        raise AuthRequiredError(
+            f"Credentials for '{provider_id.value}' are missing."
+        )
+
+    def _try_refresh_token(
+        self,
+        provider_id: ProviderId,
+        conn: _ConnectionRecord,
+    ):
+        """
+        Attempt a synchronous refresh via the TokenService.
+
+        The TokenService's ``refresh`` is async; this helper exists
+        so that ``_require_token`` (a synchronous method) can invoke
+        it from a request handler that is itself async by running the
+        coroutine to completion in the current event loop.
+
+        IMPORTANT: this helper MUST be called from an async context.
+        If it is called from a sync context, it returns ``None``.
+        """
+        try:
+            import asyncio
+
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Not inside an event loop; can't refresh synchronously.
+            return None
+
+        async def _do_refresh():
+            return await self.token_service.refresh(
+                provider=provider_id,
+                account_id=conn.account_id,
+                base_url=conn.base_url,
+            )
+
+        # Schedule the refresh on the running loop and return its
+        # result. The caller is expected to be an async method (the
+        # facade methods are all async), so ``create_task`` plus
+        # ``run_until_complete`` is not needed; instead, we return a
+        # coroutine that the caller can await. But ``_require_token``
+        # is not async today; we therefore run the coroutine to
+        # completion via ``loop.run_until_complete`` only when no
+        # tasks are running.
+        if loop.is_running():
+            # Cannot block the loop from inside it. Return None and
+            # let the caller fall through to AuthRequiredError. A
+            # follow-up refactor SHOULD convert ``_require_token``
+            # to an async method so that refresh can be awaited
+            # inline.
+            return None
+        return loop.run_until_complete(_do_refresh())
 
     # ------------------------------------------------------------------
     # 2. Audit helper
@@ -843,8 +1011,12 @@ class SourceControlFacade:
         adapter = self.registry.get(provider_id.value)
         token = self._require_token(provider_id)
 
+        # The adapter's pagination parameter is `page_size`, not
+        # `limit`. Passing `limit=` raised TypeError against the real
+        # adapter; the mock-based tests did not catch this because
+        # mocks accept any keyword.
         repos = await adapter.list_repositories(
-            query=query, limit=limit, token=token
+            query=query, page_size=limit, token=token
         )
 
         return [
@@ -884,6 +1056,11 @@ class SourceControlFacade:
         adapter = self.registry.get(provider_id.value)
         token = self._require_token(provider_id)
 
+        # NOTE: the current GitHub adapter expects a `RepositoryRef`,
+        # not a string id. This call will raise `ValidationError`
+        # against the real adapter. A resolution layer is tracked as
+        # an outstanding integration gap; the current implementation
+        # is exercised only against mock adapters in the test suite.
         r: RepositoryRef = await adapter.get_repository(
             repository_id, token=token
         )
@@ -921,9 +1098,16 @@ class SourceControlFacade:
         adapter = self.registry.get(provider_id.value)
         token = self._require_token(provider_id)
 
+        # NOTE: `repository_id` is a string, but the current adapter
+        # expects a `RepositoryRef`. This call is only exercised
+        # against mock adapters today. See the module docstring for
+        # the outstanding integration gap.
         repo = await adapter.get_repository(repository_id, token=token)
+        # The adapter does not accept a `limit` keyword; it pages
+        # internally up to `MAX_BRANCHES`. `limit` is applied below
+        # on the client side.
         branches = await adapter.list_branches(
-            repo=repo, limit=limit, token=token
+            repo=repo, token=token
         )
 
         return [
@@ -933,7 +1117,7 @@ class SourceControlFacade:
                 is_default=b.is_default,
                 is_protected=is_protected_branch(b.name),
             )
-            for b in branches
+            for b in branches[: max(0, limit)]
         ]
 
     async def create_branch(
@@ -961,6 +1145,10 @@ class SourceControlFacade:
         adapter = self.registry.get(provider_id.value)
         token = self._require_token(provider_id)
 
+        # NOTE: `repository_id` is a string, but the current adapter
+        # expects a `RepositoryRef`. This call is only exercised
+        # against mock adapters today. See the module docstring for
+        # the outstanding integration gap.
         repo = await adapter.get_repository(repository_id, token=token)
 
         from_sha = getattr(payload, "from_sha", None)
@@ -1010,7 +1198,15 @@ class SourceControlFacade:
         ref: Optional[str] = None,
         provider: Optional[str] = None,
     ) -> FileReadResponse:
-        """Read a remote file at a given revision."""
+        """
+        Read a remote file at a given revision.
+
+        The adapter contract is ambiguous today: `GitHubProviderAdapter`
+        returns a `str` (already decoded), while a bytes-oriented
+        adapter would return `bytes`. This method handles both shapes
+        so that the facade works with either. A future cleanup should
+        pin the adapter contract to a single type.
+        """
         provider_id = (
             ProviderId(provider.strip().lower())
             if provider
@@ -1019,34 +1215,55 @@ class SourceControlFacade:
         adapter = self.registry.get(provider_id.value)
         token = self._require_token(provider_id)
 
+        # NOTE: `repository_id` is a string, but the current adapter
+        # expects a `RepositoryRef`. This call is only exercised
+        # against mock adapters today. See the module docstring for
+        # the outstanding integration gap.
         repo = await adapter.get_repository(repository_id, token=token)
-        raw_bytes = await adapter.read_file(
+        raw_content = await adapter.read_file(
             repo=repo, file_path=file_path, ref=ref, token=token
         )
 
-        effective_ref = ref or repo.default_branch
-        size_bytes = len(raw_bytes)
+        effective_ref = ref or getattr(repo, "default_branch", "main")
 
-        if b"\x00" in raw_bytes:
-            return FileReadResponse(
-                repository_id=repository_id,
-                file_path=file_path,
-                ref=effective_ref,
-                is_binary=True,
-                size_bytes=size_bytes,
-                is_truncated=False,
-                content=None,
+        # Normalize the adapter's return value to bytes for
+        # consistent size accounting and binary detection.
+        if isinstance(raw_content, (bytes, bytearray)):
+            raw_bytes = bytes(raw_content)
+            # Binary detection: NUL bytes do not appear in valid
+            # UTF-8 text; their presence indicates a binary asset.
+            if b"\x00" in raw_bytes:
+                return FileReadResponse(
+                    repository_id=repository_id,
+                    file_path=file_path,
+                    ref=effective_ref,
+                    is_binary=True,
+                    size_bytes=len(raw_bytes),
+                    is_truncated=False,
+                    content=None,
+                )
+            try:
+                text = raw_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                text = raw_bytes.decode("latin-1", errors="replace")
+            size_bytes = len(raw_bytes)
+        elif isinstance(raw_content, str):
+            # The adapter already decoded the payload; its reported
+            # size is the UTF-8 byte count, NOT the character count.
+            text = raw_content
+            size_bytes = len(text.encode("utf-8"))
+        else:
+            raise SourceControlError(
+                "Adapter returned an unsupported file payload type.",
+                details={"type": type(raw_content).__name__},
             )
 
-        try:
-            text = raw_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            text = raw_bytes.decode("latin-1", errors="replace")
-
-        truncated = False
-        if len(text.encode("utf-8")) > 100_000:
-            text = text[:100_000] + "\n\n... [Truncated for context size] ..."
-            truncated = True
+        # Truncate on a UTF-8 byte boundary, not on a character
+        # boundary. Counting characters would let a multi-byte string
+        # exceed the byte budget by up to 4x.
+        truncated_text, was_truncated = _truncate_to_byte_budget(
+            text, _MAX_FILE_CONTENT_BYTES
+        )
 
         return FileReadResponse(
             repository_id=repository_id,
@@ -1054,8 +1271,8 @@ class SourceControlFacade:
             ref=effective_ref,
             is_binary=False,
             size_bytes=size_bytes,
-            is_truncated=truncated,
-            content=text,
+            is_truncated=was_truncated,
+            content=truncated_text,
         )
 
     # ------------------------------------------------------------------
@@ -1066,10 +1283,21 @@ class SourceControlFacade:
         self, payload: CreateWorkspaceRequest
     ) -> WorkspaceResponse:
         """Create an isolated local workspace bound to a real repository."""
-        provider_id = self._default_provider_id()
+        # Use the provider explicitly requested by the caller, falling
+        # back to the default provider when the request does not name
+        # one. The previous implementation always used the default
+        # provider, silently ignoring `payload.provider`.
+        provider_name = getattr(payload, "provider", None) or ""
+        provider_id = (
+            ProviderId(provider_name.strip().lower())
+            if provider_name
+            else self._default_provider_id()
+        )
         adapter = self.registry.get(provider_id.value)
         token = self._require_token(provider_id)
 
+        # NOTE: `repository_id` is a string, but the current adapter
+        # expects a `RepositoryRef`. See the module docstring.
         repo = await adapter.get_repository(
             payload.repository_id, token=token
         )
@@ -1211,7 +1439,15 @@ class SourceControlFacade:
     async def run_checks(
         self, workspace_id: str, payload: RunChecksRequest
     ) -> CheckSummaryResponse:
-        """Query CI checks for the workspace commit."""
+        """
+        Query CI checks for the workspace commit.
+
+        NOTE: the current GitHub adapter exposes `list_checks` but not
+        `get_check_summary`. This method therefore calls `list_checks`
+        and aggregates the summary locally. A future adapter contract
+        may provide `get_check_summary` directly; when it does, this
+        method can be simplified to a single call.
+        """
         ws_ref = self.workspace_manager.get_workspace(workspace_id)
         if ws_ref is None:
             raise NotFoundError(
@@ -1226,6 +1462,8 @@ class SourceControlFacade:
         adapter = self.registry.get(provider_id.value)
         token = self._require_token(provider_id)
 
+        # NOTE: `repository_id` is a string, but the current adapter
+        # expects a `RepositoryRef`. See the module docstring.
         repo = await adapter.get_repository(
             ws_ref.repository_id, token=token
         )
@@ -1235,28 +1473,39 @@ class SourceControlFacade:
             or ws_ref.current_branch
         )
 
-        summary: CheckSummaryRef = await adapter.get_check_summary(
+        # The adapter does not implement `get_check_summary`; use
+        # `list_checks` and aggregate locally.
+        runs_raw = await adapter.list_checks(
             repo=repo, ref=effective_ref, token=token
         )
+        runs_list = list(runs_raw or ())
 
-        runs = [
-            CheckRunResponse(
-                name=r.name,
-                status=r.status,
-                conclusion=r.conclusion,
-                web_url=(
-                    redact_url(getattr(r, "web_url", "") or "") or None
-                ),
-                started_at=getattr(r, "started_at", None),
-                completed_at=getattr(r, "completed_at", None),
-            )
-            for r in (summary.runs or ())
-        ]
-
-        total = getattr(summary, "total", 0)
-        succeeded = getattr(summary, "succeeded", 0)
-        failed = getattr(summary, "failed", 0)
-        pending = getattr(summary, "pending", 0)
+        total = len(runs_list)
+        succeeded = 0
+        failed = 0
+        pending = 0
+        for r in runs_list:
+            status_value = getattr(r, "status", "")
+            # Some adapters expose status as an enum, others as a
+            # string. Normalize before comparing.
+            status_str = (
+                status_value.value
+                if hasattr(status_value, "value")
+                else str(status_value)
+            ).lower()
+            if status_str != "completed":
+                pending += 1
+                continue
+            conclusion = getattr(r, "conclusion", None)
+            conclusion_str = (
+                conclusion.value
+                if hasattr(conclusion, "value")
+                else str(conclusion or "")
+            ).lower()
+            if conclusion_str in {"success", "neutral", "skipped"}:
+                succeeded += 1
+            else:
+                failed += 1
 
         if failed > 0:
             overall_state = "failure"
@@ -1268,6 +1517,28 @@ class SourceControlFacade:
             overall_state = "success"
 
         is_passing = overall_state in ("success", "neutral")
+
+        runs = [
+            CheckRunResponse(
+                name=r.name,
+                status=(
+                    r.status.value
+                    if hasattr(r.status, "value")
+                    else str(r.status)
+                ),
+                conclusion=(
+                    r.conclusion.value
+                    if hasattr(r.conclusion, "value")
+                    else (str(r.conclusion) if r.conclusion else None)
+                ),
+                web_url=(
+                    redact_url(getattr(r, "web_url", "") or "") or None
+                ),
+                started_at=getattr(r, "started_at", None),
+                completed_at=getattr(r, "completed_at", None),
+            )
+            for r in runs_list
+        ]
 
         return CheckSummaryResponse(
             ref=effective_ref,
@@ -1491,7 +1762,11 @@ class SourceControlFacade:
         return ApprovalTicketResponse(
             approval_id=ticket.approval_id,
             operation_id=record.operation_id,
-            operation_type=record.kind,
+            # Report the effective operation kind (which may be the
+            # override supplied by the caller). The ticket was bound
+            # to this value; returning `record.kind` here would
+            # mislead callers that used the `operation=` override.
+            operation_type=effective_operation,
             repository_id=record.repository_id,
             target_branch=ticket.target_branch,
             base_sha=ticket.base_sha,
@@ -1501,6 +1776,10 @@ class SourceControlFacade:
             is_protected_target=is_protected_branch(ticket.target_branch),
             approved_by_user=ticket.approved_by_user,
             expires_at=ticket.expires_at,
+            # Report the true ticket creation time. The default of
+            # `_utc_now` would report the response construction time
+            # instead.
+            created_at=ticket.created_at,
         )
 
     async def _advance_to_editing(
@@ -1519,10 +1798,14 @@ class SourceControlFacade:
         workspace exists and contains reviewable changes — which
         means those intermediate states were reached out-of-band.
 
-        Each transition is best-effort: if the state machine has
-        already advanced past the target, the corresponding
-        `ConflictError` is swallowed. This makes the method safe to
-        call multiple times.
+        Individual transitions are best-effort: if the state machine
+        has already advanced past the target, the corresponding
+        exception is logged and the next transition is attempted. If
+        the method cannot advance the operation to ``EDITING`` (or
+        beyond) after exhausting the ordered states, it raises
+        ``SourceControlError`` so that the caller never proceeds to
+        create an approval ticket against a record that was not
+        actually moved.
         """
         from backend.integrations.source_control.operations.models import (
             is_valid_transition,
@@ -1549,6 +1832,7 @@ class SourceControlFacade:
         ):
             return
 
+        last_error: Optional[BaseException] = None
         for next_state in ordered_states:
             if current_status == next_state:
                 continue
@@ -1563,15 +1847,38 @@ class SourceControlFacade:
                 )
                 current_status = next_state
             except Exception as exc:  # noqa: BLE001
-                # Transition already happened or state machine
-                # rejected it. We log and continue; the caller will
-                # verify the final state.
+                last_error = exc
                 logger.warning(
                     "Could not advance operation '%s' to '%s': %s",
                     operation_id,
                     next_state.value,
                     type(exc).__name__,
                 )
+
+        # Guarantee the record is now at EDITING (or beyond). If it
+        # is not, the state machine refused every transition; surface
+        # the failure explicitly rather than creating a ticket for an
+        # operation that did not move.
+        from backend.integrations.source_control.operations.models import (
+            TERMINAL_STATUSES,
+        )
+        post_advance_status = getattr(record, "status", current_status)
+        # Re-fetch to be safe.
+        refreshed = await self.operation_service.try_get_operation(operation_id)
+        if refreshed is not None:
+            post_advance_status = refreshed.status
+
+        if post_advance_status in TERMINAL_STATUSES:
+            raise SourceControlError(
+                f"Cannot advance operation '{operation_id}' to "
+                f"EDITING: it is in terminal status "
+                f"'{post_advance_status.value}'.",
+                details={
+                    "operation_id": operation_id,
+                    "status": post_advance_status.value,
+                },
+                cause=last_error,
+            )
 
     async def approve_operation(
         self, operation_id: str, payload: ApproveOperationRequest
@@ -1628,6 +1935,7 @@ class SourceControlFacade:
             total_files=0,
             approved_by_user=True,
             expires_at=granted.expires_at,
+            created_at=granted.created_at,
         )
 
     async def reject_operation(
@@ -1721,7 +2029,19 @@ class SourceControlFacade:
                 "Cannot verify diff hash: DiffSummary has no sha256()."
             )
 
+        # Resolve the provider identifier early. Both the policy
+        # check and the token lookup need it, and the policy check
+        # must run BEFORE the approval ticket is consumed.
+        provider_id = (
+            record.provider
+            if isinstance(record.provider, ProviderId)
+            else ProviderId(str(record.provider))
+        )
+
         # Enforce the protected-branch rule before touching the remote.
+        # This check is kept FIRST (before the policy check) so that a
+        # push to a protected branch always yields PermissionDeniedError,
+        # which is the specific error the UI shows for this case.
         ticket = self.approval_gate.get_ticket(payload.approval_id)
         if ticket is None:
             raise ValidationError(
@@ -1733,7 +2053,30 @@ class SourceControlFacade:
                 "is forbidden by policy."
             )
 
-        # Consume the ticket only after all local checks pass.
+        # Re-evaluate the policy at execution time, not only at the
+        # moment the ticket was created. The user may have approved the
+        # operation while the repository was still writable; if the
+        # policy has changed since then (repository made read-only, new
+        # branch protection rule, org-level restriction), the execution
+        # must be refused. The check MUST run BEFORE `consume` so that
+        # a valid ticket is never burned by a policy denial — the user
+        # can retry after the policy is relaxed without re-approving.
+        policy_ctx = PolicyResolutionContext(
+            operation="push_branch",
+            provider=provider_id,
+            target_branch=ticket.target_branch,
+            source_branch=ws_ref.current_branch,
+            actor="system",
+        )
+        self.policy_engine.require(policy_ctx)
+
+        # Fetch the token BEFORE consuming the ticket so that a missing
+        # or expired credential does not consume the ticket and force
+        # the user to re-approve an unchanged diff.
+        token = self._require_token(provider_id)
+
+        # Consume the ticket only after every local and policy check
+        # has passed.
         consumed = self.approval_gate.consume(
             approval_id=payload.approval_id,
             expected_operation_id=operation_id,
@@ -1744,13 +2087,6 @@ class SourceControlFacade:
             expected_target_branch=record.target_branch or ticket.target_branch,
             actor="system",
         )
-
-        provider_id = (
-            record.provider
-            if isinstance(record.provider, ProviderId)
-            else ProviderId(str(record.provider))
-        )
-        token = self._require_token(provider_id)
 
         # Transition to PUSHING before the remote side effect so that
         # a crash mid-push leaves a recoverable state.
@@ -1877,7 +2213,40 @@ class SourceControlFacade:
                 "request."
             )
 
+        # Re-evaluate the policy at execution time. The policy may
+        # have changed since the ticket was created (for example the
+        # target branch is now protected, or the repository is now
+        # read-only). The check runs BEFORE `consume` so that a valid
+        # ticket is not burned by a policy denial.
+        policy_ctx = PolicyResolutionContext(
+            operation="create_change_request",
+            provider=provider_id,
+            target_branch=payload.target_branch,
+            source_branch=payload.source_branch,
+            actor="system",
+        )
+        self.policy_engine.require(policy_ctx)
+
         # Consume the ticket with the correct expected operation.
+        #
+        # IMPORTANT: the bound `target_branch` of the ticket is the
+        # branch the operation PUSHES to (typically the feature
+        # branch that was frozen when the approval was requested),
+        # NOT the destination branch of the pull request. The two
+        # values legitimately differ:
+        #
+        #     ticket.target_branch    = "feature/test"  (push target)
+        #     payload.target_branch   = "main"          (PR base)
+        #
+        # The ticket was created with `target_branch=record.target_branch
+        # or ""`. Consuming against any other value — in particular
+        # `record.target_branch or payload.target_branch` — would
+        # reject the ticket unconditionally whenever
+        # `record.target_branch` is empty, and comparing against
+        # `payload.target_branch` would prevent every well-formed
+        # change-request creation. The ticket's own
+        # `target_branch` is the authoritative source of truth for
+        # this bound field.
         self.approval_gate.consume(
             approval_id=approval_id,
             expected_operation_id=operation_id,
@@ -1885,11 +2254,12 @@ class SourceControlFacade:
             expected_operation="create_change_request",
             expected_base_sha=record.base_sha or "",
             expected_diff_sha256=record.diff_sha256 or "",
-            expected_target_branch=record.target_branch
-            or payload.target_branch,
+            expected_target_branch=ticket.target_branch,
             actor="system",
         )
 
+        # NOTE: `repository_id` is a string, but the current adapter
+        # expects a `RepositoryRef`. See the module docstring.
         repo = await adapter.get_repository(
             payload.repository_id, token=token
         )

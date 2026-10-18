@@ -258,6 +258,16 @@ class AuditEvent:
             timestamp = timestamp_raw
         else:
             timestamp = _utc_now()
+        # Normalize the timestamp to timezone-aware UTC. A naive
+        # value can appear when a persisted event was written by
+        # older code, or when a caller-supplied mapping omits the
+        # timezone offset. Naive and aware datetimes cannot be
+        # compared directly, so a naive value would raise
+        # `TypeError` on the first filtered query. We treat naive
+        # values as UTC, matching the convention used by
+        # `token_service._parse_datetime`.
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
 
         return cls(
             event_id=str(data.get("event_id") or secrets.token_hex(8)),
@@ -303,7 +313,12 @@ def _make_event(
     """
     raw_payload = dict(payload or {})
     safe_payload = redact_mapping(raw_payload)
-    safe_message = redact_text(message) if message else None
+    # Preserve the distinction between "no message" (None) and
+    # "empty message" (""). The previous `if message` check treated
+    # an empty string as missing, which both lost information and
+    # produced a false positive in the redaction flag below
+    # ("" -> None was incorrectly reported as redaction).
+    safe_message = redact_text(message) if message is not None else None
 
     # Detect whether redaction actually changed anything.
     was_redacted = safe_payload != raw_payload or (
@@ -694,6 +709,16 @@ def _filter_events(
 
     The comparison is inclusive for `since` and exclusive for `until`.
     """
+    # Normalize caller-provided time bounds to timezone-aware UTC so
+    # that a naive `since`/`until` cannot trigger a `TypeError`
+    # during the comparisons below. Naive values are assumed to be
+    # UTC, matching the convention used by `AuditEvent.from_dict`
+    # and `token_service._parse_datetime`.
+    if since is not None and since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    if until is not None and until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+
     min_rank = (
         _SEVERITY_ORDER[min_severity] if min_severity is not None else None
     )

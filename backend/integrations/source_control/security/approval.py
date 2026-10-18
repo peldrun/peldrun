@@ -17,6 +17,19 @@ and consume approval tickets. It enforces the following invariants:
        ticket, and CANNOT mark itself as approved.
     5. Every state change on a ticket is recorded in the audit log.
 
+State machine (single source of truth for `_transition`):
+
+    PENDING   -> GRANTED | REJECTED | REVOKED | EXPIRED
+    GRANTED   -> CONSUMED | REJECTED | REVOKED | EXPIRED
+    REJECTED  -> REJECTED | REVOKED          (terminal, cleanup only)
+    EXPIRED   -> EXPIRED  | REJECTED | REVOKED (terminal, cleanup only)
+    REVOKED   -> REVOKED                     (terminal)
+    CONSUMED  -> CONSUMED                    (terminal)
+
+Any transition not listed above raises `ApprovalInvalidError` (or
+`ApprovalExpiredError` / `ApprovalConsumedError` where those specific
+errors are more informative).
+
 The `ApprovalTicket` model is defined in `domain.models` and is the
 single source of truth. This module MUST NOT redefine it.
 
@@ -279,12 +292,17 @@ class ApprovalGate:
                 an already-expired ticket, which is useful for tests.
             approval_id: Optional identifier for the ticket. When
                 `None`, a random 16-hex-character ID is generated.
+                When provided and already in use, the call fails with
+                `ApprovalInvalidError` rather than silently
+                overwriting the existing ticket.
 
         Returns:
             A new `ApprovalTicket` in `PENDING` status.
 
         Raises:
             ValidationError: If any input is invalid.
+            ApprovalInvalidError: If an explicit `approval_id` is
+                already in use.
         """
         self._validate_non_empty(operation_id, "operation_id")
         self._validate_non_empty(repository_id, "repository_id")
@@ -317,6 +335,15 @@ class ApprovalGate:
         )
 
         with self._lock:
+            # Reject duplicate explicit IDs rather than silently
+            # overwriting an existing ticket. Random IDs generated
+            # internally have negligible collision probability, but
+            # the check is unconditional for defense in depth.
+            if ticket.approval_id in self._tickets:
+                raise ApprovalInvalidError(
+                    f"Approval ticket '{ticket.approval_id}' already exists.",
+                    details={"approval_id": ticket.approval_id},
+                )
             self._enforce_capacity_locked()
             self._tickets[ticket.approval_id] = ticket
 
@@ -362,8 +389,10 @@ class ApprovalGate:
 
         Raises:
             ValidationError: If `approval_id` is empty.
-            ApprovalInvalidError: If the ticket does not exist.
-            ApprovalExpiredError: If the ticket has expired.
+            ApprovalInvalidError: If the ticket does not exist, was
+                already rejected, or was already revoked.
+            ApprovalExpiredError: If the ticket has expired (either
+                by time or by prior status).
             ApprovalConsumedError: If the ticket has been consumed.
         """
         return self._transition(
@@ -386,6 +415,8 @@ class ApprovalGate:
         Mark a ticket as rejected by the user.
 
         A rejected ticket cannot be granted or consumed afterwards.
+        The only further transition permitted is to `REVOKED` for
+        cleanup purposes.
         """
         return self._transition(
             approval_id,
@@ -862,35 +893,77 @@ class ApprovalGate:
         """
         Perform a state transition on a ticket.
 
-        Guards against invalid transitions:
-            - Consumed tickets cannot be re-transitioned.
-            - Expired tickets cannot be granted or rejected.
-            - Rejected tickets cannot be granted.
+        The state machine is exhaustive and monotonic; any
+        transition not listed below is refused:
+
+            PENDING   -> GRANTED | REJECTED | REVOKED | EXPIRED
+            GRANTED   -> CONSUMED | REJECTED | REVOKED | EXPIRED
+            REJECTED  -> REJECTED | REVOKED          (cleanup only)
+            EXPIRED   -> EXPIRED  | REJECTED | REVOKED (cleanup only)
+            REVOKED   -> REVOKED                     (idempotent)
+            CONSUMED  -> (terminal, no transition)
+
+        In addition, the following time-based rule is enforced:
+        a ticket whose ``expires_at`` has passed cannot be granted,
+        even if its status is still PENDING or GRANTED. Such a grant
+        attempt flips the status to EXPIRED before raising
+        ``ApprovalExpiredError``.
         """
         with self._lock:
             ticket = self._get_ticket_locked(approval_id)
 
+            # --- Terminal state: CONSUMED ---------------------------
             if ticket.status == ApprovalStatus.CONSUMED:
                 raise ApprovalConsumedError(
                     "Cannot modify a consumed approval ticket.",
                     details={"approval_id": approval_id},
                 )
-            if ticket.status == ApprovalStatus.REVOKED and target_status not in (
-                ApprovalStatus.REVOKED,
-            ):
-                raise ApprovalInvalidError(
-                    "Cannot modify a revoked approval ticket.",
-                    details={"approval_id": approval_id},
-                )
+
+            # --- Terminal state: REVOKED ----------------------------
+            if ticket.status == ApprovalStatus.REVOKED:
+                if target_status != ApprovalStatus.REVOKED:
+                    raise ApprovalInvalidError(
+                        "Cannot modify a revoked approval ticket.",
+                        details={
+                            "approval_id": approval_id,
+                            "requested_status": target_status.value,
+                        },
+                    )
+
+            # --- Terminal state: REJECTED ---------------------------
+            # A rejected ticket cannot be re-granted or re-rejected
+            # in a meaningful way; only cleanup to REVOKED is
+            # permitted.
+            if ticket.status == ApprovalStatus.REJECTED:
+                if target_status not in (
+                    ApprovalStatus.REJECTED,
+                    ApprovalStatus.REVOKED,
+                ):
+                    raise ApprovalInvalidError(
+                        "Cannot modify a rejected approval ticket.",
+                        details={
+                            "approval_id": approval_id,
+                            "requested_status": target_status.value,
+                        },
+                    )
+
+            # --- Time-based expiry, and status=EXPIRED --------------
+            # A ticket can be EXPIRED either because its wall-clock
+            # expires_at has passed, or because a previous grant
+            # attempt already flipped its status. Both cases must
+            # block further grants.
             if (
-                ticket.expires_at <= _utc_now()
+                (
+                    ticket.status == ApprovalStatus.EXPIRED
+                    or ticket.expires_at <= _utc_now()
+                )
                 and target_status == ApprovalStatus.GRANTED
             ):
-                # Mark the ticket as expired and refuse the grant.
-                expired = self._replace_ticket(
-                    ticket, status=ApprovalStatus.EXPIRED
-                )
-                self._tickets[approval_id] = expired
+                if ticket.status != ApprovalStatus.EXPIRED:
+                    expired = self._replace_ticket(
+                        ticket, status=ApprovalStatus.EXPIRED
+                    )
+                    self._tickets[approval_id] = expired
                 raise ApprovalExpiredError(
                     "Approval ticket has expired.",
                     details={
@@ -1090,9 +1163,3 @@ def reset_default_approval_gate() -> ApprovalGate:
 get_default_approval_manager = get_default_approval_gate
 set_default_approval_manager = set_default_approval_gate
 reset_default_approval_manager = reset_default_approval_gate
-
-# The `ApprovalTicket` model is defined in `domain.models` and is the
-# single source of truth for the approval snapshot. It is re-exported
-# here so that `security/__init__.py` can import it alongside the
-# `ApprovalGate` without needing a separate domain import.
-ApprovalTicket = ApprovalTicket

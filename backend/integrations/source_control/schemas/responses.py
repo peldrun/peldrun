@@ -1,8 +1,22 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, Sequence
 from pydantic import BaseModel, ConfigDict, Field
+
+
+def _utc_now() -> datetime:
+    """
+    Return the current time as a timezone-aware UTC datetime.
+
+    Used as a `default_factory` for schema fields that must default
+    to the moment of construction. Defined at module scope so that
+    every schema shares the same implementation; this guarantees that
+    all default timestamps are timezone-aware and interoperate
+    correctly with the fields whose values are populated from domain
+    objects (which are also timezone-aware).
+    """
+    return datetime.now(timezone.utc)
 
 
 class BaseSCResponse(BaseModel):
@@ -179,7 +193,16 @@ class ApprovalTicketResponse(BaseSCResponse):
     is_protected_target: bool = Field(default=False, description="Warning if destination is protected.")
     approved_by_user: bool = Field(default=False, description="Whether human approved the ticket.")
     expires_at: datetime = Field(..., description="Timestamp when ticket expires.")
-    created_at: datetime = Field(default_factory=datetime.utcnow, description="Creation timestamp.")
+    created_at: datetime = Field(
+        default_factory=_utc_now,
+        description=(
+            "Timestamp when the response was constructed. NOTE: this "
+            "defaults to 'now' because the caller does not currently "
+            "propagate the ticket's true creation time. Callers SHOULD "
+            "pass `created_at=<ticket>.created_at` explicitly so that "
+            "the response reflects the actual ticket creation moment."
+        ),
+    )
 
 
 class WorkspaceResponse(BaseSCResponse):

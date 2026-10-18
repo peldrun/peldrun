@@ -148,7 +148,7 @@ def register_provider(
     Returns True when the adapter was registered or replaced, False
     when registration was skipped because the ID already existed.
     """
-    target = registry or get_default_registry()
+    target = registry if registry is not None else get_default_registry()
     provider_id = getattr(adapter, "provider_id", None)
     if not provider_id or not isinstance(provider_id, str):
         raise ValidationError(
@@ -178,7 +178,7 @@ def unregister_provider(
     Unregister a single provider. Returns True when a provider was
     removed, False when nothing was registered under that ID.
     """
-    target = registry or get_default_registry()
+    target = registry if registry is not None else get_default_registry()
     return target.unregister(provider_id)
 
 
@@ -202,7 +202,7 @@ def register_builtin_providers(
         - `"skipped"`    : the adapter was already registered.
         - `"failed"`     : the adapter could not be constructed.
     """
-    target = registry or get_default_registry()
+    target = registry if registry is not None else get_default_registry()
     selected = (
         list(providers) if providers else list(_PROVIDER_FACTORIES.keys())
     )
@@ -241,6 +241,22 @@ def register_builtin_providers(
 
         already_registered = target.has(key)
 
+        # A duplicate registration without `force=True` is a normal
+        # no-op, not an error. The previous implementation reported
+        # it as `"failed"` because `ProviderRegistry.register()`
+        # raises `ValidationError` for an existing key *before* the
+        # `if already_registered` branch could classify it as
+        # `"skipped"`. Detecting the duplicate here keeps the status
+        # map truthful and stops the misleading WARNING from being
+        # logged on every second-and-later startup.
+        if already_registered and not force:
+            logger.debug(
+                "Provider '%s' was already registered; skipping.",
+                key,
+            )
+            status[key] = "skipped"
+            continue
+
         try:
             target.register(adapter, overwrite=force)
         except Exception as exc:  # noqa: BLE001
@@ -252,17 +268,12 @@ def register_builtin_providers(
             status[key] = "failed"
             continue
 
+        # Reached only when the provider was either new or `force=True`.
         if already_registered:
-            if force:
-                logger.info(
-                    "Replaced source-control provider '%s'.", key
-                )
-                status[key] = "replaced"
-            else:
-                logger.debug(
-                    "Provider '%s' was already registered.", key
-                )
-                status[key] = "skipped"
+            logger.info(
+                "Replaced source-control provider '%s'.", key
+            )
+            status[key] = "replaced"
         else:
             logger.info("Registered source-control provider '%s'.", key)
             status[key] = "registered"
@@ -281,7 +292,7 @@ def unregister_builtin_providers(
     removed, False when nothing was registered under that ID.
     Intended for tests that want to start from a clean slate.
     """
-    target = registry or get_default_registry()
+    target = registry if registry is not None else get_default_registry()
     results: Dict[str, bool] = {}
     for provider_id in _PROVIDER_FACTORIES.keys():
         key = provider_id.value
@@ -308,5 +319,5 @@ def list_registered_providers(
     """
     Return the IDs of every provider currently registered.
     """
-    target = registry or get_default_registry()
+    target = registry if registry is not None else get_default_registry()
     return target.list_provider_ids()

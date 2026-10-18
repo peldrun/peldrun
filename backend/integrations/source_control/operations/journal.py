@@ -55,8 +55,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import tempfile
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -342,6 +345,19 @@ class OperationJournal(ABC):
             cr_data = data.get("change_request")
             if isinstance(cr_data, dict):
                 change_request = _change_request_from_dict(cr_data)
+                if change_request is None:
+                    # A dict was present but could not be
+                    # deserialized (missing required field, unknown
+                    # enum value, or a schema change). Log a warning
+                    # so operators can investigate; the previous
+                    # implementation silently dropped the field and
+                    # returned a record that looked complete but was
+                    # missing its change request.
+                    logger.warning(
+                        "Could not deserialize change_request for "
+                        "operation %s; the field will be None.",
+                        data.get("operation_id"),
+                    )
 
             return OperationRecord(
                 operation_id=operation_id,
@@ -554,7 +570,22 @@ class FileOperationJournal(OperationJournal):
         self._root = Path(root).expanduser()
         if create_parents:
             (self._root / "operations").mkdir(parents=True, exist_ok=True)
+        # `_lock` protects in-memory structures that are shared
+        # across all operations (currently none on this class, but
+        # retained for future extensions and to keep the pattern
+        # consistent with `InMemoryOperationJournal`).
         self._lock = threading.RLock()
+        # `_write_locks` holds one lock per target path. It is
+        # acquired during `_write_atomic` to serialize writes to
+        # the SAME file. This is mandatory on Windows, where two
+        # concurrent `os.replace` calls on the same destination
+        # raise `WinError 5 ERROR_ACCESS_DENIED`. See
+        # `_path_lock` and `_replace_with_retry` for the full
+        # explanation. The dictionary itself is guarded by
+        # `_write_locks_lock`; individual locks are returned and
+        # released by the caller.
+        self._write_locks: Dict[str, threading.RLock] = {}
+        self._write_locks_lock = threading.RLock()
 
     @property
     def root(self) -> Path:
@@ -571,6 +602,38 @@ class FileOperationJournal(OperationJournal):
 
     def _events_path(self, operation_id: str) -> Path:
         return self._operations_dir() / f"{operation_id}.jsonl"
+
+    def _path_lock(self, path: Path) -> threading.RLock:
+        """
+        Return the per-path lock that serializes writers to `path`.
+
+        The lock MUST be held across the entire write + ``os.replace``
+        sequence. Without it, two threads writing to the same target
+        file on Windows will race on ``os.replace`` and one of them
+        will fail with ``WinError 5 ERROR_ACCESS_DENIED`` (see
+        ``_replace_with_retry`` for the full explanation).
+
+        POSIX does not need this lock for correctness (``rename``
+        is atomic), but taking it unconditionally keeps the code
+        paths identical across platforms and makes the concurrency
+        guarantees uniform. The lock is only held by a pool thread,
+        never by the event loop, so ``save_record`` remains
+        non-blocking for the caller.
+
+        The lock is created lazily on first use. There is a small
+        window where two threads might both see ``None`` and each
+        create a lock; the ``_write_locks_lock`` guards the
+        dictionary itself, so only one of them actually inserts and
+        the other re-reads the existing lock. There is therefore no
+        leak of unused locks.
+        """
+        key = str(path)
+        with self._write_locks_lock:
+            lock = self._write_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._write_locks[key] = lock
+            return lock
 
     # --- Records --------------------------------------------------------
 
@@ -726,23 +789,72 @@ class FileOperationJournal(OperationJournal):
         """
         Write `text` to `path` atomically.
 
-        The content is first written to a temporary file in the same
-        directory and then renamed onto the target, so a crash during
-        write does not leave a partial record.
+        The content is first written to a UNIQUE temporary file in
+        the same directory and then renamed onto the target via
+        ``os.replace``, which is atomic on both POSIX and Windows
+        (same-filesystem rename).
+
+        CONCURRENCY: three separate guarantees are required for a
+        correct write under Windows concurrency:
+
+            1. Unique temporary names. Two writers must not share a
+               temp file (otherwise the last writer's bytes are
+               committed as the first writer's record). Solved by
+               ``tempfile.mkstemp`` with a unique suffix per call.
+
+            2. Serialized ``os.replace``. Two concurrent replaces
+               on the same target raise ``WinError 5
+               ERROR_ACCESS_DENIED`` because the first replace
+               takes an exclusive lock on the destination. Solved
+               by ``_path_lock``, which serializes the entire
+               write+replace sequence per target.
+
+            3. Transient-failure tolerance. Antivirus scanning and
+               the Windows kernel's delayed handle release can also
+               cause ``ERROR_ACCESS_DENIED``. Solved by
+               ``_replace_with_retry`` with exponential backoff.
+
+        The per-path lock is acquired inside the worker thread, so
+        the event loop is never blocked; concurrent
+        ``save_record`` calls remain truly concurrent at the loop
+        level and are only serialized in the pool thread that
+        actually performs the I/O.
+
+        This composite guarantee is why the previous
+        implementation's race is not reachable through
+        ``OperationService`` either (the service already serialized
+        ``save_record`` under ``_operation_lock``), but the journal
+        is a public, reusable component. A future caller that
+        bypasses the service MUST NOT be able to corrupt the on-disk
+        state.
         """
-
         def _write() -> None:
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            with tmp.open("w", encoding="utf-8") as fh:
-                fh.write(text)
-                fh.flush()
+            path_lock = self._path_lock(path)
+            with path_lock:
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=f".{path.stem}.",
+                    suffix=".tmp",
+                    dir=str(path.parent),
+                )
                 try:
-                    import os
-
-                    os.fsync(fh.fileno())
-                except OSError:
-                    pass
-            tmp.replace(path)
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fh.write(text)
+                        fh.flush()
+                        try:
+                            os.fsync(fh.fileno())
+                        except OSError:
+                            # fsync may fail on exotic
+                            # filesystems; the write is still
+                            # consistent, just not durable across
+                            # a power loss.
+                            pass
+                    _replace_with_retry(tmp_name, str(path))
+                except BaseException:
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        pass
+                    raise
 
         await asyncio.to_thread(_write)
 
@@ -750,21 +862,65 @@ class FileOperationJournal(OperationJournal):
         """
         Append a single JSON line to `path`.
 
-        A trailing newline is added. The file is `fsync`ed to ensure
-        durability.
+        The payload and its trailing newline are written with a
+        SINGLE ``write`` call, and the whole operation is serialized
+        by ``self._lock`` inside the worker thread. The previous
+        implementation performed two ``write`` calls without a
+        lock, which allowed two concurrent appenders to interleave:
+
+            Writer A: write("line_A")     -> file: "line_A"
+            Writer B: write("line_B")     -> file: "line_Aline_B"
+            Writer A: write("\\n")         -> file: "line_Aline_B\\n"
+            Writer B: write("\\n")         -> file: "line_Aline_B\\n\\n"
+
+        The resulting ``line_Aline_B`` was a corrupt JSON line that
+        the reader silently skipped, meaning two audit events were
+        lost with no trace. Writing the payload and the newline as a
+        single string, combined with the lock, removes the window
+        entirely.
+
+        A cross-process file lock is intentionally NOT taken: the
+        journal is designed for a single-process model, and
+        filesystem locks would change the failure mode from
+        "occasional lost events under unusual concurrency" to
+        "hang until the lock is released". Single-process
+        serialization is the correct contract.
+
+        The lock is acquired INSIDE the worker thread, not on the
+        event loop, so concurrent append calls do not block the
+        loop: each ``asyncio.to_thread`` runs its body in a pool
+        thread, and the ``RLock`` serializes those threads without
+        ever holding up the loop itself.
         """
+        # Payload and newline in one write. `str` concatenation
+        # avoids a second syscall and makes the write atomic for
+        # small payloads on POSIX (single write() to a file opened
+        # with O_APPEND). On Windows the append is also atomic for
+        # small payloads as long as the file handle is opened in
+        # append mode; the retry below covers the case where
+        # antivirus software holds the file open for scanning.
+        payload = f"{line}\n"
 
         def _append() -> None:
-            with path.open("a", encoding="utf-8") as fh:
-                fh.write(line)
-                fh.write("\n")
-                fh.flush()
+            # Serialize concurrent appends within this process.
+            # Cross-process appends are NOT serialized (the journal
+            # is designed for a single-process model; adding OS
+            # file locking would trade "occasional lost event" for
+            # "hang until lock release", which is worse).
+            with self._lock:
+                fh = _open_append_with_retry(path)
                 try:
-                    import os
-
-                    os.fsync(fh.fileno())
-                except OSError:
-                    pass
+                    fh.write(payload)
+                    fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except OSError:
+                        pass
+                finally:
+                    try:
+                        fh.close()
+                    except OSError:
+                        pass
 
         await asyncio.to_thread(_append)
 
@@ -894,6 +1050,107 @@ def _opt_str(value: object) -> Optional[str]:
         return None
     text = str(value)
     return text or None
+
+
+def _replace_with_retry(
+    src: str,
+    dst: str,
+    *,
+    max_attempts: int = 6,
+) -> None:
+    """
+    Replace `dst` with `src` via `os.replace`, retrying transient
+    Windows `PermissionError` failures.
+
+    On Windows, `os.replace` calls
+    ``MoveFileExW(..., MOVEFILE_REPLACE_EXISTING)``. Even when the
+    target file is not explicitly held open by any program, the
+    replace can fail with ``WinError 5 ERROR_ACCESS_DENIED`` under
+    common conditions:
+
+        - Two threads/processes call ``os.replace`` on the same
+          target nearly simultaneously: the first move takes an
+          exclusive lock on the destination, and the second fails
+          immediately.
+
+        - Antivirus software (Windows Defender, third-party AV)
+          opens a newly written temporary file to scan it. While
+          the scan is in progress, the file has a share mode that
+          prevents ``MoveFileEx`` from replacing the destination.
+
+        - The Windows kernel keeps a delayed close handle on the
+          previous destination for a few milliseconds after the
+          rename completes.
+
+    POSIX does not have this issue: `os.replace` maps to
+    `rename(2)`, which is atomic and succeeds even when the target
+    is being read by another process.
+
+    A short bounded retry with exponential backoff (20, 40, 80,
+    160, 320 ms — up to ~620 ms total) resolves every case in
+    practice without ever blocking the caller for long. The
+    function NEVER silently degrades: after `max_attempts` failures
+    the last exception is re-raised so the caller sees a real error
+    rather than a lost write.
+    """
+    last_exc: Optional[BaseException] = None
+    for attempt in range(max_attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                time.sleep(0.02 * (2 ** attempt))
+        except OSError as exc:
+            # Some Win32/Python combinations raise a plain OSError
+            # with ``winerror = 5`` instead of PermissionError.
+            if getattr(exc, "winerror", None) == 5:
+                last_exc = exc
+                if attempt < max_attempts - 1:
+                    time.sleep(0.02 * (2 ** attempt))
+            else:
+                raise
+    assert last_exc is not None
+    raise last_exc
+
+
+def _open_append_with_retry(
+    path: Path,
+    *,
+    max_attempts: int = 6,
+):
+    """
+    Open `path` in append mode, retrying transient Windows errors.
+
+    The same conditions that break ``os.replace`` (see
+    ``_replace_with_retry``) can also break ``open(path, "a")``
+    when antivirus software has the file open for scanning. The
+    retry uses exponential backoff (20..320 ms) and re-raises the
+    last exception when all attempts are exhausted.
+
+    Only the OPEN call is retried. The subsequent write+fsync+close
+    is executed exactly once so that a retry can never duplicate
+    the appended payload.
+    """
+    last_exc: Optional[BaseException] = None
+    for attempt in range(max_attempts):
+        try:
+            return path.open("a", encoding="utf-8")
+        except PermissionError as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                time.sleep(0.02 * (2 ** attempt))
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 5:
+                last_exc = exc
+                if attempt < max_attempts - 1:
+                    time.sleep(0.02 * (2 ** attempt))
+            else:
+                raise
+    if last_exc is not None:
+        raise last_exc
+    raise OSError(f"Could not open {path} for append after retries")
 
 
 def _change_request_from_dict(data: Dict[str, object]):

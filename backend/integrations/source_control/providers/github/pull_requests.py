@@ -29,6 +29,15 @@ Design rules:
       present as a user-friendly message.
     - The service is stateless with respect to per-request data and
       is safe to share across coroutines.
+
+MERGED-STATE DETECTION:
+    GitHub's single-PR endpoint (`GET /pulls/{number}`) exposes both
+    ``merged: bool`` and ``merged_at: string | null``, but the list
+    endpoint (`GET /pulls`) omits ``merged`` and only carries
+    ``merged_at``. The state mapper therefore treats a PR as merged
+    when EITHER signal is true. Relying on ``merged`` alone would
+    report every merged PR as CLOSED whenever it was read from a
+    listing.
 """
 
 from __future__ import annotations
@@ -46,6 +55,7 @@ from ...errors import (
     ProviderError,
     ValidationError,
 )
+from ...security.redaction import redact_text, redact_url
 from .client import (
     DEFAULT_API_URL,
     GitHubApiConfig,
@@ -278,10 +288,11 @@ class GitHubPullRequestService:
         Args:
             repo: The repository reference.
             token: Access token. Required.
-            state: Optional state filter. GitHub's API only accepts
-                `open`, `closed`, or `all`; we map `MERGED` to
-                `closed` and rely on the client-side filter for the
-                rest.
+            state: Optional state filter. GitHub's server-side API
+                only understands `open`, `closed`, and `all`, and
+                `closed` returns both merged and not-merged PRs. A
+                client-side filter narrows the results to the exact
+                state the caller asked for.
             source_branch: Optional filter on the head branch.
             target_branch: Optional filter on the base branch.
             page: 1-based page number.
@@ -345,11 +356,20 @@ class GitHubPullRequestService:
                 )
                 continue
 
-            # Client-side filter for MERGED, which GitHub does not
-            # expose as a query value.
-            if state == ChangeRequestState.MERGED:
-                if pr.state != ChangeRequestState.MERGED:
-                    continue
+            # GitHub's server-side `state` filter is coarse: it only
+            # understands `open`, `closed`, and `all`, and `closed`
+            # returns BOTH merged and closed-not-merged PRs. Apply a
+            # client-side filter so that the caller actually gets
+            # the state they asked for:
+            #   - OPEN   -> OPEN + DRAFT (drafts are, by definition,
+            #               still open)
+            #   - DRAFT  -> DRAFT only
+            #   - CLOSED -> CLOSED only (MERGED excluded)
+            #   - MERGED -> MERGED only
+            if state is not None and not _state_filter_matches(
+                pr.state, state
+            ):
+                continue
             results.append(pr)
             if len(results) >= max_results:
                 break
@@ -457,7 +477,8 @@ class GitHubPullRequestService:
 
         GitHub accepts only `open`, `closed`, and `all` for the
         `state` query parameter. MERGED PRs are closed on GitHub, so
-        they are filtered client-side after the fetch.
+        they are filtered client-side after the fetch. DRAFT PRs are
+        open on GitHub, so they are also requested via `open`.
         """
         if state == ChangeRequestState.OPEN:
             return "open"
@@ -476,18 +497,35 @@ class GitHubPullRequestService:
         """
         Map the GitHub PR state to a `ChangeRequestState`.
 
-        GitHub's PR payload exposes `state` (`open` or `closed`) and
-        `merged` (boolean, only meaningful when closed). Draft PRs
-        are open with `draft: true`.
+        GitHub's PR payload exposes two merged-related fields with
+        subtly different shapes depending on the endpoint:
+
+            - The single-PR endpoint (`GET /pulls/{number}`) returns
+              both ``merged: bool`` and ``merged_at: string | null``.
+            - The list endpoint (`GET /pulls`) returns only
+              ``merged_at: string | null``; the boolean ``merged``
+              field is NOT present.
+
+        To classify PRs correctly from BOTH payload shapes, this
+        method treats a PR as merged when EITHER signal is true.
+        Relying solely on ``merged`` (as the original implementation
+        did) caused every merged PR to be reported as CLOSED when
+        read through ``list_pull_requests``.
+
+        Draft PRs are classified as DRAFT regardless of their
+        ``state`` value, because GitHub marks them ``state: open``
+        with an auxiliary ``draft: true`` flag.
         """
         state_raw = str(payload.get("state") or "").lower()
-        merged = bool(payload.get("merged", False))
+        merged_flag = bool(payload.get("merged", False))
+        merged_at_present = payload.get("merged_at") is not None
+        is_merged = merged_flag or merged_at_present
         draft = bool(payload.get("draft", False))
 
         if state_raw == "closed":
             return (
                 ChangeRequestState.MERGED
-                if merged
+                if is_merged
                 else ChangeRequestState.CLOSED
             )
         if state_raw == "open":
@@ -507,6 +545,11 @@ class GitHubPullRequestService:
         """
         Map a GitHub PR payload to `ChangeRequestRef`.
 
+        The title and web URL are sanitized with the same helpers
+        used by ``GitHubDataMapper.parse_change_request`` so that
+        credentials accidentally embedded in a PR title or URL are
+        never surfaced to the UI or the audit log.
+
         Raises `ValidationError` when a required field is missing.
         """
         number = payload.get("number")
@@ -520,6 +563,10 @@ class GitHubPullRequestService:
             raise ValidationError(
                 "Pull request payload is missing `html_url`."
             )
+        # Defensive: apply redaction to any URL surfaced to callers.
+        # URLs from GitHub should never contain credentials, but
+        # redaction is cheap and matches the sibling mapper.
+        safe_web_url = redact_url(web_url)
 
         head = payload.get("head")
         if not isinstance(head, Mapping):
@@ -554,15 +601,20 @@ class GitHubPullRequestService:
 
         state = GitHubPullRequestService._map_pull_request_state(payload)
 
+        # Defense in depth: redact the title so that a user who
+        # accidentally includes a token in a PR title does not cause
+        # that token to land in the operation journal or audit log.
+        safe_title = redact_text(str(payload.get("title") or ""))
+
         return ChangeRequestRef(
             provider=ProviderId.GITHUB,
             repository_id=repository_id,
             number_or_iid=str(number),
-            web_url=web_url,
+            web_url=safe_web_url,
             state=state,
             source_branch=source_branch,
             target_branch=target_branch,
-            title=str(payload.get("title") or ""),
+            title=safe_title,
             is_draft=bool(payload.get("draft", False)),
             created_at=_parse_iso(payload.get("created_at")),
             updated_at=_parse_iso(payload.get("updated_at")),
@@ -578,6 +630,40 @@ class GitHubPullRequestService:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _state_filter_matches(
+    actual: ChangeRequestState,
+    requested: ChangeRequestState,
+) -> bool:
+    """
+    Return True when ``actual`` satisfies the caller's ``requested``
+    state filter.
+
+    GitHub's REST API only supports ``open``, ``closed``, and ``all``
+    server-side, and ``closed`` returns merged and not-merged PRs
+    alike. This helper narrows the results to the exact state the
+    caller asked for:
+
+        - OPEN   : OPEN and DRAFT (a draft is, by definition, open)
+        - DRAFT  : DRAFT only
+        - CLOSED : CLOSED only (MERGED is excluded)
+        - MERGED : MERGED only
+
+    Any other ``requested`` value (e.g. UNKNOWN) matches everything.
+    """
+    if requested == ChangeRequestState.OPEN:
+        return actual in (
+            ChangeRequestState.OPEN,
+            ChangeRequestState.DRAFT,
+        )
+    if requested == ChangeRequestState.DRAFT:
+        return actual == ChangeRequestState.DRAFT
+    if requested == ChangeRequestState.CLOSED:
+        return actual == ChangeRequestState.CLOSED
+    if requested == ChangeRequestState.MERGED:
+        return actual == ChangeRequestState.MERGED
+    return True
 
 
 def _parse_iso(value: Any) -> Optional[datetime]:

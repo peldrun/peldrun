@@ -36,7 +36,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import (
     Awaitable,
@@ -80,6 +80,13 @@ def _utc_now() -> datetime:
 
 #: Tokens within this margin of expiry are treated as expired to
 #: avoid mid-request failures. Sixty seconds is the industry norm.
+#:
+#: NOTE: this constant is currently UNUSED. It is reserved for the
+#: planned proactive expiry check inside ``get_access_token`` (which
+#: would return ``None`` and let the caller trigger a refresh instead
+#: of surfacing a 401 from the provider). Until that path is wired,
+#: ``get_access_token`` returns expired tokens verbatim and the
+#: caller's HTTP layer handles the 401.
 _EXPIRY_MARGIN = timedelta(seconds=60)
 
 
@@ -115,7 +122,7 @@ RefreshCallback = Callable[
 
 
 # ---------------------------------------------------------------------------
-# Internal record
+# Internal records
 # ---------------------------------------------------------------------------
 
 
@@ -136,6 +143,26 @@ class _TokenRecord:
     stored_at: datetime = field(default_factory=_utc_now)
     last_refreshed_at: Optional[datetime] = None
     schema_version: int = 1
+
+
+@dataclass(frozen=True)
+class _CachedRecord:
+    """
+    Cache entry pairing a ``_TokenRecord`` with its original identity.
+
+    The vault key is opaque to the service and MUST NOT be reverse-
+    engineered: ``base_url`` may contain dots (e.g. ``api.github.com``
+    or ``https://github.com``) which makes the key format
+    ``peldrun.sc.oauth.{provider}.{base_url}.{account_id}`` inherently
+    ambiguous. Carrying the triple alongside the record eliminates the
+    need to reverse the key and guarantees that ``list_stored``
+    returns the exact identity that was passed to ``store_token``.
+    """
+
+    record: _TokenRecord
+    provider: ProviderId
+    base_url: str
+    account_id: str
 
 
 def _serialize_record(record: _TokenRecord) -> str:
@@ -246,7 +273,11 @@ class TokenService(TokenServicePort):
             else get_default_audit_logger()
         )
         self._refresh_callbacks: Dict[str, RefreshCallback] = {}
-        self._record_cache: Dict[str, _TokenRecord] = {}
+        # The cache carries the full identity alongside each record so
+        # that ``list_stored`` never has to reverse-engineer the vault
+        # key (which is inherently ambiguous because ``base_url`` can
+        # contain dots).
+        self._record_cache: Dict[str, _CachedRecord] = {}
         self._lock = threading.RLock()
 
     # --- Refresh callback registration ----------------------------------
@@ -322,7 +353,12 @@ class TokenService(TokenServicePort):
 
         with self._lock:
             self._vault.put(key, _serialize_record(record))
-            self._record_cache[key] = record
+            self._record_cache[key] = _CachedRecord(
+                record=record,
+                provider=provider,
+                base_url=base_url,
+                account_id=account_id,
+            )
 
         self._audit.record(
             AuditEventType.CREDENTIAL_STORE,
@@ -456,7 +492,12 @@ class TokenService(TokenServicePort):
         vault_key = _vault_key(provider, base_url, account_id)
         with self._lock:
             self._vault.put(vault_key, _serialize_record(refreshed))
-            self._record_cache[vault_key] = refreshed
+            self._record_cache[vault_key] = _CachedRecord(
+                record=refreshed,
+                provider=provider,
+                base_url=base_url,
+                account_id=account_id,
+            )
 
         self._audit.record(
             AuditEventType.CREDENTIAL_REFRESH,
@@ -529,30 +570,29 @@ class TokenService(TokenServicePort):
         to enumerate the vault directly, use
         `CredentialVault.keys()`.
 
+        The identity of each entry is taken from the ``_CachedRecord``
+        (which carries the original ``provider``, ``base_url``, and
+        ``account_id``), NOT from reverse-parsing the opaque vault
+        key. This is required because ``base_url`` may contain dots
+        (e.g. ``api.github.com``), which would make reverse parsing
+        ambiguous.
+
         No token values are ever returned.
         """
         with self._lock:
-            items = list(self._record_cache.items())
+            cached_items = list(self._record_cache.values())
 
         results: List[TokenInfo] = []
-        for vault_key, record in items:
-            parsed = _parse_vault_key(vault_key)
-            if parsed is None:
-                continue
-            provider_value, base_url, account_id = parsed
-            try:
-                provider = ProviderId(provider_value)
-            except ValueError:
-                continue
+        for cached in cached_items:
             results.append(
                 TokenInfo(
-                    provider=provider,
-                    account_id=account_id,
-                    base_url=base_url,
-                    expires_at=record.expires_at,
-                    scopes=tuple(record.scopes),
-                    has_refresh_token=bool(record.refresh_token),
-                    last_refreshed_at=record.last_refreshed_at,
+                    provider=cached.provider,
+                    account_id=cached.account_id,
+                    base_url=cached.base_url,
+                    expires_at=cached.record.expires_at,
+                    scopes=tuple(cached.record.scopes),
+                    has_refresh_token=bool(cached.record.refresh_token),
+                    last_refreshed_at=cached.record.last_refreshed_at,
                 )
             )
         results.sort(
@@ -595,7 +635,7 @@ class TokenService(TokenServicePort):
         with self._lock:
             cached = self._record_cache.get(key)
             if cached is not None:
-                return cached
+                return cached.record
 
         raw = self._vault.get(key)
         if raw is None:
@@ -613,7 +653,12 @@ class TokenService(TokenServicePort):
             return None
 
         with self._lock:
-            self._record_cache[key] = record
+            self._record_cache[key] = _CachedRecord(
+                record=record,
+                provider=provider,
+                base_url=base_url,
+                account_id=account_id,
+            )
         return record
 
 
@@ -644,21 +689,46 @@ def _parse_vault_key(
     key: str,
 ) -> Optional[Tuple[str, str, str]]:
     """
-    Reverse the key format produced by `_vault_key`.
+    DEPRECATED: reverse the key format produced by `_vault_key`.
 
-    Returns `(provider_value, base_url, account_id)` or `None` if the
-    key does not match the expected shape. The account ID may itself
-    contain dots, so the parser consumes the remainder of the string
-    as the account ID.
+    The key format
+    ``peldrun.sc.oauth.{provider}.{base_url}.{account_id}`` is
+    inherently ambiguous because ``base_url`` may itself contain
+    dots (e.g. ``api.github.com``) and ``account_id`` may not be
+    dot-free either. This helper therefore CANNOT recover the
+    original triple for every possible key.
+
+    The service no longer uses it: ``list_stored`` reads the
+    identity directly from ``_CachedRecord``. It is retained ONLY
+    for backward compatibility with any external caller that
+    imports it, and now uses a split that is correct for the
+    COMMON case where the provider is a single dot-free token and
+    the account_id is dot-free:
+
+        - split on the FIRST dot  -> provider
+        - split on the LAST dot   -> account_id
+        - everything in between   -> base_url
+
+    Returns
+    -------
+    Optional[Tuple[str, str, str]]
+        ``(provider, base_url, account_id)`` for keys that match the
+        prefix and contain at least two dots after it, ``None``
+        otherwise.
     """
     prefix = "peldrun.sc.oauth."
     if not key.startswith(prefix):
         return None
     remainder = key[len(prefix):]
-    parts = remainder.split(".", 2)
-    if len(parts) < 3:
+
+    provider_value, sep1, rest = remainder.partition(".")
+    if not sep1 or not provider_value:
         return None
-    provider_value, base_url, account_id = parts
+
+    base_url, sep2, account_id = rest.rpartition(".")
+    if not sep2 or not base_url or not account_id:
+        return None
+
     return provider_value, base_url, account_id
 
 

@@ -1,3 +1,44 @@
+"""
+HTTP router for the Source Control Integration subsystem.
+
+AUTHENTICATION MODEL:
+    This router does NOT enforce authentication at the FastAPI
+    layer. PELDRUN is designed as a local-first application, and the
+    expected deployment is one of:
+
+        - A single-user desktop installation behind the operating
+          system's user boundary.
+        - A local reverse proxy that terminates TLS and performs
+          authentication BEFORE forwarding to this router.
+
+    Deployments that expose this router to a network MUST mount it
+    behind an authenticating reverse proxy (or add a
+    `Depends(get_current_user)` to every endpoint). The router
+    itself only enforces DOMAIN authorization: the approval gate and
+    the policy engine decide whether a specific operation is allowed
+    for the target repository.
+
+ERROR MODEL:
+    Every `SourceControlError` subclass carries its own
+    `http_status` hint in `errors.py`. This router delegates to that
+    hint via `handle_source_control_error` so that adding a new
+    error subclass automatically produces the correct HTTP response
+    without requiring a change here. Do NOT add a hard-coded status
+    in this module for a specific error class; if a specific
+    endpoint needs a different status, wrap the exception in an
+    `HTTPException` at the endpoint level.
+
+RATE LIMITING / LONG OPERATIONS:
+    This router does not implement rate limiting or background
+    execution. Push operations can take up to ~120 seconds; callers
+    SHOULD be prepared for slow responses, and deployments SHOULD
+    configure the reverse proxy's timeout accordingly. A future
+    revision may add `BackgroundTasks` for the two slowest endpoints
+    (`push_approved_branch`, `create_change_request`); doing so
+    requires an API contract change (task id + polling endpoint),
+    so it is intentionally out of scope for the current revision.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -123,14 +164,42 @@ def handle_source_control_error(exc: Exception) -> NoReturn:
     Translate a source-control domain error into a structured FastAPI
     HTTPException.
 
-    The mapping is ordered from most-specific to least-specific so that
-    subclasses are not swallowed by broader parent classes. For example,
-    `RemoteStateChangedError` is checked before `ConflictError` in case
-    it inherits from it.
+    The mapping is delegated to `SourceControlError.http_status`,
+    which every error subclass declares as a class-level default in
+    `errors.py`. This keeps the router and the error taxonomy in
+    sync: adding a new error class with a specific HTTP status only
+    requires editing `errors.py`, not this router.
 
-    Any exception that is not a `SourceControlError` is logged with full
-    diagnostics and translated into a generic 500 response so that
-    internal details never leak to the client.
+    The previous implementation hard-coded an `isinstance` chain for
+    a small subset of error classes and mapped everything else to
+    502. That silently misclassified errors whose `errors.py`
+    declaration differs from 502:
+
+        - `ApprovalRequiredError`      -> 428 (was 502)
+        - `ApprovalInvalidError`       -> 409 (was 502)
+        - `ApprovalExpiredError`       -> 410 (was 502)
+        - `ApprovalConsumedError`      -> 409 (was 502)
+        - `PolicyDeniedError`          -> 403 (was 502)
+        - `ProtectedBranchError`       -> 403 (was 502)
+        - `WorkflowFileError`          -> 428 (was 502)
+        - `WorkspaceNotFoundError`     -> 404 (was 502)
+        - `WorkspaceDirtyError`        -> 409 (was 502)
+        - `PathTraversalError`         -> 400 (was 502)
+        - `CommandTimeoutError`        -> 504 (was 502)
+        - `CommandFailedError`         -> 500 (was 502)
+        - `UnsupportedCapabilityError` -> 501 (was 502)
+        - `RemoteStateChangedError`    -> 409 (was 412)
+
+    The two most visible consequences of the old mapping were:
+
+        - A `PolicyDeniedError` (for example, a push to a protected
+          branch) reached the UI as "Bad Gateway", which suggested a
+          server fault rather than a policy refusal.
+
+        - A `RemoteStateChangedError` returned 412 Precondition
+          Failed, contradicting its own `default_http_status = 409`
+          in `errors.py`. Two clients relying on different documents
+          would disagree about the meaning.
 
     This function never returns; it always raises.
     """
@@ -138,45 +207,19 @@ def handle_source_control_error(exc: Exception) -> NoReturn:
     if isinstance(exc, HTTPException):
         raise exc
 
-    # Most specific domain errors first.
-    if isinstance(exc, RemoteStateChangedError):
-        raise HTTPException(
-            status_code=status.HTTP_412_PRECONDITION_FAILED,
-            detail=str(exc),
-        )
-    if isinstance(exc, NotFoundError):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(exc),
-        )
-    if isinstance(exc, (AuthRequiredError, AuthExpiredError)):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=str(exc),
-        )
-    if isinstance(exc, PermissionDeniedError):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=str(exc),
-        )
-    if isinstance(exc, ConflictError):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=str(exc),
-        )
-    if isinstance(exc, ValidationError):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=str(exc),
-        )
-    if isinstance(exc, RateLimitedError):
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=str(exc),
-        )
     if isinstance(exc, SourceControlError):
+        # `http_status` is set in the base constructor from the
+        # class-level `default_http_status`, so every instance carries
+        # an int. Fall back to 500 defensively for exotic cases
+        # (e.g. a subclass that forgot to set a default and somehow
+        # bypassed the constructor).
+        http_status = getattr(exc, "http_status", None) or 500
+        # `str(exc)` is safe: the message was redacted by the base
+        # constructor (`errors.py::SourceControlError.__init__` runs
+        # `redact_message` before `Exception.__init__`), and the
+        # `details` mapping is not surfaced to the client.
         raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
+            status_code=http_status,
             detail=str(exc),
         )
 

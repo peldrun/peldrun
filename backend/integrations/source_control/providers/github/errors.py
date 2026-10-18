@@ -9,7 +9,6 @@ from ...errors import (
     AuthExpiredError,
     AuthRequiredError,
     ConflictError,
-    NetworkError,
     NotFoundError,
     PermissionDeniedError,
     RateLimitedError,
@@ -92,6 +91,31 @@ def parse_github_error_body(
     return redact_text(body.strip()[:500]), [], None
 
 
+def _rate_limit_details(
+    base_details: Mapping[str, Any],
+    delay: Optional[int],
+) -> dict[str, Any]:
+    """
+    Build the ``details`` mapping for a ``RateLimitError``.
+
+    ``RateLimitError`` does NOT accept a ``retry_after_seconds``
+    keyword argument; the value MUST be carried inside ``details``
+    (see the docstring of ``RateLimitError`` in
+    ``integrations/source_control/errors.py``). This helper keeps
+    the two rate-limit call sites consistent and avoids duplicating
+    the merge logic.
+
+    The value is stored as an ``int`` (matching the convention used
+    by ``GitHubClient._rate_limit_error``) rather than a string, so
+    that downstream consumers can use it directly as a backoff
+    without re-parsing.
+    """
+    merged: dict[str, Any] = dict(base_details)
+    if delay is not None:
+        merged["retry_after_seconds"] = int(delay)
+    return merged
+
+
 def map_github_http_error(
     status_code: int,
     body: str,
@@ -108,7 +132,7 @@ def map_github_http_error(
     req_id = _get_header_ci(headers, "x-github-request-id")
     clean_url = redact_url(url) if url else None
 
-    diagnostic_details: dict[str, str] = {
+    diagnostic_details: dict[str, Any] = {
         "status_code": str(status_code),
         "method": method.upper(),
     }
@@ -151,8 +175,7 @@ def map_github_http_error(
             delay = extract_rate_limit_delay(headers)
             return RateLimitedError(
                 f"GitHub API rate limit exceeded: {clean_message}",
-                retry_after_seconds=delay,
-                details=diagnostic_details,
+                details=_rate_limit_details(diagnostic_details, delay),
             )
 
         return PermissionDeniedError(
@@ -202,8 +225,7 @@ def map_github_http_error(
         delay = extract_rate_limit_delay(headers)
         return RateLimitedError(
             f"GitHub API rate limit exceeded: {clean_message}",
-            retry_after_seconds=delay,
-            details=diagnostic_details,
+            details=_rate_limit_details(diagnostic_details, delay),
         )
 
     # 5xx Server Errors: Ephemeral gateway / upstream failures

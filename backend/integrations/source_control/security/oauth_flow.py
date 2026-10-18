@@ -89,14 +89,13 @@ __all__ = [
     "set_default_oauth_flow_coordinator",
     "reset_default_oauth_flow_coordinator",
     "get_default_oauth_session_manager",
+    "set_default_oauth_session_manager",
+    "reset_default_oauth_session_manager",
     "SESSION_TTL_SECONDS",
     "LOOPBACK_HOSTS",
     "generate_pkce_verifier",
     "compute_pkce_challenge",
     "generate_state_token",
-    "get_default_oauth_session_manager",
-    "set_default_oauth_session_manager",
-    "reset_default_oauth_session_manager",
 ]
 
 
@@ -296,6 +295,18 @@ class OAuthFlowCoordinator(OAuthFlowPort):
         self._audit = audit_logger or get_default_audit_logger()
         self._sessions = session_manager or OAuthSessionManager()
         self._providers: Dict[str, OAuthProviderCallbacks] = {}
+        # Account resolvers are registered per provider at startup.
+        # Initializing the mapping here (rather than lazily via
+        # `object.__setattr__`) keeps the coordinator's state complete
+        # after construction, avoids a race with `_resolve_account`,
+        # and makes the type checker happy.
+        self._account_resolvers: Dict[
+            str,
+            Callable[
+                [ProviderId, TokenRefreshResult, Optional[str]],
+                Awaitable[ProviderAccount],
+            ],
+        ] = {}
         self._lock = threading.RLock()
         self._session_ttl_seconds = max(1, int(session_ttl_seconds))
 
@@ -533,10 +544,28 @@ class OAuthFlowCoordinator(OAuthFlowPort):
                 "OAuth session has expired. Please restart the flow."
             )
 
-        try:
-            _validate_callback_url(redirect_uri)
-        except ValidationError:
-            raise
+        # Validate the caller-provided redirect_uri as a loopback URL,
+        # then verify that it matches the value registered in the
+        # session. The provider will reject a mismatched redirect_uri
+        # with `redirect_uri_mismatch` during the token exchange, but
+        # catching the mismatch here is defense in depth: it surfaces
+        # a clear, actionable error, and it prevents a caller that
+        # forgot to read `session.redirect_uri` (which is what the
+        # HTTP facade currently does) from silently accepting a
+        # different loopback URL — a scenario that would otherwise
+        # allow an attacker who knows the victim's `state` value to
+        # swap in a code issued for their own redirect_uri.
+        _validate_callback_url(redirect_uri)
+        if redirect_uri != session.redirect_uri:
+            raise ValidationError(
+                "redirect_uri does not match the value registered "
+                "for this OAuth session. Restart the authorization "
+                "flow.",
+                details={
+                    "expected": redact_url(session.redirect_uri),
+                    "received": redact_url(redirect_uri),
+                },
+            )
 
         callbacks = self._get_callbacks(provider)
 
@@ -608,7 +637,17 @@ class OAuthFlowCoordinator(OAuthFlowPort):
             provider=provider,
             account_id=account.account_id,
             username=account.username,
-            base_url=session.base_url or account.base_url,
+            # Apply the same fallback used by `store_token` above so
+            # that the reported base_url and the base_url actually
+            # stored in the vault are byte-for-byte identical. Without
+            # this, a resolver that returns an empty `base_url` would
+            # cause `AuthResult.base_url` to be `""` while the vault
+            # entry was keyed under `"default"`.
+            base_url=(
+                session.base_url
+                or account.base_url
+                or "default"
+            ),
             status=ConnectionStatus.CONNECTED,
             scopes=tuple(token_result.scopes or session.scopes),
             expires_at=token_result.expires_at,
@@ -700,9 +739,15 @@ class OAuthFlowCoordinator(OAuthFlowPort):
         placeholder account is returned to allow the flow to
         complete, and the UI can refresh the identity later.
         """
-        resolver = getattr(self, "_account_resolvers", {}).get(
-            _provider_key(provider)
-        )
+        # Read the resolver reference under the lock so that a
+        # concurrent `register_account_resolver` cannot observe a
+        # half-initialized mapping. The call itself is awaited
+        # outside the lock so that a slow resolver does not block
+        # registration of other providers.
+        with self._lock:
+            resolver = self._account_resolvers.get(
+                _provider_key(provider)
+            )
         if resolver is not None:
             return await resolver(provider, token_result, base_url)
 
@@ -739,8 +784,6 @@ class OAuthFlowCoordinator(OAuthFlowPort):
                 details={"provider": key},
             )
         with self._lock:
-            if not hasattr(self, "_account_resolvers"):
-                object.__setattr__(self, "_account_resolvers", {})
             self._account_resolvers[key] = resolver
 
 

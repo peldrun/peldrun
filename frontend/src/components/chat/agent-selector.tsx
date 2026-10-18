@@ -83,22 +83,22 @@ export function AgentSelector({ disabled = false }: AgentSelectorProps) {
         type="button"
         disabled={disabled}
         onClick={() => setIsOpen(!isOpen)}
-        className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium border transition-all ${
+        className={`flex items-center gap-1.5 px-2.5 py-1 rounded-xs text-xs font-medium transition-all ${
           disabled
-            ? "opacity-50 cursor-not-allowed bg-muted/40 border-border text-muted-foreground"
+            ? "opacity-50 cursor-not-allowed bg-transparent border-border text-muted-foreground"
             : "bg-card hover:bg-muted border-border text-foreground shadow-peldrun-xs cursor-pointer"
         }`}
         title={`Active: ${activeAgent.name} (Max${activeAgent.max_steps || 30} Steps)`}
       >
-        <span className="p-0.5 rounded-sm bg-muted">{renderIcon(activeAgent.icon)}</span>
+        <span className="p-0.5">{renderIcon(activeAgent.icon)}</span>
         <span className="font-semibold truncate max-w-[110px]">{activeAgent.name}</span>
         <ChevronDown size={12} className={`text-muted-foreground transition-transform ${isOpen ? "rotate-180" : ""}`} />
       </button>
 
       {isOpen && (
-        <div className="absolute left-0 bottom-full mb-1.5 w-64 rounded-xl border border-border bg-card/95 backdrop-blur-md shadow-2xl z-50 overflow-hidden font-sans text-xs animate-in fade-in zoom-in-95 duration-100">
-          <div className="px-3 py-1.5 border-b border-border bg-muted/30 flex items-center justify-between">
-            <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+        <div className="absolute left-0 bottom-full mb-1.5 w-64 rounded-sm bg-card backdrop-blur-md shadow-xl z-50 overflow-hidden font-sans text-xs animate-in fade-in zoom-in-95 duration-100">
+          <div className="px-3 py-1.5 border-b border-border bg-custom flex items-center justify-between">
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-black">
               Select Agent Persona
             </span>
           </div>
@@ -114,10 +114,10 @@ export function AgentSelector({ disabled = false }: AgentSelectorProps) {
                     setSelectedAgentId(ag.id);
                     setIsOpen(false);
                   }}
-                  className={`w-full flex items-start gap-2 p-1.5 rounded-lg text-left transition ${
+                  className={`w-full flex items-start gap-2 p-1.5 rounded-xs text-left transition ${
                     isSelected
-                      ? "bg-primary/10 border border-primary/20 text-foreground"
-                      : "hover:bg-muted text-muted-foreground hover:text-foreground"
+                      ? "bg-muted/60 border border-muted/20 text-foreground"
+                      : "hover:bg-muted text-muted-foreground hover:text-foreground hover:shadow-xs"
                   }`}
                 >
                   <div className="p-1 rounded-md bg-muted shrink-0 mt-0.5">

@@ -413,6 +413,50 @@ class OperationService:
             ConflictError: If the transition is invalid or the
                 operation is already terminal.
         """
+        return await self._transition_internal(
+            operation_id,
+            to_status,
+            reason=reason,
+            metadata=metadata,
+            actor=actor,
+        )
+
+    async def _transition_internal(
+        self,
+        operation_id: str,
+        to_status: OperationStatus,
+        *,
+        reason: Optional[str] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+        actor: str = "system",
+        extra_fields: Optional[Mapping[str, Any]] = None,
+    ) -> OperationRecord:
+        """
+        Real implementation of `transition`, with support for extra
+        record fields that must be applied atomically with the status
+        change.
+
+        The public `transition` method delegates here without extra
+        fields. `mark_failed` also delegates here, passing
+        `error_code`/`error_message` so that the failure fields and
+        the status change are persisted in a single journal write.
+
+        Why this matters: the previous implementation of `mark_failed`
+        saved the failure fields (via `save_record`) BEFORE the state
+        machine had a chance to validate the transition. When
+        `transition` subsequently raised `ConflictError` (for
+        example, because the operation was already in a terminal
+        status), the record was left carrying `error_code` and
+        `error_message` while its `status` remained unchanged — an
+        operation that never failed appeared to have failed. Merging
+        both updates into a single journal write eliminates that
+        window entirely.
+
+        `extra_fields`, when provided, are merged into the same
+        `dataclasses.replace` call as the status change. They MUST
+        NOT contain `status` or `updated_at`; those are owned by
+        this method.
+        """
         if not isinstance(to_status, OperationStatus):
             raise ValidationError(
                 "to_status must be an OperationStatus.",
@@ -460,11 +504,26 @@ class OperationService:
                     },
                 )
 
-            updated = replace(
-                record,
-                status=to_status,
-                updated_at=_utc_now(),
-            )
+            # Apply the status change AND any extra fields in a
+            # single `replace` call. The journal write that follows
+            # is therefore atomic with respect to the state machine:
+            # either both the status and the extra fields are
+            # persisted, or neither is.
+            update_kwargs: Dict[str, Any] = {
+                "status": to_status,
+                "updated_at": _utc_now(),
+            }
+            if extra_fields:
+                for field_name, field_value in extra_fields.items():
+                    if field_name in ("status", "updated_at"):
+                        raise ValidationError(
+                            f"extra_fields must not override "
+                            f"'{field_name}'.",
+                            details={"field": field_name},
+                        )
+                    update_kwargs[field_name] = field_value
+
+            updated = replace(record, **update_kwargs)
             await self._journal.save_record(updated)
 
             transition = OperationTransition(
@@ -541,31 +600,28 @@ class OperationService:
 
         `retryable=True` selects `FAILED_RETRYABLE`; otherwise
         `FAILED_FINAL`. The `error_code` and `error_message` are
-        persisted on the record.
+        persisted on the record in the SAME journal write as the
+        status change, so a failed transition (e.g. the operation
+        is already terminal) leaves the record completely
+        untouched — no orphan `error_code` with an unchanged status.
+
+        See `_transition_internal` for the rationale.
         """
         target = (
             OperationStatus.FAILED_RETRYABLE
             if retryable
             else OperationStatus.FAILED_FINAL
         )
-
-        key = _validate_operation_id(operation_id)
-        lock = self._operation_lock(key)
-        with lock:
-            record = await self.get_operation(key)
-            updated = replace(
-                record,
-                error_code=error_code,
-                error_message=error_message,
-            )
-            await self._journal.save_record(updated)
-
-        return await self.transition(
-            key,
+        return await self._transition_internal(
+            operation_id,
             target,
             reason=error_message,
             metadata={"error_code": error_code, "retryable": retryable},
             actor=actor,
+            extra_fields={
+                "error_code": error_code,
+                "error_message": error_message,
+            },
         )
 
     # --- Side updates (no status change) -------------------------------

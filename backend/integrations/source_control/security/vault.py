@@ -42,6 +42,8 @@ Naming:
 from __future__ import annotations
 
 import logging
+import os
+import sys
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -404,9 +406,23 @@ class KeyringVault(CredentialVault):
     library is not installed; in that case `is_available()` returns
     False.
 
-    Keys are stored under the service name
-    `peldrun.sc.<provider>.<host>`, with the vault key as the username
-    field. This matches how `keyring` expects data to be namespaced.
+    Storage layout
+    --------------
+    Each secret is stored as a ``(service, username)`` pair:
+
+        service  = ``peldrun.sc.{kind}`` where ``{kind}`` is the
+                   token kind segment of the vault key (e.g.
+                   ``oauth``, ``pat``).
+        username = ``{provider}.{base_url}.{account_id}`` derived
+                   from the remainder of the vault key.
+
+    The service groups secrets by token kind, while the username
+    uniquely identifies the account (including the provider and the
+    instance base URL). Two entries under different ``kind`` values
+    never collide because they use different service names; two
+    entries under the same ``kind`` never collide because their
+    usernames differ in the ``provider``, ``base_url``, or
+    ``account_id`` segments.
     """
 
     backend_name = "keyring"
@@ -451,14 +467,20 @@ class KeyringVault(CredentialVault):
         Split a validated key into `(service, username)`.
 
         The key format produced by `make_vault_key` is
-        `peldrun.sc.{kind}.{provider}.{base_url}.{account_id}`. The
-        service name groups secrets by provider instance while the
-        username field uniquely identifies the account.
+        ``peldrun.sc.{kind}.{provider}.{base_url}.{account_id}``.
+        This method returns:
+
+            service  = ``peldrun.sc.{kind}``  (first three segments)
+            username = ``{provider}.{base_url}.{account_id}``
+                       (everything after the third segment)
+
+        If the key does not have at least three dot-separated
+        segments after the prefix, the whole key becomes the
+        username under the default service prefix. This is a
+        defensive fallback for keys produced by future ``kind``
+        variants; it is not expected in normal operation.
         """
         parts = key.split(".")
-        # Best-effort: use the first three components as the service
-        # and the rest as the username. If the key does not match the
-        # expected shape, fall back to using the whole key as username.
         if len(parts) >= 4:
             service = ".".join(parts[:3])
             username = ".".join(parts[3:])
@@ -486,17 +508,38 @@ class KeyringVault(CredentialVault):
         return self._keyring.get_password(service, username)
 
     def _delete(self, key: str) -> None:
+        """
+        Delete the secret, tolerating only the "entry does not exist"
+        case as a no-op.
+
+        The keyring library raises a backend-specific exception (for
+        example ``keyring.errors.PasswordDeleteError``) when the
+        entry is missing, but real backend failures — network errors,
+        permission denials, or a broken keychain service — raise
+        different exception types and MUST propagate so the caller
+        can detect that a credential was NOT actually removed.
+
+        The previous implementation caught every ``Exception`` and
+        silently ignored it, which meant a failed revocation left the
+        token in the vault while the caller believed the operation
+        had succeeded. The new implementation checks existence first
+        and only skips ``delete_password`` when the entry is
+        positively confirmed absent.
+        """
         if self._keyring is None:
             raise VaultError(
                 "Secure vault is unavailable: keyring library missing.",
                 details={"backend": self.backend_name},
             )
         service, username = self._split_key(key)
-        try:
-            self._keyring.delete_password(service, username)
-        except Exception:  # noqa: BLE001
-            # Deleting a non-existent entry is a no-op by contract.
-            pass
+        # ``get_password`` returns ``None`` for missing entries and
+        # raises for real backend failures; both are the signals we
+        # need to distinguish "nothing to delete" from "deletion
+        # might actually fail".
+        existing = self._keyring.get_password(service, username)
+        if existing is None:
+            return
+        self._keyring.delete_password(service, username)
 
     def _exists(self, key: str) -> bool:
         return self._get(key) is not None
@@ -523,8 +566,10 @@ class FallbackVault(CredentialVault):
     """
     Vault that wraps an ordered list of vaults.
 
-    The first vault that reports itself available is used for both
-    reads and writes. If none of the wrapped vaults is available,
+    The first vault that reports itself available is used for writes.
+    Reads consult every available vault in order, so a secret written
+    by an earlier preferred backend remains readable after the
+    preference changes. If none of the wrapped vaults is available,
     every operation raises `VaultError`. This class NEVER falls back
     to an insecure backend.
     """
@@ -536,6 +581,16 @@ class FallbackVault(CredentialVault):
             raise ValidationError(
                 "FallbackVault requires at least one wrapped vault."
             )
+        for index, vault in enumerate(vaults):
+            if not isinstance(vault, CredentialVault):
+                raise ValidationError(
+                    "FallbackVault requires every wrapped object to be "
+                    "a CredentialVault instance.",
+                    details={
+                        "index": index,
+                        "type": type(vault).__name__,
+                    },
+                )
         self._vaults = tuple(vaults)
 
     def _active(self) -> CredentialVault:
@@ -551,9 +606,6 @@ class FallbackVault(CredentialVault):
         self._active().put(key, secret)
 
     def _get(self, key: str) -> Optional[str]:
-        # Reads consult every available vault in order, so that a
-        # secret written by one backend remains readable after the
-        # preferred backend changes.
         for vault in self._vaults:
             if not vault.is_available():
                 continue
@@ -563,10 +615,35 @@ class FallbackVault(CredentialVault):
         return None
 
     def _delete(self, key: str) -> None:
-        # Deletion is best-effort across every vault.
+        """
+        Best-effort deletion across every available wrapped vault.
+
+        A failure in one vault MUST NOT prevent the remaining vaults
+        from being cleaned up. The first captured exception is
+        re-raised after every vault has been visited so that callers
+        can observe that at least one backend failed to delete the
+        secret.
+        """
+        first_error: Optional[BaseException] = None
+        visited = 0
         for vault in self._vaults:
-            if vault.is_available():
+            if not vault.is_available():
+                continue
+            visited += 1
+            try:
                 vault.delete(key)
+            except Exception as exc:  # noqa: BLE001
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+        if visited == 0:
+            raise VaultError(
+                "No secure vault backend is available.",
+                details={
+                    "backends": [v.backend_name for v in self._vaults],
+                },
+            )
 
     def _exists(self, key: str) -> bool:
         return self._get(key) is not None
@@ -605,8 +682,9 @@ def _build_default_vault(environment: str) -> CredentialVault:
 
     Rules:
         - `production`: use `KeyringVault`. If unavailable, raise.
-        - `development`: use `FallbackVault([KeyringVault, InMemoryVault])`
-          and log a warning when the fallback is used.
+        - `development`: use a `FallbackVault` that prefers
+          `KeyringVault` and degrades to `InMemoryVault`. A warning is
+          logged when the fallback is used.
         - `test`: use `InMemoryVault`.
     """
     env = (environment or _ENV_DEVELOPMENT).strip().lower()
@@ -624,16 +702,18 @@ def _build_default_vault(environment: str) -> CredentialVault:
             )
         return keyring_vault
 
-    # Development
+    # Development: prefer keyring, but degrade gracefully if the OS
+    # keychain is unavailable. The FallbackVault keeps reads working
+    # if the preferred backend becomes unavailable mid-run.
     keyring_vault = KeyringVault()
-    if keyring_vault.is_available():
-        return keyring_vault
-    logger.warning(
-        "No OS keychain available; falling back to in-memory vault. "
-        "Secrets will not persist across restarts. This is acceptable "
-        "only in development."
-    )
-    return InMemoryVault()
+    fallback = FallbackVault([keyring_vault, InMemoryVault()])
+    if not keyring_vault.is_available():
+        logger.warning(
+            "No OS keychain available; falling back to in-memory "
+            "vault. Secrets will not persist across restarts. This "
+            "is acceptable only in development."
+        )
+    return fallback
 
 
 def get_default_vault(
@@ -649,8 +729,6 @@ def get_default_vault(
     global _DEFAULT_VAULT
     with _DEFAULT_LOCK:
         if _DEFAULT_VAULT is None:
-            import os
-
             resolved_env = (
                 environment
                 or os.environ.get("PELDRUN_ENV")
@@ -734,11 +812,16 @@ class WindowsNativeCredentialVault(KeyringVault):
     explicitly request the Windows backend without depending on the
     `keyring` library's runtime backend selection.
 
-    On non-Windows platforms, instances of this class still function
-    but do NOT provide an OS-native store; they fall back to
-    whichever backend `keyring` selects. Callers that need a
-    platform-specific vault SHOULD inspect `is_available()` before
-    use.
+    On non-Windows platforms, ``is_available()`` returns ``False``
+    because the class contract is specifically to provide a
+    Windows-native store. Callers that need a cross-platform vault
+    SHOULD use ``KeyringVault`` directly.
     """
 
     backend_name = "windows-native"
+
+    def is_available(self) -> bool:
+        """Return True only when running on Windows with a real backend."""
+        if sys.platform != "win32":
+            return False
+        return super().is_available()

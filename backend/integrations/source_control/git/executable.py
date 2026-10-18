@@ -157,6 +157,29 @@ _UNSAFE_ENV_VARS: Tuple[str, ...] = (
     "GIT_HTTP_LOW_SPEED_TIME",
 )
 
+#: Environment variables that a caller MAY provide via `extra_env`.
+#:
+#: The design rule "the environment is entirely controlled here"
+#: forbids arbitrary caller-supplied environments, because that
+#: would open the door to `LD_PRELOAD`, `GIT_SSH_COMMAND`,
+#: `GIT_EXTERNAL_DIFF`, and similar command-execution vectors. The
+#: credential flow in `push.py` nevertheless requires exactly two
+#: variables to be set: `GIT_ASKPASS` (and its SSH twin
+#: `SSH_ASKPASS`), which point at a temporary script that echoes
+#: the access token.
+#:
+#: Restricting `extra_env` to this allowlist preserves the security
+#: invariant while enabling the credential flow. Any other key is a
+#: programming error and raises `ValidationError` before the
+#: subprocess is spawned. Values are still validated for NUL bytes
+#: and non-string types.
+_EXTRA_ENV_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+    }
+)
+
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -372,6 +395,7 @@ class GitExecutable:
         timeout_seconds: Optional[int] = None,
         check_returncode: bool = True,
         stdin_bytes: Optional[bytes] = None,
+        extra_env: Optional[Mapping[str, str]] = None,
     ) -> GitResult:
         """
         Run a Git command asynchronously.
@@ -388,9 +412,15 @@ class GitExecutable:
             stdin_bytes: Optional bytes written to the child's stdin
                 before it is closed. Useful for `git apply` and
                 similar commands. Must not contain secrets.
+            extra_env: Optional allowlisted environment overrides.
+                Only keys in `_EXTRA_ENV_ALLOWLIST` are accepted;
+                any other key raises `ValidationError`. Used by the
+                credential flow in `push.py` to provide
+                `GIT_ASKPASS`/`SSH_ASKPASS`.
 
         Raises:
-            ValidationError: If arguments are malformed.
+            ValidationError: If arguments are malformed, or if
+                `extra_env` contains a non-allowlisted key.
             GitTimeoutError: If the command exceeds the timeout.
             GitExecutionError: If the command fails and
                 `check_returncode` is True.
@@ -400,7 +430,7 @@ class GitExecutable:
         cwd_path = self._validate_cwd(cwd)
         command = (self._git_binary, *args)
 
-        env = self._build_environment()
+        env = self._build_environment(extra_env=extra_env)
 
         started = time.monotonic()
         started_at = _utc_now()
@@ -481,6 +511,7 @@ class GitExecutable:
         cwd: Optional[Union[str, Path]] = None,
         timeout_seconds: Optional[int] = None,
         check_returncode: bool = True,
+        extra_env: Optional[Mapping[str, str]] = None,
     ) -> GitResult:
         """
         Run a Git command synchronously.
@@ -488,12 +519,14 @@ class GitExecutable:
         Intended for startup paths (version checks) and for tests.
         Production code SHOULD prefer the async variant to avoid
         blocking the event loop.
+
+        `extra_env` follows the same contract as in `run()`.
         """
         self._validate_args(args)
         timeout = self._coerce_timeout(timeout_seconds)
         cwd_path = self._validate_cwd(cwd)
         command = (self._git_binary, *args)
-        env = self._build_environment()
+        env = self._build_environment(extra_env=extra_env)
 
         started = time.monotonic()
         started_at = _utc_now()
@@ -758,19 +791,31 @@ class GitExecutable:
 
     # --- Internals: environment ----------------------------------------
 
-    def _build_environment(self) -> Mapping[str, str]:
+    def _build_environment(
+        self,
+        extra_env: Optional[Mapping[str, str]] = None,
+    ) -> Mapping[str, str]:
         """
         Build the sanitized environment for the child process.
 
         Dangerous variables are removed, and a small set of safe
         defaults is injected. The `PATH` of the parent is preserved so
         that Git can find its own helper programs.
+
+        `extra_env`, when provided, is applied AFTER sanitization.
+        This is what allows the credential flow in `push.py` to
+        re-introduce `GIT_ASKPASS`/`SSH_ASKPASS` (both of which are
+        on the unsafe list and would otherwise be stripped from the
+        inherited environment). Every key in `extra_env` is checked
+        against `_EXTRA_ENV_ALLOWLIST`; anything else raises
+        `ValidationError` before the subprocess is spawned.
         """
         env: dict[str, str] = dict(os.environ)
         for name in _UNSAFE_ENV_VARS:
             env.pop(name, None)
 
-        # Safe defaults.
+        # Safe defaults (applied BEFORE extra_env so that the caller
+        # cannot accidentally disable them).
         env["LANG"] = "C"
         env["LC_ALL"] = "C"
         env["GIT_TERMINAL_PROMPT"] = "0"
@@ -778,11 +823,34 @@ class GitExecutable:
         env["GIT_PAGER"] = "cat"
         env["GIT_EDITOR"] = ":"
         env["GIT_MERGE_AUTOEDIT"] = "no"
-        # Prevent SSH from opening a prompt for a password.
         env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
-        # Never write to a global credential helper.
         env["GIT_CONFIG_GLOBAL"] = "/dev/null"
         env["GIT_CONFIG_SYSTEM"] = "/dev/null"
+
+        if extra_env:
+            for key, value in extra_env.items():
+                if key not in _EXTRA_ENV_ALLOWLIST:
+                    raise ValidationError(
+                        f"Environment variable '{key}' is not allowed "
+                        f"as an override.",
+                        details={
+                            "key": key,
+                            "allowed": sorted(_EXTRA_ENV_ALLOWLIST),
+                        },
+                    )
+                if not isinstance(value, str):
+                    raise ValidationError(
+                        f"Environment variable '{key}' must be a "
+                        f"string.",
+                        details={"key": key},
+                    )
+                if "\x00" in key or "\x00" in value:
+                    raise ValidationError(
+                        f"Environment variable '{key}' contains a NUL "
+                        f"byte.",
+                        details={"key": key},
+                    )
+                env[key] = value
 
         return env
 

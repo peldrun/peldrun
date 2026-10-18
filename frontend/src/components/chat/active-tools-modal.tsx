@@ -247,7 +247,7 @@ export function ActiveToolsModal() {
       <button
         type="button"
         onClick={() => setIsOpen(true)}
-        className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-medium border border-border bg-card hover:bg-muted/70 text-foreground transition-all cursor-pointer shadow-xs"
+        className="flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium bg-transparent hover:bg-muted/70 text-foreground transition-all cursor-pointer"
         title={`View active tools for ${displayName}`}
       >
         <Wrench size={12} className="text-primary" />
@@ -266,7 +266,7 @@ export function ActiveToolsModal() {
         >
           <div className="bg-card border border-border rounded-xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden animate-in zoom-in-95 duration-150">
             {/* Header */}
-            <div className="h-14 border-b border-border bg-muted/30 px-5 flex items-center justify-between shrink-0">
+            <div className="h-14 border-b border-border bg-gigbg px-5 flex items-center justify-between shrink-0">
               <div className="flex items-center gap-2.5 min-w-0">
                 <div className="p-2 rounded-lg bg-primary/10 text-primary border border-primary/20 shrink-0">
                   <Wrench size={16} />
@@ -306,8 +306,8 @@ export function ActiveToolsModal() {
             </div>
 
             {/* Filter Tabs */}
-            <div className="px-5 py-2.5 bg-card border-b border-border/60 flex items-center justify-between text-xs shrink-0">
-              <div className="flex items-center gap-1 bg-muted/60 p-0.5 rounded-lg border border-border/60 text-[11px]">
+            <div className="px-5 py-2.5 bg-muted border-b border-border/60 flex items-center justify-between text-xs shrink-0">
+              <div className="flex items-center gap-1 bg-card p-0.5 rounded-lg border border-border/60 text-[11px] shadow-sm">
                 {(["all", "builtin", "mcp"] as const).map((f) => (
                   <button
                     key={f}
@@ -315,7 +315,7 @@ export function ActiveToolsModal() {
                     onClick={() => setActiveFilter(f)}
                     className={`px-2.5 py-1 rounded-md transition-all font-medium cursor-pointer ${
                       activeFilter === f
-                        ? "bg-card text-foreground shadow-xs font-semibold"
+                        ? "bg-muted/90 text-foreground shadow-xs font-semibold"
                         : "text-muted-foreground hover:text-foreground"
                     }`}
                   >
@@ -335,7 +335,7 @@ export function ActiveToolsModal() {
             </div>
 
             {/* Tools List */}
-            <div className="flex-1 overflow-y-auto p-5 space-y-2.5 bg-background/50">
+            <div className="flex-1 overflow-y-auto p-5 space-y-2.5 bg-custom">
               {loading && tools.length === 0 ? (
                 <div className="flex items-center justify-center py-12 text-muted-foreground gap-2 text-xs">
                   <Loader2 size={16} className="animate-spin text-primary" />
@@ -408,7 +408,7 @@ export function ActiveToolsModal() {
             </div>
 
             {/* Footer */}
-            <div className="h-12 border-t border-border bg-card px-5 flex items-center justify-between shrink-0 text-xs">
+            <div className="h-12 border-t border-border bg-gigbg px-5 flex items-center justify-between shrink-0 text-xs">
               <a
                 href="/stores"
                 className="text-muted-foreground hover:text-primary transition-colors flex items-center gap-1.5 font-medium"
@@ -421,7 +421,7 @@ export function ActiveToolsModal() {
               <button
                 type="button"
                 onClick={() => setIsOpen(false)}
-                className="px-3 py-1.5 rounded-md bg-secondary text-secondary-foreground hover:bg-secondary/80 font-medium transition-colors cursor-pointer text-xs"
+                className="px-3 py-1.5 rounded-xs bg-black/70 text-card hover:bg-black/90 font-medium transition-colors cursor-pointer text-xs"
               >
                 Close
               </button>

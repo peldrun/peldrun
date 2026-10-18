@@ -138,7 +138,25 @@ _PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)\bset-cookie\s*:\s*[^\r\n]{8,}"),
     # --- URLs with embedded credentials --------------------------------
     # scheme://user:password@host/path -> scheme://user:***REDACTED***@host/path
-    re.compile(r"([a-zA-Z][a-zA-Z0-9+.\-]*://)([^/\s:@]+):([^/\s@]+)@"),
+    # Two capture groups are used (prefix ending at the colon, suffix
+    # starting at the '@') so that `_redact_match` can preserve both
+    # the username and the `@` separator. A single-group pattern would
+    # only preserve the scheme and produce a misleading URL that no
+    # longer contains the username.
+    #
+    # PERFORMANCE: every length-quantified class is bounded. An
+    # unbounded `[a-zA-Z0-9+.\-]*` would be O(n^2) on non-URL input
+    # (for each of the n start positions, the engine would greedily
+    # match n - i characters before failing to find `://`, then
+    # backtrack). On a 1 MiB non-URL string this caused the redaction
+    # pass to hang. The bounds below reflect real-world URL component
+    # lengths (schemes up to 31 chars per RFC 3986's practical limit,
+    # usernames up to 255 chars, passwords up to 511 chars). They
+    # convert the worst-case cost from O(n^2) to O(n).
+    re.compile(
+        r"([a-zA-Z][a-zA-Z0-9+.\-]{1,31}://[^/\s:@]{1,255}:)"
+        r"[^/\s@]{1,511}(@)"
+    ),
     # --- OAuth and API parameters --------------------------------------
     re.compile(r"(?i)\b(client_secret=)[^&\s\"']+"),
     re.compile(r"(?i)\b(refresh_token=)[^&\s\"']+"),
@@ -149,10 +167,21 @@ _PATTERNS: tuple[re.Pattern[str], ...] = (
     # OAuth authorization codes are short-lived but still sensitive
     re.compile(r"(?i)\b(code=)[A-Za-z0-9_\-]{8,}"),
     # --- Generic JSON fields ------------------------------------------
-    # Matches `"client_secret": "..."` and similar in JSON blobs
+    # Matches `"client_secret": "..."` and similar in JSON blobs.
+    # Two capture groups are used (the JSON key + opening quote +
+    # separator, and the closing quote) so that the replacement
+    # preserves the JSON structure. A single-group pattern would
+    # collapse the entire fragment into `client_secret***REDACTED***`,
+    # producing invalid JSON and breaking downstream parsers.
+    #
+    # LIMITATION: values that contain escaped double quotes (e.g.
+    # "password": "a\"b") are truncated at the first unescaped quote;
+    # the remainder is left in the output. This is acceptable for
+    # known secret formats, which never contain quotes, but callers
+    # SHOULD NOT treat the output as authoritative for arbitrary JSON.
     re.compile(
-        r'(?i)"(client_secret|refresh_token|access_token|password|'
-        r'api_key|private_key|secret)"\s*:\s*"[^"]*"'
+        r'(?i)("(?:client_secret|refresh_token|access_token|password|'
+        r'api_key|private_key|secret)"\s*:\s*")[^"]*(")'
     ),
 )
 
@@ -165,8 +194,8 @@ _FAST_PATTERNS: tuple[re.Pattern[str], ...] = (
     _PATTERNS[1],   # gh*_
     _PATTERNS[2],   # glpat-
     _PATTERNS[5],   # ATBB
-    _PATTERNS[15],  # Bearer (generic)
-    _PATTERNS[18],  # URL credentials
+    _PATTERNS[16],  # Bearer (generic)
+    _PATTERNS[19],  # URL credentials
 )
 
 
@@ -564,14 +593,43 @@ class SafeStr:
 
 def _redact_match(match: re.Match[str]) -> str:
     """
-    Redaction callback that preserves a captured non-secret prefix.
+    Redaction callback that preserves captured non-secret context.
 
-    When a pattern captures a prefix such as `client_secret=` or
-    `scheme://user:`, the prefix is preserved and only the value is
-    replaced. When no group is captured, the entire match is
-    replaced.
+    Patterns in this module use three shapes, all handled here:
+
+        - No capture groups: the entire match is replaced. Used by
+          the token patterns (``ghp_*``, ``glpat-*``, JWTs, private
+          keys) where the surrounding text carries no useful
+          context.
+
+        - One capture group: the group is a non-secret prefix such as
+          ``client_secret=``. The prefix is preserved and only the
+          secret that follows is replaced:
+
+              ``client_secret=abc123`` -> ``client_secret=***REDACTED***``
+
+        - Two capture groups: the groups are a non-secret prefix and a
+          non-secret suffix. Both are preserved and the secret
+          between them is replaced. This is required for:
+
+              URLs with credentials:
+                  ``https://user:pass@host``
+                    -> ``https://user:***REDACTED***@host``
+
+              JSON field values:
+                  ``"client_secret": "abc"``
+                    -> ``"client_secret": "***REDACTED***"``
+
+              Without the two-group form, the URL pattern would lose
+              the username and the ``@`` separator, and the JSON
+              pattern would produce invalid JSON.
     """
+    if (
+        match.lastindex
+        and match.lastindex >= 2
+        and match.group(2) is not None
+    ):
+        return f"{match.group(1) or ''}{REDACTED}{match.group(2)}"
     if match.lastindex and match.lastindex >= 1:
-        prefix = match.group(1) or ""
-        return f"{prefix}{REDACTED}"
+        return f"{match.group(1) or ''}{REDACTED}"
     return REDACTED

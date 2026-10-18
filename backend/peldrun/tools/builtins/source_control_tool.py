@@ -64,6 +64,7 @@ try:
     from integrations.source_control.tools import (
         CreateBranchTool,
         CreateChangeRequestTool,
+        CreateWorkspaceTool,
         InspectDiffTool,
         ListRepositoriesTool,
         PushBranchTool,
@@ -91,6 +92,7 @@ except ImportError:  # repo layout: backend.integrations.*
     from backend.integrations.source_control.tools import (
         CreateBranchTool,
         CreateChangeRequestTool,
+        CreateWorkspaceTool,
         InspectDiffTool,
         ListRepositoriesTool,
         PushBranchTool,
@@ -126,6 +128,17 @@ _ACTION_MAP: dict[str, tuple[type, frozenset[str]]] = {
     "read_file": (
         ReadFileTool,
         frozenset({"registry", "token_service", "audit_logger"}),
+    ),
+    "create_workspace": (
+        CreateWorkspaceTool,
+        frozenset(
+            {
+                "registry",
+                "token_service",
+                "workspace_manager",
+                "audit_logger",
+            }
+        ),
     ),
     "create_branch": (
         CreateBranchTool,
@@ -184,6 +197,10 @@ _ACTION_ALIASES: Mapping[str, str] = {
     "search_repos": "list_repositories",
     "read": "read_file",
     "cat": "read_file",
+    "clone": "create_workspace",
+    "workspace": "create_workspace",
+    "new_workspace": "create_workspace",
+    "open_workspace": "create_workspace",
     "branch": "create_branch",
     "new_branch": "create_branch",
     "diff": "inspect_diff",
@@ -212,9 +229,10 @@ class SourceControlArgs(BaseModel):
         ...,
         description=(
             "The source-control action to execute. Canonical actions: "
-            "'list_repositories', 'read_file', 'create_branch', "
-            "'inspect_diff', 'run_checks', 'request_approval', "
-            "'push_branch', 'create_change_request'."
+            "'list_repositories', 'read_file', 'create_workspace', "
+            "'create_branch', 'inspect_diff', 'run_checks', "
+            "'request_approval', 'push_branch', "
+            "'create_change_request'."
         ),
     )
     params: Optional[dict[str, Any]] = Field(

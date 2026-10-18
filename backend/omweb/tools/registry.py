@@ -387,7 +387,7 @@ class ToolRegistry:
             )
             return None
 
-        self._loaded_custom_instances[tool_id_original := entry.id] = instance
+        self._loaded_custom_instances[entry.id] = instance
         return instance
 
     @staticmethod

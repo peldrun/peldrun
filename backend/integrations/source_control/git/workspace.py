@@ -45,7 +45,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Dict, List, Optional, Sequence
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from ..domain.enums import ProviderId
 from ..domain.models import (
@@ -322,8 +322,31 @@ class GitWorkspaceManager:
             await self._force_remove_directory(workspace_path)
             raise
 
+        # The capacity check MUST run again here: the early check
+        # above fast-fails when the registry is already full, but
+        # between that check and this insert the long-running
+        # `_materialize` call may have given other coroutines the
+        # chance to fill the remaining slots. Holding the lock
+        # across the whole materialization would serialize every
+        # workspace creation, and releasing it after materialize
+        # without a re-check would allow the registry to exceed
+        # `_max_workspaces` under concurrency.
         with self._lock:
-            self._workspaces[workspace_id] = materialized
+            at_capacity = (
+                len(self._workspaces) >= self._max_workspaces
+            )
+            if not at_capacity:
+                self._workspaces[workspace_id] = materialized
+
+        if at_capacity:
+            # Release the lock before cleanup so that a slow
+            # `rmtree` never blocks other registry operations.
+            await self._force_remove_directory(workspace_path)
+            raise ValidationError(
+                "Workspace registry is at capacity.",
+                details={"max_workspaces": self._max_workspaces},
+            )
+
         return materialized
 
     # --- Lifecycle: read -----------------------------------------------
@@ -823,6 +846,16 @@ class GitWorkspaceManager:
 
         A new branch is created from the current HEAD when it does
         not already exist.
+
+        IMPORTANT: this method uses ``git checkout -b`` (lowercase),
+        NOT ``git checkout -B`` (uppercase). The uppercase form
+        force-RESETS an existing branch to the current HEAD, which
+        would discard any commits already on that branch — a direct
+        violation of the manager's "never discard user changes"
+        design rule. The lowercase form refuses to overwrite an
+        existing branch, so a stale or reused workspace whose branch
+        already exists surfaces a clear error instead of silently
+        losing commits.
         """
         # Try to check the branch out first.
         result = await self._git.run(
@@ -833,9 +866,10 @@ class GitWorkspaceManager:
         if result.returncode == 0:
             return
 
-        # Create the branch from HEAD.
+        # Create the branch from HEAD. Lowercase `-b` refuses to
+        # overwrite an existing branch, protecting user commits.
         await self._git.run(
-            ["checkout", "-B", branch],
+            ["checkout", "-b", branch],
             cwd=target,
         )
 
@@ -1022,7 +1056,16 @@ def _inject_token_in_url(clone_url: str, token: str) -> str:
     if not parsed.hostname:
         return clone_url
 
-    netloc = f"x-access-token:{token}@{parsed.hostname}"
+    # Percent-encode the token so that reserved URL characters it
+    # might contain (`@`, `:`, `/`, `?`, `#`, space, ...) cannot
+    # corrupt the URL structure. Tokens issued by GitHub, GitLab,
+    # and Bitbucket are URL-safe in practice, but a custom or
+    # legacy credential could contain a reserved character and
+    # silently break the clone. `quote(..., safe="")` keeps the
+    # RFC 3986 unreserved set (A-Z a-z 0-9 - _ . ~) and
+    # percent-encodes everything else.
+    encoded_token = quote(token, safe="")
+    netloc = f"x-access-token:{encoded_token}@{parsed.hostname}"
     if parsed.port:
         netloc += f":{parsed.port}"
 

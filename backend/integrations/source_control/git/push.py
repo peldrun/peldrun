@@ -49,6 +49,7 @@ from ..ports.repository import PushPort, PushResult
 from ..errors import (
     AuthRequiredError,
     CommandFailedError,
+    CommandTimeoutError,
     ConflictError,
     ProtectedBranchError,
     RemoteStateChangedError,
@@ -285,12 +286,19 @@ class GitPushManager(PushPort):
         if timed_out:
             # We cannot know whether the push succeeded. Ask the
             # remote for the current SHA of the destination.
+            #
+            # IMPORTANT: pass the same token that was used for the
+            # push attempt. Without it, the reconciliation
+            # `ls-remote` is unauthenticated and returns None for
+            # private repositories, so a successful push is
+            # reported as "timeout_ambiguous".
             final = await self._reconcile_after_timeout(
                 target=target,
                 remote=remote,
                 destination=destination,
                 local_sha=local_sha,
                 local_branch=local_branch,
+                token=token,
             )
             return final
 
@@ -319,8 +327,16 @@ class GitPushManager(PushPort):
                 },
             )
 
+        # Read the remote SHA to populate `PushResult.remote_sha`.
+        # Pass the token so that private repositories return the
+        # real SHA rather than None. The caller (audit log, facade,
+        # UI) relies on this value to confirm the push landed at the
+        # expected commit.
         remote_sha = await self._remote_head_sha(
-            target=target, remote=remote, ref=destination
+            target=target,
+            remote=remote,
+            ref=destination,
+            token=token,
         )
 
         return PushResult(
@@ -501,13 +517,24 @@ class GitPushManager(PushPort):
         Returns `(stdout, stderr, returncode, timed_out)`. When the
         command times out, `timed_out` is True and the caller is
         responsible for reconciliation.
+
+        Credentials are supplied through the process environment via
+        ``GIT_ASKPASS`` and ``SSH_ASKPASS``. The mapping returned by
+        ``_build_askpass`` is passed as ``extra_env`` to
+        ``GitExecutable.run``; the executable merges it into the
+        sanitized environment it builds. Callers MUST NOT construct
+        their own ``env=os.environ.copy()`` here — that would
+        bypass the sanitization performed by ``GitExecutable``
+        (stripping ``GIT_SSH_COMMAND``, ``LD_PRELOAD``, and other
+        dangerous variables), and the executable does not even
+        accept an ``env`` keyword.
         """
-        env_overrides: dict[str, str] = {}
         askpass_path: Optional[Path] = None
+        extra_env: Optional[dict[str, str]] = None
 
         try:
             if token:
-                askpass_path, env_overrides = self._build_askpass(token)
+                askpass_path, extra_env = self._build_askpass(token)
 
             try:
                 result = await self._git.run(
@@ -515,16 +542,16 @@ class GitPushManager(PushPort):
                     cwd=target,
                     timeout_seconds=timeout_seconds,
                     check_returncode=False,
+                    extra_env=extra_env,
                 )
+            except CommandTimeoutError:
+                # MUST be caught before `GitExecutionError`: a
+                # timeout may be wrapped as a `GitExecutionError`,
+                # and treating it as an ordinary failure would skip
+                # the reconciliation path entirely.
+                return "", "", -1, True
             except GitExecutionError as exc:
                 return "", str(exc), -1, False
-            except Exception as exc:  # noqa: BLE001
-                # Distinguish timeout from other failures.
-                from ..errors import CommandTimeoutError
-
-                if isinstance(exc, CommandTimeoutError):
-                    return "", "", -1, True
-                raise
 
             stdout = redact_text(result.stdout)
             stderr = redact_text(result.stderr)
@@ -771,21 +798,28 @@ class GitPushManager(PushPort):
         """
         Return the SHA the remote currently points to for `ref`, or
         `None` if the ref does not exist on the remote.
+
+        When `token` is provided, the askpass script is created and
+        its mapping is passed to ``GitExecutable.run`` as
+        ``extra_env``. Without this, ``ls-remote`` against a private
+        repository returns ``None`` even when the ref exists,
+        because the request is unauthenticated.
         """
         full_ref = f"refs/heads/{ref}"
         args = ["ls-remote", "--refs", remote, full_ref]
 
-        env_overrides: dict[str, str] = {}
         askpass_path: Optional[Path] = None
+        extra_env: Optional[dict[str, str]] = None
         try:
             if token:
-                askpass_path, env_overrides = self._build_askpass(token)
+                askpass_path, extra_env = self._build_askpass(token)
 
             result = await self._git.run(
                 args,
                 cwd=target,
                 timeout_seconds=LS_REMOTE_TIMEOUT_SECONDS,
                 check_returncode=False,
+                extra_env=extra_env,
             )
         except GitExecutionError:
             return None
@@ -825,6 +859,7 @@ class GitPushManager(PushPort):
         destination: str,
         local_sha: str,
         local_branch: str,
+        token: Optional[str] = None,
     ) -> PushResult:
         """
         Build a `PushResult` for a push that timed out.
@@ -835,9 +870,18 @@ class GitPushManager(PushPort):
         differs, the push is considered failed but NOT ambiguous; the
         caller now knows the state. When the remote cannot be
         reached, the result remains ambiguous.
+
+        The caller MUST pass the same `token` that was used for the
+        push attempt. Without it, the reconciliation ``ls-remote``
+        call runs unauthenticated, returns ``None`` for private
+        repositories, and the result is reported as
+        ``timeout_ambiguous`` even when the push actually succeeded.
         """
         remote_sha = await self._remote_head_sha(
-            target=target, remote=remote, ref=destination
+            target=target,
+            remote=remote,
+            ref=destination,
+            token=token,
         )
 
         if remote_sha is None:

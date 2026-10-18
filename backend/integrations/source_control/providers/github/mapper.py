@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, Sequence
 
 from ...domain.enums import FileChangeType, ProviderId
@@ -129,11 +129,13 @@ class GitHubDataMapper:
             head_sha = commit_data
 
         is_default = bool(default_branch and name == default_branch)
+        is_protected = bool(data.get("protected", False))
 
         return BranchRef(
             name=name,
             head_sha=head_sha,
             is_default=is_default,
+            is_protected=is_protected,
         )
 
     @staticmethod
@@ -144,7 +146,10 @@ class GitHubDataMapper:
 
         author_name = "Unknown"
         author_email = ""
-        created_at = datetime.utcnow()
+        # Default to a timezone-aware UTC "now" so that consumers do
+        # not receive a naive datetime when the payload omits the
+        # author date.
+        created_at = datetime.now(timezone.utc)
 
         if isinstance(commit_obj, dict):
             raw_msg = str(commit_obj.get("message") or "")
@@ -236,7 +241,16 @@ class GitHubDataMapper:
 
     @staticmethod
     def parse_check_run(data: Mapping[str, Any]) -> CheckRunRef:
-        """Transforms a raw GitHub check-run API object into a typed CheckRunRef."""
+        """Transforms a raw GitHub check-run API object into a typed CheckRunRef.
+
+        NOTE: GitHub exposes both ``html_url`` and ``details_url`` on a
+        check run. The ``details_url`` field is the authoritative
+        link to the CI build logs, while ``html_url`` points to the
+        GitHub-hosted summary. This mapper uses ``html_url`` for
+        historical reasons; callers that need the build-log URL
+        should prefer ``checks.GitHubChecksService``, which uses
+        ``details_url``.
+        """
         name = str(data.get("name", "unnamed-check"))
         status = str(data.get("status", "completed")).lower()
         conclusion_raw = data.get("conclusion")

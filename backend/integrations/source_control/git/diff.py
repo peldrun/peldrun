@@ -40,6 +40,7 @@ from ..domain.enums import FileChangeType
 from ..domain.models import DiffSummary, FileDiff
 from ..errors import (
     NotFoundError,
+    SourceControlError,
     ValidationError,
     WorkspaceNotFoundError,
 )
@@ -317,8 +318,26 @@ class GitDiffEngine(DiffPort):
             check_returncode=False,
             timeout_seconds=120,
         )
-        if result.returncode != 0 and not result.stdout:
-            return []
+        # The previous implementation silently returned an empty
+        # diff whenever git exited non-zero without producing
+        # stdout. That masked a class of real failures — the most
+        # common being an invalid `base_sha` ("fatal: bad revision")
+        # — behind a plausible-looking "no changes" result. The
+        # approval flow relies on distinguishing "workspace has no
+        # changes" (a legitimate state that blocks approval with a
+        # clear message) from "diff computation failed" (an actual
+        # error the user must see). A non-zero return code is
+        # always a genuine failure: `git diff` without
+        # `--exit-code` returns 0 even when there are differences.
+        if result.returncode != 0:
+            raise SourceControlError(
+                f"git diff --numstat failed for base '{base}'.",
+                details={
+                    "base": base,
+                    "returncode": result.returncode,
+                    "stderr": (result.stderr or "").strip()[:500],
+                },
+            )
         return _parse_numstat_z(result.stdout, max_files=max_files)
 
     async def _run_name_status(
@@ -350,8 +369,20 @@ class GitDiffEngine(DiffPort):
             check_returncode=False,
             timeout_seconds=120,
         )
-        if result.returncode != 0 and not result.stdout:
-            return []
+        # Mirror the failure contract of `_run_numstat`: a non-zero
+        # return code from `git diff` is a genuine error (invalid
+        # base SHA, corrupt repository, wrong working directory),
+        # not an empty result. Surfacing it here lets the caller
+        # distinguish "workspace is unchanged" from "diff failed".
+        if result.returncode != 0:
+            raise SourceControlError(
+                f"git diff --name-status failed for base '{base}'.",
+                details={
+                    "base": base,
+                    "returncode": result.returncode,
+                    "stderr": (result.stderr or "").strip()[:500],
+                },
+            )
         return _parse_name_status_z(result.stdout, max_files=max_files)
 
     async def _read_head_sha(self, target: Path) -> Optional[str]:

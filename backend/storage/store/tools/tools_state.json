@@ -7,5 +7,5 @@
   "ask_human": true,
   "file_saver": true,
   "http_fetch": true,
-  "browser_interactive": false
+  "browser_interactive": true
 }

@@ -208,10 +208,13 @@ ALLOWED_TRANSITIONS: Dict[OperationStatus, FrozenSet[OperationStatus]] = {
             OperationStatus.APPROVED,
         }
     ),
+    # NOTE: PUSHED is NOT a terminal status. It is the last state of
+    # the local happy path, from which the operation may either
+    # create a change request (CHANGE_REQUEST_CREATED) or stop. It
+    # may also fail transiently or terminally. See TERMINAL_STATUSES
+    # above for the canonical list of terminal states.
     OperationStatus.PUSHED: frozenset(
         {
-            # After a successful push, the operation may create a
-            # change request or stop here.
             OperationStatus.CHANGE_REQUEST_CREATED,
             OperationStatus.FAILED_RETRYABLE,
             OperationStatus.FAILED_FINAL,
@@ -256,13 +259,6 @@ ALLOWED_TRANSITIONS: Dict[OperationStatus, FrozenSet[OperationStatus]] = {
         }
     ),
     # Terminal statuses have no outgoing transitions.
-    OperationStatus.PUSHED: frozenset(
-        {
-            OperationStatus.CHANGE_REQUEST_CREATED,
-            OperationStatus.FAILED_RETRYABLE,
-            OperationStatus.FAILED_FINAL,
-        }
-    ),
     OperationStatus.CHANGE_REQUEST_CREATED: frozenset(),
     OperationStatus.CANCELLED: frozenset(),
     OperationStatus.FAILED_FINAL: frozenset(),
@@ -356,6 +352,8 @@ def allowed_next_statuses(
     Empty for terminal statuses.
     """
     return ALLOWED_TRANSITIONS.get(status, frozenset())
+
+
 # ---------------------------------------------------------------------------
 # Backward-compatibility aliases
 # ---------------------------------------------------------------------------

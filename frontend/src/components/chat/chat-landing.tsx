@@ -10,14 +10,13 @@ import {
   Paperclip,
   Sparkles,
   ArrowUp,
-  Layout,
-  Globe,
-  Palette,
-  Gamepad2,
   FileText,
   X,
   Maximize2,
   Minimize2,
+  Globe,
+  GitFork,
+  Info,
 } from "lucide-react";
 import { AgentSelector } from "./agent-selector";
 import { ActiveToolsModal } from "./active-tools-modal";
@@ -27,39 +26,7 @@ import { inferModelCapabilities, fetchServerMetadata } from "@/lib/modelMetadata
 import { LexicalEditorComponent } from "./composer/lexical-editor";
 import { LexicalEditorHandle } from "./composer/types";
 import { commandRegistry } from "./composer/registry/command-registry";
-
-interface QuickPill {
-  label: string;
-  icon: React.ReactNode;
-  prompt: string;
-}
-
-const QUICK_PILLS: QuickPill[] = [
-  {
-    label: "Create slides",
-    icon: <Layout size={13} />,
-    prompt:
-      "Create an interactive presentation in HTML with modern slide navigation and CSS styling, then terminate.",
-  },
-  {
-    label: "Build website",
-    icon: <Globe size={13} />,
-    prompt:
-      "Build a responsive modern single-page website in HTML and Tailwind CSS with a clean hero section and pricing cards, then terminate.",
-  },
-  {
-    label: "Design",
-    icon: <Palette size={13} />,
-    prompt:
-      "In workspace, create an animated SVG dashboard widget with modern cards and dark mode styling, then terminate.",
-  },
-  {
-    label: "Create games",
-    icon: <Gamepad2 size={13} />,
-    prompt:
-      "Create a playable HTML5 canvas retro game with keyboard controls, sound effects, and score tracking, then terminate.",
-  },
-];
+import { useChatStore } from "@/stores/chat-store";
 
 interface ChatLandingProps {
   inputValue: string;
@@ -85,6 +52,17 @@ export function ChatLanding({
   const [isLandingDragging, setIsLandingDragging] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
 
+  // Web Search: temporary per-message toggle, chat mode only.
+  const [webSearchEnabled, setWebSearchEnabled] = useState(false);
+
+  // Multi-Agent Delegation Toggle State
+  const [delegationAllowed, setDelegationAllowed] = useAppStorage(
+    "peldrun_delegation_allowed" as Parameters<typeof useAppStorage>[0]
+  );
+
+  const { selectedAgentId } = useChatStore();
+  const isTeamLead = (selectedAgentId || "peldrun").toLowerCase() === "peldrun";
+
   // Multi-tier storage state synchronization
   const [activeModel, setActiveModel] = useAppStorage("active_model");
   const [activeProvider, setActiveProvider] = useAppStorage("active_provider");
@@ -96,18 +74,15 @@ export function ChatLanding({
 
   // Dynamically register active built-in agent mentions for autocomplete
   useEffect(() => {
-
-  const unregisterPeldrun = commandRegistry.registerMentionItem({
-    id: "agent-peldrun",
-    label: "@peldrun",
-    description: "Autonomous Master Agent",
-    category: "agent",
-    insertText: "`peldrun` ",        // ← [FIX-1.5] بدون @
-    mentionToken: "peldrun",          // ← [FIX-1.5] صريح
-    metadata: {
-      agentId: "peldrun",
-    },
-  });
+    const unregisterPeldrun = commandRegistry.registerMentionItem({
+      id: "agent-peldrun",
+      label: "@peldrun",
+      description: "Autonomous Master Agent",
+      category: "agent",
+      insertText: "`peldrun` ",
+      mentionToken: "peldrun",
+      metadata: { agentId: "peldrun" },
+    });
     return () => {
       unregisterPeldrun();
     };
@@ -128,7 +103,6 @@ export function ChatLanding({
         if (e.detail?.model) setActiveModel(e.detail.model);
         if (e.detail?.provider_name) setActiveProvider(e.detail.provider_name);
       };
-
       window.addEventListener("omweb:model-change", onModelChange);
       return () => window.removeEventListener("omweb:model-change", onModelChange);
     }
@@ -160,12 +134,17 @@ export function ChatLanding({
     const payloadOverride = {
       is_reasoning_model: isReasoningSupported,
       reasoning_effort: isReasoningSupported ? (reasoningEffort || "none") : "none",
+      // Attach web search flag (chat mode only)
+      ...(execMode === "chat" && { web_search_enabled: webSearchEnabled }),
+      // Attach delegation flag (agent mode only)
+      ...(execMode === "agent" && { delegation_allowed: delegationAllowed }),
     };
 
     onStartTask(textToRun, payloadOverride, landingAttachedFiles);
     landingEditorRef.current?.clear();
     setInputValue("");
     setLandingAttachedFiles([]);
+    setWebSearchEnabled(false); // Reset after dispatch
   };
 
   const dynamicPlaceholder =
@@ -252,31 +231,37 @@ export function ChatLanding({
       >
         {/* Attached Files Badges Container */}
         {landingAttachedFiles.length > 0 && (
-          <div className="flex flex-wrap gap-2 mb-2 pb-2 border-b border-border/40">
-            {landingAttachedFiles.map((file, idx) => (
-              <div
-                key={`${file.name}-${idx}`}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs bg-muted/60 border border-border shadow-xs text-foreground animate-in fade-in"
-              >
-                <FileText size={13} className="text-primary shrink-0" />
-                <span className="font-medium truncate max-w-[160px]" title={file.name}>
-                  {file.name}
-                </span>
-                <span className="text-[10px] text-muted-foreground font-mono">
-                  ({formatFileSize(file.size)})
-                </span>
-                <button
-                  type="button"
-                  onClick={() =>
-                    setLandingAttachedFiles((prev) => prev.filter((_, i) => i !== idx))
-                  }
-                  className="p-0.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer ml-1"
-                  title="Remove file"
+          <div className="flex flex-col border-b border-border/40 bg-muted/20 mb-2 pb-1">
+            <div className="flex flex-wrap gap-2 p-2.5 pb-1">
+              {landingAttachedFiles.map((file, idx) => (
+                <div
+                  key={`${file.name}-${idx}`}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs bg-muted/60 border border-border shadow-xs text-foreground animate-in fade-in"
                 >
-                  <X size={12} />
-                </button>
-              </div>
-            ))}
+                  <FileText size={13} className="text-primary shrink-0" />
+                  <span className="font-medium truncate max-w-[160px]" title={file.name}>
+                    {file.name}
+                  </span>
+                  <span className="text-[10px] text-muted-foreground font-mono">
+                    ({formatFileSize(file.size)})
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setLandingAttachedFiles((prev) => prev.filter((_, i) => i !== idx))
+                    }
+                    className="p-0.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer ml-1"
+                    title="Remove file"
+                  >
+                    <X size={12} />
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div className="px-2.5 pb-1.5 text-[10px] text-muted-foreground/70 flex items-center gap-1">
+              <Info size={10} className="shrink-0" />
+              <span>Unsent attachments are held in memory and upload upon confirmed task submission.</span>
+            </div>
           </div>
         )}
 
@@ -296,7 +281,6 @@ export function ChatLanding({
                 ? "min-h-[220px] max-h-[480px] px-2 py-2 leading-relaxed"
                 : "min-h-[72px] max-h-[220px] px-1 py-1 leading-relaxed"
             }
-
             placeholderClassName={isExpanded ? "px-2 py-2" : "px-1 py-1"}
             className="w-full bg-card"
             onClearEditor={() => {
@@ -321,16 +305,6 @@ export function ChatLanding({
               )}
             </button>
 
-            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-muted/60 text-muted-foreground border border-border">
-              <Sparkles
-                size={12}
-                className={execMode === "agent" ? "text-emerald-500" : "text-sky-500"}
-              />
-              <span className="font-mono text-[11px] font-semibold text-foreground">
-                {execMode === "agent" ? "Agent Mode" : "Chat Mode"}
-              </span>
-            </span>
-
             {/* Dynamic Reasoning Effort Selector */}
             {isReasoningSupported && (
               <div className="animate-in fade-in zoom-in-95 duration-200">
@@ -338,11 +312,61 @@ export function ChatLanding({
               </div>
             )}
 
-            {/* Agent Selector & Active Tools Modal: Visible ONLY when execMode === 'agent' */}
+            {/* Web Search Toggle (Chat Mode Only) */}
+            {execMode === "chat" && (
+              <button
+                type="button"
+                onClick={() => setWebSearchEnabled((v) => !v)}
+                className={`flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium border transition-all cursor-pointer ${
+                  webSearchEnabled
+                    ? "bg-primary/15 border-primary/40 text-primary shadow-xs"
+                    : "bg-card hover:bg-muted border-border text-muted-foreground"
+                }`}
+                title={
+                  webSearchEnabled
+                    ? "Web Search: ENABLED for the next message only"
+                    : "Web Search: disabled. Click to enable for the next message."
+                }
+              >
+                <Globe size={12} className={webSearchEnabled ? "text-primary" : "text-muted-foreground"} />
+                <span className="text-[11px]">Web Search</span>
+              </button>
+            )}
+
+            {/* Agent Selector, Tools, & Delegation (Agent Mode Only) */}
             {execMode === "agent" && (
               <div className="animate-in fade-in duration-150 flex items-center gap-1.5 z-50">
                 <AgentSelector />
                 <ActiveToolsModal />
+
+                {/* Delegation Toggle with Strict Role Governance */}
+                {isTeamLead ? (
+                  <button
+                    type="button"
+                    onClick={() => setDelegationAllowed(!delegationAllowed)}
+                    className={`flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium border transition-all cursor-pointer ${
+                      delegationAllowed
+                        ? "bg-primary/15 border-primary/40 text-primary shadow-xs"
+                        : "bg-card hover:bg-muted border-border text-muted-foreground"
+                    }`}
+                    title={
+                      delegationAllowed
+                        ? "Multi-Agent Delegation: ENABLED (Leader can delegate subtasks)"
+                        : "Multi-Agent Delegation: DISABLED (Single agent execution only)"
+                    }
+                  >
+                    <GitFork size={12} className={delegationAllowed ? "text-primary" : "text-muted-foreground"} />
+                    <span className="text-[11px]">Delegation</span>
+                  </button>
+                ) : (
+                  <div
+                    className="flex items-center gap-1 px-2 py-1 rounded-md text-xs border border-border/40 bg-muted/30 text-muted-foreground/50 cursor-not-allowed select-none"
+                    title="Delegation is strictly restricted to Team Lead ('peldrun'). Manual specialists cannot delegate."
+                  >
+                    <GitFork size={12} />
+                    <span className="text-[11px]">Solo</span>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -370,21 +394,6 @@ export function ChatLanding({
             </button>
           </div>
         </div>
-      </div>
-
-      {/* Quick Pills Container */}
-      <div className="flex flex-wrap items-center justify-center gap-2 mt-6 -z-1">
-        {QUICK_PILLS.map((pill, idx) => (
-          <button
-            key={idx}
-            type="button"
-            onClick={() => handleDispatch(pill.prompt)}
-            className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full border border-border bg-card/60 hover:bg-muted text-xs text-foreground transition-all cursor-pointer shadow-peldrun-xs"
-          >
-            <span className="text-muted-foreground">{pill.icon}</span>
-            <span>{pill.label}</span>
-          </button>
-        ))}
       </div>
     </div>
   );

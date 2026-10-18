@@ -171,10 +171,42 @@ class CreateOperationRequest(BaseSCRequest):
     @field_validator("operation_type")
     @classmethod
     def validate_op_type(cls, v: str) -> str:
+        """
+        Normalize and validate the operation type.
+
+        The set of allowed values mirrors the operation kinds the
+        application actually dispatches through the source-control
+        dispatcher (see ``SourceControlTool._ACTION_MAP``), not just
+        the three remote-write kinds that were originally hard-coded.
+        Both local operations (``create_workspace``, ``create_branch``,
+        ``inspect_diff``, ``run_checks``) and remote-write operations
+        (``push_branch``, ``create_change_request``,
+        ``merge_change_request``, ``request_approval``) are accepted so
+        that callers can register a durable operation of any of these
+        kinds.
+
+        The dispatch layer is still responsible for refusing an
+        operation whose kind is not implemented — this validator only
+        rejects clearly malformed values.
+        """
         clean = v.strip().lower()
-        allowed = {"push_branch", "create_change_request", "merge_change_request"}
+        allowed = {
+            # Local operations
+            "create_workspace",
+            "create_branch",
+            "inspect_diff",
+            "run_checks",
+            # Remote-write operations
+            "request_approval",
+            "push_branch",
+            "create_change_request",
+            "merge_change_request",
+        }
         if clean not in allowed:
-            raise ValueError(f"Invalid operation_type '{v}'. Must be one of: {sorted(allowed)}")
+            raise ValueError(
+                f"Invalid operation_type '{v}'. "
+                f"Must be one of: {sorted(allowed)}"
+            )
         return clean
 
     @field_validator("target_branch")
