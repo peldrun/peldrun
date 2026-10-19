@@ -78,6 +78,7 @@ export interface ChatThreadProps {
   onPauseJob?: () => void;
   onResumeJob?: () => void;
   onRegenerate?: (turnIndex: number, turn?: ChatTurn) => void;
+  onOpenReview?: (operationId: string) => void;
 }
 
 export const HUMAN_TOOL_NAMES = new Set(["ask_human", "human_input"]);

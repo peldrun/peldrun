@@ -9,6 +9,9 @@
 
 import type { AttachedUserFile } from "./types";
 
+import { StepEvent } from "../chat-timeline";
+import { OperationResponse } from "@/features/source-control/api/schemas";
+
 /**
  * Splits a raw prompt into its human-readable display text and a list of
  * attached files. This handles two attachment sources:
@@ -105,4 +108,38 @@ export function resolveFileCategory(fileName: string, customUrl?: string) {
     isCode,
     previewUrl,
   };
+}
+
+
+export function extractOperationFromSteps(steps: StepEvent[]): OperationResponse | null {
+  for (const step of steps) {
+    if (step.toolName === "source_control" && step.type === "observation") {
+      try {
+        const data = typeof step.content === "string" ? JSON.parse(step.content) : step.content;
+        if (data?.approval_id && data?.operation_id) {
+          return {
+            operation_id: data.operation_id,
+            operation_type: data.operation || "push_branch",
+            provider: "github",
+            repository_id: "unknown",
+            target_branch: data.target_branch || "main",
+            current_state: "review_required",
+            approval_id: data.approval_id,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            events: [],
+          };
+        }
+      } catch (e) {
+        // Ignore JSON parse errors
+      }
+    }
+  }
+  return null;
+}
+
+export function filterApprovalSteps(steps: StepEvent[]): StepEvent[] {
+  return steps.filter(
+    (s) => !(s.toolName === "source_control" && s.type === "observation" && s.content.includes("approval_id"))
+  );
 }

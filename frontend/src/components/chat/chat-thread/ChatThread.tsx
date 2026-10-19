@@ -28,6 +28,9 @@ import { LiveStatusIndicator } from "./LiveStatusIndicator";
 import { useHumanToolDetection } from "./useHumanToolDetection";
 import type { ChatThreadProps } from "./types";
 
+import { ChatOperationCard } from "@/features/source-control/components/ChatOperationCard";
+import { extractOperationFromSteps, filterApprovalSteps } from "./utils";
+
 /**
  * Groups visible step events by their numeric step index.
  *
@@ -82,8 +85,12 @@ export function ChatThread({
   onPauseJob,
   onResumeJob,
   onRegenerate,
+  onOpenReview,
 }: ChatThreadProps) {
   const activePromptAnchorRef = useRef<HTMLDivElement | null>(null);
+
+
+
 
   // Auto-scroll to the active prompt anchor when a new prompt is submitted.
   useEffect(() => {
@@ -121,6 +128,13 @@ export function ChatThread({
     );
 
   const activeApprovalList = Object.values(pendingApprovals || {});
+
+  const activeOperation = extractOperationFromSteps(activeStepsList);
+  const filteredGroupedSteps = Object.fromEntries(
+    Object.entries(activeGroupedSteps || {})
+      .map(([stepNum, steps]) => [stepNum, filterApprovalSteps(steps)])
+      .filter(([_, steps]) => (steps as StepEvent[]).length > 0)
+  );
 
   return (
     <div className="flex-1 overflow-y-auto p-4 sm:p-5 font-sans">
@@ -161,11 +175,10 @@ export function ChatThread({
 
         {/* Active Stepper (Agent Mode) */}
         {execMode === "agent" &&
-          activeGroupedSteps &&
-          Object.keys(activeGroupedSteps).length > 0 && (
+          Object.keys(filteredGroupedSteps).length > 0 && (
             <ChatTimeline
               prefix="active"
-              groupedSteps={activeGroupedSteps}
+              groupedSteps={filteredGroupedSteps}
               isCurrentActive={true}
               currentStepNum={currentStepNum}
               isRunning={status === "running"}
@@ -173,6 +186,13 @@ export function ChatThread({
               toggleStep={toggleStep}
             />
           )}
+
+        {activeOperation && onOpenReview && (
+          <ChatOperationCard
+            operation={activeOperation}
+            onOpenReview={onOpenReview}
+          />
+        )}
 
         {/* Active Delegation Approval Cards */}
         {activeApprovalList.length > 0 && onApproveDelegation && onRejectDelegation && (

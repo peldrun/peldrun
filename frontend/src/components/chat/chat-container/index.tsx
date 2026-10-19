@@ -23,6 +23,7 @@ import {
 import type { StepEvent } from "@/components/chat/chat-timeline";
 import type { EngineOption } from "@/components/chat/engine-selector";
 import { useChatStore } from "@/stores/chat-store";
+import { useSourceControlStore } from "@/features/source-control/state/source-control-store";
 import { useAppStorage } from "@/hooks/use-app-storage";
 import { inferModelCapabilities } from "@/lib/modelMetadata";
 
@@ -106,6 +107,15 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   const metadataVault = useMetadataVault();
   const [elapsedSeconds, setElapsedSeconds] = useElapsedTimer(status as any);
   const { producedFiles, setProducedFiles, fetchJobFiles } = useJobFiles();
+
+  const handleOpenReview = useCallback(
+    (operationId: string) => {
+      useSourceControlStore.setState({ activeOperationId: operationId });
+      useSourceControlStore.getState().openPanel("source-control");
+      setShowRightPanel(true);
+    },
+    [setShowRightPanel]
+  );
 
   // Refs mirror fast-changing state so SSE handlers always read the latest
   // value rather than a closure-captured snapshot.
@@ -1012,6 +1022,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
             onPauseJob={handlePauseTask}
             onResumeJob={handleResumeTask}
             onRegenerate={handleRegenerate}
+            onOpenReview={handleOpenReview}
           />
         )}
 
