@@ -403,17 +403,59 @@ class GitWorkspaceManager:
 
     async def cleanup_orphans(self) -> Dict[str, Any]:
         """
-        Prune registry entries whose `workspace_path` no longer
-        exists on disk. Companion of the chat storage engine's
-        `sweep_orphaned_storage()`: that method handles files, this
-        one handles the source-control registry.
+        Prune registry entries whose workspace is no longer usable.
+
+        A workspace is pruned when any of the following is true:
+
+            1. Its `workspace_path` does not exist on disk
+               (canonical orphan: chat or project was deleted).
+            2. The path exists but is not a Git repository (no
+               `.git` directory) AND no `.peldrun/workspace.json`
+               marker is present. This catches "partial deletes"
+               where `shutil.rmtree(ignore_errors=True)` was used
+               and silently left a directory shell behind.
+
+        Companion of the chat storage engine's
+        `sweep_orphaned_storage()`: that method handles the
+        physical storage tree, this one handles the source-control
+        registry. The two are intentionally decoupled so this
+        method never needs to know how the chat storage engine
+        performed the deletion.
         """
         removed: List[str] = []
+        pruned_reasons: Dict[str, int] = {
+            "path_missing": 0,
+            "broken_workspace": 0,
+        }
+
         with self._lock:
             for ws_id, ws in list(self._workspaces.items()):
-                if not Path(ws.workspace_path).exists():
+                ws_path = Path(ws.workspace_path)
+
+                # Case 1: physical directory gone.
+                if not ws_path.exists():
                     del self._workspaces[ws_id]
                     removed.append(ws_id)
+                    pruned_reasons["path_missing"] += 1
+                    continue
+
+                # Case 2: directory exists but it is no longer a
+                # valid workspace. Detect via the two independent
+                # indicators the manager itself writes:
+                #   - a `.git` directory (set up by materialization)
+                #   - a `.peldrun/workspace.json` marker
+                # If neither is present, the directory is a
+                # post-delete remnant and must be pruned.
+                git_dir = ws_path / ".git"
+                has_git = git_dir.exists() and git_dir.is_dir()
+                has_marker = self._read_workspace_marker(
+                    ws_path
+                ) is not None
+                if not has_git and not has_marker:
+                    del self._workspaces[ws_id]
+                    removed.append(ws_id)
+                    pruned_reasons["broken_workspace"] += 1
+
             if removed:
                 self._save_registry()
             remaining = len(self._workspaces)
@@ -423,6 +465,7 @@ class GitWorkspaceManager:
             "removed_ids": removed,
             "remaining_count": remaining,
             "registry_path": str(self._registry_path),
+            "pruned_reasons": pruned_reasons,
         }
 
     # --- Workspace marker (.peldrun/workspace.json) ---------------------
@@ -1749,6 +1792,30 @@ class GitWorkspaceManager:
     ) -> str:
         """
         Return the current HEAD SHA, or `fallback` when unavailable.
+
+        Returns `fallback` when any of the following is true:
+
+            - The `git rev-parse` subprocess exits with a non-zero
+              status.
+            - The captured stdout is empty.
+            - The captured stdout is not a valid 40- or 64-character
+              hexadecimal commit SHA.
+
+        The SHA-format check is critical and MUST NOT be removed.
+        On a repository with an unborn HEAD (no commits yet),
+        `git rev-parse HEAD` exits with status 128 and echoes the
+        literal string `"HEAD"` to stdout, alongside a fatal error
+        on stderr. Without this validation, that string is treated
+        as a valid commit SHA, propagates into the workspace's
+        `base_sha`, and breaks every downstream `git diff <base_sha>`
+        call: "HEAD" is a movable reference, so once `request_approval`
+        commits the staged changes, `git diff HEAD` compares the
+        just-committed tree to itself and returns an empty diff —
+        which surfaces to the agent as "No changes detected",
+        causing an infinite retry loop that only the operator can
+        stop. Returning `fallback` here lets `_materialize` proceed
+        to its empty-commit bootstrap path, which produces a real
+        SHA that the downstream code can diff against.
         """
         try:
             result = await self._git.run(
@@ -1758,8 +1825,29 @@ class GitWorkspaceManager:
             )
         except GitExecutionError:
             return fallback
+
+        # Reject any non-zero exit. `check_returncode=False` above
+        # exists only to suppress the exception on a normal
+        # "unborn HEAD" call; the caller still needs the exit code.
+        if getattr(result, "returncode", 0) != 0:
+            return fallback
+
         sha = result.stdout.strip()
-        return sha or fallback
+        if not sha:
+            return fallback
+
+        # Validate the SHA shape: 40 hex (SHA-1) or 64 hex
+        # (SHA-256). Anything else — "HEAD", "refs/heads/main",
+        # an abbreviated ref, a tag name, etc. — is a symbolic
+        # reference, NOT a commit SHA, and MUST NOT be stored as
+        # `base_sha` or `head_sha`.
+        lowered = sha.lower()
+        if len(lowered) not in (40, 64):
+            return fallback
+        if any(c not in "0123456789abcdef" for c in lowered):
+            return fallback
+
+        return sha
 
     # --- Internal: cleanup ---------------------------------------------
 

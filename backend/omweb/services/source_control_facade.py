@@ -2693,14 +2693,61 @@ class SourceControlFacade:
                 workspace_path=ws_ref.workspace_path,
             )
         except Exception as exc:
+            # Surface the real diagnostic. Without this block, the
+            # router maps every uncaught exception to a generic 500
+            # "Internal server error", which tells neither the agent
+            # nor the operator *why* the push failed. The most common
+            # causes are: a server-side hook rejection, an expired
+            # token, a non-fast-forward update, or an invalid
+            # argument passed to `git push`. The stderr captured by
+            # `GitPushManager` is the only place these causes are
+            # visible, so log it and propagate it into the operation
+            # record's metadata and the raised SourceControlError.
+            logger.exception(
+                "Push failed for operation '%s' (workspace '%s', "
+                "branch '%s'): %s",
+                operation_id,
+                record.workspace_id,
+                consumed.target_branch,
+                type(exc).__name__,
+            )
+
+            details = getattr(exc, "details", {}) or {}
+            stderr_snippet = ""
+            if isinstance(details, dict):
+                stderr_snippet = str(details.get("stderr", ""))[:800]
+            stderr_snippet = redact_text(stderr_snippet)
+
+            reason_text = (
+                f"Push failed: {type(exc).__name__}. "
+                f"{str(exc)}"
+            )
+            if stderr_snippet:
+                reason_text += f"\n\nstderr: {stderr_snippet}"
+
             await self.operation_service.transition(
                 operation_id,
                 OperationStatus.FAILED_RETRYABLE,
-                reason=f"Push failed: {type(exc).__name__}",
-                metadata={"error": type(exc).__name__},
+                reason=reason_text,
+                metadata={
+                    "error": type(exc).__name__,
+                    "stderr": stderr_snippet,
+                    "detail_message": str(exc)[:500],
+                },
                 actor="system",
             )
-            raise
+            # Re-raise as SourceControlError so the router maps it to
+            # a specific HTTP status (not a generic 500) and includes
+            # the stderr in the response body where the UI and the
+            # agent can see it.
+            raise SourceControlError(
+                reason_text,
+                details={
+                    "underlying_error": type(exc).__name__,
+                    "workspace_id": record.workspace_id,
+                    "branch": consumed.target_branch,
+                },
+            ) from exc
 
         if not push_result.accepted:
             await self.operation_service.transition(

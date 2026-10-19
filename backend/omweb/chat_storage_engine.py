@@ -448,6 +448,56 @@ class ChatStorageEngine:
 
         return target_chat
 
+    @staticmethod
+    def _force_rmtree(target: Path) -> bool:
+        """
+        Remove a directory tree robustly on Windows.
+
+        The naive `shutil.rmtree(path, ignore_errors=True)` silently
+        swallows failures caused by locked or read-only files, which
+        on Windows commonly leaves the root directory in place with
+        fragments inside it (notably `.git/objects/pack/*.pack`,
+        which antivirus and git background processes hold open).
+        The chat then reports "deleted" even though its directory
+        survives, and downstream cleanup (source-control workspace
+        registry, artifact index) sees a ghost entry.
+
+        This implementation retries the failed entries after clearing
+        the read-only bit. It returns True when the target directory
+        no longer exists afterwards, False otherwise. Callers SHOULD
+        use the return value to decide whether the delete actually
+        succeeded.
+        """
+        import stat as _stat
+
+        if not target.exists():
+            return True
+
+        def _on_error(func, path, exc_info):
+            # Windows: files often come back read-only after git or
+            # an antivirus touched them. Clear the bit and retry
+            # exactly once.
+            try:
+                os.chmod(path, _stat.S_IWRITE | _stat.S_IREAD)
+                func(path)
+            except Exception:
+                pass
+
+        try:
+            shutil.rmtree(target, onerror=_on_error)
+        except Exception:
+            pass
+
+        # A second pass catches residual directories whose children
+        # were released after the first attempt.
+        if target.exists():
+            try:
+                shutil.rmtree(target, onerror=_on_error)
+            except Exception:
+                pass
+
+        return not target.exists()
+
     def deep_delete_chat(self, chat_id: str) -> Dict[str, Any]:
         """Deep delete: wipes chat directory (including session.json and session.context.json)."""
         idx = project_manager._read_index()
@@ -463,6 +513,7 @@ class ChatStorageEngine:
         target_ids: Set[str] = {t for t in [chat_id, job_id] if t}
 
         deleted_paths: List[str] = []
+        failed_paths: List[str] = []
         freed_bytes: int = 0
 
         candidate_chat_folders = [
@@ -480,10 +531,16 @@ class ChatStorageEngine:
                                 freed_bytes += (Path(root) / f).stat().st_size
                             except Exception:
                                 pass
-                    shutil.rmtree(cf, ignore_errors=True)
+                    if not self._force_rmtree(cf):
+                        failed_paths.append(str(cf))
+                        continue
                 else:
                     freed_bytes += cf.stat().st_size
-                    cf.unlink(missing_ok=True)
+                    try:
+                        cf.unlink(missing_ok=True)
+                    except Exception:
+                        failed_paths.append(str(cf))
+                        continue
                 deleted_paths.append(str(cf))
 
         candidate_ws_folders = [
@@ -500,7 +557,9 @@ class ChatStorageEngine:
                             freed_bytes += (Path(root) / f).stat().st_size
                         except Exception:
                             pass
-                shutil.rmtree(ws, ignore_errors=True)
+                if not self._force_rmtree(ws):
+                    failed_paths.append(str(ws))
+                    continue
                 deleted_paths.append(str(ws))
 
         idx["chats"] = [
@@ -513,12 +572,23 @@ class ChatStorageEngine:
         purged_jobs_count = self._purge_from_jobs_json(target_ids)
 
         return {
-            "status": "ok",
+            "status": "ok" if not failed_paths else "partial",
             "chat_id": chat_id,
             "job_id": job_id,
             "purged_jobs_records": purged_jobs_count,
             "freed_bytes": freed_bytes,
-            "deleted_paths": deleted_paths
+            "deleted_paths": deleted_paths,
+            "failed_paths": failed_paths,
+            "message": (
+                "Session purged."
+                if not failed_paths
+                else (
+                    "Session partially purged. "
+                    f"{len(failed_paths)} path(s) could not be "
+                    "removed (likely locked by another process); "
+                    "they will be cleaned up by the next sweep."
+                )
+            ),
         }
 
     def delete_all_chats(self) -> Dict[str, Any]:

@@ -103,11 +103,25 @@ LS_REMOTE_TIMEOUT_SECONDS: int = 30
 #:     '*' new branch
 #:     '!' rejected
 #:     '=' up to date
+#:
+#: The format documented by `git help push` is EXACTLY:
+#:
+#:     <flag>\t<from>:<to>\t<summary> (<reason>)
+#:
+#: That is two TAB separators and THREE fields, not four. The
+#: previous regex expected `<flag>\t<from>\t<to>\t<summary>`,
+#: which never matches real output. As a consequence every
+#: successful push (returncode 0, `* [new branch]` in the actual
+#: git output) was parsed as `UNKNOWN`, and the facade then
+#: rejected the operation with a 500 "Push was rejected: unknown"
+#: even though the branch had already been created on the remote.
+#:
+#: `<from>` may be empty for a ref deletion (`:refs/heads/x`), so
+#: the capture group is `[^:\t]*` (zero or more) rather than `+`.
 _PUSH_PORCELAIN_LINE = re.compile(
     r"^(?P<flag>[ +\-*!=])\t"
-    r"(?P<local_ref>[^\t]+)"
-    r"\t(?P<remote_ref>[^\t]+)"
-    r"\t(?P<summary>.+)$"
+    r"(?P<from>[^:\t]*):(?P<to>[^\t]+)\t"
+    r"(?P<summary>.+)$"
 )
 
 #: Extracts the reason inside `[...]` or `(...)` in a porcelain line.
@@ -257,13 +271,25 @@ class GitPushManager(PushPort):
             )
 
         # Build the refspec and the argument list.
+        #
+        # NOTE: `git push` does NOT support a `--no-color` flag. That
+        # option exists only on subcommands like `git diff` and `git
+        # log`; passing it to `git push` makes git exit immediately
+        # with `error: unknown option 'no-color'` (exit 129), before
+        # any network call is attempted. The previous version of
+        # this method included it, which caused every push to fail
+        # with a `CommandFailedError` whose message carried only the
+        # opaque `error: unknown option 'no-color'` string. Colors
+        # are now disabled via the `color.ui=false` config override
+        # prepended below, which works on every git version.
         refspec = f"{local_branch}:{destination}"
         args: List[str] = [
+            "-c",
+            "color.ui=false",
             "push",
             "--porcelain",
             "--atomic",
             "--no-thin",
-            "--no-color",
         ]
         if set_upstream:
             args.append("--set-upstream")
@@ -318,13 +344,41 @@ class GitPushManager(PushPort):
                 local_branch=local_branch,
             )
 
+        if returncode == 0 and outcome == PushOutcome.UNKNOWN:
+            # The git command itself succeeded (returncode 0), but
+            # the porcelain parser did not recognize any flag in
+            # the output. This can happen when a future or
+            # non-standard git version emits a porcelain variant
+            # the regex does not cover. The safe default is to
+            # treat it as a successful push: the command exited 0,
+            # no rejection marker was seen, and stderr was empty
+            # (otherwise the classifier above would have caught
+            # `[rejected]` in the summary). Marking this as
+            # failure would surface a spurious 500 on a push that
+            # actually landed on the remote — which is exactly the
+            # bug the previous porcelain regex produced.
+            logger.warning(
+                "Push exited 0 but porcelain output was not "
+                "recognized (%d bytes stdout). Treating as success. "
+                "First 200 bytes: %r",
+                len(stdout),
+                stdout[:200],
+            )
+            outcome = PushOutcome.PUSHED
+
         if returncode != 0 and outcome == PushOutcome.UNKNOWN:
-            # Nothing matched; treat as a generic failure.
+            # Non-zero exit with no recognizable outcome. The most
+            # likely cause is an error before any ref was
+            # transferred (e.g., bad remote, bad credentials).
+            # Raise with the stderr so the caller sees the actual
+            # reason instead of a generic "Git push failed."
             raise CommandFailedError(
                 "Git push failed.",
                 details={
                     "returncode": returncode,
-                    "stderr": redact_text(stderr)[:500],
+                    "stderr": redact_text(stderr)[:2000],
+                    "stdout": redact_text(stdout)[:500],
+                    "argv": list(args),
                 },
             )
 
@@ -392,10 +446,15 @@ class GitPushManager(PushPort):
 
         target = self._resolve_workspace_path(workspace_path, workspace_id)
 
+        # `git push` does not accept `--no-color`; see the note in
+        # `push_branch` above. Disable colors via the config
+        # override, which is a global option handled by the parent
+        # `git` command rather than the `push` subcommand.
         args = [
+            "-c",
+            "color.ui=false",
             "push",
             "--porcelain",
-            "--no-color",
             remote,
             f":refs/heads/{remote_branch}",
         ]
@@ -655,9 +714,18 @@ class GitPushManager(PushPort):
         """
         Parse `git push --porcelain` output.
 
-        Returns a list of `(flag, local_ref, remote_ref, summary)`
-        tuples. Lines that do not match the porcelain format (e.g.
-        the `To <url>` header) are skipped.
+        Returns a list of `(flag, from_ref, to_ref, summary)` tuples.
+        Lines that do not match the porcelain format (e.g. the
+        `To <url>` header line, which does not begin with a valid
+        status flag) are skipped.
+
+        The mapping from porcelain fields to this tuple is:
+
+            flag         <flag>       one of ' ', '+', '-', '*', '!', '='
+            from_ref     <from>       source ref (may be empty for deletes)
+            to_ref       <to>         destination ref
+            summary      <summary>    one-line summary, including the
+                                      optional "(<reason>)" suffix
         """
         results: List[Tuple[str, str, str, str]] = []
         for raw_line in stdout.splitlines():
@@ -667,8 +735,8 @@ class GitPushManager(PushPort):
             results.append(
                 (
                     match.group("flag"),
-                    match.group("local_ref"),
-                    match.group("remote_ref"),
+                    match.group("from"),
+                    match.group("to"),
                     match.group("summary"),
                 )
             )

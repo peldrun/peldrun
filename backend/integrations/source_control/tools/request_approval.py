@@ -162,8 +162,17 @@ class RequestApprovalTool(SourceControlTool):
                     chat_id_ctx = raw_chat.strip()
             if chat_id_ctx:
                 try:
-                    from ..git.workspace import get_default_workspace_manager
-
+                    # NOTE: get_default_workspace_manager is imported
+                    # at module level (see the top of this file). The
+                    # previous local re-import inside this block made
+                    # Python treat the name as a function-local
+                    # variable for the ENTIRE execute() method, which
+                    # caused an UnboundLocalError on the code path
+                    # that reaches `if not operation_id and
+                    # workspace_id:` below — because that path skips
+                    # this block, so the local binding never ran.
+                    # Removing the redundant local import restores
+                    # the module-level binding and fixes the crash.
                     mgr = get_default_workspace_manager()
                     candidates = [
                         ws
