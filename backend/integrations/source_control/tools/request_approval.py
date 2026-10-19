@@ -559,11 +559,20 @@ class RequestApprovalTool(SourceControlTool):
             pass
 
         # --- Return success and instruct the agent to stop -------------
+        #
+        # The payload carries the fields the UI needs to render the
+        # ChatOperationCard WITHOUT a second round-trip to the
+        # operation endpoint. Adding `repository_id` and
+        # `source_branch` here removes the "unknown" placeholder the
+        # card used to display and lets the review header show the
+        # real repository and branch names on first paint.
         return self.success_result(
             {
                 "approval_id": ticket.approval_id,
                 "operation_id": ticket.operation_id,
                 "operation": ticket.operation,
+                "repository_id": record.repository_id,
+                "source_branch": record.source_branch or "",
                 "target_branch": ticket.target_branch,
                 "status": ticket.status.value,
                 "expires_at": ticket.expires_at.isoformat(),
