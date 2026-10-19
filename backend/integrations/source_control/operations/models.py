@@ -191,6 +191,18 @@ ALLOWED_TRANSITIONS: Dict[OperationStatus, FrozenSet[OperationStatus]] = {
     OperationStatus.APPROVED: frozenset(
         {
             OperationStatus.PUSHING,
+            # Terminal successor for operations whose kind is
+            # `create_change_request`. The push flow that shares
+            # `APPROVED` as an entry point never takes this edge
+            # (it goes APPROVED -> PUSHING -> PUSHED); only the
+            # create_change_request flow does, and it does so in a
+            # single step after the approval is consumed. Without
+            # this edge, every change-request creation raises
+            # `ConflictError` at the final transition and the record
+            # is stuck in APPROVED — while the ticket has already
+            # been consumed and the remote PR has already been
+            # created, so the record and reality disagree.
+            OperationStatus.CHANGE_REQUEST_CREATED,
             OperationStatus.BLOCKED,
             OperationStatus.FAILED_RETRYABLE,
             OperationStatus.FAILED_FINAL,

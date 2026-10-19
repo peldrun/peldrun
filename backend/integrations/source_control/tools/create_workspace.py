@@ -269,17 +269,19 @@ class CreateWorkspaceTool(SourceControlTool):
         account_id, base_url, token = auth
 
         # --- Resolve the repository reference --------------------------
+        #
+        # Always use `_resolve_repository`, which lists the caller's
+        # repositories and matches by stable ID, full name, or bare
+        # name. The previous implementation passed the raw string to
+        # `adapter.get_repository(...)` for "owner/repo" shapes; the
+        # adapter expects a `RepositoryRef`, so that call failed with
+        # a misleading "namespace and name must not be empty" error.
         try:
-            # If repository_id contains a slash (e.g., "mtaman/mtaman"),
-            # try to fetch it directly instead of searching a list.
-            if "/" in repository_id:
-                repo = await adapter.get_repository(repository_id, token=token)
-            else:
-                repo = await self._resolve_repository(
-                    adapter=adapter,
-                    repository_id=repository_id,
-                    token=token,
-                )
+            repo = await self._resolve_repository(
+                adapter=adapter,
+                repository_id=repository_id,
+                token=token,
+            )
         except Exception as exc:  # noqa: BLE001
             normalized = to_source_control_error(exc)
             return self.failure_result(
@@ -314,17 +316,56 @@ class CreateWorkspaceTool(SourceControlTool):
             or get_default_workspace_manager()
         )
 
-        # Extract chat_id from context to align workspace with session files
-        chat_id = context.run_id or context.metadata.get("chat_id")
-
+        # Resolve the target directory for the workspace.
+        #
+        # `project_dir` (from context metadata) is the canonical
+        # directory where the agent's editing tools operate: the
+        # chat's `files/` subdirectory. The adapter forwards it from
+        # `EngineRunContext.project_dir`, so it is the authoritative
+        # source for where the workspace must live. If the workspace
+        # is created anywhere else, the agent's edits and the Git
+        # repository would live in different directories and the diff
+        # would always be empty.
+        #
+        # Fallbacks (older callers that do not forward project_dir):
+        #   - chat_id (+ optional project_id): ask the project manager
+        #     for the canonical files directory. Imported lazily so
+        #     the integration layer stays independent of omweb unless
+        #     this fallback is actually used.
+        #   - Otherwise: leave target_path as None so the manager uses
+        #     its global workspace root (backward-compatible behavior
+        #     for standalone callers).
+        #
+        # The run_id MUST NOT be used: it is a per-run UUID with no
+        # relationship to the chat session.
         from pathlib import Path
-        import os
 
-        target_path = None
-        if chat_id:
-            # Construct path to the chat session's files directory
-            # Assuming standard PELDRUN storage structure: storage/chats/<chat_id>/files
-            target_path = Path(os.getcwd()) / "storage" / "chats" / chat_id / "files"
+        metadata = context.metadata or {}
+
+        target_path: Optional[Path] = None
+        project_dir_raw = metadata.get("project_dir")
+        if isinstance(project_dir_raw, str) and project_dir_raw.strip():
+            target_path = Path(project_dir_raw).resolve()
+        else:
+            fallback_chat_id = metadata.get("chat_id")
+            if isinstance(fallback_chat_id, str) and fallback_chat_id.strip():
+                try:
+                    from omweb.project_manager import project_manager
+                    fallback_project_id = metadata.get("project_id") or "default_project"
+                    if not isinstance(fallback_project_id, str) or not fallback_project_id:
+                        fallback_project_id = "default_project"
+                    target_path = project_manager.get_chat_files_dir(
+                        fallback_chat_id.strip(),
+                        fallback_project_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Could not resolve the chat files directory for "
+                        "chat_id=%r (%s); falling back to the manager's "
+                        "global workspace root.",
+                        fallback_chat_id,
+                        type(exc).__name__,
+                    )
 
         try:
             workspace = await manager.create_workspace(
@@ -340,14 +381,29 @@ class CreateWorkspaceTool(SourceControlTool):
                     "created_by": "source_control.create_workspace",
                     "operation_id": context.operation_id or "",
                     "run_id": context.run_id or "",
+                    "chat_id": metadata.get("chat_id") or "",
+                    "project_id": metadata.get("project_id") or "",
                 },
                 auth_token=token,
             )
         except Exception as exc:  # noqa: BLE001
             normalized = to_source_control_error(exc)
+            # Git failures carry the real diagnostic in `.stderr`,
+            # but `to_source_control_error` only preserves the
+            # high-level exception message ("Git command failed with
+            # exit status N"). Without the stderr, neither the agent
+            # nor the operator can tell auth errors from network
+            # errors from an invalid clone URL. Surface it directly.
+            extra = ""
+            raw_stderr = getattr(exc, "stderr", "") or ""
+            raw_stdout = getattr(exc, "stdout", "") or ""
+            if raw_stderr:
+                extra += f"\n\nstderr: {str(raw_stderr)[:800]}"
+            if raw_stdout:
+                extra += f"\n\nstdout: {str(raw_stdout)[:400]}"
             return self.failure_result(
                 error_code=normalized.code.value,
-                error_message=normalized.message,
+                error_message=normalized.message + extra,
                 metadata={
                     "provider": provider.value,
                     "repository_id": repository_id,
@@ -489,9 +545,9 @@ class CreateWorkspaceTool(SourceControlTool):
             return ToolResult.fail(
                 error_code="AUTH_REQUIRED",
                 error_message=(
-                    "The stored credential is missing or expired. "
-                    "Reconnect the provider before creating a "
-                    "workspace."
+                    "The stored credential is missing. "
+                    "Reconnect the provider from the Integrations & "
+                    "Providers page before creating a workspace."
                 ),
                 metadata={
                     "provider": provider.value,
@@ -499,6 +555,40 @@ class CreateWorkspaceTool(SourceControlTool):
                     "base_url": redact_url(chosen.base_url),
                 },
             )
+
+        # Detect token expiry before making any network call. GitHub
+        # OAuth Apps issue access tokens that expire after 8 hours by
+        # default. The TokenService returns the raw token without
+        # checking its timestamp, so an expired token would surface
+        # downstream as an opaque "GitHub rejected the credential"
+        # error. Surfacing the specific state here lets the agent ask
+        # the user to re-authorize instead of chasing a phantom auth
+        # bug.
+        token_info = token_service.get_token_info(
+            provider, chosen.account_id, chosen.base_url
+        )
+        if token_info is not None and token_info.expires_at is not None:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            expires = token_info.expires_at
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+            if expires <= now:
+                return ToolResult.fail(
+                    error_code="AUTH_REQUIRED",
+                    error_message=(
+                        "The stored OAuth token expired at "
+                        f"{expires.isoformat()}. Reconnect the "
+                        "provider from the Integrations & Providers "
+                        "page to obtain a fresh token."
+                    ),
+                    metadata={
+                        "provider": provider.value,
+                        "account_id": chosen.account_id,
+                        "base_url": redact_url(chosen.base_url),
+                        "expired_at": expires.isoformat(),
+                    },
+                )
 
         return chosen.account_id, chosen.base_url, token
 
@@ -539,12 +629,25 @@ class CreateWorkspaceTool(SourceControlTool):
         except Exception:  # noqa: BLE001
             return None
 
-        for repo in listing:
-            if (
-                isinstance(repo, RepositoryRef)
-                and repo.repository_id == repository_id
-            ):
-                return repo
+        # Match by stable ID first, then by full name ("owner/repo"),
+        # then by bare name. The order matters: a bare name can be
+        # ambiguous across accounts.
+        target = repository_id.strip()
+        for candidate in listing:
+            if not isinstance(candidate, RepositoryRef):
+                continue
+            if candidate.repository_id == target:
+                return candidate
+        for candidate in listing:
+            if not isinstance(candidate, RepositoryRef):
+                continue
+            if candidate.full_name() == target:
+                return candidate
+        for candidate in listing:
+            if not isinstance(candidate, RepositoryRef):
+                continue
+            if candidate.name == target:
+                return candidate
         return None
 
     # --- Helpers --------------------------------------------------------

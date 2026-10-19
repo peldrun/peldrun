@@ -13,6 +13,7 @@ The agent's own system_prompt, tools list, and max_steps govern its behavior.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
 import json
@@ -193,6 +194,19 @@ class PeldrunEngine(ExecutionEngine):
 
         # 2. Assemble Sanitized Prompt Context via ContextManager
         context_mgr = ContextManager(default_system_prompt=system_prompt)
+        # `include_execution=False` intentionally excludes the
+        # previous turn's execution telemetry from the initial
+        # context. `build_context_sidecar` sets
+        # `sidecar.current_execution` to `None` once the latest turn
+        # is no longer "running" (see
+        # `sidecar.extract_conversation_and_execution`), so the flag
+        # is a no-op for the common case. When the process was
+        # killed mid-turn and `current_execution` still holds stale
+        # data, hiding it prevents the agent from reasoning about
+        # tool calls that the restart already invalidated. Do not
+        # flip this to True without also gating on
+        # `sidecar.current_execution.status == "running"` — otherwise
+        # stale execution state would leak into every new turn.
         context_messages, context_usage = context_mgr.build_messages(
             sidecar=sidecar,
             current_user_message=prompt,
@@ -516,12 +530,58 @@ class PeldrunEngine(ExecutionEngine):
                 or event.type == getattr(EventType, "TOOL_COMPLETED", None)
             ):
                 obs_out = event.payload.get("output", "") or event.payload.get("error", "")
-                obs_str = str(obs_out)
+
+                # Serialize structured tool outputs as JSON, not as
+                # Python `repr`. `str({"approval_id": "x"})` produces
+                # "{'approval_id': 'x'}" (single quotes, Python repr),
+                # which `JSON.parse` on the frontend rejects. In
+                # practice peldrun-core often stringifies tool outputs
+                # BEFORE this bridge sees them, so a plain string can
+                # still be a Python repr. Handle both shapes:
+                #
+                #   - dict / list          -> json.dumps
+                #   - string beginning "{"/"[" -> try ast.literal_eval,
+                #                               then json.dumps
+                #   - everything else      -> str()
+                if isinstance(obs_out, (dict, list)):
+                    obs_str = json.dumps(
+                        obs_out, ensure_ascii=False, default=str
+                    )
+                elif isinstance(obs_out, str) and obs_out.lstrip().startswith(
+                    ("{", "[")
+                ):
+                    stripped = obs_out.strip()
+                    try:
+                        parsed = ast.literal_eval(stripped)
+                        if isinstance(parsed, (dict, list)):
+                            obs_str = json.dumps(
+                                parsed, ensure_ascii=False, default=str
+                            )
+                        else:
+                            obs_str = str(obs_out)
+                    except (ValueError, SyntaxError):
+                        obs_str = str(obs_out)
+                else:
+                    obs_str = str(obs_out)
+
                 is_tool_error = bool(
                     event.payload.get("is_error") or event.payload.get("error")
                 )
 
                 await _sync_and_dispatch_artifacts(curr_step)
+
+                # Try to recover the tool name from the event payload.
+                # peldrun-core may or may not include it depending on
+                # the version; this is best-effort. The frontend no
+                # longer requires it (see `extractOperationFromSteps`),
+                # but carrying it makes the UI able to group steps more
+                # precisely.
+                observation_tool = str(
+                    event.payload.get("tool_name")
+                    or event.payload.get("tool")
+                    or event.payload.get("toolName")
+                    or ""
+                )
 
                 await dispatch_event(
                     job_id,
@@ -531,6 +591,7 @@ class PeldrunEngine(ExecutionEngine):
                         data={
                             "output": obs_str,
                             "content": obs_str,
+                            "tool_name": observation_tool,
                             "is_error": is_tool_error,
                             "error": event.payload.get("error") if is_tool_error else None,
                             "seq": event_seq,
@@ -710,16 +771,53 @@ class PeldrunEngine(ExecutionEngine):
                 )
             return
 
-        if canonical_deliverables:
-            file_bullets = "\n".join([f"- `{f}`" for f in canonical_deliverables])
+        # Compose the final message shown to the user.
+        #
+        # The previous implementation replaced the agent's own output
+        # with a generic "Deliverables Created Successfully" block
+        # whenever any file appeared in the workspace. For source
+        # control this silently dropped the operation IDs, approval
+        # IDs, and PR URLs the agent had reported — exactly the data
+        # the user needs to complete the approval workflow. The fix
+        # preserves the agent's output as the primary message and
+        # only falls back to the deliverables block when the agent
+        # produced no meaningful output of its own.
+        agent_output = sanitize_final_result_text(
+            run_result.output, latest_meaningful_thought
+        )
+        agent_output_is_meaningful = bool(
+            agent_output and agent_output.strip()
+        )
+
+        if agent_output_is_meaningful:
+            # The agent produced a meaningful message. Keep it as the
+            # final result. The deliverables list is still visible to
+            # the UI through the ARTIFACT_CREATED SSE events and the
+            # produced_files panel, so appending it here would only
+            # add noise (especially for cloned repositories).
+            result_text = agent_output
+        elif canonical_deliverables:
+            # The agent produced no meaningful message; fall back to
+            # the deliverables block so the user still knows what was
+            # created. This matches the historical behavior for
+            # agents that only produce files (e.g. code generators)
+            # and terminate without a summary.
+            file_bullets = "\n".join(
+                [f"- `{f}`" for f in canonical_deliverables]
+            )
             result_text = (
                 f"### Deliverables Created Successfully\n\n"
-                f"The requested project files have been built and saved in your workspace:\n\n"
+                f"The requested project files have been built and "
+                f"saved in your workspace:\n\n"
                 f"{file_bullets}\n\n"
-                f"You can preview and interact with the application live in the **Preview** panel."
+                f"You can preview and interact with the application "
+                f"live in the **Preview** panel."
             )
         else:
-            result_text = sanitize_final_result_text(run_result.output, latest_meaningful_thought)
+            # Neither the agent nor the file scanner produced
+            # anything. Keep the historical behavior: propagate the
+            # (empty or thought-derived) agent output unchanged.
+            result_text = agent_output
 
         print(
             f"[ENGINE PELDRUN] Job {job_id} completed successfully in step {step_count}. "

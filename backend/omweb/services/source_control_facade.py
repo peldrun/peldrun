@@ -22,19 +22,16 @@ Design rules:
       correct `(provider, account_id, base_url)` triple. Tokens
       themselves live only in the vault.
 
-KNOWN INTEGRATION GAPS (tracked, not yet fixed):
+REPOSITORY ID RESOLUTION:
     The provider adapters (`GitHubProviderAdapter`, and future
     GitLab/Bitbucket adapters) operate on `RepositoryRef` objects,
     while the HTTP layer identifies repositories by their opaque
-    string `repository_id`. Several methods below call
-    `adapter.get_repository(repository_id, token=...)` with a plain
-    string, which the current adapters reject with a
-    `ValidationError`. Until a resolution layer (string id ->
-    `RepositoryRef`) is added to the facade, these methods are only
-    exercised against mock adapters in the test suite. The affected
-    methods are: `get_repository`, `list_branches`, `read_file`,
-    `create_branch`, `create_workspace`, `run_checks`, and
-    `create_change_request`.
+    string `repository_id`. The `_resolve_repo` helper added below
+    converts the string to a `RepositoryRef` by asking the adapter to
+    refresh a placeholder and, if that fails, by listing the
+    caller's repositories and matching by `repository_id`. Every
+    method that touches a provider adapter uses this helper instead
+    of passing the raw string to `adapter.get_repository(...)`.
 """
 
 from __future__ import annotations
@@ -49,7 +46,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 # Resilient imports for source control integration components
 try:
-    from ...integrations.source_control import (
+    from integrations.source_control import (
         ApprovalGate,
         ApprovalTicket,
         AuditLogger,
@@ -87,25 +84,25 @@ try:
         register_builtin_providers,
         validate_branch_name,
     )
-    from ...integrations.source_control.errors import (
+    from integrations.source_control.errors import (
         AuthRequiredError,
         NotFoundError,
         PermissionDeniedError,
         RemoteStateChangedError,
         ValidationError,
     )
-    from ...integrations.source_control.security.audit import (
+    from integrations.source_control.security.audit import (
         AuditEventType,
         AuditSeverity,
     )
-    from ...integrations.source_control.security.oauth_flow import (
+    from integrations.source_control.security.oauth_flow import (
         OAuthFlowCoordinator,
         OAuthProviderCallbacks,
     )
-    from ...integrations.source_control.security.policy_engine import (
+    from integrations.source_control.security.policy_engine import (
         PolicyResolutionContext,
     )
-    from ...integrations.source_control.schemas import (
+    from integrations.source_control.schemas import (
         ActionSuccessResponse,
         ApprovalTicketResponse,
         ApproveOperationRequest,
@@ -144,7 +141,7 @@ except ImportError:
     # one. `ValueError` was removed from this clause: `import`
     # statements do not raise it, so catching it only masked genuine
     # programming errors.
-    from backend.integrations.source_control import (
+    from integrations.source_control import (
         ApprovalGate,
         ApprovalTicket,
         AuditLogger,
@@ -182,25 +179,25 @@ except ImportError:
         register_builtin_providers,
         validate_branch_name,
     )
-    from backend.integrations.source_control.errors import (
+    from integrations.source_control.errors import (
         AuthRequiredError,
         NotFoundError,
         PermissionDeniedError,
         RemoteStateChangedError,
         ValidationError,
     )
-    from backend.integrations.source_control.security.audit import (
+    from integrations.source_control.security.audit import (
         AuditEventType,
         AuditSeverity,
     )
-    from backend.integrations.source_control.security.oauth_flow import (
+    from integrations.source_control.security.oauth_flow import (
         OAuthFlowCoordinator,
         OAuthProviderCallbacks,
     )
-    from backend.integrations.source_control.security.policy_engine import (
+    from integrations.source_control.security.policy_engine import (
         PolicyResolutionContext,
     )
-    from backend.integrations.source_control.schemas import (
+    from integrations.source_control.schemas import (
         ActionSuccessResponse,
         ApprovalTicketResponse,
         ApproveOperationRequest,
@@ -397,7 +394,7 @@ class SourceControlFacade:
         if operation_service is not None:
             self.operation_service = operation_service
         else:
-            from backend.integrations.source_control.operations.service import (
+            from integrations.source_control.operations.service import (
                 get_default_operation_service,
             )
             self.operation_service = get_default_operation_service()
@@ -418,26 +415,45 @@ class SourceControlFacade:
         self._data_root = backend_root / "data" / "source_control"
         self._data_root.mkdir(parents=True, exist_ok=True)
 
-        from backend.integrations.source_control.git.path_policy import (
+        from integrations.source_control.git.path_policy import (
             WorkspacePathPolicy,
         )
         self._path_policy = WorkspacePathPolicy(root=resolved_base)
 
-        # Git services share the same path policy so that all
-        # operations agree on the workspace root.
+        # Git services MUST use the process-wide default managers
+        # when no explicit dependency was injected. Otherwise the
+        # facade and the agent tools each hold their own registry,
+        # so a workspace created by the agent is invisible to the
+        # facade (and vice versa). The symptom is a "workspace not
+        # found" error on the HTTP endpoints even though the
+        # operation exists and the workspace is on disk. The
+        # `path_policy` argument on the individual managers is
+        # ignored when the defaults are used — they already carry
+        # the correct policy (including extra_roots for chat-scoped
+        # workspaces).
         if workspace_manager is not None:
             self.workspace_manager = workspace_manager
         else:
-            self.workspace_manager = GitWorkspaceManager(
-                path_policy=self._path_policy
+            from integrations.source_control.git.workspace import (
+                get_default_workspace_manager,
             )
+            self.workspace_manager = get_default_workspace_manager()
 
-        self.diff_engine = diff_engine or GitDiffEngine(
-            path_policy=self._path_policy
-        )
-        self.push_manager = push_manager or GitPushManager(
-            path_policy=self._path_policy
-        )
+        if diff_engine is not None:
+            self.diff_engine = diff_engine
+        else:
+            from integrations.source_control.git.diff import (
+                get_default_diff_engine,
+            )
+            self.diff_engine = get_default_diff_engine()
+
+        if push_manager is not None:
+            self.push_manager = push_manager
+        else:
+            from integrations.source_control.git.push import (
+                get_default_push_manager,
+            )
+            self.push_manager = get_default_push_manager()
 
         # OAuth
         self.oauth_coordinator = oauth_coordinator or OAuthFlowCoordinator()
@@ -453,17 +469,17 @@ class SourceControlFacade:
     def _register_default_oauth_providers(self) -> None:
         """Register OAuth callbacks for built-in providers."""
         try:
-            from backend.integrations.source_control.security.oauth_flow import (
+            from integrations.source_control.security.oauth_flow import (
                 OAuthProviderCallbacks,
             )
-            from backend.integrations.source_control.security.token_service import (
+            from integrations.source_control.security.token_service import (
                 TokenRefreshResult,
             )
         except ImportError:
-            from ...integrations.source_control.security.oauth_flow import (
+            from integrations.source_control.security.oauth_flow import (
                 OAuthProviderCallbacks,
             )
-            from ...integrations.source_control.security.token_service import (
+            from integrations.source_control.security.token_service import (
                 TokenRefreshResult,
             )
 
@@ -662,7 +678,7 @@ class SourceControlFacade:
                 continue
         return ProviderId.GITHUB
 
-    def _require_token(
+    async def _require_token(
         self,
         provider_id: ProviderId,
     ) -> str:
@@ -705,7 +721,7 @@ class SourceControlFacade:
         # of band. Try to refresh; the refresh may succeed if the
         # refresh token is still present.
         try:
-            info = self._try_refresh_token(provider_id, conn)
+            info = await self._try_refresh_token(provider_id, conn)
         except Exception as exc:  # noqa: BLE001
             # The refresh path is best-effort; a failure here is
             # reported via the AuthRequiredError below, not by a
@@ -730,53 +746,199 @@ class SourceControlFacade:
             f"Credentials for '{provider_id.value}' are missing."
         )
 
-    def _try_refresh_token(
+    async def _try_refresh_token(
         self,
         provider_id: ProviderId,
         conn: _ConnectionRecord,
     ):
         """
-        Attempt a synchronous refresh via the TokenService.
+        Attempt a refresh via the TokenService.
 
-        The TokenService's ``refresh`` is async; this helper exists
-        so that ``_require_token`` (a synchronous method) can invoke
-        it from a request handler that is itself async by running the
-        coroutine to completion in the current event loop.
+        The TokenService's ``refresh`` is async, so this helper is
+        async. It is called from ``_require_token``, which is also
+        async. Any exception raised by the token service (network
+        failure, missing refresh token, provider-side rejection) is
+        logged and swallowed: the caller falls through to
+        ``AuthRequiredError`` with a clear message, which is what the
+        UI needs.
 
-        IMPORTANT: this helper MUST be called from an async context.
-        If it is called from a sync context, it returns ``None``.
+        This replaces the previous synchronous implementation whose
+        refresh path was dead code. The old code only attempted a
+        refresh when NO event loop was running; in practice the
+        facade always runs inside an event loop, so every expired
+        token surfaced as an unrefreshed `AuthRequiredError`. The
+        current implementation actually attempts the refresh.
         """
         try:
-            import asyncio
-
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # Not inside an event loop; can't refresh synchronously.
-            return None
-
-        async def _do_refresh():
             return await self.token_service.refresh(
                 provider=provider_id,
                 account_id=conn.account_id,
                 base_url=conn.base_url,
             )
-
-        # Schedule the refresh on the running loop and return its
-        # result. The caller is expected to be an async method (the
-        # facade methods are all async), so ``create_task`` plus
-        # ``run_until_complete`` is not needed; instead, we return a
-        # coroutine that the caller can await. But ``_require_token``
-        # is not async today; we therefore run the coroutine to
-        # completion via ``loop.run_until_complete`` only when no
-        # tasks are running.
-        if loop.is_running():
-            # Cannot block the loop from inside it. Return None and
-            # let the caller fall through to AuthRequiredError. A
-            # follow-up refactor SHOULD convert ``_require_token``
-            # to an async method so that refresh can be awaited
-            # inline.
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Token refresh attempt failed for '%s': %s",
+                provider_id.value,
+                type(exc).__name__,
+            )
             return None
-        return loop.run_until_complete(_do_refresh())
+
+    async def _resolve_repo(
+        self,
+        adapter: Any,
+        repository_id: str,
+        provider_id: ProviderId,
+        token: str,
+    ) -> RepositoryRef:
+        """
+        Resolve a caller-supplied repository identifier to a fully
+        populated `RepositoryRef`.
+
+        The HTTP layer identifies repositories by an opaque string
+        (either the provider's stable ID, or a slug like
+        ``"owner/repo"``), but the provider adapter contract expects a
+        complete `RepositoryRef`. This helper performs the conversion
+        that the module docstring previously listed as an outstanding
+        integration gap.
+
+        Resolution strategy:
+
+            1. Try the adapter's ``get_repository(repo=..., token=...)``
+               with a minimal placeholder ref. This is the fast path
+               when the adapter resolves by ID directly, and it also
+               works when the adapter accepts a
+               ``namespace/name`` slug (the adapter refreshes the
+               remaining fields from the provider API).
+            2. Fall back to ``list_repositories`` and match by
+               ``repository_id``. This is the correct path when the
+               adapter cannot resolve by ID alone, but it requires the
+               target repository to appear within the first page of
+               the listing.
+
+        Raises:
+            NotFoundError: When the adapter cannot resolve the ID by
+                either path. The message names both the repository
+                and the provider so that the UI and the agent can
+                surface an actionable diagnostic.
+        """
+        if not repository_id:
+            raise NotFoundError(
+                "A non-empty repository_id is required."
+            )
+        if not token:
+            raise NotFoundError(
+                f"Cannot resolve repository '{repository_id}': "
+                "no access token is available."
+            )
+
+        # Normalize the caller's input. The agent sometimes supplies
+        # a git clone URL (`git@github.com:owner/repo.git` or
+        # `https://github.com/owner/repo.git`) instead of the
+        # canonical `owner/repo` slug. Extract the slug so that the
+        # rest of the resolution logic sees a consistent form.
+        normalized_id = repository_id.strip()
+        if normalized_id.startswith("git@"):
+            # git@github.com:owner/repo.git -> owner/repo
+            _, _, path = normalized_id.partition(":")
+            normalized_id = path
+        elif normalized_id.startswith(("http://", "https://")):
+            # https://github.com/owner/repo(.git) -> owner/repo
+            parsed = normalized_id.split("://", 1)[-1]
+            _, _, path = parsed.partition("/")
+            normalized_id = path
+        if normalized_id.endswith(".git"):
+            normalized_id = normalized_id[:-4]
+        normalized_id = normalized_id.strip("/")
+
+        # Build a minimal placeholder. The adapter is expected to
+        # refresh the remaining fields from the provider API. When it
+        # cannot, the fallback below fills in the real values.
+        conn = self._get_connection(provider_id)
+        account_id = conn.account_id if conn is not None else ""
+        base_url = conn.base_url if conn is not None else "default"
+
+        placeholder = RepositoryRef(
+            provider=provider_id,
+            account_id=account_id,
+            repository_id=normalized_id,
+            namespace="",
+            name=normalized_id,
+            clone_url="",
+            web_url="",
+            default_branch="",
+            is_private=False,
+            base_url=base_url or None,
+        )
+
+        # Fast path: ask the adapter to refresh the placeholder. Some
+        # adapters accept a string id directly; try that shape first
+        # so that a future adapter contract change does not silently
+        # regress here. The `repo=` keyword is used because that is
+        # what the current adapters declare.
+        try:
+            refreshed = await adapter.get_repository(
+                repo=placeholder, token=token
+            )
+            if isinstance(refreshed, RepositoryRef):
+                return refreshed
+        except NotFoundError:
+            pass
+        except TypeError:
+            # Adapter does not accept a ``repo=`` keyword; try the
+            # string form (some test doubles do).
+            try:
+                refreshed = await adapter.get_repository(
+                    repository_id, token=token
+                )
+                if isinstance(refreshed, RepositoryRef):
+                    return refreshed
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001
+            # The adapter rejected the placeholder for any reason; the
+            # fallback below is the authoritative path.
+            pass
+
+        # Fallback: list and filter.
+        try:
+            listing = await adapter.list_repositories(
+                page=1, page_size=100, token=token
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "list_repositories fallback for '%s' failed: %s",
+                repository_id,
+                type(exc).__name__,
+            )
+            listing = ()
+
+        # Try exact match on the stable ID first, then on the full
+        # name (owner/repo), then on the bare name. The order matters:
+        # `owner/repo` is unambiguous; the bare name is only used as
+        # a last resort because it can be ambiguous on a shared
+        # account. This is what allows a caller to pass `mtaman`
+        # (bare name) and receive `mtaman/mtaman` when that is the
+        # only repository with that name.
+        for candidate in listing:
+            if not isinstance(candidate, RepositoryRef):
+                continue
+            if candidate.repository_id == normalized_id:
+                return candidate
+        for candidate in listing:
+            if not isinstance(candidate, RepositoryRef):
+                continue
+            if f"{candidate.namespace}/{candidate.name}" == normalized_id:
+                return candidate
+        for candidate in listing:
+            if not isinstance(candidate, RepositoryRef):
+                continue
+            if candidate.name == normalized_id:
+                return candidate
+
+        raise NotFoundError(
+            f"Repository '{repository_id}' could not be resolved for "
+            f"provider '{provider_id.value}'."
+        )
 
     # ------------------------------------------------------------------
     # 2. Audit helper
@@ -1235,7 +1397,7 @@ class SourceControlFacade:
             else self._default_provider_id()
         )
         adapter = self.registry.get(provider_id.value)
-        token = self._require_token(provider_id)
+        token = await self._require_token(provider_id)
 
         # The adapter's pagination parameter is `page_size`, not
         # `limit`. Passing `limit=` raised TypeError against the real
@@ -1280,15 +1442,15 @@ class SourceControlFacade:
             else self._default_provider_id()
         )
         adapter = self.registry.get(provider_id.value)
-        token = self._require_token(provider_id)
+        token = await self._require_token(provider_id)
 
         # NOTE: the current GitHub adapter expects a `RepositoryRef`,
         # not a string id. This call will raise `ValidationError`
         # against the real adapter. A resolution layer is tracked as
         # an outstanding integration gap; the current implementation
         # is exercised only against mock adapters in the test suite.
-        r: RepositoryRef = await adapter.get_repository(
-            repository_id, token=token
+        r: RepositoryRef = await self._resolve_repo(
+            adapter, repository_id, provider_id, token
         )
 
         return RepositoryResponse(
@@ -1322,13 +1484,15 @@ class SourceControlFacade:
             else self._default_provider_id()
         )
         adapter = self.registry.get(provider_id.value)
-        token = self._require_token(provider_id)
+        token = await self._require_token(provider_id)
 
         # NOTE: `repository_id` is a string, but the current adapter
         # expects a `RepositoryRef`. This call is only exercised
         # against mock adapters today. See the module docstring for
         # the outstanding integration gap.
-        repo = await adapter.get_repository(repository_id, token=token)
+        repo = await self._resolve_repo(
+            adapter, repository_id, provider_id, token
+        )
         # The adapter does not accept a `limit` keyword; it pages
         # internally up to `MAX_BRANCHES`. `limit` is applied below
         # on the client side.
@@ -1369,13 +1533,15 @@ class SourceControlFacade:
         self.policy_engine.require(policy_ctx)
 
         adapter = self.registry.get(provider_id.value)
-        token = self._require_token(provider_id)
+        token = await self._require_token(provider_id)
 
         # NOTE: `repository_id` is a string, but the current adapter
         # expects a `RepositoryRef`. This call is only exercised
         # against mock adapters today. See the module docstring for
         # the outstanding integration gap.
-        repo = await adapter.get_repository(repository_id, token=token)
+        repo = await self._resolve_repo(
+            adapter, repository_id, provider_id, token
+        )
 
         from_sha = getattr(payload, "from_sha", None)
         if not from_sha:
@@ -1439,13 +1605,15 @@ class SourceControlFacade:
             else self._default_provider_id()
         )
         adapter = self.registry.get(provider_id.value)
-        token = self._require_token(provider_id)
+        token = await self._require_token(provider_id)
 
         # NOTE: `repository_id` is a string, but the current adapter
         # expects a `RepositoryRef`. This call is only exercised
         # against mock adapters today. See the module docstring for
         # the outstanding integration gap.
-        repo = await adapter.get_repository(repository_id, token=token)
+        repo = await self._resolve_repo(
+            adapter, repository_id, provider_id, token
+        )
         raw_content = await adapter.read_file(
             repo=repo, file_path=file_path, ref=ref, token=token
         )
@@ -1520,12 +1688,12 @@ class SourceControlFacade:
             else self._default_provider_id()
         )
         adapter = self.registry.get(provider_id.value)
-        token = self._require_token(provider_id)
+        token = await self._require_token(provider_id)
 
         # NOTE: `repository_id` is a string, but the current adapter
         # expects a `RepositoryRef`. See the module docstring.
-        repo = await adapter.get_repository(
-            payload.repository_id, token=token
+        repo = await self._resolve_repo(
+            adapter, payload.repository_id, provider_id, token
         )
 
         policy_ctx = PolicyResolutionContext(
@@ -1543,12 +1711,18 @@ class SourceControlFacade:
             # Use the chat's session files directory as the workspace
             target_path = Path(os.getcwd()) / "storage" / "chats" / chat_id / "files"
 
+        # Pass `auth_token` so that private repositories can be
+        # cloned. The previous implementation dropped the token
+        # before this call, which made every private-repo clone via
+        # the UI fail with an authentication error from the provider
+        # even though the token was already resolved above.
         ws_ref = await self.workspace_manager.create_workspace(
             repo=repo,
             base_sha=getattr(payload, "base_sha", None),
             source_branch=getattr(payload, "branch_name", None),
             use_worktree=True,
             target_path=target_path,
+            auth_token=token,
         )
 
         self._audit(
@@ -1693,12 +1867,12 @@ class SourceControlFacade:
             .lower()
         )
         adapter = self.registry.get(provider_id.value)
-        token = self._require_token(provider_id)
+        token = await self._require_token(provider_id)
 
         # NOTE: `repository_id` is a string, but the current adapter
         # expects a `RepositoryRef`. See the module docstring.
-        repo = await adapter.get_repository(
-            ws_ref.repository_id, token=token
+        repo = await self._resolve_repo(
+            adapter, ws_ref.repository_id, provider_id, token
         )
         effective_ref = (
             getattr(payload, "ref", None)
@@ -2040,7 +2214,7 @@ class SourceControlFacade:
         create an approval ticket against a record that was not
         actually moved.
         """
-        from backend.integrations.source_control.operations.models import (
+        from integrations.source_control.operations.models import (
             is_valid_transition,
         )
 
@@ -2092,7 +2266,7 @@ class SourceControlFacade:
         # is not, the state machine refused every transition; surface
         # the failure explicitly rather than creating a ticket for an
         # operation that did not move.
-        from backend.integrations.source_control.operations.models import (
+        from integrations.source_control.operations.models import (
             TERMINAL_STATUSES,
         )
         post_advance_status = getattr(record, "status", current_status)
@@ -2306,7 +2480,7 @@ class SourceControlFacade:
         # Fetch the token BEFORE consuming the ticket so that a missing
         # or expired credential does not consume the ticket and force
         # the user to re-approve an unchanged diff.
-        token = self._require_token(provider_id)
+        token = await self._require_token(provider_id)
 
         # Consume the ticket only after every local and policy check
         # has passed.
@@ -2425,7 +2599,7 @@ class SourceControlFacade:
             .lower()
         )
         adapter = self.registry.get(provider_id.value)
-        token = self._require_token(provider_id)
+        token = await self._require_token(provider_id)
 
         # SECURITY: change-request creation MUST consume a ticket
         # bound to `create_change_request`, NOT to the operation's
@@ -2493,8 +2667,8 @@ class SourceControlFacade:
 
         # NOTE: `repository_id` is a string, but the current adapter
         # expects a `RepositoryRef`. See the module docstring.
-        repo = await adapter.get_repository(
-            payload.repository_id, token=token
+        repo = await self._resolve_repo(
+            adapter, payload.repository_id, provider_id, token
         )
         cr: ChangeRequestRef = await adapter.create_change_request(
             repo=repo,

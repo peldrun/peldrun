@@ -674,16 +674,31 @@ class GitWorkspaceManager:
         branch = request.branch_name or workspace.current_branch
 
         if request.clone_url:
-            # If target is not empty and doesn't have .git, clone into it
-            if not (target / ".git").exists() and any(target.iterdir()):
+            git_dir = target / ".git"
+            if git_dir.exists():
+                # A Git repository already exists in the target
+                # directory. Cloning into it would fail ("destination
+                # path already exists"), and re-initializing would
+                # fail on the "origin" remote already being present.
+                # Reuse the existing repository as-is; callers that
+                # need to refresh the remote state should do so
+                # through a dedicated fetch/reset operation.
+                pass
+            elif any(target.iterdir()):
+                # Non-empty directory without `.git`: `git clone`
+                # refuses to operate on such a directory. Use the
+                # init+fetch path instead, which preserves the
+                # existing files and still wires up the remote.
                 await self._clone(
                     clone_url=request.clone_url,
                     target=target,
                     depth=request.depth,
-                    use_worktree=False, # Force clone instead of init
+                    use_worktree=True,
                     auth_token=request.auth_token,
                 )
             else:
+                # Empty directory: both clone and init+fetch work.
+                # Honor the caller's preference.
                 await self._clone(
                     clone_url=request.clone_url,
                     target=target,
@@ -706,11 +721,59 @@ class GitWorkspaceManager:
             target, fallback=branch or "main"
         )
         head_sha = await self._head_sha(target, fallback="")
+
+        # A born HEAD is required for every downstream operation:
+        # `git diff` needs it, the approval flow needs it, and the
+        # push pipeline refuses to push an unborn branch. When
+        # neither the remote nor the local repository produced a
+        # commit (for example a fresh repository created with `init`
+        # on a machine with no network, or `init`+`fetch` against a
+        # remote with no reachable objects), bootstrap an empty
+        # initial commit so that HEAD exists. This mirrors the same
+        # convention `_init_empty_repo` already uses; it is applied
+        # here only when the earlier steps could not produce a born
+        # HEAD.
+        #
+        # The previous implementation stored a synthetic `"0"*40`
+        # placeholder as `base_sha` when HEAD was unborn. That value
+        # is not a valid commit and caused `git diff <sha>` to fail
+        # with "fatal: bad revision"; the agent received a cryptic
+        # error message and could not recover. Bootstrapping an
+        # empty commit removes the ambiguity: either HEAD is born
+        # (and a real SHA-1 is stored) or the operation fails
+        # loudly.
+        if not head_sha:
+            await self._git.run(
+                [
+                    "-c", "user.name=PELDRUN",
+                    "-c", "user.email=peldrun@localhost",
+                    "commit", "--allow-empty",
+                    "-m", "Initial commit",
+                ],
+                cwd=target,
+                check_returncode=False,
+            )
+            head_sha = await self._head_sha(target, fallback="")
+
         dirty = await self._detect_dirty(target)
 
-        # Keep the SHA-1 (40 chars) for Git operations.
-        # The conversion to SHA-256 (64 chars) happens at ticket creation.
-        effective_base_sha = request.base_sha or head_sha or "0" * 40
+        # Prefer an explicitly requested base SHA; otherwise anchor
+        # the workspace to the born HEAD. When neither is available
+        # the workspace is in an unrecoverable state and we surface
+        # that explicitly rather than fabricating a SHA.
+        if request.base_sha:
+            effective_base_sha = request.base_sha
+        elif head_sha:
+            effective_base_sha = head_sha
+        else:
+            raise ValidationError(
+                "Workspace could not be initialized: the repository "
+                "has no commits and no reachable remote HEAD.",
+                details={
+                    "workspace_id": workspace.workspace_id,
+                    "workspace_path": str(target),
+                },
+            )
 
         return replace(
             workspace,
@@ -865,8 +928,22 @@ class GitWorkspaceManager:
         """
         Ensure the workspace is on `branch`, creating it if needed.
 
-        A new branch is created from the current HEAD when it does
-        not already exist.
+        A new branch is created from the best available start point:
+
+            1. ``origin/<branch>`` when the remote tracks that branch
+               (the standard case after an `init`+`fetch` cycle).
+            2. ``origin/HEAD`` when the remote's default branch is
+               known but the requested branch does not exist yet.
+            3. The current ``HEAD`` when it is already born (for
+               example after a plain `git clone`).
+
+        Creating the branch from a bare ``git checkout -b <name>`` on
+        a repository whose HEAD is still unborn (no commits, no
+        remote HEAD) produces an orphan branch with no history. In
+        that state ``git diff`` fails with "fatal: ambiguous argument
+        'HEAD'", and the approval flow surfaces an error that the
+        agent cannot interpret. Resolving an explicit start point
+        below prevents that state whenever the remote is reachable.
 
         IMPORTANT: this method uses ``git checkout -b`` (lowercase),
         NOT ``git checkout -B`` (uppercase). The uppercase form
@@ -887,12 +964,58 @@ class GitWorkspaceManager:
         if result.returncode == 0:
             return
 
-        # Create the branch from HEAD. Lowercase `-b` refuses to
-        # overwrite an existing branch, protecting user commits.
-        await self._git.run(
-            ["checkout", "-b", branch],
+        # Branch does not exist locally. Resolve a start point.
+        start_point: Optional[str] = None
+
+        # 1. origin/<branch> (the exact remote branch, if present).
+        remote_branch_ref = await self._git.run(
+            ["rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
             cwd=target,
+            check_returncode=False,
         )
+        if (
+            remote_branch_ref.returncode == 0
+            and remote_branch_ref.stdout.strip()
+        ):
+            start_point = f"origin/{branch}"
+        else:
+            # 2. origin/HEAD (the remote's default branch).
+            remote_head_ref = await self._git.run(
+                ["rev-parse", "--verify", "--quiet", "refs/remotes/origin/HEAD"],
+                cwd=target,
+                check_returncode=False,
+            )
+            if (
+                remote_head_ref.returncode == 0
+                and remote_head_ref.stdout.strip()
+            ):
+                start_point = "origin/HEAD"
+            else:
+                # 3. Current HEAD, when it is already born.
+                local_head_ref = await self._git.run(
+                    ["rev-parse", "--verify", "--quiet", "HEAD"],
+                    cwd=target,
+                    check_returncode=False,
+                )
+                if (
+                    local_head_ref.returncode == 0
+                    and local_head_ref.stdout.strip()
+                ):
+                    start_point = "HEAD"
+                # else: no valid start point; the caller
+                # (`_materialize`) is responsible for bootstrapping
+                # an initial commit so that HEAD becomes born.
+
+        if start_point is not None:
+            await self._git.run(
+                ["checkout", "-b", branch, start_point],
+                cwd=target,
+            )
+        else:
+            await self._git.run(
+                ["checkout", "-b", branch],
+                cwd=target,
+            )
 
     async def _checkout_sha(self, *, target: Path, sha: str) -> None:
         """

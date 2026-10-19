@@ -59,7 +59,7 @@ import threading
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Iterable, Optional, Union
+from typing import Iterable, Optional, Sequence, Union
 
 from ..errors import PathTraversalError, ValidationError
 
@@ -237,6 +237,14 @@ class WorkspacePathPolicy:
     max_component_length: int = MAX_COMPONENT_LENGTH
     follow_symlinks: bool = True
     require_existence: bool = False
+    # Additional roots that are considered "inside the workspace" for
+    # path-traversal purposes. This is how chat-scoped workspaces
+    # (created under `storage/chats/<chat_id>/files/`) are allowed to
+    # coexist with the primary workspace root (`~/.peldrun/workspaces`)
+    # without disabling the containment check entirely. Every entry
+    # MUST be an absolute path; relative entries are resolved against
+    # the current process working directory during construction.
+    extra_roots: tuple[Path, ...] = ()
 
     def __post_init__(self) -> None:
         # `frozen=True` prevents normal assignment; use
@@ -264,6 +272,32 @@ class WorkspacePathPolicy:
             raise ValidationError(
                 "max_component_length must be positive.",
                 details={"max_component_length": self.max_component_length},
+            )
+
+        # Normalize each extra root the same way the primary root was
+        # normalized above: expand `~`, resolve to an absolute path,
+        # and drop entries that resolve to the primary root (they are
+        # redundant). Duplicate entries are also removed to keep the
+        # containment check cheap and deterministic.
+        if self.extra_roots:
+            normalized_extras: list[Path] = []
+            seen: set[str] = set()
+            primary_key = str(root)
+            for entry in self.extra_roots:
+                candidate = (
+                    entry if isinstance(entry, Path) else Path(entry)
+                ).expanduser()
+                try:
+                    resolved_extra = candidate.resolve(strict=False)
+                except (OSError, RuntimeError):
+                    resolved_extra = candidate.absolute()
+                key = str(resolved_extra)
+                if key == primary_key or key in seen:
+                    continue
+                seen.add(key)
+                normalized_extras.append(resolved_extra)
+            object.__setattr__(
+                self, "extra_roots", tuple(normalized_extras)
             )
 
     # --- Public API -----------------------------------------------------
@@ -396,28 +430,40 @@ class WorkspacePathPolicy:
         self, absolute_path: Union[str, Path]
     ) -> PurePosixPath:
         """
-        Convert an absolute path inside the root to a POSIX-style
-        relative path suitable for use with Git.
+        Convert an absolute path inside the allowed roots to a
+        POSIX-style relative path suitable for use with Git.
+
+        The relative path is computed against the root that actually
+        contains the input: the primary root (`self.root`) takes
+        priority; otherwise each entry in `self.extra_roots` is
+        tried. Callers that want to know WHICH root was used should
+        compare the returned relative path against their expected
+        workspace directory.
 
         Raises:
-            PathTraversalError: If the input is not inside the root.
+            PathTraversalError: If the input is not inside any
+                allowed root.
         """
         resolved = self.resolve_within_root(absolute_path)
-        try:
-            relative = resolved.relative_to(self.root)
-        except ValueError as exc:
-            # Should be unreachable because resolve_within_root
-            # already checked containment, but we handle it
-            # defensively.
-            raise PathTraversalError(
-                "Path is not inside the workspace root.",
-                details={"path": _safe_repr(str(resolved))},
-                cause=exc,
-            ) from exc
-        parts = relative.parts
-        if not parts:
-            return PurePosixPath(".")
-        return PurePosixPath(*parts)
+        candidates = (self.root, *self.extra_roots)
+        last_error: Optional[Exception] = None
+        for candidate in candidates:
+            try:
+                relative = resolved.relative_to(candidate)
+                parts = relative.parts
+                if not parts:
+                    return PurePosixPath(".")
+                return PurePosixPath(*parts)
+            except ValueError as exc:
+                last_error = exc
+                continue
+        # Unreachable when resolve_within_root succeeded; kept for
+        # defense in depth.
+        raise PathTraversalError(
+            "Path is not inside any allowed workspace root.",
+            details={"path": _safe_repr(str(resolved))},
+            cause=last_error,
+        )
 
     # --- Internals ------------------------------------------------------
 
@@ -450,16 +496,26 @@ class WorkspacePathPolicy:
 
     def _is_inside_root(self, resolved: Path) -> bool:
         """
-        Return True if `resolved` is inside `self.root`.
+        Return True if `resolved` is inside any of the allowed roots.
 
-        Uses `Path.is_relative_to` when available (Python 3.9+) with
-        an `os.path.commonpath` fallback for older runtimes.
+        The primary root (`self.root`) is checked first. When it does
+        not contain the path, each entry in `self.extra_roots` is
+        tried in order. A path is accepted only if it lies within one
+        of these roots; anything else is treated as an escape attempt
+        and is rejected by `resolve_within_root`.
         """
         try:
             resolved.relative_to(self.root)
             return True
         except ValueError:
-            return False
+            pass
+        for extra_root in self.extra_roots:
+            try:
+                resolved.relative_to(extra_root)
+                return True
+            except ValueError:
+                continue
+        return False
 
     def _check_path_length(self, resolved: Path) -> None:
         text = str(resolved)
@@ -790,18 +846,118 @@ _DEFAULT_POLICY: Optional[WorkspacePathPolicy] = None
 _DEFAULT_LOCK = threading.RLock()
 
 
+def _resolve_extra_roots() -> tuple[Path, ...]:
+    """
+    Return the additional roots that the default policy should accept.
+
+    Chat-scoped workspaces live under the application's storage
+    directory (`storage/chats/<chat_id>/files/` or
+    `storage/projects/<project_id>/chats/<chat_id>/files/`), not under
+    the primary workspace root (`~/.peldrun/workspaces`). Without an
+    explicit allowance, every Git operation on a chat workspace would
+    fail the containment check with `PathTraversalError`.
+
+    Resolution order for the storage root:
+        1. `PELDRUN_STORAGE_ROOT` environment variable, when set.
+        2. `omweb.config.settings.storage_dir` (defensive import;
+           missing or broken configuration is ignored).
+        3. `<backend>/storage/` as a last-resort fallback.
+
+    Only paths that exist on disk are returned; non-existent entries
+    are dropped so that the containment check does not accidentally
+    accept a path that merely shares a lexical prefix.
+    """
+    candidates: list[Path] = []
+
+    env_override = os.environ.get("PELDRUN_STORAGE_ROOT")
+    if env_override:
+        candidates.append(Path(env_override).expanduser())
+
+    # Authoritative source: `project_manager.storage_dir` is the
+    # directory the engine passes to the agent as `project_dir`.
+    # If the policy's extra_roots do not include it,
+    # `_force_remove_directory` refuses to clean up a partially
+    # materialized workspace (error "Refusing to remove a directory
+    # outside the workspace root"), and `_materialize` sees a
+    # different directory than the one the agent edited.
+    #
+    # IMPORTANT: `project_manager` resolves storage as
+    # `<project_root>/storage` (three parents up from
+    # `backend/omweb/project_manager.py`), while this file's own
+    # fallback resolves it as `<backend>/storage` (four parents up
+    # from `backend/integrations/source_control/git/path_policy.py`).
+    # The two paths differ; querying project_manager directly is the
+    # only way to guarantee a match.
+    try:
+        from omweb.project_manager import project_manager
+
+        candidates.append(Path(project_manager.storage_dir))
+    except Exception:  # noqa: BLE001
+        # project_manager is optional in isolated test runs; the
+        # config-based lookup and the `<backend>/storage` fallback
+        # below still cover the default deployment layout.
+        pass
+
+    try:
+        import omweb.config as _om_cfg  # type: ignore[import-not-found]
+        storage_candidate: Optional[Path] = None
+        if hasattr(_om_cfg, "settings") and hasattr(
+            _om_cfg.settings, "storage_dir"
+        ):
+            storage_candidate = Path(_om_cfg.settings.storage_dir)
+        elif hasattr(_om_cfg, "STORAGE_DIR"):
+            storage_candidate = Path(_om_cfg.STORAGE_DIR)
+        elif hasattr(_om_cfg, "get_settings"):
+            storage_candidate = Path(_om_cfg.get_settings().storage_dir)
+        if storage_candidate is not None:
+            candidates.append(storage_candidate.expanduser())
+    except Exception:  # noqa: BLE001
+        # Configuration is optional; the fallback below covers the
+        # default deployment layout.
+        pass
+
+    # Fallback: `<backend>/storage`.
+    try:
+        backend_root = Path(__file__).resolve().parent.parent.parent.parent
+        candidates.append((backend_root / "storage").expanduser())
+    except Exception:  # noqa: BLE001
+        pass
+
+    resolved: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved_candidate = candidate.resolve(strict=False)
+        except (OSError, RuntimeError):
+            resolved_candidate = candidate.absolute()
+        key = str(resolved_candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not resolved_candidate.exists():
+            continue
+        resolved.append(resolved_candidate)
+    return tuple(resolved)
+
+
 def get_default_path_policy() -> WorkspacePathPolicy:
     """
     Return the process-wide default `WorkspacePathPolicy`, creating
     it on first use.
 
-    The default root is resolved with `get_workspace_root()`. Tests
-    can replace it with `set_default_path_policy`.
+    The primary root is resolved with `get_workspace_root()`. The
+    additional roots are resolved with `_resolve_extra_roots()` so
+    that chat-scoped workspaces under `storage/` are also allowed.
+    Tests can replace the policy entirely with
+    `set_default_path_policy`.
     """
     global _DEFAULT_POLICY
     with _DEFAULT_LOCK:
         if _DEFAULT_POLICY is None:
-            _DEFAULT_POLICY = WorkspacePathPolicy(root=get_workspace_root())
+            _DEFAULT_POLICY = WorkspacePathPolicy(
+                root=get_workspace_root(),
+                extra_roots=_resolve_extra_roots(),
+            )
         return _DEFAULT_POLICY
 
 
@@ -822,17 +978,37 @@ def set_default_path_policy(policy: WorkspacePathPolicy) -> None:
 
 def reset_default_path_policy(
     root: Optional[Union[str, Path]] = None,
+    extra_roots: Optional[Sequence[Union[str, Path]]] = None,
 ) -> WorkspacePathPolicy:
     """
     Replace the default policy with a fresh one.
 
-    When `root` is provided, the new policy uses it. Otherwise, the
-    default root is resolved via `get_workspace_root()`.
+    Args:
+        root: Primary workspace root. When omitted, resolved via
+            `get_workspace_root()`.
+        extra_roots: Additional allowed roots. When omitted,
+            resolved via `_resolve_extra_roots()`. Pass an empty
+            sequence to explicitly disable the extra roots (useful
+            for tests that want a strictly single-root policy).
+
+    Returns:
+        The newly installed policy.
     """
     global _DEFAULT_POLICY
-    resolved_root = get_workspace_root(root) if root is not None else get_workspace_root()
+    resolved_root = (
+        get_workspace_root(root) if root is not None else get_workspace_root()
+    )
+    if extra_roots is None:
+        resolved_extras = _resolve_extra_roots()
+    else:
+        resolved_extras = tuple(
+            Path(entry) for entry in extra_roots
+        )
     with _DEFAULT_LOCK:
-        _DEFAULT_POLICY = WorkspacePathPolicy(root=resolved_root)
+        _DEFAULT_POLICY = WorkspacePathPolicy(
+            root=resolved_root,
+            extra_roots=resolved_extras,
+        )
         return _DEFAULT_POLICY
 
 

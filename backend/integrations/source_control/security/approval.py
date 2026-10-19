@@ -117,6 +117,19 @@ DEFAULT_MAX_TICKETS: int = 10_000
 #: Pattern for a valid SHA-256 hex digest (64 lowercase hex chars).
 _SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 
+#: Pattern for a valid SHA-1 hex digest (40 lowercase hex chars).
+#:
+#: Git still produces SHA-1 object IDs on every supported version
+#: (and will continue to for existing repositories even after SHA-256
+#: rollout). The `base_sha` field of an approval ticket records the
+#: commit the diff was computed against, so accepting SHA-1 here is
+#: required for the ticket to bind to a real commit. The previous
+#: implementation accepted SHA-256 only, which made every ticket
+#: creation fail with a `ValidationError` whenever the workspace
+#: carried a normal Git SHA-1. The diff hash itself is validated
+#: separately by `_validate_diff_sha256` and remains SHA-256-only.
+_SHA1_PATTERN = re.compile(r"^[a-f0-9]{40}$")
+
 #: Values that are accepted as a "base SHA" but are not real hashes.
 #: These are useful in tests and in operations that do not yet have a
 #: concrete commit SHA. They MUST NOT be accepted at consumption time
@@ -276,8 +289,9 @@ class ApprovalGate:
             - `operation_id`, `repository_id`, `operation`, and
               `target_branch` MUST be non-empty.
             - `base_sha` MUST be non-empty and MUST either be a valid
-              SHA-256 hex digest or one of `{"HEAD", "UNKNOWN",
-              "UNBORN"}`.
+              SHA-1 hex digest (40 chars, the normal Git object ID),
+              a SHA-256 hex digest (64 chars, forward compatibility),
+              or one of `{"HEAD", "UNKNOWN", "UNBORN"}`.
             - `diff_sha256` MUST be a 64-character lowercase hex
               digest.
 
@@ -1068,6 +1082,27 @@ class ApprovalGate:
 
     @staticmethod
     def _validate_base_sha(base_sha: str) -> None:
+        """
+        Validate a `base_sha` value.
+
+        Accepted shapes:
+
+            - A 40-character lowercase hex SHA-1 (the object ID that
+              `git rev-parse HEAD` actually produces; the value is
+              passed verbatim to `git diff`, `git push`, and any
+              other Git operation that consumes it).
+            - A 64-character lowercase hex SHA-256 (accepted so that
+              callers migrating to a future SHA-256 object format
+              can still create tickets; the value is stored as-is).
+            - One of the allowlisted placeholders (`HEAD`,
+              `UNKNOWN`, `UNBORN`) used by tests and by operations
+              that do not yet have a concrete commit SHA.
+
+        The diff hash is validated separately by
+        `_validate_diff_sha256`, which is SHA-256-only by design:
+        the diff hash is a content-addressed contract, not a Git
+        object ID, so it must not accept SHA-1.
+        """
         if not base_sha or not isinstance(base_sha, str):
             raise ValidationError(
                 "base_sha must be a non-empty string.",
@@ -1075,12 +1110,14 @@ class ApprovalGate:
             )
         if base_sha in _BASE_SHA_ALLOWLIST:
             return
-        if not _SHA256_PATTERN.match(base_sha):
-            raise ValidationError(
-                "base_sha must be a 64-character lowercase hex digest "
-                "or one of the allowlisted placeholders.",
-                details={"field": "base_sha", "value_length": len(base_sha)},
-            )
+        if _SHA1_PATTERN.match(base_sha) or _SHA256_PATTERN.match(base_sha):
+            return
+        raise ValidationError(
+            "base_sha must be a 40-character SHA-1 digest, a "
+            "64-character SHA-256 digest, or one of the allowlisted "
+            "placeholders.",
+            details={"field": "base_sha", "value_length": len(base_sha)},
+        )
 
     @staticmethod
     def _validate_diff_sha256(diff_sha256: str) -> None:

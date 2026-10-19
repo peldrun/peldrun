@@ -1,9 +1,9 @@
 {
   "id": "source_control",
   "name": "Source Control",
-  "description": "Unified interface for interacting with Git repositories. WORKFLOW: 1. Call 'create_workspace' with 'repository_id'. 2. Edit files locally. 3. Call 'request_approval' with the 'workspace_id' returned from step 1. Do NOT use http_fetch or bash for Git operations. All remote writes require explicit human approval via the UI.",
+  "description": "CRITICAL RULE: Do NOT use `http_fetch` to read files from GitHub URLs. `http_fetch` returns raw HTML, not the file content, and it does not create a local copy you can edit. Do NOT use `bash` to edit files either — on Windows, `bash` cannot run `mkdir -p`, `&&`, or `touch`, and it cannot see files that are not in the current working directory. The ONLY way to edit a file is: create_workspace → str_replace_editor → request_approval → push_branch. Unified interface for interacting with Git repositories. WORKFLOW: (1) Optional discovery: list_providers, list_repositories, get_repository, list_branches. (2) create_workspace(repository_id='owner/repo') → returns workspace_id and workspace_path. You MUST call this BEFORE any str_replace_editor call. (3) Edit files inside workspace_path with the file-edit tool. (4) request_approval(workspace_id=..., operation='push_branch', target_branch='<feature-branch>') → returns operation_id + approval_id. STOP HERE and include BOTH IDs in your final message; the user must approve in the UI. (5) In a subsequent turn, if you do not remember the IDs: call get_operation(operation_id) to verify the current status, or list_operations(status='approved') to find the pending approvals. Then push_branch(operation_id=..., approval_id=...). (6) Then request_approval(workspace_id=..., operation='create_change_request', source_branch='<the branch you pushed>', target_branch='main') → returns NEW operation_id + approval_id. STOP HERE and include both IDs in your final message; the user must approve again. (7) In a subsequent turn: create_change_request(operation_id=..., approval_id=..., title=...). AUTH AND RETRY POLICY (MANDATORY): If any source_control action returns AUTH_REQUIRED, PERMISSION_DENIED, or CONFLICT, you MUST stop immediately and use ask_human exactly ONCE to tell the user what happened. Do NOT retry the same action. Do NOT try a different action to work around it. Do NOT ask for a personal access token — PELDRUN uses OAuth. Example ask_human message: 'The GitHub token has expired (AUTH_REQUIRED). Please go to the Integrations & Providers page, click Disconnect on GitHub, then click Connect to obtain a fresh token. Then tell me to continue.' After the user responds, wait for their instruction before retrying. IMPORTANT: A push approval cannot be reused to open a PR — each side effect needs its own approval. get_operation and list_operations are read-only: they never consume a ticket or change the status. Do NOT use http_fetch or bash for Git operations. Do NOT push or open PRs without a valid approval_id.",
   "category": "system",
-  "safety_level": "safe",
+  "safety_level": "dangerous",
   "is_builtin": true,
   "is_enabled": true,
   "parameters": {
@@ -12,26 +12,31 @@
       "action": {
         "type": "string",
         "enum": [
-          "create_workspace",
+          "list_providers",
           "list_repositories",
+          "get_repository",
+          "list_branches",
           "read_file",
+          "create_workspace",
           "create_branch",
           "inspect_diff",
           "run_checks",
           "request_approval",
           "push_branch",
-          "create_change_request"
+          "create_change_request",
+          "get_operation",
+          "list_operations"
         ],
-        "description": "The source-control action to execute."
+        "description": "The source-control action to execute. See the tool description for the full workflow."
       },
       "params": {
         "type": "object",
-        "description": "Optional structured parameter bag.",
+        "description": "Optional structured parameter bag. Same keys as the top-level parameters; nested values override top-level ones.",
         "additionalProperties": true
       },
       "repository_id": {
         "type": "string",
-        "description": "Stable provider repository identifier (e.g., 'owner/repo'). Required for 'create_workspace'."
+        "description": "Stable provider repository identifier (e.g., 'owner/repo'). Required for 'create_workspace', 'get_repository', 'list_branches', and 'read_file'."
       },
       "provider": {
         "type": "string",
@@ -40,88 +45,107 @@
       },
       "account_id": {
         "type": "string",
-        "description": "Optional stable account ID."
+        "description": "Optional stable account ID. When omitted, the first stored account for the provider is used."
       },
       "file_path": {
         "type": "string",
-        "description": "Repository-relative file path (required for 'read_file')."
+        "description": "Repository-relative file path. Required for 'read_file'."
       },
       "ref": {
         "type": "string",
-        "description": "Branch, tag, or commit SHA to read from."
+        "description": "Branch, tag, or commit SHA to read from. Used by 'read_file'."
       },
       "workspace_id": {
         "type": "string",
-        "description": "Local workspace ID returned by 'create_workspace'. Required for 'create_branch', 'inspect_diff', 'run_checks', and 'request_approval'."
+        "description": "Local workspace ID returned by 'create_workspace'. Required for 'create_branch', 'inspect_diff', 'run_checks', and for 'request_approval' when creating a new operation."
       },
       "branch_name": {
         "type": "string",
-        "description": "Branch name to create (required for 'create_branch')."
+        "description": "Branch name. Required for 'create_branch'. Optional for 'create_workspace' (defaults to the repository's default branch)."
       },
       "from_sha": {
         "type": "string",
-        "description": "Optional starting commit SHA for 'create_branch'."
+        "description": "Optional starting commit SHA for 'create_branch'. Defaults to the workspace's current HEAD."
       },
       "base_sha": {
         "type": "string",
-        "description": "Base commit SHA to diff against."
+        "description": "Optional base commit SHA. Used by 'inspect_diff' and 'create_workspace' to diff against (or check out) a specific commit."
       },
       "include_patch": {
         "type": "boolean",
-        "description": "Include per-file diff text in 'inspect_diff' output."
+        "description": "When true (default), include per-file diff text in 'inspect_diff' output."
       },
       "checks": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "Names of pre-registered checks to run."
+        "description": "Names of pre-registered checks to run. Used by 'run_checks'."
       },
       "fail_fast": {
         "type": "boolean",
-        "description": "Stop after the first failing check."
+        "description": "When true (default), stop after the first failing check. Used by 'run_checks'."
       },
       "operation_id": {
         "type": "string",
-        "description": "Operation ID. Required for 'push_branch' and 'create_change_request'. Optional for 'request_approval' if 'workspace_id' is provided."
+        "description": "Operation ID returned by a previous 'request_approval' call. Required for 'push_branch', 'create_change_request', and 'get_operation'. For 'request_approval': pass this INSTEAD of workspace_id only when re-issuing a ticket for the EXISTING operation; the diff is NOT recomputed in that case, so pass workspace_id + target_branch if files changed since the last approval."
       },
       "operation": {
         "type": "string",
         "enum": ["push_branch", "create_change_request"],
         "default": "push_branch",
-        "description": "The operation to request approval for. Defaults to 'push_branch'."
+        "description": "The remote side effect the approval covers. 'push_branch' for the first approval (writes to the remote branch). 'create_change_request' for the second, separate approval that opens the PR/MR."
       },
       "target_branch": {
         "type": "string",
-        "default": "main",
-        "description": "Target branch (required for 'request_approval'). Defaults to 'main'."
-      },
-      "approval_id": {
-        "type": "string",
-        "description": "Approval ticket ID (required for 'push_branch' and 'create_change_request')."
-      },
-      "remote": {
-        "type": "string",
-        "description": "Remote name (optional for 'push_branch')."
-      },
-      "local_branch": {
-        "type": "string",
-        "description": "Local branch to push."
+        "description": "REQUIRED when creating a new operation via 'request_approval' (workspace_id without operation_id). For 'push_branch': the remote branch the push writes to (typically a feature branch, e.g. 'feature/x'). For 'create_change_request': the PR base branch (e.g. 'main'). MUST differ from source_branch when operation='create_change_request'."
       },
       "source_branch": {
         "type": "string",
-        "description": "Source branch (required for 'create_change_request')."
+        "description": "Optional. The local branch the change lives on. Defaults to the workspace's current branch. For 'create_change_request', this is the branch that was pushed and MUST differ from target_branch."
+      },
+      "approval_id": {
+        "type": "string",
+        "description": "Approval ticket ID returned by 'request_approval' and granted by the user in the UI. Required for 'push_branch' and 'create_change_request'."
+      },
+      "remote": {
+        "type": "string",
+        "description": "Remote name for 'push_branch'. Defaults to 'origin'."
+      },
+      "local_branch": {
+        "type": "string",
+        "description": "Optional override for the local branch to push. Defaults to the operation's source_branch."
       },
       "title": {
         "type": "string",
-        "description": "Change-request title. ONLY used for 'create_change_request'."
+        "description": "Change-request title. Required for 'create_change_request'. The user reviewed this title."
       },
       "body": {
         "type": "string",
-        "description": "Change-request description. ONLY used for 'create_change_request'."
+        "description": "Change-request description (Markdown supported). Optional. Used by 'create_change_request'."
       },
       "draft": {
         "type": "boolean",
         "default": true,
-        "description": "Create as draft change request. ONLY used for 'create_change_request'."
+        "description": "When true (default), create the change request as a draft. Used by 'create_change_request'."
+      },
+      "include_events": {
+        "type": "boolean",
+        "default": true,
+        "description": "When true (default), include the event history in 'get_operation' results. Set to false to keep the response compact."
+      },
+      "limit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100,
+        "default": 20,
+        "description": "Maximum number of operations returned by 'list_operations' (1-100, default 20)."
+      },
+      "status": {
+        "type": "string",
+        "description": "Optional status filter for 'list_operations' (e.g. 'review_required', 'approved', 'pushed'). Has no effect on other actions. NOTE: distinct from the 'inspect_diff' alias, which normalizes the ACTION value, not this parameter name."
+      },
+      "kind": {
+        "type": "string",
+        "description": "Optional kind filter for 'list_operations' (e.g. 'push_branch', 'create_change_request'). Has no effect on other actions."
       }
     },
     "required": ["action"]

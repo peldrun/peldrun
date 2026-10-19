@@ -80,24 +80,33 @@ DEFAULT_AUTHOR_EMAIL: str = "peldrun@localhost"
 #: Maximum number of commits returned by `list_commits` in one call.
 MAX_LISTED_COMMITS: int = 1_000
 
-#: Delimiter used between fields in `git log --format`. The record
-#: separator (`\x1e`) marks the end of one commit and the start of
-#: the next.
+#: Delimiter bytes that GIT must EMIT in the output stream. These are
+#: the bytes `_parse_commit_log` splits on, so they are NUL (0x00) for
+#: field separation and RECORD SEPARATOR (0x1E) for commit separation.
+#:
+#: IMPORTANT: these constants describe the OUTPUT, not the argv passed
+#: to git. `subprocess` (and `execve` / `CreateProcessW` underneath it)
+#: rejects NUL bytes in argv, so a literal `\x00` in the format string
+#: raises `ValidationError: Git arguments must not contain NUL bytes`
+#: before git even runs. The format string below uses git's own
+#: `%x00` / `%x1e` escapes so that the argv passed to git is pure
+#: printable ASCII while the emitted bytes are still NUL / RS.
 _FIELD_SEP = "\x00"
 _RECORD_SEP = "\x1e"
 
 #: Format string for `git log --format=...`.
 #:
 #: Fields (in order):
-#:     %H  full commit SHA
-#:     %an author name
-#:     %ae author email
-#:     %at author timestamp (Unix seconds)
-#:     %P  parent SHAs (space-separated)
-#:     %B  raw commit body (may contain newlines)
+#:     %H      full commit SHA
+#:     %an     author name
+#:     %ae     author email
+#:     %at     author timestamp (Unix seconds)
+#:     %P      parent SHAs (space-separated)
+#:     %B      raw commit body (may contain newlines)
+#:     %x00    emit byte 0x00 (field separator)
+#:     %x1e    emit byte 0x1e (record separator)
 _COMMIT_LOG_FORMAT = (
-    f"%H{_FIELD_SEP}%an{_FIELD_SEP}%ae{_FIELD_SEP}%at"
-    f"{_FIELD_SEP}%P{_FIELD_SEP}%B{_RECORD_SEP}"
+    "%H%x00%an%x00%ae%x00%at%x00%P%x00%B%x1e"
 )
 
 
@@ -373,13 +382,15 @@ class GitCommitManager(CommitPort):
             raise ValidationError("sha must not be empty.")
         target = self._resolve_workspace_path(workspace_path, workspace_id)
 
+        # `--no-pager` is a global git option (see the note in
+        # `_read_latest_commit`); the pager is already disabled via
+        # GIT_PAGER=cat in `GitExecutable`.
         result = await self._git.run(
             [
                 "show",
                 "-s",
                 f"--format={_COMMIT_LOG_FORMAT}",
                 "--no-color",
-                "--no-pager",
                 sha,
             ],
             cwd=target,
@@ -437,13 +448,15 @@ class GitCommitManager(CommitPort):
 
         target = self._resolve_workspace_path(workspace_path, workspace_id)
 
+        # `--no-pager` is a global git option (see the note in
+        # `_read_latest_commit`); the pager is already disabled via
+        # GIT_PAGER=cat in `GitExecutable`.
         result = await self._git.run(
             [
                 "log",
                 f"-n{limit}",
                 f"--format={_COMMIT_LOG_FORMAT}",
                 "--no-color",
-                "--no-pager",
                 ref or "HEAD",
             ],
             cwd=target,
@@ -477,6 +490,17 @@ class GitCommitManager(CommitPort):
         the process. Projects that require signed commits must be
         signed outside PELDRUN.
         """
+        # `git commit` rejects `--no-color` on every supported Git
+        # version: it exits 129 ("unknown option `no-color'") before
+        # running any hook. Unlike `git diff` / `git log` / `git show`,
+        # `git commit` does not produce colored output, so the flag is
+        # meaningless here anyway. The previous implementation kept it
+        # "for consistency" with the other commands, which broke every
+        # non-empty commit. The remaining flags are all valid:
+        #   - `--no-gpg-sign`  : avoid a hanging GPG prompt.
+        #   - `--no-verify`    : bypass hooks; the caller already
+        #                        reviewed the change.
+        #   - `-F -`           : read the message from stdin.
         args: List[str] = [
             "-c",
             f"user.name={author_name}",
@@ -485,7 +509,6 @@ class GitCommitManager(CommitPort):
             "commit",
             "--no-gpg-sign",
             "--no-verify",
-            "--no-color",
         ]
         if allow_empty:
             args.append("--allow-empty")
@@ -565,22 +588,47 @@ class GitCommitManager(CommitPort):
         """Return the HEAD commit, or `None` for an empty repository."""
         if not await self._has_any_commit(target):
             return None
+        # `--no-pager` is a GLOBAL git option, not a `git log` option.
+        # Modern git rejects it in this position with
+        # "fatal: unrecognized argument: --no-pager", which exits
+        # non-zero with no stdout — exactly the case that used to look
+        # like a failed read and surfaced as a bogus
+        # "Commit succeeded but could not be read back" error. The
+        # pager is already disabled via GIT_PAGER=cat in
+        # `GitExecutable._build_environment`, so the flag is not
+        # needed here.
         result = await self._git.run(
             [
                 "log",
                 "-n1",
                 f"--format={_COMMIT_LOG_FORMAT}",
                 "--no-color",
-                "--no-pager",
                 "HEAD",
             ],
             cwd=target,
             check_returncode=False,
         )
         if result.returncode != 0 and not result.stdout:
+            logger.warning(
+                "_read_latest_commit: git log failed "
+                "(returncode=%d, stderr=%r)",
+                result.returncode,
+                (result.stderr or "")[:300],
+            )
             return None
         commits = _parse_commit_log(result.stdout)
-        return commits[0] if commits else None
+        if not commits:
+            logger.warning(
+                "_read_latest_commit: parse returned no commits "
+                "(returncode=%d, stdout_len=%d, stdout_repr=%r, "
+                "stderr_repr=%r)",
+                result.returncode,
+                len(result.stdout),
+                result.stdout[:200],
+                (result.stderr or "")[:200],
+            )
+            return None
+        return commits[0]
 
     # --- Internal: validation ------------------------------------------
 

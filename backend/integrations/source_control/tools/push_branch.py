@@ -57,7 +57,9 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Tuple, Union
 
 from ..domain.enums import OperationStatus, ProviderId
+from ..domain.policies import is_protected_branch
 from ..errors import to_source_control_error
+from ..git.diff import get_default_diff_engine
 from ..git.push import GitPushManager, get_default_push_manager
 from ..git.workspace import (
     GitWorkspaceManager,
@@ -70,6 +72,10 @@ from ..operations.service import (
 from ..security.approval import (
     ApprovalGate,
     get_default_approval_gate,
+)
+from ..security.policy_engine import (
+    PolicyResolutionContext,
+    get_default_policy_engine,
 )
 from ..security.redaction import redact_url
 from ..security.token_service import (
@@ -276,24 +282,12 @@ class PushBranchTool(SourceControlTool):
                 metadata={"operation_id": operation_id},
             )
 
-        target_branch = record.target_branch or record.source_branch
-        if not target_branch:
-            return self.failure_result(
-                error_code="VALIDATION_ERROR",
-                error_message=(
-                    "Operation has no target branch; cannot push."
-                ),
-                metadata={"operation_id": operation_id},
-            )
-
-        local_branch = (
-            local_branch_override
-            or record.source_branch
-            or target_branch
-        )
-
-        # Fetch the workspace so we can pass its path to the push
-        # manager and to the reconciliation logic.
+        # Fetch the workspace first. It provides both the working
+        # directory and the branch the repository is actually on.
+        # The record's `source_branch` is authoritative (it is what
+        # the user reviewed), but falling back to the workspace's
+        # current branch keeps this tool usable with older records
+        # created before `source_branch` was populated.
         workspace = workspace_manager.get_workspace(record.workspace_id)
         if workspace is None:
             return self.failure_result(
@@ -308,11 +302,143 @@ class PushBranchTool(SourceControlTool):
                 },
             )
 
+        # `target_branch` is the REMOTE branch we push to. It is the
+        # value the user approved; falling back to `source_branch`
+        # here would silently push the source branch to itself on
+        # the remote, which is not what the user requested.
+        target_branch = record.target_branch
+        if not target_branch:
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message=(
+                    "Operation has no target_branch. Re-request "
+                    "approval with a valid target_branch."
+                ),
+                metadata={"operation_id": operation_id},
+            )
+
+        # `source_branch` is the LOCAL branch we push from. The
+        # record's value takes priority; the workspace's actual
+        # checkout is the fallback for legacy records.
+        source_branch = record.source_branch or workspace.current_branch
+        if not source_branch:
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message=(
+                    "Operation has no source_branch and the workspace "
+                    "has no current branch; cannot determine which "
+                    "local branch to push."
+                ),
+                metadata={"operation_id": operation_id},
+            )
+
+        local_branch = local_branch_override or source_branch
+        # --- Pre-flight safety checks -----------------------------------
+        #
+        # These run BEFORE the approval ticket is touched. A failure
+        # here leaves the ticket intact so the user does not have to
+        # re-approve an unchanged diff after fixing the underlying
+        # condition (missing connection, workspace discarded, policy
+        # changed, etc.).
+        #
+        # The previous implementation only checked the workspace
+        # state and the approval ticket. It let three critical cases
+        # slip through:
+        #   - pushes to protected branches (main, release/*),
+        #   - pushes that violated the currently-active policy,
+        #   - pushes whose workspace had changed since the review.
+
+        # 1. Protected target branch. The UI does not let the user
+        #    request such an approval, but defense in depth: never
+        #    trust a ticket's target_branch blindly.
+        if is_protected_branch(target_branch):
+            return self.failure_result(
+                error_code="PERMISSION_DENIED",
+                error_message=(
+                    f"Pushing to the protected branch "
+                    f"'{target_branch}' is forbidden. Push to a "
+                    "feature branch and open a change request."
+                ),
+                metadata={
+                    "operation_id": operation_id,
+                    "target_branch": target_branch,
+                },
+            )
+
+        # 2. Policy engine, re-evaluated at execution time. The
+        #    policy may have changed since the ticket was created
+        #    (repository now read-only, branch protection tightened,
+        #    etc.). The check runs BEFORE `consume` so a valid ticket
+        #    is never burned by a policy denial: the user can retry
+        #    once the policy is relaxed.
+        policy_engine = get_default_policy_engine()
+        try:
+            policy_engine.require(
+                PolicyResolutionContext(
+                    operation="push_branch",
+                    provider=record.provider,
+                    source_branch=source_branch,
+                    target_branch=target_branch,
+                    actor="system",
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            normalized = to_source_control_error(exc)
+            return self.failure_result(
+                error_code=normalized.code.value,
+                error_message=normalized.message,
+                metadata={
+                    "operation_id": operation_id,
+                    "target_branch": target_branch,
+                },
+            )
+
+        # 3. Diff integrity. Recompute the current workspace diff and
+        #    compare its SHA-256 to the one bound into the approval
+        #    ticket. If the workspace changed after review, the ticket
+        #    is stale and MUST be rejected: allowing the push would
+        #    execute a different diff than the one the user approved.
+        if record.diff_sha256:
+            try:
+                current_summary = await get_default_diff_engine().compute_diff(
+                    workspace_id=record.workspace_id,
+                    base_sha=record.base_sha or None,
+                    include_patch=False,
+                    workspace_path=workspace.workspace_path,
+                )
+            except Exception as exc:  # noqa: BLE001
+                normalized = to_source_control_error(exc)
+                return self.failure_result(
+                    error_code=normalized.code.value,
+                    error_message=(
+                        "Could not recompute the diff to verify the "
+                        "approval is still current: "
+                        + normalized.message
+                    ),
+                    metadata={"operation_id": operation_id},
+                )
+
+            current_hash = current_summary.sha256()
+            if current_hash != record.diff_sha256:
+                return self.failure_result(
+                    error_code="APPROVAL_INVALID",
+                    error_message=(
+                        "The workspace changed after the approval "
+                        "was granted. Request a new approval for "
+                        "the current diff."
+                    ),
+                    metadata={
+                        "operation_id": operation_id,
+                        "recorded_diff_sha256": record.diff_sha256,
+                        "current_diff_sha256": current_hash,
+                    },
+                )
+
         # --- Resolve the credential ------------------------------------
         #
         # IMPORTANT: this step runs BEFORE approval validation and
         # BEFORE approval consumption. If the credential is missing,
-        # we fail early and the user can fix the connection and
+        # we fail early so the user can fix the connection and
         # retry — the approval ticket is preserved.
         auth = self._resolve_auth(
             token_service=token_service,
@@ -349,76 +475,32 @@ class PushBranchTool(SourceControlTool):
                 },
             )
 
-        # --- Re-fetch the remote SHA -----------------------------------
+        # --- Remote-state check (intentionally omitted) ----------------
         #
-        # This check catches the race where another contributor
-        # pushed to the target branch between the moment the user
-        # reviewed the diff and the moment we are about to push.
+        # The previous implementation compared the remote's current
+        # head to `record.base_sha`. That comparison is semantically
+        # wrong: `record.base_sha` is the commit the WORKSPACE was
+        # created from, not the commit the TARGET branch was at when
+        # the user reviewed the diff. Two consequences:
         #
-        # The credential is supplied so the check works for private
-        # repositories. Without it, `_remote_head_sha` returns
-        # `None` and the check is silently skipped.
-        try:
-            remote_sha = await push_manager._remote_head_sha(
-                target=Path(workspace.workspace_path),
-                remote=remote,
-                ref=target_branch,
-                token=token,
-            )
-        except Exception as exc:  # noqa: BLE001
-            normalized = to_source_control_error(exc)
-            return self.failure_result(
-                error_code=normalized.code.value,
-                error_message=(
-                    "Could not verify the remote branch state: "
-                    + normalized.message
-                ),
-                metadata={"operation_id": operation_id},
-            )
-
-        if remote_sha is not None and record.base_sha:
-            if remote_sha != record.base_sha:
-                # The remote moved. Invalidate the approval so the
-                # user cannot re-use it for a different base.
-                try:
-                    approval_gate.revoke(
-                        approval_id,
-                        actor="system",
-                        reason="Remote base changed before push.",
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-
-                # Transition the operation so that the UI shows the
-                # stale state.
-                try:
-                    await operation_service.transition(
-                        operation_id,
-                        OperationStatus.STALE_REVIEW_REQUIRED,
-                        reason=(
-                            "Remote base changed since the review."
-                        ),
-                        metadata={
-                            "previous_base_sha": record.base_sha,
-                            "remote_sha": remote_sha,
-                        },
-                        actor="system",
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-
-                return self.failure_result(
-                    error_code="REMOTE_STATE_CHANGED",
-                    error_message=(
-                        "The remote branch has changed since the "
-                        "review. Re-review the diff before pushing."
-                    ),
-                    metadata={
-                        "operation_id": operation_id,
-                        "previous_base_sha": record.base_sha,
-                        "remote_sha": remote_sha,
-                    },
-                )
+        #   - For a NEW feature branch (which is the normal case for
+        #     agent-driven pushes), the remote branch does not exist
+        #     at review time. The remote SHA is either None (skip) or
+        #     set by an unrelated prior push, in which case the check
+        #     fires `REMOTE_STATE_CHANGED` on valid work.
+        #   - For an existing feature branch, the branch legitimately
+        #     points at a commit different from `record.base_sha`
+        #     (which tracks the base the workspace was cloned from).
+        #     The check therefore also fires on the most common
+        #     non-new-branch case.
+        #
+        # The real anti-race guarantee is provided by Git itself: the
+        # `push_manager` calls `git push` without `--force`, so git
+        # rejects any non-fast-forward update before writing to the
+        # remote. If a stricter pre-flight check is ever needed, the
+        # remote SHA MUST be captured at review time (in
+        # `record.metadata["reviewed_remote_sha"]`) and compared
+        # against THAT — not against `record.base_sha`.
 
         # --- Consume the approval -------------------------------------
         #

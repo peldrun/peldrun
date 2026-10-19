@@ -113,33 +113,60 @@ export function resolveFileCategory(fileName: string, customUrl?: string) {
 
 export function extractOperationFromSteps(steps: StepEvent[]): OperationResponse | null {
   for (const step of steps) {
-    if (step.toolName === "source_control" && step.type === "observation") {
-      try {
-        const data = typeof step.content === "string" ? JSON.parse(step.content) : step.content;
-        if (data?.approval_id && data?.operation_id) {
-          return {
-            operation_id: data.operation_id,
-            operation_type: data.operation || "push_branch",
-            provider: "github",
-            repository_id: "unknown",
-            target_branch: data.target_branch || "main",
-            current_state: "review_required",
-            approval_id: data.approval_id,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-            events: [],
-          };
-        }
-      } catch (e) {
-        // Ignore JSON parse errors
+    // Identify the request_approval observation by payload shape,
+    // not by toolName. The SSE bridge does not guarantee that
+    // `tool_name` is present on observation events (peldrun-core may
+    // omit it), and the previous check
+    // `step.toolName === "source_control"` therefore never matched —
+    // which is why the ChatOperationCard never rendered and the
+    // Source Control panel stayed idle after a successful
+    // request_approval. The payload is self-identifying: only a
+    // successful request_approval response contains both
+    // `approval_id` and `operation_id`.
+    if (step.type !== "observation") continue;
+    const raw = typeof step.content === "string" ? step.content.trim() : "";
+    if (!raw || !raw.startsWith("{")) continue;
+    try {
+      const data = JSON.parse(raw);
+      if (
+        data &&
+        typeof data === "object" &&
+        typeof data.approval_id === "string" &&
+        typeof data.operation_id === "string"
+      ) {
+        return {
+          operation_id: data.operation_id,
+          operation_type: data.operation || "push_branch",
+          provider: "github",
+          repository_id: data.repository_id || "unknown",
+          target_branch: data.target_branch || "main",
+          current_state: "review_required",
+          approval_id: data.approval_id,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+          events: [],
+        };
       }
+    } catch {
+      // Not JSON; skip.
     }
   }
   return null;
 }
 
 export function filterApprovalSteps(steps: StepEvent[]): StepEvent[] {
-  return steps.filter(
-    (s) => !(s.toolName === "source_control" && s.type === "observation" && s.content.includes("approval_id"))
-  );
+  return steps.filter((s) => {
+    if (s.type !== "observation") return true;
+    const raw = typeof s.content === "string" ? s.content.trim() : "";
+    if (!raw.startsWith("{") || !raw.includes("approval_id")) return true;
+    try {
+      const data = JSON.parse(raw);
+      // Hide the raw observation from the timeline only when it is a
+      // real request_approval payload; the ChatOperationCard will
+      // render it prominently.
+      return !(data?.approval_id && data?.operation_id);
+    } catch {
+      return true;
+    }
+  });
 }

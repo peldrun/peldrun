@@ -65,7 +65,12 @@ try:
         CreateBranchTool,
         CreateChangeRequestTool,
         CreateWorkspaceTool,
+        GetOperationTool,
+        GetRepositoryTool,
         InspectDiffTool,
+        ListBranchesTool,
+        ListOperationsTool,
+        ListProvidersTool,
         ListRepositoriesTool,
         PushBranchTool,
         ReadFileTool,
@@ -93,7 +98,12 @@ except ImportError:  # repo layout: backend.integrations.*
         CreateBranchTool,
         CreateChangeRequestTool,
         CreateWorkspaceTool,
+        GetOperationTool,
+        GetRepositoryTool,
         InspectDiffTool,
+        ListBranchesTool,
+        ListOperationsTool,
+        ListProvidersTool,
         ListRepositoriesTool,
         PushBranchTool,
         ReadFileTool,
@@ -121,6 +131,23 @@ logger = logging.getLogger(__name__)
 # the accepted surface explicit and lets the dispatcher filter cleanly.
 
 _ACTION_MAP: dict[str, tuple[type, frozenset[str]]] = {
+    # Discovery. These three actions let the agent inspect available
+    # providers, look up a single repository's metadata, and enumerate
+    # branches BEFORE committing to a workspace. Without them, the
+    # agent can only discover repositories (via list_repositories) and
+    # is blind to branches and providers entirely.
+    "list_providers": (
+        ListProvidersTool,
+        frozenset({"registry", "audit_logger"}),
+    ),
+    "get_repository": (
+        GetRepositoryTool,
+        frozenset({"registry", "token_service", "audit_logger"}),
+    ),
+    "list_branches": (
+        ListBranchesTool,
+        frozenset({"registry", "token_service", "audit_logger"}),
+    ),
     "list_repositories": (
         ListRepositoriesTool,
         frozenset({"registry", "token_service", "audit_logger"}),
@@ -188,6 +215,20 @@ _ACTION_MAP: dict[str, tuple[type, frozenset[str]]] = {
             }
         ),
     ),
+    # Read-only journal access. These two actions let an agent
+    # resume after an approval without relying on its own memory:
+    # `get_operation` fetches one operation by ID, and
+    # `list_operations` enumerates recent operations (optionally
+    # filtered by workspace, kind, or status). Neither touches the
+    # remote or the state machine.
+    "get_operation": (
+        GetOperationTool,
+        frozenset({"operation_service", "audit_logger"}),
+    ),
+    "list_operations": (
+        ListOperationsTool,
+        frozenset({"operation_service", "audit_logger"}),
+    ),
 }
 
 #: Aliases the model may emit; each maps to a canonical action name.
@@ -195,6 +236,11 @@ _ACTION_ALIASES: Mapping[str, str] = {
     "list_repos": "list_repositories",
     "repos": "list_repositories",
     "search_repos": "list_repositories",
+    "providers": "list_providers",
+    "get_repo": "get_repository",
+    "repo": "get_repository",
+    "branches": "list_branches",
+    "get_branches": "list_branches",
     "read": "read_file",
     "cat": "read_file",
     "clone": "create_workspace",
@@ -213,6 +259,12 @@ _ACTION_ALIASES: Mapping[str, str] = {
     "create_pr": "create_change_request",
     "open_pr": "create_change_request",
     "pr": "create_change_request",
+    "get_op": "get_operation",
+    "op_status": "get_operation",
+    "operation": "get_operation",
+    "list_ops": "list_operations",
+    "pending_operations": "list_operations",
+    "list_approvals": "list_operations",
 }
 
 
@@ -229,10 +281,12 @@ class SourceControlArgs(BaseModel):
         ...,
         description=(
             "The source-control action to execute. Canonical actions: "
-            "'list_repositories', 'read_file', 'create_workspace', "
+            "'list_providers', 'list_repositories', 'get_repository', "
+            "'list_branches', 'read_file', 'create_workspace', "
             "'create_branch', 'inspect_diff', 'run_checks', "
             "'request_approval', 'push_branch', "
-            "'create_change_request'."
+            "'create_change_request', 'get_operation', "
+            "'list_operations'."
         ),
     )
     params: Optional[dict[str, Any]] = Field(

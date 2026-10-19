@@ -170,16 +170,28 @@ class GetRepositoryTool(SourceControlTool):
             )
 
         # --- Build a minimal RepositoryRef -----------------------------
-        # The adapter's `get_repository` expects a `RepositoryRef`
-        # whose `repository_id` (and namespace/name) are used to
-        # build the API URL. We construct a placeholder from the
-        # caller-provided ID; the adapter refreshes the rest.
+        # The adapter's `get_repository` validates that BOTH
+        # `namespace` and `name` are non-empty before building the
+        # API URL. A raw `repository_id` like "mtaman/mtaman" must
+        # therefore be split into its two components; otherwise the
+        # adapter raises `ValidationError("Repository namespace and
+        # name must not be empty")` before it has a chance to
+        # resolve anything.
+        #
+        # A bare id (no "/") keeps `namespace=""`; the adapter's
+        # validation will reject it, but the fallback listing below
+        # catches that case and matches by name.
+        if "/" in repository_id:
+            _ns, _, _nm = repository_id.partition("/")
+        else:
+            _ns, _nm = "", repository_id
+
         placeholder = RepositoryRef(
             provider=provider,
             account_id=account_id,
             repository_id=repository_id,
-            namespace="",
-            name=repository_id,
+            namespace=_ns,
+            name=_nm,
             clone_url="",
             web_url="",
             default_branch="",
@@ -256,11 +268,24 @@ class GetRepositoryTool(SourceControlTool):
             )
             if isinstance(refreshed, RepositoryRef):
                 return refreshed
-        except NotFoundError:
-            # Fall through to the listing fallback.
+        except (NotFoundError, ValidationError):
+            # NotFoundError: the adapter accepted the placeholder's
+            #   shape but the repository does not exist.
+            # ValidationError: the adapter rejected the placeholder
+            #   (e.g., namespace/name still empty). Both mean the
+            #   fast path cannot resolve; fall through to listing.
+            pass
+        except Exception:  # noqa: BLE001
+            # Any other adapter-specific rejection is handled the
+            # same way: try the fallback.
             pass
 
-        # Fallback: list repositories and filter.
+        # Fallback: list repositories and match. The caller-supplied
+        # `repository_id` may be:
+        #   - the provider's stable ID (e.g., GitHub numeric),
+        #   - the full name "owner/repo",
+        #   - the bare repository name.
+        # Match in that order of specificity.
         try:
             listing = await adapter.list_repositories(
                 page=1, page_size=100, token=token
@@ -268,11 +293,21 @@ class GetRepositoryTool(SourceControlTool):
         except Exception:  # noqa: BLE001
             return None
 
+        target = placeholder.repository_id.strip()
         for repo in listing:
-            if (
-                isinstance(repo, RepositoryRef)
-                and repo.repository_id == placeholder.repository_id
-            ):
+            if not isinstance(repo, RepositoryRef):
+                continue
+            if repo.repository_id == target:
+                return repo
+        for repo in listing:
+            if not isinstance(repo, RepositoryRef):
+                continue
+            if repo.full_name() == target:
+                return repo
+        for repo in listing:
+            if not isinstance(repo, RepositoryRef):
+                continue
+            if repo.name == target:
                 return repo
         return None
 

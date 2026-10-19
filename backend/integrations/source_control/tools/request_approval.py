@@ -9,8 +9,13 @@ import logging
 from typing import Any, Mapping, Optional
 
 from ..domain.enums import OperationStatus
-from ..errors import to_source_control_error
+from ..errors import WorkspaceDirtyError, to_source_control_error
+from ..git.commit import (
+    CommitOptions,
+    get_default_commit_manager,
+)
 from ..git.diff import get_default_diff_engine
+from ..git.path_policy import is_valid_branch_name
 from ..git.workspace import get_default_workspace_manager
 from ..operations.service import (
     OperationService,
@@ -86,9 +91,26 @@ class RequestApprovalTool(SourceControlTool):
                     "default": "push_branch",
                     "description": "The remote side effect the approval covers."
                 },
+                "source_branch": {
+                    "type": "string",
+                    "description": (
+                        "Local branch the change lives on. Optional; "
+                        "defaults to the workspace's current branch. "
+                        "For create_change_request, this is the head "
+                        "branch of the PR and MUST differ from "
+                        "target_branch."
+                    )
+                },
                 "target_branch": {
                     "type": "string",
-                    "description": "The remote branch the operation targets."
+                    "description": (
+                        "Remote branch the operation targets. "
+                        "REQUIRED when creating a new operation "
+                        "(workspace_id without operation_id). For "
+                        "push_branch: the remote branch to push to. "
+                        "For create_change_request: the PR base branch "
+                        "(for example 'main')."
+                    )
                 },
                 "ttl_seconds": {
                     "type": "integer",
@@ -116,10 +138,66 @@ class RequestApprovalTool(SourceControlTool):
             if operation_id.lower() in ("none", "null", ""):
                 operation_id = None
 
+        # Auto-resolve workspace_id from the most recent workspace
+        # created in this chat session when neither operation_id nor
+        # workspace_id was supplied. This compensates for LLM models
+        # (including GigaChat-3-Pro) that succeed at create_workspace
+        # but forget to forward the returned `workspace_id` to the
+        # subsequent request_approval call — even though the model
+        # demonstrably knows the value (it correctly passes it to
+        # push_branch). Without this fallback, the model loops on
+        # "Either operation_id or workspace_id must be provided" until
+        # max_steps, and no approval ticket is ever created.
+        #
+        # Safety: the fallback ONLY activates when the caller supplies
+        # neither identifier. It picks the workspace with the highest
+        # created_at among workspaces whose metadata.chat_id matches
+        # the current session's chat_id. If the caller supplies either
+        # identifier, the fallback is skipped entirely.
+        if not operation_id and not workspace_id:
+            chat_id_ctx = ""
+            if isinstance(context.metadata, dict):
+                raw_chat = context.metadata.get("chat_id")
+                if isinstance(raw_chat, str):
+                    chat_id_ctx = raw_chat.strip()
+            if chat_id_ctx:
+                try:
+                    from ..git.workspace import get_default_workspace_manager
+
+                    mgr = get_default_workspace_manager()
+                    candidates = [
+                        ws
+                        for ws in mgr.list_workspaces()
+                        if isinstance(ws.metadata, dict)
+                        and ws.metadata.get("chat_id") == chat_id_ctx
+                    ]
+                    # list_workspaces() returns oldest-first; use the
+                    # newest match.
+                    if candidates:
+                        workspace_id = candidates[-1].workspace_id
+                        logger.info(
+                            "request_approval: auto-resolved "
+                            "workspace_id=%r from the most recent "
+                            "workspace for chat_id=%r",
+                            workspace_id,
+                            chat_id_ctx,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "request_approval: auto-resolve of "
+                        "workspace_id failed (%s); the caller will "
+                        "receive the standard validation error.",
+                        type(exc).__name__,
+                    )
+
         if not operation_id and not workspace_id:
             return self.failure_result(
                 error_code="VALIDATION_ERROR",
-                error_message="Either `operation_id` or `workspace_id` must be provided."
+                error_message=(
+                    "Either `operation_id` or `workspace_id` must be "
+                    "provided. The `workspace_id` is returned by the "
+                    "preceding `create_workspace` call; pass it here."
+                ),
             )
 
         # Accept common aliases and fall back to push_branch
@@ -133,18 +211,76 @@ class RequestApprovalTool(SourceControlTool):
         }
         operation = operation_aliases.get(raw_op, raw_op)
         if operation not in SUPPORTED_OPERATIONS:
-            operation = "push_branch" # Safest default
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message=(
+                    f"Unsupported operation: {raw_op!r}. "
+                    f"Supported: {list(SUPPORTED_OPERATIONS)}."
+                ),
+            )
 
         # Ignore title/body (they belong to create_change_request)
         kwargs.pop("title", None)
         kwargs.pop("body", None)
         kwargs.pop("draft", None)
 
-        # Default target_branch to "main" if missing
-        target_branch = kwargs.get("target_branch")
-        if not isinstance(target_branch, str) or not target_branch.strip():
-            target_branch = "main"
-        target_branch = target_branch.strip()
+        # target_branch: required for new operations (the caller must
+        # know where the change is going), resolved from the record
+        # for existing ones. The old "main" default silently directed
+        # pushes at the protected default branch and disagreed with
+        # the record for re-request scenarios.
+        target_branch_input = kwargs.get("target_branch")
+        if isinstance(target_branch_input, str):
+            target_branch_input = target_branch_input.strip() or None
+        else:
+            target_branch_input = None
+
+        # source_branch: optional override. When omitted, the
+        # workspace's current branch is used as the change's head.
+        source_branch_input = kwargs.get("source_branch")
+        if isinstance(source_branch_input, str):
+            source_branch_input = source_branch_input.strip() or None
+        else:
+            source_branch_input = None
+
+        # A new operation is created when workspace_id is given without
+        # an existing operation_id. This flag drives both the required
+        # target_branch validation below and the ticket branch choice
+        # at the end of the method.
+        creating_new = bool(workspace_id and not operation_id)
+        if creating_new:
+            if not target_branch_input:
+                return self.failure_result(
+                    error_code="VALIDATION_ERROR",
+                    error_message=(
+                        "`target_branch` is required when creating a "
+                        "new operation. For push_branch, pass the "
+                        "remote branch to push to. For "
+                        "create_change_request, pass the PR base "
+                        "branch (for example 'main')."
+                    ),
+                    metadata={"workspace_id": workspace_id},
+                )
+            if not is_valid_branch_name(target_branch_input):
+                return self.failure_result(
+                    error_code="VALIDATION_ERROR",
+                    error_message=(
+                        f"Invalid `target_branch`: "
+                        f"{target_branch_input!r}."
+                    ),
+                    metadata={"workspace_id": workspace_id},
+                )
+            if source_branch_input and not is_valid_branch_name(
+                source_branch_input
+            ):
+                return self.failure_result(
+                    error_code="VALIDATION_ERROR",
+                    error_message=(
+                        f"Invalid `source_branch`: "
+                        f"{source_branch_input!r}."
+                    ),
+                    metadata={"workspace_id": workspace_id},
+                )
 
         ttl_raw = kwargs.get("ttl_seconds")
         ttl_seconds: Optional[int] = None
@@ -182,33 +318,84 @@ class RequestApprovalTool(SourceControlTool):
                 )
 
             try:
-                # Auto-commit any uncommitted changes before diff
-                import subprocess
+                # Stage and commit any pending edits using the async
+                # CommitManager. The previous implementation used
+                # synchronous `subprocess.run`, which blocked the
+                # event loop for up to 60 seconds per invocation and
+                # silently swallowed every failure. A failed commit
+                # left the workspace without a born HEAD (or with
+                # stale staging), which caused `git diff` to fail
+                # downstream with an error the agent could not
+                # interpret.
+                #
+                # The CommitManager raises WorkspaceDirtyError when
+                # there is nothing to commit. That is a legitimate
+                # state — the agent's edits may have been committed
+                # manually, or none were made — so we treat it as a
+                # no-op and proceed to diff computation.
+                commit_manager = get_default_commit_manager()
                 try:
-                    subprocess.run(
-                        ["git", "add", "-A"],
-                        cwd=ws.workspace_path,
-                        check=False,
-                        capture_output=True,
-                        timeout=30,
+                    await commit_manager.create_commit(
+                        workspace_id=workspace_id,
+                        message=f"PELDRUN: {operation}",
+                        options=CommitOptions(
+                            stage_all=True,
+                            allow_empty=False,
+                        ),
+                        workspace_path=ws.workspace_path,
                     )
-                    subprocess.run(
-                        ["git", "-c", "user.name=PELDRUN", "-c", "user.email=peldrun@localhost",
-                         "commit", "-m", f"PELDRUN: {operation}"],
-                        cwd=ws.workspace_path,
-                        check=False,
-                        capture_output=True,
-                        timeout=30,
-                    )
-                except Exception:
+                except WorkspaceDirtyError:
+                    # Nothing to commit; proceed to diff.
                     pass
+
+                # Resolve the change's head branch. The explicit input
+                # wins; otherwise we use the branch the workspace is
+                # actually on. This value is stored on the record as
+                # source_branch and is consumed by push_branch (as the
+                # local ref) and create_change_request (as the PR
+                # head).
+                effective_source_branch = (
+                    source_branch_input or ws.current_branch
+                )
+                if not is_valid_branch_name(effective_source_branch):
+                    return self.failure_result(
+                        error_code="VALIDATION_ERROR",
+                        error_message=(
+                            f"Invalid `source_branch`: "
+                            f"{effective_source_branch!r}."
+                        ),
+                        metadata={"workspace_id": workspace_id},
+                    )
+
+                # For create_change_request, source and target MUST
+                # differ: a PR from a branch to itself is meaningless
+                # and would be rejected by the provider. For
+                # push_branch they may be equal (push feature-x to
+                # feature-x).
+                if (
+                    operation == "create_change_request"
+                    and effective_source_branch == target_branch_input
+                ):
+                    return self.failure_result(
+                        error_code="VALIDATION_ERROR",
+                        error_message=(
+                            f"`source_branch` and `target_branch` are "
+                            f"identical ({effective_source_branch!r}); "
+                            "for create_change_request, source_branch "
+                            "is the branch being merged and "
+                            "target_branch is the PR base. They must "
+                            "differ."
+                        ),
+                        metadata={"workspace_id": workspace_id},
+                    )
 
                 # 1. Create operation dynamically
                 record = await operation_service.create_operation(
                     repository_id=ws.repository_id,
                     kind=operation,
                     provider=ws.provider,
-                    target_branch=target_branch,
+                    source_branch=effective_source_branch,
+                    target_branch=target_branch_input,
                     workspace_id=workspace_id,
                 )
                 operation_id = record.operation_id
@@ -225,9 +412,7 @@ class RequestApprovalTool(SourceControlTool):
                     except Exception:
                         pass # Ignore if already in that state
 
-                # 3. Compute and attach the diff
-                # We use the SHA-1 base_sha for Git diff.
-                import hashlib
+                # 3. Compute and attach the diff.
                 git_base_sha = ws.base_sha or None
                 diff_engine = get_default_diff_engine()
                 summary = await diff_engine.compute_diff(
@@ -236,16 +421,49 @@ class RequestApprovalTool(SourceControlTool):
                     include_patch=True,
                     workspace_path=ws.workspace_path,
                 )
+
+                # Reject an empty diff. Creating an approval ticket
+                # for a diff that contains no file changes would
+                # present the user with an empty review and let the
+                # agent believe its request succeeded when there was
+                # nothing to approve. Surface the state explicitly
+                # instead.
+                if not summary.files:
+                    return self.failure_result(
+                        error_code="VALIDATION_ERROR",
+                        error_message=(
+                            "No changes detected in the workspace. "
+                            "Edit at least one file before requesting "
+                            "approval; an empty diff cannot be "
+                            "approved."
+                        ),
+                        metadata={"workspace_id": workspace_id},
+                    )
+
                 diff_hash = summary.sha256()
 
-                # The ApprovalGate requires a 64-character SHA-256 digest
-                # for base_sha. We hash the SHA-1 value we used for Git.
-                sha256_base = hashlib.sha256((summary.base_sha or "").encode()).hexdigest()
+                # Store the ACTUAL Git commit SHA the diff was computed
+                # against. The ApprovalGate accepts both SHA-1 (40) and
+                # SHA-256 (64) for base_sha, so no transformation is
+                # needed. `summary.base_sha` is also what push_branch
+                # later compares against the remote's SHA; storing a
+                # transformed hash here would make every push reject as
+                # REMOTE_STATE_CHANGED.
+                effective_base_sha = summary.base_sha or ws.base_sha or ""
+                if not effective_base_sha:
+                    return self.failure_result(
+                        error_code="VALIDATION_ERROR",
+                        error_message=(
+                            "Cannot request approval: the workspace has "
+                            "no base commit SHA."
+                        ),
+                        metadata={"workspace_id": workspace_id},
+                    )
 
                 await operation_service.attach_diff(
                     operation_id=operation_id,
                     diff_sha256=diff_hash,
-                    base_sha=sha256_base,
+                    base_sha=effective_base_sha,
                 )
 
                 # 4. Transition to REVIEW_REQUIRED
@@ -292,17 +510,38 @@ class RequestApprovalTool(SourceControlTool):
                 metadata={"operation_id": operation_id},
             )
 
+        # --- Determine the ticket's target branch ----------------------
+        #
+        # For an operation created in THIS call, record.target_branch
+        # already equals the input. For an existing operation (only
+        # operation_id was passed), record.target_branch is the
+        # authoritative value: push_branch / create_change_request
+        # re-validate every bound field on the ticket against the
+        # record at consumption time, so using the input's default
+        # would surface as an ApprovalInvalidError on the first
+        # attempt to execute.
+        ticket_target_branch = (
+            record.target_branch or target_branch_input
+        )
+        if not ticket_target_branch:
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message=(
+                    "Operation record has no target_branch and no "
+                    "`target_branch` was supplied."
+                ),
+                metadata={"operation_id": operation_id},
+            )
+
         # --- Create the ticket -----------------------------------------
         try:
-            # The record.base_sha is now the SHA-256 digest (stored
-            # via attach_diff above). It is already 64 characters.
             ticket = approval_gate.create_ticket(
                 operation_id=operation_id,
                 repository_id=record.repository_id,
                 operation=operation,
                 base_sha=record.base_sha,
                 diff_sha256=record.diff_sha256,
-                target_branch=target_branch,
+                target_branch=ticket_target_branch,
                 ttl_seconds=ttl_seconds,
             )
         except Exception as exc:

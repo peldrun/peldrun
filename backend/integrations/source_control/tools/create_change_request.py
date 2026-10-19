@@ -3,26 +3,50 @@
 The `source_control.create_change_request` tool.
 
 Creates a pull request (GitHub, Bitbucket) or merge request (GitLab)
-for a previously pushed branch. The tool requires its own approval
-ticket: the approval for the push covers the push, not the pull
-request. Users must review the PR/MR title and body before they are
-submitted.
+for a previously pushed branch. The tool requires its OWN operation
+AND its own approval ticket: the push approval covers the push, not
+the pull request. Users must review the PR/MR title and body before
+they are submitted.
 
-Pipeline:
+Why a separate operation, not the push operation:
+
+    A `push_branch` operation carries PUSH semantics: its
+    `target_branch` field is the remote branch the push writes to.
+    A `create_change_request` operation carries PR semantics:
+    `source_branch` is the branch being merged, `target_branch` is
+    the PR base. Reusing the push operation would either fail
+    ticket validation (different `target_branch` meaning) or open a
+    PR from a branch to itself. The tool therefore rejects any
+    operation whose kind is not `create_change_request`.
+
+Canonical flow after a successful push:
+
+    1. request_approval(workspace_id=ws,
+                        operation='create_change_request',
+                        source_branch='feature/x',
+                        target_branch='main')
+       → new operation (kind='create_change_request'),
+         status=REVIEW_REQUIRED
+    2. The user approves the new ticket via the UI
+       → status=APPROVED
+    3. create_change_request(operation_id=<new>,
+                             approval_id=<new>, title='...')
+       → status=CHANGE_REQUEST_CREATED
+
+Pipeline (this tool):
     1. Validate inputs.
     2. Load the operation record from the journal.
-    3. Verify the operation is in `PUSHED` (the normal case) or, if
-       the caller is resuming a partially completed flow, in
-       `APPROVED`. In either case the source branch MUST have been
-       pushed already.
-    4. Resolve the credential for the operation's provider.
-    5. Resolve the repository reference using that credential.
-    6. Validate the approval ticket against the operation record.
-    7. Consume the approval ticket.
-    8. Create the change request via the provider adapter, passing
-       the credential resolved in step 4.
-    9. Attach the change request to the operation.
-   10. Transition the operation to `CHANGE_REQUEST_CREATED`.
+    3. Reject operations whose kind is not
+       'create_change_request'.
+    4. Reject operations whose status is not 'APPROVED'.
+    5. Read source_branch and target_branch from the record.
+    6. Resolve the credential for the operation's provider.
+    7. Resolve the repository reference using that credential.
+    8. Re-check the operation status, then validate the ticket.
+    9. Consume the ticket.
+   10. Create the change request via the provider adapter.
+   11. Attach the change request to the operation.
+   12. Transition the operation to `CHANGE_REQUEST_CREATED`.
 
 Design rules:
     - The tool MUST NOT accept `source_branch`, `target_branch`,
@@ -263,24 +287,65 @@ class CreateChangeRequestTool(SourceControlTool):
                 metadata={"operation_id": operation_id},
             )
 
+        # --- Validate operation kind ----------------------------------
+        #
+        # A `push_branch` operation has different `target_branch`
+        # semantics (the remote branch the push writes to). Reusing
+        # a push operation here would either fail ticket validation
+        # or open a PR from a branch to itself. Rejecting the wrong
+        # kind early produces an actionable error instead of a
+        # downstream mismatch.
+        if record.kind != "create_change_request":
+            return self.failure_result(
+                error_code="VALIDATION_ERROR",
+                error_message=(
+                    f"This tool requires an operation of kind "
+                    f"'create_change_request', but operation "
+                    f"'{operation_id}' is of kind '{record.kind}'. "
+                    "A push operation cannot be reused to open a PR. "
+                    "Call request_approval again with "
+                    "workspace_id, operation='create_change_request', "
+                    "source_branch (the branch that was pushed, "
+                    "e.g. 'feature/x'), and target_branch (the PR "
+                    "base, e.g. 'main'). Then approve the new "
+                    "ticket, then call this tool with the NEW "
+                    "operation_id."
+                ),
+                metadata={
+                    "operation_id": operation_id,
+                    "kind": record.kind,
+                },
+            )
+
         # --- Validate operation state ----------------------------------
         #
-        # The canonical path is PUSHED -> CHANGE_REQUEST_CREATED.
-        # We also accept APPROVED so that a resumed flow that failed
-        # after push but before recording the transition can still
-        # create the PR (the "attach_change_request" step is
-        # idempotent).
-        allowed_statuses = {
-            OperationStatus.PUSHED,
-            OperationStatus.APPROVED,
-        }
-        if record.status not in allowed_statuses:
+        # The canonical flow is:
+        #   CREATED -> ... -> REVIEW_REQUIRED (request_approval)
+        #                    -> APPROVED       (approve_operation)
+        #                    -> CHANGE_REQUEST_CREATED (this tool)
+        #
+        # Only APPROVED is accepted. REVIEW_REQUIRED means the user
+        # has not yet acted on the ticket, and PUSHED belongs to
+        # push_branch operations (rejected by the kind check above).
+        if record.status != OperationStatus.APPROVED:
+            if record.status == OperationStatus.REVIEW_REQUIRED:
+                return self.failure_result(
+                    error_code="CONFLICT",
+                    error_message=(
+                        f"Operation '{operation_id}' is in status "
+                        "'review_required'. The user has not approved "
+                        "the change-request ticket yet. Approve it "
+                        "via the UI first, then call this tool again."
+                    ),
+                    metadata={"operation_id": operation_id},
+                )
             return self.failure_result(
                 error_code="CONFLICT",
                 error_message=(
-                    f"Operation is in status '{record.status.value}'. "
-                    "A change request can only be created for a "
-                    "pushed operation."
+                    f"Operation '{operation_id}' is in status "
+                    f"'{record.status.value}'. A change request "
+                    "requires the operation to be 'approved' "
+                    "(after the user grants the ticket)."
                 ),
                 metadata={
                     "operation_id": operation_id,
@@ -294,8 +359,12 @@ class CreateChangeRequestTool(SourceControlTool):
             return self.failure_result(
                 error_code="VALIDATION_ERROR",
                 error_message=(
-                    "Operation is missing source_branch or "
-                    "target_branch; cannot create a change request."
+                    f"Operation '{operation_id}' is missing "
+                    "source_branch or target_branch. Both are "
+                    "required to open a change request. This usually "
+                    "means the operation was created without them; "
+                    "re-request approval with explicit "
+                    "source_branch and target_branch values."
                 ),
                 metadata={"operation_id": operation_id},
             )
@@ -304,7 +373,15 @@ class CreateChangeRequestTool(SourceControlTool):
             return self.failure_result(
                 error_code="VALIDATION_ERROR",
                 error_message=(
-                    "source_branch and target_branch are identical."
+                    f"Operation '{operation_id}' has identical source "
+                    f"and target branches ({source_branch!r}). For a "
+                    "change request, source_branch must be the branch "
+                    "being merged (e.g. 'feature/x') and target_branch "
+                    "must be the base (e.g. 'main'). Re-request "
+                    "approval with distinct values: "
+                    "request_approval(workspace_id=..., "
+                    "operation='create_change_request', "
+                    "source_branch='feature/x', target_branch='main')."
                 ),
                 metadata={"operation_id": operation_id},
             )
@@ -355,6 +432,38 @@ class CreateChangeRequestTool(SourceControlTool):
                 metadata={
                     "operation_id": operation_id,
                     "repository_id": record.repository_id,
+                },
+            )
+
+        # --- Re-check operation status (race protection) ---------------
+        #
+        # The record was loaded earlier; between then and now, another
+        # request (cancel_operation, mark_failed) could have changed
+        # its status. Failing here leaves the ticket untouched so the
+        # caller can retry once the state is repaired.
+        current_record = await operation_service.try_get_operation(
+            operation_id
+        )
+        if current_record is None:
+            return self.failure_result(
+                error_code="NOT_FOUND",
+                error_message=(
+                    f"Operation '{operation_id}' was not found."
+                ),
+                metadata={"operation_id": operation_id},
+            )
+        if current_record.status != OperationStatus.APPROVED:
+            return self.failure_result(
+                error_code="CONFLICT",
+                error_message=(
+                    f"Operation '{operation_id}' is no longer in "
+                    f"'approved' status (current: "
+                    f"'{current_record.status.value}'). The change "
+                    "request cannot be created."
+                ),
+                metadata={
+                    "operation_id": operation_id,
+                    "status": current_record.status.value,
                 },
             )
 

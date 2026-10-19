@@ -81,6 +81,8 @@ __all__ = [
     "ReadFileTool",
     "RequestApprovalTool",
     "RunChecksTool",
+    "GetOperationTool",
+    "ListOperationsTool",
 ]
 
 
@@ -349,6 +351,26 @@ def _build_create_change_request() -> SourceControlTool:
     return CreateChangeRequestTool()
 
 
+def _build_get_operation() -> SourceControlTool:
+    try:
+        from .get_operation import GetOperationTool  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise NotImplementedError(
+            "The 'get_operation' tool is not implemented yet."
+        ) from exc
+    return GetOperationTool()
+
+
+def _build_list_operations() -> SourceControlTool:
+    try:
+        from .get_operation import ListOperationsTool  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise NotImplementedError(
+            "The 'list_operations' tool is not implemented yet."
+        ) from exc
+    return ListOperationsTool()
+
+
 #: Ordered mapping from canonical tool name to a zero-argument
 #: factory. The insertion order defines the registration order.
 _TOOL_FACTORIES: Dict[str, Callable[[], SourceControlTool]] = {
@@ -364,6 +386,8 @@ _TOOL_FACTORIES: Dict[str, Callable[[], SourceControlTool]] = {
     "source_control.request_approval": _build_request_approval,
     "source_control.push_branch": _build_push_branch,
     "source_control.create_change_request": _build_create_change_request,
+    "source_control.get_operation": _build_get_operation,
+    "source_control.list_operations": _build_list_operations,
 }
 
 
@@ -405,6 +429,8 @@ _TOOL_CLASS_IMPORTS: Dict[str, tuple[str, str]] = {
         ".create_change_request",
         "CreateChangeRequestTool",
     ),
+    "GetOperationTool": (".get_operation", "GetOperationTool"),
+    "ListOperationsTool": (".get_operation", "ListOperationsTool"),
 }
 
 

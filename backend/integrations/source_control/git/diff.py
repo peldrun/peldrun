@@ -600,7 +600,7 @@ class GitDiffEngine(DiffPort):
 
 
 def _parse_numstat_z(
-    raw: bytes, *, max_files: int
+    raw: str, *, max_files: int
 ) -> List[Tuple[str, str, str]]:
     """
     Parse `git diff --numstat -z` output.
@@ -608,12 +608,19 @@ def _parse_numstat_z(
     Format: `<added>\\t<removed>\\t<path>\\0` where `<path>` may
     itself contain tabs. Binary files use `-` for both counts.
     Renames are encoded as `<added>\\t<removed>\\t\\0<old>\\0<new>\\0`.
+
+    The caller passes `GitResult.stdout`, which is already a decoded
+    `str` (see `GitExecutable._sanitize_stream`). The previous
+    implementation assumed `bytes` and called `.decode()` on it,
+    which raised `AttributeError: 'str' object has no attribute
+    'decode'` on every invocation. The NUL and tab separators survive
+    the UTF-8 decode intact because they are ASCII bytes, so splitting
+    on the `str` equivalents is equivalent to the old behavior.
     """
     if not raw:
         return []
 
-    text = raw.decode("utf-8", errors="replace")
-    fields = text.split("\x00")
+    fields = raw.split("\x00")
     if fields and fields[-1] == "":
         fields.pop()
 
@@ -645,19 +652,21 @@ def _parse_numstat_z(
 
 
 def _parse_name_status_z(
-    raw: bytes, *, max_files: int
+    raw: str, *, max_files: int
 ) -> List[Tuple[str, str, Optional[str]]]:
     """
     Parse `git diff --name-status -z` output.
 
     Format: `<status>\\0<path>\\0` for non-renames, and
     `<status>\\0<old>\\0<new>\\0` for renames/copies.
+
+    The caller passes `GitResult.stdout`, which is already a decoded
+    `str`. See `_parse_numstat_z` for the full rationale.
     """
     if not raw:
         return []
 
-    text = raw.decode("utf-8", errors="replace")
-    fields = text.split("\x00")
+    fields = raw.split("\x00")
     if fields and fields[-1] == "":
         fields.pop()
 

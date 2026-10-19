@@ -241,6 +241,33 @@ class StrReplaceEditor(BaseTool):
         **kwargs: Any,
     ) -> ToolResult:
         """Execute sandboxed editor operations and record mutated artifact paths."""
+        # Normalize command aliases. GigaChat-3-Pro and a few other
+        # LLMs consistently emit "edit" (or "replace", or
+        # "undo_edit") when the canonical command is "str_replace"
+        # (or "undo"). Rather than fail those calls with
+        # "Unsupported editor command", map them to the canonical
+        # names. The map is intentionally narrow: unknown values are
+        # still rejected so typos remain visible.
+        _COMMAND_ALIASES = {
+            "edit": "str_replace",
+            "replace": "str_replace",
+            "patch": "str_replace",
+            "undo_edit": "undo",
+            "revert": "undo",
+            "write": "create",
+            "new": "create",
+            "read": "view",
+            "cat": "view",
+            "show": "view",
+        }
+        if isinstance(command, str):
+            normalized_command = _COMMAND_ALIASES.get(
+                command.strip().lower(), command
+            )
+        else:
+            normalized_command = command
+        command = normalized_command
+
         try:
             target_path = self._resolve_safe_path(path)
         except (ValueError, PermissionError) as path_err:
@@ -281,8 +308,43 @@ class StrReplaceEditor(BaseTool):
 
             # 2. FILE EXISTENCE CHECK FOR REMAINING COMMANDS
             if not target_path.is_file():
+                # When the workspace is essentially empty (no .git,
+                # no tracked files), this almost always means the
+                # caller skipped `source_control.create_workspace`.
+                # Without that call, there is no local copy of the
+                # repository and no diff base for the approval flow.
+                # The message below is deliberately actionable: it
+                # names the exact tool the model must call next.
+                workspace_has_git = (root / ".git").exists()
+                if not workspace_has_git:
+                    return ToolResult(
+                        output=(
+                            f"Cannot open '{rel_str}': no workspace is "
+                            "active in this chat. You MUST call "
+                            "`source_control` with "
+                            "action='create_workspace' and "
+                            "repository_id='owner/repo' BEFORE editing "
+                            "any file. Do NOT use `http_fetch` to read "
+                            "the file from GitHub — it returns HTML, "
+                            "not the file. Do NOT use `bash` — it "
+                            "cannot edit workspace files on Windows. "
+                            "After create_workspace returns, call this "
+                            "tool again with the same relative path."
+                        ),
+                        exit_code=1,
+                        is_error=True,
+                        metadata={
+                            "error_code": "WORKSPACE_REQUIRED",
+                            "path": rel_str,
+                        },
+                    )
                 return ToolResult(
-                    output=f"File not found: '{rel_str}'",
+                    output=(
+                        f"File '{rel_str}' does not exist in the "
+                        "workspace. Use command='create' to create it, "
+                        "or command='view' on an existing file to "
+                        "verify its current path."
+                    ),
                     exit_code=1,
                     is_error=True,
                 )

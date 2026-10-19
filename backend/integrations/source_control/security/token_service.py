@@ -89,6 +89,27 @@ def _utc_now() -> datetime:
 #: caller's HTTP layer handles the 401.
 _EXPIRY_MARGIN = timedelta(seconds=60)
 
+#: Vault key under which the persistent index of stored token
+#: identities is kept.
+#:
+#: The index is a JSON array of ``[provider, base_url, account_id]``
+#: triples. It exists because the token vault key format
+#: (``peldrun.sc.oauth.{provider}.{base_url}.{account_id}``) is
+#: inherently ambiguous: ``base_url`` may contain dots (e.g.
+#: ``api.github.com``), and ``account_id`` may too. There is no way to
+#: reverse the key into a reliable identity, and several backends
+#: (notably ``KeyringVault``) do not expose an enumeration API. The
+#: index is therefore the only durable source of truth for "which
+#: accounts are stored".
+#:
+#: The key MUST start with the vault's required ``peldrun.sc.``
+#: prefix. It is chosen to live under the ``oauth`` service so that
+#: ``KeyringVault`` groups it alongside the tokens, and to be
+#: distinguishable from a real token key: `_parse_vault_key` rejects
+#: it (no dot after the service prefix), and real token keys always
+#: carry at least two dots in the username segment.
+_INDEX_VAULT_KEY = "peldrun.sc.oauth._index"
+
 
 # ---------------------------------------------------------------------------
 # Refresh contract
@@ -359,6 +380,24 @@ class TokenService(TokenServicePort):
                 base_url=base_url,
                 account_id=account_id,
             )
+            # Persist the identity so that `list_stored` still sees
+            # this token after a process restart (when the in-memory
+            # cache is empty). A failure here MUST NOT fail the store:
+            # the token is already saved and usable via
+            # `get_access_token`. It is only the enumeration view that
+            # is temporarily incomplete.
+            try:
+                self._bootstrap_index_if_needed_locked()
+                self._add_to_index_locked(provider, base_url, account_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to update token index after storing %s/%s; "
+                    "the token is usable but may not appear in "
+                    "list_stored after a restart: %s",
+                    _provider_value(provider),
+                    account_id,
+                    type(exc).__name__,
+                )
 
         self._audit.record(
             AuditEventType.CREDENTIAL_STORE,
@@ -543,6 +582,23 @@ class TokenService(TokenServicePort):
         with self._lock:
             self._vault.delete(key)
             self._record_cache.pop(key, None)
+            # Remove the identity from the persistent index. A
+            # failure here leaves a stale entry, which `list_stored`
+            # will skip (it cannot fetch a record for a deleted
+            # token). The index is self-healing on the next successful
+            # store.
+            try:
+                self._remove_from_index_locked(
+                    provider, base_url, account_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to update token index after revoking "
+                    "%s/%s; a stale index entry may remain: %s",
+                    _provider_value(provider),
+                    account_id,
+                    type(exc).__name__,
+                )
 
         self._audit.record(
             AuditEventType.CREDENTIAL_DELETE,
@@ -565,36 +621,78 @@ class TokenService(TokenServicePort):
         """
         Return metadata for every token pair known to the service.
 
-        Only accounts that have been stored since the service started
-        are listed. This is a best-effort view of the in-memory cache;
-        to enumerate the vault directly, use
-        `CredentialVault.keys()`.
+        The result is the union of two sources:
 
-        The identity of each entry is taken from the ``_CachedRecord``
-        (which carries the original ``provider``, ``base_url``, and
-        ``account_id``), NOT from reverse-parsing the opaque vault
-        key. This is required because ``base_url`` may contain dots
-        (e.g. ``api.github.com``), which would make reverse parsing
-        ambiguous.
+          1. The persistent identity index in the vault. This is
+             populated by `store_token` and drained by `revoke`, and
+             survives process restarts. It is the ONLY way a newly
+             started process learns about tokens it did not itself
+             store during this session.
+          2. The in-memory `_record_cache`, which may contain entries
+             written before the index was introduced (or by a writer
+             that bypassed `store_token`). These entries are still
+             returned for backward compatibility.
+
+        Entries that appear in the index but whose vault record is
+        gone (e.g. because a caller deleted the token out of band)
+        are silently skipped: `_read_record` returns `None` for them,
+        which is the same behavior as a missing token.
+
+        Identities are always taken from the persisted triples (or
+        the cached record's original triple), never from reverse-
+        parsing the vault key, because the key format is inherently
+        ambiguous when `base_url` or `account_id` contain dots.
 
         No token values are ever returned.
         """
+        # 1. Read the persistent index. A failure here degrades to an
+        #    empty index (the cache-only view remains available).
+        try:
+            index_entries = self._read_index()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to read token index; falling back to the "
+                "in-memory cache only: %s",
+                type(exc).__name__,
+            )
+            index_entries = []
+
+        # 2. Snapshot the cache under the lock (cheap).
         with self._lock:
             cached_items = list(self._record_cache.values())
 
-        results: List[TokenInfo] = []
+        # 3. Build the identity -> record map from both sources.
+        identities: Dict[Tuple[ProviderId, str, str], _TokenRecord] = {}
         for cached in cached_items:
-            results.append(
-                TokenInfo(
-                    provider=cached.provider,
-                    account_id=cached.account_id,
-                    base_url=cached.base_url,
-                    expires_at=cached.record.expires_at,
-                    scopes=tuple(cached.record.scopes),
-                    has_refresh_token=bool(cached.record.refresh_token),
-                    last_refreshed_at=cached.record.last_refreshed_at,
-                )
+            identities[
+                (cached.provider, cached.base_url, cached.account_id)
+            ] = cached.record
+
+        # 4. Hydrate the map with any identity that only appears in
+        #    the index. `_read_record` populates the cache as a side
+        #    effect, so subsequent calls for the same identity are
+        #    cheap.
+        for pid, base_url, account_id in index_entries:
+            identity = (pid, base_url, account_id)
+            if identity in identities:
+                continue
+            record = self._read_record(pid, account_id, base_url)
+            if record is not None:
+                identities[identity] = record
+
+        # 5. Project the map to `TokenInfo` and sort deterministically.
+        results: List[TokenInfo] = [
+            TokenInfo(
+                provider=pid,
+                account_id=account_id,
+                base_url=base_url,
+                expires_at=record.expires_at,
+                scopes=tuple(record.scopes),
+                has_refresh_token=bool(record.refresh_token),
+                last_refreshed_at=record.last_refreshed_at,
             )
+            for (pid, base_url, account_id), record in identities.items()
+        ]
         results.sort(
             key=lambda info: (
                 info.provider.value,
@@ -613,6 +711,146 @@ class TokenService(TokenServicePort):
         """
         with self._lock:
             self._record_cache.clear()
+
+    # --- Internal: persistent index ------------------------------------
+
+    def _read_index(self) -> List[Tuple[ProviderId, str, str]]:
+        """
+        Return the persisted list of stored identities.
+
+        Reads the ``_INDEX_VAULT_KEY`` entry from the vault and parses
+        it as a JSON array of ``[provider, base_url, account_id]``
+        triples. Missing, corrupt, or non-list payloads yield an empty
+        list — the caller MUST NOT treat an empty list as "the vault
+        is empty", only as "we have no index entries to work with".
+
+        Does not hold `self._lock`: it is a pure vault read and is
+        safe to call from both locked and unlocked contexts.
+        """
+        raw = self._vault.get(_INDEX_VAULT_KEY)
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Discarding corrupt token index; it will be rebuilt "
+                "on the next successful store."
+            )
+            return []
+        if not isinstance(data, list):
+            logger.warning(
+                "Discarding token index with unexpected JSON type %s.",
+                type(data).__name__,
+            )
+            return []
+
+        entries: List[Tuple[ProviderId, str, str]] = []
+        for item in data:
+            if not isinstance(item, list) or len(item) != 3:
+                continue
+            provider_str, base_url, account_id = item
+            if not all(
+                isinstance(part, str)
+                for part in (provider_str, base_url, account_id)
+            ):
+                continue
+            try:
+                pid = ProviderId(provider_str)
+            except ValueError:
+                logger.debug(
+                    "Skipping index entry for unknown provider %r.",
+                    provider_str,
+                )
+                continue
+            entries.append((pid, base_url, account_id))
+        return entries
+
+    def _write_index_locked(
+        self, entries: Sequence[Tuple[ProviderId, str, str]]
+    ) -> None:
+        """
+        Persist the index to the vault.
+
+        Assumes `self._lock` is held. Writes the whole array in one
+        vault call, so concurrent writers cannot observe a partial
+        index.
+        """
+        serialized = [
+            [pid.value, base_url, account_id]
+            for pid, base_url, account_id in entries
+        ]
+        payload = json.dumps(serialized, separators=(",", ":"))
+        self._vault.put(_INDEX_VAULT_KEY, payload)
+
+    def _add_to_index_locked(
+        self,
+        provider: ProviderId,
+        base_url: str,
+        account_id: str,
+    ) -> None:
+        """
+        Add an identity to the persistent index if not already present.
+
+        Assumes `self._lock` is held. Idempotent: re-adding an entry
+        is a no-op and does not write to the vault.
+        """
+        entries = self._read_index()
+        key = (provider, base_url, account_id)
+        if any(entry == key for entry in entries):
+            return
+        entries.append(key)
+        self._write_index_locked(entries)
+
+    def _remove_from_index_locked(
+        self,
+        provider: ProviderId,
+        base_url: str,
+        account_id: str,
+    ) -> None:
+        """
+        Remove an identity from the persistent index if present.
+
+        Assumes `self._lock` is held. Idempotent: removing a missing
+        entry is a no-op and does not write to the vault.
+        """
+        entries = self._read_index()
+        key = (provider, base_url, account_id)
+        filtered = [entry for entry in entries if entry != key]
+        if len(filtered) == len(entries):
+            return
+        self._write_index_locked(filtered)
+
+    def _bootstrap_index_if_needed_locked(self) -> None:
+        """
+        Persist any in-memory cache entries into the index when the
+        index is currently missing or empty.
+
+        Assumes `self._lock` is held. The bootstrap runs at most once
+        per process state (the condition is "index is empty"), and
+        only matters for installations upgrading from a version that
+        predated the persistent index: entries already in the cache
+        become durable on the next `store_token` call. Entries that
+        were only ever in a pre-upgrade vault remain invisible until
+        the user re-authorizes the provider, which is acceptable for
+        the local-first deployment model.
+
+        This method MUST be called only from inside a write operation
+        (`store_token` / `revoke`), never from `list_stored`.
+        """
+        if self._read_index():
+            return  # already populated
+        if not self._record_cache:
+            return  # nothing to migrate
+        migrated = [
+            (cached.provider, cached.base_url, cached.account_id)
+            for cached in self._record_cache.values()
+        ]
+        self._write_index_locked(migrated)
+        logger.info(
+            "Bootstrapped token index from %d cached entries.",
+            len(migrated),
+        )
 
     # --- Internal helpers ----------------------------------------------
 

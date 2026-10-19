@@ -54,6 +54,12 @@ logger = logging.getLogger("omweb.adapters.tools_adapters.source_control")
 
 def create_source_control_executor(
     workspace_dir: WorkspacePathType = None,
+    *,
+    run_id: Optional[str] = None,
+    job_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    project_id: Optional[str] = None,
     **kwargs: Any,
 ) -> Callable[..., Awaitable[ToolResult]]:
     """
@@ -82,6 +88,30 @@ def create_source_control_executor(
     ws_path = _resolve_workspace_path(workspace_dir)
     core_tool = SourceControlTool(workspace_root=str(ws_path))
 
+    # Build the context metadata forwarded to every sub-tool through
+    # the dispatcher. This is how chat-scoped operations (notably
+    # create_workspace) learn the correct chat and project IDs so that
+    # their files are placed inside the chat's session directory
+    # instead of the global workspace root.
+    forwarded_metadata: Dict[str, str] = {}
+    if run_id:
+        forwarded_metadata["run_id"] = run_id
+    if job_id:
+        forwarded_metadata["job_id"] = job_id
+    if session_id:
+        forwarded_metadata["session_id"] = session_id
+    if chat_id:
+        forwarded_metadata["chat_id"] = chat_id
+    if project_id:
+        forwarded_metadata["project_id"] = project_id
+
+    # ws_path is derived from `workspace_dir`, which the engine sets to
+    # the chat session's files directory (project_dir). Expose it so that
+    # create_workspace places its Git repository exactly where the agent's
+    # editing tools operate; otherwise the diff would be computed against
+    # a directory the agent never touched.
+    forwarded_metadata["project_dir"] = str(ws_path)
+
     async def _execute_source_control(
         action: str,
         params: Optional[Dict[str, Any]] = None,
@@ -109,6 +139,19 @@ def create_source_control_executor(
         await_args.update(
             {key: value for key, value in call_kwargs.items() if value is not None}
         )
+
+        # Inject the forwarded context metadata. The Core dispatcher
+        # pops "context_metadata" into ToolContext.metadata and
+        # forwards "run_id" as ToolContext.run_id. Both are required:
+        #   - run_id: identifies the current agent run.
+        #   - chat_id / project_id / session_id / job_id: identify the
+        #     chat session so that workspace-scoped tools (e.g.
+        #     create_workspace) place their files alongside the
+        #     session's existing files.
+        if forwarded_metadata:
+            await_args["context_metadata"] = dict(forwarded_metadata)
+        if run_id:
+            await_args["run_id"] = run_id
 
         try:
             res = await core_tool.aexecute(**await_args)
@@ -143,6 +186,19 @@ def create_source_control_executor(
 ADAPTER_SPEC = AdapterSpec(
     tool_names=("source_control",),
     factory=create_source_control_executor,
+    # Declare the context keys the factory accepts. Without this
+    # declaration, AdapterSpec.matches_context would return an empty
+    # dict and the adapter would never receive the chat-scoped IDs
+    # it needs to place workspaces inside the session directory.
+    requires_context=frozenset(
+        {
+            "run_id",
+            "job_id",
+            "session_id",
+            "chat_id",
+            "project_id",
+        }
+    ),
 )
 
 

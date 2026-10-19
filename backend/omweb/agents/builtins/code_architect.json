@@ -12,7 +12,8 @@
     "ask_human",
     "str_replace_editor",
     "source_control",
-    "http_fetch"
+    "http_fetch",
+    "web_search"
   ],
   "max_steps": 30,
   "is_builtin": true,

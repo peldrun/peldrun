@@ -256,8 +256,14 @@ class GitStatusReader:
         if result.returncode != 0:
             # Not a repository: treat as clean for compatibility.
             return True
-        # Any non-empty output means dirty.
-        return not result.stdout.strip(b"\x00").strip()
+        # Any non-empty output means dirty. `GitResult.stdout` is
+        # already a `str`; the previous `.strip(b"\x00")` raised
+        # `TypeError: strip arg must be None or str` on every call.
+        # `.strip()` removes only ASCII whitespace, but `git status
+        # --porcelain -z` never emits stray whitespace, so this is
+        # sufficient to distinguish "clean" (empty output) from
+        # "dirty" (at least one record).
+        return not result.stdout.strip()
 
     async def read_conflicts(
         self, workspace_path: Union[str, Path]
@@ -459,7 +465,7 @@ def _parse_branch_header(line: str) -> _BranchHeader:
 
 
 def _parse_porcelain_z(
-    raw: bytes,
+    raw: str,
 ) -> Tuple[List[PorcelainEntry], _BranchHeader]:
     """
     Parse NUL-delimited porcelain output.
@@ -470,12 +476,19 @@ def _parse_porcelain_z(
 
     Handles the rename form `R  orig -> new` (in v1, renames are
     encoded as `R  new\\0orig`, i.e. two NUL-separated fields).
+
+    The caller passes `GitResult.stdout`, which is already a decoded
+    `str` (see `GitExecutable._sanitize_stream`). The previous
+    implementation assumed `bytes` and called `.decode()` on it,
+    which raised `AttributeError: 'str' object has no attribute
+    'decode'` on every invocation. The NUL separator survives the
+    UTF-8 decode intact because it is an ASCII byte, so splitting
+    on the `str` equivalent is equivalent to the old behavior.
     """
     if not raw:
         return [], _BranchHeader()
 
-    text = raw.decode("utf-8", errors="replace")
-    fields = text.split("\x00")
+    fields = raw.split("\x00")
     # The trailing NUL produces a final empty field; drop it.
     if fields and fields[-1] == "":
         fields.pop()
@@ -534,18 +547,21 @@ def _parse_porcelain_z(
     return entries, header
 
 
-def _split_z(raw: bytes) -> List[str]:
+def _split_z(raw: str) -> List[str]:
     """
     Split a NUL-delimited buffer into normalized path strings.
 
     Empty fields and the trailing NUL are dropped.
+
+    The caller passes `GitResult.stdout`, which is already a decoded
+    `str`. See `_parse_porcelain_z` for the full rationale on why
+    the previous `bytes` signature was incorrect.
     """
     if not raw:
         return []
-    text = raw.decode("utf-8", errors="replace")
     return [
         _normalize_path(part)
-        for part in text.split("\x00")
+        for part in raw.split("\x00")
         if part
     ]
 
