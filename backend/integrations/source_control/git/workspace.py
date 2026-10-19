@@ -708,16 +708,9 @@ class GitWorkspaceManager:
         head_sha = await self._head_sha(target, fallback="")
         dirty = await self._detect_dirty(target)
 
-        # The ApprovalGate requires a 64-character SHA-256 digest,
-        # but Git head_sha is 40 characters (SHA-1). We hash it to
-        # produce a valid 64-character base_sha.
-        import hashlib
-        effective_base_sha = request.base_sha
-        if not effective_base_sha:
-            if head_sha:
-                effective_base_sha = hashlib.sha256(head_sha.encode()).hexdigest()
-            else:
-                effective_base_sha = "0" * 64  # Fallback placeholder
+        # Keep the SHA-1 (40 chars) for Git operations.
+        # The conversion to SHA-256 (64 chars) happens at ticket creation.
+        effective_base_sha = request.base_sha or head_sha or "0" * 40
 
         return replace(
             workspace,

@@ -226,19 +226,26 @@ class RequestApprovalTool(SourceControlTool):
                         pass # Ignore if already in that state
 
                 # 3. Compute and attach the diff
+                # We use the SHA-1 base_sha for Git diff.
+                import hashlib
+                git_base_sha = ws.base_sha or None
                 diff_engine = get_default_diff_engine()
                 summary = await diff_engine.compute_diff(
                     workspace_id=workspace_id,
-                    base_sha=ws.base_sha or None,
+                    base_sha=git_base_sha,
                     include_patch=True,
                     workspace_path=ws.workspace_path,
                 )
                 diff_hash = summary.sha256()
 
+                # The ApprovalGate requires a 64-character SHA-256 digest
+                # for base_sha. We hash the SHA-1 value we used for Git.
+                sha256_base = hashlib.sha256((summary.base_sha or "").encode()).hexdigest()
+
                 await operation_service.attach_diff(
                     operation_id=operation_id,
                     diff_sha256=diff_hash,
-                    base_sha=summary.base_sha,
+                    base_sha=sha256_base,
                 )
 
                 # 4. Transition to REVIEW_REQUIRED
@@ -287,6 +294,8 @@ class RequestApprovalTool(SourceControlTool):
 
         # --- Create the ticket -----------------------------------------
         try:
+            # The record.base_sha is now the SHA-256 digest (stored
+            # via attach_diff above). It is already 64 characters.
             ticket = approval_gate.create_ticket(
                 operation_id=operation_id,
                 repository_id=record.repository_id,
