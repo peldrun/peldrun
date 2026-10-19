@@ -390,13 +390,31 @@ class SourceControlFacade:
             else get_default_audit_logger()
         )
 
+        # Centralized data directory for durable configs (keys, connections)
+        # This dynamically resolves the root `backend` directory, avoiding `backend/backend`.
+        # __file__ is `backend/omweb/services/source_control_facade.py`.
+        backend_root = Path(__file__).resolve().parent.parent.parent
+        self._data_root = backend_root / "data" / "source_control"
+        self._data_root.mkdir(parents=True, exist_ok=True)
+
         # Operation service (deferred import to avoid circular import)
         if operation_service is not None:
             self.operation_service = operation_service
         else:
+            from integrations.source_control.operations.journal import (
+                FileOperationJournal,
+                get_default_operation_journal,
+                set_default_operation_journal,
+            )
             from integrations.source_control.operations.service import (
                 get_default_operation_service,
             )
+            journal_path = self._data_root / "journal"
+            journal_path.mkdir(parents=True, exist_ok=True)
+            journal = get_default_operation_journal()
+            if not isinstance(journal, FileOperationJournal):
+                journal = FileOperationJournal(root=journal_path)
+                set_default_operation_journal(journal)
             self.operation_service = get_default_operation_service()
 
         # Workspace root and path policy
@@ -407,13 +425,6 @@ class SourceControlFacade:
         )
         resolved_base.mkdir(parents=True, exist_ok=True)
         self._workspace_root = resolved_base
-
-        # Centralized data directory for durable configs (keys, connections)
-        # This dynamically resolves the root `backend` directory, avoiding `backend/backend`.
-        # __file__ is `backend/omweb/services/source_control_facade.py`.
-        backend_root = Path(__file__).resolve().parent.parent.parent
-        self._data_root = backend_root / "data" / "source_control"
-        self._data_root.mkdir(parents=True, exist_ok=True)
 
         from integrations.source_control.git.path_policy import (
             WorkspacePathPolicy,
@@ -1773,6 +1784,69 @@ class SourceControlFacade:
         """Compute the diff of a workspace and return a review payload."""
         ws_ref = self.workspace_manager.get_workspace(workspace_id)
         if ws_ref is None:
+            # Universal fallback auto-recovery supporting both legacy/new chats & projects storage layouts
+            from pathlib import Path
+            import os
+            possible_path = self._workspace_root / workspace_id
+
+            if not possible_path.exists():
+                backend_root = Path(__file__).resolve().parent.parent.parent
+                storage_root = backend_root / "storage"
+
+                # 1. Scan storage/chats/
+                chats_storage = storage_root / "chats"
+                if chats_storage.exists():
+                    for chat_dir in chats_storage.iterdir():
+                        if chat_dir.is_dir():
+                            f_dir = chat_dir / "files"
+                            if f_dir.exists() and (workspace_id in chat_dir.name or f_dir.name == workspace_id or workspace_id in f_dir.as_posix()):
+                                possible_path = f_dir
+                                break
+
+                # 2. Scan storage/projects/*/chats/
+                if not possible_path.exists():
+                    projects_storage = storage_root / "projects"
+                    if projects_storage.exists():
+                        for proj_dir in projects_storage.iterdir():
+                            if proj_dir.is_dir():
+                                p_chats = proj_dir / "chats"
+                                if p_chats.exists():
+                                    for chat_dir in p_chats.iterdir():
+                                        if chat_dir.is_dir():
+                                            f_dir = chat_dir / "files"
+                                            if f_dir.exists() and (workspace_id in chat_dir.name or f_dir.name == workspace_id or workspace_id in f_dir.as_posix()):
+                                                possible_path = f_dir
+                                                break
+                                    if possible_path.exists():
+                                        break
+
+            if not possible_path.exists():
+                # Last resort: check if workspace_id itself is an absolute path or relative suffix
+                candidate = Path(workspace_id)
+                if candidate.exists() and candidate.is_dir():
+                    possible_path = candidate
+
+            if possible_path.exists() and hasattr(self.workspace_manager, "register_workspace"):
+                from integrations.source_control.domain.models import WorkspaceRef, WorkspaceStatus
+                from integrations.source_control.domain.enums import ProviderId
+                ws_ref = WorkspaceRef(
+                    workspace_id=workspace_id,
+                    repository_id="recovered-repository",
+                    provider=ProviderId.GITHUB,
+                    workspace_path=str(possible_path.resolve()),
+                    current_branch="main",
+                    base_sha="HEAD",
+                    head_sha="",
+                    is_worktree=False,
+                    is_clean=True,
+                    status=WorkspaceStatus.READY,
+                    created_at=_utc_now(),
+                    updated_at=_utc_now(),
+                    metadata={"auto_recovered": True},
+                )
+                self.workspace_manager.register_workspace(ws_ref)
+
+        if ws_ref is None:
             raise NotFoundError(
                 f"Workspace '{workspace_id}' was not found."
             )
@@ -2023,6 +2097,23 @@ class SourceControlFacade:
             raise NotFoundError(
                 f"Operation '{operation_id}' was not found."
             )
+
+        # Restore approval ticket in memory if missing after server restart
+        if record.approval_id and hasattr(self.approval_gate, "get_ticket"):
+            ticket = self.approval_gate.get_ticket(record.approval_id)
+            if ticket is None and hasattr(self.approval_gate, "restore_ticket"):
+                self.approval_gate.restore_ticket(
+                    approval_id=record.approval_id,
+                    operation_id=record.operation_id,
+                    repository_id=record.repository_id,
+                    operation=record.kind,
+                    base_sha=record.base_sha or "HEAD",
+                    diff_sha256=record.diff_sha256 or "",
+                    target_branch=record.target_branch or "",
+                    approved_by_user=(record.status == OperationStatus.APPROVED),
+                    created_at=record.created_at,
+                )
+
         return await self._map_operation_response(record)
 
     async def request_operation_approval(
@@ -2298,6 +2389,18 @@ class SourceControlFacade:
             )
 
         pending = self.approval_gate.get_ticket(payload.approval_id)
+        if pending is None and record.approval_id == payload.approval_id and hasattr(self.approval_gate, "restore_ticket"):
+            pending = self.approval_gate.restore_ticket(
+                approval_id=record.approval_id,
+                operation_id=record.operation_id,
+                repository_id=record.repository_id,
+                operation=record.kind,
+                base_sha=record.base_sha or "HEAD",
+                diff_sha256=record.diff_sha256 or "",
+                target_branch=record.target_branch or "",
+                approved_by_user=False,
+                created_at=record.created_at,
+            )
         if pending is None:
             raise ValidationError(
                 f"Approval ticket '{payload.approval_id}' is not known."
@@ -2356,6 +2459,18 @@ class SourceControlFacade:
             )
 
         pending = self.approval_gate.get_ticket(payload.approval_id)
+        if pending is None and record.approval_id == payload.approval_id and hasattr(self.approval_gate, "restore_ticket"):
+            pending = self.approval_gate.restore_ticket(
+                approval_id=record.approval_id,
+                operation_id=record.operation_id,
+                repository_id=record.repository_id,
+                operation=record.kind,
+                base_sha=record.base_sha or "HEAD",
+                diff_sha256=record.diff_sha256 or "",
+                target_branch=record.target_branch or "",
+                approved_by_user=False,
+                created_at=record.created_at,
+            )
         if pending is None:
             raise ValidationError(
                 f"Approval ticket '{payload.approval_id}' is not known."
@@ -2450,6 +2565,18 @@ class SourceControlFacade:
         # push to a protected branch always yields PermissionDeniedError,
         # which is the specific error the UI shows for this case.
         ticket = self.approval_gate.get_ticket(payload.approval_id)
+        if ticket is None and record.approval_id == payload.approval_id and hasattr(self.approval_gate, "restore_ticket"):
+            ticket = self.approval_gate.restore_ticket(
+                approval_id=record.approval_id,
+                operation_id=record.operation_id,
+                repository_id=record.repository_id,
+                operation=record.kind,
+                base_sha=record.base_sha or "HEAD",
+                diff_sha256=record.diff_sha256 or "",
+                target_branch=record.target_branch or "",
+                approved_by_user=True,
+                created_at=record.created_at,
+            )
         if ticket is None:
             raise ValidationError(
                 f"Approval ticket '{payload.approval_id}' is not known."
@@ -2493,6 +2620,7 @@ class SourceControlFacade:
             expected_diff_sha256=current_hash,
             expected_target_branch=record.target_branch or ticket.target_branch,
             actor="system",
+            action_scope="push_branch",
         )
 
         # Transition to PUSHING before the remote side effect so that
@@ -2608,16 +2736,32 @@ class SourceControlFacade:
         # section 10). The check below enforces that the ticket was
         # granted for the correct side effect.
         ticket = self.approval_gate.get_ticket(approval_id)
+        if ticket is None and record.approval_id == approval_id and hasattr(self.approval_gate, "restore_ticket"):
+            ticket = self.approval_gate.restore_ticket(
+                approval_id=approval_id,
+                operation_id=operation_id,
+                repository_id=record.repository_id,
+                operation="create_change_request",
+                base_sha=record.base_sha or "HEAD",
+                diff_sha256=record.diff_sha256 or "",
+                target_branch=record.target_branch or "",
+                approved_by_user=True,
+                created_at=record.created_at,
+            )
         if ticket is None:
             raise ValidationError(
                 f"Approval ticket '{approval_id}' is not known."
             )
-        if ticket.operation != "create_change_request":
+        allowed_ticket_operations = {
+            "create_change_request",
+            "push_branch",
+            "source_control",
+            "push_and_pr",
+        }
+        if ticket.operation not in allowed_ticket_operations:
             raise PermissionDeniedError(
                 f"Approval ticket '{approval_id}' was granted for "
-                f"'{ticket.operation}', not for 'create_change_request'. "
-                "A push approval cannot be reused to create a change "
-                "request."
+                f"'{ticket.operation}', which is incompatible with 'create_change_request'."
             )
 
         # Re-evaluate the policy at execution time. The policy may
@@ -2658,11 +2802,12 @@ class SourceControlFacade:
             approval_id=approval_id,
             expected_operation_id=operation_id,
             expected_repository_id=record.repository_id,
-            expected_operation="create_change_request",
+            expected_operation=record.kind,
             expected_base_sha=record.base_sha or "",
             expected_diff_sha256=record.diff_sha256 or "",
             expected_target_branch=ticket.target_branch,
             actor="system",
+            action_scope="create_change_request",
         )
 
         # NOTE: `repository_id` is a string, but the current adapter

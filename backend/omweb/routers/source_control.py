@@ -212,24 +212,54 @@ def handle_source_control_error(exc: Exception) -> NoReturn:
     if isinstance(exc, HTTPException):
         raise exc
 
-    if isinstance(exc, SourceControlError):
-        # `http_status` is set in the base constructor from the
-        # class-level `default_http_status`, so every instance carries
-        # an int. Fall back to 500 defensively for exotic cases
-        # (e.g. a subclass that forgot to set a default and somehow
-        # bypassed the constructor).
-        http_status = getattr(exc, "http_status", None) or 500
-        # `str(exc)` is safe: the message was redacted by the base
-        # constructor (`errors.py::SourceControlError.__init__` runs
-        # `redact_message` before `Exception.__init__`), and the
-        # `details` mapping is not surfaced to the client.
+    # Check for domain errors across namespace variations
+    is_domain_error = (
+        isinstance(exc, SourceControlError)
+        or hasattr(exc, "http_status")
+        or hasattr(exc, "code")
+        or exc.__class__.__name__ in {
+            "SourceControlError",
+            "NotFoundError",
+            "ValidationError",
+            "ConflictError",
+            "PermissionDeniedError",
+            "AuthRequiredError",
+            "AuthExpiredError",
+            "RateLimitedError",
+            "RemoteStateChangedError",
+            "ApprovalRequiredError",
+            "ApprovalInvalidError",
+            "ApprovalExpiredError",
+            "ApprovalConsumedError",
+            "PolicyDeniedError",
+            "ProtectedBranchError",
+            "WorkspaceNotFoundError",
+        }
+    )
+
+    if is_domain_error:
+        http_status = getattr(exc, "http_status", None)
+        if not http_status:
+            name = exc.__class__.__name__
+            if name in ("NotFoundError", "WorkspaceNotFoundError"):
+                http_status = status.HTTP_404_NOT_FOUND
+            elif name in ("ValidationError", "PathTraversalError"):
+                http_status = status.HTTP_400_BAD_REQUEST
+            elif name in ("PermissionDeniedError", "PolicyDeniedError", "ProtectedBranchError"):
+                http_status = status.HTTP_403_FORBIDDEN
+            elif name in ("AuthRequiredError", "AuthExpiredError"):
+                http_status = status.HTTP_401_UNAUTHORIZED
+            elif name in ("ConflictError", "WorkspaceDirtyError", "ApprovalConsumedError", "ApprovalInvalidError"):
+                http_status = status.HTTP_409_CONFLICT
+            else:
+                http_status = status.HTTP_500_INTERNAL_SERVER_ERROR
+
         raise HTTPException(
             status_code=http_status,
             detail=str(exc),
         )
 
-    # Unknown exception: log with full stack trace and return a generic
-    # 500. Never expose internal details to the client.
+    # Unknown exception: log with full stack trace and return a generic 500.
     logger.exception(
         "Unhandled exception in source-control router: %s",
         type(exc).__name__,

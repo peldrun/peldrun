@@ -108,6 +108,14 @@ class CreateBranchTool(SourceControlTool):
                     ),
                     "default": False,
                 },
+                "checkout": {
+                    "type": "boolean",
+                    "description": (
+                        "When true (default), switch the workspace "
+                        "checkout to the newly created branch."
+                    ),
+                    "default": True,
+                },
             },
             "required": ["workspace_id", "branch_name"],
             "additionalProperties": False,
@@ -149,6 +157,7 @@ class CreateBranchTool(SourceControlTool):
             from_sha = from_sha.strip() or None
 
         force = bool(kwargs.get("force", False))
+        checkout = bool(kwargs.get("checkout", True))
 
         # --- Resolve workspace -----------------------------------------
         workspace_manager = (
@@ -208,6 +217,54 @@ class CreateBranchTool(SourceControlTool):
                 ),
             )
 
+        # --- Optionally check out the newly created branch -------------
+        if checkout:
+            try:
+                if hasattr(branch_manager, "checkout_branch"):
+                    checked_out = await branch_manager.checkout_branch(
+                        workspace_id=workspace_id,
+                        branch_name=branch_name,
+                        workspace_path=workspace.workspace_path,
+                    )
+                    if isinstance(checked_out, BranchRef):
+                        branch = checked_out
+                else:
+                    git_exec = getattr(branch_manager, "_git", None)
+                    if git_exec is not None:
+                        await git_exec.run(
+                            ["checkout", branch_name],
+                            cwd=workspace.workspace_path,
+                            check_returncode=True,
+                        )
+
+                # Synchronize workspace state so current_branch reflects the checkout
+                if hasattr(workspace_manager, "set_current_branch"):
+                    workspace_manager.set_current_branch(workspace_id, branch_name)
+                elif (
+                    hasattr(workspace_manager, "_workspaces")
+                    and isinstance(workspace_manager._workspaces, dict)
+                    and workspace_id in workspace_manager._workspaces
+                ):
+                    from dataclasses import replace
+                    current_ws = workspace_manager._workspaces[workspace_id]
+                    workspace_manager._workspaces[workspace_id] = replace(
+                        current_ws, current_branch=branch_name
+                    )
+            except Exception as exc:  # noqa: BLE001
+                normalized = to_source_control_error(exc)
+                return self.failure_result(
+                    error_code=normalized.code.value,
+                    error_message=(
+                        f"Branch '{branch_name}' was created, but checking it out failed: "
+                        + normalized.message
+                    ),
+                    metadata={
+                        "workspace_id": workspace_id,
+                        "branch_name": branch_name,
+                        "retryable": normalized.is_retryable,
+                    },
+                )
+
         return self.success_result(
             {
                 "workspace_id": workspace_id,
@@ -215,10 +272,12 @@ class CreateBranchTool(SourceControlTool):
                 "head_sha": branch.head_sha,
                 "is_default": branch.is_default,
                 "is_protected": branch.is_protected,
+                "checked_out": checkout,
             },
             metadata={
                 "workspace_id": workspace_id,
                 "from_sha": from_sha,
                 "force": force,
+                "checkout": checkout,
             },
         )

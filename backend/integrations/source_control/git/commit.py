@@ -506,6 +506,10 @@ class GitCommitManager(CommitPort):
             f"user.name={author_name}",
             "-c",
             f"user.email={author_email}",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.safecrlf=false",
             "commit",
             "--no-gpg-sign",
             "--no-verify",
@@ -556,17 +560,23 @@ class GitCommitManager(CommitPort):
 
     async def _has_staged_changes(self, target: Path) -> bool:
         """
-        Return True if the index differs from HEAD.
+        Return True if the index differs from HEAD (or empty tree if unborn).
 
-        Uses `git diff --cached --quiet`, which exits 1 when there
-        are differences and 0 otherwise.
+        Uses `git diff --cached --quiet <ref>`, which exits 1 when there
+        are differences and 0 when clean.
         """
+        has_head = await self._has_any_commit(target)
+        diff_target = (
+            "HEAD"
+            if has_head
+            else "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+        )
         result = await self._git.run(
-            ["diff", "--cached", "--quiet"],
+            ["diff", "--cached", "--quiet", diff_target],
             cwd=target,
             check_returncode=False,
         )
-        return result.returncode != 0
+        return result.returncode == 1
 
     async def _has_any_commit(self, target: Path) -> bool:
         """
@@ -851,8 +861,10 @@ def _parse_commit_log(raw: str) -> Tuple[CommitRef, ...]:
     if not raw:
         return ()
 
+    normalized_raw = raw.replace("\r\n", "\n")
+
     commits: List[CommitRef] = []
-    for record in raw.split(_RECORD_SEP):
+    for record in normalized_raw.split(_RECORD_SEP):
         record = record.strip("\n")
         if not record:
             continue

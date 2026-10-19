@@ -61,6 +61,7 @@ from ..security.redaction import redact_bytes
 __all__ = [
     "GitExecutable",
     "GitResult",
+    "GitCommandResult",
     "GitExecutionError",
     "GitTimeoutError",
     "GitNotAvailableError",
@@ -317,6 +318,10 @@ class GitResult:
         }
 
 
+# Backward-compatibility alias for callers expecting GitCommandResult.
+GitCommandResult = GitResult
+
+
 # ---------------------------------------------------------------------------
 # Git executable
 # ---------------------------------------------------------------------------
@@ -428,7 +433,8 @@ class GitExecutable:
         self._validate_args(args)
         timeout = self._coerce_timeout(timeout_seconds)
         cwd_path = self._validate_cwd(cwd)
-        command = (self._git_binary, *args)
+        effective_args = self._inject_crlf_configs(args)
+        command = (self._git_binary, *effective_args)
 
         env = self._build_environment(extra_env=extra_env)
 
@@ -504,6 +510,42 @@ class GitExecutable:
 
         return result
 
+    async def arun(
+        self,
+        args: Sequence[str],
+        *,
+        cwd: Optional[Union[str, Path]] = None,
+        timeout_seconds: Optional[Union[int, float]] = None,
+        timeout: Optional[Union[int, float]] = None,
+        check_returncode: bool = True,
+        check: Optional[bool] = None,
+        stdin_bytes: Optional[bytes] = None,
+        extra_env: Optional[Mapping[str, str]] = None,
+        env: Optional[Mapping[str, str]] = None,
+    ) -> GitResult:
+        """
+        Non-blocking execution of git commands for async agent tools and facade methods.
+
+        Provides compatibility with callers expecting an `arun` interface or
+        shorthand parameter names (`timeout`, `check`, `env`).
+        """
+        effective_timeout = timeout_seconds if timeout_seconds is not None else timeout
+        effective_check = check if check is not None else check_returncode
+        effective_env = extra_env if extra_env is not None else env
+
+        timeout_int: Optional[int] = (
+            int(effective_timeout) if effective_timeout is not None else None
+        )
+
+        return await self.run(
+            args,
+            cwd=cwd,
+            timeout_seconds=timeout_int,
+            check_returncode=effective_check,
+            stdin_bytes=stdin_bytes,
+            extra_env=effective_env,
+        )
+
     def run_sync(
         self,
         args: Sequence[str],
@@ -525,7 +567,8 @@ class GitExecutable:
         self._validate_args(args)
         timeout = self._coerce_timeout(timeout_seconds)
         cwd_path = self._validate_cwd(cwd)
-        command = (self._git_binary, *args)
+        effective_args = self._inject_crlf_configs(args)
+        command = (self._git_binary, *effective_args)
         env = self._build_environment(extra_env=extra_env)
 
         started = time.monotonic()
@@ -729,6 +772,24 @@ class GitExecutable:
         return text, truncated, redacted
 
     # --- Internals: validation -----------------------------------------
+
+    @staticmethod
+    def _inject_crlf_configs(args: Sequence[str]) -> Tuple[str, ...]:
+        """
+        Inject standard CRLF configuration overrides to ensure deterministic
+        line-ending behavior across Windows and POSIX platforms.
+        """
+        if args and args[0] in ("--version", "version", "--help", "help"):
+            return tuple(args)
+
+        joined = " ".join(args)
+        prefix: list[str] = []
+        if "core.autocrlf" not in joined:
+            prefix.extend(["-c", "core.autocrlf=false"])
+        if "core.safecrlf" not in joined:
+            prefix.extend(["-c", "core.safecrlf=false"])
+
+        return (*prefix, *args)
 
     @staticmethod
     def _validate_args(args: Sequence[str]) -> None:

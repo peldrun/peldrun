@@ -41,10 +41,13 @@ Design rules:
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import (
     Any,
     Awaitable,
@@ -363,24 +366,32 @@ class OperationRecoveryService:
                     type(exc).__name__,
                 )
 
+        actions: List[RecoveryAction] = []
+        errors: List[str] = []
+
         try:
             records = await self._journal.list_records(limit=max_operations)
         except Exception as exc:  # noqa: BLE001
-            completed_at = _utc_now()
-            return RecoveryReport(
-                started_at=started_at,
-                completed_at=completed_at,
-                duration_ms=int(
-                    (time.monotonic() - started_monotonic) * 1000
-                ),
-                dry_run=dry_run,
-                actions=(),
-                total_scanned=0,
-                errors=[f"Failed to list records: {type(exc).__name__}"],
-            )
-
-        actions: List[RecoveryAction] = []
-        errors: List[str] = []
+            # Fallback: read line-by-line isolating corrupt or incomplete JSON lines
+            records = await self._recover_records_fallback(max_operations)
+            if records:
+                errors.append(
+                    f"Journal list_records failed ({type(exc).__name__}); "
+                    f"salvaged {len(records)} valid records via fault-tolerant reader."
+                )
+            else:
+                completed_at = _utc_now()
+                return RecoveryReport(
+                    started_at=started_at,
+                    completed_at=completed_at,
+                    duration_ms=int(
+                        (time.monotonic() - started_monotonic) * 1000
+                    ),
+                    dry_run=dry_run,
+                    actions=(),
+                    total_scanned=0,
+                    errors=[f"Failed to list records: {type(exc).__name__}"],
+                )
 
         for record in records:
             try:
@@ -493,6 +504,18 @@ class OperationRecoveryService:
                     "Operation is approved and ready to be resumed by "
                     "the user."
                 ),
+            )
+
+        if status == OperationStatus.PUSHED:
+            return self._left_as_is(
+                record=record,
+                reason="Operation has been pushed; awaiting change request creation.",
+            )
+
+        if status == OperationStatus.CHANGE_REQUEST_CREATED:
+            return self._left_as_is(
+                record=record,
+                reason="Change request has been created; awaiting review or merge.",
             )
 
         if status == OperationStatus.FAILED_RETRYABLE:
@@ -846,6 +869,46 @@ class OperationRecoveryService:
             from_status=record.status,
             reason=reason,
         )
+
+    async def _recover_records_fallback(
+        self, max_operations: int
+    ) -> List[OperationRecord]:
+        """
+        Attempt to read records directly from journal file if list_records failed,
+        isolating incomplete or corrupted JSON lines to prevent recovery aborts.
+        """
+        raw_path = getattr(self._journal, "_path", None) or getattr(
+            self._journal, "path", None
+        )
+        if not raw_path:
+            return []
+
+        file_path = Path(raw_path)
+        if not file_path.exists():
+            return []
+
+        def _read_salvageable() -> List[OperationRecord]:
+            salvaged: List[OperationRecord] = []
+            try:
+                with file_path.open("r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                            record = OperationRecord.from_dict(data)
+                            salvaged.append(record)
+                            if len(salvaged) >= max_operations:
+                                break
+                        except (json.JSONDecodeError, Exception):
+                            # Skip partial or corrupt trailing lines caused by abrupt shutdown
+                            continue
+            except Exception:
+                return []
+            return salvaged
+
+        return await asyncio.to_thread(_read_salvageable)
 
 
 # ---------------------------------------------------------------------------

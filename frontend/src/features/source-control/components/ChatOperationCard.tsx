@@ -27,8 +27,8 @@ export function ChatOperationCard({
           title: "Waiting for your review",
           description: `The agent has prepared changes for ${operation.repository_id}. Please review before pushing.`,
           buttonText: "Open Review & Approve",
-          colorClass: "border-yellow-200 bg-yellow-50",
-          buttonClass: "bg-yellow-600 hover:bg-yellow-700 text-white",
+          colorClass: "border-amber-300 bg-custom",
+          buttonClass: "bg-amber-500 hover:bg-rb/80 text-white hover:shadow-md",
         };
       case "approved":
       case "pushing":
@@ -91,7 +91,7 @@ export function ChatOperationCard({
   const config = getStatusConfig();
 
   return (
-    <div className={`my-4 max-w-md rounded-lg border p-4 shadow-sm ${config.colorClass}`}>
+    <div className={`my-4 max-w-full m-auto rounded-md border border-dashed p-4 shadow-sm  ${config.colorClass}`}>
       <div className="flex items-start">
         <div className="text-2xl">{config.icon}</div>
         <div className="ml-3 flex-1">
@@ -109,7 +109,7 @@ export function ChatOperationCard({
             <button
               type="button"
               onClick={() => onOpenReview(operation.operation_id)}
-              className={`inline-flex items-center rounded-md px-3 py-1.5 text-sm font-medium shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 ${config.buttonClass}`}
+              className={`inline-flex items-center rounded-sm px-3 py-1.5 text-sm font-medium shadow-sm bg-rb focus:outline-none focus:ring-2 focus:ring-offset-2 ${config.buttonClass}`}
             >
               {config.buttonText}
             </button>

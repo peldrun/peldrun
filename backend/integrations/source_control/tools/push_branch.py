@@ -463,6 +463,7 @@ class PushBranchTool(SourceControlTool):
                 expected_base_sha=record.base_sha,
                 expected_diff_sha256=record.diff_sha256 or "",
                 expected_target_branch=target_branch,
+                action_scope="push_branch",
             )
         except Exception as exc:  # noqa: BLE001
             normalized = to_source_control_error(exc)
@@ -504,9 +505,9 @@ class PushBranchTool(SourceControlTool):
 
         # --- Consume the approval -------------------------------------
         #
-        # Once consumed, the ticket cannot be reused. If the push
-        # fails for a transient reason, the user will need to
-        # approve again; this is intentional.
+        # Consume the ticket specifically for the 'push_branch' action scope.
+        # This preserves the ticket for subsequent lifecycle steps (e.g.
+        # create_change_request) while preventing duplicate push attempts.
         try:
             approval_gate.consume(
                 approval_id,
@@ -516,6 +517,7 @@ class PushBranchTool(SourceControlTool):
                 expected_base_sha=record.base_sha,
                 expected_diff_sha256=record.diff_sha256 or "",
                 expected_target_branch=target_branch,
+                action_scope="push_branch",
             )
         except Exception as exc:  # noqa: BLE001
             normalized = to_source_control_error(exc)

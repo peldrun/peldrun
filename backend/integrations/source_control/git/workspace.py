@@ -362,12 +362,83 @@ class GitWorkspaceManager:
         Return the workspace with the given ID, or `None` if unknown.
 
         This method never raises for a missing workspace; callers that
-        need a strict failure use `require_workspace`.
+        need a strict failure use `require_workspace`. Automatically
+        discovers existing workspaces on disk across application restarts.
         """
         if not workspace_id or not isinstance(workspace_id, str):
             return None
         with self._lock:
-            return self._workspaces.get(workspace_id)
+            ws = self._workspaces.get(workspace_id)
+            if ws is not None:
+                return ws
+
+            # Attempt auto-discovery from workspace root on disk after restart
+            discovered = self._discover_workspace_on_disk(workspace_id)
+            if discovered is not None:
+                self._workspaces[workspace_id] = discovered
+                return discovered
+            return None
+
+    def register_workspace(self, workspace: WorkspaceRef) -> None:
+        """Register or restore an existing workspace reference into the manager."""
+        if not workspace or not isinstance(workspace, WorkspaceRef):
+            return
+        with self._lock:
+            self._workspaces[workspace.workspace_id] = workspace
+
+    def _discover_workspace_on_disk(self, workspace_id: str) -> Optional[WorkspaceRef]:
+        """
+        Scan workspace root directory to locate an existing workspace folder
+        matching the workspace_id across application restarts.
+        """
+        if not self._policy.root.exists():
+            return None
+
+        target_dir: Optional[Path] = None
+        suffix = f"__{workspace_id}"
+        try:
+            for child in self._policy.root.iterdir():
+                if child.is_dir() and (child.name == workspace_id or child.name.endswith(suffix)):
+                    target_dir = child
+                    break
+        except OSError:
+            return None
+
+        if target_dir is None or not (target_dir / ".git").exists():
+            return None
+
+        # Resolve repository and branch info from disk metadata
+        branch_name = "main"
+        head_sha = ""
+        head_file = target_dir / ".git" / "HEAD"
+        if head_file.exists():
+            try:
+                head_content = head_file.read_text(encoding="utf-8").strip()
+                if head_content.startswith("ref: refs/heads/"):
+                    branch_name = head_content[len("ref: refs/heads/"):]
+                    ref_file = target_dir / ".git" / "refs" / "heads" / branch_name
+                    if ref_file.exists():
+                        head_sha = ref_file.read_text(encoding="utf-8").strip()
+                elif len(head_content) == 40:
+                    head_sha = head_content
+            except OSError:
+                pass
+
+        return WorkspaceRef(
+            workspace_id=workspace_id,
+            repository_id=target_dir.name.split("__")[0] if "__" in target_dir.name else "unknown",
+            provider=ProviderId.GITHUB,
+            workspace_path=str(target_dir),
+            current_branch=branch_name,
+            base_sha=head_sha,
+            head_sha=head_sha,
+            is_worktree=False,
+            is_clean=True,
+            status=WorkspaceStatus.READY,
+            created_at=_utc_now(),
+            updated_at=_utc_now(),
+            metadata={"recovered_from_disk": True},
+        )
 
     def require_workspace(self, workspace_id: str) -> WorkspaceRef:
         """

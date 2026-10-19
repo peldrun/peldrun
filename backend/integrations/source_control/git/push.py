@@ -34,6 +34,7 @@ Design rules:
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import re
@@ -531,14 +532,21 @@ class GitPushManager(PushPort):
         """
         askpass_path: Optional[Path] = None
         extra_env: Optional[dict[str, str]] = None
+        effective_args = list(args)
 
         try:
             if token:
                 askpass_path, extra_env = self._build_askpass(token)
+                auth_header = _build_github_http_auth_header(token)
+                effective_args = [
+                    "-c",
+                    f"http.extraHeader={auth_header}",
+                    *effective_args,
+                ]
 
             try:
                 result = await self._git.run(
-                    args,
+                    effective_args,
                     cwd=target,
                     timeout_seconds=timeout_seconds,
                     check_returncode=False,
@@ -595,9 +603,24 @@ class GitPushManager(PushPort):
                 # Windows batch files must not contain special
                 # characters unescaped. The token is emitted via
                 # `echo` with delayed expansion disabled.
-                script = f"@echo off\r\necho {token}\r\n"
+                script = (
+                    "@echo off\r\n"
+                    "set \"prompt=%~1\"\r\n"
+                    "echo %prompt% | findstr /i \"username\" >nul\r\n"
+                    "if %errorlevel% equ 0 (\r\n"
+                    "    echo x-access-token\r\n"
+                    ") else (\r\n"
+                    f"    echo {token}\r\n"
+                    ")\r\n"
+                )
             else:
-                script = f"#!/bin/sh\necho '{token}'\n"
+                script = (
+                    "#!/bin/sh\n"
+                    "case \"$1\" in\n"
+                    "    *[Uu]sername*) echo \"x-access-token\" ;;\n"
+                    f"    *) echo '{token}' ;;\n"
+                    "esac\n"
+                )
             path.write_text(script, encoding="utf-8")
 
             # Restrict permissions on Unix.
@@ -806,16 +829,22 @@ class GitPushManager(PushPort):
         because the request is unauthenticated.
         """
         full_ref = f"refs/heads/{ref}"
-        args = ["ls-remote", "--refs", remote, full_ref]
+        effective_args = ["ls-remote", "--refs", remote, full_ref]
 
         askpass_path: Optional[Path] = None
         extra_env: Optional[dict[str, str]] = None
         try:
             if token:
                 askpass_path, extra_env = self._build_askpass(token)
+                auth_header = _build_github_http_auth_header(token)
+                effective_args = [
+                    "-c",
+                    f"http.extraHeader={auth_header}",
+                    *effective_args,
+                ]
 
             result = await self._git.run(
-                args,
+                effective_args,
                 cwd=target,
                 timeout_seconds=LS_REMOTE_TIMEOUT_SECONDS,
                 check_returncode=False,
@@ -986,6 +1015,22 @@ class GitPushManager(PushPort):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _build_github_http_auth_header(token: str) -> str:
+    """
+    Build the HTTP Basic authorization header required by GitHub HTTPS Git operations.
+
+    GitHub Smart HTTP git-receive-pack and git-upload-pack endpoints require
+    HTTP Basic authentication with username 'x-access-token' and the token as password,
+    encoded in Base64: 'AUTHORIZATION: basic <base64(x-access-token:token)>'.
+    """
+    raw_cred = f"x-access-token:{token}".encode("utf-8")
+    b64_cred = base64.b64encode(raw_cred).decode("ascii")
+    return f"AUTHORIZATION: basic {b64_cred}"
+
+
+build_github_http_auth_header = _build_github_http_auth_header
 
 
 def _extract_reason(summary: str) -> Optional[str]:

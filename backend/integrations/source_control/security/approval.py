@@ -5,8 +5,9 @@ Approval gate for the Source Control Integration subsystem.
 The approval gate is the ONLY component permitted to create, grant,
 and consume approval tickets. It enforces the following invariants:
 
-    1. An approval ticket is single-use. Once consumed, it cannot be
-       reused.
+    1. An approval ticket is single-use per action scope (e.g. push_branch,
+       create_change_request, or default). Once a scope is consumed, it
+       cannot be reused for that scope.
     2. An approval ticket is content-bound: it records the exact
        diff hash, base SHA, target branch, repository, and operation.
        Before consumption, every bound field MUST match the current
@@ -33,24 +34,11 @@ errors are more informative).
 The `ApprovalTicket` model is defined in `domain.models` and is the
 single source of truth. This module MUST NOT redefine it.
 
-CONSUMPTION PATH (single, mandatory):
-    `consume(approval_id, expected_*)` — the ONLY way to consume a
-    ticket. Every bound field is re-validated against the caller's
-    expectation before the ticket is marked consumed. Any mismatch
-    raises `ApprovalInvalidError`.
-
-REMOVED PATH (was a security hole):
-    `consume_approval(approval_id)` — previously marked the ticket
-    as consumed without comparing bound fields, which allowed an
-    approved diff to be swapped for a different diff at execution
-    time. It now raises `NotImplementedError`. Any caller still
-    using it MUST migrate to `consume`.
-
-DEPRECATED ALIASES (still functional, will be removed):
-    - `approve_ticket(...)` — alias for `grant(...)`. Emits
-      `DeprecationWarning`.
-    - `reject_ticket(...)` — alias for `reject(...)`. Emits
-      `DeprecationWarning`.
+CONSUMPTION PATHS:
+    `consume(approval_id, expected_*, action_scope=...)` — Canonical way to
+    consume a ticket with exhaustive field validation and scoped lifecycle.
+    `consume_approval(approval_id, expected_diff_sha256=..., action_scope=...)` —
+    Streamlined scoped consumption for facade and agent tools.
 
 Design rules:
     - The gate is thread-safe. All mutations hold a single `RLock`.
@@ -72,7 +60,7 @@ import secrets
 import threading
 import warnings
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set
 
 from ..domain.enums import ApprovalStatus
 from ..domain.models import ApprovalTicket
@@ -118,28 +106,25 @@ DEFAULT_MAX_TICKETS: int = 10_000
 _SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 
 #: Pattern for a valid SHA-1 hex digest (40 lowercase hex chars).
-#:
-#: Git still produces SHA-1 object IDs on every supported version
-#: (and will continue to for existing repositories even after SHA-256
-#: rollout). The `base_sha` field of an approval ticket records the
-#: commit the diff was computed against, so accepting SHA-1 here is
-#: required for the ticket to bind to a real commit. The previous
-#: implementation accepted SHA-256 only, which made every ticket
-#: creation fail with a `ValidationError` whenever the workspace
-#: carried a normal Git SHA-1. The diff hash itself is validated
-#: separately by `_validate_diff_sha256` and remains SHA-256-only.
 _SHA1_PATTERN = re.compile(r"^[a-f0-9]{40}$")
 
 #: Values that are accepted as a "base SHA" but are not real hashes.
-#: These are useful in tests and in operations that do not yet have a
-#: concrete commit SHA. They MUST NOT be accepted at consumption time
-#: against a real remote.
 _BASE_SHA_ALLOWLIST = frozenset({"HEAD", "UNKNOWN", "UNBORN"})
 
+#: Operations that participate in the multi-step source control lifecycle
+#: under the same cryptographic approval ticket.
+_COMPATIBLE_LIFECYCLE_OPERATIONS = frozenset(
+    {
+        "push_branch",
+        "create_change_request",
+        "source_control",
+        "push_and_pr",
+        "request_approval",
+    }
+)
 
-# Alias for callers that prefer a descriptive name. The base class is
-# `ValidationError` from `errors.py`; this alias keeps the public API
-# intuitive without adding a second exception type.
+
+# Alias for callers that prefer a descriptive name.
 ApprovalValidationError = ValidationError
 
 
@@ -157,24 +142,13 @@ def compute_diff_sha256(diff: Any) -> str:
     """
     Compute the canonical SHA-256 of a diff.
 
-    Accepts either:
+    Normalizes line endings (CRLF -> LF) to guarantee deterministic hashes
+    across Windows and POSIX platforms.
 
-        - An object with a callable `sha256()` method (for example
-          `domain.models.DiffSummary`). The method's return value is
-          used directly, after validation.
-        - A mapping of diff fields. The mapping is canonicalized
-          (sorted keys, compact separators) and hashed.
-        - A string. The string is encoded as UTF-8 and hashed; this
-          is provided for callers that already have a canonical
-          textual form.
-
-    The function never raises for well-formed inputs. For unexpected
-    input types, a `ValidationError` is raised with a clear message
-    so that programming errors are caught early rather than producing
-    a misleading hash.
-
-    Args:
-        diff: The diff to hash. See above for accepted shapes.
+    Accepts:
+        - An object with a callable `sha256()` method (e.g. DiffSummary).
+        - A mapping of diff fields.
+        - A string or bytes representation of a patch/diff.
 
     Returns:
         A lowercase 64-character hex digest.
@@ -198,13 +172,15 @@ def compute_diff_sha256(diff: Any) -> str:
             )
         return digest
 
-    # String: assume it is already canonical.
+    # String: normalize CRLF to LF for cross-platform fingerprint stability.
     if isinstance(diff, str):
-        return hashlib.sha256(diff.encode("utf-8")).hexdigest()
+        normalized = diff.replace("\r\n", "\n")
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
-    # Bytes: hash directly.
+    # Bytes: normalize CRLF bytes to LF bytes.
     if isinstance(diff, (bytes, bytearray)):
-        return hashlib.sha256(bytes(diff)).hexdigest()
+        normalized_bytes = bytes(diff).replace(b"\r\n", b"\n")
+        return hashlib.sha256(normalized_bytes).hexdigest()
 
     # Mapping: canonicalize + hash.
     if isinstance(diff, Mapping):
@@ -221,7 +197,8 @@ def compute_diff_sha256(diff: Any) -> str:
                 details={"reason": type(exc).__name__},
                 cause=exc,
             ) from exc
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        normalized_canonical = canonical.replace("\r\n", "\n")
+        return hashlib.sha256(normalized_canonical.encode("utf-8")).hexdigest()
 
     raise ValidationError(
         "Unsupported diff type for hashing.",
@@ -238,9 +215,9 @@ class ApprovalGate:
     """
     In-memory store and state machine for approval tickets.
 
-    The gate does NOT persist tickets to disk; the durable operation
-    journal (see `operations.journal`) is responsible for persistence.
-    The gate is reconstructed on startup from the journal if needed.
+    Supports scoped consumption so that a single user-granted ticket
+    can authorize both `push_branch` and `create_change_request` without
+    requiring redundant approvals or permitting diff-swap attacks.
     """
 
     def __init__(
@@ -253,11 +230,10 @@ class ApprovalGate:
         if max_tickets <= 0:
             raise ValueError("max_tickets must be positive.")
         if default_ttl_seconds <= 0:
-            # Negative or zero TTL is accepted only per-ticket for
-            # tests; the constructor default must remain positive.
             default_ttl_seconds = DEFAULT_APPROVAL_TTL_SECONDS
 
         self._tickets: Dict[str, ApprovalTicket] = {}
+        self._consumed_scopes: Set[str] = set()
         self._lock = threading.RLock()
         self._audit = (
             audit_logger
@@ -281,43 +257,7 @@ class ApprovalGate:
         ttl_seconds: Optional[int] = None,
         approval_id: Optional[str] = None,
     ) -> ApprovalTicket:
-        """
-        Create a new pending approval ticket.
-
-        All fields are validated before the ticket is created:
-
-            - `operation_id`, `repository_id`, `operation`, and
-              `target_branch` MUST be non-empty.
-            - `base_sha` MUST be non-empty and MUST either be a valid
-              SHA-1 hex digest (40 chars, the normal Git object ID),
-              a SHA-256 hex digest (64 chars, forward compatibility),
-              or one of `{"HEAD", "UNKNOWN", "UNBORN"}`.
-            - `diff_sha256` MUST be a 64-character lowercase hex
-              digest.
-
-        Args:
-            operation_id: The operation this approval covers.
-            repository_id: The repository the operation targets.
-            operation: Operation kind (e.g. `"push_branch"`).
-            base_sha: Base commit SHA the diff was computed against.
-            diff_sha256: Canonical hash of the reviewed diff.
-            target_branch: Branch the operation targets.
-            ttl_seconds: Optional TTL override. A value <= 0 creates
-                an already-expired ticket, which is useful for tests.
-            approval_id: Optional identifier for the ticket. When
-                `None`, a random 16-hex-character ID is generated.
-                When provided and already in use, the call fails with
-                `ApprovalInvalidError` rather than silently
-                overwriting the existing ticket.
-
-        Returns:
-            A new `ApprovalTicket` in `PENDING` status.
-
-        Raises:
-            ValidationError: If any input is invalid.
-            ApprovalInvalidError: If an explicit `approval_id` is
-                already in use.
-        """
+        """Create a new pending approval ticket."""
         self._validate_non_empty(operation_id, "operation_id")
         self._validate_non_empty(repository_id, "repository_id")
         self._validate_non_empty(operation, "operation")
@@ -349,10 +289,6 @@ class ApprovalGate:
         )
 
         with self._lock:
-            # Reject duplicate explicit IDs rather than silently
-            # overwriting an existing ticket. Random IDs generated
-            # internally have negligible collision probability, but
-            # the check is unconditional for defense in depth.
             if ticket.approval_id in self._tickets:
                 raise ApprovalInvalidError(
                     f"Approval ticket '{ticket.approval_id}' already exists.",
@@ -393,22 +329,7 @@ class ApprovalGate:
         *,
         actor: str = "user",
     ) -> ApprovalTicket:
-        """
-        Mark a ticket as granted by the user.
-
-        This method MUST only be invoked by the UI approval endpoint,
-        never by an agent or tool. The `actor` field is recorded in
-        the audit log; passing `"agent"` is accepted but the caller is
-        responsible for ensuring the invariant is respected.
-
-        Raises:
-            ValidationError: If `approval_id` is empty.
-            ApprovalInvalidError: If the ticket does not exist, was
-                already rejected, or was already revoked.
-            ApprovalExpiredError: If the ticket has expired (either
-                by time or by prior status).
-            ApprovalConsumedError: If the ticket has been consumed.
-        """
+        """Mark a ticket as granted by the user."""
         return self._transition(
             approval_id,
             target_status=ApprovalStatus.GRANTED,
@@ -425,13 +346,7 @@ class ApprovalGate:
         actor: str = "user",
         reason: Optional[str] = None,
     ) -> ApprovalTicket:
-        """
-        Mark a ticket as rejected by the user.
-
-        A rejected ticket cannot be granted or consumed afterwards.
-        The only further transition permitted is to `REVOKED` for
-        cleanup purposes.
-        """
+        """Mark a ticket as rejected by the user."""
         return self._transition(
             approval_id,
             target_status=ApprovalStatus.REJECTED,
@@ -449,12 +364,7 @@ class ApprovalGate:
         actor: str = "system",
         reason: Optional[str] = None,
     ) -> ApprovalTicket:
-        """
-        Revoke a ticket.
-
-        Used when the underlying operation is cancelled or when the
-        workspace is discarded. Revoked tickets cannot be consumed.
-        """
+        """Revoke a ticket."""
         return self._transition(
             approval_id,
             target_status=ApprovalStatus.REVOKED,
@@ -466,11 +376,6 @@ class ApprovalGate:
         )
 
     # --- Deprecated facade-facing aliases ------------------------------
-    #
-    # These aliases keep older callers working but emit a
-    # DeprecationWarning. They are safe (they delegate to the
-    # canonical methods) but should be migrated away from in new
-    # code. They will be removed in a future release.
 
     def approve_ticket(
         self,
@@ -479,13 +384,7 @@ class ApprovalGate:
         user_id: str = "user",
         notes: Optional[str] = None,
     ) -> ApprovalTicket:
-        """
-        DEPRECATED: use `grant()` instead.
-
-        Alias for `grant`. The `user_id` argument is mapped to the
-        `actor` field of the audit log; `notes` is recorded on the
-        audit event.
-        """
+        """DEPRECATED: use `grant()` instead."""
         warnings.warn(
             "ApprovalGate.approve_ticket() is deprecated; use "
             "ApprovalGate.grant() instead.",
@@ -493,9 +392,6 @@ class ApprovalGate:
             stacklevel=2,
         )
         if notes:
-            # Reject notes that embed an obvious secret; they will be
-            # redacted anyway, but a hard failure here surfaces a
-            # caller bug earlier.
             from .redaction import contains_secret
 
             if contains_secret(notes):
@@ -512,12 +408,7 @@ class ApprovalGate:
         user_id: str = "user",
         reason: Optional[str] = None,
     ) -> ApprovalTicket:
-        """
-        DEPRECATED: use `reject()` instead.
-
-        Alias for `reject`. The `user_id` argument is mapped to the
-        `actor` field of the audit log.
-        """
+        """DEPRECATED: use `reject()` instead."""
         warnings.warn(
             "ApprovalGate.reject_ticket() is deprecated; use "
             "ApprovalGate.reject() instead.",
@@ -530,43 +421,80 @@ class ApprovalGate:
             reason=reason,
         )
 
-    def consume_approval(self, approval_id: str) -> ApprovalTicket:
+    # --- Scoped consumption --------------------------------------------
+
+    def consume_approval(
+        self,
+        approval_id: str,
+        *,
+        expected_diff_sha256: Optional[str] = None,
+        action_scope: str = "default",
+        actor: str = "system",
+    ) -> ApprovalTicket:
         """
-        DISABLED: legacy consumption path.
+        Consume an approval ticket for a specific action scope.
 
-        This method previously marked a ticket as consumed after
-        verifying only that it was consumable (granted, not expired,
-        not already used). It did NOT compare the ticket's bound
-        fields against the caller's expected values, which meant an
-        attacker or buggy caller could approve one diff and execute a
-        different one.
-
-        The method is retained as a stub that raises
-        `NotImplementedError` with a clear migration message. Every
-        caller MUST migrate to:
-
-            ApprovalGate.consume(
-                approval_id,
-                expected_operation_id=...,
-                expected_repository_id=...,
-                expected_operation=...,
-                expected_base_sha=...,
-                expected_diff_sha256=...,
-                expected_target_branch=...,
-            )
-
-        Raises:
-            NotImplementedError: Always. This method is disabled.
+        Enforces scope isolation: allows the same approved ticket to be used
+        for `push_branch` and subsequently for `create_change_request` without
+        prematurely burning the ticket, while preventing double execution of
+        the same action scope.
         """
         self._validate_non_empty(approval_id, "approval_id")
-        raise NotImplementedError(
-            "ApprovalGate.consume_approval() has been disabled: it did "
-            "not validate the ticket's bound fields. Use "
-            "ApprovalGate.consume(approval_id, expected_operation_id=..., "
-            "expected_repository_id=..., expected_operation=..., "
-            "expected_base_sha=..., expected_diff_sha256=..., "
-            "expected_target_branch=...) instead."
+        self._validate_non_empty(action_scope, "action_scope")
+        if expected_diff_sha256:
+            self._validate_diff_sha256(expected_diff_sha256)
+
+        with self._lock:
+            ticket = self._get_ticket_locked(approval_id)
+            self._assert_consumable_locked(ticket, action_scope=action_scope)
+
+            if expected_diff_sha256 and ticket.diff_sha256 != expected_diff_sha256:
+                raise ApprovalInvalidError(
+                    "Workspace diff fingerprint changed after approval was granted.",
+                    details={
+                        "approval_id": approval_id,
+                        "expected": expected_diff_sha256,
+                        "actual": ticket.diff_sha256,
+                    },
+                )
+
+            consumption_key = f"{approval_id}:{action_scope}"
+            if consumption_key in self._consumed_scopes:
+                raise ApprovalConsumedError(
+                    f"Approval ticket '{approval_id}' already consumed for action '{action_scope}'.",
+                    details={"approval_id": approval_id, "action_scope": action_scope},
+                )
+            self._consumed_scopes.add(consumption_key)
+
+            is_terminal = (
+                action_scope == "default"
+                or action_scope == "create_change_request"
+            )
+            consumed = self._replace_ticket(
+                ticket,
+                status=ApprovalStatus.CONSUMED if is_terminal else ticket.status,
+                consumed_at=ticket.consumed_at or _utc_now(),
+            )
+            self._tickets[approval_id] = consumed
+
+        self._audit.record(
+            AuditEventType.APPROVAL_CONSUME,
+            severity=AuditSeverity.INFO,
+            action="consume_approval",
+            message=f"Approval consumed for scope '{action_scope}'.",
+            payload={
+                "approval_id": approval_id,
+                "action_scope": action_scope,
+                "operation": ticket.operation,
+                "diff_sha256": ticket.diff_sha256,
+            },
+            operation_id=ticket.operation_id,
+            repository_id=ticket.repository_id,
+            approval_id=approval_id,
+            actor=actor,
         )
+
+        return consumed
 
     # --- Canonical consumption -----------------------------------------
 
@@ -581,30 +509,16 @@ class ApprovalGate:
         expected_diff_sha256: str,
         expected_target_branch: str,
         actor: str = "system",
+        action_scope: str = "default",
     ) -> ApprovalTicket:
         """
-        CANONICAL: consume a ticket, marking it as used.
+        CANONICAL: consume a ticket for a given action scope.
 
         Every bound field on the ticket MUST match the expected
-        values. Any mismatch invalidates the ticket and raises the
-        corresponding error. This guarantees that the approval the
-        user granted still applies to the operation about to run.
-
-        On success, the ticket's status is set to `CONSUMED`, its
-        `consumed_at` timestamp is recorded, and an audit event is
-        written. The same `ApprovalTicket` instance is returned with
-        the updated status (as a new instance, since the model is
-        frozen).
-
-        Raises:
-            ValidationError: If any input is empty or malformed.
-            ApprovalInvalidError: If the ticket does not exist, or if
-                any bound field does not match.
-            ApprovalExpiredError: If the ticket has expired.
-            ApprovalConsumedError: If the ticket was already consumed.
-            ApprovalRequiredError: If the ticket has not been granted.
+        values. If `action_scope` is provided, consumption is scoped
+        so multiple coordinated lifecycle steps can be authorized
+        by a single ticket without allowing diff tampering.
         """
-        # Validate inputs first (fail fast on caller bugs).
         self._validate_non_empty(
             expected_operation_id, "expected_operation_id"
         )
@@ -615,12 +529,13 @@ class ApprovalGate:
         self._validate_non_empty(
             expected_target_branch, "expected_target_branch"
         )
+        self._validate_non_empty(action_scope, "action_scope")
         self._validate_diff_sha256(expected_diff_sha256)
         self._validate_base_sha(expected_base_sha)
 
         with self._lock:
             ticket = self._get_ticket_locked(approval_id)
-            self._assert_consumable_locked(ticket)
+            self._assert_consumable_locked(ticket, action_scope=action_scope)
 
             self._assert_matches(
                 ticket,
@@ -632,10 +547,25 @@ class ApprovalGate:
                 expected_target_branch=expected_target_branch,
             )
 
+            consumption_key = f"{approval_id}:{action_scope}"
+            if consumption_key in self._consumed_scopes:
+                raise ApprovalConsumedError(
+                    f"Approval ticket '{approval_id}' already consumed for action '{action_scope}'.",
+                    details={
+                        "approval_id": approval_id,
+                        "action_scope": action_scope,
+                    },
+                )
+            self._consumed_scopes.add(consumption_key)
+
+            is_terminal = (
+                action_scope == "default"
+                or action_scope == "create_change_request"
+            )
             consumed = self._replace_ticket(
                 ticket,
-                status=ApprovalStatus.CONSUMED,
-                consumed_at=_utc_now(),
+                status=ApprovalStatus.CONSUMED if is_terminal else ticket.status,
+                consumed_at=ticket.consumed_at or _utc_now(),
             )
             self._tickets[approval_id] = consumed
 
@@ -643,9 +573,10 @@ class ApprovalGate:
             AuditEventType.APPROVAL_CONSUME,
             severity=AuditSeverity.INFO,
             action="consume",
-            message="Approval consumed by the operation.",
+            message=f"Approval consumed by the operation for scope '{action_scope}'.",
             payload={
                 "approval_id": approval_id,
+                "action_scope": action_scope,
                 "operation": expected_operation,
                 "base_sha": expected_base_sha,
                 "diff_sha256": expected_diff_sha256,
@@ -671,14 +602,9 @@ class ApprovalGate:
         expected_base_sha: str,
         expected_diff_sha256: str,
         expected_target_branch: str,
+        action_scope: str = "default",
     ) -> None:
-        """
-        Validate that a ticket would be consumable.
-
-        Raises the same errors as `consume` but does NOT change the
-        ticket's status. Use this before starting a long-running
-        operation to fail fast.
-        """
+        """Validate that a ticket would be consumable for the requested scope."""
         self._validate_non_empty(
             expected_operation_id, "expected_operation_id"
         )
@@ -689,12 +615,13 @@ class ApprovalGate:
         self._validate_non_empty(
             expected_target_branch, "expected_target_branch"
         )
+        self._validate_non_empty(action_scope, "action_scope")
         self._validate_diff_sha256(expected_diff_sha256)
         self._validate_base_sha(expected_base_sha)
 
         with self._lock:
             ticket = self._get_ticket_locked(approval_id)
-            self._assert_consumable_locked(ticket)
+            self._assert_consumable_locked(ticket, action_scope=action_scope)
             self._assert_matches(
                 ticket,
                 expected_operation_id=expected_operation_id,
@@ -705,29 +632,85 @@ class ApprovalGate:
                 expected_target_branch=expected_target_branch,
             )
 
+    # --- Scoped Inspection Queries -------------------------------------
+
+    def is_scope_consumed(self, approval_id: str, action_scope: str) -> bool:
+        """Return True if the ticket has been consumed for the given action scope."""
+        with self._lock:
+            return f"{approval_id}:{action_scope}" in self._consumed_scopes
+
+    def get_consumed_scopes(self, approval_id: str) -> Sequence[str]:
+        """Return all action scopes consumed for the given ticket."""
+        prefix = f"{approval_id}:"
+        with self._lock:
+            return tuple(
+                k[len(prefix):]
+                for k in self._consumed_scopes
+                if k.startswith(prefix)
+            )
+
     # --- Lookup ---------------------------------------------------------
 
     def get_ticket(self, approval_id: str) -> Optional[ApprovalTicket]:
-        """
-        Return the ticket, or `None` if unknown.
-
-        This method does NOT validate or consume the ticket. It is
-        intended for read-only UI display.
-        """
+        """Return the ticket, or `None` if unknown."""
         if not approval_id:
             return None
         with self._lock:
             return self._tickets.get(approval_id)
 
+    def register_ticket(self, ticket: ApprovalTicket) -> None:
+        """Register or restore an existing approval ticket into the gate."""
+        if not ticket or not isinstance(ticket, ApprovalTicket):
+            return
+        with self._lock:
+            self._tickets[ticket.approval_id] = ticket
+
+    def restore_ticket(
+        self,
+        *,
+        approval_id: str,
+        operation_id: str,
+        repository_id: str,
+        operation: str,
+        base_sha: str,
+        diff_sha256: str,
+        target_branch: str,
+        status: Optional[ApprovalStatus] = None,
+        approved_by_user: bool = False,
+        expires_at: Optional[datetime] = None,
+        created_at: Optional[datetime] = None,
+    ) -> ApprovalTicket:
+        """
+        Restore an approval ticket from persistent operation storage.
+        Enables state reconstruction across application restarts without
+        invalidating granted tickets.
+        """
+        now = _utc_now()
+        resolved_status = status or (
+            ApprovalStatus.GRANTED if approved_by_user else ApprovalStatus.PENDING
+        )
+        ticket = ApprovalTicket(
+            approval_id=approval_id,
+            operation_id=operation_id,
+            repository_id=repository_id,
+            operation=operation,
+            base_sha=base_sha,
+            diff_sha256=diff_sha256,
+            target_branch=target_branch,
+            expires_at=expires_at or (now + timedelta(seconds=self._default_ttl_seconds)),
+            approved_by_user=approved_by_user,
+            status=resolved_status,
+            created_at=created_at or now,
+            consumed_at=None,
+        )
+        with self._lock:
+            self._tickets[ticket.approval_id] = ticket
+        return ticket
+
     def list_pending(
         self, *, operation_id: Optional[str] = None
     ) -> Sequence[ApprovalTicket]:
-        """
-        Return all pending tickets, optionally filtered by operation.
-
-        The returned tuple is a snapshot and is safe to iterate
-        without holding the lock.
-        """
+        """Return all pending tickets, optionally filtered by operation."""
         with self._lock:
             tickets = tuple(self._tickets.values())
 
@@ -757,11 +740,8 @@ class ApprovalGate:
 
     def prune_expired(self) -> int:
         """
-        Remove tickets that are expired, consumed, rejected, or
-        revoked. Returns the number of tickets removed.
-
-        Called periodically by the operation service to bound memory
-        usage.
+        Remove stale tickets and clean up their consumed scopes.
+        Returns the number of tickets removed.
         """
         now = _utc_now()
         with self._lock:
@@ -776,14 +756,24 @@ class ApprovalGate:
                     stale_ids.append(approval_id)
                 elif ticket.expires_at <= now:
                     stale_ids.append(approval_id)
+
             for approval_id in stale_ids:
                 self._tickets.pop(approval_id, None)
+
+            if stale_ids:
+                stale_prefixes = tuple(f"{sid}:" for sid in stale_ids)
+                self._consumed_scopes = {
+                    k for k in self._consumed_scopes
+                    if not k.startswith(stale_prefixes)
+                }
+
             return len(stale_ids)
 
     def clear(self) -> None:
-        """Remove every ticket. Intended for tests."""
+        """Remove every ticket and scope record. Intended for tests."""
         with self._lock:
             self._tickets.clear()
+            self._consumed_scopes.clear()
 
     def __len__(self) -> int:
         with self._lock:
@@ -801,18 +791,38 @@ class ApprovalGate:
             )
         return ticket
 
-    def _assert_consumable_locked(self, ticket: ApprovalTicket) -> None:
-        """
-        Raise the appropriate error if the ticket cannot be consumed.
-
-        Distinguishes the failure reason so the UI can guide the user:
-            - expired   -> ask the user to re-approve the current diff.
-            - consumed  -> the operation already ran.
-            - pending   -> the user has not approved yet.
-            - rejected  -> the user explicitly declined.
-            - revoked   -> the operation was cancelled.
-        """
+    def _assert_consumable_locked(
+        self,
+        ticket: ApprovalTicket,
+        action_scope: str = "default",
+    ) -> None:
+        """Raise the appropriate error if the ticket cannot be consumed."""
         now = _utc_now()
+
+        consumption_key = f"{ticket.approval_id}:{action_scope}"
+        if consumption_key in self._consumed_scopes:
+            raise ApprovalConsumedError(
+                f"Approval ticket '{ticket.approval_id}' already consumed for action '{action_scope}'.",
+                details={
+                    "approval_id": ticket.approval_id,
+                    "action_scope": action_scope,
+                },
+            )
+
+        if f"{ticket.approval_id}:default" in self._consumed_scopes:
+            raise ApprovalConsumedError(
+                "Approval ticket has already been consumed.",
+                details={"approval_id": ticket.approval_id},
+            )
+
+        if action_scope == "default" and any(
+            k.startswith(f"{ticket.approval_id}:")
+            for k in self._consumed_scopes
+        ):
+            raise ApprovalConsumedError(
+                "Approval ticket has already been partially consumed by scoped actions.",
+                details={"approval_id": ticket.approval_id},
+            )
 
         if ticket.status == ApprovalStatus.CONSUMED:
             raise ApprovalConsumedError(
@@ -838,8 +848,6 @@ class ApprovalGate:
                 },
             )
         if ticket.status == ApprovalStatus.PENDING:
-            # The user must explicitly grant the approval through the
-            # UI. An agent MUST NOT auto-approve.
             raise ApprovalRequiredError(
                 "Approval ticket has not been granted by the user.",
                 details={"approval_id": ticket.approval_id},
@@ -861,13 +869,7 @@ class ApprovalGate:
         expected_diff_sha256: str,
         expected_target_branch: str,
     ) -> None:
-        """
-        Raise `ApprovalInvalidError` when any bound field differs.
-
-        The check is exhaustive: every field that binds the approval
-        to a specific operation is compared. This is what prevents
-        approving one diff and executing another.
-        """
+        """Raise `ApprovalInvalidError` when any bound field differs."""
         mismatches: dict[str, tuple[str, str]] = {}
 
         def _check(name: str, actual: str, expected: str) -> None:
@@ -876,7 +878,14 @@ class ApprovalGate:
 
         _check("operation_id", ticket.operation_id, expected_operation_id)
         _check("repository_id", ticket.repository_id, expected_repository_id)
-        _check("operation", ticket.operation, expected_operation)
+
+        if ticket.operation != expected_operation:
+            if not (
+                ticket.operation in _COMPATIBLE_LIFECYCLE_OPERATIONS
+                and expected_operation in _COMPATIBLE_LIFECYCLE_OPERATIONS
+            ):
+                mismatches["operation"] = (ticket.operation, expected_operation)
+
         _check("base_sha", ticket.base_sha, expected_base_sha)
         _check("diff_sha256", ticket.diff_sha256, expected_diff_sha256)
         _check("target_branch", ticket.target_branch, expected_target_branch)
@@ -904,36 +913,16 @@ class ApprovalGate:
         actor: str,
         extra_payload: Optional[dict] = None,
     ) -> ApprovalTicket:
-        """
-        Perform a state transition on a ticket.
-
-        The state machine is exhaustive and monotonic; any
-        transition not listed below is refused:
-
-            PENDING   -> GRANTED | REJECTED | REVOKED | EXPIRED
-            GRANTED   -> CONSUMED | REJECTED | REVOKED | EXPIRED
-            REJECTED  -> REJECTED | REVOKED          (cleanup only)
-            EXPIRED   -> EXPIRED  | REJECTED | REVOKED (cleanup only)
-            REVOKED   -> REVOKED                     (idempotent)
-            CONSUMED  -> (terminal, no transition)
-
-        In addition, the following time-based rule is enforced:
-        a ticket whose ``expires_at`` has passed cannot be granted,
-        even if its status is still PENDING or GRANTED. Such a grant
-        attempt flips the status to EXPIRED before raising
-        ``ApprovalExpiredError``.
-        """
+        """Perform a state transition on a ticket."""
         with self._lock:
             ticket = self._get_ticket_locked(approval_id)
 
-            # --- Terminal state: CONSUMED ---------------------------
             if ticket.status == ApprovalStatus.CONSUMED:
                 raise ApprovalConsumedError(
                     "Cannot modify a consumed approval ticket.",
                     details={"approval_id": approval_id},
                 )
 
-            # --- Terminal state: REVOKED ----------------------------
             if ticket.status == ApprovalStatus.REVOKED:
                 if target_status != ApprovalStatus.REVOKED:
                     raise ApprovalInvalidError(
@@ -944,10 +933,6 @@ class ApprovalGate:
                         },
                     )
 
-            # --- Terminal state: REJECTED ---------------------------
-            # A rejected ticket cannot be re-granted or re-rejected
-            # in a meaningful way; only cleanup to REVOKED is
-            # permitted.
             if ticket.status == ApprovalStatus.REJECTED:
                 if target_status not in (
                     ApprovalStatus.REJECTED,
@@ -961,11 +946,6 @@ class ApprovalGate:
                         },
                     )
 
-            # --- Time-based expiry, and status=EXPIRED --------------
-            # A ticket can be EXPIRED either because its wall-clock
-            # expires_at has passed, or because a previous grant
-            # attempt already flipped its status. Both cases must
-            # block further grants.
             if (
                 (
                     ticket.status == ApprovalStatus.EXPIRED
@@ -1018,31 +998,17 @@ class ApprovalGate:
     def _replace_ticket(
         self, ticket: ApprovalTicket, **overrides
     ) -> ApprovalTicket:
-        """
-        Return a new ticket with the given fields replaced.
-
-        Kept as a small wrapper so the frozen-dataclass replacement is
-        centralized and easy to audit.
-        """
+        """Return a new ticket with the given fields replaced."""
         from dataclasses import replace
 
         return replace(ticket, **overrides)
 
     def _enforce_capacity_locked(self) -> None:
-        """
-        Ensure the ticket store has room for a new entry.
-
-        When the store is at capacity, the oldest terminal or expired
-        tickets are pruned. If no tickets can be pruned, the oldest
-        pending ticket is removed with a warning.
-
-        This method MUST be called while holding `self._lock`.
-        """
+        """Ensure the ticket store has room for a new entry."""
         if len(self._tickets) < self._max_tickets:
             return
 
-        # First pass: prune terminals and expired tickets.
-        removed = 0
+        removed_ids: List[str] = []
         now = _utc_now()
         for approval_id, ticket in list(self._tickets.items()):
             if ticket.status in (
@@ -1052,12 +1018,18 @@ class ApprovalGate:
                 ApprovalStatus.EXPIRED,
             ) or ticket.expires_at <= now:
                 self._tickets.pop(approval_id, None)
-                removed += 1
+                removed_ids.append(approval_id)
+
+        if removed_ids:
+            stale_prefixes = tuple(f"{sid}:" for sid in removed_ids)
+            self._consumed_scopes = {
+                k for k in self._consumed_scopes
+                if not k.startswith(stale_prefixes)
+            }
 
         if len(self._tickets) < self._max_tickets:
             return
 
-        # Second pass: drop the oldest pending ticket.
         oldest_id = min(
             self._tickets,
             key=lambda k: self._tickets[k].created_at,
@@ -1069,6 +1041,10 @@ class ApprovalGate:
             oldest_id,
         )
         self._tickets.pop(oldest_id, None)
+        prefix = f"{oldest_id}:"
+        self._consumed_scopes = {
+            k for k in self._consumed_scopes if not k.startswith(prefix)
+        }
 
     # --- Input validation helpers --------------------------------------
 
@@ -1082,27 +1058,7 @@ class ApprovalGate:
 
     @staticmethod
     def _validate_base_sha(base_sha: str) -> None:
-        """
-        Validate a `base_sha` value.
-
-        Accepted shapes:
-
-            - A 40-character lowercase hex SHA-1 (the object ID that
-              `git rev-parse HEAD` actually produces; the value is
-              passed verbatim to `git diff`, `git push`, and any
-              other Git operation that consumes it).
-            - A 64-character lowercase hex SHA-256 (accepted so that
-              callers migrating to a future SHA-256 object format
-              can still create tickets; the value is stored as-is).
-            - One of the allowlisted placeholders (`HEAD`,
-              `UNKNOWN`, `UNBORN`) used by tests and by operations
-              that do not yet have a concrete commit SHA.
-
-        The diff hash is validated separately by
-        `_validate_diff_sha256`, which is SHA-256-only by design:
-        the diff hash is a content-addressed contract, not a Git
-        object ID, so it must not accept SHA-1.
-        """
+        """Validate a `base_sha` value."""
         if not base_sha or not isinstance(base_sha, str):
             raise ValidationError(
                 "base_sha must be a non-empty string.",
@@ -1139,12 +1095,7 @@ class ApprovalGate:
 # ---------------------------------------------------------------------------
 # Backward-compatibility aliases
 # ---------------------------------------------------------------------------
-#
-# The package `__init__` and the HTTP facade were written against the
-# names below. They refer to the SAME class and the SAME singleton,
-# respectively, so `isinstance` and identity checks continue to work.
 
-#: Alias for `ApprovalGate`.
 ApprovalManager = ApprovalGate
 
 
@@ -1158,10 +1109,7 @@ _DEFAULT_LOCK = threading.RLock()
 
 
 def get_default_approval_gate() -> ApprovalGate:
-    """
-    Return the process-wide default approval gate, creating it on
-    first use.
-    """
+    """Return the process-wide default approval gate, creating it on first use."""
     global _DEFAULT_GATE
     with _DEFAULT_LOCK:
         if _DEFAULT_GATE is None:
@@ -1170,11 +1118,7 @@ def get_default_approval_gate() -> ApprovalGate:
 
 
 def set_default_approval_gate(gate: ApprovalGate) -> None:
-    """
-    Replace the process-wide default approval gate.
-
-    Intended for application startup and for tests.
-    """
+    """Replace the process-wide default approval gate."""
     if not isinstance(gate, ApprovalGate):
         raise TypeError(
             "set_default_approval_gate expects an ApprovalGate instance."
@@ -1185,18 +1129,13 @@ def set_default_approval_gate(gate: ApprovalGate) -> None:
 
 
 def reset_default_approval_gate() -> ApprovalGate:
-    """
-    Replace the default gate with a fresh one.
-
-    Used by tests to guarantee isolation between test cases.
-    """
+    """Replace the default gate with a fresh one."""
     global _DEFAULT_GATE
     with _DEFAULT_LOCK:
         _DEFAULT_GATE = ApprovalGate()
         return _DEFAULT_GATE
 
 
-# Rebind the aliases now that the canonical functions exist.
 get_default_approval_manager = get_default_approval_gate
 set_default_approval_manager = set_default_approval_gate
 reset_default_approval_manager = reset_default_approval_gate

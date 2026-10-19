@@ -592,6 +592,11 @@ class FileOperationJournal(OperationJournal):
         """Return the journal root directory."""
         return self._root
 
+    @property
+    def path(self) -> Path:
+        """Return the operations directory path for caller compatibility."""
+        return self._operations_dir()
+
     # --- Paths ----------------------------------------------------------
 
     def _operations_dir(self) -> Path:
@@ -662,12 +667,16 @@ class FileOperationJournal(OperationJournal):
             return None
         try:
             data = json.loads(text)
-        except json.JSONDecodeError:
-            logger.warning("Corrupt record file: %s", path.name)
+        except (json.JSONDecodeError, Exception) as exc:
+            logger.warning("Corrupt record file: %s (%s)", path.name, type(exc).__name__)
             return None
         if not isinstance(data, dict):
             return None
-        return self._record_from_dict(data)
+        try:
+            return self._record_from_dict(data)
+        except Exception as exc:
+            logger.warning("Failed to deserialize record from %s: %s", path.name, type(exc).__name__)
+            return None
 
     async def list_records(
         self, *, limit: int = MAX_RECORDS_IN_MEMORY
@@ -687,14 +696,18 @@ class FileOperationJournal(OperationJournal):
                 continue
             try:
                 data = json.loads(text)
-            except json.JSONDecodeError:
-                logger.warning("Corrupt record file: %s", path.name)
+            except (json.JSONDecodeError, Exception) as exc:
+                logger.warning("Corrupt record file: %s (%s)", path.name, type(exc).__name__)
                 continue
             if not isinstance(data, dict):
                 continue
-            record = self._record_from_dict(data)
-            if record is not None:
-                records.append(record)
+            try:
+                record = self._record_from_dict(data)
+                if record is not None:
+                    records.append(record)
+            except Exception as exc:
+                logger.warning("Skipping unparseable record file %s: %s", path.name, type(exc).__name__)
+                continue
         records.sort(
             key=lambda r: (r.created_at, r.operation_id),
             reverse=True,
@@ -748,16 +761,22 @@ class FileOperationJournal(OperationJournal):
                 continue
             try:
                 data = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, Exception):
                 logger.warning(
                     "Skipping corrupt event line in %s", path.name
                 )
                 continue
             if not isinstance(data, dict):
                 continue
-            event = self._event_from_dict(data)
-            if event is not None:
-                events.append(event)
+            try:
+                event = self._event_from_dict(data)
+                if event is not None:
+                    events.append(event)
+            except Exception as exc:
+                logger.warning(
+                    "Skipping unparseable event in %s: %s", path.name, type(exc).__name__
+                )
+                continue
         # Ensure deterministic order even if the file was written out
         # of sequence for some reason.
         events.sort(key=lambda e: e.sequence)
@@ -829,6 +848,11 @@ class FileOperationJournal(OperationJournal):
         state.
         """
         def _write() -> None:
+            if not path.parent.exists():
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    pass
             path_lock = self._path_lock(path)
             with path_lock:
                 fd, tmp_name = tempfile.mkstemp(
@@ -932,7 +956,7 @@ class FileOperationJournal(OperationJournal):
 
         def _read() -> Optional[str]:
             try:
-                return path.read_text(encoding="utf-8")
+                return path.read_text(encoding="utf-8", errors="replace")
             except FileNotFoundError:
                 return None
             except OSError as exc:
@@ -1133,6 +1157,12 @@ def _open_append_with_retry(
     is executed exactly once so that a retry can never duplicate
     the appended payload.
     """
+    if not path.parent.exists():
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
     last_exc: Optional[BaseException] = None
     for attempt in range(max_attempts):
         try:
@@ -1185,17 +1215,29 @@ _DEFAULT_LOCK = threading.RLock()
 
 def get_default_operation_journal() -> OperationJournal:
     """
-    Return the process-wide default journal, creating it on first
-    use.
+    Return the process-wide default journal, creating it on first use.
 
-    The default is `InMemoryOperationJournal`. Applications that need
-    persistence SHOULD call `set_default_operation_journal` with a
-    `FileOperationJournal` at startup.
+    In production and development environments, it creates a persistent
+    `FileOperationJournal` under the backend data directory so operations
+    and events survive restarts. In test environments (PELDRUN_ENV=test),
+    it falls back to `InMemoryOperationJournal`.
     """
     global _DEFAULT_JOURNAL
     with _DEFAULT_LOCK:
         if _DEFAULT_JOURNAL is None:
-            _DEFAULT_JOURNAL = InMemoryOperationJournal()
+            env = os.environ.get("PELDRUN_ENV", "").strip().lower()
+            if env == "test":
+                _DEFAULT_JOURNAL = InMemoryOperationJournal()
+            else:
+                journal_dir = (
+                    Path(os.environ["PELDRUN_JOURNAL_DIR"]).resolve()
+                    if "PELDRUN_JOURNAL_DIR" in os.environ
+                    else Path(__file__).resolve().parent.parent.parent.parent
+                    / "data"
+                    / "source_control"
+                    / "journal"
+                )
+                _DEFAULT_JOURNAL = FileOperationJournal(root=journal_dir)
         return _DEFAULT_JOURNAL
 
 

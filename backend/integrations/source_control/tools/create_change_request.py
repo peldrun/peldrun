@@ -289,27 +289,20 @@ class CreateChangeRequestTool(SourceControlTool):
 
         # --- Validate operation kind ----------------------------------
         #
-        # A `push_branch` operation has different `target_branch`
-        # semantics (the remote branch the push writes to). Reusing
-        # a push operation here would either fail ticket validation
-        # or open a PR from a branch to itself. Rejecting the wrong
-        # kind early produces an actionable error instead of a
-        # downstream mismatch.
-        if record.kind != "create_change_request":
+        # Compatible lifecycle operations (create_change_request, push_branch,
+        # source_control, push_and_pr) can proceed to change request creation.
+        allowed_kinds = {
+            "create_change_request",
+            "push_branch",
+            "source_control",
+            "push_and_pr",
+        }
+        if record.kind not in allowed_kinds:
             return self.failure_result(
                 error_code="VALIDATION_ERROR",
                 error_message=(
-                    f"This tool requires an operation of kind "
-                    f"'create_change_request', but operation "
-                    f"'{operation_id}' is of kind '{record.kind}'. "
-                    "A push operation cannot be reused to open a PR. "
-                    "Call request_approval again with "
-                    "workspace_id, operation='create_change_request', "
-                    "source_branch (the branch that was pushed, "
-                    "e.g. 'feature/x'), and target_branch (the PR "
-                    "base, e.g. 'main'). Then approve the new "
-                    "ticket, then call this tool with the NEW "
-                    "operation_id."
+                    f"Operation '{operation_id}' has unsupported kind '{record.kind}' "
+                    "for creating a change request."
                 ),
                 metadata={
                     "operation_id": operation_id,
@@ -319,15 +312,12 @@ class CreateChangeRequestTool(SourceControlTool):
 
         # --- Validate operation state ----------------------------------
         #
-        # The canonical flow is:
-        #   CREATED -> ... -> REVIEW_REQUIRED (request_approval)
-        #                    -> APPROVED       (approve_operation)
-        #                    -> CHANGE_REQUEST_CREATED (this tool)
-        #
-        # Only APPROVED is accepted. REVIEW_REQUIRED means the user
-        # has not yet acted on the ticket, and PUSHED belongs to
-        # push_branch operations (rejected by the kind check above).
-        if record.status != OperationStatus.APPROVED:
+        # Both APPROVED (pre-push or standalone PR) and PUSHED (post-push in the
+        # coordinated agent lifecycle) are valid states for opening a change request.
+        if record.status not in (
+            OperationStatus.APPROVED,
+            OperationStatus.PUSHED,
+        ):
             if record.status == OperationStatus.REVIEW_REQUIRED:
                 return self.failure_result(
                     error_code="CONFLICT",
@@ -344,8 +334,7 @@ class CreateChangeRequestTool(SourceControlTool):
                 error_message=(
                     f"Operation '{operation_id}' is in status "
                     f"'{record.status.value}'. A change request "
-                    "requires the operation to be 'approved' "
-                    "(after the user grants the ticket)."
+                    "requires the operation to be 'approved' or 'pushed'."
                 ),
                 metadata={
                     "operation_id": operation_id,
@@ -452,12 +441,15 @@ class CreateChangeRequestTool(SourceControlTool):
                 ),
                 metadata={"operation_id": operation_id},
             )
-        if current_record.status != OperationStatus.APPROVED:
+        if current_record.status not in (
+            OperationStatus.APPROVED,
+            OperationStatus.PUSHED,
+        ):
             return self.failure_result(
                 error_code="CONFLICT",
                 error_message=(
                     f"Operation '{operation_id}' is no longer in "
-                    f"'approved' status (current: "
+                    f"an executable status (current: "
                     f"'{current_record.status.value}'). The change "
                     "request cannot be created."
                 ),
@@ -473,10 +465,11 @@ class CreateChangeRequestTool(SourceControlTool):
                 approval_id,
                 expected_operation_id=operation_id,
                 expected_repository_id=record.repository_id,
-                expected_operation="create_change_request",
+                expected_operation=record.kind,
                 expected_base_sha=record.base_sha,
                 expected_diff_sha256=record.diff_sha256 or "",
                 expected_target_branch=target_branch,
+                action_scope="create_change_request",
             )
         except Exception as exc:  # noqa: BLE001
             normalized = to_source_control_error(exc)
@@ -495,10 +488,11 @@ class CreateChangeRequestTool(SourceControlTool):
                 approval_id,
                 expected_operation_id=operation_id,
                 expected_repository_id=record.repository_id,
-                expected_operation="create_change_request",
+                expected_operation=record.kind,
                 expected_base_sha=record.base_sha,
                 expected_diff_sha256=record.diff_sha256 or "",
                 expected_target_branch=target_branch,
+                action_scope="create_change_request",
             )
         except Exception as exc:  # noqa: BLE001
             normalized = to_source_control_error(exc)

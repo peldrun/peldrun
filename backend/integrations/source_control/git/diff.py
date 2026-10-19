@@ -169,12 +169,25 @@ class GitDiffEngine(DiffPort):
             workspace_id=workspace_id, workspace_path=workspace_path
         )
 
+        # Include untracked files in the diff by recording intent-to-add.
+        await self._git.run(
+            ["add", "--intent-to-add", "."],
+            cwd=target,
+            check_returncode=False,
+            timeout_seconds=30,
+        )
+
         head_sha = await self._read_head_sha(target)
         resolved_base = base_sha or head_sha
 
         # If base equals head, diff the working tree against HEAD.
-        # The caller passes `base_sha=None` for that case.
-        diff_base = base_sha if base_sha else "HEAD"
+        # If HEAD is unborn, diff against the Git empty-tree SHA.
+        if base_sha:
+            diff_base = base_sha
+        elif head_sha:
+            diff_base = "HEAD"
+        else:
+            diff_base = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
         numstat = await self._run_numstat(
             target=target, base=diff_base, max_files=max_files
@@ -550,7 +563,8 @@ class GitDiffEngine(DiffPort):
         if result.returncode != 0:
             return None
 
-        text = result.stdout
+        # Normalize line endings to ensure consistent diff hashes across platforms.
+        text = result.stdout.replace("\r\n", "\n")
         if len(text.encode("utf-8", errors="replace")) <= max_bytes:
             return text
 
