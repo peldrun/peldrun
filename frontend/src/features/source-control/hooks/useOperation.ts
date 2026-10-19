@@ -50,9 +50,43 @@ export function useOperation(operationId: string | null) {
           );
           setActiveDiff(diff);
         } catch (diffErr) {
-          // It's possible the workspace is not ready yet or diff fails.
-          console.warn("Could not fetch diff for operation:", diffErr);
-          setActiveDiff(null);
+          // Distinguish two failure modes:
+          //
+          //   - 404 NOT_FOUND: the workspace no longer exists on
+          //     disk. This is the common case after the chat that
+          //     owned the operation was deleted. The operation
+          //     record survives in the journal until the next
+          //     `POST /operations/cleanup` call, so the card still
+          //     renders — but there is no diff to review and no
+          //     path to approve. Surface a clear, non-retryable
+          //     error so the UI can disable the Approve/Reject
+          //     buttons and show an actionable message.
+          //
+          //   - Any other error: transient failure (network blip,
+          //     workspace not yet fully materialized, etc.). Keep
+          //     the existing warn-and-continue behavior so a
+          //     momentary hiccup does not permanently lock the
+          //     review panel.
+          if (
+            diffErr instanceof SourceControlApiError &&
+            diffErr.status === 404
+          ) {
+            setError({
+              code: "WORKSPACE_GONE",
+              message:
+                "The workspace for this operation no longer exists on disk. " +
+                "The chat that created it was deleted, so the operation " +
+                "cannot be reviewed or approved. Start a new task to continue.",
+              isRetryable: false,
+            });
+            setActiveDiff(null);
+          } else {
+            console.warn(
+              "Could not fetch diff for operation:",
+              diffErr
+            );
+            setActiveDiff(null);
+          }
         }
       }
     } catch (err) {

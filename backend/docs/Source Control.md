@@ -1486,3 +1486,23 @@ Tests                            16 files   (260 tests)
 ---
 
 **This tree represents the current state of the project after all fixes. Any new addition should follow the same layered pattern.**
+
+
+# Source Control — Troubleshooting
+
+## Workspace 404 after restart
+**Symptom:** `GET /workspaces/{id}/diff` → 404 after restart, but files exist on disk.
+**Root cause:** In-memory registry is lost on restart; workspace exists in `storage/chats/<chat>/files/` but wasn't discovered.
+**Fix:** Persistent registry + `.peldrun/workspace.json` markers.
+**Verify:** `Test-Path "storage/chats/<chat>/files/.peldrun/workspace.json"`.
+
+## Push returns 500 but branch exists on GitHub
+**Symptom:** `POST /push` → 500, but the branch was created on the remote.
+**Root cause:** `git push --porcelain` parser expected 4 fields (actually 3).
+**Fix:** Corrected regex in `push.py`. Verify with:
+`python -c "from integrations.source_control.git.push import _PUSH_PORCELAIN_LINE; print(_PUSH_PORCELAIN_LINE.pattern)"`
+
+## Windows PowerShell 5.1 JSON BOM
+**Symptom:** `Failed to load workspace registry: JSONDecodeError`.
+**Root cause:** `Set-Content -Encoding UTF8` on PS 5.1 adds a BOM.
+**Fix:** Code reads with `utf-8-sig`. Never write JSON via PS 5.1.

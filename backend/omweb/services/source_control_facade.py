@@ -1806,6 +1806,246 @@ class SourceControlFacade:
         )
         return result
 
+    async def cleanup_orphaned_operations(
+        self, dry_run: bool = False
+    ) -> dict:
+        """
+        Prune journal operations whose bound workspace is gone.
+
+        When a chat is deleted, its `files/` directory (which hosted
+        the workspace's Git repository) is removed, but the durable
+        operation journal — stored under
+        `backend/data/source_control/journal/` — is intentionally
+        untouched by the chat-storage layer. Those operations then
+        surface in the UI as ghosts:
+
+            - `GET /operations/{id}` returns 200 (the record exists).
+            - `GET /workspaces/{id}/diff` returns 404 (the workspace
+              no longer exists).
+
+        The user sees a "Waiting for your review" card whose diff
+        can never load and whose Approve button can never succeed.
+        This method removes those dead operations from the journal
+        so the UI can return to a clean state.
+
+        Only operations whose `workspace_id` is set AND whose
+        workspace cannot be resolved by the workspace manager are
+        pruned. Operations without a workspace (e.g. a pure
+        `list_operations` call that never created one) are left
+        alone because they hold no orphan state.
+
+        Args:
+            dry_run: When True, report what WOULD be removed without
+                mutating the journal. Use this from UI previews and
+                before destructive sweeps.
+
+        Returns:
+            A dict with the following shape::
+
+                {
+                    "removed_count": int,
+                    "removed_ids": List[str],
+                    "removed": List[{
+                        "operation_id": str,
+                        "workspace_id": str,
+                        "status": str,
+                    }],
+                    "dry_run": bool,
+                }
+        """
+        # Deferred imports so that a facade module import never
+        # forces the journal subsystem to be initialized on a code
+        # path that does not use source control.
+        try:
+            from integrations.source_control.operations.journal import (
+                FileOperationJournal,
+            )
+        except ImportError:  # repo layout: backend.integrations.*
+            from backend.integrations.source_control.operations.journal import (  # type: ignore[no-redef]
+                FileOperationJournal,
+            )
+
+        # Discover the operation IDs currently persisted. The
+        # operation service exposes `list_operations()` in the
+        # current implementation; fall back to the underlying
+        # journal's internal records map when that method is not
+        # available (older builds, test doubles).
+        operation_ids: List[str] = []
+        try:
+            listed = await self.operation_service.list_operations()
+            for record in listed or ():
+                op_id = getattr(record, "operation_id", None)
+                if isinstance(op_id, str) and op_id:
+                    operation_ids.append(op_id)
+        except AttributeError:
+            journal = getattr(
+                self.operation_service, "_journal", None
+            )
+            if isinstance(journal, FileOperationJournal):
+                operation_ids = list(
+                    getattr(journal, "_records", {}).keys()
+                )
+
+        removed: List[dict] = []
+        removed_ids: List[str] = []
+
+        for op_id in operation_ids:
+            try:
+                record = await self.operation_service.try_get_operation(
+                    op_id
+                )
+            except Exception:  # noqa: BLE001
+                # A read failure on one entry must not abort the
+                # sweep. Treat it as "unknown" and skip.
+                continue
+            if record is None:
+                continue
+
+            ws_id = getattr(record, "workspace_id", None)
+            if not ws_id:
+                # No workspace bound; nothing to orphan.
+                continue
+
+            # Does the workspace still resolve?
+            ws_ref = self.workspace_manager.get_workspace(ws_id)
+            if ws_ref is not None:
+                continue
+
+            status_value = (
+                record.status.value
+                if hasattr(record.status, "value")
+                else str(record.status)
+            )
+            removed.append(
+                {
+                    "operation_id": op_id,
+                    "workspace_id": ws_id,
+                    "status": status_value,
+                }
+            )
+            removed_ids.append(op_id)
+
+        # Apply the deletion unless this is a dry run.
+        failures: List[dict] = []
+        deleted_ids: List[str] = []
+        if not dry_run and removed_ids:
+            for op_id in removed_ids:
+                try:
+                    await self.operation_service.delete_operation(op_id)
+                    deleted_ids.append(op_id)
+                except AttributeError:
+                    # Fallback: if the operation service does not
+                    # expose `delete_operation`, try to remove the
+                    # journal record directly. This path exists for
+                    # older builds and test doubles.
+                    journal = getattr(
+                        self.operation_service, "_journal", None
+                    )
+                    if isinstance(journal, FileOperationJournal):
+                        try:
+                            journal.delete(op_id)
+                            deleted_ids.append(op_id)
+                        except Exception as exc:  # noqa: BLE001
+                            failures.append(
+                                {
+                                    "operation_id": op_id,
+                                    "error": type(exc).__name__,
+                                }
+                            )
+                    else:
+                        failures.append(
+                            {
+                                "operation_id": op_id,
+                                "error": "journal_unavailable",
+                            }
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(
+                        {
+                            "operation_id": op_id,
+                            "error": type(exc).__name__,
+                        }
+                    )
+
+            if failures:
+                logger.warning(
+                    "cleanup_orphaned_operations: %d operation(s) "
+                    "could not be deleted: %s",
+                    len(failures),
+                    failures,
+                )
+
+            # Narrow the reported removal set to entries that were
+            # actually removed so the caller receives an accurate
+            # count. The dry_run branch above still reports the full
+            # candidate list.
+            removed = [
+                item for item in removed
+                if item["operation_id"] in set(deleted_ids)
+            ]
+            removed_ids = deleted_ids
+
+        # Build aggregation breakdowns for the audit log. These give
+        # operators a quick visual summary of what was pruned without
+        # having to parse the full removal list. Both breakdowns are
+        # cheap to compute (O(n) over the already-tiny removed list)
+        # and dramatically improve the forensic value of the audit
+        # trail: a reviewer can see "10 edits, 3 review_required" at
+        # a glance, and can spot a single workspace that produced an
+        # unusual number of orphans.
+        status_breakdown: Dict[str, int] = {}
+        workspace_breakdown: Dict[str, int] = {}
+        for item in removed:
+            status_key = item.get("status", "unknown")
+            status_breakdown[status_key] = (
+                status_breakdown.get(status_key, 0) + 1
+            )
+            ws_key = item.get("workspace_id", "unknown")
+            workspace_breakdown[ws_key] = (
+                workspace_breakdown.get(ws_key, 0) + 1
+            )
+
+        audit_payload: Dict[str, Any] = {
+            "removed_count": len(removed_ids),
+            "removed_ids": removed_ids,
+            "status_breakdown": status_breakdown,
+            "workspace_breakdown": workspace_breakdown,
+            "dry_run": dry_run,
+        }
+        # Include the full failure details only for actual
+        # (non-dry-run) sweeps: dry runs cannot fail because they do
+        # not mutate. Recording an empty `failures` list would
+        # pollute the audit trail with a field that carries no
+        # information.
+        if failures:
+            audit_payload["failures"] = failures
+        # Attach the full removal list for non-dry-run sweeps so the
+        # audit log records exactly which operations were pruned and
+        # from which workspaces. Skip it for dry runs to keep the
+        # payload compact and avoid recording operations that were
+        # only previewed.
+        if not dry_run:
+            audit_payload["removed"] = removed
+
+        self._audit(
+            AuditEventType.OTHER,
+            action="cleanup_orphaned_operations",
+            message=(
+                f"Pruned {len(removed_ids)} orphaned operation(s)"
+                + (" (dry run)." if dry_run else ".")
+            ),
+            payload=audit_payload,
+            actor="user",
+        )
+
+        return {
+            "removed_count": len(removed_ids),
+            "removed_ids": removed_ids,
+            "removed": removed,
+            "failures": failures,
+            "dry_run": dry_run,
+        }
+
     async def inspect_workspace_diff(
         self, workspace_id: str, base_ref: Optional[str] = None
     ) -> DiffSummaryResponse:

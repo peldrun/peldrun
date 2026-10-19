@@ -4,18 +4,42 @@ import React, { useState } from "react";
 
 interface ApprovalDialogProps {
   operationType: string;
+  targetBranch?: string;
   isActionLoading: boolean;
   isStale: boolean;
   onApprove: () => void;
   onReject: (reason: string) => void;
 }
 
+//: The set of branch names that the backend's policy engine treats
+//: as protected. This list mirrors `is_protected_branch()` in the
+//: source-control policy engine. Keeping it duplicated here lets
+//: the UI disable the Approve button BEFORE the user clicks it,
+//: which avoids the round-trip that ends in a 403 and a burned
+//: approval ticket.
+const PROTECTED_BRANCHES = new Set([
+  "main",
+  "master",
+  "develop",
+  "release",
+  "prod",
+  "production",
+]);
+
 /**
  * The final action block for approving or rejecting a remote write.
  * Enforces explicit naming of side effects and requires a reason for rejection.
+ *
+ * When the target branch is a known protected branch, the Approve
+ * button is disabled and a clear instruction replaces it: cancel the
+ * operation and start a new task that pushes to a feature branch.
+ * The backend enforces the same rule with `PermissionDeniedError`
+ * (HTTP 403), so this UI-level check is purely a UX improvement —
+ * it does not replace the server-side guard.
  */
 export function ApprovalDialog({
   operationType,
+  targetBranch,
   isActionLoading,
   isStale,
   onApprove,
@@ -25,8 +49,16 @@ export function ApprovalDialog({
   const [rejectReason, setRejectReason] = useState("");
   const [rejectError, setRejectError] = useState<string | null>(null);
 
-  // Determine the exact label based on the operation type
+  const isProtectedTarget = Boolean(
+    targetBranch && PROTECTED_BRANCHES.has(targetBranch.toLowerCase())
+  );
+
+  // Determine the exact label based on the operation type and
+  // whether the target is protected.
   const getApproveLabel = () => {
+    if (isProtectedTarget) {
+      return `Cannot Push to '${targetBranch}' (Protected)`;
+    }
     if (operationType === "create_change_request") {
       return "Approve & Create Pull Request";
     }
@@ -121,12 +153,21 @@ export function ApprovalDialog({
           {showRejectInput ? "Confirm Rejection" : "Reject"}
         </button>
 
-        {/* Approve Button */}
+        {/* Approve Button (disabled when target is protected) */}
         <button
           type="button"
           onClick={onApprove}
-          disabled={isActionLoading || isStale}
-          className="w-full sm:w-auto inline-flex justify-center items-center rounded-md border border-transparent bg-blue-600 px-6 py-2 text-sm font-semibold text-white shadow-sm hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed"
+          disabled={isActionLoading || isStale || isProtectedTarget}
+          title={
+            isProtectedTarget
+              ? `Branch '${targetBranch}' is protected. Cancel this operation and start a new task targeting a feature branch (e.g., 'feature/my-change').`
+              : undefined
+          }
+          className={`w-full sm:w-auto inline-flex justify-center items-center rounded-md border border-transparent px-6 py-2 text-sm font-semibold shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 disabled:cursor-not-allowed ${
+            isProtectedTarget
+              ? "bg-gray-400 text-white cursor-not-allowed focus:ring-gray-400"
+              : "bg-blue-600 text-white hover:bg-blue-700 focus:ring-blue-500"
+          } ${isActionLoading || isStale ? "opacity-50" : ""}`}
         >
           {isActionLoading && !showRejectInput ? (
             <>
@@ -141,6 +182,28 @@ export function ApprovalDialog({
           )}
         </button>
       </div>
+
+      {/* Protected-branch explanatory text (only when relevant) */}
+      {isProtectedTarget && (
+        <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
+          <p className="font-semibold">This operation cannot be approved.</p>
+          <p className="mt-1">
+            PELDRUN&apos;s policy engine refuses every push to a protected
+            branch. To push these changes, cancel this operation and
+            start a new task that targets a feature branch — for
+            example{" "}
+            <code className="rounded bg-amber-100 px-1 py-0.5 font-mono">
+              feature/my-change
+            </code>
+            . The feature branch can then be opened as a Pull Request
+            against{" "}
+            <code className="rounded bg-amber-100 px-1 py-0.5 font-mono">
+              {targetBranch}
+            </code>
+            .
+          </p>
+        </div>
+      )}
     </div>
   );
 }

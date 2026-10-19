@@ -122,6 +122,7 @@ export function SourceControlPanel() {
         <div className="border-t border-border bg-card p-4 shrink-0">
           <ApprovalDialog
             operationType={operation.operation_type}
+            targetBranch={operation.target_branch}
             isActionLoading={isActionLoading}
             isStale={isStale}
             onApprove={approveAndPush}

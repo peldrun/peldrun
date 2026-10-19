@@ -679,6 +679,45 @@ async def create_operation(
         handle_source_control_error(exc)
 
 
+@router.post("/operations/cleanup")
+async def cleanup_operations(
+    dry_run: bool = Query(
+        default=False,
+        description=(
+            "When true, report what WOULD be removed without "
+            "mutating the operation journal."
+        ),
+    ),
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> dict:
+    """
+    Prune journal operations whose bound workspace no longer exists.
+
+    A workspace becomes orphaned when the chat or project that
+    owned it is deleted: the physical directory under
+    `storage/chats/<chat>/files/` disappears, but the durable
+    operation journal keeps the record. Those operations surface
+    in the UI as ghost review cards whose diff can never load and
+    whose Approve button can never succeed.
+
+    This endpoint removes those stale entries. Companion of
+    `POST /workspaces/cleanup`, which prunes the workspace
+    registry. Neither endpoint touches any surviving workspace
+    directory or any still-valid operation.
+
+    NOTE: this route MUST be declared before the
+    `GET /operations/{operation_id}` route. FastAPI matches routes
+    in declaration order, and a later literal path would be shadowed
+    by the earlier parameterized route.
+    """
+    try:
+        return await facade.cleanup_orphaned_operations(
+            dry_run=dry_run
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
 @router.get("/operations/{operation_id}", response_model=OperationResponse)
 async def get_operation(
     operation_id: str,

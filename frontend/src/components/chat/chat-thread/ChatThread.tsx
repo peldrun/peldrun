@@ -38,8 +38,15 @@ import { extractOperationFromSteps, filterApprovalSteps } from "./utils";
  * empty placeholders. The returned record preserves insertion order.
  */
 function groupStepEvents(evts: StepEvent[]): Record<number, StepEvent[]> {
+  const seen = new Set<string>();
   return evts.reduce((acc, s) => {
-    const isVisible = (s.content && s.content.trim() !== "") || Boolean(s.toolName);
+    const contentKey =
+      typeof s.content === "string" ? s.content.trim() : "";
+    const dedupKey = `${s.step}|${s.type}|${s.toolName || ""}|${contentKey}`;
+    if (seen.has(dedupKey)) return acc;
+    seen.add(dedupKey);
+
+    const isVisible = contentKey !== "" || Boolean(s.toolName);
     if (!isVisible) return acc;
     if (!acc[s.step]) acc[s.step] = [];
     acc[s.step].push(s);
@@ -130,9 +137,32 @@ export function ChatThread({
   const activeApprovalList = Object.values(pendingApprovals || {});
 
   const activeOperation = extractOperationFromSteps(activeStepsList);
+
+  //: The final result is surfaced separately as `<ChatDeliverable>`.
+  //: Some backends also emit the same content as an observation
+  //: event in the last step, which causes the final message to
+  //: render twice: once inside the timeline, once inside the
+  //: deliverable. Filter that observation out of the timeline.
+  const finalResultTrimmed =
+    typeof finalResult === "string" ? finalResult.trim() : "";
+
   const filteredGroupedSteps = Object.fromEntries(
     Object.entries(activeGroupedSteps || {})
-      .map(([stepNum, steps]) => [stepNum, filterApprovalSteps(steps)])
+      .map(([stepNum, steps]) => {
+        const cleaned = (steps as StepEvent[]).filter((s) => {
+          if (!finalResultTrimmed) return true;
+          if (s.type !== "observation") return true;
+          const content =
+            typeof s.content === "string" ? s.content.trim() : "";
+          if (!content) return true;
+          return !(
+            content === finalResultTrimmed ||
+            content.startsWith(finalResultTrimmed) ||
+            finalResultTrimmed.startsWith(content)
+          );
+        });
+        return [stepNum, filterApprovalSteps(cleaned)];
+      })
       .filter(([_, steps]) => (steps as StepEvent[]).length > 0)
   );
 

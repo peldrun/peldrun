@@ -88,11 +88,38 @@ export function formatFileSize(bytes: number): string {
  * Groups visible step events by their step number, dropping any event that
  * carries neither content nor a tool name (i.e. invisible noise).
  */
+/**
+ * Groups visible step events by their step number, dropping any event
+ * that carries neither content nor a tool name (i.e. invisible noise).
+ *
+ * De-duplication is applied on the composite key
+ * `(step, type, toolName, content)`. This is the layer that feeds
+ * `ChatThread` → `ChatTimeline`, so a duplicate arriving here would
+ * be rendered twice in the UI. Duplicates are produced by:
+ *
+ *   - SSE reconnects that replay events the client already consumed
+ *     (the `after_sequence` optimization only helps on reconnect, not
+ *     on the initial connect when the server replays a buffer);
+ *   - backend retries that emit the same tool call twice (identified
+ *     only by `attempt`, which the UI does not currently surface);
+ *   - concurrent writes to `steps` that race on the same tick.
+ *
+ * Keeping the first occurrence preserves chronological order and the
+ * earliest timestamp (the one the user should see).
+ */
 export function groupStepEvents(evts: StepEvent[]): Record<number, StepEvent[]> {
+  const seen = new Set<string>();
   return evts.reduce((acc, s) => {
-    const isVisible =
-      (s.content && s.content.trim() !== "") || Boolean(s.toolName);
+    const contentKey =
+      typeof s.content === "string" ? s.content.trim() : "";
+
+    const dedupKey = `${s.step}|${s.type}|${s.toolName || ""}|${contentKey}`;
+    if (seen.has(dedupKey)) return acc;
+    seen.add(dedupKey);
+
+    const isVisible = contentKey !== "" || Boolean(s.toolName);
     if (!isVisible) return acc;
+
     if (!acc[s.step]) acc[s.step] = [];
     acc[s.step].push(s);
     return acc;

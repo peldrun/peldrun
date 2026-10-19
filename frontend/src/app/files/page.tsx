@@ -66,7 +66,7 @@ interface ExplorerItem {
 export default function StorageArtifactsHubPage() {
   const [activeMainTab, setActiveMainTab] = useState<"artifacts" | "storage">("artifacts");
   const [artifactCategory, setArtifactCategory] = useState<"all" | "images" | "files" | "links">("all");
-  
+
   // Artifacts state
   const [artifacts, setArtifacts] = useState<ArtifactItem[]>([]);
   const [loadingArtifacts, setLoadingArtifacts] = useState(false);
@@ -223,27 +223,48 @@ export default function StorageArtifactsHubPage() {
     }
   };
 
+  //: Hide dot-prefixed paths (`.git/…`, `.peldrun/…`, `.env`,
+  //: `.gitignore`, …) from the artifacts showcase. They are workspace
+  //: internals, not user-facing artifacts, and they bury the real
+  //: deliverables under dozens of Git plumbing files. The workspace
+  //: panel (Files tab) still shows them for debugging.
+  const isHiddenPath = (rawPath: string): boolean => {
+    if (!rawPath) return false;
+    return rawPath
+      .split(/[/\\]/)
+      .some((segment) => segment.startsWith("."));
+  };
+
+  const visibleArtifacts = useMemo(
+    () => artifacts.filter((a) => !isHiddenPath(a.path || a.name || "")),
+    [artifacts]
+  );
+
   const filteredArtifacts = useMemo(() => {
     if (artifactCategory === "images") {
-      return artifacts.filter((a) => a.type === "image");
+      return visibleArtifacts.filter((a) => a.type === "image");
     }
     if (artifactCategory === "files") {
-      return artifacts.filter((a) => ["code", "markdown", "data", "file"].includes(a.type));
+      return visibleArtifacts.filter((a) =>
+        ["code", "markdown", "data", "file"].includes(a.type)
+      );
     }
     if (artifactCategory === "links") {
-      return artifacts.filter((a) => a.type === "html");
+      return visibleArtifacts.filter((a) => a.type === "html");
     }
-    return artifacts;
-  }, [artifacts, artifactCategory]);
+    return visibleArtifacts;
+  }, [visibleArtifacts, artifactCategory]);
 
   const counts = useMemo(() => {
     return {
-      all: artifacts.length,
-      images: artifacts.filter((a) => a.type === "image").length,
-      files: artifacts.filter((a) => ["code", "markdown", "data", "file"].includes(a.type)).length,
-      links: artifacts.filter((a) => a.type === "html").length,
+      all: visibleArtifacts.length,
+      images: visibleArtifacts.filter((a) => a.type === "image").length,
+      files: visibleArtifacts.filter((a) =>
+        ["code", "markdown", "data", "file"].includes(a.type)
+      ).length,
+      links: visibleArtifacts.filter((a) => a.type === "html").length,
     };
-  }, [artifacts]);
+  }, [visibleArtifacts]);
 
   const getLanguageMeta = (filename: string) => {
     const ext = filename.split(".").pop()?.toLowerCase();
@@ -425,7 +446,7 @@ export default function StorageArtifactsHubPage() {
             <Sparkles size={14} />
             <span>Artifacts Showcase</span>
             <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-muted font-mono">
-              {artifacts.length}
+              {counts.all}
             </span>
           </button>
 

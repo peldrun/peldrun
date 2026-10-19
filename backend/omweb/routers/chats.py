@@ -8,15 +8,22 @@ Enhanced with resilient session log discovery and synthesized replay.
 """
 
 import os
+import logging
 import mimetypes
 from pathlib import Path
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 
 from omweb.project_manager import project_manager
 from omweb.chat_storage_engine import chat_storage_engine
+from omweb.services.source_control_facade import (
+    SourceControlFacade,
+    get_source_control_facade,
+)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -205,7 +212,7 @@ async def get_chat_log(chat_id: str):
         chat = project_manager.get_chat(chat_id)
         project_id = chat.get("project_id", "default_project") if chat else "default_project"
         chat_dir = project_manager.get_chat_dir(chat_id, project_id)
-        
+
         candidate_paths = [
             chat_dir / "chat.log",
             chat_storage_engine.chats_dir / chat_id / "chat.log",
@@ -295,6 +302,63 @@ async def get_chat_detail(chat_id: str):
 
 
 @router.delete("/{chat_id}")
-async def delete_single_chat(chat_id: str):
+async def delete_single_chat(
+    chat_id: str,
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+):
+    """
+    Delete a chat session and its on-disk artifacts.
+
+    After the physical chat directory is removed, this endpoint
+    automatically prunes any source-control state that referred to
+    the deleted workspace:
+
+        1. `cleanup_workspaces()` removes the orphaned entry from
+           the persistent workspace registry.
+        2. `cleanup_orphaned_operations()` removes any operation
+           from the journal whose workspace no longer exists.
+
+    This prevents "ghost" review cards from lingering in the UI
+    after the user deletes the chat that produced them. Both
+    cleanup calls are best-effort: a failure is logged and ignored
+    so that the primary deletion still reports success.
+    """
     res = chat_storage_engine.deep_delete_chat(chat_id)
+
+    # Auto-cleanup source-control state. Both calls are
+    # best-effort; a failure here must not prevent the user from
+    # seeing the "chat deleted" confirmation.
+    try:
+        workspace_report = await facade.cleanup_workspaces()
+        logger.info(
+            "Auto-cleanup after chat delete '%s': workspaces "
+            "removed=%s, remaining=%s",
+            chat_id,
+            workspace_report.get("removed_count"),
+            workspace_report.get("remaining_count"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Auto-cleanup of workspaces failed after chat delete "
+            "'%s': %s",
+            chat_id,
+            type(exc).__name__,
+        )
+
+    try:
+        operation_report = await facade.cleanup_orphaned_operations()
+        logger.info(
+            "Auto-cleanup after chat delete '%s': operations "
+            "removed=%s",
+            chat_id,
+            operation_report.get("removed_count"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Auto-cleanup of operations failed after chat delete "
+            "'%s': %s",
+            chat_id,
+            type(exc).__name__,
+        )
+
     return {"status": "ok", "report": res}

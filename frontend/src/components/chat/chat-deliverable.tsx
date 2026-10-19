@@ -49,7 +49,27 @@ export function ChatDeliverable({
   onRegenerate,
 }: ChatDeliverableProps) {
   const copyId = typeof turnIndex === "number" ? `turn-res-${turnIndex}` : "final-result";
-  const hasFiles = producedFiles && producedFiles.length > 0;
+
+  //: Hide dot-prefixed paths (`.git/…`, `.peldrun/…`, `.env`,
+  //: `.gitignore`, …) from the user-facing deliverables list.
+  //: These paths are implementation details of the workspace — they
+  //: are not what the agent "produced" for the user, and they pollute
+  //: the deliverable card with dozens of internal Git files (hooks,
+  //: objects, refs, …) that bury the actual deliverables.
+  //:
+  //: The workspace panel (Files tab) still shows them in full, so the
+  //: user can inspect the Git internals when needed.
+  //:
+  //: The check splits on both POSIX and Windows separators so that
+  //: paths from either side of the stack are treated uniformly.
+  const visibleProducedFiles = (producedFiles || []).filter((f) => {
+    const raw = f.path || f.name || "";
+    if (!raw) return false;
+    const segments = raw.split(/[/\\]/);
+    return !segments.some((segment) => segment.startsWith("."));
+  });
+
+  const hasFiles = visibleProducedFiles.length > 0;
 
   let displayContent = finalResult;
   if (isTurnRawTrace) {
@@ -127,11 +147,11 @@ export function ChatDeliverable({
         <div className="p-3.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-xs space-y-2.5">
           <div className="flex items-center justify-between">
             <span className="text-emerald-500 font-semibold tracking-wide text-xs">
-              TASK DELIVERABLES & OUTPUT FILES ({producedFiles.length})
+              TASK DELIVERABLES & OUTPUT FILES ({visibleProducedFiles.length})
             </span>
           </div>
           <div className="flex flex-wrap gap-2">
-            {producedFiles.map((f, idx) => {
+            {visibleProducedFiles.map((f, idx) => {
               const isModified = f.action === "modified" || f.status === "modified";
               const targetPath = f.path || f.name;
               return (
