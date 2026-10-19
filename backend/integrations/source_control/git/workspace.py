@@ -38,13 +38,23 @@ Design rules:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 import threading
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Awaitable, Callable, Dict, List, Optional, Sequence
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+)
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from ..domain.enums import ProviderId
@@ -87,6 +97,15 @@ logger = logging.getLogger(__name__)
 #: Prevents unbounded growth when callers forget to delete
 #: workspaces.
 DEFAULT_MAX_WORKSPACES: int = 100
+
+#: Directory name of the per-workspace marker that allows the
+#: manager to recover a workspace after a process restart, even when
+#: the global registry file is lost or corrupted. Added to
+#: `.git/info/exclude` so it never pollutes `git status`.
+WORKSPACE_MARKER_DIR: str = ".peldrun"
+
+#: File name of the per-workspace marker inside `WORKSPACE_MARKER_DIR`.
+WORKSPACE_MARKER_NAME: str = "workspace.json"
 
 
 def _utc_now() -> datetime:
@@ -155,6 +174,7 @@ class GitWorkspaceManager:
         path_policy: Optional[WorkspacePathPolicy] = None,
         repository_resolver: Optional[RepositoryResolver] = None,
         max_workspaces: int = DEFAULT_MAX_WORKSPACES,
+        registry_path: Optional[Path] = None,
     ) -> None:
         if max_workspaces <= 0:
             raise ValidationError(
@@ -168,6 +188,462 @@ class GitWorkspaceManager:
 
         self._workspaces: Dict[str, WorkspaceRef] = {}
         self._lock = threading.RLock()
+
+        # Durable registry so workspaces survive a process restart.
+        # The marker file inside each workspace is the authoritative
+        # source of truth; the registry is a fast-lookup cache.
+        self._registry_path: Path = (
+            Path(registry_path)
+            if registry_path is not None
+            else self._default_registry_path()
+        )
+        self._load_registry()
+
+    # --- Registry persistence -------------------------------------------
+
+    def _default_registry_path(self) -> Path:
+        """
+        Return the default registry file location:
+        `<backend>/data/source_control/workspaces.json`.
+
+        The module lives at `backend/integrations/source_control/git/workspace.py`,
+        so four `parent` hops reach the `backend/` directory.
+        """
+        try:
+            backend_root = (
+                Path(__file__).resolve().parent.parent.parent.parent
+            )
+            return (
+                backend_root
+                / "data"
+                / "source_control"
+                / "workspaces.json"
+            )
+        except Exception:  # noqa: BLE001
+            return (
+                Path.cwd()
+                / ".peldrun"
+                / "workspaces"
+                / "registry.json"
+            )
+
+    def _load_registry(self) -> None:
+        """
+        Load the persisted registry and silently prune entries whose
+        `workspace_path` no longer exists (e.g., after the owning
+        chat was deleted). Pruning is persisted so stale entries do
+        not accumulate across restarts.
+        """
+        path = self._registry_path
+        if not path.exists():
+            return
+        try:
+            # `utf-8-sig` tolerates a BOM prefix, which Windows
+            # PowerShell 5.1's `Set-Content -Encoding UTF8` adds
+            # by default. A plain `utf-8` read on a BOM-prefixed
+            # file raises `JSONDecodeError` and, prior to this
+            # fix, silently emptied the registry on every restart.
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "Failed to load workspace registry %s: %s",
+                path,
+                type(exc).__name__,
+            )
+            return
+        if not isinstance(data, dict):
+            return
+        items = data.get("workspaces", [])
+        if not isinstance(items, list):
+            return
+
+        loaded = 0
+        pruned = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            ws = self._deserialize_workspace(item)
+            if ws is None:
+                pruned += 1
+                continue
+            if not Path(ws.workspace_path).exists():
+                pruned += 1
+                continue
+            self._workspaces[ws.workspace_id] = ws
+            loaded += 1
+
+        if loaded or pruned:
+            logger.info(
+                "Workspace registry %s: loaded=%d pruned=%d",
+                path,
+                loaded,
+                pruned,
+            )
+        if pruned:
+            self._save_registry()
+
+    def _save_registry(self) -> None:
+        """
+        Persist the current registry atomically.
+
+        MUST be called with `self._lock` held (all call sites comply)
+        so that `_workspaces` is stable during serialization.
+        """
+        try:
+            self._registry_path.parent.mkdir(
+                parents=True, exist_ok=True
+            )
+            payload = {
+                "schema_version": 1,
+                "updated_at": _utc_now().isoformat(),
+                "workspaces": [
+                    self._serialize_workspace(ws)
+                    for ws in self._workspaces.values()
+                ],
+            }
+            tmp = self._registry_path.with_suffix(
+                self._registry_path.suffix + ".tmp"
+            )
+            tmp.write_text(
+                json.dumps(
+                    payload,
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                ),
+                encoding="utf-8",
+            )
+            tmp.replace(self._registry_path)
+        except OSError as exc:
+            logger.warning(
+                "Failed to save workspace registry %s: %s",
+                self._registry_path,
+                type(exc).__name__,
+            )
+
+    @staticmethod
+    def _serialize_workspace(ws: WorkspaceRef) -> Dict[str, Any]:
+        """Serialize a `WorkspaceRef` to a JSON-safe dict."""
+
+        def _v(value: Any, default: str = "") -> str:
+            if value is None:
+                return default
+            return (
+                value.value if hasattr(value, "value") else str(value)
+            )
+
+        return {
+            "workspace_id": ws.workspace_id,
+            "repository_id": ws.repository_id,
+            "provider": _v(ws.provider, "github"),
+            "workspace_path": ws.workspace_path,
+            "current_branch": ws.current_branch,
+            "base_sha": ws.base_sha,
+            "head_sha": ws.head_sha,
+            "is_worktree": bool(ws.is_worktree),
+            "is_clean": bool(ws.is_clean),
+            "status": _v(ws.status, "ready"),
+            "created_at": (
+                ws.created_at.isoformat() if ws.created_at else None
+            ),
+            "updated_at": (
+                ws.updated_at.isoformat() if ws.updated_at else None
+            ),
+            "metadata": dict(ws.metadata or {}),
+        }
+
+    @staticmethod
+    def _deserialize_workspace(
+        data: Mapping[str, Any],
+    ) -> Optional[WorkspaceRef]:
+        """Rebuild a `WorkspaceRef` from a JSON dict, or None."""
+        try:
+            try:
+                provider = ProviderId(
+                    str(data.get("provider", "github"))
+                )
+            except ValueError:
+                provider = ProviderId.GITHUB
+            try:
+                ws_status = WorkspaceStatus(
+                    str(data.get("status", "ready"))
+                )
+            except ValueError:
+                ws_status = WorkspaceStatus.READY
+
+            created_raw = data.get("created_at")
+            updated_raw = data.get("updated_at")
+            return WorkspaceRef(
+                workspace_id=str(data["workspace_id"]),
+                repository_id=str(data.get("repository_id", "")),
+                provider=provider,
+                workspace_path=str(data["workspace_path"]),
+                current_branch=str(
+                    data.get("current_branch", "main")
+                ),
+                base_sha=str(data.get("base_sha", "")),
+                head_sha=str(data.get("head_sha", "")),
+                is_worktree=bool(data.get("is_worktree", False)),
+                is_clean=bool(data.get("is_clean", True)),
+                status=ws_status,
+                created_at=(
+                    datetime.fromisoformat(created_raw)
+                    if created_raw
+                    else _utc_now()
+                ),
+                updated_at=(
+                    datetime.fromisoformat(updated_raw)
+                    if updated_raw
+                    else _utc_now()
+                ),
+                metadata=dict(data.get("metadata") or {}),
+            )
+        except (KeyError, ValueError, TypeError):
+            return None
+
+    async def cleanup_orphans(self) -> Dict[str, Any]:
+        """
+        Prune registry entries whose `workspace_path` no longer
+        exists on disk. Companion of the chat storage engine's
+        `sweep_orphaned_storage()`: that method handles files, this
+        one handles the source-control registry.
+        """
+        removed: List[str] = []
+        with self._lock:
+            for ws_id, ws in list(self._workspaces.items()):
+                if not Path(ws.workspace_path).exists():
+                    del self._workspaces[ws_id]
+                    removed.append(ws_id)
+            if removed:
+                self._save_registry()
+            remaining = len(self._workspaces)
+
+        return {
+            "removed_count": len(removed),
+            "removed_ids": removed,
+            "remaining_count": remaining,
+            "registry_path": str(self._registry_path),
+        }
+
+    # --- Workspace marker (.peldrun/workspace.json) ---------------------
+
+    @classmethod
+    def _marker_path(cls, workspace_path: Path) -> Path:
+        return (
+            workspace_path
+            / WORKSPACE_MARKER_DIR
+            / WORKSPACE_MARKER_NAME
+        )
+
+    def _write_workspace_marker(self, ws: WorkspaceRef) -> None:
+        """
+        Write the per-workspace marker and add its directory to
+        `.git/info/exclude` so it never appears in `git status`.
+
+        Best-effort: write failures are logged and swallowed.
+        """
+        try:
+            ws_path = Path(ws.workspace_path)
+            marker = self._marker_path(ws_path)
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(
+                json.dumps(
+                    self._serialize_workspace(ws),
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                ),
+                encoding="utf-8",
+            )
+
+            exclude_path = ws_path / ".git" / "info" / "exclude"
+            if exclude_path.parent.exists():
+                existing = ""
+                if exclude_path.exists():
+                    try:
+                        existing = exclude_path.read_text(
+                            encoding="utf-8"
+                        )
+                    except OSError:
+                        existing = ""
+                marker_rel = f"/{WORKSPACE_MARKER_DIR}/"
+                if marker_rel not in existing:
+                    with open(
+                        exclude_path, "a", encoding="utf-8"
+                    ) as f:
+                        if existing and not existing.endswith("\n"):
+                            f.write("\n")
+                        f.write(
+                            f"# PELDRUN workspace marker\n{marker_rel}\n"
+                        )
+        except OSError as exc:
+            logger.warning(
+                "Failed to write workspace marker for %s: %s",
+                ws.workspace_id,
+                type(exc).__name__,
+            )
+
+    def _read_workspace_marker(
+        self, workspace_path: Path
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Return the parsed marker dict, or None when absent/invalid.
+
+        Reads with `utf-8-sig` so that a marker written by a tool
+        that prepends a BOM (notably Windows PowerShell 5.1's
+        `Set-Content -Encoding UTF8`, which silently adds one)
+        still parses correctly. A plain `utf-8` read on a
+        BOM-prefixed file raises `JSONDecodeError`, which used to
+        silently disable workspace discovery after a restart.
+        """
+        marker = self._marker_path(workspace_path)
+        if not marker.exists():
+            return None
+        try:
+            data = json.loads(
+                marker.read_text(encoding="utf-8-sig")
+            )
+            return data if isinstance(data, dict) else None
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _delete_workspace_marker(self, workspace_path: Path) -> None:
+        """Remove the marker file so re-scans cannot re-discover it."""
+        marker = self._marker_path(workspace_path)
+        try:
+            if marker.exists():
+                marker.unlink()
+        except OSError:
+            pass
+
+    # --- Internal path helpers ------------------------------------------
+
+    def _storage_roots(self) -> List[Path]:
+        """
+        Return the storage roots to scan for workspace markers.
+
+        Multiple candidates are checked, in priority order:
+
+            1. `<project_root>/storage` — canonical location for
+               chat and project storage. This is where the chat
+               storage engine actually writes workspaces, because
+               `PROJECT_ROOT` in `storage.py` resolves to the
+               directory that contains `backend/`.
+            2. `<backend>/storage` — legacy location. Kept for
+               backward compatibility with older deployments where
+               the storage tree lived inside the backend directory.
+
+        Both are resolved and de-duplicated so a machine with a
+        symlinked layout does not scan the same tree twice. Missing
+        roots are skipped silently; an empty list means the storage
+        tree is unavailable (typical in isolated unit tests).
+        """
+        roots: List[Path] = []
+        seen: set = set()
+        try:
+            backend_root = (
+                Path(__file__).resolve().parent.parent.parent.parent
+            )
+            candidates = [
+                backend_root.parent / "storage",
+                backend_root / "storage",
+            ]
+            for candidate in candidates:
+                try:
+                    resolved = candidate.resolve()
+                except Exception:  # noqa: BLE001
+                    continue
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                if resolved.exists():
+                    roots.append(resolved)
+        except Exception:  # noqa: BLE001
+            pass
+        return roots
+
+    def _remove_by_path(self, workspace_path: Path) -> List[str]:
+        """
+        Drop any registry entries that resolve to the same physical
+        directory. Prevents duplicate workspace IDs on the same path
+        when a chat is re-executed (which reuses the existing `.git`
+        but generates a new `workspace_id`).
+        """
+        removed: List[str] = []
+        try:
+            normalized = str(Path(workspace_path).resolve())
+        except Exception:  # noqa: BLE001
+            normalized = str(workspace_path)
+
+        with self._lock:
+            for ws_id, ws in list(self._workspaces.items()):
+                try:
+                    ws_norm = str(Path(ws.workspace_path).resolve())
+                except Exception:  # noqa: BLE001
+                    ws_norm = ws.workspace_path
+                if ws_norm == normalized:
+                    del self._workspaces[ws_id]
+                    removed.append(ws_id)
+            if removed:
+                self._save_registry()
+        return removed
+
+    def _build_workspace_ref_from_path(
+        self, workspace_id: str, target_dir: Path
+    ) -> WorkspaceRef:
+        """
+        Build a `WorkspaceRef` by inspecting a legacy workspace
+        directory laid out under `_policy.root` (no marker file).
+        """
+        branch_name = "main"
+        head_sha = ""
+        head_file = target_dir / ".git" / "HEAD"
+        if head_file.exists():
+            try:
+                head_content = head_file.read_text(
+                    encoding="utf-8"
+                ).strip()
+                if head_content.startswith("ref: refs/heads/"):
+                    branch_name = head_content[
+                        len("ref: refs/heads/") :
+                    ]
+                    ref_file = (
+                        target_dir
+                        / ".git"
+                        / "refs"
+                        / "heads"
+                        / branch_name
+                    )
+                    if ref_file.exists():
+                        head_sha = ref_file.read_text(
+                            encoding="utf-8"
+                        ).strip()
+                elif len(head_content) == 40:
+                    head_sha = head_content
+            except OSError:
+                pass
+
+        repository_id = (
+            target_dir.name.split("__")[0]
+            if "__" in target_dir.name
+            else "unknown"
+        )
+
+        return WorkspaceRef(
+            workspace_id=workspace_id,
+            repository_id=repository_id,
+            provider=ProviderId.GITHUB,
+            workspace_path=str(target_dir),
+            current_branch=branch_name,
+            base_sha=head_sha,
+            head_sha=head_sha,
+            is_worktree=False,
+            is_clean=True,
+            status=WorkspaceStatus.READY,
+            created_at=_utc_now(),
+            updated_at=_utc_now(),
+            metadata={"recovered_from_disk": True},
+        )
 
     # --- Properties -----------------------------------------------------
 
@@ -328,6 +804,11 @@ class GitWorkspaceManager:
             await self._force_remove_directory(workspace_path)
             raise
 
+        # Evict any stale entry that points to the same physical
+        # directory so that re-running a task does not accumulate
+        # duplicate workspace IDs on the same path.
+        self._remove_by_path(workspace_path)
+
         # The capacity check MUST run again here: the early check
         # above fast-fails when the registry is already full, but
         # between that check and this insert the long-running
@@ -343,6 +824,7 @@ class GitWorkspaceManager:
             )
             if not at_capacity:
                 self._workspaces[workspace_id] = materialized
+                self._save_registry()
 
         if at_capacity:
             # Release the lock before cleanup so that a slow
@@ -353,6 +835,10 @@ class GitWorkspaceManager:
                 details={"max_workspaces": self._max_workspaces},
             )
 
+        # Persist the on-disk marker AFTER registration so that the
+        # marker content is the canonical, latest state.
+        self._write_workspace_marker(materialized)
+
         return materialized
 
     # --- Lifecycle: read -----------------------------------------------
@@ -361,84 +847,151 @@ class GitWorkspaceManager:
         """
         Return the workspace with the given ID, or `None` if unknown.
 
-        This method never raises for a missing workspace; callers that
-        need a strict failure use `require_workspace`. Automatically
-        discovers existing workspaces on disk across application restarts.
+        Resolution after a restart:
+            1. Cached entry whose directory still exists -> return.
+            2. Cached entry whose directory was deleted (chat purged)
+               -> drop it and continue.
+            3. Not cached -> scan `.peldrun/workspace.json` markers
+               under `storage/chats` and `storage/projects`.
         """
         if not workspace_id or not isinstance(workspace_id, str):
             return None
         with self._lock:
             ws = self._workspaces.get(workspace_id)
             if ws is not None:
-                return ws
+                if Path(ws.workspace_path).exists():
+                    return ws
+                # Stale entry: physical directory is gone.
+                del self._workspaces[workspace_id]
+                self._save_registry()
 
-            # Attempt auto-discovery from workspace root on disk after restart
-            discovered = self._discover_workspace_on_disk(workspace_id)
+            # Attempt discovery from disk.
+            discovered = self._discover_workspace_on_disk(
+                workspace_id
+            )
             if discovered is not None:
                 self._workspaces[workspace_id] = discovered
+                self._save_registry()
+                self._write_workspace_marker(discovered)
                 return discovered
             return None
 
     def register_workspace(self, workspace: WorkspaceRef) -> None:
-        """Register or restore an existing workspace reference into the manager."""
+        """Register or restore an existing workspace reference."""
         if not workspace or not isinstance(workspace, WorkspaceRef):
             return
         with self._lock:
             self._workspaces[workspace.workspace_id] = workspace
+            self._save_registry()
+        self._write_workspace_marker(workspace)
 
-    def _discover_workspace_on_disk(self, workspace_id: str) -> Optional[WorkspaceRef]:
+    def _discover_workspace_on_disk(
+        self, workspace_id: str
+    ) -> Optional[WorkspaceRef]:
         """
-        Scan workspace root directory to locate an existing workspace folder
-        matching the workspace_id across application restarts.
+        Locate an existing workspace by scanning disk.
+
+        Search order:
+            1. `_policy.root` — legacy name-based discovery for
+               workspaces created without a custom `target_path`.
+            2. `storage/chats/<chat>/files/.peldrun/workspace.json`.
+            3. `storage/projects/<proj>/chats/<chat>/files/.peldrun/workspace.json`.
         """
-        if not self._policy.root.exists():
-            return None
 
-        target_dir: Optional[Path] = None
-        suffix = f"__{workspace_id}"
-        try:
-            for child in self._policy.root.iterdir():
-                if child.is_dir() and (child.name == workspace_id or child.name.endswith(suffix)):
-                    target_dir = child
-                    break
-        except OSError:
-            return None
-
-        if target_dir is None or not (target_dir / ".git").exists():
-            return None
-
-        # Resolve repository and branch info from disk metadata
-        branch_name = "main"
-        head_sha = ""
-        head_file = target_dir / ".git" / "HEAD"
-        if head_file.exists():
+        # 1) Legacy name-based scan under the policy root.
+        if self._policy.root.exists():
+            suffix = f"__{workspace_id}"
             try:
-                head_content = head_file.read_text(encoding="utf-8").strip()
-                if head_content.startswith("ref: refs/heads/"):
-                    branch_name = head_content[len("ref: refs/heads/"):]
-                    ref_file = target_dir / ".git" / "refs" / "heads" / branch_name
-                    if ref_file.exists():
-                        head_sha = ref_file.read_text(encoding="utf-8").strip()
-                elif len(head_content) == 40:
-                    head_sha = head_content
+                for child in self._policy.root.iterdir():
+                    if not child.is_dir():
+                        continue
+                    matches_name = (
+                        child.name == workspace_id
+                        or child.name.endswith(suffix)
+                    )
+                    if (
+                        matches_name
+                        and (child / ".git").exists()
+                    ):
+                        return self._build_workspace_ref_from_path(
+                            workspace_id, child
+                        )
             except OSError:
                 pass
 
-        return WorkspaceRef(
-            workspace_id=workspace_id,
-            repository_id=target_dir.name.split("__")[0] if "__" in target_dir.name else "unknown",
-            provider=ProviderId.GITHUB,
-            workspace_path=str(target_dir),
-            current_branch=branch_name,
-            base_sha=head_sha,
-            head_sha=head_sha,
-            is_worktree=False,
-            is_clean=True,
-            status=WorkspaceStatus.READY,
-            created_at=_utc_now(),
-            updated_at=_utc_now(),
-            metadata={"recovered_from_disk": True},
-        )
+        # 2) + 3) Marker-driven scan under the storage tree.
+        for root in self._storage_roots():
+            chats_dir = root / "chats"
+            if chats_dir.exists():
+                try:
+                    for chat_dir in chats_dir.iterdir():
+                        if not chat_dir.is_dir():
+                            continue
+                        files_dir = chat_dir / "files"
+                        if not files_dir.exists():
+                            continue
+                        marker = self._read_workspace_marker(
+                            files_dir
+                        )
+                        if (
+                            marker
+                            and marker.get("workspace_id")
+                            == workspace_id
+                        ):
+                            recovered = self._deserialize_workspace(
+                                marker
+                            )
+                            if recovered is not None:
+                                # Trust the actual path over the
+                                # marker content so a tampered
+                                # marker cannot redirect workspace
+                                # operations elsewhere.
+                                return replace(
+                                    recovered,
+                                    workspace_path=str(
+                                        files_dir.resolve()
+                                    ),
+                                )
+                except OSError:
+                    pass
+
+            projects_dir = root / "projects"
+            if projects_dir.exists():
+                try:
+                    for proj_dir in projects_dir.iterdir():
+                        if not proj_dir.is_dir():
+                            continue
+                        p_chats = proj_dir / "chats"
+                        if not p_chats.exists():
+                            continue
+                        for chat_dir in p_chats.iterdir():
+                            if not chat_dir.is_dir():
+                                continue
+                            files_dir = chat_dir / "files"
+                            if not files_dir.exists():
+                                continue
+                            marker = (
+                                self._read_workspace_marker(files_dir)
+                            )
+                            if (
+                                marker
+                                and marker.get("workspace_id")
+                                == workspace_id
+                            ):
+                                recovered = (
+                                    self._deserialize_workspace(marker)
+                                )
+                                if recovered is not None:
+                                    return replace(
+                                        recovered,
+                                        workspace_path=str(
+                                            files_dir.resolve()
+                                        ),
+                                    )
+                except OSError:
+                    pass
+
+        return None
 
     def require_workspace(self, workspace_id: str) -> WorkspaceRef:
         """
@@ -527,36 +1080,60 @@ class GitWorkspaceManager:
 
     # --- Lifecycle: delete ---------------------------------------------
 
-    async def delete_workspace(self, workspace_id: str) -> None:
+    async def delete_workspace(
+        self,
+        workspace_id: str,
+        *,
+        force_delete_files: bool = False,
+    ) -> None:
         """
-        Remove a PELDRUN-owned workspace from disk and the registry.
+        Remove a workspace from PELDRUN tracking.
 
-        This operation is destructive and MUST only be called for
-        workspaces owned by this manager. The target directory MUST
-        resolve inside the workspace root, or the operation is
-        refused.
+        By default this is a non-destructive unregister: the entry
+        is removed from the in-memory and on-disk registries, the
+        `.peldrun/workspace.json` marker is deleted (so future
+        scans cannot re-discover it), and the physical directory is
+        left untouched.
+
+        Pass `force_delete_files=True` to also remove the directory
+        tree. This is only honored when the workspace path resolves
+        inside `_policy.root`; chat-scoped workspaces under
+        `storage/chats/<chat>/files` are intentionally never
+        deleted here because their lifecycle is owned by the chat
+        storage engine.
 
         Raises:
             WorkspaceNotFoundError: If the ID is unknown.
-            PathTraversalError: If the resolved path escapes the
-                root.
         """
         workspace = self.require_workspace(workspace_id)
 
-        # Validate containment before any destructive action.
-        try:
-            resolved = self._policy.resolve_within_root(
-                workspace.workspace_path, must_exist=False
-            )
-        except Exception:
-            # Refuse to delete anything we cannot prove is inside
-            # the root.
-            raise
+        if force_delete_files:
+            try:
+                resolved = self._policy.resolve_within_root(
+                    workspace.workspace_path, must_exist=False
+                )
+                await self._force_remove_directory(resolved)
+            except Exception as exc:  # noqa: BLE001
+                # Path is outside the policy root — expected for
+                # chat-scoped workspaces. Log and continue with
+                # the unregister path only.
+                logger.info(
+                    "delete_workspace: refusing to delete files for "
+                    "%s outside the workspace root (%s). "
+                    "Unregistering only.",
+                    workspace_id,
+                    type(exc).__name__,
+                )
 
-        await self._force_remove_directory(resolved)
+        # Remove the marker first so a subsequent disk scan cannot
+        # re-register the workspace.
+        self._delete_workspace_marker(
+            Path(workspace.workspace_path)
+        )
 
         with self._lock:
             self._workspaces.pop(workspace_id, None)
+            self._save_registry()
 
     # Alias retained for backward compatibility with older callers.
     async def cleanup_workspace(self, workspace_id: str) -> None:
@@ -574,6 +1151,7 @@ class GitWorkspaceManager:
         """
         with self._lock:
             self._workspaces.clear()
+            self._save_registry()
 
     def __len__(self) -> int:
         with self._lock:

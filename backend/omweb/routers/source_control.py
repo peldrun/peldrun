@@ -589,6 +589,30 @@ async def create_workspace(
         handle_source_control_error(exc)
 
 
+@router.post("/workspaces/cleanup")
+async def cleanup_workspaces(
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> dict:
+    """
+    Prune orphaned workspace entries from the registry.
+
+    A workspace becomes orphaned when the owning chat or project is
+    deleted: the physical directory under
+    `storage/chats/<chat>/files/` disappears but the registry entry
+    remains. This endpoint drops those stale entries. It does NOT
+    touch any surviving workspace directory.
+
+    NOTE: this route MUST be declared before the
+    `GET /workspaces/{workspace_id}` route. FastAPI matches routes
+    in declaration order, and a later literal path would be shadowed
+    by the earlier parameterized route.
+    """
+    try:
+        return await facade.cleanup_workspaces()
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
 @router.get("/workspaces/{workspace_id}", response_model=WorkspaceResponse)
 async def get_workspace(
     workspace_id: str,

@@ -1778,6 +1778,34 @@ class SourceControlFacade:
             created_at=ws_ref.created_at,
         )
 
+    async def cleanup_workspaces(self) -> dict:
+        """
+        Prune orphaned workspace entries from the registry.
+
+        A workspace becomes orphaned when its `workspace_path` no
+        longer exists on disk. The most common cause is deletion of
+        the owning chat or project, which removes the physical
+        directory tree under `storage/chats/<chat>/files/` but
+        leaves the registry entry behind. This method drops those
+        stale entries without touching any surviving workspace.
+
+        Companion of `chat_storage_engine.sweep_orphaned_storage()`,
+        which handles the physical storage tree; this method handles
+        the source-control workspace registry.
+        """
+        result = await self.workspace_manager.cleanup_orphans()
+        self._audit(
+            AuditEventType.OTHER,
+            action="cleanup_workspaces",
+            message=(
+                f"Pruned {result['removed_count']} orphaned "
+                f"workspace(s)."
+            ),
+            payload=result,
+            actor="user",
+        )
+        return result
+
     async def inspect_workspace_diff(
         self, workspace_id: str, base_ref: Optional[str] = None
     ) -> DiffSummaryResponse:
@@ -2063,6 +2091,25 @@ class SourceControlFacade:
             metadata["title"] = redact_text(title)
         if description:
             metadata["description"] = redact_text(description)
+
+        # Persist the workspace path so downstream code can recover
+        # the workspace location even when the on-disk registry is
+        # lost. The durable operation journal already persists this
+        # metadata, so it survives a process restart.
+        ws_id_for_meta = getattr(payload, "workspace_id", None)
+        if ws_id_for_meta:
+            try:
+                ws_ref_for_meta = self.workspace_manager.get_workspace(
+                    ws_id_for_meta
+                )
+                if ws_ref_for_meta is not None:
+                    metadata["workspace_path"] = (
+                        ws_ref_for_meta.workspace_path
+                    )
+            except Exception:  # noqa: BLE001
+                # Best-effort enrichment; never fail operation
+                # creation because of a workspace lookup miss.
+                pass
 
         record: OperationRecord = await self.operation_service.create_operation(
             repository_id=payload.repository_id,
