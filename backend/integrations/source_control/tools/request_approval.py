@@ -96,7 +96,7 @@ class RequestApprovalTool(SourceControlTool):
                     "description": "Optional TTL for the approval, in seconds."
                 },
             },
-            "required": ["operation", "target_branch"],
+            "required": [],
             "additionalProperties": False,
         }
 
@@ -122,10 +122,23 @@ class RequestApprovalTool(SourceControlTool):
                 error_message="Either `operation_id` or `workspace_id` must be provided."
             )
 
-        # Default to push_branch if the LLM forgets, to prevent infinite loops
-        operation = kwargs.get("operation") or "push_branch"
+        # Accept common aliases and fall back to push_branch
+        raw_op = str(kwargs.get("operation") or "push_branch").strip().lower()
+        operation_aliases = {
+            "commit": "push_branch",
+            "push": "push_branch",
+            "pr": "create_change_request",
+            "pull_request": "create_change_request",
+            "merge": "merge_change_request",
+        }
+        operation = operation_aliases.get(raw_op, raw_op)
         if operation not in SUPPORTED_OPERATIONS:
-            operation = "push_branch" # Fallback to safest default
+            operation = "push_branch" # Safest default
+
+        # Ignore title/body (they belong to create_change_request)
+        kwargs.pop("title", None)
+        kwargs.pop("body", None)
+        kwargs.pop("draft", None)
 
         # Default target_branch to "main" if missing
         target_branch = kwargs.get("target_branch")

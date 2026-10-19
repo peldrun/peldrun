@@ -708,11 +708,22 @@ class GitWorkspaceManager:
         head_sha = await self._head_sha(target, fallback="")
         dirty = await self._detect_dirty(target)
 
+        # The ApprovalGate requires a 64-character SHA-256 digest,
+        # but Git head_sha is 40 characters (SHA-1). We hash it to
+        # produce a valid 64-character base_sha.
+        import hashlib
+        effective_base_sha = request.base_sha
+        if not effective_base_sha:
+            if head_sha:
+                effective_base_sha = hashlib.sha256(head_sha.encode()).hexdigest()
+            else:
+                effective_base_sha = "0" * 64  # Fallback placeholder
+
         return replace(
             workspace,
             current_branch=branch_now,
             head_sha=head_sha,
-            base_sha=request.base_sha or head_sha,  # <-- ADD THIS LINE
+            base_sha=effective_base_sha,
             is_clean=not dirty,
             status=(
                 WorkspaceStatus.READY
