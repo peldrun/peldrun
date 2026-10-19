@@ -135,10 +135,10 @@ AuthorizationUrlBuilder = Callable[
 
 #: Exchange an authorization code for tokens. Receives the provider,
 #: the authorization code, the PKCE code_verifier, the redirect URI,
-#: the client_id, and an optional base URL. Returns a
+#: the client_id, the client_secret, and an optional base URL. Returns a
 #: `TokenRefreshResult`-shaped object (same fields).
 TokenExchanger = Callable[
-    [ProviderId, str, str, str, str, Optional[str]],
+    [ProviderId, str, str, str, str, Optional[str], Optional[str]],
     Awaitable[TokenRefreshResult],
 ]
 
@@ -352,11 +352,8 @@ class OAuthFlowCoordinator(OAuthFlowPort):
                 "register_provider expects OAuthProviderCallbacks.",
                 details={"provider": key},
             )
-        if not callbacks.client_id:
-            raise ValidationError(
-                "client_id must not be empty.",
-                details={"provider": key},
-            )
+        # client_id validation is deferred to begin_authorization,
+        # allowing dynamic BYOK configurations.
         with self._lock:
             if key in self._providers and not overwrite:
                 raise ValidationError(
@@ -385,6 +382,7 @@ class OAuthFlowCoordinator(OAuthFlowPort):
         base_url: Optional[str] = None,
         scopes: Optional[Sequence[str]] = None,
         redirect_uri: Optional[str] = None,
+        client_id: Optional[str] = None,
     ) -> OAuthStartResult:
         """
         Start an OAuth authorization attempt.
@@ -413,6 +411,7 @@ class OAuthFlowCoordinator(OAuthFlowPort):
         _validate_callback_url(resolved_redirect)
 
         resolved_scopes = tuple(scopes or callbacks.default_scopes)
+        effective_client_id = client_id or callbacks.client_id
         now = _utc_now()
 
         session = _PendingSession(
@@ -424,14 +423,14 @@ class OAuthFlowCoordinator(OAuthFlowPort):
             created_at=now,
             expires_at=now + timedelta(seconds=self._session_ttl_seconds),
             scopes=resolved_scopes,
-            client_id=callbacks.client_id,
+            client_id=effective_client_id,
         )
         self._sessions.add(session)
 
         try:
             authorization_url = callbacks.authorization_url_builder(
                 provider,
-                callbacks.client_id,
+                effective_client_id,
                 resolved_redirect,
                 state,
                 code_challenge,
@@ -483,6 +482,8 @@ class OAuthFlowCoordinator(OAuthFlowPort):
         state: str,
         code: str,
         redirect_uri: str,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
     ) -> AuthResult:
         """
         Complete an OAuth authorization attempt.
@@ -568,6 +569,7 @@ class OAuthFlowCoordinator(OAuthFlowPort):
             )
 
         callbacks = self._get_callbacks(provider)
+        effective_client_id = client_id or session.client_id or callbacks.client_id
 
         try:
             token_result = await callbacks.token_exchanger(
@@ -575,8 +577,9 @@ class OAuthFlowCoordinator(OAuthFlowPort):
                 code,
                 session.code_verifier,
                 redirect_uri,
-                callbacks.client_id,
+                effective_client_id,
                 session.base_url,
+                client_secret,
             )
         except Exception as exc:  # noqa: BLE001
             self._audit.record(
@@ -871,21 +874,29 @@ def _validate_callback_url(url: str) -> None:
             details={"reason": str(exc)},
         ) from exc
 
-    if parsed.scheme.lower() != "http":
-        raise ValidationError(
-            "redirect_uri MUST use the http scheme.",
-            details={"scheme": parsed.scheme},
-        )
-    if parsed.hostname not in {"127.0.0.1", "::1"}:
-        raise ValidationError(
-            "redirect_uri MUST use a loopback host (127.0.0.1 or ::1).",
-            details={"host": parsed.hostname},
-        )
-    if not parsed.port:
-        raise ValidationError(
-            "redirect_uri MUST include an explicit port.",
-            details={"url": redact_url(url)},
-        )
+    # Allow loopback (http/https) or real domains (https only)
+    is_loopback = parsed.hostname in {"127.0.0.1", "::1", "localhost"}
+
+    if is_loopback:
+        if parsed.scheme.lower() not in {"http", "https"}:
+            raise ValidationError(
+                "Loopback redirect_uri MUST use http or https scheme.",
+                details={"scheme": parsed.scheme},
+            )
+        if not parsed.port:
+            raise ValidationError(
+                "redirect_uri MUST include an explicit port.",
+                details={"url": redact_url(url)},
+            )
+    else:
+        # Real domains require HTTPS for security
+        if parsed.scheme.lower() != "https":
+            raise ValidationError(
+                "Non-loopback redirect_uri MUST use the https scheme.",
+                details={"scheme": parsed.scheme},
+            )
+        # Port is optional for real domains (defaults to 443)
+
     if parsed.username or parsed.password:
         raise ValidationError(
             "redirect_uri MUST NOT include userinfo."

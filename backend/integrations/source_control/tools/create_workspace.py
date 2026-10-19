@@ -54,6 +54,7 @@ from ..git.workspace import (
     get_default_workspace_manager,
 )
 from ..registry import ProviderRegistry, get_default_registry
+from ..providers import register_builtin_providers
 from ..security.redaction import redact_url
 from ..security.token_service import (
     TokenService,
@@ -236,6 +237,9 @@ class CreateWorkspaceTool(SourceControlTool):
 
         # --- Resolve adapter -------------------------------------------
         registry = self._explicit_registry or get_default_registry()
+        # Defensive: Ensure built-in providers are registered
+        register_builtin_providers(registry=registry)
+
         adapter = registry.try_get(provider)
         if adapter is None:
             return self.failure_result(
@@ -266,11 +270,16 @@ class CreateWorkspaceTool(SourceControlTool):
 
         # --- Resolve the repository reference --------------------------
         try:
-            repo = await self._resolve_repository(
-                adapter=adapter,
-                repository_id=repository_id,
-                token=token,
-            )
+            # If repository_id contains a slash (e.g., "mtaman/mtaman"),
+            # try to fetch it directly instead of searching a list.
+            if "/" in repository_id:
+                repo = await adapter.get_repository(repository_id, token=token)
+            else:
+                repo = await self._resolve_repository(
+                    adapter=adapter,
+                    repository_id=repository_id,
+                    token=token,
+                )
         except Exception as exc:  # noqa: BLE001
             normalized = to_source_control_error(exc)
             return self.failure_result(
@@ -305,6 +314,18 @@ class CreateWorkspaceTool(SourceControlTool):
             or get_default_workspace_manager()
         )
 
+        # Extract chat_id from context to align workspace with session files
+        chat_id = context.run_id or context.metadata.get("chat_id")
+
+        from pathlib import Path
+        import os
+
+        target_path = None
+        if chat_id:
+            # Construct path to the chat session's files directory
+            # Assuming standard PELDRUN storage structure: storage/chats/<chat_id>/files
+            target_path = Path(os.getcwd()) / "storage" / "chats" / chat_id / "files"
+
         try:
             workspace = await manager.create_workspace(
                 repo=repo,
@@ -314,6 +335,7 @@ class CreateWorkspaceTool(SourceControlTool):
                 source_branch=branch_name,
                 use_worktree=use_worktree,
                 depth=depth,
+                target_path=target_path,  # Pass the dynamic path
                 metadata={
                     "created_by": "source_control.create_workspace",
                     "operation_id": context.operation_id or "",
@@ -384,6 +406,39 @@ class CreateWorkspaceTool(SourceControlTool):
         for_provider = [
             entry for entry in stored if entry.provider == provider
         ]
+
+        # FALLBACK: If list_stored() fails (due to key parsing issues), read connections.json directly
+        if not for_provider:
+            try:
+                import json
+                from pathlib import Path
+                # Resolve the path to backend/data/source_control/connections.json
+                # __file__ is backend/integrations/source_control/tools/create_workspace.py
+                # parent x4 goes up to the `backend` directory
+                backend_root = Path(__file__).resolve().parent.parent.parent.parent
+                conn_file = backend_root / "data" / "source_control" / "connections.json"
+                if conn_file.exists():
+                    data = json.loads(conn_file.read_text(encoding="utf-8"))
+                    for conn in data.get("connections", []):
+                        if conn.get("provider") == provider.value:
+                            # Create a mock StoredToken object or just extract values
+                            from dataclasses import dataclass
+
+                            @dataclass
+                            class MockStoredToken:
+                                provider: str
+                                account_id: str
+                                base_url: str
+
+                            mock_entry = MockStoredToken(
+                                provider=conn.get("provider"),
+                                account_id=conn.get("account_id"),
+                                base_url=conn.get("base_url"),
+                            )
+                            for_provider.append(mock_entry)
+            except Exception as e:
+                pass # Fallback failed, continue to error below
+
         if not for_provider:
             return ToolResult.fail(
                 error_code="AUTH_REQUIRED",

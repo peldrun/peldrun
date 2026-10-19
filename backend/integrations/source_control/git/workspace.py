@@ -215,6 +215,7 @@ class GitWorkspaceManager:
         reuse_existing_branch: bool = False,
         metadata: Optional[Dict[str, object]] = None,
         auth_token: Optional[str] = None,
+        target_path: Optional[Path] = None, # <-- ADD THIS
     ) -> WorkspaceRef:
         """
         Create a new workspace.
@@ -287,13 +288,18 @@ class GitWorkspaceManager:
             ),
             repository_hint=request.repository_id,
         )
-        workspace_path = self._derive_workspace_path(
-            workspace_id=workspace_id,
-            repository_id=request.repository_id,
-        )
 
-        # Ensure the workspace root exists.
-        self._policy.root.mkdir(parents=True, exist_ok=True)
+        if target_path:
+            # Use the provided target path (e.g., chat session files directory)
+            workspace_path = target_path
+            workspace_path.mkdir(parents=True, exist_ok=True)
+        else:
+            workspace_path = self._derive_workspace_path(
+                workspace_id=workspace_id,
+                repository_id=request.repository_id,
+            )
+            # Ensure the workspace root exists.
+            self._policy.root.mkdir(parents=True, exist_ok=True)
 
         workspace = WorkspaceRef(
             workspace_id=workspace_id,
@@ -663,18 +669,28 @@ class GitWorkspaceManager:
         produces a real Git workspace that tests can inspect.
         """
         target = Path(workspace.workspace_path)
-        target.parent.mkdir(parents=True, exist_ok=True)
+        target.mkdir(parents=True, exist_ok=True)
 
         branch = request.branch_name or workspace.current_branch
 
         if request.clone_url:
-            await self._clone(
-                clone_url=request.clone_url,
-                target=target,
-                depth=request.depth,
-                use_worktree=request.use_worktree,
-                auth_token=request.auth_token,
-            )
+            # If target is not empty and doesn't have .git, clone into it
+            if not (target / ".git").exists() and any(target.iterdir()):
+                await self._clone(
+                    clone_url=request.clone_url,
+                    target=target,
+                    depth=request.depth,
+                    use_worktree=False, # Force clone instead of init
+                    auth_token=request.auth_token,
+                )
+            else:
+                await self._clone(
+                    clone_url=request.clone_url,
+                    target=target,
+                    depth=request.depth,
+                    use_worktree=request.use_worktree,
+                    auth_token=request.auth_token,
+                )
         else:
             await self._init_empty_repo(target=target)
 
@@ -696,6 +712,7 @@ class GitWorkspaceManager:
             workspace,
             current_branch=branch_now,
             head_sha=head_sha,
+            base_sha=request.base_sha or head_sha,  # <-- ADD THIS LINE
             is_clean=not dirty,
             status=(
                 WorkspaceStatus.READY

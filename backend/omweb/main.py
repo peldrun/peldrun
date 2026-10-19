@@ -37,6 +37,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from omweb.config import STORAGE_ROOT
+from integrations.source_control.providers import register_builtin_providers
+
+# Register built-in Git providers globally on startup
+register_builtin_providers()
 from omweb.routers import (
     chats,
     config_rtr,

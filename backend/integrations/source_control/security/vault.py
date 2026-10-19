@@ -558,6 +558,78 @@ class KeyringVault(CredentialVault):
 
 
 # ---------------------------------------------------------------------------
+# Encrypted File Vault (Cross-Platform Fallback)
+# ---------------------------------------------------------------------------
+
+class EncryptedFileVault(CredentialVault):
+    """
+    Cross-platform fallback vault that encrypts secrets locally.
+    Used when the OS keyring is unavailable, ensuring data is never
+    stored in plaintext on Linux or headless environments.
+    """
+    backend_name = "encrypted-file"
+
+    def __init__(self, storage_path: str = "data/source_control/secrets.enc") -> None:
+        from pathlib import Path
+        from cryptography.fernet import Fernet
+
+        self._path = Path(storage_path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+
+        key_path = self._path.parent / ".vault_key"
+        if key_path.exists():
+            self._key = key_path.read_bytes()
+        else:
+            self._key = Fernet.generate_key()
+            key_path.write_bytes(self._key)
+            try:
+                import os
+                os.chmod(key_path, 0o600) # Secure permissions
+            except Exception:
+                pass
+
+        self._fernet = Fernet(self._key)
+        self._data = self._load()
+
+    def _load(self) -> dict:
+        if not self._path.exists():
+            return {}
+        try:
+            decrypted = self._fernet.decrypt(self._path.read_bytes())
+            import json
+            return json.loads(decrypted.decode("utf-8"))
+        except Exception:
+            return {}
+
+    def _save(self) -> None:
+        import json
+        encrypted = self._fernet.encrypt(json.dumps(self._data).encode("utf-8"))
+        self._path.write_bytes(encrypted)
+
+    def _put(self, key: str, secret: str) -> None:
+        self._data[key] = secret
+        self._save()
+
+    def _get(self, key: str) -> Optional[str]:
+        return self._data.get(key)
+
+    def _delete(self, key: str) -> None:
+        if key in self._data:
+            del self._data[key]
+            self._save()
+
+    def _exists(self, key: str) -> bool:
+        return key in self._data
+
+    def keys(self) -> Sequence[str]:
+        """Return a snapshot of the stored keys."""
+        return tuple(sorted(self._data.keys()))
+
+    def is_available(self) -> bool:
+        return True # Always available if cryptography is installed
+
+
+# ---------------------------------------------------------------------------
 # Fallback vault
 # ---------------------------------------------------------------------------
 
@@ -648,6 +720,17 @@ class FallbackVault(CredentialVault):
     def _exists(self, key: str) -> bool:
         return self._get(key) is not None
 
+    def keys(self) -> Sequence[str]:
+        """Return a merged snapshot of keys from all available vaults."""
+        all_keys = set()
+        for vault in self._vaults:
+            if vault.is_available() and hasattr(vault, "keys"):
+                try:
+                    all_keys.update(vault.keys())
+                except Exception:
+                    pass
+        return tuple(sorted(all_keys))
+
     def is_available(self) -> bool:
         return any(v.is_available() for v in self._vaults)
 
@@ -702,16 +785,21 @@ def _build_default_vault(environment: str) -> CredentialVault:
             )
         return keyring_vault
 
-    # Development: prefer keyring, but degrade gracefully if the OS
-    # keychain is unavailable. The FallbackVault keeps reads working
-    # if the preferred backend becomes unavailable mid-run.
+    # Development: prefer keyring, fallback to encrypted file, then memory.
     keyring_vault = KeyringVault()
-    fallback = FallbackVault([keyring_vault, InMemoryVault()])
+
+    # Resolve absolute path to backend/data/source_control/secrets.enc
+    from pathlib import Path
+    backend_root = Path(__file__).resolve().parent.parent.parent.parent
+    storage_path = backend_root / "data" / "source_control" / "secrets.enc"
+
+    encrypted_vault = EncryptedFileVault(storage_path=str(storage_path))
+    fallback = FallbackVault([keyring_vault, encrypted_vault, InMemoryVault()])
+
     if not keyring_vault.is_available():
         logger.warning(
-            "No OS keychain available; falling back to in-memory "
-            "vault. Secrets will not persist across restarts. This "
-            "is acceptable only in development."
+            "No OS keychain available; falling back to EncryptedFileVault. "
+            "Secrets will persist securely across restarts."
         )
     return fallback
 

@@ -61,6 +61,7 @@ class ProviderDescriptorResponse(BaseSCResponse):
     provider_id: str = Field(..., description="Provider unique identifier (e.g. 'github').")
     display_name: str = Field(..., description="User-friendly display name (e.g. 'GitHub Cloud').")
     is_connected: bool = Field(..., description="Whether valid active credentials exist in vault.")
+    is_configured: bool = Field(default=False, description="Whether OAuth App credentials are configured.")
     capabilities: ProviderCapabilitiesResponse = Field(..., description="Declared capabilities.")
     web_base_url: str = Field(..., description="Upstream web base URL.")
     api_base_url: str = Field(..., description="Upstream API base URL.")

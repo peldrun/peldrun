@@ -1,7 +1,7 @@
 {
   "id": "source_control",
   "name": "Source Control",
-  "description": "Unified interface for interacting with version control and remote Git repositories. Actions: list_repositories, read_file, create_branch, inspect_diff, run_checks, request_approval, push_branch, create_change_request. All remote write operations strictly require explicit human approval via approval tickets.",
+  "description": "Unified interface for interacting with Git repositories. WORKFLOW: 1. Call 'create_workspace' with 'repository_id'. 2. Edit files locally. 3. Call 'request_approval' with the 'workspace_id' returned from step 1. Do NOT use http_fetch or bash for Git operations. All remote writes require explicit human approval via the UI.",
   "category": "system",
   "safety_level": "safe",
   "is_builtin": true,
@@ -12,6 +12,7 @@
       "action": {
         "type": "string",
         "enum": [
+          "create_workspace",
           "list_repositories",
           "read_file",
           "create_branch",
@@ -21,25 +22,25 @@
           "push_branch",
           "create_change_request"
         ],
-        "description": "The source-control action to execute. Aliases accepted: 'list_repos', 'read', 'branch', 'diff', 'checks', 'approve', 'push', 'pr', 'create_pr'."
+        "description": "The source-control action to execute."
       },
       "params": {
         "type": "object",
-        "description": "Optional structured parameter bag for the action. Any of the parameters below may also be passed directly as top-level fields.",
+        "description": "Optional structured parameter bag.",
         "additionalProperties": true
       },
       "repository_id": {
         "type": "string",
-        "description": "Stable provider repository identifier (required for list/read actions and as the target of pushes and change requests)."
+        "description": "Stable provider repository identifier (e.g., 'owner/repo'). Required for 'create_workspace'."
       },
       "provider": {
         "type": "string",
         "enum": ["github", "gitlab", "bitbucket"],
-        "description": "Provider to use. Defaults to the only connected provider."
+        "description": "Provider to use. Defaults to 'github'."
       },
       "account_id": {
         "type": "string",
-        "description": "Optional stable account ID when multiple accounts are connected for the same provider."
+        "description": "Optional stable account ID."
       },
       "file_path": {
         "type": "string",
@@ -47,11 +48,11 @@
       },
       "ref": {
         "type": "string",
-        "description": "Branch, tag, or commit SHA to read from (optional for 'read_file'; defaults to default branch)."
+        "description": "Branch, tag, or commit SHA to read from."
       },
       "workspace_id": {
         "type": "string",
-        "description": "Local workspace ID (required for 'create_branch', 'inspect_diff', 'run_checks', 'push_branch')."
+        "description": "Local workspace ID returned by 'create_workspace'. Required for 'create_branch', 'inspect_diff', 'run_checks', and 'request_approval'."
       },
       "branch_name": {
         "type": "string",
@@ -59,32 +60,39 @@
       },
       "from_sha": {
         "type": "string",
-        "description": "Optional starting commit SHA for 'create_branch'; defaults to HEAD."
+        "description": "Optional starting commit SHA for 'create_branch'."
       },
       "base_sha": {
         "type": "string",
-        "description": "Base commit SHA to diff against (optional for 'inspect_diff')."
+        "description": "Base commit SHA to diff against."
       },
       "include_patch": {
         "type": "boolean",
-        "description": "Include per-file unified diff text in 'inspect_diff' output (default: true)."
+        "description": "Include per-file diff text in 'inspect_diff' output."
       },
       "checks": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "Names of pre-registered checks to run (required for 'run_checks')."
+        "description": "Names of pre-registered checks to run."
       },
       "fail_fast": {
         "type": "boolean",
-        "description": "Stop after the first failing check (default: true)."
+        "description": "Stop after the first failing check."
       },
       "operation_id": {
         "type": "string",
-        "description": "Operation ID (required for 'request_approval', 'push_branch', 'create_change_request')."
+        "description": "Operation ID. Required for 'push_branch' and 'create_change_request'. Optional for 'request_approval' if 'workspace_id' is provided."
+      },
+      "operation": {
+        "type": "string",
+        "enum": ["push_branch", "create_change_request"],
+        "default": "push_branch",
+        "description": "The operation to request approval for. Defaults to 'push_branch'."
       },
       "target_branch": {
         "type": "string",
-        "description": "Target branch (required for 'request_approval'; used for 'create_change_request')."
+        "default": "main",
+        "description": "Target branch (required for 'request_approval'). Defaults to 'main'."
       },
       "approval_id": {
         "type": "string",
@@ -92,11 +100,11 @@
       },
       "remote": {
         "type": "string",
-        "description": "Remote name (optional for 'push_branch'; default: 'origin')."
+        "description": "Remote name (optional for 'push_branch')."
       },
       "local_branch": {
         "type": "string",
-        "description": "Local branch to push (optional for 'push_branch'; defaults to operation's source branch)."
+        "description": "Local branch to push."
       },
       "source_branch": {
         "type": "string",
@@ -104,15 +112,16 @@
       },
       "title": {
         "type": "string",
-        "description": "Change-request title (required for 'create_change_request')."
+        "description": "Change-request title. ONLY used for 'create_change_request'."
       },
       "body": {
         "type": "string",
-        "description": "Change-request description (optional for 'create_change_request')."
+        "description": "Change-request description. ONLY used for 'create_change_request'."
       },
       "draft": {
         "type": "boolean",
-        "description": "Create as draft change request (optional for 'create_change_request'; default: true)."
+        "default": true,
+        "description": "Create as draft change request. ONLY used for 'create_change_request'."
       }
     },
     "required": ["action"]

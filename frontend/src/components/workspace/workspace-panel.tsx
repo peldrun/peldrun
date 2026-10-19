@@ -23,7 +23,9 @@ import {
   Download,
   Loader2,
   RefreshCw,
+  GitBranch,
 } from "lucide-react";
+import { SourceControlPanel } from "@/features/source-control/components/SourceControlPanel";
 import { Button } from "@/components/ui/button";
 import { PreviewTab } from "@/components/workspace/preview-tab";
 import { FilesTab } from "@/components/workspace/files-tab";
@@ -31,7 +33,7 @@ import { ArtifactsTab } from "@/components/workspace/artifacts-tab";
 import { LogsTab } from "@/components/workspace/logs-tab";
 import { EditorTab } from "@/components/workspace/editor-tab";
 
-export type TabId = "preview" | "files" | "artifacts" | "logs" | "editor";
+export type TabId = "preview" | "files" | "artifacts" | "logs" | "editor" | "source-control";
 
 export interface WorkspaceFileItem {
   name: string;
@@ -233,7 +235,7 @@ export function WorkspacePanel({
         } else {
           handleAutoArtifact(targetFile);
         }
-      } else if (targetTab && ["preview", "files", "artifacts", "logs", "editor"].includes(targetTab)) {
+      } else if (targetTab && ["preview", "files", "artifacts", "logs", "editor", "source-control"].includes(targetTab)) {
         if (isUserAction || targetTab === "preview" || targetTab === "artifacts") {
           setActiveTab(targetTab as TabId);
         }
@@ -302,6 +304,7 @@ export function WorkspacePanel({
     { id: "preview", label: "Preview", icon: <Monitor size={14} /> },
     { id: "files", label: "Files", icon: <FolderTree size={14} /> },
     { id: "artifacts", label: "Artifacts", icon: <Package size={14} /> },
+    { id: "source-control", label: "Source Control", icon: <GitBranch size={14} /> },
     { id: "logs", label: "Logs", icon: <TerminalSquare size={14} /> },
     ...(selectedFilePath || draftContent
       ? [{ id: "editor" as TabId, label: "Editor", icon: <FileCode2 size={14} /> }]
@@ -395,6 +398,9 @@ export function WorkspacePanel({
             chatId={activeChatId}
             selectedFile={selectedFilePath}
           />
+        )}
+        {activeTab === "source-control" && (
+          <SourceControlPanel />
         )}
         {activeTab === "logs" && (
           <LogsTab

@@ -134,6 +134,7 @@ try:
         RejectOperationRequest,
         RepositoryResponse,
         RunChecksRequest,
+        SaveProviderConfigRequest,
         ValidateConnectionRequest,
         WorkspaceResponse,
     )
@@ -245,6 +246,10 @@ _DEFAULT_OAUTH_REDIRECT = "http://127.0.0.1:8765/oauth/callback"
 #: contains only non-secret metadata (provider, account ID, base URL,
 #: username); tokens live in the OS credential vault.
 _CONNECTIONS_FILE_NAME = "connections.json"
+
+#: Name of the file that stores the user-provided OAuth Client IDs.
+#: Client Secrets are NEVER stored here; they go to the OS Vault.
+_PROVIDER_CONFIG_FILE_NAME = "provider_configs.json"
 
 #: Maximum number of bytes returned to the UI when reading a file.
 #: This is a byte budget, NOT a character budget: multi-byte UTF-8
@@ -406,6 +411,13 @@ class SourceControlFacade:
         resolved_base.mkdir(parents=True, exist_ok=True)
         self._workspace_root = resolved_base
 
+        # Centralized data directory for durable configs (keys, connections)
+        # This dynamically resolves the root `backend` directory, avoiding `backend/backend`.
+        # __file__ is `backend/omweb/services/source_control_facade.py`.
+        backend_root = Path(__file__).resolve().parent.parent.parent
+        self._data_root = backend_root / "data" / "source_control"
+        self._data_root.mkdir(parents=True, exist_ok=True)
+
         from backend.integrations.source_control.git.path_policy import (
             WorkspacePathPolicy,
         )
@@ -430,17 +442,104 @@ class SourceControlFacade:
         # OAuth
         self.oauth_coordinator = oauth_coordinator or OAuthFlowCoordinator()
 
+        # Register OAuth providers for all available adapters
+        self._register_default_oauth_providers()
+
         # Facade-private connection registry. This is NOT a secret
         # store: only identifiers and timestamps are kept here.
         self._connections: Dict[str, _ConnectionRecord] = {}
         self._load_connections()
+
+    def _register_default_oauth_providers(self) -> None:
+        """Register OAuth callbacks for built-in providers."""
+        try:
+            from backend.integrations.source_control.security.oauth_flow import (
+                OAuthProviderCallbacks,
+            )
+            from backend.integrations.source_control.security.token_service import (
+                TokenRefreshResult,
+            )
+        except ImportError:
+            from ...integrations.source_control.security.oauth_flow import (
+                OAuthProviderCallbacks,
+            )
+            from ...integrations.source_control.security.token_service import (
+                TokenRefreshResult,
+            )
+
+        # Register GitHub
+        try:
+            adapter = self.registry.get("github")
+            auth_service = adapter._get_auth_service()
+
+            def build_github_url(
+                provider: Any,
+                client_id: str,
+                redirect_uri: str,
+                state: str,
+                code_challenge: str,
+                scopes: Optional[Sequence[str]],
+            ) -> str:
+                return auth_service.build_authorization_url(
+                    client_id=client_id,
+                    redirect_uri=redirect_uri,
+                    state=state,
+                    scopes=scopes,
+                    code_challenge=code_challenge,
+                )
+
+            async def exchange_github_code(
+                provider: Any,
+                code: str,
+                code_verifier: str,
+                redirect_uri: str,
+                client_id: str,
+                base_url: Optional[str],
+                client_secret: Optional[str],
+            ) -> Any:
+                res = await auth_service.exchange_code_for_token(
+                    client_id=client_id,
+                    code=code,
+                    redirect_uri=redirect_uri,
+                    client_secret=client_secret,
+                    code_verifier=code_verifier,
+                )
+                from datetime import datetime, timedelta, timezone
+                expires_at = None
+                if res.expires_in:
+                    expires_at = datetime.now(timezone.utc) + timedelta(seconds=res.expires_in)
+
+                return TokenRefreshResult(
+                    access_token=res.access_token,
+                    refresh_token=res.refresh_token,
+                    expires_at=expires_at,
+                    scopes=res.granted_scopes,
+                )
+
+            async def resolve_github_account(
+                provider: Any,
+                token_result: Any,
+                base_url: Optional[str],
+            ) -> Any:
+                # Fetch real user data from GitHub
+                account = await auth_service.get_authenticated_account(token_result.access_token)
+                return account
+
+            callbacks = OAuthProviderCallbacks(
+                client_id="",
+                authorization_url_builder=build_github_url,
+                token_exchanger=exchange_github_code,
+            )
+            self.register_oauth_provider("github", callbacks, account_resolver=resolve_github_account)
+        except Exception as exc:
+            logger.warning("Failed to register GitHub OAuth callbacks: %s", exc)
 
     # ------------------------------------------------------------------
     # 1. Connection registry helpers
     # ------------------------------------------------------------------
 
     def _connections_path(self) -> Path:
-        return self._workspace_root / _CONNECTIONS_FILE_NAME
+        return self._data_root / _CONNECTIONS_FILE_NAME
 
     def _load_connections(self) -> None:
         """Load the persisted connection index, if present and readable."""
@@ -497,6 +596,39 @@ class SourceControlFacade:
         if record is not None:
             self._save_connections()
         return record
+
+    def _provider_config_path(self) -> Path:
+        return self._data_root / _PROVIDER_CONFIG_FILE_NAME
+
+    def _load_provider_configs(self) -> Dict[str, str]:
+        """Load the provider configs (Client IDs) from disk."""
+        path = self._provider_config_path()
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Failed to load provider configs: %s", type(exc).__name__)
+            return {}
+
+    def _save_provider_configs(self, configs: Dict[str, str]) -> None:
+        """Save the provider configs (Client IDs) to disk atomically."""
+        path = self._provider_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(configs, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def _is_provider_configured(self, provider_id: str) -> bool:
+        """Check if both Client ID (JSON) and Client Secret (Vault) exist."""
+        configs = self._load_provider_configs()
+        client_id = configs.get(provider_id)
+        if not client_id:
+            return False
+
+        secret_key = f"peldrun.sc.oauth_secret_{provider_id}"
+        secret = self.vault.get(secret_key)
+        return bool(secret)
 
     def _default_provider_id(self) -> ProviderId:
         """
@@ -725,6 +857,7 @@ class SourceControlFacade:
                     provider_id=pid_str,
                     display_name=pid_str.title() + " Cloud",
                     is_connected=self._get_connection(pid_str) is not None,
+                    is_configured=self._is_provider_configured(pid_str),
                     capabilities=caps_resp,
                     web_base_url=web_url,
                     api_base_url=api_url,
@@ -786,14 +919,93 @@ class SourceControlFacade:
                 provider_id, account_resolver
             )
 
+    async def get_provider_config(self, provider: str) -> dict:
+        """Retrieve the configured Client ID (Secret is never returned)."""
+        provider_id = provider.strip().lower()
+        configs = self._load_provider_configs()
+        client_id = configs.get(provider_id)
+        if not client_id:
+            raise NotFoundError(f"No configuration found for '{provider_id}'.")
+        return {"client_id": client_id, "is_configured": True}
+
+    async def delete_provider_config(self, provider: str) -> ActionSuccessResponse:
+        """Delete both the Client ID (JSON) and Client Secret (Vault)."""
+        provider_id = provider.strip().lower()
+
+        # 1. Delete from JSON
+        configs = self._load_provider_configs()
+        if provider_id in configs:
+            del configs[provider_id]
+            self._save_provider_configs(configs)
+
+        # 2. Delete from Vault
+        secret_key = f"peldrun.sc.oauth_secret_{provider_id}"
+        try:
+            self.vault.delete(secret_key)
+        except Exception as exc:
+            logger.warning("Failed to delete secret from vault: %s", exc)
+
+        self._audit(
+            AuditEventType.OTHER,
+            action="delete_provider_config",
+            message=f"OAuth credentials deleted for '{provider_id}'.",
+            payload={"provider": provider_id},
+            actor="user",
+        )
+
+        return ActionSuccessResponse(
+            message=f"Successfully deleted OAuth credentials for {provider_id.title()}."
+        )
+
+    async def save_provider_config(
+        self, provider: str, payload: SaveProviderConfigRequest
+    ) -> ActionSuccessResponse:
+        """
+        Save user-provided OAuth App credentials.
+        Client ID goes to JSON, Client Secret goes to Vault.
+        """
+        provider_id = provider.strip().lower()
+        self.registry.get(provider_id)
+
+        # 1. Save Client ID to JSON file
+        configs = self._load_provider_configs()
+        configs[provider_id] = payload.client_id
+        self._save_provider_configs(configs)
+
+        # 2. Save Client Secret to OS Vault
+        secret_key = f"peldrun.sc.oauth_secret_{provider_id}"
+        self.vault.put(secret_key, payload.client_secret)
+
+        self._audit(
+            AuditEventType.OTHER,
+            action="save_provider_config",
+            message=f"OAuth App credentials configured for '{provider_id}'.",
+            payload={"provider": provider_id},
+            actor="user",
+        )
+
+        return ActionSuccessResponse(
+            message=f"Successfully configured OAuth credentials for {provider_id.title()}."
+        )
+
     async def begin_connection(
         self, provider: str, payload: ConnectBeginRequest
     ) -> ConnectBeginResponse:
         """Start an OAuth 2.0 PKCE handshake and return the authorization URL."""
         provider_id = ProviderId(provider.strip().lower())
-
-        # Ensure the adapter exists.
         self.registry.get(provider_id.value)
+
+        # BYOK: Verify that the user has configured credentials
+        configs = self._load_provider_configs()
+        client_id = configs.get(provider_id.value)
+        secret_key = f"peldrun.sc.oauth_secret_{provider_id.value}"
+        client_secret = self.vault.get(secret_key)
+
+        if not client_id or not client_secret:
+            raise ValidationError(
+                f"OAuth credentials for '{provider_id.value}' are not configured. "
+                "Please provide Client ID and Secret first."
+            )
 
         scopes = getattr(payload, "scopes", None) or None
         redirect_uri = (
@@ -802,6 +1014,7 @@ class SourceControlFacade:
 
         result = self.oauth_coordinator.begin_authorization(
             provider_id,
+            client_id=client_id,
             scopes=scopes,
             redirect_uri=redirect_uri,
         )
@@ -843,11 +1056,24 @@ class SourceControlFacade:
             )
         redirect_uri = session.redirect_uri
 
+        # BYOK: Fetch credentials for the code exchange
+        configs = self._load_provider_configs()
+        client_id = configs.get(provider_id.value)
+        secret_key = f"peldrun.sc.oauth_secret_{provider_id.value}"
+        client_secret = self.vault.get(secret_key)
+
+        if not client_id or not client_secret:
+            raise ValidationError(
+                f"OAuth credentials for '{provider_id.value}' were deleted mid-flow."
+            )
+
         auth_result = await self.oauth_coordinator.complete_authorization(
             provider_id,
             state=state,
             code=code,
             redirect_uri=redirect_uri,
+            client_id=client_id,
+            client_secret=client_secret,
         )
 
         record = _ConnectionRecord(
@@ -1280,7 +1506,7 @@ class SourceControlFacade:
     # ------------------------------------------------------------------
 
     async def create_workspace(
-        self, payload: CreateWorkspaceRequest
+        self, payload: CreateWorkspaceRequest, chat_id: Optional[str] = None
     ) -> WorkspaceResponse:
         """Create an isolated local workspace bound to a real repository."""
         # Use the provider explicitly requested by the caller, falling
@@ -1311,11 +1537,18 @@ class SourceControlFacade:
         )
         self.policy_engine.require(policy_ctx)
 
+        target_path = None
+        if chat_id:
+            from pathlib import Path
+            # Use the chat's session files directory as the workspace
+            target_path = Path(os.getcwd()) / "storage" / "chats" / chat_id / "files"
+
         ws_ref = await self.workspace_manager.create_workspace(
             repo=repo,
             base_sha=getattr(payload, "base_sha", None),
             source_branch=getattr(payload, "branch_name", None),
             use_worktree=True,
+            target_path=target_path,
         )
 
         self._audit(

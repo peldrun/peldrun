@@ -52,6 +52,7 @@ from .requests import (
     PushBranchRequest,
     RejectOperationRequest,
     RunChecksRequest,
+    SaveProviderConfigRequest,
     ValidateConnectionRequest,
 )
 
@@ -88,6 +89,7 @@ __all__ = [
     # -----------------------------------------------------------------------
     "BaseSCRequest",
     "ConnectBeginRequest",
+    "SaveProviderConfigRequest",
     "ValidateConnectionRequest",
     "DisconnectRequest",
     "CreateWorkspaceRequest",

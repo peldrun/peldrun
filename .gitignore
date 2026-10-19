@@ -53,3 +53,5 @@ backend/data/*.tmp
 backend/storage/
 
 config/config.toml
+
+backend/data/source_control*

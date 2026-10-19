@@ -1,3 +1,5 @@
+# backend/omweb/routers/source_control.py
+
 """
 HTTP router for the Source Control Integration subsystem.
 
@@ -44,7 +46,8 @@ from __future__ import annotations
 import logging
 from typing import Any, NoReturn, Optional, Sequence
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Request
+from fastapi.responses import HTMLResponse
 
 # Resilient imports for source control subsystem
 try:
@@ -84,6 +87,7 @@ try:
         RejectOperationRequest,
         RepositoryResponse,
         RunChecksRequest,
+        SaveProviderConfigRequest,
         ValidateConnectionRequest,
         WorkspaceResponse,
     )
@@ -124,6 +128,7 @@ except (ImportError, ValueError):
         RejectOperationRequest,
         RepositoryResponse,
         RunChecksRequest,
+        SaveProviderConfigRequest,
         ValidateConnectionRequest,
         WorkspaceResponse,
     )
@@ -251,6 +256,25 @@ async def list_providers(
         handle_source_control_error(exc)
 
 
+@router.get("/connections/{provider}/redirect-uri")
+async def get_redirect_uri(
+    provider: str,
+    origin: Optional[str] = Query(default=None, description="The frontend origin (e.g., http://localhost:3000)"),
+    request: Request = None,
+):
+    """Dynamically returns the OAuth callback URI for the frontend."""
+    if origin:
+        base_url = origin.rstrip("/")
+    else:
+        # Fallback to the request headers if origin is not explicitly provided
+        scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+        host = request.headers.get("x-forwarded-host", request.headers.get("host", request.url.netloc))
+        base_url = f"{scheme}://{host}"
+
+    return {
+        "redirect_uri": f"{base_url}/api/source-control/oauth/callback/{provider}"
+    }
+
 @router.get("/connections", response_model=Sequence[ConnectionStatusResponse])
 async def list_connections(
     facade: SourceControlFacade = Depends(get_source_control_facade),
@@ -262,20 +286,78 @@ async def list_connections(
         handle_source_control_error(exc)
 
 
+@router.post("/connections/{provider}/config", response_model=ActionSuccessResponse)
+async def save_provider_config(
+    provider: str,
+    payload: SaveProviderConfigRequest,
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> ActionSuccessResponse:
+    """
+    Saves custom OAuth App credentials (Client ID & Secret) for a provider.
+    Required for local-first deployments where a central OAuth broker is not used.
+    """
+    try:
+        return await facade.save_provider_config(provider, payload)
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.get("/connections/{provider}/config")
+async def get_provider_config(
+    provider: str,
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+):
+    """Retrieve the configured Client ID (Secret is never returned)."""
+    try:
+        return await facade.get_provider_config(provider)
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.delete("/connections/{provider}/config", response_model=ActionSuccessResponse)
+async def delete_provider_config(
+    provider: str,
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> ActionSuccessResponse:
+    """Delete both the Client ID and Client Secret for a provider."""
+    try:
+        return await facade.delete_provider_config(provider)
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
 @router.post("/connections/{provider}/begin", response_model=ConnectBeginResponse)
 async def begin_connection(
     provider: str,
     payload: ConnectBeginRequest,
+    request: Request,
     facade: SourceControlFacade = Depends(get_source_control_facade),
 ) -> ConnectBeginResponse:
     """Initiates an OAuth 2.0 PKCE authentication handshake."""
     try:
+        # Construct the redirect URI based on the dynamically provided origin
+        if payload.origin:
+            base_url = payload.origin.rstrip("/")
+        else:
+            scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+            host = request.headers.get("x-forwarded-host", request.headers.get("host", request.url.netloc))
+            base_url = f"{scheme}://{host}"
+
+        # oauth_flow strictly requires 127.0.0.1 instead of localhost
+        if "localhost" in base_url:
+            base_url = base_url.replace("localhost", "127.0.0.1")
+
+        dynamic_redirect = f"{base_url}/api/source-control/oauth/callback/{provider}"
+
+        # Pass the dynamically generated URI to the facade
+        payload = payload.model_copy(update={"redirect_uri": dynamic_redirect})
+
         return await facade.begin_connection(provider, payload)
     except Exception as exc:
         handle_source_control_error(exc)
 
 
-@router.get("/oauth/callback/{provider}", response_model=ActionSuccessResponse)
+@router.get("/oauth/callback/{provider}", response_class=HTMLResponse)
 async def oauth_callback(
     provider: str,
     code: str = Query(
@@ -283,14 +365,37 @@ async def oauth_callback(
     ),
     state: str = Query(..., description="CSRF state parameter matching session."),
     facade: SourceControlFacade = Depends(get_source_control_facade),
-) -> ActionSuccessResponse:
+):
     """Handles OAuth 2.0 PKCE callback and exchanges code for tokens."""
     try:
-        return await facade.complete_oauth_callback(
+        result = await facade.complete_oauth_callback(
             provider, code=code, state=state
         )
+        return f"""
+        <html>
+            <body style="font-family: sans-serif; text-align: center; padding: 50px;">
+                <h2 style="color: #16a34a;">Successfully Connected!</h2>
+                <p>{result.message}</p>
+                <p>You can close this window and return to PELDRUN.</p>
+                <script>
+                    setTimeout(() => window.close(), 2000);
+                </script>
+            </body>
+        </html>
+        """
     except Exception as exc:
-        handle_source_control_error(exc)
+        return f"""
+        <html>
+            <body style="font-family: sans-serif; text-align: center; padding: 50px;">
+                <h2 style="color: #dc2626;">Connection Failed</h2>
+                <p>Please return to PELDRUN and try again.</p>
+                <p style="color: gray; font-size: 12px;">{str(exc)}</p>
+                <script>
+                    setTimeout(() => window.close(), 5000);
+                </script>
+            </body>
+        </html>
+        """
 
 
 @router.post(

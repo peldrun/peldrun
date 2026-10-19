@@ -46,7 +46,8 @@ Declared-but-unimplemented capabilities:
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
+from urllib.parse import quote
 
 from ...domain.enums import ProviderId
 from ...domain.models import (
@@ -239,14 +240,7 @@ class GitHubProviderAdapter(BaseSourceControlProvider):
         token: Optional[str] = None,
     ) -> RepositoryRef:
         """
-        Fetch repository metadata by its stable numeric ID.
-
-        GitHub exposes a dedicated endpoint (`GET /repositories/{id}`)
-        that accepts the numeric repository identifier directly. When
-        the underlying `GitHubRepositoryService` later grows a
-        matching method, it is used; otherwise the adapter calls the
-        endpoint itself and reuses the service's private payload
-        mapper, keeping the parsing logic centralized in one place.
+        Fetch repository metadata by its stable numeric ID or owner/repo path.
         """
         if not repository_id or not isinstance(repository_id, str):
             raise ValidationError(
@@ -258,6 +252,29 @@ class GitHubProviderAdapter(BaseSourceControlProvider):
                 "details."
             )
         service = self._get_repository_service()
+
+        # If it's a path like "owner/repo", use the standard endpoint
+        if "/" in repository_id:
+            client = self._get_client()
+            parts = repository_id.split("/", 1)
+            encoded = f"{quote(parts[0], safe='')}/{quote(parts[1], safe='')}"
+            payload = await client.get_json(
+                f"/repos/{encoded}", token=token
+            )
+            if not isinstance(payload, Mapping):
+                raise ProviderError(
+                    "GitHub returned an unexpected payload for the "
+                    "repository lookup.",
+                    details={"repository_id": repository_id},
+                )
+            mapper = getattr(service, "_map_repository", None)
+            if not callable(mapper):
+                raise UnsupportedCapabilityError(
+                    "Repository mapping is unavailable in the current "
+                    "service.",
+                    details={"provider": self.provider_id},
+                )
+            return mapper(payload)
 
         # Prefer the service method when it exists (forward-
         # compatible with a future `GitHubRepositoryService.
