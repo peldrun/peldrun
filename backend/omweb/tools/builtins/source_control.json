@@ -78,16 +78,24 @@
 
   "examples": [
     {
-      "input": { "action": "create_workspace", "repository_id": "owner/repo" },
-      "output_preview": "{ workspace_id: 'ws_...', workspace_path: '/tmp/ws_...' }"
+      "input": { "action": "create_workspace", "repository_id": "mtaman/mtaman" },
+      "output_preview": "{ workspace_id: 'ws_a1b2c3', workspace_path: 'C:/.../files' }"
     },
     {
-      "input": { "action": "request_approval", "workspace_id": "ws_...", "operation": "push_branch", "target_branch": "feature/x" },
-      "output_preview": "{ operation_id: 'op_...', approval_id: 'ap_...', status: 'review_required' }"
+      "input": { "action": "request_approval", "workspace_id": "ws_a1b2c3", "operation": "push_branch", "target_branch": "feature/readme-update" },
+      "output_preview": "{ operation_id: 'op_x9y8z7', approval_id: 'ap_q1w2e3', status: 'review_required' }"
     },
     {
-      "input": { "action": "list_operations", "status": "approved", "kind": "push_branch", "limit": 20 },
-      "output_preview": "[{ operation_id: 'op_...', kind: 'push_branch', status: 'approved' }]"
+      "input": { "action": "push_branch", "operation_id": "op_x9y8z7", "approval_id": "ap_q1w2e3" },
+      "output_preview": "{ status: 'pushed', branch_name: 'feature/readme-update', pushed_sha: 'abc123...' }"
+    },
+    {
+      "input": { "action": "request_approval", "workspace_id": "ws_a1b2c3", "operation": "create_change_request", "source_branch": "feature/readme-update", "target_branch": "main" },
+      "output_preview": "{ operation_id: 'op_r4t5y6', approval_id: 'ap_u7i8o9', status: 'review_required' }"
+    },
+    {
+      "input": { "action": "create_change_request", "operation_id": "op_r4t5y6", "approval_id": "ap_u7i8o9", "title": "Update README" },
+      "output_preview": "{ number_or_iid: '42', web_url: 'https://github.com/mtaman/mtaman/pull/42' }"
     }
   ],
   "usage_notes": "Follow the documented workflow: create_workspace before any file edit, request_approval before each remote side effect, and never reuse an approval ticket across different operations. On AUTH_REQUIRED / PERMISSION_DENIED / CONFLICT, stop immediately and call ask_human exactly once.",

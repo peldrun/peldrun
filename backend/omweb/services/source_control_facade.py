@@ -3055,6 +3055,32 @@ class SourceControlFacade:
                 "Creating a change request requires an approval ticket."
             )
 
+        # SECURITY: the request MUST target the same repository that
+        # the approval was issued for. Without this check, an agent
+        # could:
+        #   1. Ask the user to approve a PR on repository A (the
+        #      ticket binds to record.repository_id = A).
+        #   2. Then send payload.repository_id = B and payload.source_branch = x.
+        #   3. The ticket consumes successfully against A (because
+        #      the ticket's expected_repository_id matches A), but
+        #      `_resolve_repo` below resolves B, and
+        #      `adapter.create_change_request` opens the PR on B.
+        # The user has approved a side effect on A but a different
+        # side effect executes on B. This is a critical security bug.
+        # Reject any mismatch before the ticket is consumed.
+        requested_repo_id = getattr(payload, "repository_id", None)
+        if not requested_repo_id:
+            raise ValidationError(
+                "A change request requires `repository_id`."
+            )
+        if requested_repo_id != record.repository_id:
+            raise ValidationError(
+                f"Repository mismatch: the approval ticket was issued "
+                f"for '{record.repository_id}', but the request targets "
+                f"'{requested_repo_id}'. A ticket cannot be used to open "
+                f"a change request on a different repository."
+            )
+
         provider_id = ProviderId(
             (getattr(payload, "provider", None) or self._default_provider_id().value)
             .strip()

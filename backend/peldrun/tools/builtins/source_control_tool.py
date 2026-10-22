@@ -473,6 +473,103 @@ class SourceControlTool(BaseTool):
             metadata=call_params.pop("context_metadata", {}) or {},
         )
 
+        # 3b. Workflow guards.
+        #
+        # The agent (GigaChat in particular) frequently jumps directly
+        # to `push_branch` or `create_change_request` without first
+        # calling `request_approval`. The sub-tool's schema validation
+        # then rejects with a generic "Missing required input field(s)"
+        # message that does NOT explain how to obtain the IDs, so the
+        # model loops (retries the same call, or falls back to
+        # `ask_human`). These guards intercept the pattern at the
+        # dispatcher level and return a specific, actionable
+        # instruction for the correct next action.
+        if canonical_action == "push_branch":
+            if not call_params.get("operation_id") or not call_params.get("approval_id"):
+                return ToolResult(
+                    output=(
+                        "WORKFLOW VIOLATION: `push_branch` requires "
+                        "`operation_id` and `approval_id`, and these IDs "
+                        "are NOT supplied by you. They come ONLY from "
+                        "`request_approval`. Do this now:\n"
+                        "\n"
+                        "STEP 1 — call:\n"
+                        "  source_control(\n"
+                        "    action='request_approval',\n"
+                        "    workspace_id='<the workspace_id from create_workspace>',\n"
+                        "    operation='push_branch',\n"
+                        "    target_branch='<the branch you want to push>'\n"
+                        "  )\n"
+                        "\n"
+                        "STEP 2 — the tool returns:\n"
+                        "  { operation_id: 'op_...', approval_id: 'ap_...', status: 'review_required' }\n"
+                        "\n"
+                        "STEP 3 — STOP. Tell the user: 'Please approve the "
+                        "changes in the PELDRUN UI.' Then wait for the next turn.\n"
+                        "\n"
+                        "STEP 4 — after the user approves, call:\n"
+                        "  source_control(\n"
+                        "    action='push_branch',\n"
+                        "    operation_id='<from step 2>',\n"
+                        "    approval_id='<from step 2>'\n"
+                        "  )\n"
+                        "\n"
+                        "Do NOT ask the user for permission in chat; the UI handles it. "
+                        "Do NOT retry `push_branch` without both IDs."
+                    ),
+                    is_error=True,
+                    exit_code=1,
+                    metadata={
+                        "action": "push_branch",
+                        "error_type": "WorkflowViolation",
+                        "error_code": "REQUEST_APPROVAL_REQUIRED_FIRST",
+                    },
+                )
+
+        if canonical_action == "create_change_request":
+            if not call_params.get("operation_id") or not call_params.get("approval_id"):
+                return ToolResult(
+                    output=(
+                        "WORKFLOW VIOLATION: `create_change_request` requires "
+                        "`operation_id` and `approval_id`, and these IDs are "
+                        "NOT supplied by you. They come ONLY from "
+                        "`request_approval`. Do this now:\n"
+                        "\n"
+                        "STEP 1 — call:\n"
+                        "  source_control(\n"
+                        "    action='request_approval',\n"
+                        "    workspace_id='<the workspace_id>',\n"
+                        "    operation='create_change_request',\n"
+                        "    source_branch='<the branch you already pushed>',\n"
+                        "    target_branch='main'\n"
+                        "  )\n"
+                        "\n"
+                        "STEP 2 — the tool returns:\n"
+                        "  { operation_id: 'op_...', approval_id: 'ap_...', status: 'review_required' }\n"
+                        "\n"
+                        "STEP 3 — STOP. Tell the user to approve the PR in the UI. "
+                        "Wait for the next turn.\n"
+                        "\n"
+                        "STEP 4 — after the user approves, call:\n"
+                        "  source_control(\n"
+                        "    action='create_change_request',\n"
+                        "    operation_id='<from step 2>',\n"
+                        "    approval_id='<from step 2>',\n"
+                        "    title='<the PR title>'\n"
+                        "  )\n"
+                        "\n"
+                        "Do NOT ask the user for permission in chat. "
+                        "A push approval CANNOT be reused for a PR."
+                    ),
+                    is_error=True,
+                    exit_code=1,
+                    metadata={
+                        "action": "create_change_request",
+                        "error_type": "WorkflowViolation",
+                        "error_code": "REQUEST_APPROVAL_REQUIRED_FIRST",
+                    },
+                )
+
         # 4. Dispatch.
         try:
             subtool = self._get_subtool(canonical_action)
