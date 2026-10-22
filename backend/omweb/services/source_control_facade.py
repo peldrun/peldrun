@@ -1222,15 +1222,29 @@ class SourceControlFacade:
             pass
 
         # Fallback: list and filter.
+        #
+        # Use `page_size=30`, matching what the working
+        # `GET /repositories` endpoint uses. Some adapter versions
+        # validate `page_size` strictly and reject `page_size=100`
+        # with a `ValidationError` that the previous `except
+        # Exception: pass` swallowed silently — leaving `listing`
+        # empty and producing a misleading "could not be resolved"
+        # 404 even when the repository was right there in the
+        # default listing.
+        #
+        # The exception is logged at WARNING (not DEBUG) so that a
+        # future occurrence is visible in the server log instead of
+        # silently degrading the endpoint.
         try:
             listing = await adapter.list_repositories(
-                page=1, page_size=100, token=token
+                page=1, page_size=30, token=token
             )
         except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "list_repositories fallback for '%s' failed: %s",
+            logger.warning(
+                "list_repositories fallback for '%s' failed: %s: %s",
                 repository_id,
                 type(exc).__name__,
+                exc,
             )
             listing = ()
 
@@ -4294,13 +4308,22 @@ class SourceControlFacade:
             adapter, repository_id, provider_id, token
         )
 
+        # `all` is a valid filter at the GitHub API level but is NOT
+        # a member of `ChangeRequestState` (which only models the
+        # states of an individual PR). Map it to `None` so the
+        # service falls back to its default `state=all` query and the
+        # client-side filter is skipped entirely. Without this
+        # special case, `?state=all` — a natural thing for the UI to
+        # send when the user clicks the "All" filter — produced a
+        # 422 and the request never reached the service.
         state_enum: Optional[ChangeRequestState] = None
-        if state:
+        if state and state.strip().lower() != "all":
             try:
                 state_enum = ChangeRequestState(state.strip().lower())
             except ValueError:
                 raise ValidationError(
-                    f"Unknown PR state '{state}'.",
+                    f"Unknown PR state '{state}'. "
+                    "Valid values are: open, closed, merged, draft, all.",
                     details={"state": state},
                 )
 
@@ -4315,10 +4338,20 @@ class SourceControlFacade:
         )
 
         items = [self._to_pull_request_response(pr) for pr in prs]
+        # The response echoes back the requested state filter, not
+        # the internal enum. When the caller passes `state="all"`,
+        # `state_enum` is intentionally None (there is no "all"
+        # member in ChangeRequestState), but the response must
+        # still say "all" so the UI can display the active filter
+        # correctly. Falling back to the raw input also handles the
+        # `state=None` case (returns "open", the natural default).
+        response_state = (
+            state.strip().lower() if state else "open"
+        )
         return PullRequestListResponse(
             items=tuple(items),
             total=len(items),
-            state=(state_enum.value if state_enum else "open"),
+            state=response_state,
         )
 
     async def get_pull_request(
