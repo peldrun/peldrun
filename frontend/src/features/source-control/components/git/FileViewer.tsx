@@ -1,8 +1,7 @@
 // frontend/src/features/source-control/components/git/FileViewer.tsx
 
 import React, { useEffect, useState } from "react";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { Highlight, themes } from "prism-react-renderer";
 import { AlertCircle, FileText } from "lucide-react";
 import { sourceControlClient } from "../../api/source-control-client";
 import type { FileContentAtRefResponse } from "../../api/schemas";
@@ -107,7 +106,7 @@ export function FileViewer({ workspaceId, ref, path }: FileViewerProps) {
       )}
 
       {/* Body */}
-      <div className="flex-1 overflow-auto">
+      <div className="flex-1 overflow-auto ">
         {loading && (
           <div className="p-4 text-xs text-muted-foreground">
             Loading file…
@@ -129,27 +128,55 @@ export function FileViewer({ workspaceId, ref, path }: FileViewerProps) {
         )}
 
         {!loading && !error && data && !data.is_binary && (
-          <SyntaxHighlighter
+          <Highlight
+            theme={themes.vsDark}
+            code={data.content ?? ""}
             language={language}
-            style={vscDarkPlus}
-            showLineNumbers
-            wrapLongLines={false}
-            customStyle={{
-              margin: 0,
-              padding: "1rem",
-              background: "transparent",
-              fontSize: "0.8125rem",
-              lineHeight: "1.5",
-            }}
-            lineNumberStyle={{
-              minWidth: "2.5em",
-              paddingRight: "1em",
-              color: "rgba(148, 163, 184, 0.5)",
-              userSelect: "none",
-            }}
           >
-            {data.content ?? ""}
-          </SyntaxHighlighter>
+            {({ className, style, tokens, getLineProps, getTokenProps }) => (
+              <pre
+                className={className}
+                style={{
+                  ...style,
+                  margin: 0,
+                  padding: "1rem",
+                  fontSize: "0.8125rem",
+                  lineHeight: "1.5",
+                  overflowX: "auto",
+                }}
+              >
+                {tokens.map((line, i) => {
+                  const lineProps = getLineProps({ line });
+                  return (
+                    <div
+                      key={i}
+                      {...lineProps}
+                      style={{ ...lineProps.style, display: "flex" }}
+                    >
+                      <span
+                        style={{
+                          minWidth: "2.5em",
+                          paddingRight: "1em",
+                          color: "rgba(148, 163, 184, 0.5)",
+                          userSelect: "none",
+                          textAlign: "right",
+                          flexShrink: 0,
+                        }}
+                      >
+                        {i + 1}
+                      </span>
+                      <span style={{ flex: 1 }}>
+                        {line.map((token, key) => {
+                          const tokenProps = getTokenProps({ token });
+                          return <span key={key} {...tokenProps} />;
+                        })}
+                      </span>
+                    </div>
+                  );
+                })}
+              </pre>
+            )}
+          </Highlight>
         )}
 
         {!loading && !error && !data && (

@@ -13,8 +13,7 @@ import { ApprovalDialog } from "./ApprovalDialog";
 import { OperationTimeline } from "./OperationTimeline";
 import { ManualModePanel } from "./manual/ManualModePanel";
 import { GitBrowserPanel } from "./git/GitBrowserPanel";
-import { GitPullRequest, AlertCircle } from "lucide-react";
-
+import { GitPullRequest, AlertCircle, Loader2 } from "lucide-react";
 export interface SourceControlPanelProps {
   chatId?: string;
 }
@@ -155,7 +154,7 @@ export function SourceControlPanel({
           <ManualModePanel />
         </div>
         <div className={mode === "browse" ? "h-full" : "hidden"}>
-          <BrowsePanel />
+          <BrowsePanel chatId={resolvedChatId} />
         </div>
       </div>
     </div>
@@ -166,34 +165,159 @@ export function SourceControlPanel({
 // Browse panel (Repository Browser / History / Branches)
 // ----------------------------------------------------------------------
 
+type BrowseResolveState =
+  | { status: "loading" }
+  | {
+      status: "ready";
+      workspaceId: string;
+      repositoryId: string;
+      provider: string;
+      currentBranch: string;
+    }
+  | { status: "empty"; reason: "no-chat" | "no-workspace" };
+
 /**
  * Mounted only when the user selects the Browse tab.
  *
- * The wrapper resolves the workspace / repository from the currently
- * attached operation. When no operation is active, it shows a
- * placeholder rather than attempting to guess which workspace to
- * browse; the Agent and Manual flows are the intended paths for
- * attaching an operation.
+ * The wrapper resolves the workspace from two sources, in priority
+ * order:
+ *
+ *   1. The active source-control operation (set when the user
+ *      clicked "Open Review & Approve" in Agent Mode).
+ *   2. The chat's own workspace, resolved via `getWorkspaceByChat`.
+ *      This is the path Manual Mode uses, and it is what allows
+ *      Browse to work without going through the Agent flow.
+ *
+ * While resolving, a loading spinner is shown instead of the
+ * "No workspace" placeholder. This avoids the confusing flash of
+ * "empty" content that the previous implementation produced on
+ * every mount, and it also prevents a race where the user clicks
+ * Browse before the operation state has settled.
+ *
+ * DESIGN — why call `getWorkspace` even when activeOperation exists:
+ *   `activeOperation.target_branch` is the operation's TARGET
+ *   branch, not necessarily the workspace's CURRENT branch. The
+ *   two coincide for a push operation but can diverge for other
+ *   kinds. Asking the workspace for its real `current_branch`
+ *   guarantees BranchManager highlights the correct branch.
  */
-function BrowsePanel() {
+function BrowsePanel({ chatId }: { chatId: string | null }) {
+  const [state, setState] = useState<BrowseResolveState>({
+    status: "loading",
+  });
   const activeOperation = useSourceControlStore(
     (s) => s.activeOperation
   );
+  const [reloadKey, setReloadKey] = useState(0);
 
-  if (
-    !activeOperation?.workspace_id ||
-    !activeOperation?.repository_id
-  ) {
+  useEffect(() => {
+    let cancelled = false;
+
+    async function resolve() {
+      if (cancelled) return;
+      setState({ status: "loading" });
+
+      // Strategy 1: an active operation, if it has a workspace.
+      if (activeOperation?.workspace_id) {
+        try {
+          const ws = await sourceControlClient.getWorkspace(
+            activeOperation.workspace_id
+          );
+          if (cancelled) return;
+          setState({
+            status: "ready",
+            workspaceId: ws.workspace_id,
+            repositoryId:
+              ws.repository_id || activeOperation.repository_id || "",
+            provider: activeOperation.provider || "github",
+            currentBranch:
+              ws.current_branch ||
+              activeOperation.target_branch ||
+              "main",
+          });
+          return;
+        } catch (err) {
+          console.warn(
+            "[BrowsePanel] getWorkspace failed; falling back to chat lookup:",
+            err
+          );
+          // Fall through to the chat-scoped strategy.
+        }
+      }
+
+      // Strategy 2: chat-scoped workspace (Manual Mode, or a
+      // workspace created by an earlier agent run on this chat).
+      if (chatId) {
+        try {
+          const ws = await sourceControlClient.getWorkspaceByChat(
+            chatId
+          );
+          if (cancelled) return;
+          if (ws?.workspace_id && ws?.repository_id) {
+            setState({
+              status: "ready",
+              workspaceId: ws.workspace_id,
+              repositoryId: ws.repository_id,
+              provider: "github",
+              currentBranch: ws.current_branch || "main",
+            });
+            return;
+          }
+        } catch (err) {
+          console.warn(
+            "[BrowsePanel] getWorkspaceByChat failed:",
+            err
+          );
+        }
+      }
+
+      if (cancelled) return;
+
+      // No workspace anywhere: give the user a clear next step.
+      setState({
+        status: "empty",
+        reason: chatId ? "no-workspace" : "no-chat",
+      });
+    }
+
+    resolve();
+    return () => {
+      cancelled = true;
+    };
+  }, [chatId, activeOperation?.operation_id, reloadKey]);
+
+  if (state.status === "loading") {
+    return (
+      <div className="flex items-center justify-center h-full p-8">
+        <div className="flex flex-col items-center gap-3 text-muted-foreground">
+          <Loader2 className="w-6 h-6 animate-spin text-primary" />
+          <p className="text-xs">Loading workspace…</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (state.status === "empty") {
     return (
       <div className="flex items-center justify-center h-full p-8 text-center text-muted-foreground">
         <div>
           <h3 className="text-sm font-semibold text-foreground">
-            No active workspace
+            {state.reason === "no-chat"
+              ? "No chat selected"
+              : "No workspace found for this chat"}
           </h3>
           <p className="text-xs mt-2 max-w-sm leading-relaxed">
-            Start a source control operation to browse the
-            repository files, history, and branches.
+            {state.reason === "no-chat"
+              ? "Open a chat that has a source-control workspace to browse its repository."
+              : "Use Manual Mode to create a workspace, or ask the Agent to start a task that touches this repository."}
           </p>
+          <button
+            type="button"
+            onClick={() => setReloadKey((k) => k + 1)}
+            className="mt-3 text-xs px-3 py-1.5 rounded border border-border hover:bg-muted"
+          >
+            Retry
+          </button>
         </div>
       </div>
     );
@@ -201,10 +325,10 @@ function BrowsePanel() {
 
   return (
     <GitBrowserPanel
-      workspaceId={activeOperation.workspace_id}
-      repositoryId={activeOperation.repository_id}
-      provider={activeOperation.provider}
-      currentBranch={activeOperation.target_branch || "main"}
+      workspaceId={state.workspaceId}
+      repositoryId={state.repositoryId}
+      provider={state.provider}
+      currentBranch={state.currentBranch}
     />
   );
 }
