@@ -69,13 +69,22 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         backend_dir = Path(__file__).resolve().parent.parent.parent
+        storage_dir = backend_dir / "storage"
+        self.backend_dir = backend_dir
+        self.storage_dir = storage_dir
         self.builtins_dir = Path(__file__).resolve().parent / "builtins"
-        self.custom_tools_dir = backend_dir / "storage" / "store" / "tools" / "custom"
+        self.custom_tools_dir = storage_dir / "store" / "tools" / "custom"
         self.custom_tools_dir.mkdir(parents=True, exist_ok=True)
-        self.state_file = backend_dir / "storage" / "store" / "tools" / "tools_state.json"
+        self.state_file = storage_dir / "store" / "tools" / "tools_state.json"
         self._builtin_tools: Dict[str, Dict[str, Any]] = self._init_builtin_tools()
         self._loaded_custom_instances: Dict[str, SovereignBaseTool] = {}
         self._bundle_manager: Optional["BundleManager"] = None
+
+        # M7.5: Centralized per-tool settings (schema validation + atomic I/O).
+        # NOTE: ToolSettingsManager expects the storage root (i.e. backend/storage),
+        # not the backend root, so that bundle settings align with BundleStorage.
+        from omweb.tools.settings_manager import ToolSettingsManager
+        self.settings_manager = ToolSettingsManager(storage_dir)
 
     # ── Bundle manager wiring ──────────────────────────────────────────────
 
@@ -143,6 +152,113 @@ class ToolRegistry:
             )
         except Exception as e:
             print(f"[TOOL REGISTRY ERROR] Could not save tool states: {e}")
+
+    # ── Tool settings (M7.5) ───────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_schema_from_manifest(
+        manifest: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Extract the settings schema from a manifest dict.
+
+        Two conventions coexist in PELDRUN:
+          1. ``settings.schema``  (nested)     — used by built-in manifests
+             shipped under ``builtins/*.json``.
+          2. ``settings_schema``  (top-level)  — used by bundle manifests
+             and the M7.x contract.
+
+        Both are checked in priority order. A schema whose ``properties``
+        map is missing or empty is treated as "not configurable" (returns
+        ``None``) so that tools like ``source_control`` and ``web_search``
+        — which declare ``{"type": "object", "properties": {}}`` — return
+        404 from ``GET /tools/{id}/settings`` instead of an empty modal.
+        """
+        if not isinstance(manifest, dict):
+            return None
+
+        # Priority 1: nested settings.schema
+        settings_block = manifest.get("settings")
+        if isinstance(settings_block, dict):
+            nested = settings_block.get("schema")
+            if isinstance(nested, dict):
+                props = nested.get("properties")
+                if isinstance(props, dict) and props:
+                    return nested
+                return None  # empty properties -> not configurable
+
+        # Priority 2: top-level settings_schema
+        top_level = manifest.get("settings_schema")
+        if isinstance(top_level, dict):
+            props = top_level.get("properties")
+            if isinstance(props, dict) and props:
+                return top_level
+            return None  # empty properties -> not configurable
+
+        return None
+
+    def get_tool_settings_schema(self, tool_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Return the settings schema for a tool, or None if it is not
+        configurable.
+
+        Sources (priority order):
+          1. Built-in manifests loaded into ``_builtin_tools``.
+          2. Bundle ``manifest.json`` read directly from the active blob.
+
+        A tool is considered *configurable* only when its schema declares
+        at least one property. Empty schemas yield ``None`` so the API
+        returns 404 and the frontend hides the Settings button.
+        """
+        # 1. Built-in tools
+        if tool_id in self._builtin_tools:
+            return self._extract_schema_from_manifest(self._builtin_tools[tool_id])
+
+        # 2. Bundle tools (read raw manifest from the active blob)
+        if self._bundle_manager is not None:
+            entry = self._bundle_manager.get_bundle(tool_id)
+            if entry is not None:
+                try:
+                    blob_dir = self._bundle_manager.storage.blob_dir(entry.active_hash)
+                    manifest_file = blob_dir / "manifest.json"
+                    if manifest_file.is_file():
+                        data = json.loads(manifest_file.read_text(encoding="utf-8"))
+                        return self._extract_schema_from_manifest(data)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to read settings schema for bundle %s: %s",
+                        tool_id, exc,
+                    )
+        return None
+
+    def get_tool_settings(self, tool_id: str) -> Dict[str, Any]:
+        """Return settings merged with schema defaults (empty if not configurable)."""
+        schema = self.get_tool_settings_schema(tool_id)
+        if not schema:
+            return {}
+        is_bundle = (
+            self._bundle_manager is not None
+            and self._bundle_manager.get_bundle(tool_id) is not None
+        )
+        return self.settings_manager.get_settings(tool_id, schema, is_bundle)
+
+    def save_tool_settings(
+        self, tool_id: str, values: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Validate and persist user settings for a tool.
+
+        Raises:
+            ValueError: if the tool has no schema or the values fail validation.
+        """
+        schema = self.get_tool_settings_schema(tool_id)
+        if not schema:
+            raise ValueError(f"Tool '{tool_id}' has no settings schema.")
+        is_bundle = (
+            self._bundle_manager is not None
+            and self._bundle_manager.get_bundle(tool_id) is not None
+        )
+        return self.settings_manager.save_settings(tool_id, values, schema, is_bundle)
 
     # ── Legacy custom tool loading ─────────────────────────────────────────
 
@@ -271,6 +387,14 @@ class ToolRegistry:
                     "tags": list(entry.tags),
                     "parameters": {"type": "object", "properties": {}, "required": []},
                     "source": "bundle",
+                    # Expose the settings_schema (or None) so the frontend
+                    # can decide whether to render the gear button WITHOUT
+                    # an extra round-trip to /tools/{id}/settings. For
+                    # bundles, get_tool_settings_schema reads the manifest
+                    # from the active blob. For built-in and custom JSON
+                    # tools the "settings" field is already present in the
+                    # raw manifest and takes precedence in the frontend.
+                    "settings_schema": self.get_tool_settings_schema(entry.id),
                 }
 
         return list(results.values())
@@ -310,6 +434,16 @@ class ToolRegistry:
             cached = self._loaded_custom_instances[tool_id]
             if workspace_root is not None:
                 self._apply_workspace_root(cached, workspace_root)
+            # M7.10: Refresh settings on cache hit so user updates take effect
+            # without requiring a process restart. Only tools that expose
+            # ``set_settings`` (i.e. bundles) are touched.
+            if hasattr(cached, "set_settings") and callable(cached.set_settings):
+                try:
+                    cached.set_settings(self.get_tool_settings(tool_id))
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to refresh settings for %s: %s", tool_id, exc
+                    )
             return cached
 
         # 2 & 3. Legacy file-based lookup
@@ -386,6 +520,16 @@ class ToolRegistry:
                 exc,
             )
             return None
+
+        # M7.10: Inject user settings into the bundle tool if it supports them.
+        if hasattr(instance, "set_settings") and callable(instance.set_settings):
+            try:
+                instance.set_settings(self.get_tool_settings(entry.id))
+            except Exception as exc:
+                logger.warning(
+                    "Failed to inject settings into bundle %s: %s",
+                    entry.id, exc,
+                )
 
         self._loaded_custom_instances[entry.id] = instance
         return instance

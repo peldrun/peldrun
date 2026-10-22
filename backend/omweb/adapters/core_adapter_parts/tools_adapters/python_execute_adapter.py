@@ -35,7 +35,7 @@ from __future__ import annotations
 import logging
 import sys
 import uuid
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from peldrun.tools.builtins.isolated_shell import (
     IsolatedShellTool as IsolatedPythonTool,
@@ -56,6 +56,8 @@ logger = logging.getLogger("omweb.adapters.tools_adapters.python_execute")
 def create_python_executor(
     workspace_dir: WorkspacePathType = None,
     timeout: float = 60.0,
+    *,
+    settings: Optional[Dict[str, Any]] = None,
     **kwargs: Any,
 ) -> Callable[..., Awaitable[ToolResult]]:
     """
@@ -64,10 +66,29 @@ def create_python_executor(
 
     The returned callable accepts ``code`` (Python source) and optional
     ``timeout_seconds``, and returns a canonical ``ToolResult``.
+
+    M7.8: ``settings`` is provided by ``resolve_tool_runtime`` when the
+    adapter declares ``requires_context={"settings"}``. It carries the
+    ``timeout_seconds`` and ``max_output_chars`` values from the
+    ``python_execute`` manifest and is forwarded to ``IsolatedShellTool``.
     """
     ws_path = _resolve_workspace_path(workspace_dir)
-    py_tool = IsolatedPythonTool(workspace_root=str(ws_path))
+    py_tool = IsolatedPythonTool(
+        workspace_root=str(ws_path),
+        settings=settings or {},
+        default_timeout=timeout,
+    )
     python_exe = sys.executable or "python"
+
+    # Pre-compute the settings-level timeout so the execution policy's
+    # outer budget can be sized correctly even when the caller does not
+    # pass an explicit ``timeout_seconds``.
+    _settings_timeout: float = timeout
+    if settings and "timeout_seconds" in settings:
+        try:
+            _settings_timeout = float(settings["timeout_seconds"])
+        except (TypeError, ValueError):
+            pass
 
     async def _execute_python(
         code: str = "",
@@ -86,17 +107,22 @@ def create_python_executor(
                 metadata={"error_code": "PYTHON_EMPTY_CODE"},
             )
 
-        eff_timeout = float(
-            timeout_seconds if timeout_seconds is not None else timeout
-        )
+        # M7.9: compute the effective timeout used for the execution
+        # policy's outer budget. The inner subprocess timeout is
+        # resolved by IsolatedShellTool via the settings, so we only
+        # need a value >= that for the wrapper's wait_for.
+        if timeout_seconds is not None:
+            policy_timeout = float(timeout_seconds)
+        else:
+            policy_timeout = _settings_timeout
 
-        # Give the shell tool a slightly larger budget than the requested
+        # Give the shell tool a slightly larger budget than the effective
         # timeout so its own outer wait_for does not fire first.
         try:
             py_tool.set_execution_policy(
                 ToolExecutionPolicy(
                     max_attempts=1,
-                    timeout_seconds=eff_timeout + 5.0,
+                    timeout_seconds=policy_timeout + 5.0,
                     retryable=False,
                     idempotent=False,
                     side_effects=True,
@@ -130,9 +156,13 @@ def create_python_executor(
             # exit_code=1 without running anything.
             command = f'"{python_exe}" "{script_name}"'
 
+            # M7.9: pass ``timeout_seconds`` as-is (including None) so
+            # IsolatedShellTool can resolve the effective timeout from
+            # its settings. Substituting the factory default here would
+            # silently override user settings on every call.
             res = await py_tool.aexecute(
                 command=command,
-                timeout=eff_timeout,
+                timeout=timeout_seconds,
                 **call_kwargs,
             )
             tool_res = _ensure_tool_result(
@@ -168,6 +198,8 @@ def create_python_executor(
 ADAPTER_SPEC = AdapterSpec(
     tool_names=("python_execute",),
     factory=create_python_executor,
+    # M7.7: forward user settings (timeout, output cap) at construction.
+    requires_context=frozenset({"settings"}),
 )
 
 

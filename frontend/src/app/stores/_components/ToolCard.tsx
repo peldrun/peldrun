@@ -7,6 +7,7 @@ import {
   Eye,
   Info,
   Lock,
+  Settings,
   Tag,
   Trash2,
   WifiOff,
@@ -126,6 +127,12 @@ export interface ToolCardProps {
   onDelete: (toolId: string) => void;
   /** Opens the details modal showing the full JSON manifest. */
   onViewDetails: (tool: ToolWithMeta) => void;
+  /**
+   * Opens the settings modal. Only invoked when the tool actually
+   * declares a non-empty ``settings_schema`` (the button is hidden
+   * otherwise). See ``hasConfigurableSettings`` below.
+   */
+  onOpenSettings?: (tool: ToolWithMeta) => void;
 }
 
 /**
@@ -168,10 +175,38 @@ export function ToolCard({
   onToggle,
   onDelete,
   onViewDetails,
+  onOpenSettings,
 }: ToolCardProps) {
   const meta = tool as ToolWithMeta;
   const isEnabled = tool.is_enabled !== false && tool.status !== "disabled";
   const isBuiltin = !!tool.is_builtin;
+
+  /**
+   * Detect whether the tool exposes at least one configurable field.
+   *
+   * Two possible sources (checked in priority order):
+   *   1. ``settings.schema``  — raw manifest payload (built-in + custom JSON).
+   *   2. ``settings_schema``  — derived field emitted by the backend
+   *                             for bundle tools in ``list_tools()``.
+   *
+   * Empty schemas (``properties: {}``, used by ``source_control`` and
+   * ``web_search``) are treated as "no configurable settings" so the
+   * gear button is hidden — those tools are intentionally zero-config.
+   */
+  const schemaFromRaw =
+    meta.settings && typeof meta.settings === "object"
+      ? (meta.settings as { schema?: unknown }).schema
+      : undefined;
+  const schemaFromDerived = (meta as { settings_schema?: unknown })
+    .settings_schema;
+  const effectiveSchema =
+    (schemaFromRaw as { properties?: Record<string, unknown> } | undefined) ||
+    (schemaFromDerived as { properties?: Record<string, unknown> } | undefined);
+  const hasConfigurableSettings = !!(
+    effectiveSchema &&
+    effectiveSchema.properties &&
+    Object.keys(effectiveSchema.properties).length > 0
+  );
 
   // Prefer the human-friendly display_name when available; fall back to
   // the raw manifest `name` otherwise. Used for both the visible label
@@ -252,6 +287,18 @@ export function ToolCard({
             >
               <Info size={14} />
             </button>
+
+            {hasConfigurableSettings && onOpenSettings && (
+              <button
+                type="button"
+                onClick={() => onOpenSettings(meta)}
+                className="p-1.5 rounded text-muted-foreground hover:text-primary hover:bg-primary/10 transition cursor-pointer"
+                title="Configure tool settings"
+                aria-label="Configure tool settings"
+              >
+                <Settings size={14} />
+              </button>
+            )}
 
             <button
               type="button"

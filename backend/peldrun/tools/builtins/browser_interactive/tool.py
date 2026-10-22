@@ -122,9 +122,77 @@ class BrowserInteractiveTool(BaseTool):
     # Constructor
     # ------------------------------------------------------------------
 
-    def __init__(self, workspace_root: Optional[str] = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        workspace_root: Optional[str] = None,
+        settings: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Initialize the browser tool with optional user settings (M7.9).
+
+        Settings sources (all values come from ``browser_interactive.json``):
+          * ``default_max_chars``           — default cap for snapshot /
+            get_content (500–50000).
+          * ``navigation_timeout_seconds``  — page.goto / back / forward
+            timeout (1–180 s).
+          * ``action_timeout_seconds``      — click / fill timeout
+            (1–120 s).
+          * ``user_agent``                  — browser UA string.
+          * ``viewport``                    — nested object with
+            ``width`` and ``height``.
+          * ``screenshot_dir``              — workspace-relative
+            subdirectory for screenshots (empty = workspace root).
+
+        Session note: ``user_agent`` and ``viewport`` are applied ONLY
+        when a new BrowserContext is created for the current run. Active
+        contexts keep their original settings so an in-flight session is
+        never disrupted mid-navigation. This mirrors the M7.9 guarantee
+        for all other tools.
+        """
         super().__init__(workspace_root=workspace_root, **kwargs)
         self._run_id: Optional[str] = None
+
+        s: Dict[str, Any] = settings or {}
+
+        def _as_int(value: Any, default: int) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        self._settings_default_max_chars: int = _as_int(
+            s.get("default_max_chars"), 8000
+        )
+        self._settings_navigation_timeout: float = float(
+            _as_int(s.get("navigation_timeout_seconds"), 45)
+        )
+        self._settings_action_timeout: float = float(
+            _as_int(s.get("action_timeout_seconds"), 20)
+        )
+        ua = s.get("user_agent")
+        self._settings_user_agent: Optional[str] = (
+            str(ua).strip() or None if ua is not None else None
+        )
+
+        # Nested viewport — only accepted as a dict with both width and
+        # height. Anything else is treated as "use the default".
+        raw_viewport = s.get("viewport")
+        self._settings_viewport: Optional[Dict[str, int]] = None
+        if isinstance(raw_viewport, dict):
+            try:
+                w = int(raw_viewport.get("width"))
+                h = int(raw_viewport.get("height"))
+                if w > 0 and h > 0:
+                    self._settings_viewport = {"width": w, "height": h}
+            except (TypeError, ValueError):
+                # Malformed viewport dict → ignore, use default.
+                self._settings_viewport = None
+
+        sd = s.get("screenshot_dir")
+        self._settings_screenshot_dir: Optional[str] = (
+            str(sd).strip() if isinstance(sd, str) and sd.strip() else None
+        )
 
     def set_run_id(self, run_id: str) -> None:
         """Bind this tool instance to a specific run_id for session isolation."""
@@ -143,14 +211,25 @@ class BrowserInteractiveTool(BaseTool):
         value: Optional[str] = None,
         direction: str = "down",
         full_page: bool = False,
-        max_chars: int = 8000,
+        max_chars: Optional[int] = None,
         **kwargs: Any,
     ) -> ToolResult:
         """
         Dispatch to the appropriate action handler.
 
+        M7.9: ``max_chars=None`` falls back to
+        ``settings.default_max_chars`` so callers do not need to pass
+        an explicit value on every invocation.
+
         All exceptions are caught and returned as structured ToolResults.
         """
+        # Resolve effective max_chars once so all branches (snapshot,
+        # get_content) share the same value.
+        effective_max_chars: int = (
+            int(max_chars)
+            if max_chars is not None
+            else self._settings_default_max_chars
+        )
         if not self._run_id:
             return ToolResult(
                 output=(
@@ -168,9 +247,9 @@ class BrowserInteractiveTool(BaseTool):
             if action == "navigate":
                 return await self._navigate(url)
             if action == "snapshot":
-                return await self._snapshot(max_chars)
+                return await self._snapshot(effective_max_chars)
             if action == "get_content":
-                return await self._get_content(max_chars)
+                return await self._get_content(effective_max_chars)
             if action == "click":
                 return await self._click(ref, selector)
             if action == "fill":
@@ -214,10 +293,18 @@ class BrowserInteractiveTool(BaseTool):
     async def _get_page_and_state(self) -> tuple[Any, _ContextState]:
         """
         Ensure the session context exists and the active page is available.
-        Creates a new page if the context has none.
+
+        M7.9: passes the user-configured viewport and user_agent to
+        ``get_context``. They take effect only when a NEW context is
+        created for the current run_id; active contexts are preserved
+        untouched (in-flight navigations are never disrupted).
         """
         mgr = get_session_manager()
-        state = await mgr.get_context(self._run_id)
+        state = await mgr.get_context(
+            self._run_id,
+            viewport=self._settings_viewport,
+            user_agent=self._settings_user_agent,
+        )
         pages = state.context.pages
         if not pages:
             page = await state.context.new_page()
@@ -334,8 +421,14 @@ class BrowserInteractiveTool(BaseTool):
         page, state = await self._get_page_and_state()
         state.touch()
 
+        # M7.9: honor navigation_timeout_seconds from settings.
+        nav_timeout_ms = int(self._settings_navigation_timeout * 1000)
         try:
-            response = await page.goto(target, wait_until="domcontentloaded", timeout=30000)
+            response = await page.goto(
+                target,
+                wait_until="domcontentloaded",
+                timeout=nav_timeout_ms,
+            )
         except Exception as exc:
             return ToolResult(
                 output=f"Browser Error: navigation to {target!r} failed: {exc}",
@@ -595,8 +688,10 @@ class BrowserInteractiveTool(BaseTool):
         if error is not None:
             return error
 
+        # M7.9: honor action_timeout_seconds from settings.
+        action_timeout_ms = int(self._settings_action_timeout * 1000)
         try:
-            await element.click(timeout=10000)
+            await element.click(timeout=action_timeout_ms)
         except Exception as exc:
             return ToolResult(
                 output=f"Browser Error: click failed: {exc}",
@@ -651,8 +746,10 @@ class BrowserInteractiveTool(BaseTool):
         if error is not None:
             return error
 
+        # M7.9: honor action_timeout_seconds from settings.
+        action_timeout_ms = int(self._settings_action_timeout * 1000)
         try:
-            await element.fill(value, timeout=10000)
+            await element.fill(value, timeout=action_timeout_ms)
         except Exception as exc:
             return ToolResult(
                 output=f"Browser Error: fill failed: {exc}",
@@ -719,7 +816,39 @@ class BrowserInteractiveTool(BaseTool):
         page, state = await self._get_page_and_state()
         state.touch()
 
-        workspace = Path(self.workspace_root) if self.workspace_root else Path.cwd()
+        # M7.9: resolve the screenshot destination.
+        # Base = workspace_root (or cwd). When settings.screenshot_dir
+        # is set, screenshots are nested inside it. In live sessions
+        # workspace_root already points at the chat's files directory,
+        # so the resolved path is ``<chat>/files/<screenshot_dir>/``.
+        base_dir = Path(self.workspace_root) if self.workspace_root else Path.cwd()
+        if self._settings_screenshot_dir:
+            workspace = base_dir / self._settings_screenshot_dir
+        else:
+            workspace = base_dir
+
+        # Containment: reject paths that escape the workspace
+        # (e.g. screenshot_dir="../../etc"). This mirrors the guard
+        # already enforced by bash and str_replace_editor, so all
+        # filesystem writes share the same boundary policy.
+        try:
+            workspace.resolve().relative_to(base_dir.resolve())
+        except ValueError:
+            return ToolResult(
+                output=(
+                    f"Browser Error: screenshot_dir "
+                    f"{self._settings_screenshot_dir!r} escapes the "
+                    f"workspace. Use a relative path without '..'."
+                ),
+                exit_code=1,
+                is_error=True,
+                metadata={
+                    "error_code": "SCREENSHOT_DIR_ESCAPE",
+                    "configured": self._settings_screenshot_dir,
+                    "workspace_root": str(base_dir),
+                },
+            )
+
         workspace.mkdir(parents=True, exist_ok=True)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -771,8 +900,12 @@ class BrowserInteractiveTool(BaseTool):
         page, state = await self._get_page_and_state()
         state.touch()
 
+        nav_timeout_ms = int(self._settings_navigation_timeout * 1000)
         try:
-            response = await page.go_back(wait_until="domcontentloaded", timeout=15000)
+            response = await page.go_back(
+                wait_until="domcontentloaded",
+                timeout=nav_timeout_ms,
+            )
         except Exception as exc:
             return ToolResult(
                 output=f"Browser Error: back navigation failed: {exc}",
@@ -804,8 +937,12 @@ class BrowserInteractiveTool(BaseTool):
         page, state = await self._get_page_and_state()
         state.touch()
 
+        nav_timeout_ms = int(self._settings_navigation_timeout * 1000)
         try:
-            response = await page.go_forward(wait_until="domcontentloaded", timeout=15000)
+            response = await page.go_forward(
+                wait_until="domcontentloaded",
+                timeout=nav_timeout_ms,
+            )
         except Exception as exc:
             return ToolResult(
                 output=f"Browser Error: forward navigation failed: {exc}",

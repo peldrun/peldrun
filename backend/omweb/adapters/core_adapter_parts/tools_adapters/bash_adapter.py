@@ -19,7 +19,7 @@ Factory signature:
 from __future__ import annotations
 
 import logging
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from peldrun.tools.builtins.shell_exec import ShellExecTool
 from peldrun.tools.contract import ToolResult
@@ -38,6 +38,8 @@ logger = logging.getLogger("omweb.adapters.tools_adapters.bash")
 def create_bash_executor(
     workspace_dir: WorkspacePathType = None,
     timeout: float = 60.0,
+    *,
+    settings: Optional[Dict[str, Any]] = None,
     **kwargs: Any,
 ) -> Callable[..., Awaitable[ToolResult]]:
     """
@@ -47,9 +49,24 @@ def create_bash_executor(
     The returned callable accepts ``command`` and optional
     ``timeout_seconds`` (overriding the factory-level default), and
     returns a canonical ``ToolResult``.
+
+    M7.8: ``settings`` is provided by ``resolve_tool_runtime`` when the
+    adapter declares ``requires_context={"settings"}``. It carries the
+    user-configured values from the ``bash`` manifest
+    (``timeout_seconds``, ``max_output_chars``, ``working_directory``,
+    ``inherit_env``, ``allowed_commands``) and is forwarded to
+    ``ShellExecTool`` so all defaults honor them.
+
+    The factory-level ``timeout`` parameter is retained as a fallback
+    for callers that bypass ``resolve_tool_runtime``. When settings
+    declare a ``timeout_seconds``, that wins over the factory default.
     """
     ws_path = _resolve_workspace_path(workspace_dir)
-    shell_tool = ShellExecTool(workspace_root=str(ws_path))
+    shell_tool = ShellExecTool(
+        workspace_root=str(ws_path),
+        settings=settings or {},
+        default_timeout=timeout,
+    )
 
     async def _execute_bash(
         command: str = "",
@@ -61,13 +78,14 @@ def create_bash_executor(
         if not command and "cmd" in call_kwargs:
             command = str(call_kwargs.pop("cmd") or "")
 
-        eff_timeout = float(
-            timeout_seconds if timeout_seconds is not None else timeout
-        )
+        # Pass ``timeout=None`` when the caller did not specify one so
+        # ShellExecTool falls back to its settings (M7.9). Do NOT
+        # substitute the factory ``timeout`` here — that would override
+        # user settings on every call.
         try:
             res = await shell_tool.aexecute(
                 command=command,
-                timeout=eff_timeout,
+                timeout=timeout_seconds,
                 **call_kwargs,
             )
             tool_res = _ensure_tool_result(
@@ -97,6 +115,9 @@ def create_bash_executor(
 ADAPTER_SPEC = AdapterSpec(
     tool_names=("bash", "shell_exec"),
     factory=create_bash_executor,
+    # M7.7: Request the "settings" context key so ``resolve_tool_runtime``
+    # forwards the user-configured values loaded from the bash manifest.
+    requires_context=frozenset({"settings"}),
 )
 
 

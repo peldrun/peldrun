@@ -198,6 +198,18 @@ def resolve_tool_runtime(
     if executor is None:
         spec = AdapterRegistry.lookup(name)
         if spec is not None:
+            # M7.6: Include per-tool settings in the context so that
+            # adapters declaring ``requires_context={"settings"}`` can
+            # receive them via ``spec.matches_context()``. Adapters that
+            # do not declare it are unaffected (the filter drops it).
+            try:
+                tool_settings = active_registry.get_tool_settings(name) if active_registry is not None else {}
+            except Exception as exc:
+                logger.warning(
+                    "Failed to load settings for tool %r: %s", name, exc
+                )
+                tool_settings = {}
+
             context: Dict[str, Any] = {
                 "search_config": search_config,
                 "run_id": run_id,
@@ -205,6 +217,7 @@ def resolve_tool_runtime(
                 "session_id": session_id,
                 "chat_id": chat_id,
                 "project_id": project_id,
+                "settings": tool_settings,
             }
             try:
                 executor = _invoke_adapter(spec, ws_path, context)

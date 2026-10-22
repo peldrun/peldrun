@@ -10,6 +10,7 @@ import { fetchToolManifest } from "@/lib/chatsApi";
 import { BundleCard } from "@/components/store/BundleCard";
 import { ToolCard, type ToolWithMeta } from "../_components/ToolCard";
 import { ToolDetailsModal } from "../_modals/ToolDetailsModal";
+import { ToolSettingsModal } from "../_modals/ToolSettingsModal";
 import type { SectionHeaderConfig } from "../_config/sections";
 import type { ToolFilter } from "../_types/store";
 
@@ -99,6 +100,8 @@ export function ToolsSection({
   onBundleDetails,
 }: ToolsSectionProps) {
   const [detailsTool, setDetailsTool] = useState<ToolWithMeta | null>(null);
+  // Settings modal: which tool (if any) is being configured.
+  const [settingsTool, setSettingsTool] = useState<ToolWithMeta | null>(null);
 
   /**
    * Open the details modal for a tool.
@@ -214,6 +217,7 @@ export function ToolsSection({
                 onToggle={onToggleTool}
                 onDelete={onDeleteTool}
                 onViewDetails={openDetails}
+                onOpenSettings={(tool) => setSettingsTool(tool)}
               />
             ))}
           </div>
@@ -227,6 +231,14 @@ export function ToolsSection({
         onClose={() => {
           setDetailsTool(null);
         }}
+      />
+
+      {/* ── Tool settings modal ────────────────────────────────── */}
+      <ToolSettingsModal
+        open={settingsTool !== null}
+        toolId={settingsTool?.id ?? null}
+        toolName={settingsTool?.name ?? ""}
+        onClose={() => setSettingsTool(null)}
       />
     </div>
   );

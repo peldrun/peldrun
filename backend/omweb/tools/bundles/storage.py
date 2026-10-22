@@ -189,7 +189,18 @@ class BundleStorage:
             return None
 
     def set_active_hash(self, bundle_id: str, hash_short: str) -> None:
-        """Atomically point a bundle at the given blob hash."""
+        """
+        Atomically point a bundle at the given blob hash.
+
+        Contract (M7.4):
+            This method MUST NEVER delete or overwrite files other than
+            ``active.txt`` inside ``_installs/<bundle_id>/``. In particular,
+            ``settings.json`` (managed by ``ToolSettingsManager``) MUST
+            survive bundle upgrades (v1.0.0 -> v1.1.0).
+
+            If you need to wipe the install directory, use
+            ``delete_install()`` explicitly (only valid on uninstall).
+        """
         install_dir = self.install_dir(bundle_id)
         install_dir.mkdir(parents=True, exist_ok=True)
         pointer = install_dir / ACTIVE_POINTER
@@ -198,6 +209,18 @@ class BundleStorage:
         os.replace(str(tmp), str(pointer))
 
     def delete_install(self, bundle_id: str) -> bool:
+        """
+        Remove the entire install directory for a bundle.
+
+        Contract (M7.4):
+            This is intentionally destructive: it wipes
+            ``_installs/<bundle_id>/`` INCLUDING ``settings.json`` and
+            ``active.txt``.
+
+            It is only called from ``BundleManager.delete_bundle()``
+            (uninstall path). It MUST NOT be called during upgrades;
+            use ``set_active_hash()`` for version switches instead.
+        """
         target = self.install_dir(bundle_id)
         if not target.exists():
             return False

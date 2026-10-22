@@ -23,7 +23,7 @@ correct workspace and expose its canonical ``aexecute`` entrypoint.
 from __future__ import annotations
 
 import logging
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from peldrun.tools.builtins.http_fetch import HttpFetchTool
 from peldrun.tools.contract import ToolResult
@@ -40,6 +40,8 @@ logger = logging.getLogger("omweb.adapters.tools_adapters.http_fetch")
 
 def create_http_fetch_executor(
     workspace_dir: WorkspacePathType = None,
+    *,
+    settings: Optional[Dict[str, Any]] = None,
     **kwargs: Any,
 ) -> Callable[..., Awaitable[ToolResult]]:
     """
@@ -49,16 +51,24 @@ def create_http_fetch_executor(
     The returned callable accepts ``url`` (required) and optional
     ``max_chars``, and returns a canonical ``ToolResult``.
 
+    M7.8: ``settings`` is provided by ``resolve_tool_runtime`` when the
+    adapter declares ``requires_context={"settings"}``. It carries the
+    user-configured values from the tool's ``settings_schema`` and is
+    forwarded to ``HttpFetchTool`` so request defaults honor them.
+
     Note: ``http_fetch`` does not use the workspace for fetching, but
     the Core ``HttpFetchTool`` is still constructed with a workspace
     root so it composes cleanly with the rest of the adapter layer.
     """
     ws_path = _resolve_workspace_path(workspace_dir)
-    core_tool = HttpFetchTool(workspace_root=str(ws_path))
+    core_tool = HttpFetchTool(
+        workspace_root=str(ws_path),
+        settings=settings or {},
+    )
 
     async def _execute_http_fetch(
         url: Optional[str] = None,
-        max_chars: int = 8000,
+        max_chars: Optional[int] = None,
         **call_kwargs: Any,
     ) -> ToolResult:
         # Accept ``target_url`` as an alias for ``url`` for symmetry
@@ -96,6 +106,11 @@ def create_http_fetch_executor(
 ADAPTER_SPEC = AdapterSpec(
     tool_names=("http_fetch",),
     factory=create_http_fetch_executor,
+    # M7.7: Request the "settings" context key so ``resolve_tool_runtime``
+    # forwards the user-configured values loaded from the tool's
+    # settings_schema. Adapters that do not declare this key are
+    # unaffected (``matches_context`` filters the context dict).
+    requires_context=frozenset({"settings"}),
 )
 
 

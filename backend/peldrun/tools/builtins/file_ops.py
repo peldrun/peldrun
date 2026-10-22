@@ -39,9 +39,13 @@ class FileOpsArgs(BaseModel):
         default=None,
         description="Text content required when action is 'write' or 'append'"
     )
-    encoding: str = Field(
-        default="utf-8",
-        description="Character encoding for text read/write operations (default: 'utf-8')"
+    encoding: Optional[str] = Field(
+        default=None,
+        description=(
+            "Character encoding for text read/write operations. "
+            "Omit this argument to use the tool's configured "
+            "default_encoding (utf-8 unless overridden in settings)."
+        ),
     )
 
 
@@ -69,7 +73,21 @@ class FileOpsTool(BaseTool):
         self,
         workspace_root: Optional[str] = None,
         security_policy: Optional[SecurityPolicy] = None,
+        settings: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> None:
+        """
+        Initialize the file operations tool with optional settings (M7.9).
+
+        Settings sources:
+          * ``max_file_size_kb``  — reject writes whose resulting bytes
+            exceed this cap. Checked BEFORE touching disk.
+          * ``overwrite_policy``  — behavior when the target already
+            exists: ``allow`` (overwrite), ``reject`` (return error),
+            or ``version`` (auto-suffix ``_v2``, ``_v3``, ...).
+          * ``default_encoding``  — fallback encoding used when the
+            caller does not explicitly supply one.
+        """
         super().__init__(workspace_root=workspace_root, execution_policy=self.execution_policy)
         if security_policy:
             self.security_policy = security_policy
@@ -77,6 +95,26 @@ class FileOpsTool(BaseTool):
             self.security_policy = SecurityPolicy(workspace_root=Path(workspace_root).resolve())
         else:
             self.security_policy = SecurityPolicy()
+
+        s: Dict[str, Any] = settings or {}
+
+        def _as_int(value: Any, default: int) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        self._settings_max_file_size_kb: int = _as_int(
+            s.get("max_file_size_kb"), 2048
+        )
+        policy = str(s.get("overwrite_policy", "allow")).strip().lower()
+        self._settings_overwrite_policy: str = (
+            policy if policy in ("allow", "reject", "version") else "allow"
+        )
+        enc = str(s.get("default_encoding", "utf-8")).strip().lower()
+        self._settings_default_encoding: str = (
+            enc if enc in ("utf-8", "utf-16", "latin-1") else "utf-8"
+        )
 
     def _resolve_safe_path(self, rel_path: str) -> Path:
         """Resolve path and verify strict containment within workspace_root."""
@@ -124,16 +162,102 @@ class FileOpsTool(BaseTool):
             )
 
     def _sync_write(self, path: Path, content: str, encoding: str) -> ToolResult:
+        """
+        Write ``content`` to ``path`` honoring the configured settings.
+
+        Order of checks (all BEFORE touching disk):
+          1. ``max_file_size_kb``  → reject if resulting bytes exceed cap.
+          2. ``overwrite_policy``  → allow | reject | version.
+        """
+        # 1. Size cap — compute the exact bytes we are about to persist.
+        if self._settings_max_file_size_kb > 0:
+            try:
+                prospective_bytes = len(content.encode(encoding, errors="replace"))
+            except LookupError:
+                # Unknown encoding falls back to utf-8 for the size check.
+                prospective_bytes = len(content.encode("utf-8", errors="replace"))
+            limit_bytes = self._settings_max_file_size_kb * 1024
+            if prospective_bytes > limit_bytes:
+                rel_name = os.path.relpath(path, self.workspace_root).replace("\\", "/")
+                return ToolResult(
+                    output=(
+                        f"File size {prospective_bytes} bytes exceeds "
+                        f"the configured limit of "
+                        f"{self._settings_max_file_size_kb} KB "
+                        f"({limit_bytes} bytes)."
+                    ),
+                    exit_code=1,
+                    is_error=True,
+                    metadata={
+                        "error_code": "FILE_TOO_LARGE",
+                        "path": rel_name,
+                        "prospective_bytes": prospective_bytes,
+                        "limit_kb": self._settings_max_file_size_kb,
+                    },
+                )
+
+        # 2. Overwrite policy.
+        target_path = path
+        operation = "created"
+
+        if path.exists() and path.is_file():
+            policy = self._settings_overwrite_policy
+            if policy == "reject":
+                rel_name = os.path.relpath(path, self.workspace_root).replace("\\", "/")
+                return ToolResult(
+                    output=(
+                        f"File '{rel_name}' already exists and the "
+                        "configured overwrite_policy is 'reject'. "
+                        "Delete the file or change the policy to overwrite it."
+                    ),
+                    exit_code=1,
+                    is_error=True,
+                    metadata={
+                        "error_code": "FILE_EXISTS",
+                        "path": rel_name,
+                    },
+                )
+            elif policy == "version":
+                # Auto-suffix _v2, _v3, ... until we find an unused name.
+                stem = path.stem
+                suffix = path.suffix
+                parent = path.parent
+                version = 2
+                while True:
+                    candidate = parent / f"{stem}_v{version}{suffix}"
+                    if not candidate.exists():
+                        target_path = candidate
+                        break
+                    version += 1
+                    if version > 9999:  # safety valve
+                        rel_name = os.path.relpath(path, self.workspace_root).replace("\\", "/")
+                        return ToolResult(
+                            output=(
+                                f"Could not find an available versioned "
+                                f"filename for '{rel_name}' (tried "
+                                f"_v2 through _v9999)."
+                            ),
+                            exit_code=1,
+                            is_error=True,
+                            metadata={"error_code": "VERSION_EXHAUSTED"},
+                        )
+            # policy == "allow" → target_path remains path (overwrite)
+
+        # 3. Perform the write.
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding=encoding)
-            rel_name = os.path.relpath(path, self.workspace_root).replace("\\", "/")
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_text(content, encoding=encoding)
+            rel_name = os.path.relpath(target_path, self.workspace_root).replace("\\", "/")
             return ToolResult(
                 output=f"Successfully written {len(content)} characters to '{rel_name}'.",
                 exit_code=0,
                 is_error=False,
                 artifacts=[rel_name],
-                metadata={"bytes_written": path.stat().st_size, "operation": "created"},
+                metadata={
+                    "bytes_written": target_path.stat().st_size,
+                    "operation": operation,
+                    "overwrite_policy": self._settings_overwrite_policy,
+                },
             )
         except Exception as ex:
             return ToolResult(
@@ -231,10 +355,21 @@ class FileOpsTool(BaseTool):
         action: str,
         path: str,
         content: Optional[str] = None,
-        encoding: str = "utf-8",
+        encoding: Optional[str] = None,
         **kwargs: Any,
     ) -> ToolResult:
-        """Execute the requested file operation non-blockingly."""
+        """
+        Execute the requested file operation non-blockingly.
+
+        M7.9: ``encoding=None`` (the new default) falls back to
+        ``settings.default_encoding`` (``utf-8`` unless overridden).
+        Callers that explicitly pass an encoding always win.
+        """
+        eff_encoding = (
+            encoding
+            if encoding is not None
+            else self._settings_default_encoding
+        )
         try:
             safe_target = self._resolve_safe_path(path)
         except (PermissionError, SecurityViolationError) as sec_err:
@@ -246,7 +381,7 @@ class FileOpsTool(BaseTool):
             )
 
         if action == "read":
-            return await asyncio.to_thread(self._sync_read, safe_target, encoding)
+            return await asyncio.to_thread(self._sync_read, safe_target, eff_encoding)
         elif action == "write":
             if content is None:
                 return ToolResult(
@@ -254,7 +389,7 @@ class FileOpsTool(BaseTool):
                     exit_code=1,
                     is_error=True,
                 )
-            return await asyncio.to_thread(self._sync_write, safe_target, content, encoding)
+            return await asyncio.to_thread(self._sync_write, safe_target, content, eff_encoding)
         elif action == "append":
             if content is None:
                 return ToolResult(
@@ -262,7 +397,7 @@ class FileOpsTool(BaseTool):
                     exit_code=1,
                     is_error=True,
                 )
-            return await asyncio.to_thread(self._sync_append, safe_target, content, encoding)
+            return await asyncio.to_thread(self._sync_append, safe_target, content, eff_encoding)
         elif action == "list":
             return await asyncio.to_thread(self._sync_list, safe_target)
         elif action == "exists":

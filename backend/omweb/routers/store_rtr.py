@@ -351,6 +351,108 @@ async def get_tool_detail(tool_id: str):
     return {"status": "ok", "tool": tool}
 
 
+@router.get("/tools/{tool_id}/settings")
+async def get_tool_settings(tool_id: str) -> Dict[str, Any]:
+    """
+    Return the settings schema and current effective values for a tool.
+
+    Effective values are the schema defaults merged with any values
+    previously saved by the user (user values override defaults). If
+    the tool does not declare a ``settings_schema`` it is not
+    configurable and this endpoint returns 404 so the frontend can
+    hide the Settings button on the tool card.
+    """
+    schema = tool_registry.get_tool_settings_schema(tool_id)
+    if schema is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Tool '{tool_id}' has no configurable settings.",
+        )
+    values = tool_registry.get_tool_settings(tool_id)
+    return {"status": "ok", "schema": schema, "values": values}
+
+
+@router.put("/tools/{tool_id}/settings")
+async def update_tool_settings(
+    tool_id: str, payload: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Validate and persist user settings for a tool.
+
+    Values are validated against the tool's ``settings_schema`` using
+    jsonschema. On validation failure this returns 400 and the on-disk
+    settings file is left untouched (the atomic write only happens
+    after successful validation inside ToolSettingsManager).
+    """
+    try:
+        merged = tool_registry.save_tool_settings(tool_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"status": "ok", "values": merged}
+
+
+@router.get("/tools/{tool_id}/test-environment")
+async def test_tool_environment(tool_id: str) -> Dict[str, Any]:
+    """
+    Probe a tool's runtime environment and return a structured report.
+
+    Only ``browser_interactive`` has concrete checks today:
+      * Playwright Python package is importable.
+      * Chromium binary is present on disk.
+      * ``screenshot_dir`` is writable and contained in the workspace.
+
+    For any other tool, a benign "no checks available" report is
+    returned so the frontend can render the button without special
+    casing.
+
+    The endpoint is side-effect free: it never launches a browser and
+    never mutates the settings file.
+    """
+    if tool_id == "browser_interactive":
+        try:
+            from peldrun.tools.builtins.browser_interactive.environment import (
+                probe_browser_environment,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Environment probe unavailable: {exc}",
+            )
+
+        # Load the user's current settings so screenshot_dir reflects
+        # the saved configuration (not the raw manifest defaults).
+        try:
+            current_values = tool_registry.get_tool_settings(tool_id)
+        except Exception:
+            current_values = {}
+        screenshot_dir = None
+        if isinstance(current_values, dict):
+            sd = current_values.get("screenshot_dir")
+            if isinstance(sd, str) and sd.strip():
+                screenshot_dir = sd.strip()
+
+        report = await probe_browser_environment(
+            workspace_root=None,   # probe against backend CWD
+            screenshot_dir=screenshot_dir,
+        )
+        return {"status": "ok", **report}
+
+    # Generic tools: report a benign pass.
+    return {
+        "status": "ok",
+        "tool_id": tool_id,
+        "ready": True,
+        "checks": [
+            {
+                "name": "no_environment_checks",
+                "label": "Environment checks",
+                "passed": True,
+                "message": "No environment checks are defined for this tool.",
+            }
+        ],
+    }
+
+
 @router.get("/tools/{tool_id}/icon.svg")
 async def get_tool_icon(tool_id: str):
     """

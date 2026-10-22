@@ -119,8 +119,12 @@ class HumanInputArgs(BaseModel):
         description="List of choices/buttons for the operator to select from."
     )
     timeout_seconds: Optional[int] = Field(
-        default=600,
-        description="Maximum wait time in seconds for operator response (default: 600s)."
+        default=None,
+        description=(
+            "Maximum wait time in seconds for operator response. "
+            "Omit to use the tool's configured default_timeout_seconds "
+            "(600s unless overridden in settings)."
+        ),
     )
     request_id: Optional[str] = Field(
         default=None,
@@ -159,11 +163,49 @@ class HumanInputTool(BaseTool):
         self,
         workspace_root: Optional[str] = None,
         emitter: Optional[Any] = None,
+        settings: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
+        """
+        Initialize the human input tool with optional settings (M7.9).
+
+        Settings sources:
+          * ``default_timeout_seconds`` — fallback timeout when the
+            caller does not specify ``timeout_seconds`` (default 600).
+          * ``max_prompt_chars`` — hard cap on the length of ``prompt``;
+            longer prompts are rejected BEFORE registration to prevent
+            an unbounded question from reaching the UI.
+          * ``max_options`` — hard cap on ``len(options)``; used to
+            reject over-long multiple-choice lists early.
+          * ``on_timeout`` — behavior when the wait times out:
+            ``"error"`` (raise, default) or ``"return_empty"``
+            (return a successful empty result with reason="timeout").
+        """
         super().__init__(workspace_root=workspace_root)
         self.workspace_root = workspace_root
         self.emitter = emitter
+
+        s: Dict[str, Any] = settings or {}
+
+        def _as_int(value: Any, default: int) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        self._settings_default_timeout: float = float(
+            _as_int(s.get("default_timeout_seconds"), 600)
+        )
+        self._settings_max_prompt_chars: int = _as_int(
+            s.get("max_prompt_chars"), 2000
+        )
+        self._settings_max_options: int = _as_int(
+            s.get("max_options"), 10
+        )
+        ot = str(s.get("on_timeout", "error")).strip().lower()
+        self._settings_on_timeout: str = (
+            ot if ot in ("error", "return_empty") else "error"
+        )
 
     @classmethod
     def get_pending_requests(cls) -> Dict[str, Any]:
@@ -180,14 +222,67 @@ class HumanInputTool(BaseTool):
         prompt: str,
         input_type: str = "text",
         options: Optional[List[str]] = None,
-        timeout_seconds: Optional[int] = 600,
+        timeout_seconds: Optional[int] = None,
         request_id: Optional[str] = None,
         **kwargs: Any,
     ) -> ToolResult:
-        # Guarantee dedicated unique request_id (distinct from job_id)
-        req_id = request_id or f"req_{uuid.uuid4().hex[:12]}"
-        timeout_val = float(timeout_seconds) if timeout_seconds else 600.0
+        """
+        Ask the human operator a question and wait for the response.
+
+        M7.9 enforcement (all checked BEFORE registering the request):
+          * ``max_prompt_chars`` — reject over-long prompts.
+          * ``max_options`` — reject over-long option lists.
+        The effective timeout is ``timeout_seconds`` if provided, else
+        ``settings.default_timeout_seconds``.
+        """
         opts = options or []
+
+        # 1. Prompt length enforcement.
+        if (
+            self._settings_max_prompt_chars > 0
+            and len(prompt) > self._settings_max_prompt_chars
+        ):
+            return ToolResult(
+                output=(
+                    f"Ask Human Error: prompt length "
+                    f"({len(prompt)} chars) exceeds the configured "
+                    f"limit of {self._settings_max_prompt_chars} chars."
+                ),
+                exit_code=1,
+                is_error=True,
+                metadata={
+                    "error_code": "PROMPT_TOO_LONG",
+                    "prompt_chars": len(prompt),
+                    "limit": self._settings_max_prompt_chars,
+                },
+            )
+
+        # 2. Options count enforcement.
+        if (
+            self._settings_max_options > 0
+            and len(opts) > self._settings_max_options
+        ):
+            return ToolResult(
+                output=(
+                    f"Ask Human Error: {len(opts)} options provided, "
+                    f"exceeds the configured limit of "
+                    f"{self._settings_max_options}."
+                ),
+                exit_code=1,
+                is_error=True,
+                metadata={
+                    "error_code": "TOO_MANY_OPTIONS",
+                    "options_count": len(opts),
+                    "limit": self._settings_max_options,
+                },
+            )
+
+        # 3. Resolve the effective timeout (explicit > settings default).
+        req_id = request_id or f"req_{uuid.uuid4().hex[:12]}"
+        timeout_val = float(
+            timeout_seconds if timeout_seconds is not None
+            else self._settings_default_timeout
+        )
 
         # Derive parent run identifier
         parent_run_id = str(getattr(self.emitter, "run_id", "default_run"))
@@ -241,7 +336,10 @@ class HumanInputTool(BaseTool):
                 except Exception:
                     pass
 
-        # 3. Asynchronous wait with automatic timeout handling
+        # 3. Asynchronous wait with automatic timeout handling.
+        #    M7.9: ``on_timeout`` decides between raising (default)
+        #    and returning a benign empty result so autonomous runs
+        #    can continue without an exception.
         try:
             response = await asyncio.wait_for(future, timeout=timeout_val)
             return ToolResult(
@@ -257,7 +355,28 @@ class HumanInputTool(BaseTool):
             )
         except asyncio.TimeoutError:
             HumanInputRegistry.cancel_request(req_id)
-            raise TimeoutError(f"Human input request '{req_id}' timed out after {timeout_val} seconds.")
+
+            if self._settings_on_timeout == "return_empty":
+                # Graceful timeout: caller gets a successful empty result
+                # so its agent loop can proceed with a default decision.
+                return ToolResult(
+                    output="",
+                    exit_code=0,
+                    is_error=False,
+                    metadata={
+                        "request_id": req_id,
+                        "input_type": input_type,
+                        "response": "",
+                        "reason": "timeout",
+                        "timeout_seconds": timeout_val,
+                    },
+                )
+
+            # Default ("error"): raise as before so the run halts.
+            raise TimeoutError(
+                f"Human input request '{req_id}' timed out after "
+                f"{timeout_val} seconds."
+            )
         except asyncio.CancelledError:
             HumanInputRegistry.cancel_request(req_id)
             raise

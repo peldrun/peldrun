@@ -190,10 +190,40 @@ class StrReplaceEditor(BaseTool):
         side_effects=True,
     )
 
-    def __init__(self, workspace_root: Optional[str] = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        workspace_root: Optional[str] = None,
+        settings: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Initialize the editor with optional user-supplied settings (M7.9).
+
+        Settings sources:
+          * ``max_view_lines``   — cap on lines returned by ``view``.
+          * ``max_file_size_kb`` — maximum size of any file produced by
+            ``create`` / ``str_replace`` / ``insert``. Writes that would
+            exceed this limit are rejected before touching disk so no
+            partial or oversized file is ever persisted.
+        """
         super().__init__(workspace_root=workspace_root, execution_policy=self.execution_policy)
         self.workspace_root = workspace_root or os.getcwd()
         self._history: Dict[str, List[str]] = {}
+
+        s: Dict[str, Any] = settings or {}
+
+        def _as_int(value: Any, default: int) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        self._settings_max_view_lines: int = _as_int(
+            s.get("max_view_lines"), 2000
+        )
+        self._settings_max_file_size_kb: int = _as_int(
+            s.get("max_file_size_kb"), 512
+        )
 
     def _resolve_safe_path(self, path: str) -> Path:
         """
@@ -291,6 +321,32 @@ class StrReplaceEditor(BaseTool):
                         exit_code=1,
                         is_error=True,
                     )
+
+                # M7.9: reject before touching disk if the payload would
+                # exceed the configured size cap. This keeps the
+                # workspace consistent: no partial or oversized file.
+                if self._settings_max_file_size_kb > 0:
+                    prospective_bytes = len(
+                        file_text.encode("utf-8", errors="replace")
+                    )
+                    limit_bytes = self._settings_max_file_size_kb * 1024
+                    if prospective_bytes > limit_bytes:
+                        return ToolResult(
+                            output=(
+                                f"File size {prospective_bytes} bytes exceeds "
+                                f"the configured limit of "
+                                f"{self._settings_max_file_size_kb} KB "
+                                f"({limit_bytes} bytes)."
+                            ),
+                            exit_code=1,
+                            is_error=True,
+                            metadata={
+                                "error_code": "FILE_TOO_LARGE",
+                                "prospective_bytes": prospective_bytes,
+                                "limit_kb": self._settings_max_file_size_kb,
+                            },
+                        )
+
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 target_path.write_text(file_text, encoding="utf-8")
                 size_bytes = target_path.stat().st_size
@@ -371,12 +427,26 @@ class StrReplaceEditor(BaseTool):
                         end = start
 
                     selected = lines[start - 1 : end]
+
+                    # M7.9: enforce the configured line cap for view.
+                    truncated_by_settings = False
+                    max_lines = self._settings_max_view_lines
+                    if max_lines > 0 and len(selected) > max_lines:
+                        selected = selected[:max_lines]
+                        truncated_by_settings = True
+
                     numbered = [
                         f"{i}: {line}"
                         for i, line in enumerate(selected, start=start)
                     ]
+                    output_text = "".join(numbered)
+                    if truncated_by_settings:
+                        output_text += (
+                            f"\n... [output truncated to {max_lines} lines "
+                            f"by tool settings]"
+                        )
                     return ToolResult(
-                        output="".join(numbered),
+                        output=output_text,
                         exit_code=0,
                         is_error=False,
                         metadata={
@@ -385,21 +455,34 @@ class StrReplaceEditor(BaseTool):
                             "start": start,
                             "end": end,
                             "total_lines": total,
+                            "truncated_by_settings": truncated_by_settings,
                         },
                     )
 
                 # No range provided → return the whole file
+                truncated_by_settings = False
+                max_lines = self._settings_max_view_lines
+                if max_lines > 0 and len(lines) > max_lines:
+                    lines = lines[:max_lines]
+                    truncated_by_settings = True
                 numbered = [
                     f"{i}: {line}" for i, line in enumerate(lines, start=1)
                 ]
+                output_text = "".join(numbered)
+                if truncated_by_settings:
+                    output_text += (
+                        f"\n... [output truncated to {max_lines} lines "
+                        f"by tool settings]"
+                    )
                 return ToolResult(
-                    output="".join(numbered),
+                    output=output_text,
                     exit_code=0,
                     is_error=False,
                     metadata={
                         "operation": "view",
                         "path": rel_str,
                         "total_lines": total,
+                        "truncated_by_settings": truncated_by_settings,
                     },
                 )
 
@@ -428,8 +511,33 @@ class StrReplaceEditor(BaseTool):
                         is_error=True,
                     )
 
-                self._history.setdefault(path_key, []).append(content)
                 new_content = content.replace(old_str, new_str, 1)
+
+                # M7.9: reject before touching disk if the resulting
+                # content would exceed the configured size cap.
+                if self._settings_max_file_size_kb > 0:
+                    prospective_bytes = len(
+                        new_content.encode("utf-8", errors="replace")
+                    )
+                    limit_bytes = self._settings_max_file_size_kb * 1024
+                    if prospective_bytes > limit_bytes:
+                        return ToolResult(
+                            output=(
+                                f"Resulting file size {prospective_bytes} bytes "
+                                f"exceeds the configured limit of "
+                                f"{self._settings_max_file_size_kb} KB "
+                                f"({limit_bytes} bytes)."
+                            ),
+                            exit_code=1,
+                            is_error=True,
+                            metadata={
+                                "error_code": "FILE_TOO_LARGE",
+                                "prospective_bytes": prospective_bytes,
+                                "limit_kb": self._settings_max_file_size_kb,
+                            },
+                        )
+
+                self._history.setdefault(path_key, []).append(content)
                 target_path.write_text(new_content, encoding="utf-8")
                 size_bytes = target_path.stat().st_size
                 return ToolResult(
@@ -474,10 +582,36 @@ class StrReplaceEditor(BaseTool):
                         is_error=True,
                     )
 
-                self._history.setdefault(path_key, []).append(content)
                 insert_text = new_str if new_str.endswith("\n") else new_str + "\n"
                 lines.insert(insert_line_int, insert_text)
-                target_path.write_text("".join(lines), encoding="utf-8")
+                prospective_content = "".join(lines)
+
+                # M7.9: reject before touching disk if the resulting
+                # content would exceed the configured size cap.
+                if self._settings_max_file_size_kb > 0:
+                    prospective_bytes = len(
+                        prospective_content.encode("utf-8", errors="replace")
+                    )
+                    limit_bytes = self._settings_max_file_size_kb * 1024
+                    if prospective_bytes > limit_bytes:
+                        return ToolResult(
+                            output=(
+                                f"Resulting file size {prospective_bytes} bytes "
+                                f"exceeds the configured limit of "
+                                f"{self._settings_max_file_size_kb} KB "
+                                f"({limit_bytes} bytes)."
+                            ),
+                            exit_code=1,
+                            is_error=True,
+                            metadata={
+                                "error_code": "FILE_TOO_LARGE",
+                                "prospective_bytes": prospective_bytes,
+                                "limit_kb": self._settings_max_file_size_kb,
+                            },
+                        )
+
+                self._history.setdefault(path_key, []).append(content)
+                target_path.write_text(prospective_content, encoding="utf-8")
                 size_bytes = target_path.stat().st_size
                 return ToolResult(
                     output=f"Successfully inserted text at line {insert_line_int} in '{rel_str}'.",

@@ -19,7 +19,7 @@ supports both forms.
 from __future__ import annotations
 
 import logging
-from typing import Any, Awaitable, Callable, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from peldrun.tools.builtins.file_ops import FileOpsTool
 from peldrun.tools.contract import ToolResult
@@ -28,7 +28,6 @@ from ._contract import AdapterSpec
 from ._helpers import (
     WorkspacePathType,
     _ensure_tool_result,
-    _invoke_file_ops,
     _resolve_workspace_path,
 )
 
@@ -41,6 +40,8 @@ logger = logging.getLogger("omweb.adapters.tools_adapters.file_ops")
 
 def create_file_saver_executor(
     workspace_dir: WorkspacePathType = None,
+    *,
+    settings: Optional[Dict[str, Any]] = None,
     **kwargs: Any,
 ) -> Callable[..., Awaitable[ToolResult]]:
     """
@@ -50,14 +51,22 @@ def create_file_saver_executor(
     The returned callable accepts ``file_path``, ``content``, and
     optional ``mode`` (``"w"`` to overwrite, ``"a"`` to append). It
     returns a canonical ``ToolResult``.
+
+    M7.8: ``settings`` carries ``max_file_size_kb``,
+    ``overwrite_policy``, and ``default_encoding`` from the manifest
+    and is forwarded to ``FileOpsTool``.
     """
     ws_path = _resolve_workspace_path(workspace_dir)
-    file_ops = FileOpsTool(workspace_root=str(ws_path))
+    file_ops = FileOpsTool(
+        workspace_root=str(ws_path),
+        settings=settings or {},
+    )
 
     async def _execute_file_saver(
         file_path: Optional[str] = None,
         content: str = "",
         mode: str = "w",
+        encoding: Optional[str] = None,
         **call_kwargs: Any,
     ) -> ToolResult:
         # Accept ``path`` and ``filename`` as aliases for ``file_path``.
@@ -74,13 +83,22 @@ def create_file_saver_executor(
                 is_error=True,
                 metadata={"error_code": "FILE_SAVER_MISSING_PATH"},
             )
+
+        # Map the legacy ``mode`` argument to FileOpsTool's action:
+        #   "w" -> "write"  (create or overwrite, subject to settings)
+        #   "a" -> "append"
+        action = "append" if str(mode).lower().startswith("a") else "write"
+
         try:
-            res = await _invoke_file_ops(
-                file_ops,
-                operation="write",
-                file_path=str(target_path),
+            # Call FileOpsTool.aexecute directly with the exact field
+            # names declared in FileOpsArgs (action / path / content /
+            # encoding). ``encoding=None`` lets the tool fall back to
+            # settings.default_encoding.
+            res = await file_ops.aexecute(
+                action=action,
+                path=str(target_path),
                 content=content,
-                mode=mode,
+                encoding=encoding,
                 **call_kwargs,
             )
             return _ensure_tool_result(
@@ -104,6 +122,8 @@ def create_file_saver_executor(
 
 def create_file_reader_executor(
     workspace_dir: WorkspacePathType = None,
+    *,
+    settings: Optional[Dict[str, Any]] = None,
     **kwargs: Any,
 ) -> Callable[..., Awaitable[ToolResult]]:
     """
@@ -112,12 +132,21 @@ def create_file_reader_executor(
 
     The returned callable accepts ``file_path`` (or aliases ``path`` /
     ``filename``) and returns a canonical ``ToolResult``.
+
+    M7.8: ``settings`` is shared with ``file_saver`` since both serve
+    the same underlying ``FileOpsTool``. ``default_encoding`` in
+    particular affects how ``file_reader`` decodes files that were
+    written by ``file_saver``.
     """
     ws_path = _resolve_workspace_path(workspace_dir)
-    file_ops = FileOpsTool(workspace_root=str(ws_path))
+    file_ops = FileOpsTool(
+        workspace_root=str(ws_path),
+        settings=settings or {},
+    )
 
     async def _execute_file_reader(
         file_path: Optional[str] = None,
+        encoding: Optional[str] = None,
         **call_kwargs: Any,
     ) -> ToolResult:
         # Accept ``path`` and ``filename`` as aliases for ``file_path``.
@@ -134,11 +163,14 @@ def create_file_reader_executor(
                 is_error=True,
                 metadata={"error_code": "FILE_READER_MISSING_PATH"},
             )
+
         try:
-            res = await _invoke_file_ops(
-                file_ops,
-                operation="read",
-                file_path=str(target_path),
+            # Direct call bypasses ``_invoke_file_ops`` which could not
+            # introspect a VAR_KEYWORD-only ``aexecute`` signature.
+            res = await file_ops.aexecute(
+                action="read",
+                path=str(target_path),
+                encoding=encoding,
                 **call_kwargs,
             )
             return _ensure_tool_result(
@@ -168,10 +200,15 @@ ADAPTER_SPECS: List[AdapterSpec] = [
     AdapterSpec(
         tool_names=("file_saver",),
         factory=create_file_saver_executor,
+        # M7.7: forward user settings (size cap, overwrite policy,
+        # encoding) to the tool at construction time.
+        requires_context=frozenset({"settings"}),
     ),
     AdapterSpec(
         tool_names=("file_reader",),
         factory=create_file_reader_executor,
+        # M7.7: same underlying FileOpsTool — share the settings.
+        requires_context=frozenset({"settings"}),
     ),
 ]
 

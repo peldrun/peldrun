@@ -27,7 +27,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from .security import make_route_handler
 
@@ -196,7 +196,13 @@ class BrowserSessionManager:
     # Context acquisition
     # ------------------------------------------------------------------
 
-    async def get_context(self, run_id: str) -> _ContextState:
+    async def get_context(
+        self,
+        run_id: str,
+        *,
+        viewport: Optional[dict] = None,
+        user_agent: Optional[str] = None,
+    ) -> _ContextState:
         """
         Return the BrowserContext state for the given run_id, creating
         a fresh isolated context if none exists.
@@ -206,6 +212,13 @@ class BrowserSessionManager:
           * ``last_used``: monotonic timestamp of last activity.
           * ``ref_map``: dict of element refs from the last snapshot.
           * ``touch()``: refresh last-used timestamp.
+
+        M7.9: ``viewport`` and ``user_agent`` are applied ONLY when a
+        new context is created. If a context already exists for
+        ``run_id``, it is returned untouched — in-flight sessions are
+        never disrupted by a settings change. Both parameters accept
+        ``None`` meaning "use the module-level defaults"
+        (``DEFAULT_VIEWPORT`` / ``DEFAULT_USER_AGENT``).
         """
         if not run_id:
             raise ValueError("run_id is required to acquire a browser context.")
@@ -224,10 +237,18 @@ class BrowserSessionManager:
                     self._contexts.pop(run_id, None)
 
         # Slow path: create a new context.
+        # M7.9: user-provided viewport / user_agent override the
+        # module defaults. This is the ONLY place they are applied;
+        # the fast path above returns existing contexts untouched.
+        effective_viewport = viewport if viewport is not None else DEFAULT_VIEWPORT
+        effective_user_agent = (
+            user_agent if user_agent is not None else DEFAULT_USER_AGENT
+        )
+
         browser = await self._ensure_browser()
         context = await browser.new_context(
-            viewport=DEFAULT_VIEWPORT,
-            user_agent=DEFAULT_USER_AGENT,
+            viewport=effective_viewport,
+            user_agent=effective_user_agent,
             ignore_https_errors=False,
             java_script_enabled=True,
         )

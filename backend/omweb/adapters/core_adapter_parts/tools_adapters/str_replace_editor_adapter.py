@@ -18,7 +18,7 @@ Factory signature:
 from __future__ import annotations
 
 import logging
-from typing import Any, Awaitable, Callable, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from peldrun.tools.builtins.str_replace_editor import (
     StrReplaceEditor as StrReplaceEditorTool,
@@ -37,6 +37,8 @@ logger = logging.getLogger("omweb.adapters.tools_adapters.str_replace_editor")
 
 def create_str_replace_editor_executor(
     workspace_dir: WorkspacePathType = None,
+    *,
+    settings: Optional[Dict[str, Any]] = None,
     **kwargs: Any,
 ) -> Callable[..., Awaitable[ToolResult]]:
     """
@@ -47,9 +49,18 @@ def create_str_replace_editor_executor(
     ``create``, ``str_replace``, ``insert``, ``undo_edit``) and the
     parameters relevant to that command. It returns a canonical
     ``ToolResult``.
+
+    M7.8: ``settings`` is provided by ``resolve_tool_runtime`` when the
+    adapter declares ``requires_context={"settings"}``. It carries the
+    user-configured values from the ``str_replace_editor`` manifest
+    (``max_view_lines``, ``max_file_size_kb``) and is forwarded to
+    ``StrReplaceEditor`` so ``view`` output and file writes honor them.
     """
     ws_path = _resolve_workspace_path(workspace_dir)
-    editor_tool = StrReplaceEditorTool(workspace_root=str(ws_path))
+    editor_tool = StrReplaceEditorTool(
+        workspace_root=str(ws_path),
+        settings=settings or {},
+    )
 
     async def _execute_str_replace_editor(
         command: str = "view",
@@ -99,6 +110,9 @@ def create_str_replace_editor_executor(
 ADAPTER_SPEC = AdapterSpec(
     tool_names=("str_replace_editor",),
     factory=create_str_replace_editor_executor,
+    # M7.7: Request the "settings" context key so ``resolve_tool_runtime``
+    # forwards the user-configured values loaded from the manifest.
+    requires_context=frozenset({"settings"}),
 )
 
 

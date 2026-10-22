@@ -24,7 +24,7 @@ Factory signature:
 from __future__ import annotations
 
 import logging
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from peldrun.tools.contract import ToolResult
 
@@ -41,6 +41,8 @@ logger = logging.getLogger("omweb.adapters.tools_adapters.ask_human")
 def create_ask_human_executor(
     workspace_dir: WorkspacePathType = None,
     human_input_callback: Optional[Callable[..., Awaitable[str]]] = None,
+    *,
+    settings: Optional[Dict[str, Any]] = None,
     **kwargs: Any,
 ) -> Callable[..., Awaitable[ToolResult]]:
     """
@@ -52,10 +54,19 @@ def create_ask_human_executor(
     ``HumanInputTool`` is used, which emits a durable
     ``HumanInputRequest`` through the runtime.
 
+    M7.8: ``settings`` is provided by ``resolve_tool_runtime`` when the
+    adapter declares ``requires_context={"settings"}``. It carries
+    ``default_timeout_seconds``, ``max_prompt_chars``, ``max_options``,
+    and ``on_timeout`` from the ``ask_human`` manifest. The values are
+    captured by the returned executor's closure and forwarded to
+    ``HumanInputTool`` on each invocation (the tool is constructed
+    per-call, not per-factory).
+
     The returned callable accepts ``question`` (or aliases ``prompt`` /
     ``query``) and returns a canonical ``ToolResult``.
     """
     ws_path = _resolve_workspace_path(workspace_dir)
+    settings_snapshot: Dict[str, Any] = dict(settings or {})
 
     async def _execute_ask_human(
         question: str = "",
@@ -97,7 +108,10 @@ def create_ask_human_executor(
         try:
             from peldrun.tools.builtins.human_input import HumanInputTool
 
-            tool = HumanInputTool(workspace_root=str(ws_path))
+            tool = HumanInputTool(
+                workspace_root=str(ws_path),
+                settings=settings_snapshot,
+            )
             res = await tool.aexecute(question=prompt_q, **call_kwargs)
             return _ensure_tool_result(
                 res, default_error_code="HUMAN_INPUT_ERROR"
@@ -127,6 +141,11 @@ def create_ask_human_executor(
 ADAPTER_SPEC = AdapterSpec(
     tool_names=("ask_human", "human_input"),
     factory=create_ask_human_executor,
+    # M7.7: forward user settings (timeout, prompt cap, options cap,
+    # on_timeout) so the HumanInputTool honors them at construction
+    # time. Settings are captured by the closure and passed to each
+    # per-call HumanInputTool instance.
+    requires_context=frozenset({"settings"}),
 )
 
 

@@ -26,7 +26,7 @@ Context requirement:
 from __future__ import annotations
 
 import logging
-from typing import Any, Awaitable, Callable, FrozenSet, Optional
+from typing import Any, Awaitable, Callable, Dict, FrozenSet, Optional
 
 from peldrun.tools.builtins.browser_interactive import BrowserInteractiveTool
 from peldrun.tools.contract import ToolResult
@@ -45,6 +45,7 @@ def create_browser_interactive_executor(
     workspace_dir: WorkspacePathType = None,
     *,
     run_id: Optional[str] = None,
+    settings: Optional[Dict[str, Any]] = None,
     **kwargs: Any,
 ) -> Callable[..., Awaitable[ToolResult]]:
     """
@@ -54,9 +55,18 @@ def create_browser_interactive_executor(
     The returned callable accepts a raw dict of action parameters
     (``action``, ``url``, ``ref``, ...) and returns a canonical
     ``ToolResult``.
+
+    M7.8: ``settings`` is provided by ``resolve_tool_runtime`` when the
+    adapter declares ``requires_context={"settings"}``. It carries
+    ``default_max_chars``, ``navigation_timeout_seconds``,
+    ``action_timeout_seconds``, ``user_agent``, ``viewport``, and
+    ``screenshot_dir`` from the manifest.
     """
     ws_path = _resolve_workspace_path(workspace_dir)
-    core_tool = BrowserInteractiveTool(workspace_root=str(ws_path))
+    core_tool = BrowserInteractiveTool(
+        workspace_root=str(ws_path),
+        settings=settings or {},
+    )
 
     if run_id:
         core_tool.set_run_id(run_id)
@@ -105,7 +115,11 @@ def create_browser_interactive_executor(
 ADAPTER_SPEC = AdapterSpec(
     tool_names=("browser_interactive",),
     factory=create_browser_interactive_executor,
-    requires_context=frozenset({"run_id"}),
+    # ``run_id`` isolates BrowserContexts per run.
+    # ``settings`` (M7.7) forwards user-configured values from the
+    # manifest: max_chars, navigation/action timeouts, user_agent,
+    # viewport, and screenshot_dir.
+    requires_context=frozenset({"run_id", "settings"}),
 )
 
 

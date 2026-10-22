@@ -318,6 +318,29 @@ class MyTool(SovereignBaseTool):
         }
 ```
 
+## update
+
+```python
+from omweb.tools.base import SovereignBaseTool
+
+class MyTool(SovereignBaseTool):
+    name: str = "my_tool"
+    description: str = "..."
+
+    def __init__(self, workspace_root=None, settings=None, **kwargs):
+        super().__init__(workspace_root=workspace_root, **kwargs)
+        self._settings = settings or {}
+
+    def set_settings(self, settings: dict):
+        # PELDRUN will call this to inject user values
+        self._settings.update(settings)
+
+    async def execute(self, **kwargs):
+        # Use self._settings.get("key") here
+        return {"output": "...", "exit_code": 0}
+
+```
+
 **Return contract:** the `execute()` method must return either a `dict`
 (converted to `ToolResult` automatically) or a `ToolResult` instance.
 
