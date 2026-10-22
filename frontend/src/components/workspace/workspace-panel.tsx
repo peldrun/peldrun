@@ -400,7 +400,7 @@ export function WorkspacePanel({
           />
         )}
         {activeTab === "source-control" && (
-          <SourceControlPanel />
+          <SourceControlPanel chatId={activeChatId ?? undefined} />
         )}
         {activeTab === "logs" && (
           <LogsTab

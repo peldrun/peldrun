@@ -184,7 +184,14 @@ except ImportError:
         NotFoundError,
         PermissionDeniedError,
         RemoteStateChangedError,
+        UnsupportedCapabilityError,
         ValidationError,
+    )
+    from integrations.source_control.providers.github.pull_requests import (
+        GitHubPullRequestService,
+    )
+    from integrations.source_control.providers.github.reviews import (
+        GitHubReviewsService,
     )
     from integrations.source_control.security.audit import (
         AuditEventType,
@@ -255,6 +262,246 @@ _MAX_FILE_CONTENT_BYTES = 100_000
 
 #: Maximum number of diff sample lines returned to the UI.
 _MAX_DIFF_SAMPLE_LINES = 500
+
+
+#: Providers whose pull-request operations are currently wired to
+#: the facade. GitLab and Bitbucket adapters exist for read/branch/
+#: push operations but do not expose the merge/review endpoints
+#: through the facade yet. Adding a provider here requires (a) a
+#: `providers/<name>/pull_requests.py` and `reviews.py` with the
+#: same public surface, and (b) updating `_get_github_pr_service`
+#: / `_get_github_reviews_service` to dispatch on the provider.
+_PR_CAPABLE_PROVIDERS: frozenset[ProviderId] = frozenset({ProviderId.GITHUB})
+
+
+# Git history reader + branch manager + the response schemas they
+# need. Imported defensively because the Git history feature is
+# rolled out incrementally: older deployments may not yet have the
+# modules below, and a hard top-level import would prevent the
+# facade from loading at all. The fallback path mirrors the
+# `backend.integrations.*` prefix used by other modules in the
+# subsystem.
+try:
+    from integrations.source_control.git.log import (
+        GitLogReader,
+        get_default_log_reader,
+    )
+    from integrations.source_control.git.branch import (
+        GitBranchManager,
+        get_default_branch_manager,
+    )
+    from integrations.source_control.schemas.requests import (
+        CheckoutBranchRequest,
+    )
+    from integrations.source_control.schemas.responses import (
+        CommitEntryResponse,
+        CommitWithStatsResponse,
+        FileContentAtRefResponse,
+        TreeNodeResponse,
+    )
+except ImportError:
+    from backend.integrations.source_control.git.log import (  # type: ignore[no-redef]
+        GitLogReader,
+        get_default_log_reader,
+    )
+    from backend.integrations.source_control.git.branch import (  # type: ignore[no-redef]
+        GitBranchManager,
+        get_default_branch_manager,
+    )
+    from backend.integrations.source_control.schemas.requests import (  # type: ignore[no-redef]
+        CheckoutBranchRequest,
+    )
+    from backend.integrations.source_control.schemas.responses import (  # type: ignore[no-redef]
+        CommitEntryResponse,
+        CommitWithStatsResponse,
+        FileContentAtRefResponse,
+        TreeNodeResponse,
+    )
+
+
+# Pull request schemas and services — Phase 2 additions.
+#
+# Why a separate try/except block and not a modification of the
+# existing imports above:
+#
+#   The main imports at the top of the module have two paths (a
+#   relative `from integrations...` try and an absolute
+#   `from backend.integrations...` fallback). Depending on how the
+#   module is imported, EITHER path may succeed. If we added the
+#   new PR imports into only one of them, the other path would
+#   silently shadow them and produce `NameError: GitHubPullRequestService`
+#   at the first PR call. By adding a self-contained try/except
+#   block that is independent of the earlier ones, the new names
+#   are guaranteed to resolve on every code path — regardless of
+#   which of the earlier blocks succeeded.
+try:
+    from integrations.source_control.domain.enums import (
+        ChangeRequestState,
+    )
+    from integrations.source_control.errors import (
+        UnsupportedCapabilityError,
+    )
+    from integrations.source_control.providers.github.pull_requests import (
+        GitHubPullRequestService,
+    )
+    from integrations.source_control.providers.github.reviews import (
+        GitHubReviewsService,
+    )
+    from integrations.source_control.schemas import (
+        CreatePullRequestCommentRequest,
+        CreatePullRequestRequest,
+        MergePullRequestRequest,
+        MergePullRequestResponse,
+        PullRequestCommentResponse,
+        PullRequestListResponse,
+        PullRequestResponse,
+        PullRequestReviewResponse,
+        SubmitPullRequestReviewRequest,
+    )
+except ImportError:
+    from backend.integrations.source_control.domain.enums import (  # type: ignore[no-redef]
+        ChangeRequestState,
+    )
+    from backend.integrations.source_control.errors import (  # type: ignore[no-redef]
+        UnsupportedCapabilityError,
+    )
+    from backend.integrations.source_control.providers.github.pull_requests import (  # type: ignore[no-redef]
+        GitHubPullRequestService,
+    )
+    from backend.integrations.source_control.providers.github.reviews import (  # type: ignore[no-redef]
+        GitHubReviewsService,
+    )
+    from backend.integrations.source_control.schemas import (  # type: ignore[no-redef]
+        CreatePullRequestCommentRequest,
+        CreatePullRequestRequest,
+        MergePullRequestRequest,
+        MergePullRequestResponse,
+        PullRequestCommentResponse,
+        PullRequestListResponse,
+        PullRequestResponse,
+        PullRequestReviewResponse,
+        SubmitPullRequestReviewRequest,
+    )
+
+
+# Issue schemas and service — Phase 3 additions. Self-contained
+# try/except for the same reason the PR block above is: the module
+# has two import paths, and adding the names to only one would
+# break the other with NameError at the first issue call.
+try:
+    from integrations.source_control.providers.github.issues import (
+        GitHubIssueService,
+    )
+    from integrations.source_control.schemas import (
+        CreateIssueCommentRequest,
+        CreateIssueRequest,
+        IssueCommentResponse,
+        IssueListResponse,
+        IssueResponse,
+        UpdateIssueStateRequest,
+    )
+except ImportError:
+    from backend.integrations.source_control.providers.github.issues import (  # type: ignore[no-redef]
+        GitHubIssueService,
+    )
+    from backend.integrations.source_control.schemas import (  # type: ignore[no-redef]
+        CreateIssueCommentRequest,
+        CreateIssueRequest,
+        IssueCommentResponse,
+        IssueListResponse,
+        IssueResponse,
+        UpdateIssueStateRequest,
+    )
+
+
+# Merge / rebase / conflict-resolution services and schemas — Phase 4
+# additions. Self-contained try/except for the same reason the earlier
+# blocks are: the module has two import paths, and adding the names to
+# only one would break the other with NameError at the first call.
+try:
+    from integrations.source_control.git.merge import (
+        GitMergeManager,
+        MergeOutcome,
+        get_default_merge_manager,
+    )
+    from integrations.source_control.git.conflict import (
+        ConflictEntry,
+        GitConflictManager,
+        OperationState,
+        get_default_conflict_manager,
+    )
+    from integrations.source_control.schemas import (
+        ConflictFileResponse,
+        ConflictListResponse,
+        MergeBranchesRequest,
+        MergeOperationResponse,
+        RebaseBranchRequest,
+        ResolveConflictsRequest,
+        ResolveConflictsResponse,
+    )
+except ImportError:
+    from backend.integrations.source_control.git.merge import (  # type: ignore[no-redef]
+        GitMergeManager,
+        MergeOutcome,
+        get_default_merge_manager,
+    )
+    from backend.integrations.source_control.git.conflict import (  # type: ignore[no-redef]
+        ConflictEntry,
+        GitConflictManager,
+        OperationState,
+        get_default_conflict_manager,
+    )
+    from backend.integrations.source_control.schemas import (  # type: ignore[no-redef]
+        ConflictFileResponse,
+        ConflictListResponse,
+        MergeBranchesRequest,
+        MergeOperationResponse,
+        RebaseBranchRequest,
+        ResolveConflictsRequest,
+        ResolveConflictsResponse,
+    )
+
+
+# Tag manager, release service, and their schemas — Phase 5 additions.
+# Self-contained try/except for the same reason all the earlier blocks
+# are: the module has two import paths, and adding the names to only
+# one would break the other with NameError at the first tag call.
+try:
+    from integrations.source_control.git.tag import (
+        GitTagManager,
+        TagRef,
+        get_default_tag_manager,
+    )
+    from integrations.source_control.providers.github.releases import (
+        GitHubReleaseService,
+        ReleaseRef,
+    )
+    from integrations.source_control.schemas import (
+        CreateReleaseRequest,
+        CreateTagRequest,
+        ReleaseListResponse,
+        ReleaseResponse,
+        TagListResponse,
+        TagResponse,
+    )
+except ImportError:
+    from backend.integrations.source_control.git.tag import (  # type: ignore[no-redef]
+        GitTagManager,
+        TagRef,
+        get_default_tag_manager,
+    )
+    from backend.integrations.source_control.providers.github.releases import (  # type: ignore[no-redef]
+        GitHubReleaseService,
+        ReleaseRef,
+    )
+    from backend.integrations.source_control.schemas import (  # type: ignore[no-redef]
+        CreateReleaseRequest,
+        CreateTagRequest,
+        ReleaseListResponse,
+        ReleaseResponse,
+        TagListResponse,
+        TagResponse,
+    )
 
 
 def _utc_now() -> datetime:
@@ -361,6 +608,14 @@ class SourceControlFacade:
         audit_logger: Optional[AuditLogger] = None,
         oauth_coordinator: Optional[OAuthFlowCoordinator] = None,
         base_workspace_dir: Optional[str | Path] = None,
+        log_reader: Optional[GitLogReader] = None,
+        branch_manager: Optional[GitBranchManager] = None,
+        pr_service: Optional[GitHubPullRequestService] = None,
+        reviews_service: Optional[GitHubReviewsService] = None,
+        merge_manager: Optional[GitMergeManager] = None,
+        conflict_manager: Optional[GitConflictManager] = None,
+        tag_manager: Optional[GitTagManager] = None,
+        release_service: Optional[GitHubReleaseService] = None,
     ) -> None:
         # Provider registry
         self.registry = (
@@ -465,6 +720,62 @@ class SourceControlFacade:
                 get_default_push_manager,
             )
             self.push_manager = get_default_push_manager()
+
+        # Git history reader. Used by the read-only browser endpoints
+        # (commit history, file tree, historical file content). As with
+        # the workspace / diff / push managers above, the process-wide
+        # default is used when no explicit dependency was injected, so
+        # that the facade sees the same workspaces the agent created.
+        if log_reader is not None:
+            self.log_reader = log_reader
+        else:
+            self.log_reader = get_default_log_reader()
+
+        # Local branch manager. Used by the checkout endpoint to switch
+        # the workspace between existing branches. This is a local-only
+        # operation and does not touch the remote.
+        if branch_manager is not None:
+            self.branch_manager = branch_manager
+        else:
+            self.branch_manager = get_default_branch_manager()
+
+        # Pull request services. Both are GitHub-only in this phase
+        # and are instantiated lazily by `_get_github_pr_service` /
+        # `_get_github_reviews_service` on first use, so a deployment
+        # that never touches pull requests pays no construction cost.
+        # Explicit injection is supported for tests and for custom
+        # Enterprise-instance deployments.
+        self._pr_service: Optional[GitHubPullRequestService] = pr_service
+        self._reviews_service: Optional[GitHubReviewsService] = reviews_service
+        self._issue_service: Optional[GitHubIssueService] = None
+
+        # Merge / rebase / conflict-resolution managers. Both are
+        # local-only (no remote calls) and use the process-wide
+        # defaults so they see the same workspaces the workspace
+        # manager and the log reader see.
+        self.merge_manager: GitMergeManager = (
+            merge_manager
+            if merge_manager is not None
+            else get_default_merge_manager()
+        )
+        self.conflict_manager: GitConflictManager = (
+            conflict_manager
+            if conflict_manager is not None
+            else get_default_conflict_manager()
+        )
+
+        # Tag manager (local) and release service (GitHub-only).
+        # Same lazy-init strategy as the PR / issue services: the
+        # release service is only constructed on first use, so a
+        # deployment that never touches releases pays no cost.
+        self.tag_manager: GitTagManager = (
+            tag_manager
+            if tag_manager is not None
+            else get_default_tag_manager()
+        )
+        self._release_service: Optional[GitHubReleaseService] = (
+            release_service
+        )
 
         # OAuth
         self.oauth_coordinator = oauth_coordinator or OAuthFlowCoordinator()
@@ -1414,8 +1725,10 @@ class SourceControlFacade:
         # `limit`. Passing `limit=` raised TypeError against the real
         # adapter; the mock-based tests did not catch this because
         # mocks accept any keyword.
+        # We must pass page=1 explicitly; some adapter versions
+        # require it as a positional argument.
         repos = await adapter.list_repositories(
-            query=query, page_size=limit, token=token
+            page=1, query=query, page_size=limit, token=token
         )
 
         return [
@@ -1433,10 +1746,8 @@ class SourceControlFacade:
                 web_url=redact_url(r.web_url),
                 clone_url=redact_url(r.clone_url),
                 is_private=r.is_private,
-                description=(
-                    r.metadata.get("description") if r.metadata else None
-                ),
-                metadata=dict(r.metadata or {}),
+                description=getattr(r, "description", None),
+                metadata=dict(getattr(r, "metadata", {}) or {}),
             )
             for r in repos
         ]
@@ -1478,8 +1789,8 @@ class SourceControlFacade:
             web_url=redact_url(r.web_url),
             clone_url=redact_url(r.clone_url),
             is_private=r.is_private,
-            description=(r.metadata.get("description") if r.metadata else None),
-            metadata=dict(r.metadata or {}),
+            description=getattr(r, "description", None),
+            metadata=dict(getattr(r, "metadata", {}) or {}),
         )
 
     async def list_branches(
@@ -1719,8 +2030,25 @@ class SourceControlFacade:
         target_path = None
         if chat_id:
             from pathlib import Path
-            # Use the chat's session files directory as the workspace
-            target_path = Path(os.getcwd()) / "storage" / "chats" / chat_id / "files"
+            # Resolve against the PROJECT root, not the backend package.
+            backend_root = Path(__file__).resolve().parent.parent.parent
+            project_root = backend_root.parent
+            target_path = project_root / "storage" / "chats" / chat_id / "files"
+
+            if not target_path.exists() and (backend_root / "storage" / "chats" / chat_id / "files").exists():
+                target_path = backend_root / "storage" / "chats" / chat_id / "files"
+
+            # A chat can host at most ONE workspace. If the target
+            # already contains a .git directory, this is a
+            # re-request on an existing workspace, not a new one.
+            # Refuse early with a clear message instead of letting
+            # `git worktree add` fail with an opaque error.
+            if target_path.exists() and (target_path / ".git").exists():
+                raise ValidationError(
+                    f"Chat '{chat_id}' already contains a workspace. "
+                    "Please use a fresh chat to create a new workspace, "
+                    "or reuse the existing one."
+                )
 
         # Pass `auth_token` so that private repositories can be
         # cloned. The previous implementation dropped the token
@@ -1777,6 +2105,222 @@ class SourceControlFacade:
             is_dirty=not ws_ref.is_clean,
             created_at=ws_ref.created_at,
         )
+
+    async def get_workspace_by_chat(self, chat_id: str) -> Optional[WorkspaceResponse]:
+        """
+        Return the workspace bound to a chat, if one exists.
+
+        Resolution order:
+
+            1. If ``storage/chats/<chat_id>/files/.peldrun/workspace.json``
+               exists, use it as the authoritative source. This file is
+               written by the workspace manager at clone time and
+               survives server restarts. It is the only source that
+               works when the in-memory registry was lost (e.g. after
+               a process restart or a hot reload).
+
+            2. Search the in-memory workspace registry for an entry
+               whose path matches the chat's files folder.
+
+            3. Search the durable operation journal for a completed
+               operation bound to that folder.
+
+        Returns ``None`` when none of the three sources can resolve a
+        workspace, which tells the caller that the chat is empty and a
+        fresh ``create_workspace`` call is appropriate.
+        """
+        from pathlib import Path
+        import json as _json
+
+        backend_root = Path(__file__).resolve().parent.parent.parent
+        project_root = backend_root.parent
+        candidate_paths = [
+            project_root / "storage" / "chats" / chat_id / "files",
+            backend_root / "storage" / "chats" / chat_id / "files",
+        ]
+        # Primary expected path is the PROJECT root (matches how
+        # PELDRUN actually stores chat files). The backend root
+        # variant is a compatibility fallback for older layouts.
+        expected_path = next(
+            (p for p in candidate_paths if p.exists()),
+            candidate_paths[0],
+        )
+
+        # ---- Strategy 1: .peldrun/workspace.json on disk ----
+        marker_path = expected_path / ".peldrun" / "workspace.json"
+        if marker_path.exists():
+            try:
+                raw = marker_path.read_text(encoding="utf-8")
+                data = _json.loads(raw)
+                ws_id = data.get("workspace_id")
+
+                # Determine the ACTUAL branch from git. The marker
+                # file records the branch at clone time, but the
+                # agent (or the user) may have switched branches
+                # since then (e.g. `git checkout -b docs/...`). We
+                # always ask git for the truth so the frontend
+                # creates the push operation against the right
+                # branch and the policy engine does not refuse the
+                # request because it thinks we are on `main`.
+                actual_branch = str(data.get("current_branch") or "main")
+                try:
+                    import subprocess
+                    res = subprocess.run(
+                        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                        cwd=str(expected_path),
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if (
+                        res.returncode == 0
+                        and res.stdout.strip()
+                        and res.stdout.strip() != "HEAD"
+                    ):
+                        actual_branch = res.stdout.strip()
+                except Exception:
+                    # Best-effort: if git is unavailable or the
+                    # directory is not a real repo, fall back to
+                    # the marker value.
+                    pass
+
+                if ws_id:
+                    # Try the live registry first so is_dirty/head_sha
+                    # reflect the current state.
+                    live = self.workspace_manager.get_workspace(ws_id)
+                    if live is not None:
+                        return WorkspaceResponse(
+                            workspace_id=live.workspace_id,
+                            repository_id=live.repository_id,
+                            current_branch=actual_branch,
+                            base_sha=live.base_sha,
+                            head_sha=live.head_sha,
+                            is_dirty=not live.is_clean,
+                            created_at=live.created_at,
+                        )
+                    # Otherwise return the values captured in the
+                    # marker file at clone time. The caller only needs
+                    # workspace_id, repository_id, and current_branch
+                    # to skip step 1; a slightly stale head_sha is
+                    # harmless because the next approval request
+                    # recomputes the diff from disk anyway.
+                    created_at_raw = data.get("created_at")
+                    try:
+                        created_at = (
+                            datetime.fromisoformat(created_at_raw)
+                            if isinstance(created_at_raw, str)
+                            else _utc_now()
+                        )
+                    except (ValueError, TypeError):
+                        created_at = _utc_now()
+                    return WorkspaceResponse(
+                        workspace_id=ws_id,
+                        repository_id=str(data.get("repository_id") or ""),
+                        current_branch=actual_branch,
+                        base_sha=str(data.get("base_sha") or "HEAD"),
+                        head_sha=data.get("head_sha"),
+                        is_dirty=bool(data.get("is_dirty", False)),
+                        created_at=created_at,
+                    )
+            except (OSError, _json.JSONDecodeError, ValueError):
+                # Marker is corrupt or unreadable; fall through to
+                # the registry and journal strategies.
+                pass
+
+        # ---- Strategy 2: in-memory workspace registry ----
+        all_workspaces = []
+        if hasattr(self.workspace_manager, "list_workspaces"):
+            try:
+                all_workspaces = self.workspace_manager.list_workspaces()
+            except Exception:
+                pass
+        elif hasattr(self.workspace_manager, "_workspaces"):
+            all_workspaces = list(self.workspace_manager._workspaces.values())
+
+        for ws in all_workspaces:
+            ws_path = getattr(ws, "workspace_path", "") or ""
+            try:
+                if Path(ws_path).resolve() == expected_path.resolve():
+                    return WorkspaceResponse(
+                        workspace_id=ws.workspace_id,
+                        repository_id=ws.repository_id,
+                        current_branch=ws.current_branch,
+                        base_sha=ws.base_sha,
+                        head_sha=ws.head_sha,
+                        is_dirty=not ws.is_clean,
+                        created_at=ws.created_at,
+                    )
+            except (OSError, ValueError):
+                continue
+
+        # ---- Strategy 3: durable operation journal ----
+        try:
+            operations = await self.operation_service.list_operations()
+            for op in operations or ():
+                if not op.workspace_id:
+                    continue
+                ws_ref = self.workspace_manager.get_workspace(op.workspace_id)
+                if ws_ref is None:
+                    continue
+                try:
+                    if Path(ws_ref.workspace_path).resolve() == expected_path.resolve():
+                        return WorkspaceResponse(
+                            workspace_id=ws_ref.workspace_id,
+                            repository_id=ws_ref.repository_id,
+                            current_branch=ws_ref.current_branch,
+                            base_sha=ws_ref.base_sha,
+                            head_sha=ws_ref.head_sha,
+                            is_dirty=not ws_ref.is_clean,
+                            created_at=ws_ref.created_at,
+                        )
+                except (OSError, ValueError):
+                    continue
+        except Exception:
+            pass
+
+        return None
+
+    async def ensure_editable_branch(self, workspace_id: str) -> str:
+        """Ensure the workspace is on a non-protected branch."""
+        import subprocess
+        from datetime import datetime as _dt
+
+        ws_ref = self.workspace_manager.get_workspace(workspace_id)
+        if ws_ref is None:
+            raise NotFoundError(f"Workspace '{workspace_id}' was not found.")
+
+        try:
+            res = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=ws_ref.workspace_path,
+                capture_output=True, text=True, timeout=5,
+            )
+            current = res.stdout.strip() if res.returncode == 0 else ws_ref.current_branch
+        except Exception:
+            current = ws_ref.current_branch
+
+        if not is_protected_branch(current):
+            return current
+
+        stamp = _dt.utcnow().strftime("%Y%m%d-%H%M%S")
+        new_branch = f"peldrun/manual-{stamp}"
+
+        res = subprocess.run(
+            ["git", "checkout", "-b", new_branch],
+            cwd=ws_ref.workspace_path,
+            capture_output=True, text=True, timeout=10,
+        )
+        if res.returncode != 0:
+            raise ValidationError(f"Could not create branch '{new_branch}': {res.stderr.strip()}")
+
+        self._audit(
+            AuditEventType.OTHER,
+            action="auto_branch_created",
+            message=f"Auto-created branch '{new_branch}' from '{current}'.",
+            payload={"workspace_id": workspace_id, "from_branch": current, "to_branch": new_branch},
+            actor="user",
+        )
+        return new_branch
 
     async def cleanup_workspaces(self) -> dict:
         """
@@ -2316,6 +2860,36 @@ class SourceControlFacade:
         )
         clean_target = validate_branch_name(payload.target_branch)
 
+        ws_id_for_branch = getattr(payload, "workspace_id", None)
+
+        # AUTO-BRANCHING: If this is a push operation targeting a
+        # protected branch (e.g. "main"), the policy engine will
+        # refuse it. Rather than surfacing that refusal to the user,
+        # we transparently create a new feature branch from HEAD
+        # (which already contains any commits the agent made) and
+        # retarget the operation at that branch.
+        if (
+            ws_id_for_branch
+            and payload.operation_type == "push_branch"
+            and is_protected_branch(clean_target)
+        ):
+            try:
+                new_branch = await self.ensure_editable_branch(ws_id_for_branch)
+                clean_target = validate_branch_name(new_branch)
+                logger.info(
+                    "create_operation: auto-created branch '%s' "
+                    "(original target '%s' was protected)",
+                    new_branch,
+                    payload.target_branch,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "create_operation: could not auto-create branch "
+                    "for protected target '%s': %s",
+                    clean_target,
+                    exc,
+                )
+
         policy_ctx = PolicyResolutionContext(
             operation=payload.operation_type,
             provider=provider_id,
@@ -2351,12 +2925,40 @@ class SourceControlFacade:
                 # creation because of a workspace lookup miss.
                 pass
 
+        # Capture the workspace's ORIGINAL base SHA so that
+        # `request_operation_approval` can compute `git diff
+        # <base_sha>` — which includes the agent's committed work
+        # — instead of falling back to `git diff HEAD` (which is
+        # empty after the agent already committed).
+        ws_base_sha_for_record = ""
+        if ws_id_for_meta:
+            try:
+                _ws_for_base = self.workspace_manager.get_workspace(
+                    ws_id_for_meta
+                )
+                if _ws_for_base is not None:
+                    ws_base_sha_for_record = (
+                        _ws_for_base.base_sha
+                        or _ws_for_base.head_sha
+                        or ""
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+
+        logger.info(
+            "create_operation: workspace=%s base_sha=%s target=%s",
+            ws_id_for_meta,
+            (ws_base_sha_for_record or "<empty>")[:12],
+            clean_target,
+        )
+
         record: OperationRecord = await self.operation_service.create_operation(
             repository_id=payload.repository_id,
             kind=payload.operation_type,
             provider=provider_id,
             target_branch=clean_target,
             workspace_id=getattr(payload, "workspace_id", None),
+            base_sha=ws_base_sha_for_record,
             metadata=metadata,
         )
 
@@ -3312,6 +3914,2106 @@ class SourceControlFacade:
             created_at=record.created_at,
             updated_at=record.updated_at,
             events=event_responses,
+        )
+
+
+    # ------------------------------------------------------------------
+    # 9. Git read-only operations (history, tree, historical content)
+    # ------------------------------------------------------------------
+    #
+    # These operations are read-only. They are exposed for the
+    # Repository Browser and Commit History views, which need access
+    # to the committed history rather than the editable working tree.
+    # Every method resolves the workspace through the shared
+    # `workspace_manager`, so a workspace created by the agent is
+    # visible here without extra plumbing.
+
+    async def read_workspace_log(
+        self,
+        workspace_id: str,
+        *,
+        limit: int = 50,
+        skip: int = 0,
+        ref: Optional[str] = None,
+        path: Optional[str] = None,
+        author: Optional[str] = None,
+    ) -> Sequence[CommitEntryResponse]:
+        """
+        Return a page of commits for the given workspace.
+
+        Pagination is stable: two calls with non-overlapping `skip`
+        values return non-overlapping pages, provided the underlying
+        history is unchanged. An empty sequence is a valid result
+        (empty repository, or all commits filtered out).
+
+        Args:
+            workspace_id: Workspace identifier.
+            limit: Maximum number of commits to return per page.
+            skip: Number of commits to skip from the tip of `ref`.
+            ref: Branch, tag, or SHA. Defaults to `HEAD`.
+            path: Optional path filter.
+            author: Optional author name/email filter.
+
+        Raises:
+            NotFoundError: If the workspace or `ref` does not exist.
+        """
+        ws_ref = self.workspace_manager.get_workspace(workspace_id)
+        if ws_ref is None:
+            raise NotFoundError(
+                f"Workspace '{workspace_id}' was not found."
+            )
+
+        commits = await self.log_reader.read_log(
+            workspace_id,
+            workspace_path=ws_ref.workspace_path,
+            limit=limit,
+            skip=skip,
+            ref=ref,
+            path=path,
+            author=author,
+        )
+        return tuple(
+            self._to_commit_entry_response(commit) for commit in commits
+        )
+
+    async def read_workspace_commit(
+        self,
+        workspace_id: str,
+        *,
+        sha: str,
+    ) -> CommitWithStatsResponse:
+        """
+        Return a single commit with aggregate file-change statistics.
+
+        Unlike `read_workspace_log`, this method makes an additional
+        `git show --numstat` invocation to compute the stats. The
+        extra cost is justified because the caller explicitly asked
+        for one commit, not a page.
+
+        Args:
+            workspace_id: Workspace identifier.
+            sha: Full or abbreviated commit SHA.
+
+        Raises:
+            NotFoundError: If the workspace or commit does not exist.
+        """
+        ws_ref = self.workspace_manager.get_workspace(workspace_id)
+        if ws_ref is None:
+            raise NotFoundError(
+                f"Workspace '{workspace_id}' was not found."
+            )
+
+        commit = await self.log_reader.read_commit(
+            workspace_id,
+            workspace_path=ws_ref.workspace_path,
+            sha=sha,
+        )
+        return self._to_commit_with_stats_response(commit)
+
+    async def list_workspace_tree(
+        self,
+        workspace_id: str,
+        *,
+        ref: Optional[str] = None,
+    ) -> Sequence[TreeNodeResponse]:
+        """
+        Return the hierarchical file tree at `ref`.
+
+        The tree reflects COMMITTED content, not the working tree.
+        When the caller wants to browse the working tree, they
+        should use the workspace status / diff endpoints instead.
+
+        Args:
+            workspace_id: Workspace identifier.
+            ref: Branch, tag, or SHA. Defaults to `HEAD`.
+
+        Raises:
+            NotFoundError: If the workspace or ref does not exist.
+        """
+        ws_ref = self.workspace_manager.get_workspace(workspace_id)
+        if ws_ref is None:
+            raise NotFoundError(
+                f"Workspace '{workspace_id}' was not found."
+            )
+
+        tree = await self.log_reader.list_tree(
+            workspace_id,
+            workspace_path=ws_ref.workspace_path,
+            ref=ref,
+        )
+        return tuple(
+            self._to_tree_node_response(node) for node in tree
+        )
+
+    async def read_file_at_ref(
+        self,
+        workspace_id: str,
+        *,
+        ref: str,
+        path: str,
+    ) -> FileContentAtRefResponse:
+        """
+        Return the content of a file at a specific committed ref.
+
+        Unlike the workspace-diff endpoint, which reads the working
+        tree, this method reads the COMMITTED content via
+        `git show <ref>:<path>`. It is the correct API for browsing
+        historical files in the Repository Browser: a user who
+        selects a commit from the history view expects to see the
+        file as it was at that commit.
+
+        Binary detection:
+            The current implementation reports `is_binary=False`
+            unconditionally. `GitExecutable` decodes the `git show`
+            output as UTF-8 with replacement, which erases the NUL
+            bytes that would otherwise signal binary content. A
+            dedicated binary-detection pass will be added to
+            `GitLogReader` in a later revision; when it lands, this
+            method will forward its result. Callers that need
+            binary detection today should rely on the size / content
+            inspection of the frontend.
+
+        Args:
+            workspace_id: Workspace identifier.
+            ref: Branch, tag, or commit SHA.
+            path: File path relative to the repository root.
+
+        Raises:
+            NotFoundError: If the workspace, ref, or file does not
+                exist at that ref.
+        """
+        ws_ref = self.workspace_manager.get_workspace(workspace_id)
+        if ws_ref is None:
+            raise NotFoundError(
+                f"Workspace '{workspace_id}' was not found."
+            )
+
+        content = await self.log_reader.read_file_at_ref(
+            workspace_id,
+            workspace_path=ws_ref.workspace_path,
+            ref=ref,
+            path=path,
+        )
+        # Detect truncation by matching the marker appended by
+        # `GitLogReader.read_file_at_ref`. This is intentionally
+        # conservative: the marker is highly unlikely to appear
+        # verbatim inside real content, and the worst case (a false
+        # positive) merely sets `is_truncated=True` on a file that
+        # happens to end with the marker.
+        truncated_marker = "... [content truncated] ..."
+        is_truncated = content.endswith(truncated_marker)
+
+        return FileContentAtRefResponse(
+            workspace_id=workspace_id,
+            ref=ref,
+            path=path,
+            # TODO: forward `is_binary` from `GitLogReader` once
+            # binary detection lands in that module.
+            is_binary=False,
+            size_bytes=len(content.encode("utf-8")),
+            is_truncated=is_truncated,
+            content=content,
+        )
+
+    async def checkout_workspace_branch(
+        self,
+        workspace_id: str,
+        payload: CheckoutBranchRequest,
+    ) -> WorkspaceResponse:
+        """
+        Check out an existing local branch in the workspace.
+
+        This is a local-only operation: it does not touch the
+        remote. A non-forced checkout is refused when the workspace
+        has uncommitted changes, so user work is never silently
+        discarded. After a successful checkout, the workspace is
+        refreshed and its updated state is returned.
+
+        Args:
+            workspace_id: Workspace identifier.
+            payload: The checkout request (`branch_name`, `force`).
+
+        Raises:
+            NotFoundError: If the workspace or the branch does not
+                exist.
+            ConflictError: If the workspace is dirty and `force` is
+                False.
+        """
+        ws_ref = self.workspace_manager.get_workspace(workspace_id)
+        if ws_ref is None:
+            raise NotFoundError(
+                f"Workspace '{workspace_id}' was not found."
+            )
+
+        await self.branch_manager.checkout_branch(
+            workspace_id,
+            branch_name=payload.branch_name,
+            workspace_path=ws_ref.workspace_path,
+            force=payload.force,
+        )
+
+        refreshed = await self.workspace_manager.refresh_workspace_status(
+            workspace_id
+        )
+
+        self._audit(
+            AuditEventType.OTHER,
+            action="checkout_workspace_branch",
+            message=(
+                f"Checked out branch '{payload.branch_name}' in "
+                f"workspace '{workspace_id}'."
+            ),
+            payload={
+                "workspace_id": workspace_id,
+                "branch_name": payload.branch_name,
+                "force": payload.force,
+            },
+            workspace_id=workspace_id,
+            actor="user",
+        )
+
+        return WorkspaceResponse(
+            workspace_id=refreshed.workspace_id,
+            repository_id=refreshed.repository_id,
+            current_branch=refreshed.current_branch,
+            base_sha=refreshed.base_sha,
+            head_sha=refreshed.head_sha,
+            is_dirty=not refreshed.is_clean,
+            created_at=refreshed.created_at,
+        )
+
+    # ------------------------------------------------------------------
+    # 10. Internal response mappers (Git read-only operations)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _to_commit_entry_response(
+        commit: Any,
+    ) -> CommitEntryResponse:
+        """
+        Map a `CommitRef` (or `CommitWithStats`) to the API response.
+
+        The input is typed as `Any` rather than `CommitRef` to avoid
+        an extra import in the facade's hot path. The attributes
+        accessed here are stable members of `CommitRef` and are
+        guaranteed to be present on every subclass.
+        """
+        return CommitEntryResponse(
+            sha=commit.sha,
+            message=commit.message,
+            author_name=commit.author_name,
+            author_email=commit.author_email,
+            committed_at=commit.committed_at,
+            parent_shas=tuple(commit.parent_shas),
+        )
+
+    @staticmethod
+    def _to_commit_with_stats_response(
+        commit: Any,
+    ) -> CommitWithStatsResponse:
+        """
+        Map a `CommitWithStats` to the API response.
+
+        See `_to_commit_entry_response` for the rationale behind the
+        `Any` annotation.
+        """
+        return CommitWithStatsResponse(
+            sha=commit.sha,
+            message=commit.message,
+            author_name=commit.author_name,
+            author_email=commit.author_email,
+            committed_at=commit.committed_at,
+            parent_shas=tuple(commit.parent_shas),
+            files_changed=int(getattr(commit, "files_changed", 0)),
+            insertions=int(getattr(commit, "insertions", 0)),
+            deletions=int(getattr(commit, "deletions", 0)),
+        )
+
+    @classmethod
+    def _to_tree_node_response(
+        cls,
+        node: Any,
+    ) -> TreeNodeResponse:
+        """
+        Recursively map a `TreeNode` to the API response.
+
+        The recursion mirrors the structure of the input tree. The
+        conversion is cheap because `TreeNode` is a frozen
+        dataclass whose attributes are stable.
+        """
+        return TreeNodeResponse(
+            name=node.name,
+            path=node.path,
+            type=node.type,
+            size=node.size,
+            children=tuple(
+                cls._to_tree_node_response(child)
+                for child in node.children
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # 11. Pull request operations (GitHub-only in this phase)
+    # ------------------------------------------------------------------
+    #
+    # These methods delegate to `GitHubPullRequestService` and
+    # `GitHubReviewsService`. Only GitHub is currently supported;
+    # GitLab and Bitbucket adapters do not expose the same merge /
+    # review endpoints through the facade yet. Calls with a
+    # non-GitHub provider raise `UnsupportedCapabilityError` so the
+    # UI can present a clear message instead of a raw 500.
+
+    async def list_pull_requests(
+        self,
+        repository_id: str,
+        *,
+        provider: Optional[str] = None,
+        state: Optional[str] = None,
+        source_branch: Optional[str] = None,
+        target_branch: Optional[str] = None,
+        page: int = 1,
+        page_size: int = 30,
+    ) -> PullRequestListResponse:
+        """List pull requests for a repository.
+
+        The `state` filter is passed through to the provider as-is;
+        GitHub supports `open`, `closed`, `merged`, and `all`. The
+        service applies a client-side filter so the returned set
+        matches the requested state exactly, rather than GitHub's
+        coarser server-side classification.
+        """
+        provider_id = (
+            ProviderId(provider.strip().lower())
+            if provider
+            else self._default_provider_id()
+        )
+        service = self._get_github_pr_service(provider_id)
+        adapter = self.registry.get(provider_id.value)
+        token = await self._require_token(provider_id)
+        repo = await self._resolve_repo(
+            adapter, repository_id, provider_id, token
+        )
+
+        state_enum: Optional[ChangeRequestState] = None
+        if state:
+            try:
+                state_enum = ChangeRequestState(state.strip().lower())
+            except ValueError:
+                raise ValidationError(
+                    f"Unknown PR state '{state}'.",
+                    details={"state": state},
+                )
+
+        prs = await service.list_pull_requests(
+            repo=repo,
+            token=token,
+            state=state_enum,
+            source_branch=source_branch,
+            target_branch=target_branch,
+            page=page,
+            page_size=page_size,
+        )
+
+        items = [self._to_pull_request_response(pr) for pr in prs]
+        return PullRequestListResponse(
+            items=tuple(items),
+            total=len(items),
+            state=(state_enum.value if state_enum else "open"),
+        )
+
+    async def get_pull_request(
+        self,
+        repository_id: str,
+        number: str,
+        *,
+        provider: Optional[str] = None,
+    ) -> PullRequestResponse:
+        """Fetch a single pull request by its number."""
+        provider_id = (
+            ProviderId(provider.strip().lower())
+            if provider
+            else self._default_provider_id()
+        )
+        service = self._get_github_pr_service(provider_id)
+        adapter = self.registry.get(provider_id.value)
+        token = await self._require_token(provider_id)
+        repo = await self._resolve_repo(
+            adapter, repository_id, provider_id, token
+        )
+        pr = await service.get_pull_request(
+            repo=repo, number_or_iid=number, token=token
+        )
+        return self._to_pull_request_response(pr)
+
+    async def create_pull_request(
+        self,
+        payload: CreatePullRequestRequest,
+    ) -> PullRequestResponse:
+        """Create a new pull request on the remote.
+
+        The policy engine is consulted before the request is sent:
+        the `create_change_request` operation kind is subject to a
+        per-repository policy, and a denial surfaces here rather
+        than after the PR has been created.
+        """
+        provider_id = (
+            ProviderId(payload.provider.strip().lower())
+            if payload.provider
+            else self._default_provider_id()
+        )
+        service = self._get_github_pr_service(provider_id)
+        adapter = self.registry.get(provider_id.value)
+        token = await self._require_token(provider_id)
+        repo = await self._resolve_repo(
+            adapter, payload.repository_id, provider_id, token
+        )
+
+        policy_ctx = PolicyResolutionContext(
+            operation="create_change_request",
+            provider=provider_id,
+            repository=repo,
+            target_branch=payload.target_branch,
+            source_branch=payload.source_branch,
+            actor="user",
+        )
+        self.policy_engine.require(policy_ctx)
+
+        pr = await service.create_pull_request(
+            repo=repo,
+            source_branch=payload.source_branch,
+            target_branch=payload.target_branch,
+            title=redact_text(payload.title),
+            body=redact_text(payload.body or ""),
+            draft=payload.draft,
+            token=token,
+        )
+
+        self._audit(
+            AuditEventType.CHANGE_REQUEST_CREATE,
+            action="create_pull_request",
+            message=f"Created PR #{pr.number_or_iid}.",
+            payload={
+                "number": pr.number_or_iid,
+                "web_url": redact_url(pr.web_url),
+                "draft": payload.draft,
+            },
+            repository_id=payload.repository_id,
+            provider=provider_id.value,
+            actor="user",
+        )
+
+        return self._to_pull_request_response(pr)
+
+    async def merge_pull_request(
+        self,
+        repository_id: str,
+        number: str,
+        payload: MergePullRequestRequest,
+        *,
+        provider: Optional[str] = None,
+    ) -> MergePullRequestResponse:
+        """Merge an open pull request.
+
+        The policy engine is consulted before the merge is sent:
+        merging is a destructive remote write and MUST pass the
+        `merge_change_request` policy. A denial surfaces as a
+        `PolicyDeniedError` before any state on the remote changes.
+        """
+        provider_id = (
+            ProviderId(provider.strip().lower())
+            if provider
+            else self._default_provider_id()
+        )
+        service = self._get_github_pr_service(provider_id)
+        adapter = self.registry.get(provider_id.value)
+        token = await self._require_token(provider_id)
+        repo = await self._resolve_repo(
+            adapter, repository_id, provider_id, token
+        )
+
+        try:
+            number_int = int(str(number).strip())
+        except (TypeError, ValueError):
+            raise ValidationError(
+                "PR number must be an integer string.",
+                details={"number": number},
+            )
+
+        policy_ctx = PolicyResolutionContext(
+            operation="merge_change_request",
+            provider=provider_id,
+            repository=repo,
+            actor="user",
+        )
+        self.policy_engine.require(policy_ctx)
+
+        result = await service.merge_pull_request(
+            repo=repo,
+            number=number_int,
+            merge_method=payload.merge_method,
+            commit_title=payload.commit_title,
+            commit_message=payload.commit_message,
+            delete_source_branch=payload.delete_source_branch,
+            expected_head_sha=payload.expected_head_sha,
+            token=token,
+        )
+
+        self._audit(
+            AuditEventType.OTHER,
+            action="merge_pull_request",
+            message=(
+                f"Merged PR #{number_int}."
+                if result.merged
+                else f"Merge attempt for PR #{number_int} did not succeed."
+            ),
+            payload={
+                "number": number_int,
+                "merged": result.merged,
+                "sha": result.sha,
+                "method": payload.merge_method,
+            },
+            repository_id=repository_id,
+            provider=provider_id.value,
+            actor="user",
+        )
+
+        return MergePullRequestResponse(
+            status="success" if result.merged else "conflict",
+            merged=result.merged,
+            sha=result.sha,
+            message=result.message
+            or (
+                "Merge applied."
+                if result.merged
+                else "Merge was not applied."
+            ),
+        )
+
+    async def submit_pr_review(
+        self,
+        repository_id: str,
+        number: str,
+        payload: SubmitPullRequestReviewRequest,
+        *,
+        provider: Optional[str] = None,
+    ) -> PullRequestReviewResponse:
+        """Submit a review on a pull request.
+
+        Inline comments are redacted before being forwarded to the
+        service, so accidental secrets in a comment body never land
+        in the provider payload or in the audit log.
+        """
+        provider_id = (
+            ProviderId(provider.strip().lower())
+            if provider
+            else self._default_provider_id()
+        )
+        reviews_service = self._get_github_reviews_service(provider_id)
+        adapter = self.registry.get(provider_id.value)
+        token = await self._require_token(provider_id)
+        repo = await self._resolve_repo(
+            adapter, repository_id, provider_id, token
+        )
+
+        try:
+            number_int = int(str(number).strip())
+        except (TypeError, ValueError):
+            raise ValidationError(
+                "PR number must be an integer string.",
+                details={"number": number},
+            )
+
+        comments_payload = [
+            {
+                "path": c.path,
+                "line": c.line,
+                "side": c.side,
+                "body": redact_text(c.body),
+            }
+            for c in payload.comments
+        ]
+
+        review = await reviews_service.submit_review(
+            repo=repo,
+            number=number_int,
+            event=payload.event,
+            body=redact_text(payload.body) if payload.body else None,
+            comments=comments_payload,
+            token=token,
+        )
+
+        self._audit(
+            AuditEventType.OTHER,
+            action="submit_pr_review",
+            message=(
+                f"Submitted review on PR #{number_int} "
+                f"({payload.event})."
+            ),
+            payload={
+                "number": number_int,
+                "event": payload.event,
+                "review_id": review.review_id,
+                "inline_comments": len(payload.comments),
+            },
+            repository_id=repository_id,
+            provider=provider_id.value,
+            actor="user",
+        )
+
+        return self._to_review_response(review)
+
+    async def create_pr_comment(
+        self,
+        repository_id: str,
+        number: str,
+        payload: CreatePullRequestCommentRequest,
+        *,
+        provider: Optional[str] = None,
+    ) -> PullRequestCommentResponse:
+        """Create a general or inline comment on a pull request.
+
+        Dispatches based on the payload shape:
+
+            - Both `path` and `line` set  -> inline comment on that
+              file/line, via `/pulls/{n}/comments`.
+            - Otherwise                   -> general comment on the
+              conversation, via `/issues/{n}/comments`.
+
+        The two paths return structurally similar but distinct
+        resources; both are mapped to `PullRequestCommentResponse`
+        so the UI has a single type to render.
+        """
+        provider_id = (
+            ProviderId(provider.strip().lower())
+            if provider
+            else self._default_provider_id()
+        )
+        reviews_service = self._get_github_reviews_service(provider_id)
+        adapter = self.registry.get(provider_id.value)
+        token = await self._require_token(provider_id)
+        repo = await self._resolve_repo(
+            adapter, repository_id, provider_id, token
+        )
+
+        try:
+            number_int = int(str(number).strip())
+        except (TypeError, ValueError):
+            raise ValidationError(
+                "PR number must be an integer string.",
+                details={"number": number},
+            )
+
+        is_inline = bool(payload.path and payload.line)
+
+        if is_inline:
+            inline = await reviews_service.create_review_comment(
+                repo=repo,
+                number=number_int,
+                body=redact_text(payload.body),
+                path=payload.path or "",
+                line=payload.line or 0,
+                side=payload.side or "RIGHT",
+                commit_id=payload.commit_id,
+                token=token,
+            )
+            self._audit(
+                AuditEventType.OTHER,
+                action="create_pr_inline_comment",
+                message=(
+                    f"Added inline comment on PR #{number_int} "
+                    f"at {payload.path}:{payload.line}."
+                ),
+                payload={
+                    "number": number_int,
+                    "comment_id": inline.comment_id,
+                    "path": inline.path,
+                    "line": inline.line,
+                },
+                repository_id=repository_id,
+                provider=provider_id.value,
+                actor="user",
+            )
+            return self._to_review_comment_response(inline)
+
+        general = await reviews_service.create_issue_comment(
+            repo=repo,
+            number=number_int,
+            body=redact_text(payload.body),
+            token=token,
+        )
+        self._audit(
+            AuditEventType.OTHER,
+            action="create_pr_comment",
+            message=f"Added comment on PR #{number_int}.",
+            payload={
+                "number": number_int,
+                "comment_id": general.comment_id,
+            },
+            repository_id=repository_id,
+            provider=provider_id.value,
+            actor="user",
+        )
+        return self._to_issue_comment_response(general)
+
+    async def list_pr_reviews_and_comments(
+        self,
+        repository_id: str,
+        number: str,
+        *,
+        provider: Optional[str] = None,
+    ) -> Mapping[str, Any]:
+        """Return reviews, general comments, and inline comments.
+
+        Returns a plain dict (not a Pydantic model) because the
+        response is a composite of three independent collections and
+        adding a dedicated schema for it would not buy anything the
+        frontend does not already have. The keys and value shapes
+        are stable and typed by the Pydantic classes referenced
+        below:
+
+            {
+                "reviews": PullRequestReviewResponse[],
+                "general_comments": PullRequestCommentResponse[],
+                "inline_comments": PullRequestCommentResponse[],
+            }
+        """
+        provider_id = (
+            ProviderId(provider.strip().lower())
+            if provider
+            else self._default_provider_id()
+        )
+        reviews_service = self._get_github_reviews_service(provider_id)
+        adapter = self.registry.get(provider_id.value)
+        token = await self._require_token(provider_id)
+        repo = await self._resolve_repo(
+            adapter, repository_id, provider_id, token
+        )
+
+        try:
+            number_int = int(str(number).strip())
+        except (TypeError, ValueError):
+            raise ValidationError(
+                "PR number must be an integer string.",
+                details={"number": number},
+            )
+
+        reviews = await reviews_service.list_reviews(
+            repo=repo, number=number_int, token=token
+        )
+        general, inline = await reviews_service.list_comments(
+            repo=repo, number=number_int, token=token
+        )
+
+        return {
+            "reviews": [self._to_review_response(r) for r in reviews],
+            "general_comments": [
+                self._to_issue_comment_response(c) for c in general
+            ],
+            "inline_comments": [
+                self._to_review_comment_response(c) for c in inline
+            ],
+        }
+
+    # ------------------------------------------------------------------
+    # 12. Internal helpers for pull requests
+    # ------------------------------------------------------------------
+
+    def _get_github_pr_service(
+        self, provider_id: ProviderId
+    ) -> GitHubPullRequestService:
+        """Return the PR service for a provider, or raise.
+
+        Only GitHub is wired today. Other providers raise
+        `UnsupportedCapabilityError` so the UI can surface a
+        capability message instead of a raw 500.
+        """
+        if provider_id not in _PR_CAPABLE_PROVIDERS:
+            raise UnsupportedCapabilityError(
+                "Pull request operations are only supported for GitHub.",
+                details={"provider": provider_id.value},
+            )
+        if self._pr_service is None:
+            self._pr_service = GitHubPullRequestService()
+        return self._pr_service
+
+    def _get_github_reviews_service(
+        self, provider_id: ProviderId
+    ) -> GitHubReviewsService:
+        """Return the reviews service for a provider, or raise."""
+        if provider_id not in _PR_CAPABLE_PROVIDERS:
+            raise UnsupportedCapabilityError(
+                "Review operations are only supported for GitHub.",
+                details={"provider": provider_id.value},
+            )
+        if self._reviews_service is None:
+            self._reviews_service = GitHubReviewsService()
+        return self._reviews_service
+
+    @staticmethod
+    def _to_pull_request_response(
+        pr: ChangeRequestRef,
+    ) -> PullRequestResponse:
+        """Map a `ChangeRequestRef` to a `PullRequestResponse`.
+
+        `author_login` and `body` are currently None because the
+        `ChangeRequestRef` dataclass does not carry those fields.
+        Extending the dataclass to include them is tracked as a
+        separate enhancement; the UI still works without them.
+        """
+        return PullRequestResponse(
+            provider=(
+                pr.provider.value
+                if isinstance(pr.provider, ProviderId)
+                else str(pr.provider)
+            ),
+            repository_id=pr.repository_id,
+            number=str(pr.number_or_iid),
+            web_url=redact_url(pr.web_url),
+            state=(
+                pr.state.value
+                if hasattr(pr.state, "value")
+                else str(pr.state)
+            ),
+            source_branch=pr.source_branch,
+            target_branch=pr.target_branch,
+            title=pr.title,
+            is_draft=pr.is_draft,
+            created_at=pr.created_at,
+            updated_at=pr.updated_at,
+            merged_at=pr.merged_at,
+        )
+
+    @staticmethod
+    def _to_review_response(review: Any) -> PullRequestReviewResponse:
+        """Map a `ReviewRef` to a `PullRequestReviewResponse`."""
+        return PullRequestReviewResponse(
+            review_id=str(review.review_id),
+            state=review.state,
+            body=review.body,
+            author_login=review.author_login,
+            submitted_at=review.submitted_at,
+        )
+
+    @staticmethod
+    def _to_review_comment_response(
+        comment: Any,
+    ) -> PullRequestCommentResponse:
+        """Map a `ReviewCommentRef` to a `PullRequestCommentResponse`."""
+        return PullRequestCommentResponse(
+            comment_id=str(comment.comment_id),
+            body=comment.body,
+            author_login=comment.author_login,
+            created_at=comment.created_at,
+            updated_at=comment.updated_at,
+            path=comment.path,
+            line=comment.line,
+            side=comment.side,
+            in_reply_to_id=comment.in_reply_to_id,
+        )
+
+    @staticmethod
+    def _to_issue_comment_response(
+        comment: Any,
+    ) -> PullRequestCommentResponse:
+        """Map an `IssueCommentRef` to a `PullRequestCommentResponse`.
+
+        General comments have no `path`, `line`, or `side`; those
+        fields are explicitly set to None so the response shape is
+        identical to the inline case and the frontend can use one
+        type for both.
+        """
+        return PullRequestCommentResponse(
+            comment_id=str(comment.comment_id),
+            body=comment.body,
+            author_login=comment.author_login,
+            created_at=comment.created_at,
+            updated_at=comment.updated_at,
+            path=None,
+            line=None,
+            side=None,
+            in_reply_to_id=None,
+        )
+
+    # ------------------------------------------------------------------
+    # 13. Issue operations (GitHub-only in this phase)
+    # ------------------------------------------------------------------
+    #
+    # These methods delegate to `GitHubIssueService`. Only GitHub is
+    # wired today; the GitLab and Bitbucket adapters do not expose
+    # the issue endpoints through the facade yet. A non-GitHub
+    # provider raises `UnsupportedCapabilityError` so the UI can
+    # present a clear message instead of a raw 500.
+    #
+    # Unlike pull requests, issues are NOT policy-gated: creating an
+    # issue or commenting on one does not touch code, branches, or
+    # the repository's contents. All write operations are still
+    # audited (see `_audit` calls below) so an operator can review
+    # the trail of what the user did.
+
+    async def list_issues(
+        self,
+        repository_id: str,
+        *,
+        provider: Optional[str] = None,
+        state: str = "open",
+        labels: Optional[Sequence[str]] = None,
+        page: int = 1,
+        page_size: int = 30,
+    ) -> IssueListResponse:
+        """List issues for a repository.
+
+        Pull requests are filtered out by the underlying service;
+        the response contains only real issues. Pass ``state="all"``
+        to include both open and closed issues.
+
+        Args:
+            repository_id: Repository identifier (ID or `owner/repo`).
+            provider: Optional provider override. Defaults to the
+                connected provider, which is GitHub today.
+            state: ``"open"``, ``"closed"``, or ``"all"``.
+            labels: Optional label filter. Empty/None means no filter.
+            page: 1-based page number.
+            page_size: Page size, capped by the service at 100.
+        """
+        provider_id = (
+            ProviderId(provider.strip().lower())
+            if provider
+            else self._default_provider_id()
+        )
+        service = self._get_github_issue_service(provider_id)
+        adapter = self.registry.get(provider_id.value)
+        token = await self._require_token(provider_id)
+        repo = await self._resolve_repo(
+            adapter, repository_id, provider_id, token
+        )
+
+        issues = await service.list_issues(
+            repo=repo,
+            token=token,
+            state=state,
+            labels=labels,
+            page=page,
+            page_size=page_size,
+        )
+
+        items = [
+            self._to_issue_response(
+                issue,
+                provider_id=provider_id,
+                repository_id=repository_id,
+            )
+            for issue in issues
+        ]
+        return IssueListResponse(
+            items=tuple(items),
+            total=len(items),
+            state=state.lower(),
+        )
+
+    async def get_issue(
+        self,
+        repository_id: str,
+        number: str,
+        *,
+        provider: Optional[str] = None,
+    ) -> IssueResponse:
+        """Fetch a single issue by its number."""
+        provider_id = (
+            ProviderId(provider.strip().lower())
+            if provider
+            else self._default_provider_id()
+        )
+        service = self._get_github_issue_service(provider_id)
+        adapter = self.registry.get(provider_id.value)
+        token = await self._require_token(provider_id)
+        repo = await self._resolve_repo(
+            adapter, repository_id, provider_id, token
+        )
+
+        try:
+            number_int = int(str(number).strip())
+        except (TypeError, ValueError):
+            raise ValidationError(
+                "Issue number must be an integer string.",
+                details={"number": number},
+            )
+
+        issue = await service.get_issue(
+            repo=repo, number=number_int, token=token
+        )
+        return self._to_issue_response(
+            issue,
+            provider_id=provider_id,
+            repository_id=repository_id,
+        )
+
+    async def create_issue(
+        self,
+        payload: CreateIssueRequest,
+    ) -> IssueResponse:
+        """Create a new issue on the remote.
+
+        The title and body are redacted before the request is sent,
+        so a token accidentally pasted into an issue description
+        never leaves the process in cleartext.
+        """
+        provider_id = (
+            ProviderId(payload.provider.strip().lower())
+            if payload.provider
+            else self._default_provider_id()
+        )
+        service = self._get_github_issue_service(provider_id)
+        adapter = self.registry.get(provider_id.value)
+        token = await self._require_token(provider_id)
+        repo = await self._resolve_repo(
+            adapter, payload.repository_id, provider_id, token
+        )
+
+        issue = await service.create_issue(
+            repo=repo,
+            title=redact_text(payload.title),
+            body=redact_text(payload.body or ""),
+            labels=payload.labels,
+            assignees=payload.assignees,
+            token=token,
+        )
+
+        self._audit(
+            AuditEventType.OTHER,
+            action="create_issue",
+            message=f"Created issue #{issue.number}.",
+            payload={
+                "number": issue.number,
+                "web_url": redact_url(issue.web_url or ""),
+                "labels": list(payload.labels),
+            },
+            repository_id=payload.repository_id,
+            provider=provider_id.value,
+            actor="user",
+        )
+
+        return self._to_issue_response(
+            issue,
+            provider_id=provider_id,
+            repository_id=payload.repository_id,
+        )
+
+    async def update_issue_state(
+        self,
+        repository_id: str,
+        number: str,
+        payload: UpdateIssueStateRequest,
+        *,
+        provider: Optional[str] = None,
+    ) -> IssueResponse:
+        """Change an issue's state (close or reopen)."""
+        provider_id = (
+            ProviderId(provider.strip().lower())
+            if provider
+            else self._default_provider_id()
+        )
+        service = self._get_github_issue_service(provider_id)
+        adapter = self.registry.get(provider_id.value)
+        token = await self._require_token(provider_id)
+        repo = await self._resolve_repo(
+            adapter, repository_id, provider_id, token
+        )
+
+        try:
+            number_int = int(str(number).strip())
+        except (TypeError, ValueError):
+            raise ValidationError(
+                "Issue number must be an integer string.",
+                details={"number": number},
+            )
+
+        issue = await service.update_issue_state(
+            repo=repo,
+            number=number_int,
+            state=payload.state,
+            state_reason=payload.state_reason,
+            token=token,
+        )
+
+        self._audit(
+            AuditEventType.OTHER,
+            action="update_issue_state",
+            message=(
+                f"Updated issue #{number_int} state to "
+                f"'{payload.state}'."
+            ),
+            payload={
+                "number": number_int,
+                "state": payload.state,
+                "state_reason": payload.state_reason,
+            },
+            repository_id=repository_id,
+            provider=provider_id.value,
+            actor="user",
+        )
+
+        return self._to_issue_response(
+            issue,
+            provider_id=provider_id,
+            repository_id=repository_id,
+        )
+
+    async def list_issue_comments(
+        self,
+        repository_id: str,
+        number: str,
+        *,
+        provider: Optional[str] = None,
+    ) -> Sequence[IssueCommentResponse]:
+        """List the comments on an issue, oldest first."""
+        provider_id = (
+            ProviderId(provider.strip().lower())
+            if provider
+            else self._default_provider_id()
+        )
+        service = self._get_github_issue_service(provider_id)
+        adapter = self.registry.get(provider_id.value)
+        token = await self._require_token(provider_id)
+        repo = await self._resolve_repo(
+            adapter, repository_id, provider_id, token
+        )
+
+        try:
+            number_int = int(str(number).strip())
+        except (TypeError, ValueError):
+            raise ValidationError(
+                "Issue number must be an integer string.",
+                details={"number": number},
+            )
+
+        comments = await service.list_comments(
+            repo=repo, number=number_int, token=token
+        )
+        return tuple(
+            self._to_issue_thread_response(c) for c in comments
+        )
+
+    async def create_issue_comment(
+        self,
+        repository_id: str,
+        number: str,
+        payload: CreateIssueCommentRequest,
+        *,
+        provider: Optional[str] = None,
+    ) -> IssueCommentResponse:
+        """Add a comment to an existing issue."""
+        provider_id = (
+            ProviderId(provider.strip().lower())
+            if provider
+            else self._default_provider_id()
+        )
+        service = self._get_github_issue_service(provider_id)
+        adapter = self.registry.get(provider_id.value)
+        token = await self._require_token(provider_id)
+        repo = await self._resolve_repo(
+            adapter, repository_id, provider_id, token
+        )
+
+        try:
+            number_int = int(str(number).strip())
+        except (TypeError, ValueError):
+            raise ValidationError(
+                "Issue number must be an integer string.",
+                details={"number": number},
+            )
+
+        comment = await service.create_comment(
+            repo=repo,
+            number=number_int,
+            body=redact_text(payload.body),
+            token=token,
+        )
+
+        self._audit(
+            AuditEventType.OTHER,
+            action="create_issue_comment",
+            message=f"Added comment on issue #{number_int}.",
+            payload={
+                "number": number_int,
+                "comment_id": comment.comment_id,
+            },
+            repository_id=repository_id,
+            provider=provider_id.value,
+            actor="user",
+        )
+
+        return self._to_issue_thread_response(comment)
+
+    # ------------------------------------------------------------------
+    # 14. Internal helpers for issues
+    # ------------------------------------------------------------------
+
+    def _get_github_issue_service(
+        self, provider_id: ProviderId
+    ) -> GitHubIssueService:
+        """Return the issue service for a provider, or raise.
+
+        Only GitHub is wired today. Other providers raise
+        `UnsupportedCapabilityError` so the UI can surface a
+        capability message instead of a raw 500.
+        """
+        if provider_id != ProviderId.GITHUB:
+            raise UnsupportedCapabilityError(
+                "Issue operations are only supported for GitHub.",
+                details={"provider": provider_id.value},
+            )
+        if self._issue_service is None:
+            self._issue_service = GitHubIssueService()
+        return self._issue_service
+
+    @staticmethod
+    def _to_issue_response(
+        issue: Any,
+        *,
+        provider_id: ProviderId,
+        repository_id: str,
+    ) -> IssueResponse:
+        """Map an `IssueRef` to an `IssueResponse`.
+
+        The `IssueRef` dataclass does not carry the provider or the
+        repository id, so the two are passed in by the caller. The
+        `web_url` field is required by the schema (not Optional) but
+        the dataclass carries it as Optional; a missing URL becomes
+        an empty string rather than a schema violation.
+        """
+        return IssueResponse(
+            provider=(
+                provider_id.value
+                if isinstance(provider_id, ProviderId)
+                else str(provider_id)
+            ),
+            repository_id=repository_id,
+            number=str(issue.number),
+            web_url=issue.web_url or "",
+            state=issue.state,
+            title=issue.title,
+            body=issue.body,
+            author_login=issue.author_login,
+            labels=tuple(issue.labels),
+            comments_count=int(issue.comments_count),
+            is_pull_request=bool(issue.is_pull_request),
+            state_reason=issue.state_reason,
+            created_at=issue.created_at,
+            updated_at=issue.updated_at,
+            closed_at=issue.closed_at,
+        )
+
+    @staticmethod
+    def _to_issue_thread_response(
+        comment: Any,
+    ) -> IssueCommentResponse:
+        """Map an `IssueCommentRef` (from `issues.py`) to the API response.
+
+        NOTE on naming:
+            There is already a `_to_issue_comment_response` method
+            on this class that maps the PR-side `IssueCommentRef`
+            (from `reviews.py`) to a `PullRequestCommentResponse`.
+            The two dataclasses share a name but live in different
+            modules and produce different response types. This
+            helper is deliberately named `_to_issue_thread_response`
+            to avoid collision and to convey that it is the
+            issue-side (conversation thread) mapper.
+        """
+        return IssueCommentResponse(
+            comment_id=str(comment.comment_id),
+            body=comment.body,
+            author_login=comment.author_login,
+            created_at=comment.created_at,
+            updated_at=comment.updated_at,
+        )
+
+    # ------------------------------------------------------------------
+    # 15. Merge / rebase / conflict resolution (local workspace)
+    # ------------------------------------------------------------------
+    #
+    # These operations run entirely inside the workspace: no remote
+    # calls, no tokens, no provider dispatch. They are audited for
+    # the same reason every other mutating operation is audited —
+    # so an operator can review what the user changed — but they are
+    # NOT policy-gated: policy in this subsystem gates REMOTE side
+    # effects (push, PR merge, branch delete on the remote). A local
+    # merge is an editor action, not a remote write.
+
+    async def merge_workspace_branches(
+        self,
+        workspace_id: str,
+        payload: MergeBranchesRequest,
+    ) -> MergeOperationResponse:
+        """Merge one local branch into another inside the workspace.
+
+        On a clean merge, returns ``kind="clean"``. On a conflicted
+        merge, returns ``kind="conflicted"`` with the current
+        conflict list; the caller then drives the conflict
+        resolution workflow and finally calls
+        `finalize_workspace_operation`.
+        """
+        ws_ref = self.workspace_manager.get_workspace(workspace_id)
+        if ws_ref is None:
+            raise NotFoundError(
+                f"Workspace '{workspace_id}' was not found."
+            )
+
+        outcome = await self.merge_manager.merge_branch(
+            workspace_id,
+            source_branch=payload.source_branch,
+            target_branch=payload.target_branch,
+            strategy=payload.strategy,
+            commit_message=payload.commit_message,
+            workspace_path=ws_ref.workspace_path,
+        )
+
+        self._audit(
+            AuditEventType.OTHER,
+            action="merge_workspace_branches",
+            message=(
+                f"Merged '{payload.source_branch}' into "
+                f"'{payload.target_branch}' "
+                f"(outcome: {outcome.kind})."
+            ),
+            payload={
+                "source_branch": payload.source_branch,
+                "target_branch": payload.target_branch,
+                "strategy": payload.strategy,
+                "kind": outcome.kind,
+                "conflicts": len(outcome.conflicts),
+            },
+            workspace_id=workspace_id,
+            repository_id=ws_ref.repository_id,
+            actor="user",
+        )
+
+        return self._to_merge_operation_response(
+            workspace_id=workspace_id, outcome=outcome
+        )
+
+    async def rebase_workspace_branch(
+        self,
+        workspace_id: str,
+        payload: RebaseBranchRequest,
+    ) -> MergeOperationResponse:
+        """Rebase one local branch onto another inside the workspace."""
+        ws_ref = self.workspace_manager.get_workspace(workspace_id)
+        if ws_ref is None:
+            raise NotFoundError(
+                f"Workspace '{workspace_id}' was not found."
+            )
+
+        outcome = await self.merge_manager.rebase_branch(
+            workspace_id,
+            branch=payload.branch,
+            onto=payload.onto,
+            workspace_path=ws_ref.workspace_path,
+        )
+
+        self._audit(
+            AuditEventType.OTHER,
+            action="rebase_workspace_branch",
+            message=(
+                f"Rebased '{payload.branch}' onto '{payload.onto}' "
+                f"(outcome: {outcome.kind})."
+            ),
+            payload={
+                "branch": payload.branch,
+                "onto": payload.onto,
+                "kind": outcome.kind,
+                "conflicts": len(outcome.conflicts),
+            },
+            workspace_id=workspace_id,
+            repository_id=ws_ref.repository_id,
+            actor="user",
+        )
+
+        return self._to_merge_operation_response(
+            workspace_id=workspace_id, outcome=outcome
+        )
+
+    async def finalize_workspace_operation(
+        self,
+        workspace_id: str,
+    ) -> MergeOperationResponse:
+        """Finalize whichever operation (merge or rebase) is in progress.
+
+        Dispatches on the current Git state. The caller is expected
+        to have resolved and staged all conflicts before calling
+        this; the underlying managers refuse to commit when
+        unresolved conflicts remain.
+        """
+        ws_ref = self.workspace_manager.get_workspace(workspace_id)
+        if ws_ref is None:
+            raise NotFoundError(
+                f"Workspace '{workspace_id}' was not found."
+            )
+
+        state = await self.conflict_manager.detect_operation_state(
+            workspace_id, workspace_path=ws_ref.workspace_path
+        )
+
+        if state == OperationState.MERGING:
+            outcome = await self.merge_manager.finalize_merge(
+                workspace_id,
+                workspace_path=ws_ref.workspace_path,
+            )
+            action = "finalize_merge"
+        elif state == OperationState.REBASING:
+            outcome = await self.merge_manager.finalize_rebase(
+                workspace_id,
+                workspace_path=ws_ref.workspace_path,
+            )
+            action = "finalize_rebase"
+        else:
+            raise ConflictError(
+                f"Cannot finalize: current state is '{state.value}', "
+                "not 'merging' or 'rebasing'.",
+                details={"state": state.value},
+            )
+
+        self._audit(
+            AuditEventType.OTHER,
+            action=action,
+            message=(
+                f"Finalized in-progress {state.value} operation "
+                f"(outcome: {outcome.kind})."
+            ),
+            payload={
+                "state": state.value,
+                "kind": outcome.kind,
+                "head_sha": outcome.head_sha,
+            },
+            workspace_id=workspace_id,
+            repository_id=ws_ref.repository_id,
+            actor="user",
+        )
+
+        return self._to_merge_operation_response(
+            workspace_id=workspace_id, outcome=outcome
+        )
+
+    async def abort_workspace_operation(
+        self,
+        workspace_id: str,
+    ) -> ConflictListResponse:
+        """Abort whichever operation (merge / rebase / cherry-pick /
+        revert) is in progress and return the resulting state.
+
+        Returns a `ConflictListResponse` with `operation_state="none"`
+        and an empty file list on success. The `message` field
+        echoes which operation was aborted.
+        """
+        ws_ref = self.workspace_manager.get_workspace(workspace_id)
+        if ws_ref is None:
+            raise NotFoundError(
+                f"Workspace '{workspace_id}' was not found."
+            )
+
+        aborted_state = await self.merge_manager.abort_operation(
+            workspace_id,
+            workspace_path=ws_ref.workspace_path,
+        )
+
+        self._audit(
+            AuditEventType.OTHER,
+            action="abort_workspace_operation",
+            message=(
+                f"Aborted in-progress operation "
+                f"(was: {aborted_state.value})."
+            ),
+            payload={"aborted_state": aborted_state.value},
+            workspace_id=workspace_id,
+            repository_id=ws_ref.repository_id,
+            actor="user",
+        )
+
+        return ConflictListResponse(
+            workspace_id=workspace_id,
+            operation_state=OperationState.NONE.value,
+            files=(),
+            total=0,
+        )
+
+    async def list_workspace_conflicts(
+        self,
+        workspace_id: str,
+    ) -> ConflictListResponse:
+        """Return the current operation state and conflicted files.
+
+        Safe to call at any time; returns ``operation_state="none"``
+        and an empty file list when no operation is in progress.
+        """
+        ws_ref = self.workspace_manager.get_workspace(workspace_id)
+        if ws_ref is None:
+            raise NotFoundError(
+                f"Workspace '{workspace_id}' was not found."
+            )
+
+        state = await self.conflict_manager.detect_operation_state(
+            workspace_id, workspace_path=ws_ref.workspace_path
+        )
+        files: Sequence[ConflictEntry] = ()
+        if state != OperationState.NONE:
+            files = await self.conflict_manager.list_conflicts(
+                workspace_id, workspace_path=ws_ref.workspace_path
+            )
+
+        return ConflictListResponse(
+            workspace_id=workspace_id,
+            operation_state=state.value,
+            files=tuple(
+                self._to_conflict_file_response(entry) for entry in files
+            ),
+            total=len(files),
+        )
+
+    async def resolve_workspace_conflicts(
+        self,
+        workspace_id: str,
+        payload: ResolveConflictsRequest,
+    ) -> ResolveConflictsResponse:
+        """Resolve conflicted files by taking a side, or by staging
+        files the caller has edited manually.
+
+        Resolution strategies:
+
+            - ``"ours"``    : run ``git checkout --ours`` on each
+                              requested path. When ``paths`` is empty,
+                              every currently-conflicted file is
+                              resolved.
+            - ``"theirs"``  : same, but ``--theirs``.
+            - ``"manual"``  : the caller has already edited the
+                              files in the workspace; run ``git add``
+                              on each path. ``paths`` is required.
+
+        Requested paths are validated against the CURRENT conflict
+        set. A path that is not (or no longer) conflicted is
+        rejected: resolving a non-conflicted path with
+        ``--ours/--theirs`` produces surprising results in Git, and
+        silently ignoring the path leaves the caller with a wrong
+        mental model of what happened.
+        """
+        ws_ref = self.workspace_manager.get_workspace(workspace_id)
+        if ws_ref is None:
+            raise NotFoundError(
+                f"Workspace '{workspace_id}' was not found."
+            )
+
+        state = await self.conflict_manager.detect_operation_state(
+            workspace_id, workspace_path=ws_ref.workspace_path
+        )
+        if state == OperationState.NONE:
+            raise ConflictError(
+                "No merge or rebase is in progress.",
+                details={"state": state.value},
+            )
+
+        current = await self.conflict_manager.list_conflicts(
+            workspace_id, workspace_path=ws_ref.workspace_path
+        )
+        current_paths = {entry.path for entry in current}
+
+        # Determine the target paths.
+        requested = list(payload.paths)
+        if payload.strategy == "manual" and not requested:
+            raise ValidationError(
+                "The 'manual' strategy requires an explicit list of "
+                "paths to mark resolved.",
+            )
+
+        if not requested:
+            target_paths = sorted(current_paths)
+        else:
+            # Reject any path that is not (or no longer) conflicted.
+            unknown = [p for p in requested if p not in current_paths]
+            if unknown:
+                raise ValidationError(
+                    "One or more paths are not currently conflicted.",
+                    details={"unknown_paths": unknown},
+                )
+            target_paths = requested
+
+        if not target_paths:
+            return ResolveConflictsResponse(
+                workspace_id=workspace_id,
+                operation_state=state.value,
+                resolved_count=0,
+                remaining=tuple(
+                    self._to_conflict_file_response(e)
+                    for e in current
+                ),
+                message="No conflicts to resolve.",
+            )
+
+        resolved_count = 0
+        if payload.strategy == "ours":
+            resolved_count = await self.conflict_manager.resolve_using_ours(
+                workspace_id,
+                paths=target_paths,
+                workspace_path=ws_ref.workspace_path,
+            )
+        elif payload.strategy == "theirs":
+            resolved_count = (
+                await self.conflict_manager.resolve_using_theirs(
+                    workspace_id,
+                    paths=target_paths,
+                    workspace_path=ws_ref.workspace_path,
+                )
+            )
+        else:  # manual
+            await self.conflict_manager.mark_resolved(
+                workspace_id,
+                paths=target_paths,
+                workspace_path=ws_ref.workspace_path,
+            )
+            resolved_count = len(target_paths)
+
+        # Recompute remaining conflicts and state after resolution.
+        remaining = await self.conflict_manager.list_conflicts(
+            workspace_id, workspace_path=ws_ref.workspace_path
+        )
+        new_state = await self.conflict_manager.detect_operation_state(
+            workspace_id, workspace_path=ws_ref.workspace_path
+        )
+
+        self._audit(
+            AuditEventType.OTHER,
+            action="resolve_workspace_conflicts",
+            message=(
+                f"Resolved {resolved_count} conflicted file(s) "
+                f"using strategy '{payload.strategy}'."
+            ),
+            payload={
+                "strategy": payload.strategy,
+                "resolved_count": resolved_count,
+                "remaining": len(remaining),
+                "state": new_state.value,
+            },
+            workspace_id=workspace_id,
+            repository_id=ws_ref.repository_id,
+            actor="user",
+        )
+
+        return ResolveConflictsResponse(
+            workspace_id=workspace_id,
+            operation_state=new_state.value,
+            resolved_count=resolved_count,
+            remaining=tuple(
+                self._to_conflict_file_response(e) for e in remaining
+            ),
+            message=(
+                f"Resolved {resolved_count} file(s); "
+                f"{len(remaining)} remain."
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # 16. Internal helpers for merge / conflict responses
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _to_conflict_file_response(
+        entry: Any,
+    ) -> ConflictFileResponse:
+        """Map a `ConflictEntry` to a `ConflictFileResponse`.
+
+        The `is_delete_modify` and `is_add_add` flags are derived
+        properties on `ConflictEntry`; they are read here rather
+        than reconstructed so that the two views can never drift.
+        """
+        return ConflictFileResponse(
+            path=entry.path,
+            has_base=bool(entry.has_base),
+            has_ours=bool(entry.has_ours),
+            has_theirs=bool(entry.has_theirs),
+            is_delete_modify=bool(entry.is_delete_modify),
+            is_add_add=bool(entry.is_add_add),
+        )
+
+    @classmethod
+    def _to_merge_operation_response(
+        cls,
+        *,
+        workspace_id: str,
+        outcome: MergeOutcome,
+    ) -> MergeOperationResponse:
+        """Map a `MergeOutcome` to a `MergeOperationResponse`."""
+        return MergeOperationResponse(
+            workspace_id=workspace_id,
+            kind=outcome.kind,
+            operation_state=(
+                outcome.operation_state.value
+                if hasattr(outcome.operation_state, "value")
+                else str(outcome.operation_state)
+            ),
+            conflicts=tuple(
+                cls._to_conflict_file_response(entry)
+                for entry in outcome.conflicts
+            ),
+            head_sha=outcome.head_sha,
+            message=outcome.message or "",
+        )
+
+    # ------------------------------------------------------------------
+    # 17. Local tags (workspace)
+    # ------------------------------------------------------------------
+    #
+    # These operations act on the workspace's LOCAL Git repository.
+    # They never touch the remote. Creating a LOCAL tag does not push
+    # it; a separate "push tag" operation would be required to make
+    # it visible upstream. That operation is intentionally out of
+    # scope for this phase.
+
+    async def list_workspace_tags(
+        self,
+        workspace_id: str,
+        *,
+        max_tags: int = 5000,
+    ) -> TagListResponse:
+        """List every local Git tag in the workspace.
+
+        Returns an empty ``items`` sequence for a workspace with no
+        tags. The list is sorted alphabetically by name (Git's
+        native `for-each-ref` order), which is what the UI displays.
+        """
+        ws_ref = self.workspace_manager.get_workspace(workspace_id)
+        if ws_ref is None:
+            raise NotFoundError(
+                f"Workspace '{workspace_id}' was not found."
+            )
+
+        tags = await self.tag_manager.list_tags(
+            workspace_id,
+            workspace_path=ws_ref.workspace_path,
+            max_tags=max_tags,
+        )
+        return TagListResponse(
+            items=tuple(self._to_tag_response(t) for t in tags),
+            total=len(tags),
+        )
+
+    async def create_workspace_tag(
+        self,
+        workspace_id: str,
+        payload: CreateTagRequest,
+    ) -> TagResponse:
+        """Create a local Git tag in the workspace.
+
+        A tag with a non-empty ``message`` is created as an annotated
+        tag; without one it is created as a lightweight tag.
+        """
+        ws_ref = self.workspace_manager.get_workspace(workspace_id)
+        if ws_ref is None:
+            raise NotFoundError(
+                f"Workspace '{workspace_id}' was not found."
+            )
+
+        tag = await self.tag_manager.create_tag(
+            workspace_id,
+            workspace_path=ws_ref.workspace_path,
+            name=payload.name,
+            message=(
+                redact_text(payload.message) if payload.message else None
+            ),
+            target_sha=payload.target_sha,
+            force=payload.force,
+        )
+
+        self._audit(
+            AuditEventType.OTHER,
+            action="create_workspace_tag",
+            message=f"Created tag '{payload.name}'.",
+            payload={
+                "name": payload.name,
+                "sha": tag.sha,
+                "is_annotated": tag.is_annotated,
+                "force": payload.force,
+            },
+            workspace_id=workspace_id,
+            repository_id=ws_ref.repository_id,
+            actor="user",
+        )
+
+        return self._to_tag_response(tag)
+
+    async def delete_workspace_tag(
+        self,
+        workspace_id: str,
+        name: str,
+    ) -> ActionSuccessResponse:
+        """Delete a local Git tag from the workspace.
+
+        Only the LOCAL tag is deleted. If the tag was previously
+        pushed to the remote, the remote copy remains until a
+        separate remote-delete operation runs (out of scope for
+        this phase).
+        """
+        ws_ref = self.workspace_manager.get_workspace(workspace_id)
+        if ws_ref is None:
+            raise NotFoundError(
+                f"Workspace '{workspace_id}' was not found."
+            )
+
+        await self.tag_manager.delete_tag(
+            workspace_id,
+            workspace_path=ws_ref.workspace_path,
+            name=name,
+        )
+
+        self._audit(
+            AuditEventType.OTHER,
+            action="delete_workspace_tag",
+            message=f"Deleted tag '{name}'.",
+            payload={"name": name},
+            workspace_id=workspace_id,
+            repository_id=ws_ref.repository_id,
+            actor="user",
+        )
+
+        return ActionSuccessResponse(
+            message=f"Tag '{name}' deleted."
+        )
+
+    # ------------------------------------------------------------------
+    # 18. GitHub releases (remote)
+    # ------------------------------------------------------------------
+    #
+    # A GitHub release bundles a tag, a title, release notes, and
+    # optional assets. This class manages the release lifecycle
+    # (list, get, create, delete). It does NOT manage asset uploads;
+    # that is a separate flow that requires the uploads.github.com
+    # host. It also does NOT delete the underlying tag on delete.
+
+    async def list_releases(
+        self,
+        repository_id: str,
+        *,
+        provider: Optional[str] = None,
+        include_drafts: bool = False,
+        page: int = 1,
+        page_size: int = 30,
+    ) -> ReleaseListResponse:
+        """List releases for a repository.
+
+        Drafts are excluded by default. Pass ``include_drafts=True``
+        to include them.
+        """
+        provider_id = (
+            ProviderId(provider.strip().lower())
+            if provider
+            else self._default_provider_id()
+        )
+        service = self._get_github_release_service(provider_id)
+        adapter = self.registry.get(provider_id.value)
+        token = await self._require_token(provider_id)
+        repo = await self._resolve_repo(
+            adapter, repository_id, provider_id, token
+        )
+
+        releases = await service.list_releases(
+            repo=repo,
+            token=token,
+            include_drafts=include_drafts,
+            page=page,
+            page_size=page_size,
+        )
+        return ReleaseListResponse(
+            items=tuple(self._to_release_response(r) for r in releases),
+            total=len(releases),
+        )
+
+    async def get_release(
+        self,
+        repository_id: str,
+        release_id: str,
+        *,
+        provider: Optional[str] = None,
+    ) -> ReleaseResponse:
+        """Fetch a single release by its numeric GitHub ID."""
+        provider_id = (
+            ProviderId(provider.strip().lower())
+            if provider
+            else self._default_provider_id()
+        )
+        service = self._get_github_release_service(provider_id)
+        adapter = self.registry.get(provider_id.value)
+        token = await self._require_token(provider_id)
+        repo = await self._resolve_repo(
+            adapter, repository_id, provider_id, token
+        )
+
+        try:
+            numeric_id = int(str(release_id).strip())
+        except (TypeError, ValueError):
+            raise ValidationError(
+                "release_id must be an integer string.",
+                details={"release_id": release_id},
+            )
+
+        release = await service.get_release(
+            repo=repo, release_id=numeric_id, token=token
+        )
+        return self._to_release_response(release)
+
+    async def create_release(
+        self,
+        payload: CreateReleaseRequest,
+    ) -> ReleaseResponse:
+        """Create a GitHub release.
+
+        The release body and name are redacted before being sent,
+        so a token accidentally pasted into release notes never
+        leaves the process in cleartext.
+        """
+        provider_id = (
+            ProviderId(payload.provider.strip().lower())
+            if payload.provider
+            else self._default_provider_id()
+        )
+        service = self._get_github_release_service(provider_id)
+        adapter = self.registry.get(provider_id.value)
+        token = await self._require_token(provider_id)
+        repo = await self._resolve_repo(
+            adapter, payload.repository_id, provider_id, token
+        )
+
+        release = await service.create_release(
+            repo=repo,
+            tag_name=payload.tag_name,
+            name=redact_text(payload.name) if payload.name else "",
+            body=redact_text(payload.body) if payload.body else "",
+            target_commitish=payload.target_commitish,
+            draft=payload.draft,
+            prerelease=payload.prerelease,
+            token=token,
+        )
+
+        self._audit(
+            AuditEventType.OTHER,
+            action="create_release",
+            message=(
+                f"Created release for tag '{payload.tag_name}' "
+                f"(draft={payload.draft}, "
+                f"prerelease={payload.prerelease})."
+            ),
+            payload={
+                "tag_name": payload.tag_name,
+                "release_id": release.release_id,
+                "draft": payload.draft,
+                "prerelease": payload.prerelease,
+                "html_url": redact_url(release.html_url),
+            },
+            repository_id=payload.repository_id,
+            provider=provider_id.value,
+            actor="user",
+        )
+
+        return self._to_release_response(release)
+
+    async def delete_release(
+        self,
+        repository_id: str,
+        release_id: str,
+        *,
+        provider: Optional[str] = None,
+    ) -> ActionSuccessResponse:
+        """Delete a GitHub release.
+
+        Only the release object is deleted. The underlying Git tag
+        on the remote is NOT deleted; it remains in the repository.
+        """
+        provider_id = (
+            ProviderId(provider.strip().lower())
+            if provider
+            else self._default_provider_id()
+        )
+        service = self._get_github_release_service(provider_id)
+        adapter = self.registry.get(provider_id.value)
+        token = await self._require_token(provider_id)
+        repo = await self._resolve_repo(
+            adapter, repository_id, provider_id, token
+        )
+
+        try:
+            numeric_id = int(str(release_id).strip())
+        except (TypeError, ValueError):
+            raise ValidationError(
+                "release_id must be an integer string.",
+                details={"release_id": release_id},
+            )
+
+        await service.delete_release(
+            repo=repo, release_id=numeric_id, token=token
+        )
+
+        self._audit(
+            AuditEventType.OTHER,
+            action="delete_release",
+            message=f"Deleted release {numeric_id}.",
+            payload={"release_id": numeric_id},
+            repository_id=repository_id,
+            provider=provider_id.value,
+            actor="user",
+        )
+
+        return ActionSuccessResponse(
+            message=(
+                f"Release {numeric_id} deleted. "
+                "The underlying Git tag was not removed."
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # 19. Internal helpers for tags and releases
+    # ------------------------------------------------------------------
+
+    def _get_github_release_service(
+        self, provider_id: ProviderId
+    ) -> GitHubReleaseService:
+        """Return the release service for a provider, or raise.
+
+        Only GitHub is wired today. Other providers raise
+        `UnsupportedCapabilityError` so the UI can present a clear
+        message instead of a raw 500.
+        """
+        if provider_id != ProviderId.GITHUB:
+            raise UnsupportedCapabilityError(
+                "Release operations are only supported for GitHub.",
+                details={"provider": provider_id.value},
+            )
+        if self._release_service is None:
+            self._release_service = GitHubReleaseService()
+        return self._release_service
+
+    @staticmethod
+    def _to_tag_response(tag: Any) -> TagResponse:
+        """Map a `TagRef` to a `TagResponse`."""
+        return TagResponse(
+            name=tag.name,
+            sha=tag.sha,
+            is_annotated=bool(tag.is_annotated),
+            message=tag.message,
+            tagger_name=tag.tagger_name,
+            tagger_email=tag.tagger_email,
+            tagged_at=tag.tagged_at,
+        )
+
+    @staticmethod
+    def _to_release_response(release: Any) -> ReleaseResponse:
+        """Map a `ReleaseRef` to a `ReleaseResponse`."""
+        return ReleaseResponse(
+            release_id=str(release.release_id),
+            tag_name=release.tag_name,
+            name=release.name,
+            body=release.body,
+            html_url=redact_url(release.html_url) or "",
+            is_draft=bool(release.is_draft),
+            is_prerelease=bool(release.is_prerelease),
+            author_login=release.author_login,
+            target_commitish=release.target_commitish,
+            created_at=release.created_at,
+            published_at=release.published_at,
         )
 
 

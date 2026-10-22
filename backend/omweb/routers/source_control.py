@@ -69,7 +69,10 @@ try:
         AuditLogEntryResponse,
         BranchResponse,
         ChangeRequestResponse,
+        CheckoutBranchRequest,
         CheckSummaryResponse,
+        CommitEntryResponse,
+        CommitWithStatsResponse,
         ConnectBeginRequest,
         ConnectBeginResponse,
         ConnectionStatusResponse,
@@ -79,6 +82,7 @@ try:
         CreateWorkspaceRequest,
         DiffSummaryResponse,
         DisconnectRequest,
+        FileContentAtRefResponse,
         FileReadResponse,
         OperationResponse,
         ProviderDescriptorResponse,
@@ -88,6 +92,7 @@ try:
         RepositoryResponse,
         RunChecksRequest,
         SaveProviderConfigRequest,
+        TreeNodeResponse,
         ValidateConnectionRequest,
         WorkspaceResponse,
     )
@@ -110,7 +115,10 @@ except (ImportError, ValueError):
         AuditLogEntryResponse,
         BranchResponse,
         ChangeRequestResponse,
+        CheckoutBranchRequest,
         CheckSummaryResponse,
+        CommitEntryResponse,
+        CommitWithStatsResponse,
         ConnectBeginRequest,
         ConnectBeginResponse,
         ConnectionStatusResponse,
@@ -120,6 +128,7 @@ except (ImportError, ValueError):
         CreateWorkspaceRequest,
         DiffSummaryResponse,
         DisconnectRequest,
+        FileContentAtRefResponse,
         FileReadResponse,
         OperationResponse,
         ProviderDescriptorResponse,
@@ -129,6 +138,7 @@ except (ImportError, ValueError):
         RepositoryResponse,
         RunChecksRequest,
         SaveProviderConfigRequest,
+        TreeNodeResponse,
         ValidateConnectionRequest,
         WorkspaceResponse,
     )
@@ -162,6 +172,106 @@ router = APIRouter(
     prefix="/api/source-control",
     tags=["Source Control Integration"],
 )
+
+
+# Pull request schemas — Phase 2 additions.
+#
+# Why a separate try/except block and not an edit to the imports
+# above: the module has two import paths (`from ...integrations`
+# try and `from backend.integrations` fallback). Adding the new
+# names into only one path would produce ImportError on the other.
+# A self-contained block guarantees resolution on every path.
+try:
+    from ...integrations.source_control.schemas import (
+        CreatePullRequestCommentRequest,
+        CreatePullRequestRequest,
+        MergePullRequestRequest,
+        MergePullRequestResponse,
+        PullRequestCommentResponse,
+        PullRequestListResponse,
+        PullRequestResponse,
+        PullRequestReviewResponse,
+        SubmitPullRequestReviewRequest,
+    )
+except (ImportError, ValueError):
+    from backend.integrations.source_control.schemas import (
+        CreatePullRequestCommentRequest,
+        CreatePullRequestRequest,
+        MergePullRequestRequest,
+        MergePullRequestResponse,
+        PullRequestCommentResponse,
+        PullRequestListResponse,
+        PullRequestResponse,
+        PullRequestReviewResponse,
+        SubmitPullRequestReviewRequest,
+    )
+
+
+# Issue schemas — Phase 3 additions. Self-contained try/except for
+# the same reason the PR block above is: the module has two import
+# paths, and adding the names to only one would break the other.
+try:
+    from ...integrations.source_control.schemas import (
+        CreateIssueCommentRequest,
+        CreateIssueRequest,
+        IssueCommentResponse,
+        IssueListResponse,
+        IssueResponse,
+        UpdateIssueStateRequest,
+    )
+except (ImportError, ValueError):
+    from backend.integrations.source_control.schemas import (
+        CreateIssueCommentRequest,
+        CreateIssueRequest,
+        IssueCommentResponse,
+        IssueListResponse,
+        IssueResponse,
+        UpdateIssueStateRequest,
+    )
+
+
+# Merge / rebase / conflict schemas — Phase 4 additions. Same
+# self-contained try/except pattern as the two blocks above.
+try:
+    from ...integrations.source_control.schemas import (
+        ConflictListResponse,
+        MergeBranchesRequest,
+        MergeOperationResponse,
+        RebaseBranchRequest,
+        ResolveConflictsRequest,
+        ResolveConflictsResponse,
+    )
+except (ImportError, ValueError):
+    from backend.integrations.source_control.schemas import (
+        ConflictListResponse,
+        MergeBranchesRequest,
+        MergeOperationResponse,
+        RebaseBranchRequest,
+        ResolveConflictsRequest,
+        ResolveConflictsResponse,
+    )
+
+
+# Tag + release schemas — Phase 5 additions. Same self-contained
+# try/except pattern as all the earlier blocks.
+try:
+    from ...integrations.source_control.schemas import (
+        CreateReleaseRequest,
+        CreateTagRequest,
+        ReleaseListResponse,
+        ReleaseResponse,
+        TagListResponse,
+        TagResponse,
+    )
+except (ImportError, ValueError):
+    from backend.integrations.source_control.schemas import (
+        CreateReleaseRequest,
+        CreateTagRequest,
+        ReleaseListResponse,
+        ReleaseResponse,
+        TagListResponse,
+        TagResponse,
+    )
 
 
 def handle_source_control_error(exc: Exception) -> NoReturn:
@@ -554,6 +664,515 @@ async def read_file(
         handle_source_control_error(exc)
 
 
+# ---------------------------------------------------------------------------
+# Pull Requests (GitHub-only in this phase)
+# ---------------------------------------------------------------------------
+#
+# These routes are declared BEFORE the generic
+# `/repositories/{repository_id:path}` route below. FastAPI
+# matches routes in declaration order, and `{...:path}` is
+# greedy: if the catch-all is declared first, it swallows a
+# request like `/repositories/owner/repo/pulls/1` as
+# `repository_id = "owner/repo/pulls/1"` and the PR routes never
+# match. The section-2 ordering already follows this rule for the
+# branches and file routes; the PR routes follow the same pattern.
+
+
+@router.get(
+    "/repositories/{repository_id:path}/pulls",
+    response_model=PullRequestListResponse,
+)
+async def list_pull_requests(
+    repository_id: str,
+    state: Optional[str] = Query(
+        default=None,
+        description="PR state filter: open, closed, merged, or all.",
+    ),
+    source_branch: Optional[str] = Query(
+        default=None, description="Optional head-branch filter."
+    ),
+    target_branch: Optional[str] = Query(
+        default=None, description="Optional base-branch filter."
+    ),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=30, ge=1, le=100),
+    provider: Optional[str] = Query(default="github"),
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> PullRequestListResponse:
+    """Lists pull requests for a repository."""
+    try:
+        return await facade.list_pull_requests(
+            repository_id=repository_id,
+            provider=provider,
+            state=state,
+            source_branch=source_branch,
+            target_branch=target_branch,
+            page=page,
+            page_size=page_size,
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.get(
+    "/repositories/{repository_id:path}/pulls/{number}",
+    response_model=PullRequestResponse,
+)
+async def get_pull_request(
+    repository_id: str,
+    number: str,
+    provider: Optional[str] = Query(default="github"),
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> PullRequestResponse:
+    """Fetches a single pull request by number."""
+    try:
+        return await facade.get_pull_request(
+            repository_id=repository_id,
+            number=number,
+            provider=provider,
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.post(
+    "/repositories/{repository_id:path}/pulls",
+    response_model=PullRequestResponse,
+)
+async def create_pull_request(
+    repository_id: str,
+    payload: CreatePullRequestRequest,
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> PullRequestResponse:
+    """Creates a new pull request.
+
+    The URL's `repository_id` and the body's `repository_id` MUST
+    match. A mismatch is rejected explicitly rather than silently
+    overriding one of the two values: a caller that copy-pastes a
+    body from one PR to another would otherwise open the PR on the
+    wrong repository without any warning. The `provider` field is
+    taken from the body (`CreatePullRequestRequest.provider`), not
+    from a query parameter, because a single request can only
+    target one provider.
+    """
+    try:
+        if payload.repository_id != repository_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"repository_id in body ('{payload.repository_id}') "
+                    f"does not match the URL ('{repository_id}')."
+                ),
+            )
+        return await facade.create_pull_request(payload)
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.put(
+    "/repositories/{repository_id:path}/pulls/{number}/merge",
+    response_model=MergePullRequestResponse,
+)
+async def merge_pull_request(
+    repository_id: str,
+    number: str,
+    payload: MergePullRequestRequest,
+    provider: Optional[str] = Query(default="github"),
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> MergePullRequestResponse:
+    """Merges an open pull request.
+
+    The policy engine is consulted inside the facade before the
+    merge is sent. A policy denial (for example, the repository
+    forbids merges) surfaces as a 403 and no remote state is
+    changed.
+    """
+    try:
+        return await facade.merge_pull_request(
+            repository_id=repository_id,
+            number=number,
+            payload=payload,
+            provider=provider,
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.post(
+    "/repositories/{repository_id:path}/pulls/{number}/reviews",
+    response_model=PullRequestReviewResponse,
+)
+async def submit_pull_request_review(
+    repository_id: str,
+    number: str,
+    payload: SubmitPullRequestReviewRequest,
+    provider: Optional[str] = Query(default="github"),
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> PullRequestReviewResponse:
+    """Submits a review (APPROVE / REQUEST_CHANGES / COMMENT)."""
+    try:
+        return await facade.submit_pr_review(
+            repository_id=repository_id,
+            number=number,
+            payload=payload,
+            provider=provider,
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.post(
+    "/repositories/{repository_id:path}/pulls/{number}/comments",
+    response_model=PullRequestCommentResponse,
+)
+async def create_pull_request_comment(
+    repository_id: str,
+    number: str,
+    payload: CreatePullRequestCommentRequest,
+    provider: Optional[str] = Query(default="github"),
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> PullRequestCommentResponse:
+    """Creates a general or inline comment on a pull request.
+
+    Dispatches on the payload shape: providing both `path` and
+    `line` creates an inline comment on that file/line; omitting
+    both creates a general (conversation) comment.
+    """
+    try:
+        return await facade.create_pr_comment(
+            repository_id=repository_id,
+            number=number,
+            payload=payload,
+            provider=provider,
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.get(
+    "/repositories/{repository_id:path}/pulls/{number}/timeline",
+)
+async def get_pull_request_timeline(
+    repository_id: str,
+    number: str,
+    provider: Optional[str] = Query(default="github"),
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> dict:
+    """Returns reviews, general comments, and inline comments for a PR.
+
+    The response is a composite of three collections and is
+    returned as a plain dict rather than a Pydantic model because
+    the frontend consumes the three collections independently. The
+    keys and value shapes are:
+
+        {
+            "reviews": PullRequestReviewResponse[],
+            "general_comments": PullRequestCommentResponse[],
+            "inline_comments": PullRequestCommentResponse[],
+        }
+    """
+    try:
+        return dict(
+            await facade.list_pr_reviews_and_comments(
+                repository_id=repository_id,
+                number=number,
+                provider=provider,
+            )
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Issues (GitHub-only in this phase)
+# ---------------------------------------------------------------------------
+#
+# These routes are declared BEFORE the generic
+# `/repositories/{repository_id:path}` route below. FastAPI matches
+# routes in declaration order, and `{...:path}` is greedy: if the
+# catch-all is declared first, it swallows
+# `/repositories/owner/repo/issues/1` as
+# `repository_id = "owner/repo/issues/1"` and the issue routes
+# never match. The PR routes above follow the same rule.
+
+@router.get(
+    "/repositories/{repository_id:path}/issues",
+    response_model=IssueListResponse,
+)
+async def list_issues(
+    repository_id: str,
+    state: str = Query(
+        default="open",
+        description="Issue state filter: 'open', 'closed', or 'all'.",
+    ),
+    labels: Optional[str] = Query(
+        default=None,
+        description="Comma-separated list of labels to filter by.",
+    ),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=30, ge=1, le=100),
+    provider: Optional[str] = Query(default="github"),
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> IssueListResponse:
+    """Lists issues for a repository.
+
+    Pull requests are filtered out by the service; the response
+    contains only real issues. Pass ``state="all"`` to include both
+    open and closed issues.
+    """
+    try:
+        labels_list: Optional[Sequence[str]] = None
+        if labels:
+            labels_list = [
+                label.strip()
+                for label in labels.split(",")
+                if label.strip()
+            ]
+        return await facade.list_issues(
+            repository_id=repository_id,
+            provider=provider,
+            state=state,
+            labels=labels_list,
+            page=page,
+            page_size=page_size,
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.get(
+    "/repositories/{repository_id:path}/issues/{number}",
+    response_model=IssueResponse,
+)
+async def get_issue(
+    repository_id: str,
+    number: str,
+    provider: Optional[str] = Query(default="github"),
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> IssueResponse:
+    """Fetches a single issue by number."""
+    try:
+        return await facade.get_issue(
+            repository_id=repository_id,
+            number=number,
+            provider=provider,
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.post(
+    "/repositories/{repository_id:path}/issues",
+    response_model=IssueResponse,
+)
+async def create_issue(
+    repository_id: str,
+    payload: CreateIssueRequest,
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> IssueResponse:
+    """Creates a new issue.
+
+    The URL's `repository_id` and the body's `repository_id` MUST
+    match. A mismatch is rejected explicitly rather than silently
+    overriding one of the two values, mirroring the same guard on
+    the pull-request creation endpoint.
+    """
+    try:
+        if payload.repository_id != repository_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"repository_id in body ('{payload.repository_id}') "
+                    f"does not match the URL ('{repository_id}')."
+                ),
+            )
+        return await facade.create_issue(payload)
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.patch(
+    "/repositories/{repository_id:path}/issues/{number}",
+    response_model=IssueResponse,
+)
+async def update_issue_state(
+    repository_id: str,
+    number: str,
+    payload: UpdateIssueStateRequest,
+    provider: Optional[str] = Query(default="github"),
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> IssueResponse:
+    """Changes an issue's state (close or reopen)."""
+    try:
+        return await facade.update_issue_state(
+            repository_id=repository_id,
+            number=number,
+            payload=payload,
+            provider=provider,
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.get(
+    "/repositories/{repository_id:path}/issues/{number}/comments",
+    response_model=Sequence[IssueCommentResponse],
+)
+async def list_issue_comments(
+    repository_id: str,
+    number: str,
+    provider: Optional[str] = Query(default="github"),
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> Sequence[IssueCommentResponse]:
+    """Lists the comments on an issue."""
+    try:
+        return await facade.list_issue_comments(
+            repository_id=repository_id,
+            number=number,
+            provider=provider,
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.post(
+    "/repositories/{repository_id:path}/issues/{number}/comments",
+    response_model=IssueCommentResponse,
+)
+async def create_issue_comment(
+    repository_id: str,
+    number: str,
+    payload: CreateIssueCommentRequest,
+    provider: Optional[str] = Query(default="github"),
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> IssueCommentResponse:
+    """Adds a comment to an existing issue."""
+    try:
+        return await facade.create_issue_comment(
+            repository_id=repository_id,
+            number=number,
+            payload=payload,
+            provider=provider,
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# 9. GitHub Releases (remote, GitHub-only)
+# ---------------------------------------------------------------------------
+#
+# Same ordering constraint as the PR and issue routes above: these
+# are declared BEFORE the generic
+# `/repositories/{repository_id:path}` route so that the catch-all
+# does not swallow them.
+
+@router.get(
+    "/repositories/{repository_id:path}/releases",
+    response_model=ReleaseListResponse,
+)
+async def list_releases(
+    repository_id: str,
+    include_drafts: bool = Query(
+        default=False,
+        description="Include draft releases.",
+    ),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=30, ge=1, le=100),
+    provider: Optional[str] = Query(default="github"),
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> ReleaseListResponse:
+    """Lists releases for a repository.
+
+    Drafts are excluded by default. Pass ``include_drafts=true`` to
+    include them.
+    """
+    try:
+        return await facade.list_releases(
+            repository_id=repository_id,
+            provider=provider,
+            include_drafts=include_drafts,
+            page=page,
+            page_size=page_size,
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.get(
+    "/repositories/{repository_id:path}/releases/{release_id}",
+    response_model=ReleaseResponse,
+)
+async def get_release(
+    repository_id: str,
+    release_id: int,
+    provider: Optional[str] = Query(default="github"),
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> ReleaseResponse:
+    """Fetches a single release by its numeric GitHub ID."""
+    try:
+        return await facade.get_release(
+            repository_id=repository_id,
+            release_id=str(release_id),
+            provider=provider,
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.post(
+    "/repositories/{repository_id:path}/releases",
+    response_model=ReleaseResponse,
+)
+async def create_release(
+    repository_id: str,
+    payload: CreateReleaseRequest,
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> ReleaseResponse:
+    """Creates a GitHub release.
+
+    The URL's `repository_id` and the body's `repository_id` MUST
+    match, mirroring the same guard on PR and issue creation.
+    """
+    try:
+        if payload.repository_id != repository_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"repository_id in body ('{payload.repository_id}') "
+                    f"does not match the URL ('{repository_id}')."
+                ),
+            )
+        return await facade.create_release(payload)
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.delete(
+    "/repositories/{repository_id:path}/releases/{release_id}",
+    response_model=ActionSuccessResponse,
+)
+async def delete_release(
+    repository_id: str,
+    release_id: int,
+    provider: Optional[str] = Query(default="github"),
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> ActionSuccessResponse:
+    """Deletes a GitHub release.
+
+    The underlying Git tag is NOT deleted; it remains on the
+    remote until a separate tag-delete operation runs.
+    """
+    try:
+        return await facade.delete_release(
+            repository_id=repository_id,
+            release_id=str(release_id),
+            provider=provider,
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
 @router.get(
     "/repositories/{repository_id:path}",
     response_model=RepositoryResponse,
@@ -582,9 +1201,19 @@ async def create_workspace(
     payload: CreateWorkspaceRequest,
     facade: SourceControlFacade = Depends(get_source_control_facade),
 ) -> WorkspaceResponse:
-    """Initializes an isolated local Git workspace for agent tasks."""
+    """
+    Initializes an isolated local Git workspace.
+
+    When ``chat_id`` is provided in the payload, the workspace is
+    created inside that chat's files directory so that the Editor
+    Tab can operate on its contents directly. This is used by
+    Manual Mode; Agent Mode leaves ``chat_id`` unset and the facade
+    falls back to its default storage location.
+    """
     try:
-        return await facade.create_workspace(payload)
+        return await facade.create_workspace(
+            payload, chat_id=getattr(payload, "chat_id", None)
+        )
     except Exception as exc:
         handle_source_control_error(exc)
 
@@ -612,6 +1241,32 @@ async def cleanup_workspaces(
     except Exception as exc:
         handle_source_control_error(exc)
 
+
+@router.get(
+    "/workspaces/by-chat/{chat_id}",
+    response_model=Optional[WorkspaceResponse],
+)
+async def get_workspace_by_chat(
+    chat_id: str,
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> Optional[WorkspaceResponse]:
+    """Return the workspace bound to a chat, or null if none exists."""
+    try:
+        return await facade.get_workspace_by_chat(chat_id)
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+@router.post("/workspaces/{workspace_id}/ensure-editable-branch")
+async def ensure_editable_branch(
+    workspace_id: str,
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> dict:
+    """Create a feature branch if on a protected branch."""
+    try:
+        branch = await facade.ensure_editable_branch(workspace_id)
+        return {"branch_name": branch}
+    except Exception as exc:
+        handle_source_control_error(exc)
 
 @router.get("/workspaces/{workspace_id}", response_model=WorkspaceResponse)
 async def get_workspace(
@@ -826,6 +1481,391 @@ async def list_audit_events(
     try:
         return await facade.list_audit_events(
             limit=limit, operation_id=operation_id
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# 7. Merge / rebase / conflict resolution (local workspace operations)
+# ---------------------------------------------------------------------------
+#
+# These endpoints are strictly local: they never call a provider API
+# and never touch a token. They are audited for the same reason every
+# other mutating operation is audited.
+#
+# Ordering note:
+#   Every route is under `/workspaces/{workspace_id}/...`. The
+#   `{workspace_id}` parameter is a single segment (not a `:path`
+#   converter), so these routes cannot shadow or be shadowed by the
+#   existing `/workspaces/{workspace_id}/checkout` or
+#   `/workspaces/{workspace_id}/diff` routes. They are declared at
+#   the end of the router for readability, not because of a matching
+#   constraint.
+
+@router.post(
+    "/workspaces/{workspace_id}/merge",
+    response_model=MergeOperationResponse,
+)
+async def merge_workspace_branches(
+    workspace_id: str,
+    payload: MergeBranchesRequest,
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> MergeOperationResponse:
+    """Merge one local branch into another inside the workspace.
+
+    On conflicts, returns ``kind="conflicted"`` with the current
+    conflict list. The caller must then call
+    `POST /workspaces/{id}/conflicts/resolve` and finally
+    `POST /workspaces/{id}/finalize`.
+    """
+    try:
+        return await facade.merge_workspace_branches(
+            workspace_id=workspace_id, payload=payload
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.post(
+    "/workspaces/{workspace_id}/rebase",
+    response_model=MergeOperationResponse,
+)
+async def rebase_workspace_branch(
+    workspace_id: str,
+    payload: RebaseBranchRequest,
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> MergeOperationResponse:
+    """Rebase one local branch onto another inside the workspace."""
+    try:
+        return await facade.rebase_workspace_branch(
+            workspace_id=workspace_id, payload=payload
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.post(
+    "/workspaces/{workspace_id}/finalize",
+    response_model=MergeOperationResponse,
+)
+async def finalize_workspace_operation(
+    workspace_id: str,
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> MergeOperationResponse:
+    """Finalize whichever merge or rebase is currently in progress.
+
+    The caller is expected to have resolved and staged all
+    conflicts first; the operation refuses to commit when
+    unresolved conflicts remain.
+    """
+    try:
+        return await facade.finalize_workspace_operation(
+            workspace_id=workspace_id
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.post(
+    "/workspaces/{workspace_id}/abort",
+    response_model=ConflictListResponse,
+)
+async def abort_workspace_operation(
+    workspace_id: str,
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> ConflictListResponse:
+    """Abort the in-progress merge / rebase / cherry-pick / revert.
+
+    Returns a state report with ``operation_state="none"`` on
+    success. Idempotent: calling this when no operation is in
+    progress raises a 409 (there is nothing to abort).
+    """
+    try:
+        return await facade.abort_workspace_operation(
+            workspace_id=workspace_id
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.get(
+    "/workspaces/{workspace_id}/conflicts",
+    response_model=ConflictListResponse,
+)
+async def list_workspace_conflicts(
+    workspace_id: str,
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> ConflictListResponse:
+    """Return the current operation state and conflicted files.
+
+    Safe to call at any time; returns ``operation_state="none"``
+    and an empty list when no operation is in progress.
+    """
+    try:
+        return await facade.list_workspace_conflicts(
+            workspace_id=workspace_id
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.post(
+    "/workspaces/{workspace_id}/conflicts/resolve",
+    response_model=ResolveConflictsResponse,
+)
+async def resolve_workspace_conflicts(
+    workspace_id: str,
+    payload: ResolveConflictsRequest,
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> ResolveConflictsResponse:
+    """Resolve conflicted files by taking a side or marking manual edits.
+
+    Strategies: ``"ours"``, ``"theirs"``, or ``"manual"``. The
+    response reports how many files were resolved and which files
+    remain conflicted.
+    """
+    try:
+        return await facade.resolve_workspace_conflicts(
+            workspace_id=workspace_id, payload=payload
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# 8. Local Git tags (workspace)
+# ---------------------------------------------------------------------------
+#
+# These endpoints operate on the LOCAL Git repository in the
+# workspace. They never call a provider API and never touch a token.
+# Creating a tag locally does not push it to the remote.
+
+@router.get(
+    "/workspaces/{workspace_id}/tags",
+    response_model=TagListResponse,
+)
+async def list_workspace_tags(
+    workspace_id: str,
+    max_tags: int = Query(default=5000, ge=1, le=10_000),
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> TagListResponse:
+    """Lists every local Git tag in the workspace."""
+    try:
+        return await facade.list_workspace_tags(
+            workspace_id=workspace_id, max_tags=max_tags
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.post(
+    "/workspaces/{workspace_id}/tags",
+    response_model=TagResponse,
+)
+async def create_workspace_tag(
+    workspace_id: str,
+    payload: CreateTagRequest,
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> TagResponse:
+    """Creates a local Git tag in the workspace.
+
+    A tag with a non-empty ``message`` is created as an annotated
+    tag; without one it is created as a lightweight tag.
+    """
+    try:
+        return await facade.create_workspace_tag(
+            workspace_id=workspace_id, payload=payload
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.delete(
+    "/workspaces/{workspace_id}/tags/{name:path}",
+    response_model=ActionSuccessResponse,
+)
+async def delete_workspace_tag(
+    workspace_id: str,
+    name: str,
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> ActionSuccessResponse:
+    """Deletes a local Git tag from the workspace.
+
+    The ``{name:path}`` converter is intentional: tag names may
+    legitimately contain slashes (e.g. ``v1.0.0/rc1``), and a
+    plain ``{name}`` capture would reject them with a 404. The
+    facade re-validates the name against Git's tag-name rules.
+    """
+    try:
+        return await facade.delete_workspace_tag(
+            workspace_id=workspace_id, name=name
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# 6. Git read-only operations (history, tree, historical file content)
+# ---------------------------------------------------------------------------
+#
+# These endpoints are strictly read-only: they inspect the committed
+# history of a workspace and never mutate the working tree, the
+# index, or any branch. They are consumed by the Repository Browser
+# and Commit History views.
+#
+# Path layout note:
+#   Every route below is under `/workspaces/{workspace_id}/...`, so
+#   none of them can shadow the parameterized `GET /workspaces/{id}`
+#   route (which is a single-segment path). FastAPI matches by
+#   segment, so `/workspaces/abc/log` cannot collide with
+#   `/workspaces/abc`.
+
+
+@router.get(
+    "/workspaces/{workspace_id}/log",
+    response_model=Sequence[CommitEntryResponse],
+)
+async def get_workspace_log(
+    workspace_id: str,
+    limit: int = Query(
+        default=50,
+        ge=1,
+        le=500,
+        description="Maximum number of commits to return per page.",
+    ),
+    skip: int = Query(
+        default=0,
+        ge=0,
+        description="Number of commits to skip from the tip of the ref.",
+    ),
+    ref: Optional[str] = Query(
+        default=None,
+        description="Branch, tag, or SHA. Defaults to HEAD.",
+    ),
+    path: Optional[str] = Query(
+        default=None,
+        description="Optional path filter.",
+    ),
+    author: Optional[str] = Query(
+        default=None,
+        description="Optional author name/email filter.",
+    ),
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> Sequence[CommitEntryResponse]:
+    """Return a page of commits for a workspace.
+
+    Pagination is stable: two calls with non-overlapping `skip`
+    values return non-overlapping pages, provided the underlying
+    history is unchanged. An empty sequence is a valid result
+    (empty repository, or all commits filtered out).
+    """
+    try:
+        return await facade.read_workspace_log(
+            workspace_id=workspace_id,
+            limit=limit,
+            skip=skip,
+            ref=ref,
+            path=path,
+            author=author,
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.get(
+    "/workspaces/{workspace_id}/commits/{sha}",
+    response_model=CommitWithStatsResponse,
+)
+async def get_workspace_commit(
+    workspace_id: str,
+    sha: str,
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> CommitWithStatsResponse:
+    """Return a single commit with aggregate file-change statistics."""
+    try:
+        return await facade.read_workspace_commit(
+            workspace_id=workspace_id, sha=sha
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.get(
+    "/workspaces/{workspace_id}/files/tree",
+    response_model=Sequence[TreeNodeResponse],
+)
+async def get_workspace_tree(
+    workspace_id: str,
+    ref: Optional[str] = Query(
+        default=None,
+        description="Branch, tag, or SHA. Defaults to HEAD.",
+    ),
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> Sequence[TreeNodeResponse]:
+    """Return the hierarchical file tree at a ref.
+
+    The tree reflects COMMITTED content, not the working tree. Use
+    the workspace status / diff endpoints when the caller wants to
+    browse the working tree.
+    """
+    try:
+        return await facade.list_workspace_tree(
+            workspace_id=workspace_id, ref=ref
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.get(
+    "/workspaces/{workspace_id}/file-content",
+    response_model=FileContentAtRefResponse,
+)
+async def get_workspace_file_content(
+    workspace_id: str,
+    ref: str = Query(
+        ...,
+        description="Git ref (branch, tag, or SHA).",
+    ),
+    path: str = Query(
+        ...,
+        description="File path relative to the repository root.",
+    ),
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> FileContentAtRefResponse:
+    """Read a file at a specific committed ref.
+
+    Unlike the workspace-diff endpoint, which reads the working
+    tree, this endpoint returns the COMMITTED content. It is the
+    correct API for browsing historical files in the Repository
+    Browser.
+    """
+    try:
+        return await facade.read_file_at_ref(
+            workspace_id=workspace_id, ref=ref, path=path
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.post(
+    "/workspaces/{workspace_id}/checkout",
+    response_model=WorkspaceResponse,
+)
+async def checkout_workspace_branch(
+    workspace_id: str,
+    payload: CheckoutBranchRequest,
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> WorkspaceResponse:
+    """Check out an existing local branch inside the workspace.
+
+    This is a local-only operation: it does not touch the remote.
+    A non-forced checkout is refused when the workspace has
+    uncommitted changes, so user work is never silently discarded.
+    """
+    try:
+        return await facade.checkout_workspace_branch(
+            workspace_id=workspace_id, payload=payload
         )
     except Exception as exc:
         handle_source_control_error(exc)

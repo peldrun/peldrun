@@ -43,8 +43,9 @@ MERGED-STATE DETECTION:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import quote
 
 from ...domain.enums import ChangeRequestState, ProviderId
@@ -53,6 +54,7 @@ from ...errors import (
     ConflictError,
     NotFoundError,
     ProviderError,
+    RemoteStateChangedError,
     ValidationError,
 )
 from ...security.redaction import redact_text, redact_url
@@ -65,8 +67,10 @@ from .client import (
 
 __all__ = [
     "GitHubPullRequestService",
+    "MergeResult",
     "MAX_PR_TITLE_LENGTH",
     "MAX_PR_BODY_LENGTH",
+    "MAX_PULL_REQUESTS",
 ]
 
 
@@ -84,6 +88,35 @@ _DEFAULT_PAGE_SIZE: int = 30
 
 #: Cap on the number of pull requests returned in one call.
 MAX_PULL_REQUESTS: int = 1_000
+
+#: Merge methods accepted by GitHub's PUT /merge endpoint.
+#:
+#: `fast_forward` is deliberately NOT in this set: the GitHub REST
+#: API exposes no direct fast-forward merge method. Callers who want
+#: a fast-forward should rebase first (a separate operation).
+_ALLOWED_MERGE_METHODS: frozenset[str] = frozenset(
+    {"merge", "squash", "rebase"}
+)
+
+
+# ---------------------------------------------------------------------------
+# Merge result
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MergeResult:
+    """Result of a merge attempt against the GitHub API.
+
+    Attributes:
+        merged:  True when GitHub reported the merge as applied.
+        sha:     SHA of the merge commit, when merged.
+        message: Human-readable status message from GitHub.
+    """
+
+    merged: bool
+    sha: Optional[str] = None
+    message: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +408,183 @@ class GitHubPullRequestService:
                 break
 
         return tuple(results)
+
+    # --- Merge --------------------------------------------------------
+
+    async def merge_pull_request(
+        self,
+        *,
+        repo: RepositoryRef,
+        number: int,
+        merge_method: str = "merge",
+        commit_title: Optional[str] = None,
+        commit_message: Optional[str] = None,
+        delete_source_branch: bool = False,
+        expected_head_sha: Optional[str] = None,
+        token: str,
+    ) -> MergeResult:
+        """Merge an open pull request.
+
+        Verification model:
+            When ``expected_head_sha`` is provided, it is sent to
+            GitHub as the ``sha`` parameter of the merge request.
+            GitHub rejects the call with a 409 Conflict if the PR's
+            head has moved since the SHA was captured, which prevents
+            a merge of commits that were never reviewed. The check
+            is enforced server-side, so no pre-fetch is needed.
+
+        Source-branch deletion:
+            When ``delete_source_branch`` is True, the PR is fetched
+            first to resolve the source branch, and that branch is
+            deleted after a successful merge. The branch deletion is
+            best-effort: a 404 (branch already gone) is swallowed
+            and logged, because the merge itself already succeeded
+            and there is nothing to roll back.
+
+        Args:
+            repo: The repository reference.
+            number: PR number (positive integer).
+            merge_method: One of ``"merge"``, ``"squash"``, or
+                ``"rebase"``.
+            commit_title: Optional custom merge-commit title.
+            commit_message: Optional custom merge-commit body.
+            delete_source_branch: Delete the source branch after a
+                successful merge.
+            expected_head_sha: Optional SHA that the PR head must
+                currently match.
+            token: Access token. Required.
+
+        Returns:
+            A `MergeResult` describing the outcome.
+
+        Raises:
+            ValidationError: If inputs are malformed (including an
+                unsupported merge method).
+            NotFoundError: If the PR or repository does not exist.
+            ConflictError: If the PR is not mergeable (already
+                merged, base conflicts, or branch-protection rules
+                forbid the merge).
+            RemoteStateChangedError: If the PR head moved since the
+                caller captured ``expected_head_sha``.
+            PermissionDeniedError: If the token cannot merge PRs.
+        """
+        # --- Validation ---
+        if not isinstance(repo, RepositoryRef):
+            raise ValidationError(
+                "repo must be a RepositoryRef.",
+                details={"type": type(repo).__name__},
+            )
+        if not isinstance(number, int) or number <= 0:
+            raise ValidationError(
+                "number must be a positive integer.",
+                details={"number": number},
+            )
+        if not token:
+            raise ValidationError("token must not be empty.")
+        clean_method = (merge_method or "").strip().lower()
+        if clean_method not in _ALLOWED_MERGE_METHODS:
+            raise ValidationError(
+                f"Invalid merge_method '{merge_method}'. "
+                f"Must be one of: {sorted(_ALLOWED_MERGE_METHODS)}",
+                details={"merge_method": merge_method},
+            )
+
+        # --- Resolve source branch if we will need to delete it ---
+        source_branch: Optional[str] = None
+        if delete_source_branch:
+            pr_ref = await self.get_pull_request(
+                repo=repo, number_or_iid=str(number), token=token
+            )
+            source_branch = pr_ref.source_branch
+
+        # --- Build the merge payload ---
+        payload: Dict[str, Any] = {"merge_method": clean_method}
+        if commit_title:
+            payload["commit_title"] = commit_title
+        if commit_message:
+            payload["commit_message"] = commit_message
+        if expected_head_sha:
+            payload["sha"] = expected_head_sha
+
+        # --- Execute the merge ---
+        repo_path = self._build_repo_path(repo)
+        try:
+            response = await self._client.request(
+                "PUT",
+                f"{repo_path}/pulls/{number}/merge",
+                token=token,
+                json_body=payload,
+            )
+        except ValidationError as exc:
+            # `GitHubClient` maps 405 (not mergeable) to a generic
+            # ValidationError whose details carry the raw status.
+            # Translate that into a domain ConflictError so the UI
+            # can present it as "cannot merge" rather than
+            # "invalid input".
+            status = (exc.details or {}).get("status")
+            if status == 405:
+                raise ConflictError(
+                    "Pull request is not mergeable. It may already "
+                    "be merged, the base branch may have diverged, "
+                    "or branch protection rules may forbid the "
+                    "merge.",
+                    details={
+                        "number": number,
+                        "status": 405,
+                    },
+                ) from exc
+            raise
+        except ConflictError as exc:
+            # A 409 from GitHub's merge endpoint specifically means
+            # the PR head changed since the last check. Surface it
+            # as RemoteStateChangedError so the UI can prompt the
+            # user to re-fetch and re-review.
+            raise RemoteStateChangedError(
+                "The pull request head was modified before the merge "
+                "could be applied. Re-fetch the pull request and try "
+                "again.",
+                details={"number": number},
+            ) from exc
+
+        if not isinstance(response, Mapping):
+            raise ProviderError(
+                "GitHub returned an unexpected payload for the merge "
+                "endpoint.",
+                details={"number": number},
+            )
+
+        merged = bool(response.get("merged", False))
+        merge_sha = response.get("sha")
+        message = str(response.get("message") or "")
+
+        # --- Optional: delete the source branch ---
+        if merged and delete_source_branch and source_branch:
+            encoded_branch = quote(source_branch, safe="/")
+            try:
+                await self._client.delete_json(
+                    f"{repo_path}/git/refs/heads/{encoded_branch}",
+                    token=token,
+                )
+            except NotFoundError:
+                # Branch already deleted; the merge is still valid.
+                logger.info(
+                    "Source branch '%s' was already deleted after merge.",
+                    source_branch,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Non-fatal: the merge succeeded. Log and continue
+                # so the caller sees a successful merge result.
+                logger.warning(
+                    "Failed to delete source branch '%s' after merge: %s",
+                    source_branch,
+                    type(exc).__name__,
+                )
+
+        return MergeResult(
+            merged=merged,
+            sha=merge_sha if isinstance(merge_sha, str) else None,
+            message=message,
+        )
 
     # --- Internal: validation ------------------------------------------
 

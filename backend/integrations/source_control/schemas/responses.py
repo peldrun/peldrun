@@ -287,3 +287,690 @@ class AuditLogEntryResponse(BaseSCResponse):
     repository: Optional[str] = Field(default=None, description="Repository involved.")
     operation_id: Optional[str] = Field(default=None, description="Associated operation ID.")
     details: Mapping[str, Any] = Field(default_factory=dict, description="Redacted context details.")
+
+
+# ----------------------------------------------------------------------
+# Git read-only operations (history, tree, historical file content)
+# ----------------------------------------------------------------------
+#
+# These schemas describe the responses of the read-only Git endpoints
+# used by the Repository Browser and Commit History views. They are
+# deliberately kept separate from the workspace/diff schemas above:
+# those describe an editable working tree, while these describe the
+# immutable committed history reachable from a ref.
+
+
+class CommitEntryResponse(BaseSCResponse):
+    """A single commit entry in the workspace's history.
+
+    The list endpoint returns commits ordered newest-first, matching
+    `git log`'s default order. Pagination is stable: two calls with
+    non-overlapping `skip` values return non-overlapping pages,
+    provided the underlying history is unchanged.
+
+    Attributes:
+        sha:          Full commit SHA-1 or SHA-256.
+        message:      Full commit message (subject line + body).
+        author_name:  Author name as recorded in the commit header.
+        author_email: Author email as recorded in the commit header.
+        committed_at: Timezone-aware commit timestamp.
+        parent_shas:  Parent commit SHAs. Empty for the root
+                      commit; two or more for a merge commit.
+    """
+
+    sha: str = Field(..., description="Full commit SHA.")
+    message: str = Field(default="", description="Full commit message.")
+    author_name: str = Field(default="", description="Author name.")
+    author_email: str = Field(default="", description="Author email.")
+    committed_at: datetime = Field(
+        default_factory=_utc_now,
+        description="Timezone-aware commit timestamp.",
+    )
+    parent_shas: Sequence[str] = Field(
+        default_factory=tuple,
+        description="Parent commit SHAs. Empty for the root commit.",
+    )
+
+
+class CommitWithStatsResponse(CommitEntryResponse):
+    """A commit entry augmented with aggregate file-change statistics.
+
+    Returned by the single-commit endpoint, where the extra Git
+    invocation needed to compute the stats is justified. The list
+    endpoint uses `CommitEntryResponse` to keep responses small: a
+    page of 50 commits with stats would require 50 additional `git
+    show --numstat` invocations, which is neither necessary nor
+    cheap.
+
+    Attributes:
+        files_changed: Number of files touched by the commit.
+        insertions:    Total number of added lines across all files.
+        deletions:     Total number of removed lines across all files.
+    """
+
+    files_changed: int = Field(
+        default=0,
+        description="Number of files touched by the commit.",
+    )
+    insertions: int = Field(
+        default=0,
+        description="Total number of added lines across all files.",
+    )
+    deletions: int = Field(
+        default=0,
+        description="Total number of removed lines across all files.",
+    )
+
+
+class TreeNodeResponse(BaseSCResponse):
+    """A single node in the repository's hierarchical file tree.
+
+    The tree is shaped for direct consumption by `react-arborist`
+    and similar tree components. Directories are ordered before
+    files at every level, and each group is sorted
+    case-insensitively by name, so the frontend receives a stable,
+    predictable order.
+
+    The `type` field is a string rather than a literal enum because
+    the frontend's Zod schema does not currently import a
+    corresponding enum, and adding one here would force a lockstep
+    change on both sides for a value that has exactly two members.
+
+    Attributes:
+        name:     Final path component (e.g. "src" or "main.py").
+        path:     Full path from the repository root, using "/".
+        type:     Either "file" or "directory".
+        size:     File size in bytes; None for directories.
+        children: Child nodes for directories; empty for files.
+    """
+
+    name: str = Field(..., description="Final path component.")
+    path: str = Field(
+        ..., description="Full path from the repository root."
+    )
+    type: str = Field(
+        ...,
+        description="Node type: 'file' or 'directory'.",
+    )
+    size: Optional[int] = Field(
+        default=None,
+        description="File size in bytes; None for directories.",
+    )
+    children: Sequence["TreeNodeResponse"] = Field(
+        default_factory=tuple,
+        description="Child nodes (directories only; empty for files).",
+    )
+
+
+class FileContentAtRefResponse(BaseSCResponse):
+    """The content of a file at a specific Git reference.
+
+    Unlike the workspace diff endpoint, which reads the working
+    tree, this response reflects the COMMITTED content at `ref`.
+    It is the correct API for browsing historical files in the
+    Repository Browser: a user who selects a commit from the
+    history view expects to see the file as it was at that commit,
+    not as it is right now.
+
+    Binary detection:
+        The backend inspects the raw `git show` output for NUL
+        bytes. A NUL byte cannot appear in valid UTF-8 text and is
+        the standard heuristic for binary content. When detected,
+        `is_binary` is set to True and `content` is None; the UI
+        MUST render a placeholder ("Binary file") rather than
+        attempting to display the content.
+
+    Attributes:
+        workspace_id: The workspace the file was read from.
+        ref:          Branch, tag, or commit SHA.
+        path:         File path relative to the repository root.
+        is_binary:    True when the file is binary.
+        size_bytes:   Size of the file in bytes, before truncation.
+        is_truncated: True when the content was truncated at the
+                      configured byte budget.
+        content:      Decoded UTF-8 text, or None for binary files.
+    """
+
+    workspace_id: str = Field(..., description="Source workspace ID.")
+    ref: str = Field(
+        ..., description="Git ref the file was read from."
+    )
+    path: str = Field(
+        ..., description="File path within the repository."
+    )
+    is_binary: bool = Field(
+        default=False,
+        description="Whether the file is binary.",
+    )
+    size_bytes: int = Field(
+        default=0,
+        description="File size in bytes (before truncation).",
+    )
+    is_truncated: bool = Field(
+        default=False,
+        description="Whether the content was truncated.",
+    )
+    content: Optional[str] = Field(
+        default=None,
+        description=(
+            "Decoded text content, or None for binary files."
+        ),
+    )
+
+
+# ----------------------------------------------------------------------
+# Pull Requests (list, detail, create, merge, reviews, comments)
+# ----------------------------------------------------------------------
+#
+# These schemas describe the responses of the pull-request endpoints.
+# They are the wire format consumed by the Pull Requests, Review
+# Editor, and PR Detail views in the frontend.
+#
+# The `number` field is a string, not an int. This mirrors the
+# provider-neutral `ChangeRequestRef.number_or_iid`, which is a
+# string so that it can represent both GitHub's integer `number`
+# and GitLab's integer `iid` without a type mismatch. Rendering it
+# as a string also avoids URL-encoding quirks in the frontend.
+
+
+class PullRequestResponse(BaseSCResponse):
+    """A single pull request entry.
+
+    The `state` field is a string rather than an enum because the
+    frontend already narrows it via its own Zod schema; keeping it
+    as a plain string here avoids a lockstep change on both sides
+    for a value that has exactly five members.
+    """
+
+    provider: str = Field(..., description="Provider identifier.")
+    repository_id: str = Field(..., description="Repository identifier.")
+    number: str = Field(..., description="PR number (string).")
+    web_url: str = Field(..., description="Sanitized browser URL.")
+    state: str = Field(
+        ...,
+        description=(
+            "PR state: 'open', 'draft', 'closed', 'merged', or "
+            "'unknown'."
+        ),
+    )
+    source_branch: str = Field(..., description="Head branch.")
+    target_branch: str = Field(..., description="Base branch.")
+    title: str = Field(default="", description="PR title.")
+    body: Optional[str] = Field(
+        default=None, description="PR body (Markdown)."
+    )
+    is_draft: bool = Field(
+        default=False, description="Whether the PR is a draft."
+    )
+    author_login: Optional[str] = Field(
+        default=None, description="Author login, when available."
+    )
+    created_at: Optional[datetime] = Field(
+        default=None, description="Creation timestamp."
+    )
+    updated_at: Optional[datetime] = Field(
+        default=None, description="Last-update timestamp."
+    )
+    merged_at: Optional[datetime] = Field(
+        default=None, description="Merge timestamp, when merged."
+    )
+
+
+class PullRequestListResponse(BaseSCResponse):
+    """A page of pull requests plus the requested state filter."""
+
+    items: Sequence[PullRequestResponse] = Field(
+        default_factory=tuple,
+        description="The pull requests in this page.",
+    )
+    total: int = Field(
+        default=0,
+        description="Number of items in this page.",
+    )
+    state: str = Field(
+        default="open",
+        description="The state filter that was applied.",
+    )
+
+
+class PullRequestReviewResponse(BaseSCResponse):
+    """A single review on a pull request."""
+
+    review_id: str = Field(..., description="Review identifier.")
+    state: str = Field(
+        ...,
+        description=(
+            "Review state: 'pending', 'approved', "
+            "'changes_requested', 'commented', 'dismissed', or "
+            "'unknown'."
+        ),
+    )
+    body: Optional[str] = Field(
+        default=None, description="Review body (Markdown)."
+    )
+    author_login: Optional[str] = Field(
+        default=None, description="Reviewer login."
+    )
+    submitted_at: Optional[datetime] = Field(
+        default=None, description="Submission timestamp."
+    )
+
+
+class PullRequestCommentResponse(BaseSCResponse):
+    """A single comment on a pull request (general or inline)."""
+
+    comment_id: str = Field(..., description="Comment identifier.")
+    body: str = Field(..., description="Comment body (Markdown).")
+    author_login: Optional[str] = Field(
+        default=None, description="Author login."
+    )
+    created_at: Optional[datetime] = Field(
+        default=None, description="Creation timestamp."
+    )
+    updated_at: Optional[datetime] = Field(
+        default=None, description="Last-update timestamp."
+    )
+    path: Optional[str] = Field(
+        default=None,
+        description="File path for inline comments; None for general.",
+    )
+    line: Optional[int] = Field(
+        default=None,
+        description="Line number for inline comments.",
+    )
+    side: Optional[str] = Field(
+        default=None,
+        description="Diff side for inline comments ('LEFT' or 'RIGHT').",
+    )
+    in_reply_to_id: Optional[str] = Field(
+        default=None,
+        description="Parent comment ID when this is a reply.",
+    )
+
+
+class MergePullRequestResponse(BaseSCResponse):
+    """Result of a merge attempt."""
+
+    status: str = Field(
+        default="success",
+        description="'success', 'accepted', or 'conflict'.",
+    )
+    merged: bool = Field(
+        default=False,
+        description="True when the merge was applied.",
+    )
+    sha: Optional[str] = Field(
+        default=None,
+        description="SHA of the merge commit, when merged.",
+    )
+    message: str = Field(
+        default="",
+        description="Human-readable result message.",
+    )
+
+
+# ----------------------------------------------------------------------
+# Issues (list, detail, comments)
+# ----------------------------------------------------------------------
+#
+# These schemas describe the responses of the issue endpoints.
+# They mirror GitHub's `/repos/{owner}/{repo}/issues` resources,
+# with two deliberate simplifications:
+#
+#   - `labels` is a flat list of names rather than the full GitHub
+#     label objects. The UI does not currently render label colors,
+#     and flattening saves a schema (and a mapper) that would
+#     otherwise only be used by the frontend.
+#   - `is_pull_request` is exposed even though the list endpoint
+#     filters PRs out by default. The field lets a future revision
+#     switch to a unified "Issues and Pull Requests" listing
+#     without a schema change.
+
+class IssueResponse(BaseSCResponse):
+    """A single issue entry."""
+
+    provider: str = Field(..., description="Provider identifier.")
+    repository_id: str = Field(..., description="Repository identifier.")
+    number: str = Field(..., description="Issue number (string).")
+    web_url: str = Field(..., description="Sanitized browser URL.")
+    state: str = Field(
+        ...,
+        description="'open' or 'closed'.",
+    )
+    title: str = Field(default="", description="Issue title.")
+    body: Optional[str] = Field(
+        default=None, description="Issue body (Markdown)."
+    )
+    author_login: Optional[str] = Field(
+        default=None, description="Author login."
+    )
+    labels: Sequence[str] = Field(
+        default_factory=tuple, description="Label names."
+    )
+    comments_count: int = Field(
+        default=0, description="Number of comments."
+    )
+    is_pull_request: bool = Field(
+        default=False,
+        description=(
+            "True when the underlying GitHub resource is a pull "
+            "request (PRs are issues under the hood)."
+        ),
+    )
+    state_reason: Optional[str] = Field(
+        default=None,
+        description=(
+            "Closure reason: 'completed', 'not_planned', "
+            "'reopened', or None."
+        ),
+    )
+    created_at: Optional[datetime] = Field(
+        default=None, description="Creation timestamp."
+    )
+    updated_at: Optional[datetime] = Field(
+        default=None, description="Last-update timestamp."
+    )
+    closed_at: Optional[datetime] = Field(
+        default=None, description="Closure timestamp, when closed."
+    )
+
+
+class IssueListResponse(BaseSCResponse):
+    """A page of issues plus the requested state filter."""
+
+    items: Sequence[IssueResponse] = Field(
+        default_factory=tuple,
+        description="The issues in this page.",
+    )
+    total: int = Field(
+        default=0,
+        description="Number of items in this page.",
+    )
+    state: str = Field(
+        default="open",
+        description="The state filter that was applied.",
+    )
+
+
+class IssueCommentResponse(BaseSCResponse):
+    """A single comment on an issue."""
+
+    comment_id: str = Field(..., description="Comment identifier.")
+    body: str = Field(..., description="Comment body (Markdown).")
+    author_login: Optional[str] = Field(
+        default=None, description="Author login."
+    )
+    created_at: Optional[datetime] = Field(
+        default=None, description="Creation timestamp."
+    )
+    updated_at: Optional[datetime] = Field(
+        default=None, description="Last-update timestamp."
+    )
+
+
+# ----------------------------------------------------------------------
+# Merge / rebase / conflict resolution (local workspace operations)
+# ----------------------------------------------------------------------
+#
+# These schemas describe the responses of the workspace-level
+# merge, rebase, and conflict-resolution endpoints. They are
+# distinct from the pull-request merge schemas above: those drive
+# the REMOTE merge via a provider API, while these drive a LOCAL
+# Git merge/rebase inside a workspace.
+
+
+class ConflictFileResponse(BaseSCResponse):
+    """A single conflicted file in a workspace.
+
+    The three boolean flags correspond to Git's three-stage index
+    for a conflicted path:
+
+        - ``has_base``   : stage 1 (common ancestor) exists.
+        - ``has_ours``   : stage 2 (local side) exists.
+        - ``has_theirs`` : stage 3 (incoming side) exists.
+
+    A delete/modify conflict, for example, has ``has_ours`` XOR
+    ``has_theirs`` set; an add/add conflict has both set and
+    ``has_base`` unset.
+    """
+
+    path: str = Field(..., description="Workspace-relative path.")
+    has_base: bool = Field(
+        default=False,
+        description="Whether the base (stage 1) version exists.",
+    )
+    has_ours: bool = Field(
+        default=False,
+        description="Whether the local (stage 2) version exists.",
+    )
+    has_theirs: bool = Field(
+        default=False,
+        description="Whether the incoming (stage 3) version exists.",
+    )
+    is_delete_modify: bool = Field(
+        default=False,
+        description=(
+            "True when exactly one side deleted the file and the "
+            "other modified it."
+        ),
+    )
+    is_add_add: bool = Field(
+        default=False,
+        description=(
+            "True when both sides added the file and there is no "
+            "common ancestor."
+        ),
+    )
+
+
+class ConflictListResponse(BaseSCResponse):
+    """The current in-progress operation and its conflicted files."""
+
+    workspace_id: str = Field(..., description="Workspace identifier.")
+    operation_state: str = Field(
+        ...,
+        description=(
+            "Current state: 'none', 'merging', 'rebasing', "
+            "'cherry_picking', or 'reverting'."
+        ),
+    )
+    files: Sequence[ConflictFileResponse] = Field(
+        default_factory=tuple,
+        description="Conflicted files in the workspace.",
+    )
+    total: int = Field(
+        default=0, description="Number of conflicted files."
+    )
+
+
+class MergeOperationResponse(BaseSCResponse):
+    """Result of a merge, rebase, or finalize operation.
+
+    ``kind`` distinguishes the three outcomes the caller must
+    handle differently:
+
+        - ``"clean"``       : the operation completed successfully.
+        - ``"conflicted"``  : the operation paused; the caller
+                              should open the conflict resolver.
+        - ``"up_to_date"``  : nothing to do.
+    """
+
+    workspace_id: str = Field(..., description="Workspace identifier.")
+    kind: str = Field(
+        ...,
+        description=(
+            "Result kind: 'clean', 'conflicted', or 'up_to_date'."
+        ),
+    )
+    operation_state: str = Field(
+        ...,
+        description=(
+            "State after the operation: 'none', 'merging', or "
+            "'rebasing'."
+        ),
+    )
+    conflicts: Sequence[ConflictFileResponse] = Field(
+        default_factory=tuple,
+        description=(
+            "Conflicted files, present when kind is 'conflicted'."
+        ),
+    )
+    head_sha: Optional[str] = Field(
+        default=None,
+        description="HEAD SHA after the operation.",
+    )
+    message: str = Field(
+        default="", description="Human-readable status."
+    )
+
+
+class ResolveConflictsResponse(BaseSCResponse):
+    """Result of a conflict-resolution action.
+
+    Reports what changed and what remains. The caller inspects
+    ``remaining`` to decide whether to finalize the operation
+    (``remaining == 0``) or continue resolving.
+    """
+
+    workspace_id: str = Field(..., description="Workspace identifier.")
+    operation_state: str = Field(
+        ...,
+        description="Current operation state (after resolution).",
+    )
+    resolved_count: int = Field(
+        default=0,
+        description="Number of files resolved by this call.",
+    )
+    remaining: Sequence[ConflictFileResponse] = Field(
+        default_factory=tuple,
+        description="Conflicted files that remain unresolved.",
+    )
+    message: str = Field(
+        default="", description="Human-readable status."
+    )
+
+
+# ----------------------------------------------------------------------
+# Tags (local) and Releases (GitHub-only)
+# ----------------------------------------------------------------------
+#
+# TagResponse describes a LOCAL Git tag.
+# ReleaseResponse describes a REMOTE GitHub release.
+# The two are intentionally distinct: a tag is a local pointer, a
+# release is a GitHub-hosted artifact. A release references a tag
+# but is not the same thing.
+
+
+class TagResponse(BaseSCResponse):
+    """A local Git tag.
+
+    ``sha`` is always the SHA of the underlying COMMIT, never the
+    SHA of an annotated tag object. Callers that need the tag
+    object's SHA (rare) can derive it from ``is_annotated`` plus
+    the repository's object database; the commit SHA is what users
+    and the UI actually care about.
+    """
+
+    name: str = Field(..., description="Tag name (short form).")
+    sha: str = Field(..., description="Commit SHA the tag points to.")
+    is_annotated: bool = Field(
+        default=False,
+        description="True for annotated tags, False for lightweight.",
+    )
+    message: Optional[str] = Field(
+        default=None,
+        description="Annotation message (annotated tags only).",
+    )
+    tagger_name: Optional[str] = Field(
+        default=None,
+        description="Tagger name (annotated tags only).",
+    )
+    tagger_email: Optional[str] = Field(
+        default=None,
+        description="Tagger email (annotated tags only).",
+    )
+    tagged_at: Optional[datetime] = Field(
+        default=None,
+        description="Tagger timestamp (annotated tags only).",
+    )
+
+
+class TagListResponse(BaseSCResponse):
+    """A page of local Git tags plus the requested offset."""
+
+    items: Sequence[TagResponse] = Field(
+        default_factory=tuple,
+        description="The tags in this page.",
+    )
+    total: int = Field(
+        default=0,
+        description="Number of tags in this page.",
+    )
+
+
+class ReleaseResponse(BaseSCResponse):
+    """A GitHub release."""
+
+    release_id: str = Field(
+        ..., description="GitHub release ID (string)."
+    )
+    tag_name: str = Field(
+        ..., description="Tag the release targets."
+    )
+    name: str = Field(
+        default="", description="Release title."
+    )
+    body: Optional[str] = Field(
+        default=None, description="Release notes (Markdown)."
+    )
+    html_url: str = Field(
+        default="", description="Sanitized browser URL."
+    )
+    is_draft: bool = Field(
+        default=False, description="True for drafts."
+    )
+    is_prerelease: bool = Field(
+        default=False, description="True for prereleases."
+    )
+    author_login: Optional[str] = Field(
+        default=None, description="Author login."
+    )
+    target_commitish: Optional[str] = Field(
+        default=None,
+        description=(
+            "Branch or commit SHA the tag was created from, when "
+            "the tag did not already exist."
+        ),
+    )
+    created_at: Optional[datetime] = Field(
+        default=None, description="Creation timestamp."
+    )
+    published_at: Optional[datetime] = Field(
+        default=None,
+        description="Publication timestamp; None for drafts.",
+    )
+
+
+class ReleaseListResponse(BaseSCResponse):
+    """A page of GitHub releases."""
+
+    items: Sequence[ReleaseResponse] = Field(
+        default_factory=tuple,
+        description="The releases in this page.",
+    )
+    total: int = Field(
+        default=0,
+        description="Number of releases in this page.",
+    )
+
+
+# Resolve forward references for the recursive tree model.
+#
+# `from __future__ import annotations` at the top of this module
+# turns every type hint into a string at runtime, which means
+# Pydantic sees `Sequence["TreeNodeResponse"]` as a forward
+# reference that must be resolved against the module's namespace.
+# The rebuild MUST happen after the class is fully defined;
+# placing it here (at the very end of the module) guarantees that
+# every class the forward reference could touch already exists.
+TreeNodeResponse.model_rebuild()

@@ -105,6 +105,16 @@ class CreateWorkspaceRequest(BaseSCRequest):
         default="github",
         description="Target source control provider identifier.",
     )
+    chat_id: Optional[str] = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "Chat ID. When provided, the workspace is created inside "
+            "the chat's files directory (storage/chats/<chat_id>/files) "
+            "so that the Editor Tab can edit its files directly. "
+            "Used by Manual Mode."
+        ),
+    )
 
     @field_validator("branch_name")
     @classmethod
@@ -356,3 +366,844 @@ class CreateChangeRequestPayload(BaseSCRequest):
     @classmethod
     def validate_branches(cls, v: str) -> str:
         return validate_branch_name(v)
+
+
+class CheckoutBranchRequest(BaseSCRequest):
+    """Payload to check out an existing branch inside a local workspace.
+
+    Used by the Repository Browser's branch switcher and by the
+    Conflict Resolver after a successful merge. The branch MUST
+    already exist locally; creating a new branch is a separate
+    operation (`CreateBranchRequest` against the remote, followed by
+    a separate checkout).
+
+    Note on precedence:
+        `force=False` is the safe default. A non-forced checkout is
+        refused by the underlying `GitBranchManager.checkout_branch`
+        when the workspace has uncommitted changes, so user work is
+        never silently discarded. Callers that intend to overwrite
+        local changes MUST set `force=True` explicitly.
+    """
+
+    branch_name: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description=(
+            "Name of the local branch to check out. Must already "
+            "exist in the workspace."
+        ),
+    )
+    force: bool = Field(
+        default=False,
+        description=(
+            "When True, discard uncommitted changes in the workspace "
+            "before switching branches. When False (default), the "
+            "checkout is refused if the workspace has uncommitted "
+            "changes."
+        ),
+    )
+
+    @field_validator("branch_name")
+    @classmethod
+    def validate_branch(cls, v: str) -> str:
+        return validate_branch_name(v)
+
+
+# ---------------------------------------------------------------------------
+# Pull Requests (list, detail, create, merge, reviews, comments)
+# ---------------------------------------------------------------------------
+
+
+class CreatePullRequestRequest(BaseSCRequest):
+    """Payload to create a new pull request on the remote.
+
+    Mirrors the parameter shape of ``GitHubPullRequestService.create_pull_request``.
+    The ``draft`` flag defaults to True, matching the subsystem-wide
+    policy that PELDRUN never opens a PR in review-ready state without
+    the user opting in.
+    """
+
+    repository_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=256,
+        description="Target repository identifier.",
+    )
+    source_branch: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Head branch containing the changes.",
+    )
+    target_branch: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Base branch the PR is opened against.",
+    )
+    title: str = Field(
+        ...,
+        min_length=1,
+        max_length=256,
+        description="PR title.",
+    )
+    body: Optional[str] = Field(
+        default="",
+        max_length=65_536,
+        description="Optional PR body (Markdown).",
+    )
+    draft: bool = Field(
+        default=True,
+        description="Whether the PR is created as a draft.",
+    )
+    provider: str = Field(
+        default="github",
+        description="Target source control provider identifier.",
+    )
+
+    @field_validator("source_branch", "target_branch")
+    @classmethod
+    def validate_branches(cls, v: str) -> str:
+        return validate_branch_name(v)
+
+
+class MergePullRequestRequest(BaseSCRequest):
+    """Payload to merge an open pull request.
+
+    ``merge_method`` is restricted to the three values supported by
+    GitHub's merge endpoint. ``fast_forward`` is deliberately excluded:
+    the GitHub REST API does not expose it as a direct merge method
+    (fast-forward is emulated by rebasing first, which is a separate
+    operation).
+    """
+
+    merge_method: str = Field(
+        default="merge",
+        description=(
+            "One of 'merge', 'squash', or 'rebase'. Defaults to a "
+            "merge commit."
+        ),
+    )
+    commit_title: Optional[str] = Field(
+        default=None,
+        max_length=256,
+        description="Optional custom commit title.",
+    )
+    commit_message: Optional[str] = Field(
+        default=None,
+        max_length=65_536,
+        description="Optional custom commit message body.",
+    )
+    delete_source_branch: bool = Field(
+        default=False,
+        description=(
+            "Whether to delete the source branch after a successful "
+            "merge. Destructive; defaults to False."
+        ),
+    )
+    expected_head_sha: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "Optional expected head SHA. When provided, the backend "
+            "verifies that the remote head still matches before the "
+            "merge is executed, preventing a merge of un-reviewed "
+            "commits."
+        ),
+    )
+
+    @field_validator("merge_method")
+    @classmethod
+    def validate_merge_method(cls, v: str) -> str:
+        clean = v.strip().lower()
+        allowed = {"merge", "squash", "rebase"}
+        if clean not in allowed:
+            raise ValueError(
+                f"Invalid merge_method '{v}'. "
+                f"Must be one of: {sorted(allowed)}"
+            )
+        return clean
+
+
+class ReviewCommentPayload(BaseSCRequest):
+    """A single inline review comment.
+
+    Attached to a review submission via
+    ``SubmitPullRequestReviewRequest.comments``. Each comment targets
+    one file at one line, on one side of the diff.
+    """
+
+    path: str = Field(
+        ...,
+        min_length=1,
+        max_length=1_024,
+        description="File path the comment applies to.",
+    )
+    line: int = Field(
+        ...,
+        ge=1,
+        description="1-based line number in the target file.",
+    )
+    body: str = Field(
+        ...,
+        min_length=1,
+        max_length=65_536,
+        description="Comment body (Markdown).",
+    )
+    side: str = Field(
+        default="RIGHT",
+        description=(
+            "Diff side: 'LEFT' (old file) or 'RIGHT' (new file). "
+            "Defaults to RIGHT, which matches GitHub's convention "
+            "for a comment on a new line."
+        ),
+    )
+
+    @field_validator("side")
+    @classmethod
+    def validate_side(cls, v: str) -> str:
+        clean = v.strip().upper()
+        if clean not in ("LEFT", "RIGHT"):
+            raise ValueError(
+                "Invalid side. Must be 'LEFT' or 'RIGHT'."
+            )
+        return clean
+
+
+class SubmitPullRequestReviewRequest(BaseSCRequest):
+    """Payload to submit a review on a pull request.
+
+    ``event`` mirrors GitHub's three review actions:
+
+        - ``APPROVE``           : mark the PR as approved.
+        - ``REQUEST_CHANGES``   : request changes; blocks merge under
+                                  the default branch-protection rules.
+        - ``COMMENT``           : general feedback that neither
+                                  approves nor blocks.
+
+    The ``comments`` array carries optional inline comments. An empty
+    array produces a review with only a top-level body (which is
+    required for ``COMMENT`` and ``REQUEST_CHANGES``).
+    """
+
+    event: str = Field(
+        ...,
+        description="One of 'APPROVE', 'REQUEST_CHANGES', 'COMMENT'.",
+    )
+    body: Optional[str] = Field(
+        default=None,
+        max_length=65_536,
+        description="Optional review body (Markdown).",
+    )
+    comments: Sequence[ReviewCommentPayload] = Field(
+        default_factory=tuple,
+        description="Optional inline comments.",
+    )
+
+    @field_validator("event")
+    @classmethod
+    def validate_event(cls, v: str) -> str:
+        clean = v.strip().upper()
+        allowed = {"APPROVE", "REQUEST_CHANGES", "COMMENT"}
+        if clean not in allowed:
+            raise ValueError(
+                f"Invalid event '{v}'. "
+                f"Must be one of: {sorted(allowed)}"
+            )
+        return clean
+
+
+class CreatePullRequestCommentRequest(BaseSCRequest):
+    """Payload to create a single comment on a pull request.
+
+    Used for two distinct GitHub endpoints:
+
+        - When ``path`` and ``line`` are both provided, an INLINE
+          comment is created on that file/line.
+        - When they are omitted, a GENERAL (conversation) comment is
+          created.
+    """
+
+    body: str = Field(
+        ...,
+        min_length=1,
+        max_length=65_536,
+        description="Comment body (Markdown).",
+    )
+    path: Optional[str] = Field(
+        default=None,
+        max_length=1_024,
+        description="File path (required for inline comments).",
+    )
+    line: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Line number (required for inline comments).",
+    )
+    side: Optional[str] = Field(
+        default=None,
+        description="Diff side: 'LEFT' or 'RIGHT' (inline only).",
+    )
+    commit_id: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "Commit SHA the comment applies to. Defaults to the PR "
+            "head when omitted."
+        ),
+    )
+
+    @field_validator("side")
+    @classmethod
+    def validate_side(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        clean = v.strip().upper()
+        if clean not in ("LEFT", "RIGHT"):
+            raise ValueError(
+                "Invalid side. Must be 'LEFT' or 'RIGHT'."
+            )
+        return clean
+
+
+# ---------------------------------------------------------------------------
+# Issues (list, detail, create, comments, state changes)
+# ---------------------------------------------------------------------------
+
+
+class CreateIssueRequest(BaseSCRequest):
+    """Payload to create a new issue on the remote.
+
+    Labels and assignees are forwarded verbatim. GitHub silently
+    ignores labels/assignees that the token cannot attach, which is
+    preferable to failing the whole creation over a permission
+    issue on a secondary field.
+    """
+
+    repository_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=256,
+        description="Target repository identifier.",
+    )
+    title: str = Field(
+        ...,
+        min_length=1,
+        max_length=256,
+        description="Issue title.",
+    )
+    body: Optional[str] = Field(
+        default="",
+        max_length=65_536,
+        description="Optional issue body (Markdown).",
+    )
+    labels: Sequence[str] = Field(
+        default_factory=tuple,
+        description="Optional labels to attach (max 20).",
+    )
+    assignees: Sequence[str] = Field(
+        default_factory=tuple,
+        description="Optional assignee logins (max 10).",
+    )
+    provider: str = Field(
+        default="github",
+        description="Target source control provider identifier.",
+    )
+
+    @field_validator("labels")
+    @classmethod
+    def validate_labels(cls, v: Sequence[str]) -> Sequence[str]:
+        if len(v) > 20:
+            raise ValueError("Too many labels (max 20).")
+        for label in v:
+            if not label or not label.strip():
+                raise ValueError("Labels must not be empty.")
+            if len(label) > 100:
+                raise ValueError(
+                    "Label names must not exceed 100 characters."
+                )
+        return tuple(v)
+
+    @field_validator("assignees")
+    @classmethod
+    def validate_assignees(cls, v: Sequence[str]) -> Sequence[str]:
+        if len(v) > 10:
+            raise ValueError("Too many assignees (max 10).")
+        for assignee in v:
+            if not assignee or not assignee.strip():
+                raise ValueError("Assignees must not be empty.")
+        return tuple(v)
+
+
+class UpdateIssueStateRequest(BaseSCRequest):
+    """Payload to change an issue's state (close or reopen).
+
+    ``state_reason`` is GitHub-specific and is accepted only for
+    closures. It is optional: GitHub accepts a closure without a
+    reason, in which case the UI shows no reason.
+    """
+
+    state: str = Field(
+        ...,
+        description="Target state: 'open' or 'closed'.",
+    )
+    state_reason: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional closure reason: 'completed', 'not_planned', "
+            "or 'reopened'. Ignored when state is 'open'."
+        ),
+    )
+
+    @field_validator("state")
+    @classmethod
+    def validate_state(cls, v: str) -> str:
+        clean = v.strip().lower()
+        if clean not in ("open", "closed"):
+            raise ValueError(
+                "state must be 'open' or 'closed'."
+            )
+        return clean
+
+    @field_validator("state_reason")
+    @classmethod
+    def validate_reason(
+        cls, v: Optional[str]
+    ) -> Optional[str]:
+        if v is None:
+            return None
+        clean = v.strip().lower()
+        if clean not in (
+            "completed",
+            "not_planned",
+            "reopened",
+        ):
+            raise ValueError(
+                "state_reason must be 'completed', 'not_planned', "
+                "or 'reopened'."
+            )
+        return clean
+
+
+class CreateIssueCommentRequest(BaseSCRequest):
+    """Payload to add a comment to an existing issue.
+
+    GitHub uses the same ``/issues/{n}/comments`` endpoint for
+    issue comments and general pull request comments. This schema
+    is intentionally identical to ``CreatePullRequestCommentRequest``
+    minus the inline-comment fields, which do not apply to issues.
+    """
+
+    body: str = Field(
+        ...,
+        min_length=1,
+        max_length=65_536,
+        description="Comment body (Markdown).",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Merge / rebase / conflict resolution (local workspace operations)
+# ---------------------------------------------------------------------------
+
+
+class MergeBranchesRequest(BaseSCRequest):
+    """Payload to merge one local branch into another.
+
+    The workspace is checked out on ``target_branch`` first. A
+    dirty working tree causes a 409 error and no changes are made.
+    """
+
+    source_branch: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Branch to merge FROM.",
+    )
+    target_branch: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description=(
+            "Branch to merge INTO. The workspace is checked out on "
+            "this branch before the merge runs."
+        ),
+    )
+    strategy: str = Field(
+        default="merge",
+        description=(
+            "One of 'merge' (always creates a merge commit), "
+            "'squash' (single squashed commit), or 'ff-only' "
+            "(refuses if a fast-forward is impossible)."
+        ),
+    )
+    commit_message: Optional[str] = Field(
+        default=None,
+        max_length=65_536,
+        description=(
+            "Optional custom commit message for the merge commit "
+            "('merge' and 'squash' only)."
+        ),
+    )
+
+    @field_validator("source_branch", "target_branch")
+    @classmethod
+    def validate_branch(cls, v: str) -> str:
+        return validate_branch_name(v)
+
+    @field_validator("strategy")
+    @classmethod
+    def validate_strategy(cls, v: str) -> str:
+        clean = v.strip().lower()
+        if clean not in ("merge", "squash", "ff-only"):
+            raise ValueError(
+                "strategy must be 'merge', 'squash', or 'ff-only'."
+            )
+        return clean
+
+
+class RebaseBranchRequest(BaseSCRequest):
+    """Payload to rebase one branch onto another."""
+
+    branch: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Branch to rebase.",
+    )
+    onto: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Branch to rebase onto.",
+    )
+
+    @field_validator("branch", "onto")
+    @classmethod
+    def validate_branch(cls, v: str) -> str:
+        return validate_branch_name(v)
+
+
+class ResolveConflictsRequest(BaseSCRequest):
+    """Payload to resolve conflicts in the workspace.
+
+    Resolution modes:
+
+        - ``"ours"``   : take the local side of every conflict.
+        - ``"theirs"`` : take the incoming side of every conflict.
+        - ``"manual"`` : the caller has already edited the files
+                         in the workspace (via the editor tab) and
+                         wants PELDRUN to stage them as resolved.
+
+    Paths MUST be workspace-relative. Empty ``paths`` in ``ours``
+    or ``theirs`` mode resolves every conflicted file; in
+    ``manual`` mode it is rejected because the caller must be
+    explicit about which files they edited.
+    """
+
+    strategy: str = Field(
+        ...,
+        description="One of 'ours', 'theirs', or 'manual'.",
+    )
+    paths: Sequence[str] = Field(
+        default_factory=tuple,
+        description=(
+            "Workspace-relative paths. Empty for 'ours'/'theirs' "
+            "means 'every conflicted file'."
+        ),
+    )
+
+    @field_validator("strategy")
+    @classmethod
+    def validate_strategy(cls, v: str) -> str:
+        clean = v.strip().lower()
+        if clean not in ("ours", "theirs", "manual"):
+            raise ValueError(
+                "strategy must be 'ours', 'theirs', or 'manual'."
+            )
+        return clean
+
+    @field_validator("paths")
+    @classmethod
+    def validate_paths(cls, v: Sequence[str]) -> Sequence[str]:
+        for path in v:
+            if not path or not path.strip():
+                raise ValueError("Path entries must not be empty.")
+            # Reject absolute paths and traversal. The backend
+            # re-validates through the path policy, but rejecting
+            # them here produces a clearer error message.
+            if path.startswith("/") or path.startswith("\\"):
+                raise ValueError(
+                    "Paths must be workspace-relative."
+                )
+            if ".." in path.split("/") or ".." in path.split("\\"):
+                raise ValueError(
+                    "Paths must not contain '..' segments."
+                )
+        return tuple(v)
+
+
+# ---------------------------------------------------------------------------
+# Issues (list, detail, create, comments, state changes)
+# ---------------------------------------------------------------------------
+
+
+class CreateIssueRequest(BaseSCRequest):
+    """Payload to create a new issue on the remote.
+
+    Labels and assignees are forwarded verbatim. GitHub silently
+    ignores labels/assignees that the token cannot attach, which is
+    preferable to failing the whole creation over a permission
+    issue on a secondary field.
+    """
+
+    repository_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=256,
+        description="Target repository identifier.",
+    )
+    title: str = Field(
+        ...,
+        min_length=1,
+        max_length=256,
+        description="Issue title.",
+    )
+    body: Optional[str] = Field(
+        default="",
+        max_length=65_536,
+        description="Optional issue body (Markdown).",
+    )
+    labels: Sequence[str] = Field(
+        default_factory=tuple,
+        description="Optional labels to attach (max 20).",
+    )
+    assignees: Sequence[str] = Field(
+        default_factory=tuple,
+        description="Optional assignee logins (max 10).",
+    )
+    provider: str = Field(
+        default="github",
+        description="Target source control provider identifier.",
+    )
+
+    @field_validator("labels")
+    @classmethod
+    def validate_labels(cls, v: Sequence[str]) -> Sequence[str]:
+        if len(v) > 20:
+            raise ValueError("Too many labels (max 20).")
+        for label in v:
+            if not label or not label.strip():
+                raise ValueError("Labels must not be empty.")
+            if len(label) > 100:
+                raise ValueError(
+                    "Label names must not exceed 100 characters."
+                )
+        return tuple(v)
+
+    @field_validator("assignees")
+    @classmethod
+    def validate_assignees(cls, v: Sequence[str]) -> Sequence[str]:
+        if len(v) > 10:
+            raise ValueError("Too many assignees (max 10).")
+        for assignee in v:
+            if not assignee or not assignee.strip():
+                raise ValueError("Assignees must not be empty.")
+        return tuple(v)
+
+
+class UpdateIssueStateRequest(BaseSCRequest):
+    """Payload to change an issue's state (close or reopen).
+
+    ``state_reason`` is GitHub-specific and is accepted only for
+    closures. It is optional: GitHub accepts a closure without a
+    reason, in which case the UI shows no reason.
+    """
+
+    state: str = Field(
+        ...,
+        description="Target state: 'open' or 'closed'.",
+    )
+    state_reason: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional closure reason: 'completed', 'not_planned', "
+            "or 'reopened'. Ignored when state is 'open'."
+        ),
+    )
+
+    @field_validator("state")
+    @classmethod
+    def validate_state(cls, v: str) -> str:
+        clean = v.strip().lower()
+        if clean not in ("open", "closed"):
+            raise ValueError(
+                "state must be 'open' or 'closed'."
+            )
+        return clean
+
+    @field_validator("state_reason")
+    @classmethod
+    def validate_reason(
+        cls, v: Optional[str]
+    ) -> Optional[str]:
+        if v is None:
+            return None
+        clean = v.strip().lower()
+        if clean not in (
+            "completed",
+            "not_planned",
+            "reopened",
+        ):
+            raise ValueError(
+                "state_reason must be 'completed', 'not_planned', "
+                "or 'reopened'."
+            )
+        return clean
+
+
+class CreateIssueCommentRequest(BaseSCRequest):
+    """Payload to add a comment to an existing issue.
+
+    GitHub uses the same ``/issues/{n}/comments`` endpoint for
+    issue comments and general pull request comments. This schema
+    is intentionally identical to ``CreatePullRequestCommentRequest``
+    minus the inline-comment fields, which do not apply to issues.
+    """
+
+    body: str = Field(
+        ...,
+        min_length=1,
+        max_length=65_536,
+        description="Comment body (Markdown).",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tags (local) and Releases (GitHub-only)
+# ---------------------------------------------------------------------------
+
+
+class CreateTagRequest(BaseSCRequest):
+    """Payload to create a new local Git tag in the workspace.
+
+    A tag with a non-empty ``message`` is created as an ANNOTATED
+    tag; a tag without one is created as a LIGHTWEIGHT tag. This
+    matches Git's own convention and the GitHub UI's "Create a
+    tag" action when no release notes are provided.
+
+    ``target_sha``, when omitted, means "tag the current HEAD".
+    ``force=True`` overwrites an existing tag of the same name;
+    the default of False is the safe choice.
+    """
+
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Tag name (e.g. 'v1.2.3').",
+    )
+    message: Optional[str] = Field(
+        default=None,
+        max_length=65_536,
+        description=(
+            "Optional annotation message. Presence of a message "
+            "makes the tag annotated; absence makes it "
+            "lightweight."
+        ),
+    )
+    target_sha: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "Commit SHA to tag. Defaults to the workspace's "
+            "current HEAD when omitted."
+        ),
+    )
+    force: bool = Field(
+        default=False,
+        description=(
+            "When True, overwrite an existing tag of the same "
+            "name. When False (default), an existing tag raises "
+            "a conflict."
+        ),
+    )
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        from ..git.tag import is_valid_tag_name
+
+        if not is_valid_tag_name(v):
+            raise ValueError(f"Invalid tag name: {v!r}.")
+        return v.strip()
+
+
+class CreateReleaseRequest(BaseSCRequest):
+    """Payload to create a GitHub release.
+
+    If the tag does not exist on the remote, GitHub creates it
+    from ``target_commitish`` (a branch name or a commit SHA).
+    If the tag already exists, GitHub uses the existing tag and
+    IGNORES ``target_commitish``. This matches GitHub's own
+    behavior and is not controllable from the API.
+
+    Drafts are invisible to the public until published. Prereleases
+    are visible but labeled.
+    """
+
+    repository_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=256,
+        description="Target repository identifier.",
+    )
+    tag_name: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Tag the release targets.",
+    )
+    name: str = Field(
+        default="",
+        max_length=256,
+        description=(
+            "Release title. Empty falls back to the tag name on "
+            "GitHub's side."
+        ),
+    )
+    body: Optional[str] = Field(
+        default="",
+        max_length=125_000,
+        description="Release notes (Markdown).",
+    )
+    target_commitish: str = Field(
+        default="main",
+        max_length=200,
+        description=(
+            "Branch or commit SHA the tag is created from, when "
+            "the tag does not already exist. Ignored otherwise."
+        ),
+    )
+    draft: bool = Field(
+        default=False,
+        description="Create as a draft (not visible until published).",
+    )
+    prerelease: bool = Field(
+        default=False,
+        description="Mark the release as a prerelease.",
+    )
+    provider: str = Field(
+        default="github",
+        description="Target source control provider identifier.",
+    )
+
+    @field_validator("tag_name")
+    @classmethod
+    def validate_tag_name(cls, v: str) -> str:
+        from ..git.tag import is_valid_tag_name
+
+        if not is_valid_tag_name(v):
+            raise ValueError(f"Invalid tag name: {v!r}.")
+        return v.strip()
