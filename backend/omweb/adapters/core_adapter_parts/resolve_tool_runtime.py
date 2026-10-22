@@ -215,8 +215,18 @@ def resolve_tool_runtime(
                 executor = None
 
     # ── 3. Custom / bundle fallback ────────────────────────────────
+    #
+    # Bundle tools (and legacy custom tools) require the active
+    # workspace_root so that any file operations they perform are
+    # strictly scoped to the current chat's files directory.
+    #
+    # Without this binding, get_custom_tool_instance() would return an
+    # instance bound to the backend's CWD (or no root at all), causing
+    # silent cross-session data leaks and path-resolution failures.
     if executor is None and active_registry is not None:
-        custom_inst = active_registry.get_custom_tool_instance(name)
+        custom_inst = active_registry.get_custom_tool_instance(
+            name, workspace_root=ws_path
+        )
         if custom_inst and hasattr(custom_inst, "execute"):
             executor = custom_inst.execute
 
