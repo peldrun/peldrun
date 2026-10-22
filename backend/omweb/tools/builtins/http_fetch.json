@@ -4,9 +4,122 @@
   "display_name": "HTTP Content Fetcher",
   "description": "Fetch static HTML content from a URL and extract its readable text. Performs a single HTTP GET request, follows redirects, strips scripts and styles, and returns the visible text content. Does NOT execute JavaScript, does NOT click elements, does NOT fill forms, and does NOT capture screenshots. Use 'browser_interactive' for dynamic pages that require JavaScript execution or user interaction.",
   "category": "network",
+  "subcategory": "content-extraction",
+  "tags": ["http", "fetch", "html", "scraping", "text-extraction", "read-only"],
+  "capabilities": ["external_network", "read_only", "stateless", "no_javascript"],
   "safety_level": "read_only",
   "is_builtin": true,
   "is_enabled": true,
+
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+  "signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+
+  "license": "proprietary",
+  "license_url": "https://peldrun.ai/license",
+
+  "version": "1.0.0",
+  "release_date": "2025-01-15",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "changelog_url": "https://peldrun.ai/tools/http_fetch/changelog",
+
+  "short_description": "Single-request HTTP GET fetcher that returns readable text from static HTML pages.",
+  "store_description": "Built-in read-only network tool that performs a single HTTP GET request against a target URL, follows redirects, strips <script> and <style> blocks, and returns the visible text content. It does not execute JavaScript, does not interact with DOM elements, and does not capture screenshots. For dynamic pages that require JavaScript or user interaction, use 'browser_interactive' instead.",
+  "homepage": "https://peldrun.ai/tools/http_fetch",
+  "docs_url": "https://docs.peldrun.ai/tools/http_fetch",
+  "demo_url": null,
+  "screenshots": [],
+  "icon": "icons/http_fetch.svg",
+
+  "pricing": "free",
+  "supported_languages": ["en", "ar"],
+  "i18n": {
+    "ar": {
+      "display_name": "HTTP Content Fetcher",
+      "short_description": "Single-request HTTP GET fetcher that returns readable text from static HTML pages."
+    }
+  },
+
+  "settings": {
+    "enabled": true,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "default_max_chars": {
+          "type": "integer",
+          "minimum": 500,
+          "maximum": 50000,
+          "default": 8000
+        },
+        "request_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120,
+          "default": 20
+        },
+        "follow_redirects": {
+          "type": "boolean",
+          "default": true
+        },
+        "max_redirects": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 20,
+          "default": 5
+        }
+      },
+      "additionalProperties": false
+    },
+    "defaults": {
+      "default_max_chars": 8000,
+      "request_timeout_seconds": 20,
+      "follow_redirects": true,
+      "max_redirects": 5
+    },
+    "required": []
+  },
+
+  "permissions": ["network:outbound"],
+  "network_access": true,
+  "allowed_schemes": ["http", "https"],
+  "requires_api_key": false,
+  "required_env_vars": [],
+  "sandbox": true,
+  "filesystem_access": "none",
+  "rate_limit": {
+    "requests": 60,
+    "window_seconds": 60
+  },
+
+  "timeout_seconds": 20,
+  "concurrency": 8,
+  "runtime": "builtin",
+  "entry_point": "http_fetch.handler",
+  "dependencies": [],
+
+  "examples": [
+    {
+      "input": { "url": "https://example.com" },
+      "output_preview": "Example Domain ... This domain is for use in illustrative examples ..."
+    },
+    {
+      "input": { "url": "https://docs.python.org/3/library/json.html", "max_chars": 4000 },
+      "output_preview": "json — JSON encoder and decoder ..."
+    }
+  ],
+  "usage_notes": "Returns only static visible text. For SPAs or pages that build content via JavaScript, prefer 'browser_interactive'. Response size is capped by max_chars (default 8000, max 50000). Redirects are followed automatically. Non-2xx responses and TLS failures are surfaced as errors rather than retried automatically.",
+
+  "deprecated": false,
+  "deprecation_message": null,
+  "replaces": [],
+  "replaced_by": null,
+
   "parameters": {
     "type": "object",
     "properties": {

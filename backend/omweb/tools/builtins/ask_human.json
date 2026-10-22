@@ -1,9 +1,130 @@
 {
   "id": "ask_human",
   "name": "Human-in-the-Loop Inquiry",
+  "display_name": "Human in theLoop Inquiry",
   "category": "interaction",
+  "subcategory": "human-in-the-loop",
+  "tags": ["hitl", "human-in-the-loop", "confirmation", "clarification", "approval", "user-input"],
+  "capabilities": ["stateful", "blocking", "requires_human", "no_side_effects"],
   "description": "Pauses agent autonomy and requests input, confirmation (Yes/No), or selection choices from the human operator.",
   "safety_level": "controlled",
+  "is_builtin": true,
+  "is_enabled": true,
+  "read_only": true,
+
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+  "signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+
+  "license": "proprietary",
+  "license_url": "https://peldrun.ai/license",
+
+  "version": "1.0.0",
+  "release_date": "2025-01-15",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "changelog_url": "https://peldrun.ai/tools/ask_human/changelog",
+
+  "short_description": "Pause the agent and request text input, Yes/No confirmation, or a selection from the human operator.",
+  "store_description": "Built-in human-in-the-loop tool that suspends agent autonomy and presents the operator with a UI prompt. Supports free text input, a Yes/No confirmation, a single-choice select, or multiple-choice selection. Intended for clarifications, destructive-action confirmations, and decisions that must not be made autonomously. The call blocks until the human responds or the configured timeout elapses.",
+  "homepage": "https://peldrun.ai/tools/ask_human",
+  "docs_url": "https://docs.peldrun.ai/tools/ask_human",
+  "demo_url": null,
+  "screenshots": [],
+  "icon": "ask_human.svg",
+
+  "pricing": "free",
+  "supported_languages": ["en", "ar"],
+  "i18n": {
+    "ar": {
+      "display_name": "Human-in-the-Loop Inquiry",
+      "short_description": "Pause the agent and request text input, Yes/No confirmation, or a selection from the human operator."
+    }
+  },
+
+  "settings": {
+    "enabled": true,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "default_timeout_seconds": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 3600,
+          "default": 600
+        },
+        "max_prompt_chars": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 2000
+        },
+        "max_options": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 20,
+          "default": 10
+        },
+        "on_timeout": {
+          "type": "string",
+          "enum": ["error", "return_empty"],
+          "default": "error"
+        }
+      },
+      "additionalProperties": false
+    },
+    "defaults": {
+      "default_timeout_seconds": 600,
+      "max_prompt_chars": 2000,
+      "max_options": 10,
+      "on_timeout": "error"
+    },
+    "required": []
+  },
+
+  "permissions": ["ui:prompt"],
+  "network_access": false,
+  "requires_api_key": false,
+  "required_env_vars": [],
+  "sandbox": false,
+  "filesystem_access": "none",
+  "rate_limit": {
+    "requests": 60,
+    "window_seconds": 60
+  },
+
+  "timeout_seconds": 600,
+  "concurrency": 1,
+  "runtime": "builtin",
+  "entry_point": "ask_human.handler",
+  "dependencies": [],
+
+  "examples": [
+    {
+      "input": { "prompt": "Proceed with deleting the staging branch?", "input_type": "confirm" },
+      "output_preview": "{ response: true }"
+    },
+    {
+      "input": { "prompt": "Which environment should I deploy to?", "input_type": "select", "options": ["staging", "production"] },
+      "output_preview": "{ response: 'staging' }"
+    },
+    {
+      "input": { "prompt": "Describe the desired behavior of the new endpoint.", "input_type": "text" },
+      "output_preview": "{ response: 'Should accept a JSON body and return 201.' }"
+    }
+  ],
+  "usage_notes": "Use for destructive-action confirmations, ambiguous requirements, and decisions that must be made by the human. The call blocks until a response is received or the timeout elapses. Do not use this tool for retrying failed operations — for auth or permission failures, follow the tool-specific policy (e.g. source_control requires a single ask_human call). For 'select' and 'multiple_choice', pass 'options' with 2 or more entries.",
+
+  "deprecated": false,
+  "deprecation_message": null,
+  "replaces": [],
+  "replaced_by": null,
+
   "parameters": {
     "type": "object",
     "properties": {
@@ -33,7 +154,5 @@
     "required": [
       "prompt"
     ]
-  },
-  "is_builtin": true,
-  "read_only": true
+  }
 }

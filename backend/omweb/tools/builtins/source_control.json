@@ -1,11 +1,102 @@
 {
   "id": "source_control",
   "name": "Source Control",
+  "display_name": "Source Control",
   "description": "CRITICAL RULE: Do NOT use `http_fetch` to read files from GitHub URLs. `http_fetch` returns raw HTML, not the file content, and it does not create a local copy you can edit. Do NOT use `bash` to edit files either — on Windows, `bash` cannot run `mkdir -p`, `&&`, or `touch`, and it cannot see files that are not in the current working directory. The ONLY way to edit a file is: create_workspace → str_replace_editor → request_approval → push_branch. Unified interface for interacting with Git repositories. WORKFLOW: (1) Optional discovery: list_providers, list_repositories, get_repository, list_branches. (2) create_workspace(repository_id='owner/repo') → returns workspace_id and workspace_path. You MUST call this BEFORE any str_replace_editor call. (3) Edit files inside workspace_path with the file-edit tool. (4) request_approval(workspace_id=..., operation='push_branch', target_branch='<feature-branch>') → returns operation_id + approval_id. STOP HERE and include BOTH IDs in your final message; the user must approve in the UI. (5) In a subsequent turn, if you do not remember the IDs: call get_operation(operation_id) to verify the current status, or list_operations(status='approved') to find the pending approvals. Then push_branch(operation_id=..., approval_id=...). (6) Then request_approval(workspace_id=..., operation='create_change_request', source_branch='<the branch you pushed>', target_branch='main') → returns NEW operation_id + approval_id. STOP HERE and include both IDs in your final message; the user must approve again. (7) In a subsequent turn: create_change_request(operation_id=..., approval_id=..., title=...). AUTH AND RETRY POLICY (MANDATORY): If any source_control action returns AUTH_REQUIRED, PERMISSION_DENIED, or CONFLICT, you MUST stop immediately and use ask_human exactly ONCE to tell the user what happened. Do NOT retry the same action. Do NOT try a different action to work around it. Do NOT ask for a personal access token — PELDRUN uses OAuth. Example ask_human message: 'The GitHub token has expired (AUTH_REQUIRED). Please go to the Integrations & Providers page, click Disconnect on GitHub, then click Connect to obtain a fresh token. Then tell me to continue.' After the user responds, wait for their instruction before retrying. IMPORTANT: A push approval cannot be reused to open a PR — each side effect needs its own approval. get_operation and list_operations are read-only: they never consume a ticket or change the status. Do NOT use http_fetch or bash for Git operations. Do NOT push or open PRs without a valid approval_id.",
   "category": "system",
+  "subcategory": "version-control",
+  "tags": ["git", "github", "gitlab", "bitbucket", "vcs", "source-control", "pull-request", "oauth"],
+  "capabilities": ["external_network", "stateful", "write_side_effects", "requires_approval"],
   "safety_level": "dangerous",
   "is_builtin": true,
   "is_enabled": true,
+
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+  "signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+
+  "license": "proprietary",
+  "license_url": "https://peldrun.ai/license",
+
+  "version": "1.0.0",
+  "release_date": "2025-01-15",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "changelog_url": "https://peldrun.ai/tools/source_control/changelog",
+
+  "short_description": "Unified Git interface with mandatory approval gates for pushes and change requests.",
+  "store_description": "Unified source-control interface for Git repositories across GitHub, GitLab, and Bitbucket. Provides discovery, workspace creation, diff inspection, pre-registered checks, and an approval-gated workflow that requires explicit user consent before any remote side effect (push_branch or create_change_request) is executed. Uses OAuth-based authentication and enforces a one-ticket-per-side-effect policy.",
+  "homepage": "https://peldrun.ai/tools/source_control",
+  "docs_url": "https://docs.peldrun.ai/tools/source_control",
+  "demo_url": null,
+  "screenshots": [],
+  "icon": "icons/source_control.svg",
+
+  "pricing": "free",
+  "supported_languages": ["en", "ar"],
+  "i18n": {
+    "ar": {
+      "display_name": "Source Control",
+      "short_description": "Unified Git interface with mandatory approval gates for pushes and change requests."
+    }
+  },
+
+  "settings": {
+    "enabled": true,
+    "schema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "defaults": {},
+    "required": []
+  },
+
+  "permissions": ["network:outbound", "vcs:read", "vcs:write", "vcs:create_pr"],
+  "network_access": true,
+  "requires_api_key": false,
+  "requires_oauth": true,
+  "required_integrations": ["github", "gitlab", "bitbucket"],
+  "required_env_vars": [],
+  "sandbox": true,
+  "approval_required": true,
+  "rate_limit": {
+    "requests": 60,
+    "window_seconds": 60
+  },
+
+  "timeout_seconds": 120,
+  "concurrency": 1,
+  "runtime": "builtin",
+  "entry_point": "source_control.handler",
+  "dependencies": [],
+
+  "examples": [
+    {
+      "input": { "action": "create_workspace", "repository_id": "owner/repo" },
+      "output_preview": "{ workspace_id: 'ws_...', workspace_path: '/tmp/ws_...' }"
+    },
+    {
+      "input": { "action": "request_approval", "workspace_id": "ws_...", "operation": "push_branch", "target_branch": "feature/x" },
+      "output_preview": "{ operation_id: 'op_...', approval_id: 'ap_...', status: 'review_required' }"
+    },
+    {
+      "input": { "action": "list_operations", "status": "approved", "kind": "push_branch", "limit": 20 },
+      "output_preview": "[{ operation_id: 'op_...', kind: 'push_branch', status: 'approved' }]"
+    }
+  ],
+  "usage_notes": "Follow the documented workflow: create_workspace before any file edit, request_approval before each remote side effect, and never reuse an approval ticket across different operations. On AUTH_REQUIRED / PERMISSION_DENIED / CONFLICT, stop immediately and call ask_human exactly once.",
+
+  "deprecated": false,
+  "deprecation_message": null,
+  "replaces": [],
+  "replaced_by": null,
+
   "parameters": {
     "type": "object",
     "properties": {

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 250 250">
+
+  <!-- Generator: Adobe Illustrator 28.7.1, SVG Export Plug-In . SVG Version: 1.2.0 Build 142)  -->
+  <g>
+    <g id="Layer_1">
+      <g>
+        <path fill="currentColor" d="M242.2,245.5H7.8c-1.8,0-3.3-1.5-3.3-3.3V7.8c0-1.8,1.5-3.3,3.3-3.3h234.4c1.8,0,3.3,1.5,3.3,3.3v234.4c0,1.8-1.5,3.3-3.3,3.3ZM11.1,238.9h227.7V11.1H11.1v227.7Z"/>
+        <rect fill="currentColor" x="58.8" y="32" width="20.4" height="6.6"/>
+        <polygon fill="currentColor" points="43.8 30.5 39.2 25.8 34.3 30.6 29.5 25.8 24.7 30.5 29.6 35.3 24.7 40.2 29.5 44.9 34.3 40 39.2 44.9 43.8 40.2 39 35.3 43.8 30.5"/>
+        <path fill="currentColor" d="M60.9,140.9v-8.8l37-13.7v8.9l-25.4,9.1,25.4,9.1v8.9l-37-13.5Z"/>
+        <path fill="currentColor" d="M134.3,96.8h10.6l-31.2,79.4h-10.8l31.3-79.4Z"/>
+        <path fill="currentColor" d="M150.2,154.5v-8.9l25.4-9.1-25.4-9.1v-9l37,13.6v8.8l-37,13.7Z"/>
+      </g>
+    </g>
+  </g>
+</svg>

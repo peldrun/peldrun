@@ -93,6 +93,8 @@ const config: Config = {
         rby: "hsl(var(--rby))",
         cgood: "var(--cgood)",
 
+        storbg:"hsl(var(--storbg))",
+
 
 
 

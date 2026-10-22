@@ -1,11 +1,124 @@
 {
   "id": "str_replace_editor",
   "name": "Str Replace Editor",
-  "description": "Standard file system editor to view, create, and replace text in workspace files.",
+  "display_name": "Str Replace Editor",
   "category": "system",
+  "subcategory": "file-editor",
+  "tags": ["filesystem", "editor", "workspace", "text", "patch"],
+  "capabilities": ["filesystem_read", "filesystem_write", "workspace_scoped", "stateful"],
+  "description": "Standard file system editor to view, create, and replace text in workspace files.",
   "safety_level": "safe",
   "is_builtin": true,
   "is_enabled": true,
+
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+  "signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+
+  "license": "proprietary",
+  "license_url": "https://peldrun.ai/license",
+
+  "version": "1.0.0",
+  "release_date": "2025-01-15",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "changelog_url": "https://peldrun.ai/tools/str_replace_editor/changelog",
+
+  "short_description": "Workspace-scoped file editor for viewing, creating, and patching text files.",
+  "store_description": "Built-in file editor that operates on files inside the active workspace only. Supports viewing file contents with optional line ranges, creating new files, applying exact string replacements, inserting text at a specific line, and undoing the most recent edit. Intended to be used after a workspace has been created (for example via source_control) so that every write targets a controlled, ephemeral working directory.",
+  "homepage": "https://peldrun.ai/tools/str_replace_editor",
+  "docs_url": "https://docs.peldrun.ai/tools/str_replace_editor",
+  "demo_url": null,
+  "screenshots": [],
+  "icon": "icons/str_replace_editor.svg",
+
+  "pricing": "free",
+  "supported_languages": ["en", "ar"],
+  "i18n": {
+    "ar": {
+      "display_name": "Str Replace Editor",
+      "short_description": "Workspace-scoped file editor for viewing, creating, and patching text files."
+    }
+  },
+
+  "settings": {
+    "enabled": true,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "max_view_lines": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 100000,
+          "default": 2000
+        },
+        "max_file_size_kb": {
+          "type": "integer",
+          "minimum": 16,
+          "maximum": 10240,
+          "default": 512
+        }
+      },
+      "additionalProperties": false
+    },
+    "defaults": {
+      "max_view_lines": 2000,
+      "max_file_size_kb": 512
+    },
+    "required": []
+  },
+
+  "permissions": ["filesystem:workspace_read", "filesystem:workspace_write"],
+  "network_access": false,
+  "requires_api_key": false,
+  "required_env_vars": [],
+  "sandbox": true,
+  "filesystem_access": "workspace_only",
+  "rate_limit": {
+    "requests": 240,
+    "window_seconds": 60
+  },
+
+  "timeout_seconds": 30,
+  "concurrency": 1,
+  "runtime": "builtin",
+  "entry_point": "str_replace_editor.handler",
+  "dependencies": [],
+
+  "examples": [
+    {
+      "input": { "command": "view", "path": "src/app.py", "view_range": [1, 50] },
+      "output_preview": "     1\timport os\n     2\t...\n"
+    },
+    {
+      "input": { "command": "create", "path": "README.md", "file_text": "# Project\n" },
+      "output_preview": "File created successfully at: README.md"
+    },
+    {
+      "input": { "command": "str_replace", "path": "src/app.py", "old_str": "DEBUG = False", "new_str": "DEBUG = True" },
+      "output_preview": "The file src/app.py has been edited successfully."
+    },
+    {
+      "input": { "command": "insert", "path": "src/app.py", "insert_line": 10, "new_str": "# inserted line\n" },
+      "output_preview": "Text inserted at line 10."
+    },
+    {
+      "input": { "command": "undo_edit", "path": "src/app.py" },
+      "output_preview": "Last edit undone."
+    }
+  ],
+  "usage_notes": "Paths must be relative to the workspace root. 'str_replace' requires old_str to match exactly and to be unique in the file; expand the snippet if it is not unique. Use 'view' with view_range to inspect large files. A workspace must exist before any write (create_workspace in source_control is the typical prerequisite).",
+
+  "deprecated": false,
+  "deprecation_message": null,
+  "replaces": [],
+  "replaced_by": null,
+
   "parameters": {
     "type": "object",
     "properties": {

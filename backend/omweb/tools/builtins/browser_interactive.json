@@ -4,9 +4,148 @@
   "display_name": "Interactive Browser",
   "description": "Control a real Chromium browser to interact with dynamic web pages. Use 'navigate' to open a URL, 'snapshot' to get a token-efficient accessibility tree with element references (refs), 'click' or 'fill' using those refs, 'get_content' for visible text, 'scroll' to reveal more, and 'screenshot' to save a PNG image to the workspace. Does NOT return images to the model (screenshots are saved as artifacts for the user). For simple static text extraction, prefer the lighter 'http_fetch' tool.",
   "category": "network",
+  "subcategory": "browser-automation",
+  "tags": ["browser", "chromium", "headless", "automation", "scraping", "accessibility-tree", "screenshots"],
+  "capabilities": ["external_network", "stateful", "dom_interaction", "javascript_execution", "screenshot_capture"],
   "safety_level": "read_only",
   "is_builtin": true,
   "is_enabled": true,
+
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+  "signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+
+  "license": "proprietary",
+  "license_url": "https://peldrun.ai/license",
+
+  "version": "1.0.0",
+  "release_date": "2025-01-15",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "changelog_url": "https://peldrun.ai/tools/browser_interactive/changelog",
+
+  "short_description": "Headless Chromium controller for dynamic pages with snapshot, click, fill, scroll, and screenshot.",
+  "store_description": "Built-in interactive browser that drives a real Chromium instance to render dynamic web pages and interact with them. Supports navigation, accessibility-tree snapshots with stable element references, click and fill actions on those references, visible-text extraction, scrolling, and full-page or viewport screenshots saved as workspace artifacts. JavaScript is executed as in a normal browser. Screenshots are never returned to the model; they are saved to the workspace for the user. For simple static HTML extraction, prefer the lighter 'http_fetch' tool.",
+  "homepage": "https://peldrun.ai/tools/browser_interactive",
+  "docs_url": "https://docs.peldrun.ai/tools/browser_interactive",
+  "demo_url": null,
+  "screenshots": [],
+  "icon": "icons/browser_interactive.svg",
+
+  "pricing": "free",
+  "supported_languages": ["en", "ar"],
+  "i18n": {
+    "ar": {
+      "display_name": "Interactive Browser",
+      "short_description": "Headless Chromium controller for dynamic pages with snapshot, click, fill, scroll, and screenshot."
+    }
+  },
+
+  "settings": {
+    "enabled": true,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "default_max_chars": {
+          "type": "integer",
+          "minimum": 500,
+          "maximum": 50000,
+          "default": 8000
+        },
+        "navigation_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 180,
+          "default": 45
+        },
+        "action_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120,
+          "default": 20
+        },
+        "user_agent": {
+          "type": "string",
+          "default": "PELDRUN-Browser/1.0"
+        },
+        "viewport": {
+          "type": "object",
+          "properties": {
+            "width": { "type": "integer", "minimum": 320, "maximum": 3840, "default": 1280 },
+            "height": { "type": "integer", "minimum": 240, "maximum": 2160, "default": 800 }
+          },
+          "additionalProperties": false
+        },
+        "screenshot_dir": {
+          "type": "string",
+          "default": "screenshots"
+        }
+      },
+      "additionalProperties": false
+    },
+    "defaults": {
+      "default_max_chars": 8000,
+      "navigation_timeout_seconds": 45,
+      "action_timeout_seconds": 20,
+      "user_agent": "PELDRUN-Browser/1.0",
+      "viewport": { "width": 1280, "height": 800 },
+      "screenshot_dir": "screenshots"
+    },
+    "required": []
+  },
+
+  "permissions": ["network:outbound", "filesystem:workspace_write"],
+  "network_access": true,
+  "allowed_schemes": ["http", "https"],
+  "requires_api_key": false,
+  "required_env_vars": [],
+  "sandbox": true,
+  "filesystem_access": "workspace_only",
+  "rate_limit": {
+    "requests": 60,
+    "window_seconds": 60
+  },
+
+  "timeout_seconds": 120,
+  "concurrency": 1,
+  "runtime": "chromium:headless",
+  "entry_point": "browser_interactive.handler",
+  "dependencies": [],
+
+  "examples": [
+    {
+      "input": { "action": "navigate", "url": "https://example.com" },
+      "output_preview": "Navigated to https://example.com (status: 200)"
+    },
+    {
+      "input": { "action": "snapshot", "max_chars": 4000 },
+      "output_preview": "[e3] heading 'Example Domain'\n[e7] link 'More information...'"
+    },
+    {
+      "input": { "action": "click", "ref": "e7" },
+      "output_preview": "Clicked element e7. Page updated."
+    },
+    {
+      "input": { "action": "fill", "ref": "e12", "value": "peldrun" },
+      "output_preview": "Filled element e12 with provided value."
+    },
+    {
+      "input": { "action": "screenshot", "full_page": true },
+      "output_preview": "Saved screenshot: screenshots/page-20250115-101500.png"
+    }
+  ],
+  "usage_notes": "Prefer 'snapshot' over 'selector' when interacting: refs are stable within a page session. Call 'snapshot' again after navigation or significant DOM updates because refs may change. Screenshots are saved to the workspace and never returned to the model. For simple static text extraction, prefer the lighter 'http_fetch' tool. Only http/https URLs are accepted.",
+
+  "deprecated": false,
+  "deprecation_message": null,
+  "replaces": [],
+  "replaced_by": null,
+
   "parameters": {
     "type": "object",
     "properties": {

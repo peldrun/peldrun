@@ -1,13 +1,131 @@
 {
   "id": "file_saver",
   "name": "File Deliverable Manager",
+  "display_name": "File Deliverable Manager",
   "category": "storage",
+  "subcategory": "deliverables",
+  "tags": ["files", "deliverables", "workspace", "storage", "assets"],
+  "capabilities": ["filesystem_write", "workspace_scoped", "deliverable_generation"],
   "description": "Creates, updates, and formats workspace deliverables and project assets.",
   "safety_level": "safe",
-  "parameters": {
-    "filename": "string",
-    "content": "string"
-  },
   "is_builtin": true,
-  "read_only": true
+  "is_enabled": true,
+  "read_only": true,
+
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+  "signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+
+  "license": "proprietary",
+  "license_url": "https://peldrun.ai/license",
+
+  "version": "1.0.0",
+  "release_date": "2025-01-15",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "changelog_url": "https://peldrun.ai/tools/file_saver/changelog",
+
+  "short_description": "Create, update, and format workspace deliverables and project assets.",
+  "store_description": "Built-in deliverable manager that writes final outputs (documents, data exports, formatted assets) into the workspace so they can be downloaded or shared. Intended for completed artifacts, not for incremental code edits; use 'str_replace_editor' for source-level patching. Each call creates or overwrites a single file identified by its filename and content.",
+  "homepage": "https://peldrun.ai/tools/file_saver",
+  "docs_url": "https://docs.peldrun.ai/tools/file_saver",
+  "demo_url": null,
+  "screenshots": [],
+  "icon": "icons/file_saver.svg",
+
+  "pricing": "free",
+  "supported_languages": ["en", "ar"],
+  "i18n": {
+    "ar": {
+      "display_name": "File Deliverable Manager",
+      "short_description": "Create, update, and format workspace deliverables and project assets."
+    }
+  },
+
+  "settings": {
+    "enabled": true,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "max_file_size_kb": {
+          "type": "integer",
+          "minimum": 16,
+          "maximum": 51200,
+          "default": 2048
+        },
+        "overwrite_policy": {
+          "type": "string",
+          "enum": ["allow", "reject", "version"],
+          "default": "allow"
+        },
+        "default_encoding": {
+          "type": "string",
+          "enum": ["utf-8", "utf-16", "latin-1"],
+          "default": "utf-8"
+        }
+      },
+      "additionalProperties": false
+    },
+    "defaults": {
+      "max_file_size_kb": 2048,
+      "overwrite_policy": "allow",
+      "default_encoding": "utf-8"
+    },
+    "required": []
+  },
+
+  "permissions": ["filesystem:workspace_write"],
+  "network_access": false,
+  "requires_api_key": false,
+  "required_env_vars": [],
+  "sandbox": true,
+  "filesystem_access": "workspace_only",
+  "rate_limit": {
+    "requests": 120,
+    "window_seconds": 60
+  },
+
+  "timeout_seconds": 30,
+  "concurrency": 1,
+  "runtime": "builtin",
+  "entry_point": "file_saver.handler",
+  "dependencies": [],
+
+  "examples": [
+    {
+      "input": { "filename": "report.md", "content": "# Report\n\nSummary: ..." },
+      "output_preview": "Saved deliverable: report.md (1.2 KB)"
+    },
+    {
+      "input": { "filename": "data/export.csv", "content": "id,name\n1,Alice\n2,Bob\n" },
+      "output_preview": "Saved deliverable: data/export.csv (24 B)"
+    }
+  ],
+  "usage_notes": "Use for final artifacts (documents, exports, formatted assets). For incremental code edits inside a workspace, use 'str_replace_editor'. Filenames are workspace-relative; subdirectories in the filename are created automatically when permitted. Overwrites follow the configured overwrite_policy.",
+
+  "deprecated": false,
+  "deprecation_message": null,
+  "replaces": [],
+  "replaced_by": null,
+
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "filename": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Workspace-relative file name for the deliverable (e.g. 'report.md', 'data/export.csv')."
+      },
+      "content": {
+        "type": "string",
+        "description": "Full content to write to the file."
+      }
+    },
+    "required": ["filename", "content"]
+  }
 }

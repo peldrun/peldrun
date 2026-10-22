@@ -4,8 +4,91 @@
   "display_name": "Web Search",
   "description": "Search the web for up-to-date information, documentation, news, and factual verification. Omit max_results to use PELDRUN Search Settings.",
   "category": "search",
+  "subcategory": "general",
+  "tags": ["web", "search", "realtime", "knowledge"],
+  "capabilities": ["external_network", "stateless", "read_only"],
   "builtin": true,
   "enabled": true,
+
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+  "signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+
+  "license": "proprietary",
+  "license_url": "https://peldrun.ai/license",
+
+  "version": "1.0.0",
+  "release_date": "2025-01-15",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "changelog_url": "https://peldrun.ai/tools/web_search/changelog",
+
+  "short_description": "Real-time web search via configurable provider.",
+  "store_description": "Built-in search tool that queries the configured PELDRUN search provider to retrieve up-to-date information, documentation, news, and factual references. Supports provider-level search settings and per-call result limits.",
+  "homepage": "https://peldrun.ai/tools/web_search",
+  "docs_url": "https://docs.peldrun.ai/tools/web_search",
+  "demo_url": null,
+  "screenshots": [],
+  "icon": "icons/web_search.svg",
+
+  "pricing": "free",
+  "supported_languages": ["en", "ar"],
+  "i18n": {
+    "ar": {
+      "display_name": "Web Search",
+      "short_description": "Real-time web search via configurable provider."
+    }
+  },
+
+  "settings": {
+    "enabled": true,
+    "schema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "defaults": {},
+    "required": []
+  },
+
+  "permissions": ["network:outbound"],
+  "network_access": true,
+  "requires_api_key": false,
+  "required_env_vars": [],
+  "sandbox": true,
+  "rate_limit": {
+    "requests": 60,
+    "window_seconds": 60
+  },
+
+  "timeout_seconds": 30,
+  "concurrency": 4,
+  "runtime": "builtin",
+  "entry_point": "web_search.handler",
+  "dependencies": [],
+
+  "examples": [
+    {
+      "input": { "query": "latest Python release" },
+      "output_preview": "Python 3.13.x — released ... (source: python.org)"
+    },
+    {
+      "input": { "query": "OpenAI function calling spec", "max_results": 3 },
+      "output_preview": "Top 3 results with titles, snippets, and URLs."
+    }
+  ],
+  "usage_notes": "Prefer passing only `query`. Omit `max_results` to inherit PELDRUN Search Settings; the configured provider ceiling is always enforced.",
+
+  "deprecated": false,
+  "deprecation_message": null,
+  "replaces": [],
+  "replaced_by": null,
+
   "parameters": {
     "type": "object",
     "properties": {

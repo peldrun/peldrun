@@ -1,12 +1,139 @@
 {
   "id": "bash",
   "name": "Bash Terminal",
+  "display_name": "Bash Terminal",
   "category": "system",
+  "subcategory": "shell",
+  "tags": ["shell", "terminal", "bash", "commands", "execution", "workspace"],
+  "capabilities": ["code_execution", "stateful", "filesystem_write", "process_execution"],
   "description": "Executes shell and terminal commands inside the execution workspace.",
   "safety_level": "controlled",
-  "parameters": {
-    "command": "string"
-  },
   "is_builtin": true,
-  "read_only": true
+  "is_enabled": true,
+  "read_only": true,
+
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+  "signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+
+  "license": "proprietary",
+  "license_url": "https://peldrun.ai/license",
+
+  "version": "1.0.0",
+  "release_date": "2025-01-15",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "changelog_url": "https://peldrun.ai/tools/bash/changelog",
+
+  "short_description": "Execute shell and terminal commands inside the isolated execution workspace.",
+  "store_description": "Built-in shell executor that runs bash/terminal commands inside the execution workspace. The working directory is pinned to the workspace root and cannot escape it. Intended for file inspection, build steps, and running project scripts. On Windows hosts the shell may not support POSIX constructs such as 'mkdir -p', '&&', or 'touch' — prefer the workspace file editor (str_replace_editor) for file operations, and prefer source_control for Git operations.",
+  "homepage": "https://peldrun.ai/tools/bash",
+  "docs_url": "https://docs.peldrun.ai/tools/bash",
+  "demo_url": null,
+  "screenshots": [],
+  "icon": "icons/bash.svg",
+
+  "pricing": "free",
+  "supported_languages": ["en", "ar"],
+  "i18n": {
+    "ar": {
+      "display_name": "Bash Terminal",
+      "short_description": "Execute shell and terminal commands inside the isolated execution workspace."
+    }
+  },
+
+  "settings": {
+    "enabled": true,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600,
+          "default": 60
+        },
+        "max_output_chars": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 1000000,
+          "default": 20000
+        },
+        "working_directory": {
+          "type": "string",
+          "default": "workspace_root",
+          "description": "Either 'workspace_root' or a relative path inside the workspace. Cannot escape the workspace."
+        },
+        "inherit_env": {
+          "type": "boolean",
+          "default": false
+        },
+        "allowed_commands": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Optional allow-list of executable names. When empty, the built-in policy is used."
+        }
+      },
+      "additionalProperties": false
+    },
+    "defaults": {
+      "timeout_seconds": 60,
+      "max_output_chars": 20000,
+      "working_directory": "workspace_root",
+      "inherit_env": false,
+      "allowed_commands": []
+    },
+    "required": []
+  },
+
+  "permissions": ["shell:execute", "filesystem:workspace_read", "filesystem:workspace_write"],
+  "network_access": false,
+  "requires_api_key": false,
+  "required_env_vars": [],
+  "sandbox": true,
+  "filesystem_access": "workspace_only",
+  "rate_limit": {
+    "requests": 120,
+    "window_seconds": 60
+  },
+
+  "timeout_seconds": 60,
+  "concurrency": 1,
+  "runtime": "shell:posix",
+  "entry_point": "bash.handler",
+  "dependencies": [],
+
+  "examples": [
+    {
+      "input": { "command": "ls -la" },
+      "output_preview": "total 24\ndrwxr-xr-x 4 user user 4096 Jan 15 10:00 .\n-rw-r--r-- 1 user user  512 Jan 15 10:00 README.md"
+    },
+    {
+      "input": { "command": "python -m pytest -q" },
+      "output_preview": "5 passed in 0.42s"
+    }
+  ],
+  "usage_notes": "Commands run inside the workspace root; the shell cannot escape it. On Windows hosts, POSIX constructs such as 'mkdir -p', '&&', and 'touch' may not be available — use the workspace file editor (str_replace_editor) for file operations, and source_control for Git operations. Always quote paths. Long-running processes are bounded by the configured timeout.",
+
+  "deprecated": false,
+  "deprecation_message": null,
+  "replaces": [],
+  "replaced_by": null,
+
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "command": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Shell command to execute inside the workspace."
+      }
+    },
+    "required": ["command"]
+  }
 }

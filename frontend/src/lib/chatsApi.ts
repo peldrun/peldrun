@@ -365,3 +365,15 @@ export async function fetchStoreExtensions(): Promise<ExtensionDefinition[]> {
   const data = await res.json();
   return data.extensions || [];
 }
+
+
+export async function fetchToolManifest(
+  toolId: string
+): Promise<Record<string, unknown> | null> {
+  try {
+    const res = await fetch(`/api/store/tools/${toolId}`, { cache: "no-store" });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.tool || null;
+  } catch { return null; }
+}

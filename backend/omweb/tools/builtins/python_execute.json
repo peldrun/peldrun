@@ -1,12 +1,122 @@
 {
   "id": "python_execute",
   "name": "Python Sandbox",
+  "display_name": "Python Sandbox",
   "category": "execution",
+  "subcategory": "code-interpreter",
+  "tags": ["python", "sandbox", "code-execution", "data-processing", "calculation"],
+  "capabilities": ["code_execution", "stateful", "sandboxed"],
   "description": "Executes stateful Python scripts, calculations, and data processing.",
   "safety_level": "safe",
-  "parameters": {
-    "code": "string"
-  },
   "is_builtin": true,
-  "read_only": true
+  "is_enabled": true,
+  "read_only": true,
+
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+  "signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+
+  "license": "proprietary",
+  "license_url": "https://peldrun.ai/license",
+
+  "version": "1.0.0",
+  "release_date": "2025-01-15",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "changelog_url": "https://peldrun.ai/tools/python_execute/changelog",
+
+  "short_description": "Stateful Python execution sandbox for scripts, math, and data processing.",
+  "store_description": "Built-in sandboxed Python interpreter that executes stateful scripts, performs calculations, and processes data. The execution context persists across calls within a session, so variables, imports, and definitions remain available between invocations. No outbound network access is provided by default.",
+  "homepage": "https://peldrun.ai/tools/python_execute",
+  "docs_url": "https://docs.peldrun.ai/tools/python_execute",
+  "demo_url": null,
+  "screenshots": [],
+  "icon": "icons/python_execute.svg",
+
+  "pricing": "free",
+  "supported_languages": ["en", "ar"],
+  "i18n": {
+    "ar": {
+      "display_name": "Python Sandbox",
+      "short_description": "Stateful Python execution sandbox for scripts, math, and data processing."
+    }
+  },
+
+  "settings": {
+    "enabled": true,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600,
+          "default": 60
+        },
+        "max_output_chars": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 1000000,
+          "default": 20000
+        }
+      },
+      "additionalProperties": false
+    },
+    "defaults": {
+      "timeout_seconds": 60,
+      "max_output_chars": 20000
+    },
+    "required": []
+  },
+
+  "permissions": ["sandbox:execute"],
+  "network_access": false,
+  "requires_api_key": false,
+  "required_env_vars": [],
+  "sandbox": true,
+  "filesystem_access": "ephemeral",
+  "rate_limit": {
+    "requests": 120,
+    "window_seconds": 60
+  },
+
+  "timeout_seconds": 60,
+  "concurrency": 1,
+  "runtime": "python:3.11-sandbox",
+  "entry_point": "python_execute.handler",
+  "dependencies": [],
+
+  "examples": [
+    {
+      "input": { "code": "x = 21\nprint(x * 2)" },
+      "output_preview": "42"
+    },
+    {
+      "input": { "code": "import math\nprint(math.sqrt(144))" },
+      "output_preview": "12.0"
+    }
+  ],
+  "usage_notes": "Execution state persists across calls within the same session. Prefer printing results explicitly; stdout/stderr are returned as part of the tool output. No network access is available inside the sandbox.",
+
+  "deprecated": false,
+  "deprecation_message": null,
+  "replaces": [],
+  "replaced_by": null,
+
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "code": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Python code to execute in the sandboxed interpreter."
+      }
+    },
+    "required": ["code"]
+  }
 }
