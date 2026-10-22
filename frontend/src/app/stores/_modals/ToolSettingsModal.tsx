@@ -343,7 +343,7 @@ export function ToolSettingsModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-sm p-4 top-0 bottom-0"
       role="dialog"
       aria-modal="true"
       aria-labelledby="tool-settings-title"
@@ -351,17 +351,17 @@ export function ToolSettingsModal({
         if (e.target === e.currentTarget && !saving) onClose();
       }}
     >
-      <div className="bg-card border border-border rounded-lg shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col">
+      <div className="bg-card rounded-md shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col">
         {/* Header */}
-        <div className="px-6 py-4 border-b border-border flex items-center justify-between shrink-0">
+        <div className="px-6 py-4 border-b border-border flex items-center justify-between shrink-0 bg-card-foreground/50">
           <div className="min-w-0">
             <h2
               id="tool-settings-title"
-              className="text-base font-bold text-foreground font-mono"
+              className="text-base font-bold text-primary-foreground font-mono"
             >
               Tool Settings
             </h2>
-            <p className="text-xs text-muted-foreground mt-0.5 truncate">
+            <p className="text-xs text-primary-foreground mt-0.5 truncate">
               {toolName}
             </p>
           </div>
@@ -377,7 +377,7 @@ export function ToolSettingsModal({
         </div>
 
         {/* Body */}
-        <div className="flex-1 overflow-y-auto px-6 py-5 scrollbar-thin">
+        <div className="flex-1 overflow-y-auto px-6 py-5 scrollbar-thin bg-card-foreground/10">
           {loading && (
             <div className="flex items-center justify-center py-12 text-muted-foreground">
               <Loader2 size={20} className="animate-spin mr-2" />
@@ -496,7 +496,7 @@ export function ToolSettingsModal({
         </div>
 
         {/* Footer */}
-        <div className="px-6 py-4 border-t border-border flex items-center justify-between gap-2 shrink-0">
+        <div className="px-6 py-4 border-t border-border flex items-center justify-between gap-2 shrink-0 bg-gigbg">
           <button
             type="button"
             onClick={handleTestEnvironment}

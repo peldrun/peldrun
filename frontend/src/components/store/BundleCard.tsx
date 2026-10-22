@@ -3,13 +3,12 @@
 import React, { useState } from "react";
 import {
   ChevronDown,
-  FileArchive,
+  ToolCase,
   Info,
   Layers,
   Shield,
   Trash2,
 } from "lucide-react";
-import { Button } from "@/components/ui/button";
 import type { BundleEntry } from "@/lib/bundleApi";
 
 export interface BundleCardProps {
@@ -40,33 +39,25 @@ export function BundleCard({
   const isMultiVersion = bundle.installed_versions.length > 1;
 
   return (
-    <div className="p-5 rounded-xl border bg-card shadow-xs hover:shadow-md transition-all flex flex-col justify-between border-border">
-      <div>
-        {/* Header */}
-        <div className="flex items-start justify-between mb-3">
-          <div className="flex items-center gap-2.5 min-w-0">
-            <div className="p-2 rounded-lg bg-primary/10 text-primary border border-primary/20 shrink-0">
-              <FileArchive size={15} />
-            </div>
-            <div className="min-w-0">
-              <h3 className="text-sm font-bold text-foreground truncate" title={bundle.name}>
-                {bundle.name}
-              </h3>
-              <span className="text-[10px] font-mono text-muted-foreground truncate block">
-                {bundle.id}
-              </span>
-            </div>
-          </div>
+    <div className="rounded-md  bg-card shadow-sm hover:shadow-md transition-all flex flex-col overflow-hidden">
 
-          {/* Version chip with rollback menu */}
-          <div className="relative shrink-0">
+      {/* Hero section: colored backdrop with a centered archive icon */}
+      <div className="relative w-full h-36 bg-rb/50 flex items-center justify-center">
+
+        <div className="card-b-icon text-[#fff]">
+          <ToolCase size={100} strokeWidth={.75} />
+        </div>
+
+        {/* Floating version selector (top-right corner) */}
+        <div className="absolute top-3 right-3">
+          <div className="relative">
             <button
               type="button"
               onClick={() => isMultiVersion && setVersionMenuOpen((v) => !v)}
-              className={`flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-mono border transition ${
+              className={`flex items-center gap-1 px-2.5 py-1 rounded-sm text-[10px] font-mono  transition ${
                 isMultiVersion
-                  ? "bg-primary/10 text-primary border-primary/30 cursor-pointer hover:bg-primary/20"
-                  : "bg-muted text-muted-foreground border-border cursor-default"
+                  ? "bg-background text-primary cursor-pointer hover:bg-primary/10 shadow-sm"
+                  : "bg-card text-muted-foreground cursor-default"
               }`}
               title={
                 isMultiVersion
@@ -76,10 +67,14 @@ export function BundleCard({
             >
               <span>v{bundle.active_version}</span>
               {isMultiVersion && (
-                <ChevronDown size={10} className={versionMenuOpen ? "rotate-180 transition" : "transition"} />
+                <ChevronDown
+                  size={12}
+                  className={versionMenuOpen ? "rotate-180 transition" : "transition"}
+                />
               )}
             </button>
 
+            {/* Rollback dropdown: lists installed versions in reverse order */}
             {versionMenuOpen && isMultiVersion && (
               <div className="absolute right-0 top-full mt-1 z-20 w-40 rounded-lg border border-border bg-popover shadow-lg p-1 text-[11px]">
                 {bundle.installed_versions
@@ -111,14 +106,19 @@ export function BundleCard({
             )}
           </div>
         </div>
+      </div>
 
-        {/* Status badges */}
-        <div className="flex items-center gap-2 mb-3 flex-wrap">
-          <span className="px-2 py-0.5 rounded-md text-[10px] font-mono uppercase bg-primary/10 text-primary border border-primary/20">
+      {/* Card body: badges, identity, and metadata */}
+      <div className="p-5 flex flex-col flex-grow">
+
+        {/* Status badges: bundle type, lifecycle status, and safety warning */}
+        <div className="flex justify-center items-center gap-2 mb-3 flex-wrap">
+          <span className="px-2 py-0.5 rounded-md text-[10px] font-mono uppercase bg-primary/10 text-primary border border-primary/20 flex items-center gap-1">
+            <Layers size={10} />
             BUNDLE
           </span>
           <span
-            className={`px-2 py-0.5 rounded-md text-[10px] font-mono uppercase ${
+            className={`px-2 py-0.5 rounded-sm text-[10px] font-mono uppercase ${
               bundle.status === "active"
                 ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30"
                 : "bg-muted text-muted-foreground border border-border"
@@ -133,15 +133,26 @@ export function BundleCard({
           )}
         </div>
 
-        {/* Description */}
-        <p className="text-xs text-muted-foreground line-clamp-2 mb-3 leading-relaxed">
-          {bundle.description || "Installed bundle."}
-        </p>
+        {/* Identity block: name, id, and description */}
+        <div className="text-center mb-4">
+          <h3
+            className="text-lg font-extrabold text-foreground mb-1 truncate font-serif"
+            title={bundle.name}
+          >
+            {bundle.name}
+          </h3>
+          <span className="text-[10px] font-mono text-muted-foreground block mb-2">
+            {bundle.id}
+          </span>
+          <p className="text-xs text-muted-foreground line-clamp-2 leading-relaxed">
+            {bundle.description || "Installed bundle."}
+          </p>
+        </div>
 
-        {/* Hash + size */}
+        {/* Active version metadata: hash, size, and file count */}
         {activeRecord && (
-          <div className="flex items-center gap-2 text-[10px] font-mono text-muted-foreground mb-3">
-            <span className="px-1.5 py-0.5 rounded bg-muted border border-border truncate">
+          <div className="flex justify-between items-center gap-2 text-[10px] font-mono text-muted-foreground mb-4">
+            <span className="px-1.5 py-0.5 rounded bg-muted border border-border truncate max-w-[100px]">
               {bundle.active_hash}
             </span>
             <span>·</span>
@@ -151,31 +162,36 @@ export function BundleCard({
           </div>
         )}
 
-        {/* Capabilities */}
+        {/* Capabilities: first three displayed, remainder collapsed into a counter */}
         {bundle.capabilities.length > 0 && (
-          <div className="mb-3">
-            <span className="text-[10px] uppercase font-semibold text-muted-foreground tracking-wider block mb-1.5">
-              Capabilities
-            </span>
-            <div className="flex flex-wrap gap-1">
-              {bundle.capabilities.map((cap) => (
+          <div className="mb-2">
+            <div className="flex flex-wrap justify-center gap-1">
+              {bundle.capabilities.slice(0, 3).map((cap) => (
                 <span
                   key={cap}
-                  className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-muted text-muted-foreground border border-border"
+                  className="px-2 py-0.5 rounded text-[10px] font-mono bg-muted text-muted-foreground border border-border"
                 >
                   {cap}
                 </span>
               ))}
+              {bundle.capabilities.length > 3 && (
+                <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-muted text-muted-foreground border border-border">
+                  +{bundle.capabilities.length - 3}
+                </span>
+              )}
             </div>
           </div>
         )}
       </div>
 
-      {/* Footer */}
-      <div className="pt-3 border-t border-border flex items-center justify-between">
+      {/* Sticky footer: version count plus detail/delete actions */}
+      <div className="bg-gigbg border-t border-border px-5 py-3 flex items-center justify-between mt-auto">
         <div className="flex items-center gap-1.5 text-[11px] font-mono text-muted-foreground">
-          <Shield size={11} />
-          <span>{bundle.installed_versions.length} version{bundle.installed_versions.length !== 1 ? "s" : ""}</span>
+          <Shield size={12} />
+          <span>
+            {bundle.installed_versions.length} version
+            {bundle.installed_versions.length !== 1 ? "s" : ""}
+          </span>
         </div>
 
         <div className="flex items-center gap-1">
@@ -185,7 +201,7 @@ export function BundleCard({
             className="p-1.5 rounded-lg hover:bg-muted text-muted-foreground hover:text-foreground transition cursor-pointer"
             title="View details"
           >
-            <Info size={13} />
+            <Info size={15} />
           </button>
           <button
             type="button"
@@ -193,10 +209,11 @@ export function BundleCard({
             className="p-1.5 rounded-lg hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition cursor-pointer"
             title="Delete bundle"
           >
-            <Trash2 size={13} />
+            <Trash2 size={15} />
           </button>
         </div>
       </div>
+
     </div>
   );
 }
