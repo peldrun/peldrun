@@ -12,6 +12,8 @@ import {
   WorkspacePanel,
   getFileCategory,
 } from "@/components/workspace/workspace-panel";
+import { SourceControlWorkspacePanel } from "@/features/source-control/components/source-control-workspace-panel";
+
 import { Composer } from "@/components/chat/composer";
 import { ChatSubHeader } from "@/components/chat/chat-sub-header";
 import { ChatLanding } from "@/components/chat/chat-landing";
@@ -96,6 +98,76 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
 
   // --- Persisted user preferences ------------------------------------------
   const [showRightPanel, setShowRightPanel] = useAppStorage("right_panel_open");
+
+  // Which of the two right-hand panels is active:
+  //   - "workspace"      : the existing WorkspacePanel (Preview, Files,
+  //                        Artifacts, Logs, Editor).
+  //   - "source-control" : the standalone SourceControlWorkspacePanel
+  //                        (Agent / Manual / Browse tabs from the
+  //                        source-control subsystem).
+  //
+  // NOTE — why `useState` + manual `localStorage` instead of
+  // `useAppStorage`:
+  //
+  // `useAppStorage` is typed against a fixed allow-list of storage
+  // keys (right_panel_open, exec_mode, theme, ...). `right_panel_mode`
+  // is not on that list, so a direct call fails with:
+  //
+  //   Type '"workspace" | "source-control"' does not satisfy the
+  //   constraint '...'
+  //
+  // Adding the key to the allow-list would require editing the
+  // shared `useAppStorage` hook, which is used by many unrelated
+  // components. That is overkill for one preference. The manual
+  // pattern below gives us the same persistence behavior (survives
+  // page reload, falls back gracefully if storage is unavailable)
+  // without touching any shared code.
+  const [rightPanelMode, setRightPanelMode] = useState<
+    "workspace" | "source-control"
+  >(() => {
+    if (typeof window === "undefined") return "workspace";
+    try {
+      const stored = window.localStorage.getItem(
+        "peldrun:right_panel_mode"
+      );
+      return stored === "source-control" ? "source-control" : "workspace";
+    } catch {
+      // Access to localStorage can throw in some privacy modes
+      // (Safari ITP, Firefox total-cookie-protection, etc.). Falling
+      // back to the default is safer than crashing the whole panel.
+      return "workspace";
+    }
+  });
+
+  // Persist `rightPanelMode` on every change.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(
+        "peldrun:right_panel_mode",
+        rightPanelMode
+      );
+    } catch {
+      // Storage full or unavailable — persistence is best-effort.
+    }
+  }, [rightPanelMode]);
+
+  // `sourceControlDefaultMode` is the mode the SourceControlPanel opens
+  // in the NEXT time it mounts. `sourceControlMountKey` is bumped to
+  // force a remount so the new default actually takes effect (React
+  // ignores prop changes to `useState`'s initializer without a key
+  // change).
+  //
+  // Example flow:
+  //   - User clicks the GitBranch icon in the header → mount key
+  //     stays the same, default mode is "browse".
+  //   - User clicks "Open Review & Approve" on a review card →
+  //     mount key bumps, default mode becomes "agent", so the panel
+  //     opens directly on the review UI.
+  const [sourceControlDefaultMode, setSourceControlDefaultMode] =
+    useState<"agent" | "manual" | "browse">("browse");
+  const [sourceControlMountKey, setSourceControlMountKey] = useState(0);
+
   const [execMode, setExecMode] = useAppStorage("exec_mode");
   const [reasoningEffort] = useAppStorage("reasoning_effort");
   const [selectedEngineId, setSelectedEngineId] =
@@ -112,9 +184,16 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     (operationId: string) => {
       useSourceControlStore.setState({ activeOperationId: operationId });
       useSourceControlStore.getState().openPanel("source-control");
+      // Force the Source Control panel to open in Agent mode, which
+      // is the review UI. The mount key change is required because
+      // `SourceControlPanel` uses `useState(defaultMode)` — changing
+      // the prop alone does not reset the internal mode state.
+      setSourceControlDefaultMode("agent");
+      setSourceControlMountKey((k) => k + 1);
+      setRightPanelMode("source-control");
       setShowRightPanel(true);
     },
-    [setShowRightPanel]
+    [setShowRightPanel, setRightPanelMode]
   );
 
   // Refs mirror fast-changing state so SSE handlers always read the latest
@@ -307,6 +386,8 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     setElapsedSeconds(0);
     setSessionTimestamp("");
     setShowRightPanel(false);
+    setRightPanelMode("workspace");
+    setSourceControlDefaultMode("browse");
     setActiveChildRuns({});
     setPendingApprovals({});
     router.push("/chat");
@@ -953,8 +1034,45 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
           onSelectEngine={handleSelectEngine}
           onNewSession={handleNewSession}
           onStopTask={handleStopTask}
-          showRightPanel={showRightPanel}
-          onToggleRightPanel={() => setShowRightPanel(!showRightPanel)}
+          showRightPanel={
+            showRightPanel && rightPanelMode === "workspace"
+          }
+          onToggleRightPanel={() => {
+            // The toggle has three states:
+            //   1. Workspace panel is open      → hide it.
+            //   2. Source Control panel is open → switch to Workspace.
+            //   3. Nothing is open              → open Workspace.
+            if (showRightPanel && rightPanelMode === "workspace") {
+              setShowRightPanel(false);
+            } else {
+              setRightPanelMode("workspace");
+              setShowRightPanel(true);
+            }
+          }}
+          showSourceControlPanel={
+            showRightPanel && rightPanelMode === "source-control"
+          }
+          onToggleSourceControlPanel={() => {
+            // Same three-state toggle, but targeting Source Control.
+            // The "mount key" is bumped on every open-from-hidden so
+            // the panel always starts on the "browse" tab (this
+            // handler is the one used when the user opens the panel
+            // manually from the header — NOT when `handleOpenReview`
+            // is used, which sets `sourceControlDefaultMode = "agent"`).
+            if (
+              showRightPanel &&
+              rightPanelMode === "source-control"
+            ) {
+              setShowRightPanel(false);
+            } else {
+              if (!showRightPanel || rightPanelMode !== "source-control") {
+                setSourceControlDefaultMode("browse");
+                setSourceControlMountKey((k) => k + 1);
+              }
+              setRightPanelMode("source-control");
+              setShowRightPanel(true);
+            }
+          }}
           status={status as any}
           activeModel={activeModelName}
         />
@@ -1043,12 +1161,21 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
 
       {showRightPanel && (
         <div className="flex-1 h-full min-w-0 transition-all">
-          <WorkspacePanel
-            activeJobId={activeJobId}
-            activeChatId={activeChatId || activeJobId}
-            overrideFile={selectedFileForEditor}
-            overrideDraft={sandboxDraft}
-          />
+          {rightPanelMode === "source-control" ? (
+            <SourceControlWorkspacePanel
+              key={sourceControlMountKey}
+              activeChatId={activeChatId || activeJobId}
+              defaultMode={sourceControlDefaultMode}
+              onClose={() => setShowRightPanel(false)}
+            />
+          ) : (
+            <WorkspacePanel
+              activeJobId={activeJobId}
+              activeChatId={activeChatId || activeJobId}
+              overrideFile={selectedFileForEditor}
+              overrideDraft={sandboxDraft}
+            />
+          )}
         </div>
       )}
     </div>

@@ -17,6 +17,15 @@ import { AuthReconnectBanner } from "./AuthReconnectBanner";
 import { GitPullRequest, AlertCircle, Loader2 } from "lucide-react";
 export interface SourceControlPanelProps {
   chatId?: string;
+  /**
+   * Mode that the panel should open in by default.
+   *
+   * Set to `"browse"` when the panel is used as a standalone side
+   * panel (the user opened it specifically to look at the repo),
+   * and leave unset (defaults to `"agent"`) when it is used inside
+   * `WorkspacePanel`.
+   */
+  defaultMode?: PanelMode;
 }
 
 type PanelMode = "agent" | "manual" | "browse";
@@ -47,8 +56,9 @@ type PanelMode = "agent" | "manual" | "browse";
  */
 export function SourceControlPanel({
   chatId: propChatId,
+  defaultMode = "agent",
 }: SourceControlPanelProps = {}) {
-  const [mode, setMode] = useState<PanelMode>("agent");
+  const [mode, setMode] = useState<PanelMode>(defaultMode);
 
   // `reloadKey` is bumped every time the user completes an inline
   // OAuth re-connect via `<AuthReconnectBanner />`. Mounting the

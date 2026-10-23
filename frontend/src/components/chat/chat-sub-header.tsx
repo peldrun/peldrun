@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { Plus, History, Square, PanelRightClose, PanelRightOpen } from "lucide-react";
+import { Plus, History, Square, PanelRightClose, PanelRightOpen, GitBranch } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { EngineOption, EngineSelector } from "./engine-selector";
 import { UsageBadgeGroup } from "@/components/chat/UsageBadges";
@@ -23,6 +23,19 @@ interface ChatSubHeaderProps {
   onStopTask: () => void;
   showRightPanel: boolean;
   onToggleRightPanel: () => void;
+  /**
+   * Whether the Source Control side panel is currently visible.
+   *
+   * Optional so that layouts which do not use the Source Control
+   * side panel are not forced to thread this prop through. When
+   * omitted, the Source Control button is not rendered.
+   */
+  showSourceControlPanel?: boolean;
+  /**
+   * Toggle handler for the Source Control side panel. Required
+   * when `showSourceControlPanel` is provided; omitted otherwise.
+   */
+  onToggleSourceControlPanel?: () => void;
 
   status?: "idle" | "running" | "ready" | "completed" | "error";
   sessionTitle?: string;
@@ -46,6 +59,8 @@ export function ChatSubHeader({
   onStopTask,
   showRightPanel,
   onToggleRightPanel,
+  showSourceControlPanel,
+  onToggleSourceControlPanel,
   status = "idle",
   stepCount,
   usageSummary,
@@ -149,6 +164,30 @@ export function ChatSubHeader({
         >
           {showRightPanel ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}
         </button>
+
+        {/* Source Control side panel toggle.
+            Rendered only when the caller opts in via
+            `showSourceControlPanel`, so existing layouts that do not
+            use the Source Control panel keep their current header
+            width without change. */}
+        {onToggleSourceControlPanel && (
+          <button
+            type="button"
+            onClick={onToggleSourceControlPanel}
+            className={`p-1.5 rounded-md transition-all cursor-pointer ${
+              showSourceControlPanel
+                ? "text-primary bg-primary/10"
+                : "text-muted-foreground hover:bg-muted hover:text-foreground"
+            }`}
+            title={
+              showSourceControlPanel
+                ? "Hide Source Control panel"
+                : "Show Source Control panel"
+            }
+          >
+            <GitBranch size={16} />
+          </button>
+        )}
       </div>
     </div>
   );
