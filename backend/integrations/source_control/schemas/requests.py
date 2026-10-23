@@ -203,6 +203,59 @@ class CreateOperationRequest(BaseSCRequest):
         default="github",
         description="Target source control provider identifier.",
     )
+    preferred_branch_name: Optional[str] = Field(
+        default=None,
+        max_length=200,
+        description=(
+            "Optional name for the auto-created feature branch. Used "
+            "ONLY when the target_branch is protected AND the user's "
+            "settings set `auto_create_feature_branch=True` (the "
+            "default). When omitted, PELDRUN generates a timestamped "
+            "name like 'peldrun/manual-YYYYMMDD-HHMMSS'. When "
+            "provided, the value MUST be a valid Git branch name and "
+            "MUST NOT itself be protected (else auto-branching "
+            "achieves nothing). If the branch already exists locally, "
+            "the workspace is checked out onto it; otherwise it is "
+            "created from the current HEAD."
+        ),
+    )
+    force_protected_push: bool = Field(
+        default=False,
+        description=(
+            "When True, the operation is allowed to target a branch "
+            "that matches the protected pattern set (e.g., 'main'). "
+            "This is the 'Owner override' path: the user explicitly "
+            "consents to pushing directly to a protected branch. "
+            "The backend will (a) SKIP the auto-branch redirect, "
+            "(b) issue the approval ticket with "
+            "`approval_scope='push_to_protected'`, and (c) allow the "
+            "push in `push_approved_branch` even if the target is "
+            "protected. The remote provider (GitHub) remains the "
+            "authoritative source of truth — if GitHub itself has "
+            "branch protection enabled, the push will still be "
+            "refused by the remote."
+        ),
+    )
+
+    @field_validator("preferred_branch_name")
+    @classmethod
+    def validate_preferred_branch_name(
+        cls, v: Optional[str]
+    ) -> Optional[str]:
+        """
+        Validate the preferred branch name if provided.
+
+        An empty string is treated as "not provided" (returns
+        ``None``). A non-empty string is validated against Git's
+        branch-name rules so the failure surfaces here, not deep
+        inside `git checkout`.
+        """
+        if v is None:
+            return None
+        trimmed = v.strip()
+        if not trimmed:
+            return None
+        return validate_branch_name(trimmed)
 
     @field_validator("operation_type")
     @classmethod
@@ -400,7 +453,19 @@ class CheckoutBranchRequest(BaseSCRequest):
             "When True, discard uncommitted changes in the workspace "
             "before switching branches. When False (default), the "
             "checkout is refused if the workspace has uncommitted "
-            "changes."
+            "changes, UNLESS `commit_message` is provided (see below)."
+        ),
+    )
+    commit_message: Optional[str] = Field(
+        default=None,
+        max_length=10000,
+        description=(
+            "When provided, any pending changes in the workspace are "
+            "committed with this message BEFORE the branch switch. "
+            "This preserves user work across the switch instead of "
+            "refusing the operation. When None (default), the "
+            "behavior depends on `force`: a dirty workspace is either "
+            "refused (`force=False`) or discarded (`force=True`)."
         ),
     )
 
@@ -1153,6 +1218,41 @@ class UpdateSourceControlSettingsRequest(BaseSCRequest):
             "issues, ...)."
         ),
     )
+    protected_branches: Optional[Sequence[str]] = Field(
+        default=None,
+        description=(
+            "Branches (or fnmatch patterns) treated as protected. "
+            "When provided, this replaces the default list. Omit "
+            "to keep the current value. See "
+            "`SourceControlSettingsResponse.protected_branches` for "
+            "the semantics."
+        ),
+    )
+    user_override_protected: Optional[Sequence[str]] = Field(
+        default=None,
+        description=(
+            "Branches exempted from protection. Useful when the "
+            "caller is the repository owner and wants to push "
+            "directly to the default branch. Omit to keep the "
+            "current value."
+        ),
+    )
+    auto_create_feature_branch: Optional[bool] = Field(
+        default=None,
+        description=(
+            "When True, a push targeting a protected branch is "
+            "automatically redirected to a new feature branch. "
+            "Omit to keep the current value."
+        ),
+    )
+    allow_push_to_protected: Optional[str] = Field(
+        default=None,
+        description=(
+            "Policy for direct pushes to protected branches. "
+            "Must be one of 'never', 'ask', or 'always'. "
+            "Omit to keep the current value."
+        ),
+    )
 
     @field_validator("default_panel_mode")
     @classmethod
@@ -1191,6 +1291,59 @@ class UpdateSourceControlSettingsRequest(BaseSCRequest):
                 "diff_view_mode must be 'unified' or 'split'."
             )
         return clean
+
+    @field_validator("allow_push_to_protected")
+    @classmethod
+    def validate_allow_push_to_protected(
+        cls, v: Optional[str]
+    ) -> Optional[str]:
+        """Validate the `allow_push_to_protected` policy value."""
+        if v is None:
+            return None
+        clean = v.strip().lower()
+        if clean not in ("never", "ask", "always"):
+            raise ValueError(
+                "allow_push_to_protected must be 'never', 'ask', "
+                "or 'always'."
+            )
+        return clean
+
+    @field_validator(
+        "protected_branches", "user_override_protected"
+    )
+    @classmethod
+    def validate_branch_pattern_list(
+        cls, v: Optional[Sequence[str]]
+    ) -> Optional[Sequence[str]]:
+        """
+        Validate the branch-pattern lists.
+
+        Each entry must be a non-empty string. Patterns may use
+        fnmatch wildcards (e.g. 'release/*'). Whitespace is
+        stripped, empty entries are dropped so that a UI that
+        submits a trailing comma does not produce a spurious
+        empty pattern that would match every branch, and a
+        per-entry length cap prevents a pathological input from
+        bloating the settings file.
+        """
+        if v is None:
+            return None
+        cleaned: list[str] = []
+        for entry in v:
+            if not isinstance(entry, str):
+                raise ValueError(
+                    "Branch pattern entries must be strings."
+                )
+            trimmed = entry.strip()
+            if not trimmed:
+                continue
+            if len(trimmed) > 200:
+                raise ValueError(
+                    "Branch pattern entries must not exceed 200 "
+                    "characters."
+                )
+            cleaned.append(trimmed)
+        return tuple(cleaned)
 
 
 class CreateTagRequest(BaseSCRequest):

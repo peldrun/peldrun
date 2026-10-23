@@ -1284,6 +1284,54 @@ async def get_workspace(
         handle_source_control_error(exc)
 
 
+@router.delete(
+    "/workspaces/{workspace_id}",
+    response_model=ActionSuccessResponse,
+)
+async def delete_workspace(
+    workspace_id: str,
+    force_delete_files: bool = Query(
+        default=False,
+        description=(
+            "When true, also remove the workspace's files from disk. "
+            "Required to make the chat's files folder available for a "
+            "new workspace (create_workspace refuses to clone into a "
+            "directory that already contains a .git folder)."
+        ),
+    ),
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> ActionSuccessResponse:
+    """
+    Delete a workspace from the registry and, optionally, its files.
+
+    This endpoint exists primarily for Manual Mode's "Change
+    Repository" flow: when the user has created a workspace but
+    wants to start over with a different repository, they need to
+    first delete the existing one because `POST /workspaces`
+    refuses to create a second workspace in the same chat folder.
+
+    The two flags are independent:
+
+        - Without `force_delete_files`, only the registry entry is
+          removed. The files stay on disk, so a follow-up
+          `create_workspace` will still fail with the same
+          "workspace already exists" error — but the workspace is
+          no longer tracked.
+
+        - With `force_delete_files=true`, the entire workspace
+          directory (including its .git) is removed from disk, so
+          the chat's files folder becomes available again.
+
+    A missing workspace ID is a 404, not a silent no-op.
+    """
+    try:
+        return await facade.delete_workspace(
+            workspace_id, force_delete_files=force_delete_files
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
 @router.get(
     "/workspaces/{workspace_id}/diff",
     response_model=DiffSummaryResponse,

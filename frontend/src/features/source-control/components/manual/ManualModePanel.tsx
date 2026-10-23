@@ -1,7 +1,10 @@
 ﻿// frontend/src/features/source-control/components/manual/ManualModePanel.tsx
 
-import React from "react";
+import React, { useState, useEffect } from "react";
 import { useManualModeStore } from "../../state/manual-mode-store";
+import { useManualMode } from "../../hooks/useManualMode";
+import { OperationResponse } from "../../api/schemas";
+import { sourceControlClient } from "../../api/source-control-client";
 import { ManualStepIndicator } from "./ManualStepIndicator";
 import { ManualRepoSelector } from "./ManualRepoSelector";
 import { ManualWorkspaceCreator } from "./ManualWorkspaceCreator";
@@ -11,6 +14,7 @@ import { ManualPushButton } from "./ManualPushButton";
 import {
   AlertCircle,
   CheckCircle2,
+  FolderX,
   MessageSquare,
   RotateCcw,
 } from "lucide-react";
@@ -42,7 +46,9 @@ import {
  * owns that flag locally. See the comment on T3.3 for details.
  */
 export function ManualModePanel() {
-  const { step, error, chatId } = useManualModeStore();
+  const { step, error, chatId, workspaceId } = useManualModeStore();
+  const { deleteWorkspace } = useManualMode();
+  const [isDeleting, setIsDeleting] = useState(false);
 
   // Guard: without a chat id we cannot persist anything (files go
   // under storage/chats/<chatId>/files/). This should never happen
@@ -63,8 +69,60 @@ export function ManualModePanel() {
     );
   }
 
+  // Show "Change Repository" whenever a workspace exists and no
+  // destructive operation is in flight. It is intentionally
+  // visible on `select-repo` and `error` as well: those are the
+  // two steps where the user most often needs to abandon a
+  // workspace they cannot use (e.g. they picked the wrong
+  // repository and the backend now refuses to clone a second one
+  // into the same folder).
+  const showChangeRepo =
+    !!workspaceId && step !== "pushing" && step !== "idle";
+
+  const handleChangeRepo = async () => {
+    if (isDeleting) return;
+    // Destructive, non-reversible action: deletes the workspace
+    // folder from disk. Confirm before executing.
+    const confirmed = window.confirm(
+      "This will delete the current workspace and all of its files " +
+      "from disk. You will then be asked to select a new repository. " +
+      "Continue?"
+    );
+    if (!confirmed) return;
+    setIsDeleting(true);
+    try {
+      await deleteWorkspace();
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
   return (
     <div className="flex flex-col h-full bg-background">
+      {/* Change Repository bar — only when a workspace exists */}
+      {showChangeRepo && (
+        <div className="flex items-center justify-end px-4 py-2 border-b border-border bg-background">
+          <button
+            type="button"
+            onClick={handleChangeRepo}
+            disabled={isDeleting}
+            className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {isDeleting ? (
+              <>
+                <div className="h-3 w-3 animate-spin rounded-full border-2 border-current border-r-transparent" />
+                Deleting workspace…
+              </>
+            ) : (
+              <>
+                <FolderX size={12} />
+                Change Repository
+              </>
+            )}
+          </button>
+        </div>
+      )}
+
       {/* Step indicator — always visible */}
       <ManualStepIndicator />
 
@@ -184,8 +242,14 @@ function StepBody({ step }: { step: ReturnType<typeof useManualModeStore.getStat
 function ChangeDescriptionCard() {
   const title = useManualModeStore((s) => s.title);
   const description = useManualModeStore((s) => s.description);
+  const preferredBranchName = useManualModeStore(
+    (s) => s.preferredBranchName
+  );
   const setTitle = useManualModeStore((s) => s.setTitle);
   const setDescription = useManualModeStore((s) => s.setDescription);
+  const setPreferredBranchName = useManualModeStore(
+    (s) => s.setPreferredBranchName
+  );
 
   return (
     <div className="mb-4 rounded-md border border-border bg-card/40 p-3 space-y-3">
@@ -235,6 +299,40 @@ function ChangeDescriptionCard() {
         />
       </div>
 
+      {/* Task 1.5: optional preferred branch name for the auto-created
+          feature branch. Always shown, but marked clearly as
+          conditional so a user pushing to a non-protected branch
+          does not wonder why nothing happened after typing a value.
+          The backend silently ignores the value when auto-branching
+          is not triggered (target not protected, or
+          auto_create_feature_branch=false). */}
+      <div>
+        <label
+          htmlFor="manual-preferred-branch"
+          className="block text-[10px] font-medium text-muted-foreground mb-1"
+        >
+          Feature branch name{" "}
+          <span className="text-muted-foreground font-normal">
+            (optional)
+          </span>
+        </label>
+        <input
+          id="manual-preferred-branch"
+          type="text"
+          value={preferredBranchName}
+          onChange={(e) => setPreferredBranchName(e.target.value)}
+          placeholder="e.g. feature/my-fix"
+          maxLength={200}
+          className="w-full text-xs px-2 py-1.5 rounded border border-border bg-background focus:outline-none focus:ring-1 focus:ring-primary font-mono"
+        />
+        <p className="mt-1 text-[10px] text-muted-foreground">
+          Used <strong>only if</strong> the target branch is protected
+          and PELDRUN auto-creates a feature branch. Leave empty to
+          let PELDRUN generate a timestamped name
+          (<code>peldrun/manual-YYYYMMDD-HHMMSS</code>).
+        </p>
+      </div>
+
       <p className="text-[10px] text-muted-foreground">
         These fields are drafts stored in the UI. They will become the
         operation's suggested PR title and body once wired to the
@@ -275,18 +373,47 @@ function PushingState() {
 
 function PushedState() {
   const chatId = useManualModeStore.getState().chatId;
+  const operationId = useManualModeStore.getState().operationId;
+  const branch = useManualModeStore.getState().branch;
+
+  // Fetch the full operation record to display a comprehensive
+  // "success receipt". This replaces the minimal branch-only view
+  // that was shown in an earlier revision.
+  const [operation, setOperation] = useState<OperationResponse | null>(null);
+  const [isLoadingOp, setIsLoadingOp] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!operationId) {
+      setIsLoadingOp(false);
+      return;
+    }
+
+    sourceControlClient
+      .getOperation(operationId)
+      .then((op) => {
+        if (!cancelled) setOperation(op);
+      })
+      .catch(() => {
+        // best-effort: if we cannot load the operation, we still
+        // show the basic success message below.
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoadingOp(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [operationId]);
 
   const handleStartOver = () => {
-    // Re-activate with the same chat id so the user keeps the chat
-    // context but starts a fresh workflow. reset() alone would
-    // clear chatId and leave the panel unmountable.
     if (chatId) {
       useManualModeStore.getState().activate(chatId);
     } else {
       useManualModeStore.getState().reset();
     }
 
-    // Notify any file/workspace panels that state changed.
     if (typeof window !== "undefined") {
       window.dispatchEvent(
         new CustomEvent("peldrun:artifact-updated", {
@@ -296,19 +423,109 @@ function PushedState() {
     }
   };
 
+  const autoBranch = operation?.metadata?.auto_created_branch as
+    | { from?: string; to?: string }
+    | undefined;
+  const targetBranch = operation?.target_branch || branch;
+
   return (
-    <div className="text-center py-8">
-      <CheckCircle2 className="h-12 w-12 text-green-500 mx-auto mb-4" />
-      <h3 className="text-lg font-semibold text-foreground">
+    <div className="flex flex-col items-center py-6 px-2">
+      <CheckCircle2 className="h-12 w-12 text-green-500 mb-4" />
+      <h3 className="text-lg font-semibold text-foreground text-center">
         Push Successful
       </h3>
-      <p className="text-sm text-muted-foreground mt-2">
-        Your changes have been pushed to the remote branch.
+      <p className="text-sm text-muted-foreground mt-2 text-center">
+        Your changes have been pushed to the remote repository.
       </p>
+
+      {/* Detailed Operation Receipt */}
+      {isLoadingOp ? (
+        <div className="mt-6 flex items-center gap-2 text-xs text-muted-foreground">
+          <div className="h-3 w-3 animate-spin rounded-full border-2 border-current border-r-transparent" />
+          Loading operation details...
+        </div>
+      ) : operation ? (
+        <div className="mt-6 w-full max-w-sm rounded-lg border border-border bg-card p-4 text-left shadow-sm">
+          <h4 className="text-xs font-semibold text-foreground mb-3 border-b border-border pb-2">
+            Operation Summary
+          </h4>
+
+          <div className="space-y-2 text-xs">
+            <div className="flex justify-between items-start gap-2">
+              <span className="text-muted-foreground shrink-0">Repository:</span>
+              <span className="font-medium text-right break-all">
+                {operation.repository_id}
+              </span>
+            </div>
+
+            <div className="flex justify-between items-start gap-2">
+              <span className="text-muted-foreground shrink-0">Target Branch:</span>
+              <span className="font-mono font-medium text-right break-all text-primary">
+                {targetBranch}
+              </span>
+            </div>
+
+            <div className="flex justify-between items-start gap-2">
+              <span className="text-muted-foreground shrink-0">Status:</span>
+              <span className="font-medium text-green-600 uppercase">
+                {operation.current_state}
+              </span>
+            </div>
+
+            <div className="flex justify-between items-start gap-2">
+              <span className="text-muted-foreground shrink-0">Operation ID:</span>
+              <span className="font-mono text-[10px] text-right break-all">
+                {operation.operation_id}
+              </span>
+            </div>
+
+            {operation.change_request_url && (
+              <div className="flex justify-between items-start gap-2 pt-2 border-t border-border mt-2">
+                <span className="text-muted-foreground shrink-0">Pull Request:</span>
+                <a
+                  href={operation.change_request_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="font-medium text-blue-600 hover:underline text-right break-all"
+                >
+                  Open PR
+                </a>
+              </div>
+            )}
+          </div>
+
+          {/* Auto-Branch Info (if applicable) */}
+          {autoBranch && autoBranch.from && autoBranch.to && (
+            <div className="mt-4 rounded-md bg-blue-50 border border-blue-200 p-3">
+              <p className="font-medium text-blue-900 text-xs mb-1">
+                Auto-Branch Redirect
+              </p>
+              <p className="text-[11px] text-blue-800 leading-relaxed">
+                <span className="font-mono">{autoBranch.from}</span> is protected.
+                Your changes were safely redirected to:
+                <br />
+                <span className="font-mono font-semibold mt-1 inline-block">
+                  {autoBranch.to}
+                </span>
+                <br />
+                <span className="mt-2 inline-block">
+                  Open a pull request from <strong>{autoBranch.to}</strong> to{" "}
+                  <strong>{autoBranch.from}</strong> to merge.
+                </span>
+              </p>
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="mt-4 text-xs text-muted-foreground">
+          Branch: <span className="font-mono">{targetBranch}</span>
+        </div>
+      )}
+
       <button
         type="button"
         onClick={handleStartOver}
-        className="mt-4 text-sm text-primary hover:underline"
+        className="mt-6 rounded-md bg-primary text-primary-foreground px-6 py-2 text-sm font-medium hover:bg-primary/90 transition-colors"
       >
         Start a new workflow
       </button>

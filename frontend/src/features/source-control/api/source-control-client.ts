@@ -298,6 +298,39 @@ export const sourceControlClient = {
     return request<WorkspaceResponse>(`/workspaces/${workspaceId}`);
   },
 
+  /**
+   * Delete a workspace from the registry and, optionally, its files
+   * on disk.
+   *
+   * Manual Mode calls this when the user wants to change the
+   * repository inside the same chat: `POST /workspaces` refuses to
+   * create a second workspace in a chat folder that already contains
+   * a `.git` directory, so the existing workspace must be deleted
+   * first. Passing `force_delete_files: true` is required for the
+   * follow-up `createWorkspace` call to succeed.
+   *
+   * The default is `false` on purpose: deleting files is
+   * destructive and should be an explicit choice at the call site.
+   */
+  async deleteWorkspace(
+    workspaceId: string,
+    options: { forceDeleteFiles?: boolean } = {}
+  ): Promise<ActionSuccessResponse> {
+    const params = new URLSearchParams();
+    if (options.forceDeleteFiles !== undefined) {
+      params.append(
+        "force_delete_files",
+        String(options.forceDeleteFiles)
+      );
+    }
+    const query = params.toString();
+    const suffix = query ? `?${query}` : "";
+    return request<ActionSuccessResponse>(
+      `/workspaces/${encodeURIComponent(workspaceId)}${suffix}`,
+      { method: "DELETE" }
+    );
+  },
+
   async getWorkspaceByChat(chatId: string): Promise<WorkspaceResponse | null> {
     return request<WorkspaceResponse | null>(
       `/workspaces/by-chat/${encodeURIComponent(chatId)}`

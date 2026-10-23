@@ -90,6 +90,13 @@ export const ApprovalTicketResponseSchema = z.object({
   approved_by_user: z.boolean().default(false),
   expires_at: z.string().datetime(),
   created_at: z.string().datetime(),
+  // What the user is being asked to approve:
+  //   - "push_branch"       → normal push to an unprotected branch
+  //   - "push_to_protected" → explicit consent to push to a branch
+  //                           that matches the protected set
+  // The UI SHOULD surface this prominently so the user knows whether
+  // they are accepting the extra risk of a protected-branch push.
+  approval_scope: z.string().default("push_branch"),
 });
 
 export const RepositoryResponseSchema = z.object({
@@ -171,6 +178,12 @@ export const OperationResponseSchema = z.object({
   created_at: z.string().datetime(),
   updated_at: z.string().datetime(),
   events: z.array(OperationEventResponseSchema).default([]),
+  // Extension bag: contains user-supplied context (title,
+  // description) and system annotations such as
+  // `auto_created_branch` and `original_target_branch` (added in
+  // Task 1.2). The UI uses these to explain that a push to a
+  // protected branch was redirected to a feature branch.
+  metadata: z.record(z.string(), z.any()).default({}),
 });
 
 export const WorkspaceResponseSchema = z.object({
@@ -232,6 +245,18 @@ export const CreateOperationRequestSchema = z.object({
   title: z.string().optional(),
   description: z.string().optional(),
   provider: z.string().default("github"),
+  // Optional user-chosen branch name for the auto-created feature
+  // branch. Only used when the target is protected AND settings
+  // have `auto_create_feature_branch=true`. `max(200)` matches
+  // the backend's branch-name length limit.
+  preferred_branch_name: z.string().max(200).optional(),
+  // When True, the operation is allowed to push directly to a
+  // branch that matches the protected pattern set. The backend
+  // skips auto-branching and issues the approval ticket with
+  // scope="push_to_protected". The remote provider (GitHub) is
+  // still the authoritative source of truth for its own branch
+  // protection rules.
+  force_protected_push: z.boolean().default(false),
 });
 
 export const ApproveOperationRequestSchema = z.object({
@@ -335,6 +360,12 @@ export const FileContentAtRefResponseSchema = z.object({
 export const CheckoutBranchRequestSchema = z.object({
   branch_name: z.string().min(1).max(200),
   force: z.boolean().default(false),
+  // When provided, any pending changes in the workspace are
+  // committed with this message BEFORE the branch switch. This
+  // preserves user work across the switch instead of refusing the
+  // operation when the workspace is dirty. `max(10_000)` matches
+  // the backend's `CommitOptions` limit.
+  commit_message: z.string().max(10_000).optional(),
 });
 
 // ----------------------------------------------------------------------

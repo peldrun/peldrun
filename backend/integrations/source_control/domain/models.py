@@ -701,6 +701,27 @@ class ApprovalTicket:
     status: ApprovalStatus = ApprovalStatus.PENDING
     created_at: datetime = field(default_factory=_utc_now)
     consumed_at: Optional[datetime] = None
+    #: Scope of what the user approved. Two values are recognized:
+    #:
+    #:   - "push_branch" (default): a normal push to a non-protected
+    #:     branch. `push_approved_branch` applies the historical
+    #:     protection rules and refuses if the target is protected.
+    #:
+    #:   - "push_to_protected": the user explicitly consented to
+    #:     pushing to a branch that matches the protected set.
+    #:     `push_approved_branch` will ALLOW the push when the
+    #:     target is protected, UNLESS the remote provider
+    #:     explicitly reports the branch as protected (in which
+    #:     case even this scope is refused — the provider is the
+    #:     authoritative source).
+    #:
+    #: This field describes WHAT the user approved, not which
+    #: downstream action is consuming the ticket. The latter is
+    #: tracked separately by `ApprovalGate.consume(action_scope=...)`
+    #: and is an orthogonal concept used to prevent a single ticket
+    #: from being reused across different side effects (e.g.
+    #: `push_branch` vs `create_change_request`).
+    approval_scope: str = "push_branch"
 
     def is_expired(self, now: Optional[datetime] = None) -> bool:
         """Return True if the ticket has passed its expiry time."""

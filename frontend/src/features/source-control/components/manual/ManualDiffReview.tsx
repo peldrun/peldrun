@@ -24,8 +24,14 @@ import { AlertCircle, ArrowRight, ChevronLeft } from "lucide-react";
  * approval data and returns to the editing guide.
  */
 export function ManualDiffReview() {
-  const { diff, operationId, approvalId, repository, branch } =
-    useManualModeStore();
+  const {
+    diff,
+    operationId,
+    approvalId,
+    repository,
+    branch,
+    approvalScope,
+  } = useManualModeStore();
 
   // Defensive: the flow should never reach here without these
   // values, but if it does (e.g. a stale render after store reset),
@@ -107,6 +113,41 @@ export function ManualDiffReview() {
           reject.
         </p>
       </div>
+
+      {/* Protected-branch warning (Task 1.3) — shown ONLY when the
+          approval ticket's scope is "push_to_protected". This means
+          the target branch matches the protected set (main, master,
+          etc.) and the user is being asked to explicitly consent to
+          a push that could normally be refused. The warning is
+          deliberately prominent and action-oriented so a distracted
+          user does not click through it by mistake. */}
+      {approvalScope === "push_to_protected" && (
+        <div className="rounded-md bg-amber-50 border-2 border-amber-400 p-3">
+          <div className="flex items-start gap-2">
+            <AlertCircle className="h-5 w-5 text-amber-600 flex-shrink-0 mt-0.5" />
+            <div className="text-xs text-amber-900 flex-1">
+              <p className="font-semibold">
+                You are about to approve a push to a protected branch.
+              </p>
+              <p className="mt-1">
+                The target branch{" "}
+                <span className="font-mono font-medium">
+                  {branch || "(unknown)"}
+                </span>{" "}
+                matches the protected pattern set. Approving this
+                ticket gives PELDRUN permission to push directly to
+                it, bypassing the usual feature-branch workflow.
+              </p>
+              <p className="mt-1">
+                Only proceed if you have explicitly configured this
+                via <span className="font-mono">allow_push_to_protected</span>{" "}
+                in settings and understand that GitHub's own branch
+                protection rules may still reject the push.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Ticket info */}
       <div className="rounded-md bg-blue-50 border border-blue-200 p-3 text-xs space-y-1">

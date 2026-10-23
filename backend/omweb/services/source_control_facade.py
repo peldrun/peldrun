@@ -972,6 +972,137 @@ class SourceControlFacade:
         secret = self.vault.get(secret_key)
         return bool(secret)
 
+    async def _load_branch_policy_from_settings(self) -> Any:
+        """
+        Build a `BranchPolicy` that respects the user's settings.
+
+        The user's `protected_branches` and `user_override_protected`
+        (from `settings.json`, Task 1.1) are merged with the historical
+        `DEFAULT_PROTECTED_BRANCH_PATTERNS` from `domain.policies` so
+        that an upgrade from a pre-Task-1.1 version does not silently
+        drop protection for patterns the user previously relied on
+        (e.g. `release/*`, `develop`). The user's override list is
+        applied on top and wins over both the user's patterns and the
+        historical defaults.
+
+        Returns a `BranchPolicy` whose `is_protected()` method
+        implements the effective policy. Any failure to read settings
+        falls back to the historical defaults so that a broken
+        settings file never blocks a push.
+        """
+        try:
+            from integrations.source_control.domain.policies import (
+                BranchPolicy,
+                DEFAULT_PROTECTED_BRANCH_PATTERNS,
+            )
+        except ImportError:  # absolute-import layout
+            from backend.integrations.source_control.domain.policies import (  # type: ignore[no-redef]
+                BranchPolicy,
+                DEFAULT_PROTECTED_BRANCH_PATTERNS,
+            )
+
+        try:
+            settings = await self.read_settings()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "_load_branch_policy_from_settings: read_settings "
+                "failed (%s); falling back to historical defaults.",
+                type(exc).__name__,
+            )
+            return BranchPolicy()
+
+        effective_patterns = (
+            tuple(settings.protected_branches)
+            + tuple(DEFAULT_PROTECTED_BRANCH_PATTERNS)
+        )
+        return BranchPolicy(
+            protected_patterns=effective_patterns,
+            user_override_protected=tuple(settings.user_override_protected),
+        )
+
+    async def _check_remote_protection(
+        self,
+        *,
+        adapter: Any,
+        repository_id: str,
+        provider_id: ProviderId,
+        branch_name: str,
+        token: str,
+    ) -> Optional[bool]:
+        """
+        Check whether a branch is protected on the remote provider.
+
+        Returns a tri-state answer:
+
+            ``True``  — the provider reports the branch as protected.
+            ``False`` — the provider reports the branch as NOT
+                        protected (GitHub returned 404 for its
+                        protection endpoint).
+            ``None``  — the check could not be performed (network
+                        error, insufficient permissions, unknown
+                        branch, or unsupported provider).
+
+        The tri-state is critical: a silent ``False`` on failure would
+        let a push to a genuinely protected branch proceed whenever
+        the provider API is momentarily unavailable.
+
+        Prefers the adapter's `is_branch_protected_remotely` method
+        (added in Task 1.2). Falls back to `get_branch_protection`
+        (which returns the raw protection payload or `None`) for
+        adapters that expose only the latter.
+        """
+        tri_check = getattr(adapter, "is_branch_protected_remotely", None)
+        get_protection = getattr(adapter, "get_branch_protection", None)
+        if not callable(tri_check) and not callable(get_protection):
+            return None
+
+        try:
+            repo = await self._resolve_repo(
+                adapter, repository_id, provider_id, token
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "_check_remote_protection: could not resolve "
+                "repository '%s': %s",
+                repository_id,
+                type(exc).__name__,
+            )
+            return None
+
+        if callable(tri_check):
+            try:
+                result = await tri_check(
+                    repo=repo, branch_name=branch_name, token=token
+                )
+                if result is True or result is False:
+                    return result
+                return None
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "_check_remote_protection: tri-state check failed "
+                    "for '%s': %s",
+                    branch_name,
+                    type(exc).__name__,
+                )
+                return None
+
+        if callable(get_protection):
+            try:
+                payload = await get_protection(
+                    repo=repo, branch_name=branch_name, token=token
+                )
+                return payload is not None
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "_check_remote_protection: fallback check failed "
+                    "for '%s': %s",
+                    branch_name,
+                    type(exc).__name__,
+                )
+                return None
+
+        return None
+
     def _default_provider_id(self) -> ProviderId:
         """
         Return the provider to use when the request does not specify one.
@@ -2298,8 +2429,210 @@ class SourceControlFacade:
 
         return None
 
-    async def ensure_editable_branch(self, workspace_id: str) -> str:
-        """Ensure the workspace is on a non-protected branch."""
+    async def delete_workspace(
+        self, workspace_id: str, *, force_delete_files: bool = False
+    ) -> ActionSuccessResponse:
+        """
+        Delete a workspace from the registry and, when requested,
+        remove its files from disk.
+
+        Deletion is ordered so that a filesystem failure leaves the
+        workspace intact and recoverable:
+
+            1. Locate the workspace path. If the workspace is not in
+               the registry (e.g. after a process restart) the path
+               is recovered by scanning `storage/chats/*/files/` for
+               a `.peldrun/workspace.json` marker that names this
+               workspace_id.
+
+            2. Delete the files (only when ``force_delete_files``).
+               On Windows, `.git` internals are frequently marked
+               read-only and `shutil.rmtree` fails with a
+               `PermissionError`. A retry handler that clears the
+               read-only bit is installed before giving up.
+
+            3. Only when the files are gone (or deletion was not
+               requested) is the workspace removed from the
+               registry. This ordering is essential: if we removed
+               the registry entry first and file deletion then
+               failed, the chat folder would be left with a `.git`
+               directory that `create_workspace` refuses to
+               overwrite — and the registry would no longer know
+               about it, so the user would be stuck.
+
+        Raises ``ValidationError`` when ``force_delete_files`` was
+        requested but the files could not be removed. In that case
+        the registry is NOT modified.
+        """
+        import inspect as _inspect
+        import shutil
+        import os
+        import stat
+        import sys
+        from pathlib import Path as _Path
+
+        ws_ref = self.workspace_manager.get_workspace(workspace_id)
+
+        # ---- 1. Locate the workspace path ----
+        workspace_path: Optional[str] = None
+        if ws_ref is not None:
+            workspace_path = getattr(ws_ref, "workspace_path", None)
+
+        # Fallback: scan chat folders for a matching marker. This is
+        # what allows delete to work after a process restart even
+        # when the in-memory registry was lost.
+        if not workspace_path:
+            backend_root = _Path(__file__).resolve().parent.parent.parent
+            project_root = backend_root.parent
+            for base in (
+                project_root / "storage" / "chats",
+                backend_root / "storage" / "chats",
+            ):
+                if not base.exists():
+                    continue
+                for chat_dir in base.iterdir():
+                    if not chat_dir.is_dir():
+                        continue
+                    files_dir = chat_dir / "files"
+                    marker = files_dir / ".peldrun" / "workspace.json"
+                    if not marker.exists():
+                        continue
+                    try:
+                        import json as _json
+                        data = _json.loads(
+                            marker.read_text(encoding="utf-8")
+                        )
+                        if data.get("workspace_id") == workspace_id:
+                            workspace_path = str(files_dir)
+                            break
+                    except Exception:
+                        continue
+                if workspace_path:
+                    break
+
+        if ws_ref is None and not workspace_path:
+            raise NotFoundError(
+                f"Workspace '{workspace_id}' was not found."
+            )
+
+        # ---- 2. Delete files first (if requested) ----
+        deleted_files = False
+        if force_delete_files and workspace_path:
+            p = _Path(workspace_path)
+            if p.exists():
+                try:
+                    shutil.rmtree(p)
+                    deleted_files = True
+                except (OSError, PermissionError) as exc:
+                    # Windows retry: clear read-only bits and retry.
+                    if os.name == "nt":
+                        def _retry(func, path, _exc_info):
+                            try:
+                                os.chmod(path, stat.S_IWRITE)
+                                func(path)
+                            except Exception:
+                                pass
+                        try:
+                            if sys.version_info >= (3, 12):
+                                shutil.rmtree(p, onexc=_retry)
+                            else:
+                                shutil.rmtree(p, onerror=_retry)
+                            deleted_files = True
+                        except Exception:
+                            deleted_files = False
+                    if not deleted_files:
+                        logger.error(
+                            "delete_workspace: could not remove files "
+                            "at '%s': %s",
+                            workspace_path,
+                            type(exc).__name__,
+                        )
+                        raise ValidationError(
+                            f"Could not delete workspace files at "
+                            f"'{workspace_path}'. The workspace "
+                            f"registry entry was NOT removed, so you "
+                            f"can retry. Underlying error: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+
+        # ---- 3. Only now remove from the registry ----
+        manager_delete = getattr(
+            self.workspace_manager, "delete_workspace", None
+        )
+        if manager_delete is not None:
+            try:
+                # We pass force_delete_files=False because we already
+                # deleted the files above (or the caller did not ask
+                # for deletion). The manager is only asked to purge
+                # its own registry bookkeeping.
+                result = manager_delete(
+                    workspace_id, force_delete_files=False
+                )
+            except TypeError:
+                result = manager_delete(workspace_id)
+            if _inspect.isawaitable(result):
+                await result
+        else:
+            internal = getattr(
+                self.workspace_manager, "_workspaces", None
+            )
+            if isinstance(internal, dict):
+                internal.pop(workspace_id, None)
+
+        self._audit(
+            AuditEventType.OTHER,
+            action="delete_workspace",
+            message=f"Deleted workspace '{workspace_id}'.",
+            payload={
+                "workspace_id": workspace_id,
+                "workspace_path": workspace_path,
+                "force_delete_files": force_delete_files,
+                "deleted_files": deleted_files,
+            },
+            workspace_id=workspace_id,
+            actor="user",
+        )
+
+        return ActionSuccessResponse(
+            message=(
+                f"Workspace '{workspace_id}' deleted."
+                + (" Files removed." if deleted_files else "")
+            )
+        )
+
+    async def ensure_editable_branch(
+        self,
+        workspace_id: str,
+        *,
+        preferred_name: Optional[str] = None,
+    ) -> str:
+        """
+        Ensure the workspace is on a non-protected branch.
+
+        When the workspace is already on a non-protected branch, it
+        is returned unchanged.
+
+        When the workspace is on a protected branch, a new branch is
+        created and checked out. The branch name is chosen as follows:
+
+            1. `preferred_name` when provided AND valid AND not
+               itself protected. If a branch with that name already
+               exists locally, the workspace is checked out onto it
+               (so a second call with the same name is idempotent).
+            2. Otherwise, a timestamped name
+               `peldrun/manual-YYYYMMDD-HHMMSS` is generated.
+
+        Args:
+            workspace_id: Workspace identifier.
+            preferred_name: Optional user-chosen branch name for the
+                auto-created feature branch. Ignored when the
+                workspace is already on a non-protected branch.
+
+        Raises:
+            NotFoundError: If the workspace does not exist.
+            ValidationError: If `preferred_name` is malformed or
+                itself protected, or if the checkout fails.
+        """
         import subprocess
         from datetime import datetime as _dt
 
@@ -2320,22 +2653,114 @@ class SourceControlFacade:
         if not is_protected_branch(current):
             return current
 
-        stamp = _dt.utcnow().strftime("%Y%m%d-%H%M%S")
-        new_branch = f"peldrun/manual-{stamp}"
+        # Determine the new branch name.
+        new_branch: Optional[str] = None
+        if preferred_name:
+            clean = validate_branch_name(preferred_name)
+            if is_protected_branch(clean):
+                raise ValidationError(
+                    f"Cannot use '{clean}' as the auto-created feature "
+                    f"branch: it is itself a protected branch. "
+                    f"Choose a name outside the protected pattern set "
+                    f"(e.g. 'feature/{clean.replace('/', '-')}').",
+                    details={
+                        "preferred_name": preferred_name,
+                        "current_branch": current,
+                    },
+                )
+            new_branch = clean
 
-        res = subprocess.run(
-            ["git", "checkout", "-b", new_branch],
+        if not new_branch:
+            stamp = _dt.utcnow().strftime("%Y%m%d-%H%M%S")
+            new_branch = f"peldrun/manual-{stamp}"
+
+        # If the branch already exists locally, check it out.
+        # Otherwise, create it. `git checkout <name>` without `-b`
+        # succeeds when the branch exists and fails when it doesn't;
+        # we therefore probe with `rev-parse --verify` first so we
+        # can choose the right subcommand deterministically and avoid
+        # relying on error-message parsing.
+        exists = subprocess.run(
+            [
+                "git",
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"refs/heads/{new_branch}",
+            ],
             cwd=ws_ref.workspace_path,
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
-        if res.returncode != 0:
-            raise ValidationError(f"Could not create branch '{new_branch}': {res.stderr.strip()}")
+        if exists.returncode == 0:
+            res = subprocess.run(
+                ["git", "checkout", new_branch],
+                cwd=ws_ref.workspace_path,
+                capture_output=True, text=True, timeout=10,
+            )
+            if res.returncode != 0:
+                raise ValidationError(
+                    f"Could not check out existing branch '{new_branch}': "
+                    f"{res.stderr.strip()}"
+                )
+        else:
+            res = subprocess.run(
+                ["git", "checkout", "-b", new_branch],
+                cwd=ws_ref.workspace_path,
+                capture_output=True, text=True, timeout=10,
+            )
+            if res.returncode != 0:
+                raise ValidationError(
+                    f"Could not create branch '{new_branch}': "
+                    f"{res.stderr.strip()}"
+                )
+
+        # Update the workspace registry so downstream code (notably
+        # `push_approved_branch`) sees the new branch. Without this,
+        # `ws_ref.current_branch` still points at the OLD branch
+        # (`main`), and the push would do `git push main:feature-x`
+        # — pushing the WRONG branch (without the new commits).
+        # That is precisely the bug that caused the UI to report
+        # "Push Successful" while GitHub received nothing.
+        try:
+            if hasattr(self.workspace_manager, "set_current_branch"):
+                self.workspace_manager.set_current_branch(
+                    workspace_id, new_branch
+                )
+            elif (
+                hasattr(self.workspace_manager, "_workspaces")
+                and isinstance(self.workspace_manager._workspaces, dict)
+                and workspace_id in self.workspace_manager._workspaces
+            ):
+                from dataclasses import replace as _dc_replace
+                _current_ws = self.workspace_manager._workspaces[
+                    workspace_id
+                ]
+                self.workspace_manager._workspaces[workspace_id] = (
+                    _dc_replace(_current_ws, current_branch=new_branch)
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "ensure_editable_branch: could not update "
+                "workspace.current_branch for %r: %s",
+                workspace_id,
+                type(exc).__name__,
+            )
 
         self._audit(
             AuditEventType.OTHER,
             action="auto_branch_created",
-            message=f"Auto-created branch '{new_branch}' from '{current}'.",
-            payload={"workspace_id": workspace_id, "from_branch": current, "to_branch": new_branch},
+            message=(
+                f"Auto-created branch '{new_branch}' from '{current}'."
+                + (" (user-specified name)" if preferred_name else "")
+            ),
+            payload={
+                "workspace_id": workspace_id,
+                "from_branch": current,
+                "to_branch": new_branch,
+                "user_specified": bool(preferred_name),
+            },
             actor="user",
         )
         return new_branch
@@ -2880,43 +3305,161 @@ class SourceControlFacade:
 
         ws_id_for_branch = getattr(payload, "workspace_id", None)
 
-        # AUTO-BRANCHING: If this is a push operation targeting a
-        # protected branch (e.g. "main"), the policy engine will
-        # refuse it. Rather than surfacing that refusal to the user,
-        # we transparently create a new feature branch from HEAD
-        # (which already contains any commits the agent made) and
-        # retarget the operation at that branch.
+        # AUTO-BRANCHING — Task 1.2 integration:
+        #
+        # Historically, a push targeting a protected branch always
+        # auto-branched to `peldrun/manual-XXX` regardless of user
+        # intent. Task 1.2 makes this decision settings-aware.
+        #
+        #   - `auto_create_feature_branch=True` (default): auto-branch,
+        #     exactly as before. The push will target the new branch,
+        #     which is not protected.
+        #   - `auto_create_feature_branch=False`: keep the original
+        #     target. The push flow (`push_approved_branch`) will then
+        #     apply the `allow_push_to_protected` policy at execution
+        #     time.
+        #   - `user_override_protected` includes the target: treat as
+        #     unprotected and do NOT auto-branch. The owner explicitly
+        #     exempted this branch.
+        #
+        # Any failure during settings loading falls back to the
+        # historical behavior (auto-branch) so that a broken settings
+        # file never blocks operation creation.
+        _auto_created = False
+        _original_target = clean_target
+        # Read `force_protected_push` early so we can decide whether
+        # to auto-branch below. When True, the caller has explicitly
+        # consented to pushing to a protected branch, so we MUST NOT
+        # redirect the target — that would defeat the entire purpose.
+        _force_protected = bool(
+            getattr(payload, "force_protected_push", False)
+        )
+
         if (
             ws_id_for_branch
             and payload.operation_type == "push_branch"
             and is_protected_branch(clean_target)
+            and not _force_protected
         ):
             try:
-                new_branch = await self.ensure_editable_branch(ws_id_for_branch)
-                clean_target = validate_branch_name(new_branch)
-                logger.info(
-                    "create_operation: auto-created branch '%s' "
-                    "(original target '%s' was protected)",
-                    new_branch,
-                    payload.target_branch,
+                _settings = await self.read_settings()
+                _branch_policy = await self._load_branch_policy_from_settings()
+                _effective_protected = _branch_policy.is_protected(
+                    clean_target
                 )
-            except Exception as exc:
+                if (
+                    _effective_protected
+                    and _settings.auto_create_feature_branch
+                ):
+                    try:
+                        # Task 1.5: pass the user's preferred branch
+                        # name (if any) to `ensure_editable_branch`.
+                        # When omitted, the timestamped default is
+                        # used, exactly as before.
+                        _preferred = getattr(
+                            payload, "preferred_branch_name", None
+                        )
+                        new_branch = await self.ensure_editable_branch(
+                            ws_id_for_branch,
+                            preferred_name=_preferred,
+                        )
+                        clean_target = validate_branch_name(new_branch)
+                        _auto_created = True
+                        logger.info(
+                            "create_operation: auto-created branch "
+                            "'%s' (original target '%s' was protected; "
+                            "auto_create_feature_branch=True; "
+                            "preferred_name=%r)",
+                            new_branch,
+                            _original_target,
+                            _preferred,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "create_operation: could not auto-create "
+                            "branch for protected target '%s': %s",
+                            clean_target,
+                            exc,
+                        )
+                elif not _effective_protected and getattr(
+                    payload, "preferred_branch_name", None
+                ):
+                    # User provided a preferred branch name, but the
+                    # target branch is not protected, so auto-branching
+                    # will not trigger. Log the mismatch so operators
+                    # can spot confused agents/callers. Do NOT fail
+                    # the operation: the value is simply unused.
+                    logger.info(
+                        "create_operation: ignoring "
+                        "preferred_branch_name=%r because target '%s' "
+                        "is not protected (no auto-branch will occur).",
+                        getattr(payload, "preferred_branch_name", None),
+                        clean_target,
+                    )
+                else:
+                    logger.info(
+                        "create_operation: keeping target '%s' "
+                        "(auto_create_feature_branch=%s, "
+                        "effective_protected=%s). The push flow will "
+                        "apply allow_push_to_protected.",
+                        clean_target,
+                        _settings.auto_create_feature_branch,
+                        _effective_protected,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                # Settings unavailable: fall back to historical
+                # behavior (auto-branch) so the agent is never
+                # blocked by a broken settings file.
                 logger.warning(
-                    "create_operation: could not auto-create branch "
-                    "for protected target '%s': %s",
-                    clean_target,
-                    exc,
+                    "create_operation: settings read failed (%s); "
+                    "falling back to auto-branch.",
+                    type(exc).__name__,
                 )
+                try:
+                    new_branch = await self.ensure_editable_branch(
+                        ws_id_for_branch
+                    )
+                    clean_target = validate_branch_name(new_branch)
+                    _auto_created = True
+                except Exception:  # noqa: BLE001
+                    pass
 
         policy_ctx = PolicyResolutionContext(
             operation=payload.operation_type,
             provider=provider_id,
             target_branch=clean_target,
             actor="agent",
+            # When the user explicitly opted in to pushing directly
+            # to a protected branch, we must tell the policy engine
+            # that this is an authorized override. Setting
+            # `remote_protection=False` causes `evaluate_policy` to
+            # skip the local protected-branch check, which is exactly
+            # what we want here. (The actual push will still be
+            # verified against the remote provider in
+            # `push_approved_branch`.)
+            remote_protection=False if _force_protected else None,
         )
         self.policy_engine.require(policy_ctx)
 
         metadata: Dict[str, Any] = {}
+        # Record the auto-branch decision (Task 1.2) so the UI and the
+        # agent can surface it accurately. `original_target_branch` is
+        # the branch the caller originally requested; `clean_target`
+        # is what the push will actually target.
+        if _auto_created and clean_target != _original_target:
+            metadata["original_target_branch"] = _original_target
+            metadata["auto_created_branch"] = {
+                "from": _original_target,
+                "to": clean_target,
+                "reason": "protected_branch_auto_redirect",
+            }
+
+        # Persist the owner-override intent (Task 2.2) so that
+        # `push_approved_branch` can bypass the local protected-branch
+        # check. The remote provider (GitHub) still has the final say.
+        if _force_protected:
+            metadata["force_protected_push"] = True
+            metadata["force_protected_reason"] = "owner_override"
         title = getattr(payload, "title", None)
         description = getattr(payload, "description", None)
         if title:
@@ -3104,13 +3647,87 @@ class SourceControlFacade:
 
         effective_operation = operation or record.kind
 
+        # Compute the approval_scope for the ticket (Task 1.3).
+        #
+        # The scope tells the push flow what the user was actually
+        # approving:
+        #
+        #   - "push_branch"        → normal push. `push_approved_branch`
+        #                            will apply the historical
+        #                            protection rules and may refuse.
+        #
+        #   - "push_to_protected"  → explicit consent to push to a
+        #                            protected branch. Only granted
+        #                            when `allow_push_to_protected =
+        #                            "ask"` or `"always"` in the
+        #                            user's settings AND the target
+        #                            matches the protected set.
+        #
+        # When `allow_push_to_protected = "never"` (or settings
+        # cannot be read), the ticket is issued with the normal
+        # scope; `push_approved_branch` will refuse the push. This
+        # preserves the historical behavior for deployments that
+        # have not customized the setting.
+        _target_branch = record.target_branch or ""
+        _approval_scope = "push_branch"
+        # Use the settings-aware branch policy (Task 1.2) so that a
+        # branch exempted via `user_override_protected` does NOT get
+        # a `push_to_protected` scope. Without this, a user who
+        # exempted `main` locally would still be shown the "you are
+        # about to push to a protected branch" warning, contradicting
+        # the override they configured.
+        _target_is_protected = False
+        if _target_branch:
+            try:
+                _approval_branch_policy = (
+                    await self._load_branch_policy_from_settings()
+                )
+                _target_is_protected = _approval_branch_policy.is_protected(
+                    _target_branch
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "request_operation_approval: settings-aware "
+                    "protection check failed (%s); falling back to "
+                    "hardcoded patterns.",
+                    type(exc).__name__,
+                )
+                _target_is_protected = is_protected_branch(_target_branch)
+        if _target_is_protected:
+            _scope_settings = None
+            try:
+                _scope_settings = await self.read_settings()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "request_operation_approval: settings read "
+                    "failed (%s); issuing normal-scope ticket.",
+                    type(exc).__name__,
+                )
+            _mode = (
+                getattr(
+                    _scope_settings, "allow_push_to_protected", "never"
+                )
+                if _scope_settings is not None
+                else "never"
+            )
+            if _mode in ("ask", "always"):
+                _approval_scope = "push_to_protected"
+            logger.info(
+                "request_operation_approval: target '%s' is protected; "
+                "allow_push_to_protected=%r → approval_scope=%r",
+                _target_branch,
+                _mode,
+                _approval_scope,
+            )
+
         ticket: ApprovalTicket = self.approval_gate.create_ticket(
             operation_id=record.operation_id,
             repository_id=record.repository_id,
             operation=effective_operation,
             base_sha=base_sha,
             diff_sha256=diff_hash,
-            target_branch=record.target_branch or "",
+            target_branch=_target_branch,
+            approval_scope=_approval_scope,
         )
 
         await self.operation_service.attach_diff(
@@ -3488,11 +4105,176 @@ class SourceControlFacade:
             raise ValidationError(
                 f"Approval ticket '{payload.approval_id}' is not known."
             )
-        if is_protected_branch(ticket.target_branch):
+        # Protected-branch decision — Task 1.2 integration.
+        #
+        # Historically, this block refused any push whose target
+        # matched the hardcoded protected patterns, regardless of the
+        # user's settings or GitHub's actual protection configuration.
+        # The new logic respects THREE inputs, in priority order:
+        #
+        #   1. `user_override_protected` — branches the owner has
+        #      explicitly exempted. Treated as unprotected UNLESS the
+        #      remote itself reports them as protected (GitHub is
+        #      still authoritative).
+        #
+        #   2. `remote_protection` — the tri-state answer from
+        #      GitHub's branch-protection API (Task 1.2). When
+        #      GitHub says the branch is NOT protected (404 on the
+        #      protection endpoint), the push proceeds — GitHub is
+        #      the authoritative source of truth for its own rules.
+        #
+        #   3. `allow_push_to_protected` — the user's fallback
+        #      policy. Only consulted when the branch is protected
+        #      locally AND `auto_create_feature_branch` is False
+        #      (i.e. the push is actually reaching the original
+        #      protected target, not a redirected feature branch):
+        #
+        #          "never"  — refuse the push (current behavior).
+        #          "ask"    — refuse UNLESS the remote explicitly
+        #                     reports the branch as unprotected.
+        #          "always" — allow the push (owner override).
+        #
+        # Settings load failures degrade gracefully to the historical
+        # "refuse protected branches" behavior so that a broken
+        # settings file never makes a push less safe.
+        _settings: Optional[Any] = None
+        _branch_policy: Optional[Any] = None
+        try:
+            _settings = await self.read_settings()
+            _branch_policy = await self._load_branch_policy_from_settings()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "push_approved_branch: settings read failed (%s); "
+                "falling back to historical protection rules.",
+                type(exc).__name__,
+            )
+
+        if _branch_policy is not None:
+            _matches_patterns = _branch_policy.matches(ticket.target_branch)
+            _locally_protected = _branch_policy.is_protected(
+                ticket.target_branch
+            )
+            _is_overridden = _matches_patterns and not _locally_protected
+        else:
+            _matches_patterns = is_protected_branch(ticket.target_branch)
+            _locally_protected = _matches_patterns
+            _is_overridden = False
+
+        _mode = (
+            getattr(_settings, "allow_push_to_protected", "never")
+            if _settings is not None
+            else "never"
+        )
+
+        # Read the owner-override flag from the operation metadata
+        # (Task 2.2). When the user checked "Push directly to this
+        # branch" on the Review screen, `create_operation` stored
+        # this flag; here we honour it by skipping the local
+        # protected-branch refusal. The remote (GitHub) is still
+        # consulted below, so a genuinely-protected branch on
+        # GitHub will still be refused.
+        _force_protected = bool(
+            dict(getattr(record, "metadata", {}) or {}).get(
+                "force_protected_push", False
+            )
+        )
+
+        # Early refusal for "never" mode: no token, no remote check,
+        # no consume. The user has configured this branch as
+        # push-forbidden. Skipped when `_force_protected` is True —
+        # the user has explicitly overridden the setting for this
+        # single operation.
+        if _locally_protected and _mode == "never" and not _force_protected:
             raise PermissionDeniedError(
                 f"Pushing to protected branch '{ticket.target_branch}' "
-                "is forbidden by policy."
+                "is forbidden by policy (allow_push_to_protected='never')."
             )
+
+        # Fetch the token here so the remote-protection check (below)
+        # and the subsequent push can share it. A missing or expired
+        # credential fails BEFORE the approval ticket is consumed, so
+        # the user never has to re-approve an unchanged diff.
+        token = await self._require_token(provider_id)
+
+        # Determine whether we need to consult the remote.
+        _needs_remote_check = _is_overridden or (
+            _locally_protected and _mode == "ask"
+        )
+        _remote_protection_for_policy: Optional[bool] = None
+        if _needs_remote_check:
+            _remote_protection_for_policy = await self._check_remote_protection(
+                adapter=self.registry.get(provider_id.value),
+                repository_id=record.repository_id,
+                provider_id=provider_id,
+                branch_name=ticket.target_branch,
+                token=token,
+            )
+
+        # Verify the ticket's approval_scope covers protected-target
+        # pushes (Task 1.3). This check runs BEFORE the policy engine
+        # so that a user who was NOT asked about the protected scope
+        # receives a clear, actionable message instead of a generic
+        # "policy denied" error.
+        #
+        # The rule: when the target is locally protected AND the
+        # remote did not explicitly report it as unprotected, the
+        # ticket MUST carry `approval_scope="push_to_protected"`.
+        # Otherwise, the user is being asked to perform a push that
+        # they were never told would hit a protected branch.
+        if _locally_protected and _remote_protection_for_policy is not False:
+            _ticket_scope = getattr(ticket, "approval_scope", "push_branch")
+            if _ticket_scope != "push_to_protected":
+                raise PermissionDeniedError(
+                    f"Approval ticket '{payload.approval_id}' was issued "
+                    f"for a normal push, but branch '{ticket.target_branch}' "
+                    f"is protected. The ticket does not cover the extra "
+                    f"risk of pushing to a protected branch. "
+                    f"Re-request approval with "
+                    f"allow_push_to_protected='ask' in settings to "
+                    f"receive a ticket with scope 'push_to_protected', "
+                    f"or add '{ticket.target_branch}' to "
+                    f"user_override_protected if you are certain the "
+                    f"remote will accept it."
+                )
+
+        # Decide the effective protection state. `_remote_protection_for_policy`
+        # is what we pass to the policy engine: `False` tells it to
+        # skip its own local check (we already decided above);
+        # `None` leaves the decision to the policy engine's own
+        # `BranchPolicy` (which uses the historical defaults and is
+        # already what non-protected branches expect).
+        if _is_overridden:
+            # The owner explicitly exempted this branch. Only the
+            # remote can override their decision.
+            if _remote_protection_for_policy is True:
+                raise PermissionDeniedError(
+                    f"Branch '{ticket.target_branch}' is protected on "
+                    f"the remote, even though you overrode it locally. "
+                    f"Remove it from 'user_override_protected' or "
+                    f"disable remote branch protection first."
+                )
+            _remote_protection_for_policy = False
+        elif _locally_protected:
+            if _force_protected or _mode == "always":
+                # Owner override (either per-operation or per-setting):
+                # allow regardless of local patterns. The remote check
+                # below still applies.
+                _remote_protection_for_policy = False
+            elif _mode == "ask":
+                if _remote_protection_for_policy is not False:
+                    raise PermissionDeniedError(
+                        f"Branch '{ticket.target_branch}' is protected. "
+                        f"To push, either: "
+                        f"(1) check 'Push directly to this branch' on "
+                        f"the Review screen, "
+                        f"(2) set allow_push_to_protected='always', "
+                        f"(3) add '{ticket.target_branch}' to "
+                        f"user_override_protected, "
+                        f"(4) disable branch protection on GitHub, or "
+                        f"(5) enable auto-branching "
+                        f"(auto_create_feature_branch=True)."
+                    )
+                _remote_protection_for_policy = False
 
         # Re-evaluate the policy at execution time, not only at the
         # moment the ticket was created. The user may have approved the
@@ -3502,19 +4284,19 @@ class SourceControlFacade:
         # must be refused. The check MUST run BEFORE `consume` so that
         # a valid ticket is never burned by a policy denial — the user
         # can retry after the policy is relaxed without re-approving.
+        #
+        # `remote_protection` is threaded through so the policy engine
+        # honours the local decision we just made (or defers to the
+        # remote when we did not reach one).
         policy_ctx = PolicyResolutionContext(
             operation="push_branch",
             provider=provider_id,
             target_branch=ticket.target_branch,
             source_branch=ws_ref.current_branch,
             actor="system",
+            remote_protection=_remote_protection_for_policy,
         )
         self.policy_engine.require(policy_ctx)
-
-        # Fetch the token BEFORE consuming the ticket so that a missing
-        # or expired credential does not consume the ticket and force
-        # the user to re-approve an unchanged diff.
-        token = await self._require_token(provider_id)
 
         # Consume the ticket only after every local and policy check
         # has passed.
@@ -3539,10 +4321,125 @@ class SourceControlFacade:
             actor="system",
         )
 
+        # Commit the worktree changes before pushing. Without this
+        # commit the branch has no new commits, so `git push` would
+        # report "Everything up-to-date" and the UI would show a
+        # false success while nothing reached the remote.
+        #
+        # The message is taken from the operation metadata (the
+        # "Describe your changes" card in Manual Mode) and falls
+        # back to a deterministic default. `stage_all=True` stages
+        # every modified, added, or deleted file. `allow_empty=False`
+        # makes the commit manager raise `WorkspaceDirtyError` when
+        # there is nothing to commit — which is the correct behavior:
+        # we do not want an empty commit, and the subsequent push
+        # will correctly report "up-to-date".
+        try:
+            from integrations.source_control.git.commit import (
+                get_default_commit_manager,
+                CommitOptions,
+            )
+            from integrations.source_control.errors import WorkspaceDirtyError
+        except ImportError:
+            from backend.integrations.source_control.git.commit import (  # type: ignore[no-redef]
+                get_default_commit_manager,
+                CommitOptions,
+            )
+            from backend.integrations.source_control.errors import WorkspaceDirtyError  # type: ignore[no-redef]
+
+        commit_mgr = get_default_commit_manager()
+        record_meta = dict(getattr(record, "metadata", {}) or {})
+        commit_message = (
+            str(record_meta.get("title") or "").strip()
+            or f"PELDRUN manual change ({operation_id[:8]})"
+        )
+        try:
+            commit_ref = await commit_mgr.create_commit(
+                workspace_id=record.workspace_id,
+                message=commit_message,
+                workspace_path=ws_ref.workspace_path,
+                options=CommitOptions(stage_all=True, allow_empty=False),
+            )
+            logger.info(
+                "push_approved_branch: committed %s before push",
+                commit_ref.sha[:12],
+            )
+        except WorkspaceDirtyError:
+            # Nothing to commit; the branch is already up to date
+            # locally. The push below will report "up-to-date".
+            pass
+
+        # Determine the ACTUAL local branch that contains the commit.
+        #
+        # Reading `ws_ref.current_branch` here is unreliable: `ws_ref`
+        # was captured at the top of this method, BEFORE
+        # `create_operation` may have called `ensure_editable_branch`
+        # to redirect a protected-branch push onto a new feature
+        # branch. In that case the registry's `current_branch` still
+        # points at the OLD branch (`main`), while the worktree is
+        # actually on the new branch (`peldrun/manual-...`).
+        #
+        # Pushing `main:peldrun/manual-...` sends the OLD branch
+        # (without the new commits) to the remote feature branch,
+        # which Git reports as "Everything up-to-date" — a false
+        # success. This was the exact bug behind the UI reporting
+        # "Push Successful" while GitHub received nothing.
+        #
+        # Reading the current branch from Git directly is the
+        # authoritative source of truth: the commit manager ran
+        # `git commit` on whatever HEAD was, and `git rev-parse
+        # --abbrev-ref HEAD` returns exactly that branch.
+        import subprocess as _subprocess
+
+        _local_branch = ws_ref.current_branch
+        try:
+            _head_res = _subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=ws_ref.workspace_path,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            _detected = (
+                _head_res.stdout.strip()
+                if _head_res.returncode == 0
+                else ""
+            )
+            if _detected and _detected != "HEAD":
+                _local_branch = _detected
+                if _local_branch != ws_ref.current_branch:
+                    logger.info(
+                        "push_approved_branch: registry branch "
+                        "('%s') differs from actual git HEAD "
+                        "('%s'); using git HEAD for push.",
+                        ws_ref.current_branch,
+                        _local_branch,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "push_approved_branch: could not read git HEAD "
+                "(%s); falling back to ws_ref.current_branch.",
+                type(exc).__name__,
+            )
+
+        # Safety net: `push_branch` is supposed to push exactly ONE
+        # ref. Passing a local branch that does not match what the
+        # remote branch name suggests would silently push the wrong
+        # ref. Warn (but proceed) when the two disagree so an
+        # operator can spot the mismatch in the logs.
+        if _local_branch != consumed.target_branch:
+            logger.info(
+                "push_approved_branch: pushing local '%s' → "
+                "remote '%s' (they differ; this is correct for "
+                "auto-branch redirects).",
+                _local_branch,
+                consumed.target_branch,
+            )
+
         try:
             push_result: PushResult = await self.push_manager.push_branch(
                 workspace_id=record.workspace_id,
-                local_branch=ws_ref.current_branch,
+                local_branch=_local_branch,
                 remote=getattr(payload, "remote_name", None) or "origin",
                 remote_branch=consumed.target_branch,
                 set_upstream=bool(
@@ -3620,6 +4517,79 @@ class SourceControlFacade:
             )
             raise SourceControlError(
                 f"Push was rejected: {push_result.rejected_reason or 'unknown'}."
+            )
+
+        # Verify the push actually landed the commits we expect.
+        #
+        # `git push` can legitimately return "Everything up-to-date"
+        # (which `GitPushManager` classifies as `accepted=True`)
+        # when the local branch it was told to push does not contain
+        # the commits we just created. This was the exact bug behind
+        # the "false success" UI: `push_approved_branch` was telling
+        # Git to push the OLD branch while the new commits lived on
+        # a DIFFERENT local branch. The push returned success, but
+        # GitHub received nothing.
+        #
+        # The authoritative check is: does the remote branch now
+        # point at the commit we just made? If not, the push is a
+        # false success and we must fail loudly so the user knows
+        # to investigate — silently reporting success would be
+        # worse than reporting failure.
+        _remote_sha = push_result.remote_sha or ""
+        _local_sha = push_result.local_sha or ""
+        if (
+            _local_sha
+            and _remote_sha
+            and _local_sha != _remote_sha
+        ):
+            # The commit we created is NOT what the remote now
+            # holds. This means the push was redirected to a
+            # different branch, or the local branch did not
+            # contain the commit we expected. Either way, the
+            # operation MUST be marked as failed so the user
+            # does not believe the push succeeded.
+            logger.error(
+                "push_approved_branch: SHA mismatch after push "
+                "(local=%s remote=%s, local_branch=%s, "
+                "target=%s). The remote does NOT contain the "
+                "committed changes.",
+                _local_sha[:12],
+                _remote_sha[:12],
+                _local_branch,
+                consumed.target_branch,
+            )
+            await self.operation_service.transition(
+                operation_id,
+                OperationStatus.FAILED_RETRYABLE,
+                reason=(
+                    f"Push returned success but the remote "
+                    f"branch '{consumed.target_branch}' does not "
+                    f"contain the committed changes "
+                    f"(local={_local_sha[:12]}, "
+                    f"remote={_remote_sha[:12]}). "
+                    f"The workspace may need to be re-checked-out "
+                    f"or the branch name re-validated."
+                ),
+                metadata={
+                    "local_sha": _local_sha,
+                    "remote_sha": _remote_sha,
+                    "local_branch": _local_branch,
+                    "target_branch": consumed.target_branch,
+                },
+                actor="system",
+            )
+            raise SourceControlError(
+                f"Push verification failed: the remote branch "
+                f"'{consumed.target_branch}' does not contain the "
+                f"committed changes. This usually means the local "
+                f"branch did not match the target branch. Try "
+                f"pushing again from the UI.",
+                details={
+                    "local_sha": _local_sha,
+                    "remote_sha": _remote_sha,
+                    "local_branch": _local_branch,
+                    "target_branch": consumed.target_branch,
+                },
             )
 
         await self.operation_service.transition(
@@ -3966,6 +4936,15 @@ class SourceControlFacade:
             created_at=record.created_at,
             updated_at=record.updated_at,
             events=event_responses,
+            # `record.metadata` is already redacted at write time
+            # (create_operation redacts `title` / `description`), and
+            # the auto-branch annotations written by create_operation
+            # (Task 1.2) contain only branch names and a fixed reason
+            # string. Passing it through verbatim is therefore safe.
+            # The UI relies on `metadata.auto_created_branch` to
+            # display the actual branch the commit landed on, and on
+            # `metadata.original_target_branch` to explain why.
+            metadata=dict(record.metadata or {}),
         )
 
 
@@ -4176,20 +5155,33 @@ class SourceControlFacade:
         Check out an existing local branch in the workspace.
 
         This is a local-only operation: it does not touch the
-        remote. A non-forced checkout is refused when the workspace
-        has uncommitted changes, so user work is never silently
-        discarded. After a successful checkout, the workspace is
-        refreshed and its updated state is returned.
+        remote. Three modes are supported by the underlying branch
+        manager, in priority order:
+
+            1. ``commit_message`` in the payload: any pending changes
+               are committed with that message FIRST, then the branch
+               switch proceeds. This preserves user work across the
+               switch — used by Manual Mode's "change branch" flow.
+            2. ``force=True``: uncommitted changes are discarded via
+               ``git checkout -f``. Destructive; the caller MUST
+               obtain explicit user consent.
+            3. Default (``force=False``, no ``commit_message``): the
+               checkout is refused when the workspace is dirty, so
+               user work is never silently discarded.
+
+        After a successful checkout, the workspace is refreshed and
+        its updated state is returned.
 
         Args:
             workspace_id: Workspace identifier.
-            payload: The checkout request (`branch_name`, `force`).
+            payload: The checkout request (`branch_name`, `force`,
+                optional `commit_message`).
 
         Raises:
             NotFoundError: If the workspace or the branch does not
                 exist.
-            ConflictError: If the workspace is dirty and `force` is
-                False.
+            ConflictError: If the workspace is dirty and neither
+                `force` nor `commit_message` was provided.
         """
         ws_ref = self.workspace_manager.get_workspace(workspace_id)
         if ws_ref is None:
@@ -4197,11 +5189,19 @@ class SourceControlFacade:
                 f"Workspace '{workspace_id}' was not found."
             )
 
+        # `commit_message` is Optional in the schema. Use `getattr`
+        # with a safe default so this facade remains compatible with
+        # older schema revisions where the field is absent (a
+        # deployment scenario in which the backend package and the
+        # schema package are updated at different moments).
+        commit_message = getattr(payload, "commit_message", None)
+
         await self.branch_manager.checkout_branch(
             workspace_id,
             branch_name=payload.branch_name,
             workspace_path=ws_ref.workspace_path,
             force=payload.force,
+            commit_message=commit_message,
         )
 
         refreshed = await self.workspace_manager.refresh_workspace_status(
@@ -4214,11 +5214,17 @@ class SourceControlFacade:
             message=(
                 f"Checked out branch '{payload.branch_name}' in "
                 f"workspace '{workspace_id}'."
+                + (
+                    " Pending changes were committed first."
+                    if commit_message
+                    else ""
+                )
             ),
             payload={
                 "workspace_id": workspace_id,
                 "branch_name": payload.branch_name,
                 "force": payload.force,
+                "committed_pending_changes": bool(commit_message),
             },
             workspace_id=workspace_id,
             actor="user",
@@ -6128,6 +7134,47 @@ class SourceControlFacade:
         Kept as a plain dict (not the Pydantic model) so that
         `read_settings` can be written without constructing a model
         when the file is missing (the common case at first run).
+
+        The branch-protection fields below are editable from the
+        UI settings page. Their defaults match the historical
+        hardcoded values in `domain.policies` so that existing
+        deployments behave identically after the upgrade — the
+        difference is that they can now be customized instead of
+        being locked into the source code.
+
+        The four new fields (Task 1.1, Phase 1):
+
+            protected_branches
+                Replaces the hardcoded `DEFAULT_PROTECTED_BRANCH_PATTERNS`
+                when non-empty. The default list is intentionally
+                SHORTER than the hardcoded one (main/master/trunk
+                vs the full 18-pattern list) so that the UI can
+                display a comprehensible starting set. Users who
+                need the full list can add the extra patterns
+                explicitly, or leave the setting absent and the
+                policy engine falls back to its built-in defaults.
+
+            user_override_protected
+                Per-branch exemptions. A branch listed here is
+                treated as unprotected even if it matches a
+                protected pattern. This is how a repository owner
+                expresses "I know what I'm doing, let me push to
+                main."
+
+            auto_create_feature_branch
+                When True (default), a push targeting a protected
+                branch is redirected to a new `peldrun/manual-XXX`
+                feature branch instead of being refused. The new
+                branch name is recorded in the operation metadata
+                and surfaced in the UI so the user always knows
+                where the commit landed.
+
+            allow_push_to_protected
+                Fallback policy when auto-branching is disabled.
+                Defaults to "ask", which requires the user to
+                grant an explicit `push_to_protected` approval
+                scope during review. This is the safest behavior
+                that still lets the owner override when needed.
         """
         return {
             "enabled": False,
@@ -6138,6 +7185,11 @@ class SourceControlFacade:
             "diff_sample_lines": 500,
             "polling_interval_ms": 3000,
             "list_page_size": 30,
+            # ---- Branch protection (Task 1.1, Phase 1) ----
+            "protected_branches": ("main", "master", "trunk"),
+            "user_override_protected": (),
+            "auto_create_feature_branch": True,
+            "allow_push_to_protected": "ask",
         }
 
     async def read_settings(self) -> SourceControlSettingsResponse:

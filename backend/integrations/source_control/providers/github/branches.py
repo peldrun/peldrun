@@ -263,6 +263,107 @@ class GitHubBranchService:
             )
         return self._map_branch(payload, default_branch=default_branch)
 
+    # --- Branch protection ---------------------------------------------
+
+    async def get_branch_protection(
+        self,
+        *,
+        repo: RepositoryRef,
+        branch_name: str,
+        token: str,
+    ) -> Optional[Mapping[str, Any]]:
+        """
+        Return the GitHub branch protection configuration for a branch.
+
+        Calls ``GET /repos/{owner}/{repo}/branches/{branch}/protection``.
+
+        Returns:
+            The protection configuration as a mapping when the branch
+            IS protected. Returns ``None`` when the branch is NOT
+            protected (GitHub responds with 404 for unprotected
+            branches — this is a legitimate state, not an error).
+
+        Raises:
+            ValidationError: If inputs are malformed.
+            PermissionDeniedError: If the token cannot read protection
+                settings (usually requires admin scope).
+            ProviderError: For other unexpected errors.
+        """
+        if not isinstance(repo, RepositoryRef):
+            raise ValidationError(
+                "repo must be a RepositoryRef.",
+                details={"type": type(repo).__name__},
+            )
+        if not branch_name or not isinstance(branch_name, str):
+            raise ValidationError(
+                "branch_name must be a non-empty string."
+            )
+        if not token:
+            raise ValidationError("token must not be empty.")
+
+        repo_path = self._build_repo_path(repo)
+        encoded_name = quote(branch_name, safe="")
+
+        try:
+            payload = await self._client.get_json(
+                f"{repo_path}/branches/{encoded_name}/protection",
+                token=token,
+            )
+        except NotFoundError:
+            # 404 = no protection configured. This is the "not
+            # protected" state, not an error. Returning None lets
+            # the caller distinguish "unprotected" from "check
+            # failed" (which raises).
+            return None
+
+        if not isinstance(payload, Mapping):
+            raise ProviderError(
+                "GitHub returned an unexpected payload for branch "
+                "protection.",
+                details={"branch": branch_name},
+            )
+        return payload
+
+    async def is_branch_protected_remotely(
+        self,
+        *,
+        repo: RepositoryRef,
+        branch_name: str,
+        token: str,
+    ) -> Optional[bool]:
+        """
+        Return whether a branch is protected on GitHub.
+
+        This is a convenience wrapper around
+        ``get_branch_protection`` that returns a tri-state answer
+        instead of a payload:
+
+            - ``True``  : branch IS protected on GitHub.
+            - ``False`` : branch is NOT protected on GitHub (404).
+            - ``None``  : the check could not be performed (network
+                          error, insufficient permissions, unknown
+                          branch). The caller MUST treat this as
+                          "unknown, assume protected" — never as
+                          "not protected".
+
+        The tri-state is deliberate: a silent ``False`` on failure
+        would let a push to a genuinely protected branch proceed
+        whenever the GitHub API is momentarily unavailable, which
+        defeats the entire safety guarantee.
+        """
+        try:
+            protection = await self.get_branch_protection(
+                repo=repo, branch_name=branch_name, token=token
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not determine remote protection for '%s': %s",
+                branch_name,
+                type(exc).__name__,
+            )
+            return None
+        return protection is not None
+
     # --- Internal: URL construction ------------------------------------
 
     @staticmethod

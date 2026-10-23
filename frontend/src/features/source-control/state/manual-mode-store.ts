@@ -26,6 +26,15 @@ interface ManualModeState {
   operationId: string | null;
   approvalId: string | null;
   diff: DiffSummaryResponse | null;
+  // Scope of the approval ticket (Task 1.3). Two values:
+  //   - "push_branch"       → normal push, refused if target
+  //                           turns out to be protected
+  //   - "push_to_protected" → explicit consent to push to a
+  //                           branch that matches the protected set
+  // Set by `setApproval` when the store receives the ticket from
+  // the backend. Used by ManualDiffReview to warn the user before
+  // they click "Proceed to Approve".
+  approvalScope: string;
 
   // Change description (optional). Collected in the "reviewing"
   // and "approving" steps and surfaced to the backend as
@@ -35,6 +44,17 @@ interface ManualModeState {
   // operation's metadata.
   title: string;
   description: string;
+  // Optional user-chosen branch name for the auto-created feature
+  // branch (Task 1.5). Only used when the target branch is
+  // protected AND settings have `auto_create_feature_branch=true`.
+  // When empty, the backend generates a timestamped name like
+  // `peldrun/manual-YYYYMMDD-HHMMSS`.
+  preferredBranchName: string;
+  // When true, the user has explicitly checked the "Owner override"
+  // box on the Repo Selector screen. The backend will skip the
+  // auto-branch redirect and issue an approval ticket with scope
+  // "push_to_protected".
+  forceProtectedPush: boolean;
 
   // Error
   error: string | null;
@@ -54,12 +74,15 @@ interface ManualModeState {
   setApproval: (
     operationId: string,
     approvalId: string,
-    diff: DiffSummaryResponse
+    diff: DiffSummaryResponse,
+    approvalScope?: string
   ) => void;
   clearApproval: () => void;
 
   setTitle: (title: string) => void;
   setDescription: (description: string) => void;
+  setPreferredBranchName: (preferredBranchName: string) => void;
+  setForceProtectedPush: (force: boolean) => void;
 
   setError: (error: string | null) => void;
   reset: () => void;
@@ -76,8 +99,11 @@ const initialState = {
   operationId: null as string | null,
   approvalId: null as string | null,
   diff: null as DiffSummaryResponse | null,
+  approvalScope: "push_branch",
   title: "",
   description: "",
+  preferredBranchName: "",
+  forceProtectedPush: false,
   error: null as string | null,
 };
 
@@ -133,11 +159,12 @@ export const useManualModeStore = create<ManualModeState>((set) => ({
   // The user must review the diff in step "reviewing" first;
   // the transition to "approving" happens via an explicit
   // "Proceed to Approve & Push" button.
-  setApproval: (operationId, approvalId, diff) =>
+  setApproval: (operationId, approvalId, diff, approvalScope) =>
     set({
       operationId,
       approvalId,
       diff,
+      approvalScope: approvalScope || "push_branch",
       error: null,
     }),
 
@@ -146,6 +173,7 @@ export const useManualModeStore = create<ManualModeState>((set) => ({
       operationId: null,
       approvalId: null,
       diff: null,
+      approvalScope: "push_branch",
       // The description belongs to the approved change; when the
       // approval is cleared, the description is cleared with it.
       // Keeping it around would make the next review silently
@@ -157,6 +185,10 @@ export const useManualModeStore = create<ManualModeState>((set) => ({
 
   setTitle: (title) => set({ title }),
   setDescription: (description) => set({ description }),
+  setPreferredBranchName: (preferredBranchName) =>
+    set({ preferredBranchName }),
+  setForceProtectedPush: (forceProtectedPush) =>
+    set({ forceProtectedPush }),
 
   // Only move to the "error" step when SETTING an error. When
   // CLEARING it (`setError(null)`), leave the current step

@@ -204,6 +204,23 @@ class ApprovalTicketResponse(BaseSCResponse):
             "the response reflects the actual ticket creation moment."
         ),
     )
+    approval_scope: str = Field(
+        default="push_branch",
+        description=(
+            "What the user is being asked to approve. "
+            "'push_branch' means a normal push to an unprotected "
+            "branch; if the target turns out to be protected at "
+            "execution time, the push is refused. "
+            "'push_to_protected' means the user explicitly "
+            "consents to pushing to a protected branch; the push "
+            "will succeed even if the target matches the "
+            "protected patterns (unless the remote provider "
+            "explicitly reports the branch as protected, in which "
+            "case it is still refused). "
+            "The UI SHOULD surface this field prominently so the "
+            "user understands the extra risk they are accepting."
+        ),
+    )
 
 
 class WorkspaceResponse(BaseSCResponse):
@@ -274,6 +291,18 @@ class OperationResponse(BaseSCResponse):
     created_at: datetime = Field(..., description="Creation timestamp.")
     updated_at: datetime = Field(..., description="Last transition timestamp.")
     events: Sequence[OperationEventResponse] = Field(default_factory=tuple, description="Timeline events.")
+    metadata: Mapping[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Extension bag persisted with the operation. Contains "
+            "user-supplied context (title, description) and system-"
+            "generated annotations such as `auto_created_branch` "
+            "(Task 1.2) and `original_target_branch`. The UI uses "
+            "these fields to display the actual branch the commit "
+            "landed on when auto-branching redirected a push. "
+            "Values are already redacted at write time."
+        ),
+    )
 
 
 class AuditLogEntryResponse(BaseSCResponse):
@@ -921,6 +950,55 @@ class SourceControlSettingsResponse(BaseSCResponse):
         description=(
             "Page size for paginated lists (commits, PRs, "
             "issues, ...)."
+        ),
+    )
+    protected_branches: Sequence[str] = Field(
+        default_factory=lambda: ("main", "master", "trunk"),
+        description=(
+            "Branches (or fnmatch patterns) that are treated as "
+            "protected. A push to a protected branch requires an "
+            "extra scope ('push_to_protected') in the approval "
+            "ticket, or triggers auto-branching when "
+            "`auto_create_feature_branch` is True. Overrides the "
+            "hardcoded default in `domain.policies`. Editable from "
+            "the UI settings page."
+        ),
+    )
+    user_override_protected: Sequence[str] = Field(
+        default_factory=tuple,
+        description=(
+            "Branches (or fnmatch patterns) that are EXEMPTED from "
+            "protection. Use this when the caller is the repository "
+            "owner and wants to push directly to the default branch "
+            "without extra friction. Takes precedence over "
+            "`protected_branches`: a branch listed here is treated "
+            "as unprotected."
+        ),
+    )
+    auto_create_feature_branch: bool = Field(
+        default=True,
+        description=(
+            "When True, a push targeting a protected branch is "
+            "automatically redirected to a new feature branch "
+            "(e.g. 'peldrun/manual-XXX') that the caller can later "
+            "open a change request from. The new branch name is "
+            "surfaced in the operation metadata and in the UI. "
+            "When False, the operation keeps the original protected "
+            "target and requires the extra 'push_to_protected' "
+            "approval scope before the push is allowed."
+        ),
+    )
+    allow_push_to_protected: str = Field(
+        default="ask",
+        description=(
+            "Policy for pushes that target a protected branch. "
+            "'never': refuse the push (auto-branch handles the safe "
+            "path); 'ask': require an extra 'push_to_protected' "
+            "approval scope (the user explicitly opted in during "
+            "review); 'always': allow without extra friction. "
+            "Note: this setting is only consulted when "
+            "`auto_create_feature_branch` is False, because "
+            "auto-branching avoids the protected branch entirely."
         ),
     )
 

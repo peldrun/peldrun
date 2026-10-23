@@ -9,31 +9,17 @@ import {
 import { BranchResponse, RepositoryResponse } from "../../api/schemas";
 import { AlertCircle, ArrowRight, RefreshCw } from "lucide-react";
 
-/**
- * Step 1 of Manual Mode: select provider, repository, and base branch.
- *
- * This component is intentionally self-contained — it uses
- * `sourceControlClient` directly instead of an external hook. Two
- * reasons:
- *
- *   1. Manual Mode should not depend on the Agent Mode's data hooks.
- *      They may change signatures independently.
- *   2. The component owns its loading/error state, so failures here
- *      are locally visible and do not leak into other steps.
- *
- * On "Continue", it writes the selection to the store and advances
- * the step to "creating-workspace". The actual workspace creation is
- * the responsibility of ManualWorkspaceCreator (step 2).
- */
 export function ManualRepoSelector() {
   const {
     provider,
     repository,
     branch,
+    forceProtectedPush,
     setProvider,
     setRepository,
     setBranch,
     setStep,
+    setForceProtectedPush,
   } = useManualModeStore();
 
   // Local UI state (not persisted across steps — intentionally).
@@ -139,18 +125,14 @@ export function ManualRepoSelector() {
     !!repository && !!branch && !isLoadingRepos && !isLoadingBranches;
 
   return (
-
-
     <div className="space-y-4">
-
-            {/* Local error (repo/branch load failures) */}
+      {/* Local error (repo/branch load failures) */}
       {error && (
         <div className="flex items-start rounded-md bg-red-50 p-3 border border-red-200">
           <AlertCircle className="h-4 w-4 text-red-600 mr-2 flex-shrink-0 mt-0.5" />
           <p className="text-xs text-red-700 flex-1">{error}</p>
         </div>
       )}
-
 
       <div>
         <h3 className="text-sm font-semibold text-foreground mb-1">
@@ -216,7 +198,14 @@ export function ManualRepoSelector() {
         </div>
         <select
           value={branch}
-          onChange={(e) => setBranch(e.target.value)}
+          onChange={(e) => {
+            setBranch(e.target.value);
+            // Reset the override if the new branch is not protected
+            const selectedBranch = branches.find((b) => b.name === e.target.value);
+            if (!selectedBranch?.is_protected) {
+              setForceProtectedPush(false);
+            }
+          }}
           disabled={!repository || isLoadingBranches}
           className="w-full rounded-md border border-border px-3 py-2 text-sm bg-background disabled:opacity-50"
         >
@@ -234,10 +223,26 @@ export function ManualRepoSelector() {
           ))}
         </select>
         {branch && branches.find((b) => b.name === branch)?.is_protected && (
-          <p className="mt-1 text-[11px] text-yellow-700">
-            ⚠️ This branch is protected. Pushing directly may be denied by
-            policy.
-          </p>
+          <div className="mt-2 rounded-md bg-amber-50 border border-amber-200 p-3">
+            <p className="text-[11px] text-amber-800 font-medium mb-2">
+              ⚠️ This branch is protected.
+            </p>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={forceProtectedPush}
+                onChange={(e) => setForceProtectedPush(e.target.checked)}
+                className="rounded border-amber-300 text-amber-600 focus:ring-amber-500"
+              />
+              <span className="text-[11px] text-amber-800">
+                Push directly to this branch (Owner override)
+              </span>
+            </label>
+            <p className="text-[10px] text-amber-700 mt-1 ml-6">
+              If checked, PELDRUN will bypass the auto-branch feature and
+              push your commits directly to <strong>{branch}</strong>.
+            </p>
+          </div>
         )}
       </div>
 

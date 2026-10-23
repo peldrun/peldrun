@@ -256,14 +256,41 @@ class ApprovalGate:
         target_branch: str,
         ttl_seconds: Optional[int] = None,
         approval_id: Optional[str] = None,
+        approval_scope: str = "push_branch",
     ) -> ApprovalTicket:
-        """Create a new pending approval ticket."""
+        """
+        Create a new pending approval ticket.
+
+        Args:
+            approval_scope: What the user is being asked to approve.
+                Two values are recognized:
+
+                    - "push_branch" (default): a normal push to a
+                      non-protected branch. The push flow will apply
+                      the historical protection rules and may refuse
+                      the push if the target turns out to be
+                      protected.
+
+                    - "push_to_protected": the user explicitly
+                      consents to pushing to a protected branch. This
+                      scope is granted by the application layer ONLY
+                      when the user has configured
+                      `allow_push_to_protected = "ask"` in the
+                      settings, so the extra approval is explicit
+                      rather than implicit.
+        """
         self._validate_non_empty(operation_id, "operation_id")
         self._validate_non_empty(repository_id, "repository_id")
         self._validate_non_empty(operation, "operation")
         self._validate_non_empty(target_branch, "target_branch")
         self._validate_base_sha(base_sha)
         self._validate_diff_sha256(diff_sha256)
+        if approval_scope not in ("push_branch", "push_to_protected"):
+            raise ValidationError(
+                f"Unknown approval_scope '{approval_scope}'. Must be "
+                f"'push_branch' or 'push_to_protected'.",
+                details={"approval_scope": approval_scope},
+            )
 
         ttl = (
             self._default_ttl_seconds
@@ -286,6 +313,7 @@ class ApprovalGate:
             status=ApprovalStatus.PENDING,
             created_at=now,
             consumed_at=None,
+            approval_scope=approval_scope,
         )
 
         with self._lock:
@@ -679,16 +707,33 @@ class ApprovalGate:
         approved_by_user: bool = False,
         expires_at: Optional[datetime] = None,
         created_at: Optional[datetime] = None,
+        approval_scope: str = "push_branch",
     ) -> ApprovalTicket:
         """
         Restore an approval ticket from persistent operation storage.
         Enables state reconstruction across application restarts without
         invalidating granted tickets.
+
+        The `approval_scope` argument defaults to "push_branch" when
+        absent. This is the correct default for older builds that did
+        not yet support "push_to_protected": a restored ticket whose
+        scope was lost during the upgrade will still be usable for
+        normal pushes, but the user will be re-prompted to approve if
+        the target turns out to be protected. That is the safe
+        behavior — it never silently grants a protected-branch push
+        on the basis of a missing field.
         """
         now = _utc_now()
         resolved_status = status or (
             ApprovalStatus.GRANTED if approved_by_user else ApprovalStatus.PENDING
         )
+        if approval_scope not in ("push_branch", "push_to_protected"):
+            logger.warning(
+                "restore_ticket: unknown approval_scope '%s'; "
+                "falling back to 'push_branch'.",
+                approval_scope,
+            )
+            approval_scope = "push_branch"
         ticket = ApprovalTicket(
             approval_id=approval_id,
             operation_id=operation_id,
@@ -702,6 +747,7 @@ class ApprovalGate:
             status=resolved_status,
             created_at=created_at or now,
             consumed_at=None,
+            approval_scope=approval_scope,
         )
         with self._lock:
             self._tickets[ticket.approval_id] = ticket

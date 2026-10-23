@@ -207,13 +207,32 @@ class BranchPolicy:
     """
     Rules for branch protection and default-branch writes.
 
-    A branch is considered protected if its name matches any pattern in
-    `protected_patterns`, compared case-insensitively after trimming
-    surrounding whitespace.
+    A branch is considered protected when:
+
+        1. It is NOT listed in `user_override_protected`, AND
+        2. It matches at least one pattern in `protected_patterns`.
+
+    The override list exists because a repository owner sometimes
+    needs to push directly to `main` on a personal repository where
+    GitHub itself has no branch-protection rule configured. Rather
+    than remove all protection globally, the owner lists the
+    specific branches they want to exempt.
     """
 
     protected_patterns: Sequence[str] = field(
         default_factory=lambda: DEFAULT_PROTECTED_BRANCH_PATTERNS
+    )
+    #: Branches (or fnmatch patterns) that are EXEMPTED from
+    #: protection. Evaluated BEFORE `protected_patterns`: a branch
+    #: listed here is treated as unprotected even if it matches a
+    #: protected pattern.
+    #:
+    #: Populated by the application from
+    #: `SourceControlSettingsResponse.user_override_protected`, so
+    #: that an owner who wants to push directly to `main` can do so
+    #: without editing source code.
+    user_override_protected: Sequence[str] = field(
+        default_factory=tuple
     )
     allow_default_branch_push: bool = False
     allow_force_push: bool = False
@@ -222,6 +241,12 @@ class BranchPolicy:
     def matches(self, branch_name: str) -> bool:
         """
         Return True if `branch_name` matches any protected pattern.
+
+        This method performs PURE PATTERN MATCHING and does NOT
+        consult `user_override_protected`. Use `is_protected()` for
+        the policy decision; use `matches()` when you specifically
+        need to know whether the pattern list would match, regardless
+        of overrides.
 
         Comparison is performed case-insensitively on a trimmed copy of
         the input. This accommodates user input like `" Master "` and
@@ -235,6 +260,24 @@ class BranchPolicy:
             if fnmatch.fnmatchcase(cleaned, pattern.lower()):
                 return True
         return False
+
+    def is_protected(self, branch_name: str) -> bool:
+        """
+        Return True if `branch_name` is protected under this policy.
+
+        Combines `user_override_protected` (checked first) with the
+        pattern match. A branch listed in the override is ALWAYS
+        unprotected, regardless of the pattern list.
+        """
+        if not branch_name:
+            return False
+        cleaned = branch_name.strip().lower()
+        # 1. Check overrides first: an explicit "unprotect" wins.
+        for pattern in self.user_override_protected:
+            if fnmatch.fnmatchcase(cleaned, pattern.lower()):
+                return False
+        # 2. Fall back to the pattern list.
+        return self.matches(branch_name)
 
 
 @dataclass(frozen=True)
@@ -314,8 +357,16 @@ class SourceControlPolicy:
     # Convenience proxies -------------------------------------------------
 
     def is_protected_branch(self, branch_name: str) -> bool:
-        """Return True if the branch is protected under this policy."""
-        return self.branch.matches(branch_name)
+        """
+        Return True if the branch is protected under this policy,
+        accounting for user overrides.
+
+        Delegates to `self.branch.is_protected()`, which checks
+        `user_override_protected` first and only then consults the
+        pattern list. A branch listed in the override is never
+        considered protected.
+        """
+        return self.branch.is_protected(branch_name)
 
     def is_workflow_path(self, path: str) -> bool:
         """Return True if the path is a workflow/CI definition."""
@@ -444,6 +495,7 @@ def evaluate_policy(
     source_branch: Optional[str] = None,
     target_branch_ref: Optional[BranchRef] = None,
     changed_paths: Sequence[str] = (),
+    remote_protection: Optional[bool] = None,
 ) -> PolicyDecision:
     """
     Evaluate `policy` against a concrete operation and return a
@@ -520,8 +572,39 @@ def evaluate_policy(
                 reason="Target branch is required for push evaluation.",
             )
 
-        # Protected branch
-        if policy.is_protected_branch(target_branch):
+        # Protected-branch determination — priority order:
+        #
+        #   1. `remote_protection is False`
+        #      GitHub explicitly reports the branch as NOT protected
+        #      (its protection endpoint returned 404). The owner can
+        #      push directly. This is the "personal repo without
+        #      branch protection" case.
+        #
+        #   2. `remote_protection is True`
+        #      GitHub explicitly reports the branch as protected.
+        #      Refuse the push regardless of the local pattern list,
+        #      because GitHub is the authoritative source of truth
+        #      for its own protection rules.
+        #
+        #   3. `remote_protection is None`
+        #      The remote state could not be determined. Fall back to
+        #      the local policy check (`user_override_protected`
+        #      followed by `protected_patterns`). This is the safe
+        #      default: when we don't know, honour the configured
+        #      protection rules.
+        #
+        # `remote_protection` is threaded through from the facade,
+        # which obtains it from the GitHub API and adjusts it based
+        # on the user's `allow_push_to_protected` setting before
+        # invoking this evaluator.
+        if remote_protection is False:
+            is_protected = False
+        elif remote_protection is True:
+            is_protected = True
+        else:
+            is_protected = policy.is_protected_branch(target_branch)
+
+        if is_protected:
             if not policy.branch.allow_default_branch_push:
                 return PolicyDecision(
                     allowed=False,
@@ -617,6 +700,7 @@ def evaluate_operation(
     source_branch: Optional[str] = None,
     target_branch_ref: Optional[BranchRef] = None,
     changed_paths: Sequence[str] = (),
+    remote_protection: Optional[bool] = None,
 ) -> PolicyDecision:
     """
     Positional-argument wrapper around `evaluate_policy`.
@@ -636,6 +720,7 @@ def evaluate_operation(
         source_branch=source_branch,
         target_branch_ref=target_branch_ref,
         changed_paths=changed_paths,
+        remote_protection=remote_protection,
     )
 
 

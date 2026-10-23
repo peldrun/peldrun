@@ -117,7 +117,7 @@ class CreateBranchTool(SourceControlTool):
                     "default": True,
                 },
             },
-            "required": ["workspace_id", "branch_name"],
+            "required": ["branch_name"],
             "additionalProperties": False,
         }
 
@@ -128,14 +128,70 @@ class CreateBranchTool(SourceControlTool):
     ) -> ToolResult:
         # --- Parse inputs ----------------------------------------------
         workspace_id = kwargs.get("workspace_id")
-        if not isinstance(workspace_id, str) or not workspace_id.strip():
+        if isinstance(workspace_id, str):
+            workspace_id = workspace_id.strip()
+            if workspace_id.lower() in ("none", "null", ""):
+                workspace_id = None
+        else:
+            workspace_id = None
+
+        # Auto-resolve workspace_id from the most recent workspace
+        # created in this chat session. Mirrors the identical fallback
+        # in `request_approval.py`: small LLMs (including
+        # GigaChat-3-Pro) succeed at `create_workspace` but forget to
+        # forward the returned `workspace_id` to subsequent tool
+        # calls. Without this, the tool loops on
+        # "workspace_id must be a non-empty string" until the agent
+        # gives up and asks the human — even though the workspace
+        # demonstrably exists and is bound to this chat.
+        #
+        # Safety: the fallback only activates when the caller omits
+        # `workspace_id`. It picks the workspace with the highest
+        # `created_at` among workspaces whose `metadata.chat_id`
+        # matches the current session's chat_id. If the caller
+        # provides `workspace_id`, the fallback is skipped entirely.
+        if not workspace_id:
+            chat_id_ctx = ""
+            if isinstance(context.metadata, dict):
+                raw_chat = context.metadata.get("chat_id")
+                if isinstance(raw_chat, str):
+                    chat_id_ctx = raw_chat.strip()
+            if chat_id_ctx:
+                try:
+                    mgr = get_default_workspace_manager()
+                    candidates = [
+                        ws
+                        for ws in mgr.list_workspaces()
+                        if isinstance(ws.metadata, dict)
+                        and ws.metadata.get("chat_id") == chat_id_ctx
+                    ]
+                    if candidates:
+                        workspace_id = candidates[-1].workspace_id
+                        logger.info(
+                            "create_branch: auto-resolved "
+                            "workspace_id=%r from the most recent "
+                            "workspace for chat_id=%r",
+                            workspace_id,
+                            chat_id_ctx,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "create_branch: auto-resolve of "
+                        "workspace_id failed (%s); the caller will "
+                        "receive the standard validation error.",
+                        type(exc).__name__,
+                    )
+
+        if not workspace_id:
             return self.failure_result(
                 error_code="VALIDATION_ERROR",
                 error_message=(
-                    "`workspace_id` must be a non-empty string."
+                    "`workspace_id` is required and could not be "
+                    "auto-resolved from the current chat. The value "
+                    "is returned by the preceding `create_workspace` "
+                    "call; pass it here explicitly."
                 ),
             )
-        workspace_id = workspace_id.strip()
 
         branch_name = kwargs.get("branch_name")
         if not isinstance(branch_name, str) or not branch_name.strip():
@@ -217,52 +273,56 @@ class CreateBranchTool(SourceControlTool):
                 ),
             )
 
-        # --- Optionally check out the newly created branch -------------
+        # --- Synchronize the workspace's tracked branch ---------------
+        # `create_local_branch` above already performed `git checkout
+        # -b <branch_name>`, which switches the workspace to the new
+        # branch. The previous implementation additionally called
+        # `checkout_branch`, which performs a dirty-workspace
+        # preflight check and ALWAYS rejects in the typical agent
+        # flow (the agent edits files BEFORE creating a branch). The
+        # result was a hard failure that left the branch created but
+        # the tool reporting failure — and the agent looping on
+        # "branch already exists" on every retry.
+        #
+        # We no longer re-checkout. We only keep the workspace
+        # registry's `current_branch` field in sync so that
+        # subsequent operations (request_approval, push_branch) see
+        # the correct current branch without a `git rev-parse`
+        # round-trip.
         if checkout:
             try:
-                if hasattr(branch_manager, "checkout_branch"):
-                    checked_out = await branch_manager.checkout_branch(
-                        workspace_id=workspace_id,
-                        branch_name=branch_name,
-                        workspace_path=workspace.workspace_path,
-                    )
-                    if isinstance(checked_out, BranchRef):
-                        branch = checked_out
-                else:
-                    git_exec = getattr(branch_manager, "_git", None)
-                    if git_exec is not None:
-                        await git_exec.run(
-                            ["checkout", branch_name],
-                            cwd=workspace.workspace_path,
-                            check_returncode=True,
-                        )
-
-                # Synchronize workspace state so current_branch reflects the checkout
                 if hasattr(workspace_manager, "set_current_branch"):
-                    workspace_manager.set_current_branch(workspace_id, branch_name)
+                    workspace_manager.set_current_branch(
+                        workspace_id, branch_name
+                    )
                 elif (
                     hasattr(workspace_manager, "_workspaces")
-                    and isinstance(workspace_manager._workspaces, dict)
+                    and isinstance(
+                        workspace_manager._workspaces, dict
+                    )
                     and workspace_id in workspace_manager._workspaces
                 ):
-                    from dataclasses import replace
-                    current_ws = workspace_manager._workspaces[workspace_id]
-                    workspace_manager._workspaces[workspace_id] = replace(
-                        current_ws, current_branch=branch_name
+                    from dataclasses import replace as _dc_replace
+                    current_ws = workspace_manager._workspaces[
+                        workspace_id
+                    ]
+                    workspace_manager._workspaces[workspace_id] = (
+                        _dc_replace(
+                            current_ws,
+                            current_branch=branch_name,
+                        )
                     )
             except Exception as exc:  # noqa: BLE001
-                normalized = to_source_control_error(exc)
-                return self.failure_result(
-                    error_code=normalized.code.value,
-                    error_message=(
-                        f"Branch '{branch_name}' was created, but checking it out failed: "
-                        + normalized.message
-                    ),
-                    metadata={
-                        "workspace_id": workspace_id,
-                        "branch_name": branch_name,
-                        "retryable": normalized.is_retryable,
-                    },
+                # Best-effort sync: if the registry cannot be
+                # updated, log and continue. The `git checkout -b`
+                # already succeeded inside `create_local_branch`, so
+                # the on-disk state is correct even if the in-memory
+                # registry is momentarily stale.
+                logger.warning(
+                    "create_branch: could not sync "
+                    "workspace.current_branch for %r: %s",
+                    workspace_id,
+                    type(exc).__name__,
                 )
 
         return self.success_result(

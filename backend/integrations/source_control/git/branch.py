@@ -41,6 +41,7 @@ from ..errors import (
     ConflictError,
     NotFoundError,
     ValidationError,
+    WorkspaceDirtyError,
     WorkspaceNotFoundError,
 )
 from .executable import (
@@ -278,24 +279,86 @@ class GitBranchManager(LocalBranchPort):
         branch_name: str,
         workspace_path: Optional[Union[str, Path]] = None,
         force: bool = False,
+        commit_message: Optional[str] = None,
     ) -> BranchRef:
         """
         Check out an existing local branch.
 
-        When `force` is False (default), the operation is refused if
-        the workspace has uncommitted changes, so that user work is
-        not silently discarded.
+        Three modes are supported, in priority order:
+
+            1. ``commit_message`` provided: any pending changes are
+               committed with that message FIRST, then the branch is
+               switched. This preserves user work across the switch
+               and is the recommended mode when the caller cannot
+               guarantee that the workspace is clean. ``force`` is
+               effectively ignored (a normal checkout is used after
+               the commit, never ``-f``).
+
+            2. ``force=True`` without ``commit_message``: uncommitted
+               changes are discarded via ``git checkout -f``. This is
+               destructive; the caller MUST obtain explicit user
+               consent.
+
+            3. Default (``force=False`` without ``commit_message``):
+               the operation is refused if the workspace is dirty, so
+               user work is never silently discarded.
 
         Raises:
             ValidationError: If `branch_name` is invalid.
-            ConflictError: If the workspace is dirty and `force` is
-                False.
+            ConflictError: If the workspace is dirty and neither
+                `force` nor `commit_message` was provided.
             NotFoundError: If the branch does not exist.
         """
         self._validate_branch_name(branch_name)
         target = self._resolve_workspace_path(workspace_path, workspace_id)
 
-        if not force:
+        # Option A: commit pending changes with the caller-supplied
+        # message, then switch. Used by Manual Mode's "change branch"
+        # flow so that the user does not lose edits made in the Files
+        # tab before the switch.
+        if commit_message:
+            # Lazy import to keep `branch.py` free of a hard dependency
+            # on the commit manager, and to match the pattern used in
+            # `push_approved_branch` in the facade. The two modules do
+            # not currently import each other, but the lazy import
+            # keeps the dependency graph unambiguous.
+            try:
+                from .commit import (  # noqa: WPS433 (intentional lazy import)
+                    CommitOptions,
+                    get_default_commit_manager,
+                )
+            except ImportError:  # repo layout: backend.integrations.*
+                from backend.integrations.source_control.git.commit import (  # type: ignore[no-redef]
+                    CommitOptions,
+                    get_default_commit_manager,
+                )
+
+            try:
+                await get_default_commit_manager().create_commit(
+                    workspace_id=workspace_id,
+                    message=commit_message,
+                    options=CommitOptions(
+                        stage_all=True, allow_empty=False
+                    ),
+                    workspace_path=target,
+                )
+            except WorkspaceDirtyError:
+                # Nothing to commit; the workspace is already clean.
+                # Proceed straight to the checkout. This is a
+                # legitimate state — the caller may have asked for
+                # auto-commit without knowing whether there was
+                # anything pending.
+                pass
+
+            # After a successful commit (or a clean no-op), the
+            # workspace is clean; skip the dirty check and use a
+            # plain checkout (never -f, which would discard the
+            # commit we just made if the caller also passed force).
+        # Option B: force-discard uncommitted changes (destructive).
+        elif force:
+            pass  # the `-f` flag is applied below
+        # Option C: refuse if dirty (default safe behavior).
+        else:
             dirty = await self._is_dirty(target)
             if dirty:
                 raise ConflictError(
@@ -304,7 +367,7 @@ class GitBranchManager(LocalBranchPort):
                 )
 
         args = ["checkout", branch_name]
-        if force:
+        if force and not commit_message:
             args = ["checkout", "-f", branch_name]
 
         result = await self._git.run(

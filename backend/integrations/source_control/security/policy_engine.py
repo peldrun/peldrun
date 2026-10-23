@@ -98,6 +98,36 @@ class PolicyResolutionContext:
         changed_paths:    Paths modified by the operation.
         actor:            Who is requesting the operation
                           (`"user"` or `"agent"`).
+        remote_protection:
+                          Tri-state answer from the provider's API
+                          for whether `target_branch` is protected
+                          on the remote.
+
+                              True  : remote reports the branch as
+                                      protected (GitHub's branch
+                                      protection endpoint returned
+                                      200 with a config payload).
+                              False : remote reports the branch as
+                                      NOT protected (GitHub returned
+                                      404).
+                              None  : remote state could not be
+                                      determined, OR the caller did
+                                      not perform the check.
+
+                          When `False`, the push proceeds even if
+                          the local `protected_branches` list would
+                          otherwise refuse it — GitHub is the
+                          authoritative source for its own
+                          protection rules. When `True`, the push
+                          is refused regardless of any local
+                          `user_override_protected` entry. When
+                          `None`, the local policy is the sole
+                          decision-maker.
+
+                          This field is threaded from the facade,
+                          which obtains it via the provider adapter
+                          and adjusts it according to the user's
+                          `allow_push_to_protected` setting.
     """
 
     operation: str
@@ -108,6 +138,7 @@ class PolicyResolutionContext:
     target_branch_ref: Optional[BranchRef] = None
     changed_paths: Sequence[str] = field(default_factory=tuple)
     actor: str = "agent"
+    remote_protection: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -337,6 +368,13 @@ class PolicyEngine:
                 return result
 
         # Step 2: policy evaluation.
+        #
+        # `remote_protection` is threaded through from the caller.
+        # When `None` (the default), the local policy is the sole
+        # decision-maker — exactly the behavior every existing
+        # caller expects. When set, the pure evaluator consults it
+        # before the local `protected_branches` list, so the remote
+        # (GitHub) is treated as the authoritative source.
         decision = evaluate_policy(
             policy,
             operation=context.operation,
@@ -345,6 +383,7 @@ class PolicyEngine:
             source_branch=context.source_branch,
             target_branch_ref=context.target_branch_ref,
             changed_paths=context.changed_paths,
+            remote_protection=context.remote_protection,
         )
 
         result = PolicyCheckResult(
