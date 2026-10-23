@@ -861,6 +861,70 @@ class ResolveConflictsResponse(BaseSCResponse):
 # but is not the same thing.
 
 
+class SourceControlSettingsResponse(BaseSCResponse):
+    """Current Source Control subsystem settings.
+
+    These values are persisted on disk under
+    `backend/data/source_control/settings.json`. They are read by
+    the frontend at startup and written back whenever the user
+    changes a setting.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch. When False (default), the entire "
+            "subsystem is hidden."
+        ),
+    )
+    default_panel_mode: str = Field(
+        default="workspace",
+        description=(
+            "Which right-hand panel opens by default: 'workspace', "
+            "'source-control', or 'hidden'."
+        ),
+    )
+    default_source_control_mode: str = Field(
+        default="browse",
+        description=(
+            "Initial mode for the Source Control tabs: 'agent', "
+            "'manual', or 'browse'."
+        ),
+    )
+    auto_open_on_operation: bool = Field(
+        default=True,
+        description=(
+            "Automatically open the Source Control panel when a "
+            "new operation arrives."
+        ),
+    )
+    diff_view_mode: str = Field(
+        default="unified",
+        description="Diff layout: 'unified' or 'split'.",
+    )
+    diff_sample_lines: int = Field(
+        default=500,
+        description=(
+            "Maximum number of diff sample lines returned by the "
+            "backend."
+        ),
+    )
+    polling_interval_ms: int = Field(
+        default=3000,
+        description=(
+            "How often the frontend polls for operation state "
+            "changes."
+        ),
+    )
+    list_page_size: int = Field(
+        default=30,
+        description=(
+            "Page size for paginated lists (commits, PRs, "
+            "issues, ...)."
+        ),
+    )
+
+
 class TagResponse(BaseSCResponse):
     """A local Git tag.
 

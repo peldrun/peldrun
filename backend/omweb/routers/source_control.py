@@ -260,8 +260,10 @@ try:
         CreateTagRequest,
         ReleaseListResponse,
         ReleaseResponse,
+        SourceControlSettingsResponse,
         TagListResponse,
         TagResponse,
+        UpdateSourceControlSettingsRequest,
     )
 except (ImportError, ValueError):
     from backend.integrations.source_control.schemas import (
@@ -269,8 +271,10 @@ except (ImportError, ValueError):
         CreateTagRequest,
         ReleaseListResponse,
         ReleaseResponse,
+        SourceControlSettingsResponse,
         TagListResponse,
         TagResponse,
+        UpdateSourceControlSettingsRequest,
     )
 
 
@@ -1482,6 +1486,53 @@ async def list_audit_events(
         return await facade.list_audit_events(
             limit=limit, operation_id=operation_id
         )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# 10. Source Control subsystem settings
+# ---------------------------------------------------------------------------
+#
+# These endpoints manage the persisted settings file under
+# `backend/data/source_control/settings.json`. They do NOT manage
+# OAuth credentials; those stay in `/integrations` and the vault.
+
+
+@router.get(
+    "/settings",
+    response_model=SourceControlSettingsResponse,
+)
+async def get_source_control_settings(
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> SourceControlSettingsResponse:
+    """Read the current Source Control subsystem settings.
+
+    Returns the factory defaults when no settings file exists yet,
+    so the frontend can call this endpoint on first run without a
+    404.
+    """
+    try:
+        return await facade.read_settings()
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.put(
+    "/settings",
+    response_model=SourceControlSettingsResponse,
+)
+async def update_source_control_settings(
+    payload: UpdateSourceControlSettingsRequest,
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> SourceControlSettingsResponse:
+    """Merge and persist settings changes.
+
+    A partial payload is supported: only the fields the caller
+    provides are updated. Omitted fields keep their current values.
+    """
+    try:
+        return await facade.write_settings(payload)
     except Exception as exc:
         handle_source_control_error(exc)
 

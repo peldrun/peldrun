@@ -1085,6 +1085,114 @@ class CreateIssueCommentRequest(BaseSCRequest):
 # ---------------------------------------------------------------------------
 
 
+class UpdateSourceControlSettingsRequest(BaseSCRequest):
+    """Payload to update the Source Control subsystem settings.
+
+    All fields are optional. Omitted fields retain their current
+    values, so a partial update never accidentally resets an
+    unrelated setting to its default.
+    """
+
+    enabled: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Master switch. When False, the entire Source Control "
+            "subsystem is hidden from the UI and none of its "
+            "modules are loaded."
+        ),
+    )
+    default_panel_mode: Optional[str] = Field(
+        default=None,
+        description=(
+            "Which right-hand panel opens by default: 'workspace', "
+            "'source-control', or 'hidden'."
+        ),
+    )
+    default_source_control_mode: Optional[str] = Field(
+        default=None,
+        description=(
+            "Initial mode for the Source Control tabs: 'agent', "
+            "'manual', or 'browse'."
+        ),
+    )
+    auto_open_on_operation: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Automatically open the Source Control panel when a "
+            "new operation arrives."
+        ),
+    )
+    diff_view_mode: Optional[str] = Field(
+        default=None,
+        description="Diff layout: 'unified' or 'split'.",
+    )
+    diff_sample_lines: Optional[int] = Field(
+        default=None,
+        ge=100,
+        le=5000,
+        description=(
+            "Maximum number of diff sample lines returned by the "
+            "backend."
+        ),
+    )
+    polling_interval_ms: Optional[int] = Field(
+        default=None,
+        ge=500,
+        le=30000,
+        description=(
+            "How often the frontend polls for operation state "
+            "changes."
+        ),
+    )
+    list_page_size: Optional[int] = Field(
+        default=None,
+        ge=10,
+        le=100,
+        description=(
+            "Page size for paginated lists (commits, PRs, "
+            "issues, ...)."
+        ),
+    )
+
+    @field_validator("default_panel_mode")
+    @classmethod
+    def validate_panel_mode(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        clean = v.strip().lower()
+        if clean not in ("workspace", "source-control", "hidden"):
+            raise ValueError(
+                "default_panel_mode must be 'workspace', "
+                "'source-control', or 'hidden'."
+            )
+        return clean
+
+    @field_validator("default_source_control_mode")
+    @classmethod
+    def validate_sc_mode(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        clean = v.strip().lower()
+        if clean not in ("agent", "manual", "browse"):
+            raise ValueError(
+                "default_source_control_mode must be 'agent', "
+                "'manual', or 'browse'."
+            )
+        return clean
+
+    @field_validator("diff_view_mode")
+    @classmethod
+    def validate_diff_mode(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        clean = v.strip().lower()
+        if clean not in ("unified", "split"):
+            raise ValueError(
+                "diff_view_mode must be 'unified' or 'split'."
+            )
+        return clean
+
+
 class CreateTagRequest(BaseSCRequest):
     """Payload to create a new local Git tag in the workspace.
 

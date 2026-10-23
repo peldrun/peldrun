@@ -481,8 +481,10 @@ try:
         CreateTagRequest,
         ReleaseListResponse,
         ReleaseResponse,
+        SourceControlSettingsResponse,
         TagListResponse,
         TagResponse,
+        UpdateSourceControlSettingsRequest,
     )
 except ImportError:
     from backend.integrations.source_control.git.tag import (  # type: ignore[no-redef]
@@ -499,8 +501,10 @@ except ImportError:
         CreateTagRequest,
         ReleaseListResponse,
         ReleaseResponse,
+        SourceControlSettingsResponse,
         TagListResponse,
         TagResponse,
+        UpdateSourceControlSettingsRequest,
     )
 
 
@@ -6082,6 +6086,163 @@ class SourceControlFacade:
             created_at=release.created_at,
             published_at=release.published_at,
         )
+
+    # ------------------------------------------------------------------
+    # 20. Source Control subsystem settings
+    # ------------------------------------------------------------------
+    #
+    # These settings are NOT about connection credentials (those
+    # live in the vault and are managed via /integrations). They
+    # control BEHAVIOR: whether the subsystem is enabled at all,
+    # which panel opens by default, how diffs are rendered, and how
+    # often the frontend polls.
+    #
+    # Persistence is a plain JSON file under
+    # `backend/data/source_control/settings.json`. That choice is
+    # deliberate:
+    #
+    #   - The file is small (~1 KB) and read once at startup.
+    #   - It survives every browser clear-cache action, so a user
+    #     who flips the switch ON does not have to flip it again
+    #     after clearing site data.
+    #   - It can be edited by hand for advanced users (the schema
+    #     is validated on read, so a typo never breaks the app).
+    #   - It is backed up by the same backup routine as the rest of
+    #     `backend/data/`.
+    #
+    # Unknown fields in the JSON are ignored; missing fields fall
+    # back to their defaults. This makes forward-compatible upgrades
+    # trivial: a new field added in a future release simply gets its
+    # default until the user changes it.
+
+    _SETTINGS_FILE_NAME = "settings.json"
+
+    def _settings_path(self) -> Path:
+        return self._data_root / self._SETTINGS_FILE_NAME
+
+    @staticmethod
+    def _default_settings_dict() -> Dict[str, Any]:
+        """
+        The authoritative defaults for the subsystem.
+
+        Kept as a plain dict (not the Pydantic model) so that
+        `read_settings` can be written without constructing a model
+        when the file is missing (the common case at first run).
+        """
+        return {
+            "enabled": False,
+            "default_panel_mode": "workspace",
+            "default_source_control_mode": "browse",
+            "auto_open_on_operation": True,
+            "diff_view_mode": "unified",
+            "diff_sample_lines": 500,
+            "polling_interval_ms": 3000,
+            "list_page_size": 30,
+        }
+
+    async def read_settings(self) -> SourceControlSettingsResponse:
+        """
+        Return the current settings, or the factory defaults when
+        no settings file exists.
+
+        A corrupt file is treated as "no file": the defaults are
+        returned instead of surfacing a 500 to the UI. The corrupt
+        file is logged and left on disk so an operator can inspect
+        it; the next `write_settings` call overwrites it.
+        """
+        path = self._settings_path()
+        defaults = self._default_settings_dict()
+
+        if not path.exists():
+            return SourceControlSettingsResponse(**defaults)
+
+        try:
+            raw = path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "Failed to read settings file %s: %s. Using defaults.",
+                path,
+                type(exc).__name__,
+            )
+            return SourceControlSettingsResponse(**defaults)
+
+        if not isinstance(data, dict):
+            logger.warning(
+                "Settings file %s is not a JSON object. Using defaults.",
+                path,
+            )
+            return SourceControlSettingsResponse(**defaults)
+
+        # Merge user values on top of the defaults so a partial file
+        # (e.g. from an older release) does not break loading. Also
+        # filters unknown keys silently, so a stale field from an
+        # older version never produces a validation error.
+        merged = {**defaults}
+        for key in defaults.keys():
+            if key in data:
+                merged[key] = data[key]
+
+        try:
+            return SourceControlSettingsResponse(**merged)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Settings file %s failed validation: %s. Using defaults.",
+                path,
+                type(exc).__name__,
+            )
+            return SourceControlSettingsResponse(**defaults)
+
+    async def write_settings(
+        self,
+        payload: UpdateSourceControlSettingsRequest,
+    ) -> SourceControlSettingsResponse:
+        """
+        Merge `payload` into the current settings and persist.
+
+        A partial update (only some fields present) is the common
+        case: the settings page writes one field at a time, so we
+        must not reset the others. Values from the payload are
+        validated by the Pydantic model before reaching this
+        method, so a bad value never reaches disk.
+        """
+        current = await self.read_settings()
+        current_dict = current.model_dump()
+
+        # Only merge fields the caller actually provided.
+        incoming = payload.model_dump(exclude_none=True)
+        merged = {**current_dict, **incoming}
+
+        # Validate the merged result so an inconsistent combination
+        # (e.g. an out-of-range number) never lands on disk.
+        try:
+            merged_model = SourceControlSettingsResponse(**merged)
+        except Exception as exc:  # noqa: BLE001
+            raise ValidationError(
+                f"Invalid settings payload: {exc}",
+                details={"merged": merged},
+            ) from exc
+
+        # Write atomically: temp file + os.replace, so a crash
+        # mid-write never leaves a half-written settings file.
+        path = self._settings_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps(merged_model.model_dump(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+
+        self._audit(
+            AuditEventType.OTHER,
+            action="write_source_control_settings",
+            message="Updated Source Control subsystem settings.",
+            payload=dict(incoming),
+            actor="user",
+        )
+
+        return merged_model
 
 
 # Global singleton cache for FastAPI dependency injection

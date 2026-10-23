@@ -67,6 +67,7 @@ from .requests import (
     SaveProviderConfigRequest,
     SubmitPullRequestReviewRequest,
     UpdateIssueStateRequest,
+    UpdateSourceControlSettingsRequest,
     ValidateConnectionRequest,
 )
 
@@ -111,6 +112,7 @@ from .responses import (
     ReleaseResponse,
     RepositoryResponse,
     ResolveConflictsResponse,
+    SourceControlSettingsResponse,
     TagListResponse,
     TagResponse,
     TreeNodeResponse,
@@ -148,6 +150,7 @@ __all__ = [
     "ResolveConflictsRequest",
     "CreateTagRequest",
     "CreateReleaseRequest",
+    "UpdateSourceControlSettingsRequest",
     # -----------------------------------------------------------------------
     # Response schemas
     # -----------------------------------------------------------------------
@@ -191,4 +194,5 @@ __all__ = [
     "TagListResponse",
     "ReleaseResponse",
     "ReleaseListResponse",
+    "SourceControlSettingsResponse",
 ]

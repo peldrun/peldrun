@@ -38,18 +38,27 @@ export function ToastContainer() {
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
   useEffect(() => {
+    // Track every scheduled timeout so we can cancel them all on
+    // unmount. Without this, a toast that is still counting down
+    // when the container unmounts would fire setToasts on an
+    // unmounted component (harmless in React 18+, but noisy).
+    const timers = new Set<ReturnType<typeof setTimeout>>();
+
     const handler = (newToast: ToastMessage) => {
       setToasts((prev) => [...prev, newToast]);
       const timer = setTimeout(() => {
+        timers.delete(timer);
         setToasts((prev) => prev.filter((t) => t.id !== newToast.id));
       }, newToast.duration || 4500);
-      return () => clearTimeout(timer);
+      timers.add(timer);
     };
 
     listeners.push(handler);
     return () => {
       const idx = listeners.indexOf(handler);
       if (idx > -1) listeners.splice(idx, 1);
+      timers.forEach((t) => clearTimeout(t));
+      timers.clear();
     };
   }, []);
 

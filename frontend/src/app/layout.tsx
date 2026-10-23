@@ -3,8 +3,11 @@ import { DM_Sans, Libre_Baskerville, Cairo } from "next/font/google";
 import { getServerStorageSnapshot } from "@/lib/storage/server";
 import { StorageProvider } from "@/components/providers/storage-provider";
 import { ThemeProvider } from "@/components/layout/theme-provider";
+import { SourceControlSettingsProvider } from "@/features/source-control/state/sourceControlSettingsProvider";
 import { I18nProvider } from "@/components/providers/i18n-provider";
 import { AppShell } from "@/components/layout/app-shell";
+import { ToastContainer } from "@/components/ui/ToastNotification";
+
 import "@/app/globals.css";
 
 const dmSans = DM_Sans({
@@ -113,9 +116,21 @@ export default async function RootLayout({
             enableSystem
           >
 
+            <SourceControlSettingsProvider />
+
             <I18nProvider initialLocale={locale}>
               <AppShell>{children}</AppShell>
             </I18nProvider>
+
+                        {/*
+              Toast container: a single instance mounted at the root
+              so any component (including non-React code that calls
+              `showToast.success/error/...`) can raise a toast. It
+              renders into a fixed-position layer above everything
+              else and stays mounted for the whole session.
+            */}
+            <ToastContainer />
+
           </ThemeProvider>
         </StorageProvider>
       </body>

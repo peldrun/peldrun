@@ -8,11 +8,25 @@ import React, {
   useCallback,
 } from "react";
 import { useRouter } from "next/navigation";
+import dynamic from "next/dynamic";
 import {
   WorkspacePanel,
   getFileCategory,
 } from "@/components/workspace/workspace-panel";
-import { SourceControlWorkspacePanel } from "@/features/source-control/components/source-control-workspace-panel";
+import { useSourceControlSettings } from "@/features/source-control/state/source-control-settings-store";
+
+// Lazy-load the Source Control workspace panel. This guarantees
+// that users who have the subsystem disabled never download its
+// ~200 KB bundle. The `{ ssr: false }` flag is required because
+// the panel reads from `localStorage` in its settings store and
+// would otherwise hydration-mismatch on first paint.
+const SourceControlWorkspacePanel = dynamic(
+  () =>
+    import(
+      "@/features/source-control/components/source-control-workspace-panel"
+    ).then((m) => m.SourceControlWorkspacePanel),
+  { ssr: false }
+);
 
 import { Composer } from "@/components/chat/composer";
 import { ChatSubHeader } from "@/components/chat/chat-sub-header";
@@ -180,8 +194,25 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   const [elapsedSeconds, setElapsedSeconds] = useElapsedTimer(status as any);
   const { producedFiles, setProducedFiles, fetchJobFiles } = useJobFiles();
 
+  // Master switch from the settings store. When this is false, the
+  // entire Source Control subsystem is treated as opt-in and none
+  // of its UI is rendered. See `source-control-settings-store.ts`
+  // for the full design rationale.
+  const sourceControlEnabled = useSourceControlSettings(
+    (s) => s.enabled
+  );
+
   const handleOpenReview = useCallback(
     (operationId: string) => {
+      // Defensive guard: even if a stale event bubbles up from an
+      // earlier session, do not open the panel when the user has
+      // explicitly disabled Source Control.
+      if (!sourceControlEnabled) {
+        console.warn(
+          "[handleOpenReview] Source Control is disabled; ignoring."
+        );
+        return;
+      }
       useSourceControlStore.setState({ activeOperationId: operationId });
       useSourceControlStore.getState().openPanel("source-control");
       // Force the Source Control panel to open in Agent mode, which
@@ -193,7 +224,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       setRightPanelMode("source-control");
       setShowRightPanel(true);
     },
-    [setShowRightPanel, setRightPanelMode]
+    [setShowRightPanel, setRightPanelMode, sourceControlEnabled]
   );
 
   // Refs mirror fast-changing state so SSE handlers always read the latest
@@ -1050,29 +1081,32 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
             }
           }}
           showSourceControlPanel={
-            showRightPanel && rightPanelMode === "source-control"
+            sourceControlEnabled &&
+            showRightPanel &&
+            rightPanelMode === "source-control"
           }
-          onToggleSourceControlPanel={() => {
-            // Same three-state toggle, but targeting Source Control.
-            // The "mount key" is bumped on every open-from-hidden so
-            // the panel always starts on the "browse" tab (this
-            // handler is the one used when the user opens the panel
-            // manually from the header — NOT when `handleOpenReview`
-            // is used, which sets `sourceControlDefaultMode = "agent"`).
-            if (
-              showRightPanel &&
-              rightPanelMode === "source-control"
-            ) {
-              setShowRightPanel(false);
-            } else {
-              if (!showRightPanel || rightPanelMode !== "source-control") {
-                setSourceControlDefaultMode("browse");
-                setSourceControlMountKey((k) => k + 1);
-              }
-              setRightPanelMode("source-control");
-              setShowRightPanel(true);
-            }
-          }}
+          onToggleSourceControlPanel={
+            sourceControlEnabled
+              ? () => {
+                  if (
+                    showRightPanel &&
+                    rightPanelMode === "source-control"
+                  ) {
+                    setShowRightPanel(false);
+                  } else {
+                    if (
+                      !showRightPanel ||
+                      rightPanelMode !== "source-control"
+                    ) {
+                      setSourceControlDefaultMode("browse");
+                      setSourceControlMountKey((k) => k + 1);
+                    }
+                    setRightPanelMode("source-control");
+                    setShowRightPanel(true);
+                  }
+                }
+              : undefined
+          }
           status={status as any}
           activeModel={activeModelName}
         />
@@ -1161,7 +1195,8 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
 
       {showRightPanel && (
         <div className="flex-1 h-full min-w-0 transition-all">
-          {rightPanelMode === "source-control" ? (
+          {sourceControlEnabled &&
+          rightPanelMode === "source-control" ? (
             <SourceControlWorkspacePanel
               key={sourceControlMountKey}
               activeChatId={activeChatId || activeJobId}

@@ -2,6 +2,7 @@
 
 import React from "react";
 import { OperationResponse } from "../api/schemas";
+import { useSourceControlSettings } from "../state/source-control-settings-store";
 
 interface ChatOperationCardProps {
   operation: OperationResponse;
@@ -17,6 +18,15 @@ export function ChatOperationCard({
   operation,
   onOpenReview,
 }: ChatOperationCardProps) {
+  // Honour the master switch. When Source Control is disabled, the
+  // card renders nothing so a review request cannot appear in the
+  // chat stream. Without this check, a user who disabled the
+  // subsystem would still see "Waiting for your review" cards from
+  // earlier agent runs and would have no way to dismiss them.
+  const sourceControlEnabled = useSourceControlSettings(
+    (s) => s.enabled
+  );
+  if (!sourceControlEnabled) return null;
 
   // Determine UI elements based on the operation state
   const getStatusConfig = () => {
@@ -95,10 +105,10 @@ export function ChatOperationCard({
       <div className="flex items-start">
         <div className="text-2xl">{config.icon}</div>
         <div className="ml-3 flex-1">
-          <h4 className="text-sm font-semibold text-gray-900">
+          <h4 className="text-sm font-semibold text-black">
             {config.title}
           </h4>
-          <p className="mt-1 text-sm text-gray-600">
+          <p className="mt-1 text-sm text-black/90">
             {config.description}
           </p>
 
