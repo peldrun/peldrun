@@ -138,10 +138,14 @@ try:
 except ImportError:
     # Fallback for the case where the package is imported via the
     # absolute `backend.integrations...` path instead of the relative
-    # one. `ValueError` was removed from this clause: `import`
-    # statements do not raise it, so catching it only masked genuine
-    # programming errors.
-    from integrations.source_control import (
+    # one. Every import below MUST use the `backend.integrations`
+    # prefix; the previous version of this block repeated the
+    # `integrations.source_control` prefix from the try block, which
+    # made the fallback fail with the SAME ModuleNotFoundError that
+    # the try block had just raised. Any deployment that does not
+    # add `backend/` to `sys.path` (the common case) would then
+    # crash at startup because the facade module could not load.
+    from backend.integrations.source_control import (
         ApprovalGate,
         ApprovalTicket,
         AuditLogger,
@@ -179,7 +183,7 @@ except ImportError:
         register_builtin_providers,
         validate_branch_name,
     )
-    from integrations.source_control.errors import (
+    from backend.integrations.source_control.errors import (
         AuthRequiredError,
         NotFoundError,
         PermissionDeniedError,
@@ -187,24 +191,24 @@ except ImportError:
         UnsupportedCapabilityError,
         ValidationError,
     )
-    from integrations.source_control.providers.github.pull_requests import (
+    from backend.integrations.source_control.providers.github.pull_requests import (
         GitHubPullRequestService,
     )
-    from integrations.source_control.providers.github.reviews import (
+    from backend.integrations.source_control.providers.github.reviews import (
         GitHubReviewsService,
     )
-    from integrations.source_control.security.audit import (
+    from backend.integrations.source_control.security.audit import (
         AuditEventType,
         AuditSeverity,
     )
-    from integrations.source_control.security.oauth_flow import (
+    from backend.integrations.source_control.security.oauth_flow import (
         OAuthFlowCoordinator,
         OAuthProviderCallbacks,
     )
-    from integrations.source_control.security.policy_engine import (
+    from backend.integrations.source_control.security.policy_engine import (
         PolicyResolutionContext,
     )
-    from integrations.source_control.schemas import (
+    from backend.integrations.source_control.schemas import (
         ActionSuccessResponse,
         ApprovalTicketResponse,
         ApproveOperationRequest,
@@ -233,6 +237,7 @@ except ImportError:
         RejectOperationRequest,
         RepositoryResponse,
         RunChecksRequest,
+        SaveProviderConfigRequest,
         ValidateConnectionRequest,
         WorkspaceResponse,
     )
@@ -790,6 +795,24 @@ class SourceControlFacade:
         # Facade-private connection registry. This is NOT a secret
         # store: only identifiers and timestamps are kept here.
         self._connections: Dict[str, _ConnectionRecord] = {}
+        # Track provider-set combinations already warned about, so
+        # that `_default_provider_id` emits its "multiple
+        # providers are connected" warning at most once per
+        # combination instead of on every call.
+        #
+        # Without this guard the warning fires on every request
+        # that omits `provider` while two or more non-GitHub
+        # providers are connected. At production request rates
+        # that produces tens of thousands of identical log lines
+        # per hour, drowning out real warnings and bloating the
+        # log file. See `_default_provider_id` for the full
+        # rationale.
+        #
+        # The accessor in `_default_provider_id` uses
+        # `__dict__.setdefault` so instances built via
+        # `object.__new__` (as some tests do) work without any
+        # extra changes.
+        self._warned_provider_sets: set[frozenset[str]] = set()
         self._load_connections()
 
     def _register_default_oauth_providers(self) -> None:
@@ -1107,24 +1130,49 @@ class SourceControlFacade:
         """
         Return the provider to use when the request does not specify one.
 
-        Resolution order:
-            1. ``github`` when a GitHub connection exists.
-            2. The first connected provider that maps to a known
-               ``ProviderId``.
-            3. ``ProviderId.GITHUB`` as a safe fallback.
+        Bug fix (deterministic provider selection):
+            The previous implementation iterated `self._connections`
+            directly and returned the first key that mapped to a
+            `ProviderId`. Because `_connections` is a dict, its
+            iteration order follows insertion order, which in turn
+            depends on the order of records in the persisted
+            `connections.json` file read by `_load_connections`.
+            That order is NOT guaranteed to be stable across
+            restarts or across installations. With two or more
+            non-GitHub providers connected, two identical calls
+            could return DIFFERENT providers depending on which
+            happened to be inserted first, silently routing
+            operations to the wrong provider.
 
-        When a connected provider key does not correspond to any
-        ``ProviderId`` member (for example a provider that was
-        removed from the enum), the key is skipped and a warning is
-        logged. The previous implementation silently swallowed the
-        ``ValueError``, which made stale connection records invisible
-        to operators.
+        Resolution order (deterministic):
+
+            1. `github` when a GitHub connection exists. This
+               matches the canonical default for the first-release
+               scope and is the behavior every caller expects.
+            2. Otherwise, the connected provider that maps to a
+               known `ProviderId`, selected by a stable sort on
+               `ProviderId.value` so that two identical calls on
+               two identical processes return the same value.
+            3. `ProviderId.GITHUB` as a safe fallback when no
+               connection is registered at all.
+
+        A warning is logged in two situations:
+
+            - A connection key does not correspond to any known
+              `ProviderId` member (for example a provider that was
+              removed from the enum). The key is skipped.
+            - More than one non-GitHub provider is connected. The
+              selected provider is named so operators can see the
+              choice and understand that they should pass
+              `provider` explicitly to override it.
         """
         if "github" in self._connections:
             return ProviderId.GITHUB
+
+        candidates: List[ProviderId] = []
         for key in self._connections.keys():
             try:
-                return ProviderId(key)
+                candidates.append(ProviderId(key))
             except ValueError:
                 logger.warning(
                     "Connected provider '%s' is not a known "
@@ -1132,8 +1180,57 @@ class SourceControlFacade:
                     "default provider.",
                     key,
                 )
-                continue
-        return ProviderId.GITHUB
+
+        if not candidates:
+            return ProviderId.GITHUB
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # Multiple non-GitHub providers are connected. Pick by
+        # `ProviderId.value` so that the result is reproducible
+        # across processes and restarts.
+        selected = min(candidates, key=lambda pid: pid.value)
+
+        # Emit the "which provider did we pick" warning at most
+        # ONCE per distinct provider-set, instead of on every
+        # call.
+        #
+        # Bug fix (log spam): the previous implementation logged
+        # the warning unconditionally. With two or more
+        # non-GitHub providers connected and a busy server (say
+        # 50 requests/second), that produced ~180,000 identical
+        # lines per hour — enough to bury genuine warnings under
+        # noise, bloat the log file, and defeat any log-based
+        # monitoring. The warning still fires exactly once per
+        # distinct set, so an operator who connects a NEW
+        # provider sees one fresh line announcing the new
+        # default.
+        #
+        # The `setdefault` on `self.__dict__` handles instances
+        # built via `object.__new__` (used by the Bug 5 tests):
+        # the first call creates the tracking set on the
+        # instance, and every subsequent call finds it. The
+        # operation is atomic in CPython, so no additional lock
+        # is needed; the worst case under contention is a single
+        # duplicate warning, never a lost warning.
+        warned_sets = self.__dict__.setdefault(
+            "_warned_provider_sets", set()
+        )
+        provider_set = frozenset(p.value for p in candidates)
+        if provider_set not in warned_sets:
+            warned_sets.add(provider_set)
+            logger.warning(
+                "Multiple non-GitHub providers are connected (%s); "
+                "defaulting to '%s' for requests that do not "
+                "specify a provider. Pass `provider` explicitly "
+                "to override. This warning is emitted once per "
+                "provider-set.",
+                sorted(provider_set),
+                selected.value,
+            )
+
+        return selected
 
     async def _require_token(
         self,
@@ -2085,11 +2182,87 @@ class SourceControlFacade:
         repo = await self._resolve_repo(
             adapter, repository_id, provider_id, token
         )
-        raw_content = await adapter.read_file(
-            repo=repo, file_path=file_path, ref=ref, token=token
-        )
 
-        effective_ref = ref or getattr(repo, "default_branch", "main")
+        # Bug 10: resolve the effective ref BEFORE calling the
+        # adapter, so that the response's `ref` field is guaranteed
+        # to describe exactly what was read.
+        #
+        # The previous implementation passed `ref` through to the
+        # adapter, then computed the response's `ref` as
+        # `ref or getattr(repo, "default_branch", "main")`. Three
+        # independent problems resulted:
+        #
+        #   1. When `repo.default_branch` was an empty string (a
+        #      real state, not just a mock issue), the response
+        #      reported `ref=""` -- a value that passes Pydantic
+        #      validation but violates the schema's non-empty
+        #      contract and misleads the UI.
+        #   2. When `repo.default_branch` was missing entirely, the
+        #      code lied with "main" even if the adapter had used
+        #      something else internally (for example the actual
+        #      HEAD of the remote), so the response described a ref
+        #      that was never read.
+        #   3. When `repo.default_branch` was `None`, the response
+        #      schema's `ref: str` field rejected the None with a
+        #      Pydantic ValidationError -- surfacing as a 500
+        #      instead of the intended 200/404.
+        #
+        # The fix resolves the ref up front and always passes it
+        # explicitly to the adapter, so the two are consistent.
+        effective_ref: Optional[str] = ref
+        if not effective_ref:
+            candidate = getattr(repo, "default_branch", None)
+            if not isinstance(candidate, str) or not candidate.strip():
+                # Refresh the repository metadata from the adapter
+                # to obtain its authoritative default branch. This
+                # is best-effort: a network failure here must not
+                # mask the caller's intent, so the error is logged
+                # and the flow continues to the validation below.
+                fresh: Optional[RepositoryRef] = None
+                try:
+                    fresh_candidate = await adapter.get_repository(
+                        repo=repo, token=token
+                    )
+                    if isinstance(fresh_candidate, RepositoryRef):
+                        fresh = fresh_candidate
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "read_file: could not refresh repository "
+                        "metadata to resolve default branch: %s",
+                        type(exc).__name__,
+                    )
+                if (
+                    fresh is not None
+                    and isinstance(fresh.default_branch, str)
+                    and fresh.default_branch.strip()
+                ):
+                    repo = fresh
+                    candidate = fresh.default_branch
+                else:
+                    candidate = None
+            if (
+                not candidate
+                or not isinstance(candidate, str)
+                or not candidate.strip()
+            ):
+                raise ValidationError(
+                    "Cannot determine which ref to read: no 'ref' "
+                    "was supplied and the repository metadata does "
+                    "not expose a usable default branch. Pass 'ref' "
+                    "explicitly.",
+                    details={
+                        "repository_id": repository_id,
+                        "file_path": file_path,
+                    },
+                )
+            effective_ref = candidate.strip()
+
+        raw_content = await adapter.read_file(
+            repo=repo,
+            file_path=file_path,
+            ref=effective_ref,
+            token=token,
+        )
 
         # Normalize the adapter's return value to bytes for
         # consistent size accounting and binary detection.
@@ -2143,6 +2316,101 @@ class SourceControlFacade:
     # ------------------------------------------------------------------
     # 5. Workspaces, Diffs & CI Checks
     # ------------------------------------------------------------------
+
+    async def _resolve_workspace_base_sha(
+        self, ws_ref: Any
+    ) -> Optional[str]:
+        """
+        Resolve a valid base SHA for a workspace.
+
+        The base SHA is the commit against which a workspace's
+        changes are compared. It MUST be a real 40- or 64-character
+        commit SHA, never a symbolic reference such as "HEAD".
+        Using a symbolic reference silently produces an empty diff
+        once the agent has committed its work, which surfaces to the
+        user as a misleading "No changes detected" error during
+        approval.
+
+        Bug 8 (base_sha unification):
+            Previously, `inspect_workspace_diff` used
+            `ws_ref.base_sha or None` while `create_operation`
+            fell back to `ws_ref.head_sha` when `base_sha` was
+            empty. The two values diverged for any workspace whose
+            `base_sha` was missing (for example, a workspace
+            recovered from disk after a process restart),
+            producing a review diff that did NOT match the diff
+            hashed into the approval ticket. This helper is now
+            the single source of truth for both call sites.
+
+        Resolution order:
+
+            1. The workspace's recorded `base_sha`, when it is a
+               valid 40- or 64-character hex SHA.
+            2. The `.peldrun/workspace.json` marker on disk
+               (survives process restarts).
+            3. The current HEAD commit SHA read from Git directly.
+            4. `None` when the repository has no commits yet.
+
+        Returns:
+            A lowercase 40- or 64-character commit SHA, or `None`
+            when no commit exists yet.
+        """
+        import asyncio as _asyncio
+        import subprocess as _subprocess
+        import json as _json
+        from pathlib import Path as _Path
+
+        def _is_valid_sha(value: Any) -> bool:
+            if not value or not isinstance(value, str):
+                return False
+            normalized = value.strip().lower()
+            if len(normalized) not in (40, 64):
+                return False
+            return all(c in "0123456789abcdef" for c in normalized)
+
+        # 1. Recorded base_sha, when it is a real SHA.
+        if _is_valid_sha(getattr(ws_ref, "base_sha", None)):
+            return str(ws_ref.base_sha).strip()
+
+        # 2. Marker file on disk.
+        try:
+            workspace_path = getattr(ws_ref, "workspace_path", None)
+            if workspace_path:
+                marker = (
+                    _Path(workspace_path)
+                    / ".peldrun"
+                    / "workspace.json"
+                )
+                if marker.exists():
+                    data = _json.loads(
+                        marker.read_text(encoding="utf-8")
+                    )
+                    candidate = data.get("base_sha")
+                    if _is_valid_sha(candidate):
+                        return str(candidate).strip()
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 3. Real HEAD SHA read from Git, off the event loop.
+        try:
+            workspace_path = getattr(ws_ref, "workspace_path", None)
+            if workspace_path:
+                result = await _asyncio.to_thread(
+                    _subprocess.run,
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=str(workspace_path),
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    sha = result.stdout.strip()
+                    if _is_valid_sha(sha):
+                        return sha
+        except Exception:  # noqa: BLE001
+            pass
+
+        return None
 
     async def create_workspace(
         self, payload: CreateWorkspaceRequest, chat_id: Optional[str] = None
@@ -2313,8 +2581,18 @@ class SourceControlFacade:
                 # request because it thinks we are on `main`.
                 actual_branch = str(data.get("current_branch") or "main")
                 try:
-                    import subprocess
-                    res = subprocess.run(
+                    import asyncio as _asyncio
+                    import subprocess as _subprocess
+                    # Offload the blocking subprocess call to a
+                    # worker thread so the async event loop stays
+                    # responsive. The previous synchronous
+                    # `subprocess.run(...)` call froze the entire
+                    # FastAPI event loop for the duration of the
+                    # Git invocation (up to `timeout` seconds),
+                    # stalling every other in-flight request
+                    # serviced by the same worker.
+                    res = await _asyncio.to_thread(
+                        _subprocess.run,
                         ["git", "rev-parse", "--abbrev-ref", "HEAD"],
                         cwd=str(expected_path),
                         capture_output=True,
@@ -2520,40 +2798,53 @@ class SourceControlFacade:
         if force_delete_files and workspace_path:
             p = _Path(workspace_path)
             if p.exists():
-                try:
-                    shutil.rmtree(p)
-                    deleted_files = True
-                except (OSError, PermissionError) as exc:
-                    # Windows retry: clear read-only bits and retry.
-                    if os.name == "nt":
-                        def _retry(func, path, _exc_info):
+                # Offload `shutil.rmtree` to a worker thread.
+                # Removing a large workspace tree (node_modules,
+                # .git objects, build artifacts) can take several
+                # seconds; running it directly on the event loop
+                # froze every other concurrent request for the
+                # entire duration of the deletion.
+                import asyncio as _asyncio
+
+                def _do_rmtree() -> bool:
+                    try:
+                        shutil.rmtree(p)
+                        return True
+                    except (OSError, PermissionError) as exc:
+                        # Windows retry: clear read-only bits
+                        # and retry.
+                        if os.name == "nt":
+                            def _retry(func, path, _exc_info):
+                                try:
+                                    os.chmod(path, stat.S_IWRITE)
+                                    func(path)
+                                except Exception:
+                                    pass
                             try:
-                                os.chmod(path, stat.S_IWRITE)
-                                func(path)
+                                if sys.version_info >= (3, 12):
+                                    shutil.rmtree(p, onexc=_retry)
+                                else:
+                                    shutil.rmtree(p, onerror=_retry)
+                                return True
                             except Exception:
                                 pass
-                        try:
-                            if sys.version_info >= (3, 12):
-                                shutil.rmtree(p, onexc=_retry)
-                            else:
-                                shutil.rmtree(p, onerror=_retry)
-                            deleted_files = True
-                        except Exception:
-                            deleted_files = False
-                    if not deleted_files:
                         logger.error(
-                            "delete_workspace: could not remove files "
-                            "at '%s': %s",
+                            "delete_workspace: could not remove "
+                            "files at '%s': %s",
                             workspace_path,
                             type(exc).__name__,
                         )
                         raise ValidationError(
                             f"Could not delete workspace files at "
                             f"'{workspace_path}'. The workspace "
-                            f"registry entry was NOT removed, so you "
-                            f"can retry. Underlying error: "
+                            f"registry entry was NOT removed, so "
+                            f"you can retry. Underlying error: "
                             f"{type(exc).__name__}: {exc}"
                         )
+
+                deleted_files = await _asyncio.to_thread(
+                    _do_rmtree
+                )
 
         # ---- 3. Only now remove from the registry ----
         manager_delete = getattr(
@@ -2748,7 +3039,9 @@ class SourceControlFacade:
         return result
 
     async def cleanup_orphaned_operations(
-        self, dry_run: bool = False
+        self,
+        dry_run: bool = False,
+        limit: int = 10_000,
     ) -> dict:
         """
         Prune journal operations whose bound workspace is gone.
@@ -2779,6 +3072,12 @@ class SourceControlFacade:
             dry_run: When True, report what WOULD be removed without
                 mutating the journal. Use this from UI previews and
                 before destructive sweeps.
+            limit: Maximum number of journal records to inspect.
+                The default of 10,000 is large enough to cover any
+                realistic journal and replaces the previous
+                implicit cap of 100 that silently skipped
+                orphaned operations once the journal grew past
+                that threshold.
 
         Returns:
             A dict with the following shape::
@@ -2794,38 +3093,46 @@ class SourceControlFacade:
                     "dry_run": bool,
                 }
         """
-        # Deferred imports so that a facade module import never
-        # forces the journal subsystem to be initialized on a code
-        # path that does not use source control.
-        try:
-            from integrations.source_control.operations.journal import (
-                FileOperationJournal,
-            )
-        except ImportError:  # repo layout: backend.integrations.*
-            from backend.integrations.source_control.operations.journal import (  # type: ignore[no-redef]
-                FileOperationJournal,
+        # Validate the limit before any I/O so a bad caller value
+        # fails fast with a clear diagnostic.
+        if limit <= 0:
+            raise ValidationError(
+                "limit must be a positive integer.",
+                details={"limit": limit},
             )
 
-        # Discover the operation IDs currently persisted. The
-        # operation service exposes `list_operations()` in the
-        # current implementation; fall back to the underlying
-        # journal's internal records map when that method is not
-        # available (older builds, test doubles).
+        # Discover the operation IDs currently persisted.
+        #
+        # Bug fix (cleanup cap): the previous implementation called
+        # `OperationService.list_operations()` without an argument,
+        # which applies its default `limit=100`. Once the journal
+        # held more than 100 records, any orphaned operation older
+        # than the 100 newest was silently skipped by the sweep and
+        # never pruned. The fix reads the journal directly with an
+        # explicit `limit` so that a maintenance sweep can see the
+        # full set of persisted operations.
+        #
+        # `OperationService.journal` is the public accessor. The
+        # `AttributeError` fallback covers older builds and test
+        # doubles that lack that property; it uses the public
+        # `list_operations()` method, which is still capped at
+        # `MAX_RECORDS_IN_MEMORY` but is at least functional.
         operation_ids: List[str] = []
         try:
-            listed = await self.operation_service.list_operations()
+            _journal_for_listing = self.operation_service.journal
+            listed = await _journal_for_listing.list_records(
+                limit=limit
+            )
             for record in listed or ():
                 op_id = getattr(record, "operation_id", None)
                 if isinstance(op_id, str) and op_id:
                     operation_ids.append(op_id)
         except AttributeError:
-            journal = getattr(
-                self.operation_service, "_journal", None
-            )
-            if isinstance(journal, FileOperationJournal):
-                operation_ids = list(
-                    getattr(journal, "_records", {}).keys()
-                )
+            listed = await self.operation_service.list_operations()
+            for record in listed or ():
+                op_id = getattr(record, "operation_id", None)
+                if isinstance(op_id, str) and op_id:
+                    operation_ids.append(op_id)
 
         removed: List[dict] = []
         removed_ids: List[str] = []
@@ -2875,16 +3182,34 @@ class SourceControlFacade:
                     await self.operation_service.delete_operation(op_id)
                     deleted_ids.append(op_id)
                 except AttributeError:
-                    # Fallback: if the operation service does not
-                    # expose `delete_operation`, try to remove the
-                    # journal record directly. This path exists for
-                    # older builds and test doubles.
-                    journal = getattr(
+                    # Fallback for older builds and test doubles
+                    # that lack `OperationService.delete_operation`.
+                    #
+                    # Bug fix: the previous fallback called
+                    # `journal.delete(op_id)` synchronously, but
+                    # `OperationJournal` has no `delete` method
+                    # (the actual method is `delete_record` and it
+                    # is async), and the `isinstance(...,
+                    # FileOperationJournal)` check never matched
+                    # the actual in-memory journal used by tests.
+                    # The corrected fallback calls
+                    # `await journal.delete_record(op_id)`, which
+                    # both concrete implementations implement.
+                    _journal_for_delete = getattr(
+                        self.operation_service, "journal", None
+                    ) or getattr(
                         self.operation_service, "_journal", None
                     )
-                    if isinstance(journal, FileOperationJournal):
+                    if (
+                        _journal_for_delete is not None
+                        and hasattr(
+                            _journal_for_delete, "delete_record"
+                        )
+                    ):
                         try:
-                            journal.delete(op_id)
+                            await _journal_for_delete.delete_record(
+                                op_id
+                            )
                             deleted_ids.append(op_id)
                         except Exception as exc:  # noqa: BLE001
                             failures.append(
@@ -3038,14 +3363,105 @@ class SourceControlFacade:
             if possible_path.exists() and hasattr(self.workspace_manager, "register_workspace"):
                 from integrations.source_control.domain.models import WorkspaceRef, WorkspaceStatus
                 from integrations.source_control.domain.enums import ProviderId
+                import asyncio as _asyncio
+                import subprocess as _subprocess
+                import json as _json
+                from pathlib import Path as _Path
+
+                # Bug 8: read real values from the marker file and
+                # from Git. The previous recovery path stored the
+                # symbolic string "HEAD" as base_sha and "main" as
+                # current_branch, which made the review diff and the
+                # approval-time diff diverge on the next restart.
+                # See `_resolve_workspace_base_sha` for the full
+                # rationale.
+                _recovered_branch = ""
+                _recovered_repo_id = ""
+                _recovered_base = ""
+                _recovered_head = ""
+
+                try:
+                    _marker = (
+                        _Path(str(possible_path))
+                        / ".peldrun"
+                        / "workspace.json"
+                    )
+                    if _marker.exists():
+                        _mdata = _json.loads(
+                            _marker.read_text(encoding="utf-8")
+                        )
+                        _recovered_branch = str(
+                            _mdata.get("current_branch") or ""
+                        ).strip()
+                        _recovered_repo_id = str(
+                            _mdata.get("repository_id") or ""
+                        ).strip()
+                        _recovered_base = str(
+                            _mdata.get("base_sha") or ""
+                        ).strip()
+                        _recovered_head = str(
+                            _mdata.get("head_sha") or ""
+                        ).strip()
+                except Exception:  # noqa: BLE001
+                    pass
+
+                # Ask Git for the authoritative current branch.
+                try:
+                    _head_res = await _asyncio.to_thread(
+                        _subprocess.run,
+                        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                        cwd=str(possible_path),
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if (
+                        _head_res.returncode == 0
+                        and _head_res.stdout.strip()
+                        and _head_res.stdout.strip() != "HEAD"
+                    ):
+                        _recovered_branch = _head_res.stdout.strip()
+                except Exception:  # noqa: BLE001
+                    pass
+
+                # Ask Git for the authoritative HEAD commit SHA.
+                try:
+                    _sha_res = await _asyncio.to_thread(
+                        _subprocess.run,
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=str(possible_path),
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if _sha_res.returncode == 0:
+                        _sha = _sha_res.stdout.strip()
+                        if len(_sha) in (40, 64):
+                            _recovered_head = _sha
+                            # When the marker has no recorded base,
+                            # fall back to the real HEAD SHA. This
+                            # is not the "original" base, but it is
+                            # a real commit SHA, strictly better
+                            # than the previous fake "HEAD" string
+                            # that produced an empty diff.
+                            if not _recovered_base:
+                                _recovered_base = _sha
+                except Exception:  # noqa: BLE001
+                    pass
+
+                if not _recovered_branch:
+                    _recovered_branch = "main"
+
                 ws_ref = WorkspaceRef(
                     workspace_id=workspace_id,
-                    repository_id="recovered-repository",
+                    repository_id=(
+                        _recovered_repo_id or "recovered-repository"
+                    ),
                     provider=ProviderId.GITHUB,
                     workspace_path=str(possible_path.resolve()),
-                    current_branch="main",
-                    base_sha="HEAD",
-                    head_sha="",
+                    current_branch=_recovered_branch,
+                    base_sha=_recovered_base,
+                    head_sha=_recovered_head,
                     is_worktree=False,
                     is_clean=True,
                     status=WorkspaceStatus.READY,
@@ -3054,13 +3470,31 @@ class SourceControlFacade:
                     metadata={"auto_recovered": True},
                 )
                 self.workspace_manager.register_workspace(ws_ref)
+                # Persist the recovered state so a future restart
+                # observes the same values. This prevents the same
+                # divergence from recurring on the next restart.
+                try:
+                    self.workspace_manager._write_workspace_marker(
+                        ws_ref
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
         if ws_ref is None:
             raise NotFoundError(
                 f"Workspace '{workspace_id}' was not found."
             )
 
-        effective_base = base_ref or ws_ref.base_sha or None
+        # Bug 8: use the shared helper so that the diff computed
+        # for review is byte-for-byte identical to the diff that
+        # `create_operation` hashes into the approval ticket. The
+        # previous `ws_ref.base_sha or None` diverged from
+        # `create_operation`'s `base_sha or head_sha` fallback
+        # whenever `base_sha` was empty.
+        effective_base = (
+            base_ref
+            or await self._resolve_workspace_base_sha(ws_ref)
+        )
 
         summary: DiffSummary = await self.diff_engine.compute_diff(
             workspace_id=workspace_id,
@@ -3452,11 +3886,21 @@ class SourceControlFacade:
                     ws_id_for_meta
                 )
                 if _ws_for_base is not None:
-                    ws_base_sha_for_record = (
-                        _ws_for_base.base_sha
-                        or _ws_for_base.head_sha
-                        or ""
+                    # Bug 8: use the shared helper. The previous
+                    # `base_sha or head_sha or ""` fallback
+                    # diverged from `inspect_workspace_diff`'s
+                    # `base_sha or None`, so the review diff the
+                    # user saw could differ from the diff hashed
+                    # into the approval ticket. The helper
+                    # validates the SHA shape and recovers a real
+                    # commit SHA from the marker file or Git when
+                    # `base_sha` is missing.
+                    _resolved_base = (
+                        await self._resolve_workspace_base_sha(
+                            _ws_for_base
+                        )
                     )
+                    ws_base_sha_for_record = _resolved_base or ""
             except Exception:  # noqa: BLE001
                 pass
 
@@ -4343,11 +4787,21 @@ class SourceControlFacade:
         # authoritative source of truth: the commit manager ran
         # `git commit` on whatever HEAD was, and `git rev-parse
         # --abbrev-ref HEAD` returns exactly that branch.
+        import asyncio as _asyncio
         import subprocess as _subprocess
 
         _local_branch = ws_ref.current_branch
         try:
-            _head_res = _subprocess.run(
+            # Offload to a worker thread. Calling
+            # `subprocess.run` directly inside this async
+            # function blocks the FastAPI event loop for the
+            # entire Git invocation, which delays every
+            # concurrent request. The push path is already the
+            # slowest endpoint in the subsystem, so freezing
+            # the loop here compounds the impact on unrelated
+            # API calls.
+            _head_res = await _asyncio.to_thread(
+                _subprocess.run,
                 ["git", "rev-parse", "--abbrev-ref", "HEAD"],
                 cwd=ws_ref.workspace_path,
                 capture_output=True,

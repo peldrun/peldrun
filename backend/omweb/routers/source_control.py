@@ -1395,6 +1395,18 @@ async def cleanup_operations(
             "mutating the operation journal."
         ),
     ),
+    limit: int = Query(
+        default=10_000,
+        ge=1,
+        le=50_000,
+        description=(
+            "Maximum number of journal records to scan. The "
+            "default of 10,000 replaces the previous implicit "
+            "cap of 100 that silently skipped orphaned "
+            "operations once the journal grew past that "
+            "threshold."
+        ),
+    ),
     facade: SourceControlFacade = Depends(get_source_control_facade),
 ) -> dict:
     """
@@ -1419,7 +1431,7 @@ async def cleanup_operations(
     """
     try:
         return await facade.cleanup_orphaned_operations(
-            dry_run=dry_run
+            dry_run=dry_run, limit=limit
         )
     except Exception as exc:
         handle_source_control_error(exc)

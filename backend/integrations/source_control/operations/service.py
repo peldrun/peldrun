@@ -28,6 +28,7 @@ Design rules:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 import threading
@@ -159,9 +160,57 @@ class OperationService:
         # Populated lazily; invalidated on service restart.
         self._event_sequences: Dict[str, int] = {}
 
-        # Per-operation locks prevent two coroutines from racing on
-        # the same operation's sequence number.
-        self._operation_locks: Dict[str, threading.RLock] = {}
+        # Per-operation async locks used to serialize state
+        # mutations (transition, field update, delete) across
+        # coroutines.
+        #
+        # Bug 9 extension (lost update on concurrent transitions):
+        #     The previous implementation used `threading.RLock`
+        #     here. `RLock` is re-entrant within the same OS
+        #     thread, and asyncio runs every coroutine in the same
+        #     thread by default. A coroutine that awaited inside
+        #     the critical section (which both
+        #     `_transition_internal` and `_update_record` do) did
+        #     NOT exclude other coroutines: they re-entered the
+        #     lock as soon as the event loop yielded to them. Two
+        #     concurrent transitions on the same operation could
+        #     therefore read the same starting record, both
+        #     compute a new state, and the second `save_record`
+        #     would silently overwrite the first — a classic lost
+        #     update. The recorded `from_status` in the
+        #     transition event could also be stale.
+        #
+        #     `asyncio.Lock` is held across `await` points, which
+        #     is the correct semantics for coroutine-level mutual
+        #     exclusion.
+        self._operation_locks: Dict[str, asyncio.Lock] = {}
+
+        # Per-operation async locks used to serialize event
+        # emission (sequence allocation + journal append).
+        #
+        # Bug 9 (duplicate event sequences):
+        #     The previous implementation allocated a sequence
+        #     number and appended the event as two independent
+        #     steps. Under concurrency, two coroutines could
+        #     interleave between the read of `_event_sequences`
+        #     and the write-back, producing the same sequence
+        #     number for two different events. They could also
+        #     interleave between the allocation and the append,
+        #     so an event with a HIGHER sequence number could be
+        #     written to the journal BEFORE an event with a
+        #     LOWER sequence number. Both symptoms corrupt the
+        #     audit trail and the state-machine history.
+        #
+        # `asyncio.Lock` properly serializes coroutines: the lock
+        # is held across `await` points, so only one coroutine
+        # per operation can be inside the emission critical
+        # section at a time. This guarantees that:
+        #
+        #   1. Sequence numbers are unique per operation.
+        #   2. Events are appended to the journal in sequence
+        #      order (no reordering under concurrency).
+        self._event_locks: Dict[str, asyncio.Lock] = {}
+
         self._locks_lock = threading.RLock()
 
     # --- Accessors ------------------------------------------------------
@@ -346,12 +395,36 @@ class OperationService:
         Returns True if the operation existed. This is a destructive
         operation; the caller is responsible for ensuring the user
         has approved it.
+
+        Side effect:
+            Also evicts the per-operation locks from the in-memory
+            caches. This prevents unbounded growth of `_event_locks`
+            and `_operation_locks` when many operations are created
+            and deleted over a long-running process lifetime.
         """
         key = _validate_operation_id(operation_id)
-        existed = await self._journal.delete_record(key)
+        # Acquire the per-operation async lock so that the delete
+        # cannot interleave with an in-flight transition or field
+        # update. Without this, a transition that had already
+        # read the record before the delete could re-create it on
+        # `save_record`, leaving the journal with a record the
+        # caller believes was deleted.
+        async with self._operation_lock(key):
+            existed = await self._journal.delete_record(key)
+        # No `await` between the lock release above and the
+        # synchronous cache eviction below, so any coroutine that
+        # was waiting on the OLD lock acquires it right after we
+        # release, calls `get_record`, and sees `None` (the
+        # record is gone) — the correct behavior for a deleted
+        # operation. A coroutine that calls `_operation_lock`
+        # AFTER the pop creates a fresh lock; both it and the
+        # OLD-lock holder fail at `get_record` because the record
+        # is gone, so no lost update can occur even though the
+        # two coroutines hold distinct lock objects.
         with self._locks_lock:
             self._event_sequences.pop(key, None)
             self._operation_locks.pop(key, None)
+            self._event_locks.pop(key, None)
         return existed
 
     # --- Transition validation -----------------------------------------
@@ -464,8 +537,12 @@ class OperationService:
             )
 
         key = _validate_operation_id(operation_id)
-        lock = self._operation_lock(key)
-        with lock:
+        # Hold the async lock across the full check-then-act
+        # sequence. `asyncio.Lock` is held across `await` points,
+        # which is what prevents two concurrent transitions on the
+        # same operation from reading the same starting record and
+        # overwriting each other's `save_record` (lost update).
+        async with self._operation_lock(key):
             record = await self._journal.get_record(key)
             if record is None:
                 raise NotFoundError(
@@ -730,12 +807,14 @@ class OperationService:
         with self._locks_lock:
             self._event_sequences.clear()
             self._operation_locks.clear()
+            self._event_locks.clear()
         await self._journal.clear()
 
     def __repr__(self) -> str:  # pragma: no cover - trivial formatting
         return (
             f"<OperationService journal={self._journal.backend_name!r} "
-            f"cached_sequences={len(self._event_sequences)}>"
+            f"cached_sequences={len(self._event_sequences)} "
+            f"event_locks={len(self._event_locks)}>"
         )
 
     # --- Internal: record updates --------------------------------------
@@ -757,8 +836,11 @@ class OperationService:
         the status is never altered here.
         """
         key = _validate_operation_id(operation_id)
-        lock = self._operation_lock(key)
-        with lock:
+        # Same locking rationale as `_transition_internal`: the
+        # check-then-act sequence includes `await` calls, so the
+        # lock MUST be an `asyncio.Lock` to actually exclude other
+        # coroutines.
+        async with self._operation_lock(key):
             record = await self._journal.get_record(key)
             if record is None:
                 raise NotFoundError(
@@ -790,13 +872,56 @@ class OperationService:
 
     # --- Internal: event sequencing ------------------------------------
 
-    def _operation_lock(self, operation_id: str) -> threading.RLock:
-        """Return the per-operation lock, creating it on first use."""
+    def _operation_lock(self, operation_id: str) -> asyncio.Lock:
+        """
+        Return the per-operation async lock, creating it on first
+        use.
+
+        The lock serializes every state mutation for a given
+        operation (`_transition_internal`, `_update_record`,
+        `delete_operation`). It MUST be held across the entire
+        check-then-act critical section, including every `await`
+        inside it; otherwise the lost-update race described in the
+        `__init__` comment reappears.
+
+        Lock ordering (never reversed anywhere in the service):
+
+            _operation_lock(key) -> _event_lock(key)
+
+        `_emit_event` is called from inside `_operation_lock` and
+        acquires `_event_lock` in turn. No code path acquires the
+        two locks in the opposite order, so the ordering is
+        deadlock-free.
+
+        `_locks_lock` (a `threading.RLock`) is used ONLY to guard
+        the dictionary that maps operation IDs to locks. Dictionary
+        access is synchronous and await-free, so `threading.RLock`
+        is appropriate there and does not suffer from the same
+        re-entrancy issue.
+        """
         with self._locks_lock:
             lock = self._operation_locks.get(operation_id)
             if lock is None:
-                lock = threading.RLock()
+                lock = asyncio.Lock()
                 self._operation_locks[operation_id] = lock
+            return lock
+
+    def _event_lock(self, operation_id: str) -> asyncio.Lock:
+        """
+        Return the per-operation async lock for event emission.
+
+        The lock serializes sequence allocation and journal append
+        across coroutines. `threading.RLock` cannot do this because
+        every coroutine runs in the same OS thread, so an RLock held
+        by one coroutine does not exclude another; `asyncio.Lock`
+        yields the event loop while waiting, which is the correct
+        semantics.
+        """
+        with self._locks_lock:
+            lock = self._event_locks.get(operation_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._event_locks[operation_id] = lock
             return lock
 
     async def _emit_event(
@@ -809,30 +934,57 @@ class OperationService:
         """
         Append an event to the journal with the next sequence number.
 
-        The sequence cache is consulted first. On a cache miss (for
-        example after a service restart), the journal is queried for
-        the latest event to determine the next sequence. This is safe
-        because `list_events` returns events in sequence order.
+        Bug 9 fix (duplicate sequences under concurrency):
+            Sequence allocation and journal append are now executed
+            while holding the per-operation `_event_lock`, so:
+
+                1. Two events for the same operation can never
+                   receive the same sequence number.
+                2. Event N is always appended to the journal before
+                   event N+1, even when multiple coroutines emit
+                   events concurrently.
+
+            The previous implementation performed the allocation
+            under a `threading.RLock`, which -- because asyncio runs
+            every coroutine in the same OS thread -- allowed two
+            coroutines to interleave at `await` points and race on
+            the cached sequence counter.
+
+            The lock is acquired per-operation, so emitting events
+            for different operations remains fully concurrent.
         """
         key = _validate_operation_id(operation_id)
-        next_seq = await self._next_event_sequence(key)
+        async with self._event_lock(key):
+            next_seq = await self._next_event_sequence_locked(key)
 
-        event = OperationEvent(
-            operation_id=key,
-            sequence=next_seq,
-            event_type=event_type,
-            occurred_at=_utc_now(),
-            payload=dict(payload),
-        )
-        await self._journal.append_event(event)
-        return event
+            event = OperationEvent(
+                operation_id=key,
+                sequence=next_seq,
+                event_type=event_type,
+                occurred_at=_utc_now(),
+                payload=dict(payload),
+            )
+            await self._journal.append_event(event)
+            return event
 
-    async def _next_event_sequence(self, operation_id: str) -> int:
+    async def _next_event_sequence_locked(
+        self, operation_id: str
+    ) -> int:
         """
         Return the next event sequence number for the operation.
 
-        Uses an in-memory cache; the cache is populated on demand.
-        The cache is per-process and invalidated at startup.
+        CALLER MUST HOLD `self._event_lock(operation_id)`.
+
+        The `_locked` suffix follows the project-wide convention for
+        functions that assume the caller holds a lock; it makes the
+        concurrency contract visible at every call site. Callers
+        outside this class MUST NOT invoke it directly.
+
+        The sequence cache is consulted first. On a cache miss (for
+        example after a service restart), the journal is queried for
+        the highest existing sequence, which is why a slow journal
+        read here blocks only events for the SAME operation -- not
+        events for other operations, which have their own locks.
         """
         with self._locks_lock:
             cached = self._event_sequences.get(operation_id)
@@ -842,6 +994,10 @@ class OperationService:
                 self._event_sequences[operation_id] = next_seq
             return next_seq
 
+        # Cache miss: read the highest existing sequence from the
+        # journal. The await happens while the caller holds the
+        # per-operation async lock, so no other coroutine can emit
+        # an event for this operation until the allocation completes.
         events = await self._journal.list_events(operation_id)
         last_seq = max((e.sequence for e in events), default=0)
         next_seq = last_seq + 1

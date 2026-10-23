@@ -277,7 +277,7 @@ function ChangeDescriptionCard() {
     branch === "dev";
 
   return (
-    <div className="mb-4 rounded-md border border-border bg-card/40 p-3 space-y-3">
+    <div className="mb-4 rounded-sm border border-border bg-gigbg p-3 space-y-3">
       <div className="flex items-center gap-1.5">
         <MessageSquare className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
         <h4 className="text-xs font-semibold text-foreground">
