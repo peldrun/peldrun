@@ -4602,6 +4602,45 @@ class SourceControlFacade:
             actor="system",
         )
 
+        # Update the workspace's base_sha (Bug 7 fix).
+        #
+        # `base_sha` is the commit the NEXT diff will compare against.
+        # If we do not update it after a successful push, the next
+        # diff will include the commits we just pushed (comparing
+        # against the ORIGINAL base_sha from when the workspace was
+        # created). By advancing base_sha to the pushed SHA, we ensure
+        # that the next push only contains NEW changes.
+        try:
+            _ws = self.workspace_manager.get_workspace(record.workspace_id)
+            if _ws is not None and push_result.local_sha:
+                # Update head_sha and base_sha, and mark the workspace clean.
+                # Using the internal dict directly is safe here because
+                # we are inside the facade and the workspace is ours.
+                from dataclasses import replace
+                _updated_ws = replace(
+                    _ws,
+                    base_sha=push_result.local_sha,
+                    head_sha=push_result.local_sha,
+                    is_clean=True,
+                )
+                # Update registry
+                if hasattr(self.workspace_manager, "_workspaces"):
+                    self.workspace_manager._workspaces[record.workspace_id] = _updated_ws
+                # Persist if supported
+                if hasattr(self.workspace_manager, "_save_registry"):
+                    self.workspace_manager._save_registry()
+
+                logger.info(
+                    "push_approved_branch: updated workspace base_sha to %s",
+                    push_result.local_sha[:12],
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "push_approved_branch: failed to update workspace "
+                "base_sha after push: %s",
+                type(exc).__name__,
+            )
+
         self._audit(
             AuditEventType.PUSH_SUCCESS,
             action="push_approved_branch",

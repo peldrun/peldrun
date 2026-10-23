@@ -29,6 +29,10 @@ export function ManualRepoSelector() {
   const [isLoadingBranches, setIsLoadingBranches] = useState(false);
   const [error, setLocalError] = useState<string | null>(null);
 
+  // Allows the user to type a new branch name, which is useful for
+  // empty repositories or when they want to start from a fresh branch.
+  const [customBranch, setCustomBranch] = useState("");
+
   // ---- Load repositories once (or when provider changes) ----
   useEffect(() => {
     let cancelled = false;
@@ -117,12 +121,16 @@ export function ManualRepoSelector() {
   };
 
   const handleContinue = () => {
-    if (!repository || !branch) return;
+    const targetBranch = customBranch.trim() || branch;
+    if (!repository || !targetBranch) return;
+    // Update the store with the chosen or custom branch
+    setBranch(targetBranch);
     setStep("creating-workspace");
   };
 
+  const targetBranch = customBranch.trim() || branch;
   const canContinue =
-    !!repository && !!branch && !isLoadingRepos && !isLoadingBranches;
+    !!repository && !!targetBranch && !isLoadingRepos && !isLoadingBranches;
 
   return (
     <div className="space-y-4">
@@ -222,7 +230,7 @@ export function ManualRepoSelector() {
             </option>
           ))}
         </select>
-        {branch && branches.find((b) => b.name === branch)?.is_protected && (
+        {branch && branches.find((b) => b.name === branch)?.is_protected && !customBranch.trim() && (
           <div className="mt-2 rounded-md bg-amber-50 border border-amber-200 p-3">
             <p className="text-[11px] text-amber-800 font-medium mb-2">
               ⚠️ This branch is protected.
@@ -244,6 +252,24 @@ export function ManualRepoSelector() {
             </p>
           </div>
         )}
+
+        {/* Custom Branch Input */}
+        <div className="mt-3">
+          <label className="block text-xs font-medium text-gray-700 mb-1">
+            Or create a new branch <span className="text-muted-foreground font-normal">(optional)</span>
+          </label>
+          <input
+            type="text"
+            value={customBranch}
+            onChange={(e) => setCustomBranch(e.target.value)}
+            placeholder="e.g. feature/initial-setup"
+            className="w-full rounded-md border border-border px-3 py-2 text-sm bg-background font-mono"
+          />
+          <p className="mt-1 text-[10px] text-muted-foreground">
+            If provided, this overrides the dropdown above. PELDRUN will
+            create and checkout this branch in the new workspace.
+          </p>
+        </div>
       </div>
 
       {/* Continue */}

@@ -245,11 +245,26 @@ function ChangeDescriptionCard() {
   const preferredBranchName = useManualModeStore(
     (s) => s.preferredBranchName
   );
+  const forceProtectedPush = useManualModeStore(
+    (s) => s.forceProtectedPush
+  );
+  const branch = useManualModeStore((s) => s.branch);
+
   const setTitle = useManualModeStore((s) => s.setTitle);
   const setDescription = useManualModeStore((s) => s.setDescription);
   const setPreferredBranchName = useManualModeStore(
     (s) => s.setPreferredBranchName
   );
+  const setForceProtectedPush = useManualModeStore(
+    (s) => s.setForceProtectedPush
+  );
+
+  // Show the override toggle if the user is on a typically protected branch
+  const isProtectedBranch =
+    branch === "main" ||
+    branch === "master" ||
+    branch === "develop" ||
+    branch === "dev";
 
   return (
     <div className="mb-4 rounded-md border border-border bg-card/40 p-3 space-y-3">
@@ -333,7 +348,30 @@ function ChangeDescriptionCard() {
         </p>
       </div>
 
-      <p className="text-[10px] text-muted-foreground">
+      {isProtectedBranch && (
+        <div className="mt-2 rounded-md bg-amber-50 border border-amber-200 p-3">
+          <p className="text-[11px] text-amber-800 font-medium mb-2">
+            ⚠️ Target branch <strong>{branch}</strong> is protected.
+          </p>
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={forceProtectedPush}
+              onChange={(e) => setForceProtectedPush(e.target.checked)}
+              className="rounded border-amber-300 text-amber-600 focus:ring-amber-500"
+            />
+            <span className="text-[11px] text-amber-800">
+              Push directly to <strong>{branch}</strong> (Owner override)
+            </span>
+          </label>
+          <p className="text-[10px] text-amber-700 mt-1 ml-6">
+            If checked, PELDRUN will skip the auto-branch feature and push
+            your commits directly to <strong>{branch}</strong>.
+          </p>
+        </div>
+      )}
+
+      <p className="text-[10px] text-muted-foreground mt-2">
         These fields are drafts stored in the UI. They will become the
         operation's suggested PR title and body once wired to the
         backend.
@@ -408,10 +446,17 @@ function PushedState() {
   }, [operationId]);
 
   const handleStartOver = () => {
+    // Do NOT call reset() here. reset() clears `workspaceId`, which
+    // would force the user to re-select the repository and hit the
+    // "workspace already exists" error.
+    //
+    // Instead, `activate(chatId)` preserves the workspace and
+    // branch, while clearing the operation-specific data
+    // (operationId, approvalId, diff, title, description, and
+    // forceProtectedPush), dropping the user straight into
+    // "editing" mode with their existing files.
     if (chatId) {
       useManualModeStore.getState().activate(chatId);
-    } else {
-      useManualModeStore.getState().reset();
     }
 
     if (typeof window !== "undefined") {
@@ -537,6 +582,11 @@ function ErrorState() {
   const { error, chatId } = useManualModeStore();
 
   const handleStartOver = () => {
+    // Preserve `workspaceId` by NOT calling reset() when a chat
+    // context exists. `activate(chatId)` clears the operation data
+    // and lands on "editing" (if a workspace exists) or
+    // "select-repo" (if none), avoiding the confusing
+    // "workspace already exists" loop.
     if (chatId) {
       useManualModeStore.getState().activate(chatId);
     } else {

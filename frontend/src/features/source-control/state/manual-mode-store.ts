@@ -119,6 +119,20 @@ export const useManualModeStore = create<ManualModeState>((set) => ({
         return {
           isActive: true,
           step: "editing",
+          // Clear all operation-specific state so a fresh workflow
+          // does not inherit the previous attempt's data (Bug 3/5).
+          operationId: null,
+          approvalId: null,
+          diff: null,
+          approvalScope: "push_branch",
+          title: "",
+          description: "",
+          preferredBranchName: "",
+          // Do NOT reset `forceProtectedPush`. If the user chose
+          // to override protection in this workspace, keep that
+          // choice for subsequent workflows until they explicitly
+          // change it or change the repository.
+          error: null,
         };
       }
       return {
