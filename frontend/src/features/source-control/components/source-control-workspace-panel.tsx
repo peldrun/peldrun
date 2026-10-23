@@ -209,18 +209,18 @@ export function SourceControlWorkspacePanel({
   return (
     <div className="flex flex-col h-full bg-background border-l border-border font-sans">
       {/* ---------------- Header ---------------- */}
-      <div className="h-12 border-b border-border bg-card/40 backdrop-blur-sm px-4 flex items-center justify-between shrink-0">
+      <div className="h-12 border-b border-border bg-slate-950 text-[#fff] backdrop-blur-sm px-4 flex items-center justify-between shrink-0">
         <div className="flex items-center gap-2 min-w-0">
-          <GitBranch className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
-          <span className="text-xs font-semibold text-foreground shrink-0">
+          <GitBranch className="w-3.5 h-3.5 text-[#fff] shrink-0" />
+          <span className="text-xs font-semibold text-[#fff] shrink-0">
             Source Control
           </span>
           {workspace && (
             <>
-              <span className="text-[10px] text-muted-foreground truncate max-w-[160px] hidden md:inline">
+              <span className="text-[10px] text-muted/70 truncate max-w-[160px] hidden md:inline">
                 {workspace.repository_id}
               </span>
-              <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary font-mono shrink-0">
+              <span className="text-[10px] px-1.5 py-0.5 rounded-sm  bg-rby text-[#fff] font-mono shrink-0">
                 {workspace.current_branch}
               </span>
             </>
@@ -233,33 +233,33 @@ export function SourceControlWorkspacePanel({
             size="sm"
             onClick={handleRefresh}
             disabled={refreshing}
-            className="h-7 w-7 p-0 text-muted-foreground hover:text-foreground"
+            className="h-7 w-7 p-0 text-[#fff] hover:text-foreground"
             title="Refresh source control data"
           >
             <RefreshCw
               size={12}
-              className={refreshing ? "animate-spin text-primary" : ""}
+              className={refreshing ? "animate-spin text-[#fff]" : ""}
             />
           </Button>
           <Button
-            variant="outline"
+            variant="save"
             size="sm"
             onClick={handleExportZip}
             disabled={exporting}
-            className="h-7 px-2.5 text-xs gap-1.5 text-muted-foreground hover:text-foreground border-border/60 hover:bg-muted/60"
+            className="h-7 px-2.5 text-xs gap-1.5 text-[#fff] hover:text-foreground border-[#fff] hover:bg-muted/80"
             title="Export workspace as ZIP"
           >
             {exporting ? (
               <>
                 <Loader2
                   size={12}
-                  className="animate-spin text-primary"
+                  className="animate-spin text-[#fff]"
                 />
                 <span>Exporting…</span>
               </>
             ) : (
               <>
-                <Download size={12} className="text-primary" />
+                <Download size={12} className="text-[#fff]" />
                 <span>Export ZIP</span>
               </>
             )}

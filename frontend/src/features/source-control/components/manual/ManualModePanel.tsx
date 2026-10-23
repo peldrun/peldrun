@@ -102,12 +102,12 @@ export function ManualModePanel() {
     <div className="flex flex-col h-full bg-background">
       {/* Change Repository bar — only when a workspace exists */}
       {showChangeRepo && (
-        <div className="flex items-center justify-end px-4 py-2 border-b border-border bg-background">
+        <div className="flex items-center justify-end px-4 py-2 border-b border-border bg-muted">
           <button
             type="button"
             onClick={handleChangeRepo}
             disabled={isDeleting}
-            className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground disabled:opacity-50 disabled:cursor-not-allowed"
+            className="flex items-center gap-1 text-xs text-black/30 hover:text-red-700 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {isDeleting ? (
               <>

@@ -111,7 +111,39 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   >({});
 
   // --- Persisted user preferences ------------------------------------------
-  const [showRightPanel, setShowRightPanel] = useAppStorage("right_panel_open");
+  //
+  // Panel visibility uses a hydration-safe localStorage pattern:
+  //
+  //   1. Server renders with `false` (no access to localStorage).
+  //   2. Client's first render also uses `false` (matching server).
+  //   3. A mount-time effect restores the persisted value.
+  //   4. Every toggle writes back to localStorage.
+  //
+  // This guarantees zero hydration mismatch and zero cookie/server
+  // dependency — the preference lives entirely in the browser.
+  const [showRightPanel, setShowRightPanelState] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const stored = window.localStorage.getItem("peldrun:right_panel_open");
+      if (stored !== null) {
+        setShowRightPanelState(stored === "true");
+      }
+    } catch {
+      // localStorage may be unavailable (Safari ITP, private mode).
+    }
+  }, []);
+
+  const setShowRightPanel = useCallback((open: boolean) => {
+    setShowRightPanelState(open);
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem("peldrun:right_panel_open", String(open));
+    } catch {
+      // Persistence is best-effort.
+    }
+  }, []);
 
   // Which of the two right-hand panels is active:
   //   - "workspace"      : the existing WorkspacePanel (Preview, Files,
@@ -136,22 +168,26 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   // pattern below gives us the same persistence behavior (survives
   // page reload, falls back gracefully if storage is unavailable)
   // without touching any shared code.
+  // Same hydration-safe pattern as `showRightPanel`. Reading
+  // localStorage inside a useState initializer produces a mismatch
+  // because the server always renders the default. We instead start
+  // with a server-consistent default and restore the persisted value
+  // after mount.
   const [rightPanelMode, setRightPanelMode] = useState<
     "workspace" | "source-control"
-  >(() => {
-    if (typeof window === "undefined") return "workspace";
+  >("workspace");
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
     try {
-      const stored = window.localStorage.getItem(
-        "peldrun:right_panel_mode"
-      );
-      return stored === "source-control" ? "source-control" : "workspace";
+      const stored = window.localStorage.getItem("peldrun:right_panel_mode");
+      if (stored === "source-control") {
+        setRightPanelMode("source-control");
+      }
     } catch {
-      // Access to localStorage can throw in some privacy modes
-      // (Safari ITP, Firefox total-cookie-protection, etc.). Falling
-      // back to the default is safer than crashing the whole panel.
-      return "workspace";
+      // Access to localStorage can throw in some privacy modes.
     }
-  });
+  }, []);
 
   // Persist `rightPanelMode` on every change.
   useEffect(() => {

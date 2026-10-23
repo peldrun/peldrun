@@ -68,7 +68,7 @@ export function GitBrowserPanel({
   return (
     <div className="flex flex-col h-full">
       {/* Tabs */}
-      <div className="flex items-center gap-1 px-2 py-1.5 border-b border-border bg-card/40 shrink-0">
+      <div className="flex items-center gap-1 px-2 py-1.5 border-b border-border bg-gigbg shrink-0">
         <TabButton
           active={tab === "files"}
           onClick={() => setTab("files")}
