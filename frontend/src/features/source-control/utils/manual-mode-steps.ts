@@ -14,6 +14,9 @@ export type ManualStep =
   | "approving"
   | "pushing"
   | "pushed"
+  | "creating-pr"
+  | "pr-approving"
+  | "pr-created"
   | "error";
 
 export interface StepDefinition {

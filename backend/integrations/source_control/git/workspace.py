@@ -928,6 +928,29 @@ class GitWorkspaceManager:
             self._save_registry()
         self._write_workspace_marker(workspace)
 
+    def update_base_sha(self, workspace_id: str, new_sha: str) -> None:
+        """
+        Update the workspace's base_sha and head_sha after a successful push.
+
+        This ensures the NEXT diff compares against the just-pushed
+        commit, rather than the original base_sha from when the
+        workspace was created. Without this, a second push would
+        re-include the commits from the first push in its diff.
+        """
+        with self._lock:
+            ws = self._workspaces.get(workspace_id)
+            if ws is not None:
+                updated = replace(
+                    ws,
+                    base_sha=new_sha,
+                    head_sha=new_sha,
+                    is_clean=True,
+                    updated_at=_utc_now(),
+                )
+                self._workspaces[workspace_id] = updated
+                self._save_registry()
+                self._write_workspace_marker(updated)
+
     def _discover_workspace_on_disk(
         self, workspace_id: str
     ) -> Optional[WorkspaceRef]:

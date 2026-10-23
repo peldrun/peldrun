@@ -2608,43 +2608,18 @@ class SourceControlFacade:
     ) -> str:
         """
         Ensure the workspace is on a non-protected branch.
-
-        When the workspace is already on a non-protected branch, it
-        is returned unchanged.
-
-        When the workspace is on a protected branch, a new branch is
-        created and checked out. The branch name is chosen as follows:
-
-            1. `preferred_name` when provided AND valid AND not
-               itself protected. If a branch with that name already
-               exists locally, the workspace is checked out onto it
-               (so a second call with the same name is idempotent).
-            2. Otherwise, a timestamped name
-               `peldrun/manual-YYYYMMDD-HHMMSS` is generated.
-
-        Args:
-            workspace_id: Workspace identifier.
-            preferred_name: Optional user-chosen branch name for the
-                auto-created feature branch. Ignored when the
-                workspace is already on a non-protected branch.
-
-        Raises:
-            NotFoundError: If the workspace does not exist.
-            ValidationError: If `preferred_name` is malformed or
-                itself protected, or if the checkout fails.
         """
-        import subprocess
-        from datetime import datetime as _dt
+        from datetime import datetime as _dt, timezone
 
         ws_ref = self.workspace_manager.get_workspace(workspace_id)
         if ws_ref is None:
             raise NotFoundError(f"Workspace '{workspace_id}' was not found.")
 
         try:
-            res = subprocess.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            res = await self.branch_manager._git.run(
+                ["rev-parse", "--abbrev-ref", "HEAD"],
                 cwd=ws_ref.workspace_path,
-                capture_output=True, text=True, timeout=5,
+                check_returncode=False,
             )
             current = res.stdout.strip() if res.returncode == 0 else ws_ref.current_branch
         except Exception:
@@ -2671,33 +2646,19 @@ class SourceControlFacade:
             new_branch = clean
 
         if not new_branch:
-            stamp = _dt.utcnow().strftime("%Y%m%d-%H%M%S")
+            stamp = _dt.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
             new_branch = f"peldrun/manual-{stamp}"
 
-        # If the branch already exists locally, check it out.
-        # Otherwise, create it. `git checkout <name>` without `-b`
-        # succeeds when the branch exists and fails when it doesn't;
-        # we therefore probe with `rev-parse --verify` first so we
-        # can choose the right subcommand deterministically and avoid
-        # relying on error-message parsing.
-        exists = subprocess.run(
-            [
-                "git",
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                f"refs/heads/{new_branch}",
-            ],
+        exists = await self.branch_manager._git.run(
+            ["rev-parse", "--verify", "--quiet", f"refs/heads/{new_branch}"],
             cwd=ws_ref.workspace_path,
-            capture_output=True,
-            text=True,
-            timeout=5,
+            check_returncode=False,
         )
         if exists.returncode == 0:
-            res = subprocess.run(
-                ["git", "checkout", new_branch],
+            res = await self.branch_manager._git.run(
+                ["checkout", new_branch],
                 cwd=ws_ref.workspace_path,
-                capture_output=True, text=True, timeout=10,
+                check_returncode=False,
             )
             if res.returncode != 0:
                 raise ValidationError(
@@ -2705,10 +2666,10 @@ class SourceControlFacade:
                     f"{res.stderr.strip()}"
                 )
         else:
-            res = subprocess.run(
-                ["git", "checkout", "-b", new_branch],
+            res = await self.branch_manager._git.run(
+                ["checkout", "-b", new_branch],
                 cwd=ws_ref.workspace_path,
-                capture_output=True, text=True, timeout=10,
+                check_returncode=False,
             )
             if res.returncode != 0:
                 raise ValidationError(
@@ -2716,13 +2677,6 @@ class SourceControlFacade:
                     f"{res.stderr.strip()}"
                 )
 
-        # Update the workspace registry so downstream code (notably
-        # `push_approved_branch`) sees the new branch. Without this,
-        # `ws_ref.current_branch` still points at the OLD branch
-        # (`main`), and the push would do `git push main:feature-x`
-        # — pushing the WRONG branch (without the new commits).
-        # That is precisely the bug that caused the UI to report
-        # "Push Successful" while GitHub received nothing.
         try:
             if hasattr(self.workspace_manager, "set_current_branch"):
                 self.workspace_manager.set_current_branch(
@@ -2740,7 +2694,7 @@ class SourceControlFacade:
                 self.workspace_manager._workspaces[workspace_id] = (
                     _dc_replace(_current_ws, current_branch=new_branch)
                 )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "ensure_editable_branch: could not update "
                 "workspace.current_branch for %r: %s",
@@ -4611,29 +4565,13 @@ class SourceControlFacade:
         # created). By advancing base_sha to the pushed SHA, we ensure
         # that the next push only contains NEW changes.
         try:
-            _ws = self.workspace_manager.get_workspace(record.workspace_id)
-            if _ws is not None and push_result.local_sha:
-                # Update head_sha and base_sha, and mark the workspace clean.
-                # Using the internal dict directly is safe here because
-                # we are inside the facade and the workspace is ours.
-                from dataclasses import replace
-                _updated_ws = replace(
-                    _ws,
-                    base_sha=push_result.local_sha,
-                    head_sha=push_result.local_sha,
-                    is_clean=True,
-                )
-                # Update registry
-                if hasattr(self.workspace_manager, "_workspaces"):
-                    self.workspace_manager._workspaces[record.workspace_id] = _updated_ws
-                # Persist if supported
-                if hasattr(self.workspace_manager, "_save_registry"):
-                    self.workspace_manager._save_registry()
-
-                logger.info(
-                    "push_approved_branch: updated workspace base_sha to %s",
-                    push_result.local_sha[:12],
-                )
+            if push_result.local_sha:
+                if hasattr(self.workspace_manager, "update_base_sha"):
+                    self.workspace_manager.update_base_sha(record.workspace_id, push_result.local_sha)
+                    logger.info(
+                        "push_approved_branch: updated workspace base_sha to %s",
+                        push_result.local_sha[:12],
+                    )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "push_approved_branch: failed to update workspace "

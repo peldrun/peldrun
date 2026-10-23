@@ -449,11 +449,79 @@ export function useManualMode() {
     []
   );
 
+  // --- Step 6: Request PR Approval ---
+  const requestPRApproval = useCallback(async (): Promise<boolean> => {
+    const { operationId, setStep, setError } = useManualModeStore.getState();
+    if (!operationId) {
+      setError("Operation is required.");
+      return false;
+    }
+    setStep("creating-pr");
+    setError(null);
+    try {
+      const ticket = await sourceControlClient.requestOperationApproval(
+        operationId,
+        "create_change_request"
+      );
+      useManualModeStore.setState({ approvalId: ticket.approval_id });
+      setStep("pr-approving");
+      return true;
+    } catch (err) {
+      const msg = err instanceof SourceControlApiError ? err.detail : "Failed to request PR approval.";
+      setError(msg);
+      return false;
+    }
+  }, []);
+
+  // --- Step 7: Submit PR ---
+  const submitPR = useCallback(async (): Promise<boolean> => {
+    const { operationId, approvalId, repository, branch, prTitle, prBody, setStep, setError, setPrUrl } = useManualModeStore.getState();
+    if (!operationId || !approvalId || !repository) {
+      setError("Missing data for PR creation.");
+      return false;
+    }
+
+    const targetBranch = repository.default_branch || "main";
+    if (branch === targetBranch) {
+      setError(`You pushed directly to ${targetBranch}. No pull request is needed.`);
+      return false;
+    }
+
+    setError(null);
+    try {
+      await sourceControlClient.approveOperation(operationId, {
+        approval_id: approvalId,
+        user_id: "user",
+      });
+
+      const pr = await sourceControlClient.createChangeRequest(operationId, {
+        repository_id: repository.repository_id,
+        provider: repository.provider,
+        source_branch: branch,
+        target_branch: targetBranch,
+        title: prTitle.trim() || `Update from ${branch}`,
+        body: prBody.trim(),
+        draft: false,
+        approval_id: approvalId,
+      });
+
+      setPrUrl(pr.message);
+      setStep("pr-created");
+      return true;
+    } catch (err) {
+      const msg = err instanceof SourceControlApiError ? err.detail : "Failed to create PR.";
+      setError(msg);
+      return false;
+    }
+  }, []);
+
   return {
     createWorkspace,
     deleteWorkspace,
     inspectAndRequestApproval,
     approveAndPush,
     rejectApproval,
+    requestPRApproval,
+    submitPR,
   };
 }

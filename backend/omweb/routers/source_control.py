@@ -1443,11 +1443,15 @@ async def get_operation(
 )
 async def request_operation_approval(
     operation_id: str,
+    operation: Optional[str] = Query(
+        default=None,
+        description="Optional operation kind override (e.g. 'create_change_request')."
+    ),
     facade: SourceControlFacade = Depends(get_source_control_facade),
 ) -> ApprovalTicketResponse:
     """Computes diff SHA-256 and freezes proposal for human review."""
     try:
-        return await facade.request_operation_approval(operation_id)
+        return await facade.request_operation_approval(operation_id, operation=operation)
     except Exception as exc:
         handle_source_control_error(exc)
 

@@ -56,6 +56,14 @@ interface ManualModeState {
   // "push_to_protected".
   forceProtectedPush: boolean;
 
+  // PR Creation
+  prTitle: string;
+  prBody: string;
+  prUrl: string | null;
+  setPrTitle: (title: string) => void;
+  setPrBody: (body: string) => void;
+  setPrUrl: (url: string | null) => void;
+
   // Error
   error: string | null;
 
@@ -104,6 +112,9 @@ const initialState = {
   description: "",
   preferredBranchName: "",
   forceProtectedPush: false,
+  prTitle: "",
+  prBody: "",
+  prUrl: null,
   error: null as string | null,
 };
 
@@ -203,6 +214,9 @@ export const useManualModeStore = create<ManualModeState>((set) => ({
     set({ preferredBranchName }),
   setForceProtectedPush: (forceProtectedPush) =>
     set({ forceProtectedPush }),
+  setPrTitle: (prTitle) => set({ prTitle }),
+  setPrBody: (prBody) => set({ prBody }),
+  setPrUrl: (prUrl) => set({ prUrl }),
 
   // Only move to the "error" step when SETTING an error. When
   // CLEARING it (`setError(null)`), leave the current step

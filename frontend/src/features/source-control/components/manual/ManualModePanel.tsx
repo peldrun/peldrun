@@ -17,6 +17,7 @@ import {
   FolderX,
   MessageSquare,
   RotateCcw,
+  GitPullRequest,
 } from "lucide-react";
 
 /**
@@ -200,6 +201,15 @@ function StepBody({ step }: { step: ReturnType<typeof useManualModeStore.getStat
 
     case "pushed":
       return <PushedState />;
+
+    case "creating-pr":
+      return <ManualPRCreator />;
+
+    case "pr-approving":
+      return <ManualPRApproving />;
+
+    case "pr-created":
+      return <ManualPRCreated />;
 
     case "error":
       return <ErrorState />;
@@ -409,6 +419,63 @@ function PushingState() {
   );
 }
 
+function ManualPRApproving() {
+  return (
+    <div className="flex flex-col items-center py-8 text-center">
+      <GitPullRequest className="h-10 w-10 text-purple-600 mb-3" />
+      <h3 className="text-sm font-semibold text-foreground">
+        Pull request approval
+      </h3>
+      <p className="mt-2 max-w-sm text-xs text-muted-foreground">
+        Review and approve the pull request in your repository provider.
+      </p>
+    </div>
+  );
+}
+
+function ManualPRCreated() {
+  return (
+    <div className="flex flex-col items-center py-8 text-center">
+      <CheckCircle2 className="h-10 w-10 text-green-500 mb-3" />
+      <h3 className="text-sm font-semibold text-foreground">
+        Pull request created
+      </h3>
+      <p className="mt-2 max-w-sm text-xs text-muted-foreground">
+        Your pull request was created successfully.
+      </p>
+      <button
+        type="button"
+        onClick={() => useManualModeStore.getState().setStep("pushed")}
+        className="mt-4 rounded-md border border-border bg-background text-foreground px-4 py-2 text-sm font-medium hover:bg-muted transition-colors"
+      >
+        Back to push details
+      </button>
+    </div>
+  );
+}
+
+function ManualPRCreator() {
+  return (
+    <div className="flex flex-col items-center py-8 text-center">
+      <GitPullRequest className="h-10 w-10 text-purple-600 mb-3" />
+      <h3 className="text-sm font-semibold text-foreground">
+        Pull request creation unavailable
+      </h3>
+      <p className="mt-2 max-w-sm text-xs text-muted-foreground">
+        The pull request creation component is not available. You can create a
+        pull request directly from your repository provider.
+      </p>
+      <button
+        type="button"
+        onClick={() => useManualModeStore.getState().setStep("pushed")}
+        className="mt-4 rounded-md border border-border bg-background text-foreground px-4 py-2 text-sm font-medium hover:bg-muted transition-colors"
+      >
+        Back to push details
+      </button>
+    </div>
+  );
+}
+
 function PushedState() {
   const chatId = useManualModeStore.getState().chatId;
   const operationId = useManualModeStore.getState().operationId;
@@ -567,10 +634,22 @@ function PushedState() {
         </div>
       )}
 
+      {/* Show "Create Pull Request" only if we didn't push directly to main/master/develop */}
+      {targetBranch !== "main" && targetBranch !== "master" && targetBranch !== "develop" && (
+        <button
+          type="button"
+          onClick={() => useManualModeStore.getState().setStep("creating-pr")}
+          className="mt-6 w-full max-w-sm rounded-md bg-purple-600 text-white px-6 py-3 text-sm font-semibold hover:bg-purple-700 transition-colors flex items-center justify-center gap-2"
+        >
+          <GitPullRequest size={18} />
+          Create Pull Request
+        </button>
+      )}
+
       <button
         type="button"
         onClick={handleStartOver}
-        className="mt-6 rounded-md bg-primary text-primary-foreground px-6 py-2 text-sm font-medium hover:bg-primary/90 transition-colors"
+        className="mt-4 rounded-md border border-border bg-background text-foreground px-6 py-2 text-sm font-medium hover:bg-muted transition-colors"
       >
         Start a new workflow
       </button>

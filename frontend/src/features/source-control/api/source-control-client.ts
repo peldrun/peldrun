@@ -377,8 +377,9 @@ export const sourceControlClient = {
     return request<OperationResponse>(`/operations/${operationId}`);
   },
 
-  async requestOperationApproval(operationId: string): Promise<ApprovalTicketResponse> {
-    return request<ApprovalTicketResponse>(`/operations/${operationId}/approval`, {
+  async requestOperationApproval(operationId: string, operation?: string): Promise<ApprovalTicketResponse> {
+    const query = operation ? `?operation=${encodeURIComponent(operation)}` : "";
+    return request<ApprovalTicketResponse>(`/operations/${operationId}/approval${query}`, {
       method: "POST",
     });
   },
