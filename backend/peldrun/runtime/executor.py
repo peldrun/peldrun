@@ -121,12 +121,46 @@ class CoreRuntimeExecutor:
         main_loop = asyncio.get_running_loop()
 
         active_tool_calls: Dict[str, str] = {}
+        active_span_ids: Dict[str, str] = {}
         pending_listener_futures: Set[Any] = set()
 
         def _telemetry_event_interceptor(evt: PeldrunEvent) -> None:
             if hasattr(evt, "step") and isinstance(evt.step, int) and evt.step > 0:
                 diagnostics.set_step(evt.step)
 
+            # --- Resource Monitor Span Tracking (best-effort, decoupled) ---
+            try:
+                from omweb.services.resource_monitor_service import get_resource_monitor_service
+                from omweb.resource_monitor.models import SpanType, SpanStatus
+
+                monitor = get_resource_monitor_service()
+
+                if evt.type in (EventType.TOOL_CALL, getattr(EventType, "TOOL_CALLED", None)):
+                    t_name = str(evt.payload.get("tool_name") or evt.payload.get("tool") or "tool")
+                    span_id = f"span_{uuid.uuid4().hex[:12]}"
+                    monitor.start_span(
+                        span_id=span_id,
+                        run_id=job_id,
+                        target_name=t_name,
+                        span_type=SpanType.TOOL_CALL,
+                    )
+                    active_span_ids[t_name] = span_id
+
+                elif evt.type in (EventType.OBSERVATION, getattr(EventType, "TOOL_COMPLETED", None)):
+                    t_name = str(evt.payload.get("tool_name") or evt.payload.get("tool") or "")
+                    span_id = active_span_ids.pop(t_name, None)
+                    if not span_id and active_span_ids:
+                        span_id = active_span_ids.pop(list(active_span_ids.keys())[-1])
+
+                    if span_id:
+                        is_err = bool(evt.payload.get("error"))
+                        status = SpanStatus.FAILED if is_err else SpanStatus.COMPLETED
+                        monitor.end_span(span_id=span_id, status=status)
+            except Exception:
+                # Never let monitoring break execution
+                pass
+
+            # --- Diagnostics Collector Tracking (existing) ---
             if evt.type in (EventType.TOOL_CALL, getattr(EventType, "TOOL_CALLED", None)):
                 t_name = str(evt.payload.get("tool_name") or evt.payload.get("tool") or "tool")
                 call_key = diagnostics.start_tool(tool_name=t_name, step_num=evt.step)
