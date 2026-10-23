@@ -20,6 +20,7 @@ a ``RESUMED`` event.
 from __future__ import annotations
 
 import json
+import logging
 
 from fastapi import APIRouter
 
@@ -30,6 +31,7 @@ from .schemas import JobControlResponse
 from .state import ACTIVE_JOB_TASKS
 from .utils import resolve_chat
 
+logger = logging.getLogger("omweb.routers.run_routes.control")
 
 router = APIRouter()
 
@@ -89,6 +91,20 @@ async def stop_job(job_id: str):
                 )
         except Exception:
             pass
+
+    # Signal cancellation to Resource Monitor subsystem
+    try:
+        from omweb.services.resource_monitor_service import (
+            get_resource_monitor_service,
+        )
+
+        get_resource_monitor_service().cancel_run(target_job_id)
+    except Exception as exc:
+        logger.debug(
+            "Failed to signal cancel_run to ResourceMonitor for %s: %s",
+            target_job_id,
+            exc,
+        )
 
     # Notify connected SSE clients that the job was cancelled.
     try:

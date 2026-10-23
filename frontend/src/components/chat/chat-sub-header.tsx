@@ -7,6 +7,10 @@ import { EngineOption, EngineSelector } from "./engine-selector";
 import { UsageBadgeGroup } from "@/components/chat/UsageBadges";
 import type { ChatUsageSummary } from "@/lib/types";
 
+
+ // app/layout.tsx أو TopBar.tsx
+import { ResourceMonitorBadge } from '@/app/resource-monitor';
+
 interface ChatSubHeaderProps {
   isFreshSession: boolean;
   submittedPrompt: string;
@@ -86,6 +90,9 @@ export function ChatSubHeader({
         {isFreshSession ? (
           <EngineSelector />
         ) : (
+
+
+
           <button
             type="button"
             onClick={onNewSession}
@@ -95,7 +102,14 @@ export function ChatSubHeader({
             <Plus size={13} />
             <span>New Session</span>
           </button>
+
+
+
+
         )}
+
+
+        <div> <ResourceMonitorBadge /></div>
       </div>
 
       <div className="flex items-center gap-2.5">

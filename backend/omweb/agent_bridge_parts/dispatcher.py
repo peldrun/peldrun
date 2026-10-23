@@ -56,6 +56,39 @@ from .mention_resolver import (
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_monitor_start_run(job_id: str) -> None:
+    try:
+        from omweb.services.resource_monitor_service import get_resource_monitor_service
+        get_resource_monitor_service().start_run(job_id)
+    except Exception as exc:
+        logger.debug("Failed to signal start_run to ResourceMonitor for %s: %s", job_id, exc)
+
+
+def _safe_monitor_complete_run(job_id: str) -> None:
+    try:
+        from omweb.services.resource_monitor_service import get_resource_monitor_service
+        get_resource_monitor_service().complete_run(job_id)
+    except Exception as exc:
+        logger.debug("Failed to signal complete_run to ResourceMonitor for %s: %s", job_id, exc)
+
+
+def _safe_monitor_fail_run(job_id: str, error_message: Optional[str] = None) -> None:
+    try:
+        from omweb.services.resource_monitor_service import get_resource_monitor_service
+        get_resource_monitor_service().fail_run(job_id, error_message=error_message)
+    except Exception as exc:
+        logger.debug("Failed to signal fail_run to ResourceMonitor for %s: %s", job_id, exc)
+
+
+def _safe_monitor_cancel_run(job_id: str) -> None:
+    try:
+        from omweb.services.resource_monitor_service import get_resource_monitor_service
+        get_resource_monitor_service().cancel_run(job_id)
+    except Exception as exc:
+        logger.debug("Failed to signal cancel_run to ResourceMonitor for %s: %s", job_id, exc)
+
+
 SUPPORTED_ENGINE = "peldrun"
 LEGACY_ENGINE_IDS = {"openmanus", "legacy", "manus"}
 VALID_CORE_ALIASES = {"peldrun", "peldrun-core", "core"}
@@ -454,6 +487,8 @@ async def run_instrumented(
             ),
         )
 
+    _safe_monitor_start_run(job_id)
+
     chat = project_manager.get_chat(job_id) or {}
     chat_id = chat.get("id", f"chat_{job_id}")
     project_id = chat.get("project_id", "default_project")
@@ -562,14 +597,17 @@ async def run_instrumented(
 
     try:
         await engine.run(context)
+        _safe_monitor_complete_run(job_id)
         _append_session_log(chat_id, project_id, "FINAL", "Execution completed successfully.")
     except asyncio.CancelledError:
         print(f"[BRIDGE] Job was cancelled/aborted: {job_id}")
+        _safe_monitor_cancel_run(job_id)
         _append_session_log(chat_id, project_id, "SYSTEM", "Execution cancelled by user.")
     except Exception as err:
         tb = traceback.format_exc()
         print(f"[BRIDGE ERROR] {err}\n{tb}")
         err_msg = format_smart_error(err, model_name, provider_name)
+        _safe_monitor_fail_run(job_id, error_message=err_msg)
         job_manager.fail_job(job_id, err_msg)
         _append_session_log(chat_id, project_id, "ERROR", err_msg)
         await dispatch_event(
@@ -678,6 +716,7 @@ async def run_direct_chat(
             },
         ),
     )
+    _safe_monitor_start_run(job_id)
 
     start_time = time.time()
     try:
@@ -955,6 +994,7 @@ async def run_direct_chat(
             f"Tokens: {usage.total_tokens if usage else 0} | Cost: ${cost_usd}"
         )
         job_manager.complete_job(job_id, result_text)
+        _safe_monitor_complete_run(job_id)
         _append_session_log(chat_id, project_id, "FINAL", result_text)
 
         try:
@@ -982,11 +1022,13 @@ async def run_direct_chat(
 
     except asyncio.CancelledError:
         print(f"[BRIDGE DIRECT CHAT] Job was cancelled: {job_id}")
+        _safe_monitor_cancel_run(job_id)
         _append_session_log(chat_id, project_id, "SYSTEM", "Direct chat cancelled by user.")
     except Exception as err:
         tb = traceback.format_exc()
         print(f"[BRIDGE DIRECT CHAT ERROR] {err}\n{tb}")
         err_msg = format_smart_error(err, model_name, provider_name)
+        _safe_monitor_fail_run(job_id, error_message=err_msg)
         job_manager.fail_job(job_id, err_msg)
         _append_session_log(chat_id, project_id, "ERROR", err_msg)
         await dispatch_event(

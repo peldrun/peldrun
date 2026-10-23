@@ -17,10 +17,12 @@ Initializes middleware, static files, and canonical REST routers:
 - /api/telemetry (P1-03D Canonical Analytics & Metering APIs)
 - /api/source-control (Source Control Integration: providers,
   repositories, workspaces, approvals, operations, audit)
+- /api/resource-monitor (PELDRUN Resource Monitor & Hardware Telemetry API)
 
 Lifespan management:
-    The application installs a FastAPI lifespan context manager that
-    gracefully closes the shared BrowserSessionManager on shutdown.
+    The application installs a FastAPI lifespan context manager that:
+    1. Initializes and shuts down the ResourceMonitorService.
+    2. Gracefully closes the shared BrowserSessionManager on shutdown.
     This is critical on Windows, where lingering Chromium processes can
     prevent Uvicorn from exiting and cause the event loop to hang after
     browser_interactive runs.
@@ -46,6 +48,7 @@ from omweb.routers import (
     config_rtr,
     files,
     mcp,
+    resource_monitor,
     run,
     search_rtr,
     setup,
@@ -78,17 +81,46 @@ async def lifespan(app: FastAPI):
     """
     Application lifespan context.
 
-    On startup: nothing additional is required beyond what module-level
-    initialization already does.
+    On startup:
+        Initializes database migrations, environment discovery snapshot,
+        and starts the adaptive sampling scheduler for Resource Monitor.
 
-    On shutdown: close the shared BrowserSessionManager so that any
-    Chromium processes spawned by the browser_interactive tool are
-    terminated cleanly. Without this, Uvicorn on Windows can hang after
-    a browser_interactive invocation because orphaned Chromium children
-    keep the Proactor event loop busy.
+    On shutdown:
+        Concludes Resource Monitor session, flushes in-memory sample buffers,
+        and gracefully terminates the shared BrowserSessionManager.
     """
+    # 1. Start Resource Monitor subsystem
+    try:
+        from omweb.services.resource_monitor_service import (
+            get_resource_monitor_service,
+        )
+
+        monitor_service = get_resource_monitor_service()
+        await monitor_service.start(app_version="1.0.0")
+        logger.info("ResourceMonitorService started cleanly on startup.")
+    except Exception as exc:
+        logger.error(
+            "Failed to start ResourceMonitorService on startup: %s",
+            exc,
+            exc_info=True,
+        )
+
     yield
 
+    # 1. Shutdown Resource Monitor subsystem
+    try:
+        from omweb.services.resource_monitor_service import (
+            get_resource_monitor_service,
+        )
+
+        await get_resource_monitor_service().shutdown()
+        logger.info("ResourceMonitorService shut down cleanly.")
+    except Exception as exc:
+        logger.warning(
+            "Failed to shutdown ResourceMonitorService on shutdown: %s", exc
+        )
+
+    # 2. Close BrowserSessionManager
     try:
         from peldrun.tools.builtins.browser_interactive.session import (
             get_session_manager,
@@ -148,6 +180,12 @@ app.include_router(telemetry.router, prefix="/api/telemetry", tags=["telemetry"]
 # `/api/source-control` (see `routers/source_control.py`). Do NOT pass
 # a `prefix=` argument here, or the path would be double-prefixed.
 app.include_router(source_control.router)
+
+# Resource Monitor & Hardware Telemetry router.
+#
+# NOTE: The router defines its internal prefix as `/api/resource-monitor`
+# (see `routers/resource_monitor.py`). Do NOT pass a `prefix=` argument here.
+app.include_router(resource_monitor.router)
 
 # Mount Storage Filesystem for Deliverables and Downloads
 STORAGE_ROOT.mkdir(parents=True, exist_ok=True)

@@ -1,3 +1,4 @@
+# backend/omweb/routers/run_routes/start_run.py
 """
 Run creation endpoint.
 
@@ -10,6 +11,7 @@ execution. The endpoint is responsible for:
 * Persisting the resolved LLM overrides on the session.
 * Capturing a pre-execution filesystem snapshot so the delta artifacts can
   later be computed for this specific turn.
+* Registering the execution run with ResourceMonitor in PENDING status.
 * Scheduling the actual execution task (agent or direct chat).
 """
 
@@ -17,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -41,6 +44,7 @@ from .state import (
 )
 from .utils import resolve_chat
 
+logger = logging.getLogger("omweb.routers.run_routes.start_run")
 
 router = APIRouter()
 
@@ -118,13 +122,7 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
         llm_override["reasoning_effort"] = req.reasoning_effort.strip()
     if req.is_reasoning_model is not None:
         llm_override["is_reasoning_model"] = req.is_reasoning_model
-    # [FIX-3.2] Forward structured file references selected by the user via the
-    # `@` typeahead menu. The dispatcher resolves and injects their contents as
-    # trusted context before invoking the agent engine.
-    #
-    # `by_alias=True` preserves the original wire format (camelCase: relPath,
-    # fileName) so that log inspection and network trace correlation remain
-    # straightforward. The dispatcher accepts both camelCase and snake_case.
+    # Forward structured file references selected by the user via the `@` menu.
     if req.context_refs:
         llm_override["context_refs"] = [
             ref.model_dump(by_alias=True, exclude_none=True)
@@ -294,10 +292,28 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
     # Web Search is a chat-only feature; ignored in agent mode and never part of llm_override.
     web_search_enabled = bool(req.web_search_enabled) if exec_mode == "chat" else False
 
+    # Register execution run with Resource Monitor in PENDING status prior to task launch
+    try:
+        from omweb.services.resource_monitor_service import get_resource_monitor_service
+
+        get_resource_monitor_service().create_run(
+            run_id=actual_job_id,
+            job_id=actual_job_id,
+            chat_id=chat_id,
+            agent_id=effective_agent,
+            engine_type=exec_mode,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to register execution run %s in ResourceMonitor: %s",
+            actual_job_id,
+            exc,
+        )
+
     # Schedule the actual execution task.
     if exec_mode == "chat":
         exec_task = asyncio.create_task(
-                        run_direct_chat(
+            run_direct_chat(
                 actual_job_id,
                 prompt,
                 llm_override,

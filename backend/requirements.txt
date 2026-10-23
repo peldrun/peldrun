@@ -45,6 +45,7 @@ ddgs>=9.0.0
 baidusearch>=1.0.0
 
 # --- Utilities, Sandbox Execution & File Tools ---
+psutil>=6.0.0
 aiofiles>=23.0.0
 # pillow pinned to 12.3.x to satisfy browser-harness (==12.3.0) and gpt2giga (>=12.3.0,<13)
 pillow>=12.3.0,<13.0.0

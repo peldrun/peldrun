@@ -1,7 +1,8 @@
 ﻿# Virtual Environments
 .venv/
 backend/.venv/
-
+__pycache__/
+*.pyc
 # Node & Next.js Build
 node_modules/
 frontend/node_modules/
