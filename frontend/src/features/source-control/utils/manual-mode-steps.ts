@@ -46,7 +46,8 @@ export const MANUAL_STEPS: StepDefinition[] = [
   {
     id: "reviewing",
     label: "Inspect & Request Approval",
-    description: "Review the diff and request human approval.",
+    description:
+      "Review the diff, optionally describe your changes, and request human approval.",
     order: 4,
   },
   {

@@ -102,9 +102,21 @@ async function request<T>(
   // Map HTTP status codes to stable error codes matching backend error taxonomy
   let code = "UNKNOWN_ERROR";
   switch (response.status) {
-    case 401:
+    case 401: {
       code = "AUTH_REQUIRED";
+      // Broadcast the auth failure so that any mounted UI
+      // (specifically `<AuthReconnectBanner />`) can offer an
+      // inline re-connect flow without forcing the user to
+      // navigate to the Settings page.
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent("peldrun:auth-required", {
+            detail: { message: detail, provider: "github" },
+          })
+        );
+      }
       break;
+    }
     case 403:
       code = "PERMISSION_DENIED";
       break;

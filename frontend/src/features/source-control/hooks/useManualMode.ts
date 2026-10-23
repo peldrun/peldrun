@@ -114,12 +114,23 @@ export function useManualMode() {
 
     try {
       // 1. Create the durable operation.
+      //
+      // Include the user-entered title and description in the
+      // operation's metadata. The Manual Mode "Describe your
+      // changes" card writes these values to the store BEFORE the
+      // user clicks "I'm done editing", so they are guaranteed to
+      // be present here. The backend stores them as
+      // `metadata.title` / `metadata.description` and the PR
+      // auto-creation flow later uses them as the PR title and body.
+      const storeState = useManualModeStore.getState();
       const op = await sourceControlClient.createOperation({
         operation_type: "push_branch",
         repository_id: repoId,
         target_branch: branch,
         workspace_id: workspaceId,
         provider: provider,
+        title: storeState.title.trim() || undefined,
+        description: storeState.description.trim() || undefined,
       });
 
       // 2. Request the approval ticket (computes diff, binds it).

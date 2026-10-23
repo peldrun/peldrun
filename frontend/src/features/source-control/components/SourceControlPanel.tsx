@@ -13,6 +13,7 @@ import { ApprovalDialog } from "./ApprovalDialog";
 import { OperationTimeline } from "./OperationTimeline";
 import { ManualModePanel } from "./manual/ManualModePanel";
 import { GitBrowserPanel } from "./git/GitBrowserPanel";
+import { AuthReconnectBanner } from "./AuthReconnectBanner";
 import { GitPullRequest, AlertCircle, Loader2 } from "lucide-react";
 export interface SourceControlPanelProps {
   chatId?: string;
@@ -49,8 +50,30 @@ export function SourceControlPanel({
 }: SourceControlPanelProps = {}) {
   const [mode, setMode] = useState<PanelMode>("agent");
 
+  // `reloadKey` is bumped every time the user completes an inline
+  // OAuth re-connect via `<AuthReconnectBanner />`. Mounting the
+  // active panels with `key={reloadKey}` forces a full remount, which
+  // in turn re-runs every `useEffect` that fetches data. That is the
+  // simplest way to guarantee a clean state after a token rotation:
+  // every stale request is abandoned and every view re-fetches with
+  // the fresh token.
+  const [reloadKey, setReloadKey] = useState(0);
+
   // Resolve chat id: prefer the prop; fall back to URL.
   const resolvedChatId = propChatId ?? deriveChatIdFromUrl();
+
+  // Listen for the "auth reconnected" event fired by the banner and
+  // bump the reload key so all live panels remount.
+  useEffect(() => {
+    const onReconnected = () => setReloadKey((k) => k + 1);
+    window.addEventListener("peldrun:auth-reconnected", onReconnected);
+    return () => {
+      window.removeEventListener(
+        "peldrun:auth-reconnected",
+        onReconnected
+      );
+    };
+  }, []);
 
   // Activate the manual store only when the user first switches to
   // Manual Mode. Subsequent toggles do NOT re-activate, so the
@@ -96,6 +119,10 @@ export function SourceControlPanel({
 
   return (
     <div className="flex flex-col h-full bg-background border-l border-border">
+      {/* Auth banner — sits ABOVE the tabs so it is visible in
+          Agent, Manual, and Browse modes alike. */}
+      <AuthReconnectBanner />
+
       {/* Mode Toggle */}
       <div className="flex items-center px-4 py-2 border-b border-border bg-card/40 shrink-0">
         <div className="flex rounded-md bg-muted p-0.5" role="tablist">
@@ -148,13 +175,13 @@ export function SourceControlPanel({
       */}
       <div className="flex-1 overflow-hidden relative">
         <div className={mode === "agent" ? "h-full" : "hidden"}>
-          <AgentModePanel />
+          <AgentModePanel key={`agent-${reloadKey}`} />
         </div>
         <div className={mode === "manual" ? "h-full" : "hidden"}>
           <ManualModePanel />
         </div>
         <div className={mode === "browse" ? "h-full" : "hidden"}>
-          <BrowsePanel chatId={resolvedChatId} />
+          <BrowsePanel key={`browse-${reloadKey}`} chatId={resolvedChatId} />
         </div>
       </div>
     </div>

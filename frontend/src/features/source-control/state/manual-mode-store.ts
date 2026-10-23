@@ -27,6 +27,15 @@ interface ManualModeState {
   approvalId: string | null;
   diff: DiffSummaryResponse | null;
 
+  // Change description (optional). Collected in the "reviewing"
+  // and "approving" steps and surfaced to the backend as
+  // `metadata.title` / `metadata.description` on the operation.
+  // These are the values the user would want as the eventual PR
+  // title and body, so the PRs tab can pre-fill the form from the
+  // operation's metadata.
+  title: string;
+  description: string;
+
   // Error
   error: string | null;
 
@@ -49,6 +58,9 @@ interface ManualModeState {
   ) => void;
   clearApproval: () => void;
 
+  setTitle: (title: string) => void;
+  setDescription: (description: string) => void;
+
   setError: (error: string | null) => void;
   reset: () => void;
 }
@@ -64,6 +76,8 @@ const initialState = {
   operationId: null as string | null,
   approvalId: null as string | null,
   diff: null as DiffSummaryResponse | null,
+  title: "",
+  description: "",
   error: null as string | null,
 };
 
@@ -132,8 +146,17 @@ export const useManualModeStore = create<ManualModeState>((set) => ({
       operationId: null,
       approvalId: null,
       diff: null,
+      // The description belongs to the approved change; when the
+      // approval is cleared, the description is cleared with it.
+      // Keeping it around would make the next review silently
+      // inherit the previous attempt's text.
+      title: "",
+      description: "",
       step: "editing",
     }),
+
+  setTitle: (title) => set({ title }),
+  setDescription: (description) => set({ description }),
 
   // Only move to the "error" step when SETTING an error. When
   // CLEARING it (`setError(null)`), leave the current step

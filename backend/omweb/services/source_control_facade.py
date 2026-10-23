@@ -3754,6 +3754,34 @@ class SourceControlFacade:
         )
         self.policy_engine.require(policy_ctx)
 
+        # Resolve the PR title/body from the payload, falling back
+        # to the metadata captured when the operation was created.
+        #
+        # The Manual Mode "Describe your changes" card stores the
+        # user's chosen title and description in the operation's
+        # metadata (via `create_operation`). When the user later
+        # creates the PR from the operation, the payload's title /
+        # body may be empty (the automatic flow does not ask for
+        # them); in that case we fall back to the metadata so the
+        # PR carries the description the user actually wrote.
+        #
+        # The fallback is intentionally narrow: it only applies when
+        # the payload field is empty or whitespace. A non-empty
+        # payload always wins, so an explicit caller (e.g. the UI's
+        # own Create PR form) is never overridden by stale metadata.
+        _record_meta = dict(getattr(record, "metadata", {}) or {})
+        _payload_title = (payload.title or "").strip()
+        _payload_body = (getattr(payload, "body", "") or "").strip()
+        _meta_title = str(_record_meta.get("title") or "").strip()
+        _meta_body = str(_record_meta.get("description") or "").strip()
+
+        effective_title = (
+            _payload_title
+            or _meta_title
+            or f"Update from {record.operation_id[:8]}"
+        )
+        effective_body = _payload_body or _meta_body
+
         # Consume the ticket with the correct expected operation.
         #
         # IMPORTANT: the bound `target_branch` of the ticket is the
@@ -3795,8 +3823,8 @@ class SourceControlFacade:
             repo=repo,
             source_branch=payload.source_branch,
             target_branch=payload.target_branch,
-            title=redact_text(payload.title),
-            body=redact_text(getattr(payload, "body", "") or ""),
+            title=redact_text(effective_title),
+            body=redact_text(effective_body),
             draft=bool(getattr(payload, "draft", True)),
             token=token,
         )
@@ -3841,7 +3869,13 @@ class SourceControlFacade:
             ),
             source_branch=cr.source_branch,
             target_branch=cr.target_branch,
-            title=payload.title,
+            # Report the title that was ACTUALLY sent to the provider,
+            # not the raw payload title. When the fallback path was
+            # taken (payload title empty, metadata title used), the
+            # response must reflect what the remote actually got —
+            # otherwise the UI would show "(no title)" while GitHub
+            # displays the metadata title.
+            title=effective_title,
             is_draft=bool(getattr(payload, "draft", True)),
             message=(
                 f"Change request #{cr.number_or_iid} created successfully."

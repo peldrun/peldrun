@@ -11,6 +11,7 @@ import { ManualPushButton } from "./ManualPushButton";
 import {
   AlertCircle,
   CheckCircle2,
+  MessageSquare,
   RotateCcw,
 } from "lucide-react";
 
@@ -82,6 +83,24 @@ export function ManualModePanel() {
 
       {/* Step body */}
       <div className="flex-1 overflow-y-auto p-4">
+        {/* The description card is shown on ALL THREE steps that
+            touch the change:
+
+              - "editing"    : filled BEFORE clicking "I'm done
+                               editing", so the values are in the
+                               store when `inspectAndRequestApproval`
+                               creates the operation. This is the
+                               critical step — without it, the card
+                               appears too late.
+              - "reviewing"  : still editable so the user can
+                               refine the wording while looking at
+                               the actual diff.
+              - "approving"  : last chance to fix a typo before
+                               the final confirm.
+        */}
+        {(step === "editing" ||
+          step === "reviewing" ||
+          step === "approving") && <ChangeDescriptionCard />}
         <StepBody step={step} />
       </div>
     </div>
@@ -139,6 +158,90 @@ function StepBody({ step }: { step: ReturnType<typeof useManualModeStore.getStat
       );
     }
   }
+}
+
+// ----------------------------------------------------------------------
+// Change description card (visible on editing + review + approve steps)
+// ----------------------------------------------------------------------
+
+/**
+ * Optional "describe your changes" card.
+ *
+ * Appears on the "editing", "reviewing", and "approving" steps.
+ * The values it collects are stored in `manual-mode-store` and
+ * are propagated to `createOperation` in `useManualMode.ts` as
+ * `title` / `description`. The backend persists them as
+ * `metadata.title` / `metadata.description` on the operation;
+ * `create_change_request` later uses them as the PR title and
+ * body when the caller does not supply its own.
+ *
+ * These fields are intentionally OPTIONAL: the flow works without
+ * them (the operation simply has no user-supplied description),
+ * but when the user does fill them the eventual PR title and body
+ * are significantly more helpful than the auto-generated
+ * "Update from task <uuid>" default.
+ */
+function ChangeDescriptionCard() {
+  const title = useManualModeStore((s) => s.title);
+  const description = useManualModeStore((s) => s.description);
+  const setTitle = useManualModeStore((s) => s.setTitle);
+  const setDescription = useManualModeStore((s) => s.setDescription);
+
+  return (
+    <div className="mb-4 rounded-md border border-border bg-card/40 p-3 space-y-3">
+      <div className="flex items-center gap-1.5">
+        <MessageSquare className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+        <h4 className="text-xs font-semibold text-foreground">
+          Describe your changes
+        </h4>
+        <span className="text-[10px] text-muted-foreground">
+          (optional)
+        </span>
+      </div>
+
+      <div>
+        <label
+          htmlFor="manual-title"
+          className="block text-[10px] font-medium text-muted-foreground mb-1"
+        >
+          Title / Commit message
+        </label>
+        <input
+          id="manual-title"
+          type="text"
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          placeholder="e.g. feat: add login button"
+          maxLength={256}
+          className="w-full text-xs px-2 py-1.5 rounded border border-border bg-background focus:outline-none focus:ring-1 focus:ring-primary"
+        />
+      </div>
+
+      <div>
+        <label
+          htmlFor="manual-description"
+          className="block text-[10px] font-medium text-muted-foreground mb-1"
+        >
+          Description (Markdown)
+        </label>
+        <textarea
+          id="manual-description"
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          placeholder="What changed and why?"
+          rows={4}
+          maxLength={65_536}
+          className="w-full text-xs px-2 py-1.5 rounded border border-border bg-background focus:outline-none focus:ring-1 focus:ring-primary resize-none font-mono"
+        />
+      </div>
+
+      <p className="text-[10px] text-muted-foreground">
+        These fields are drafts stored in the UI. They will become the
+        operation's suggested PR title and body once wired to the
+        backend.
+      </p>
+    </div>
+  );
 }
 
 // ----------------------------------------------------------------------

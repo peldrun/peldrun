@@ -17,6 +17,8 @@ import {
   Activity,
   ExternalLink,
   Coins,
+  GitBranch,
+  Blocks,
   Sparkles,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -87,8 +89,34 @@ export function Sidebar({
                 <span>{tab.label}</span>
               </div>
             </button>
+
           );
         })}
+
+
+         <Link
+            href="/integrations"
+            title="Integrations"
+            className="w-full flex items-center justify-between px-3 py-2 rounded-0 text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-all cursor-pointer group"
+          >
+            <div className="flex items-center gap-2.5">
+              <Blocks size={14} className="  group-hover:scale-110 transition-transform" />
+              <span className="group-hover:text-foreground transition-colors">Integrations</span>
+            </div>
+            <ExternalLink size={12} className="text-muted-foreground/50 group-hover:text-foreground transition-colors" />
+          </Link>
+
+            <Link
+                href="/source-control"
+                title="Source Control"
+                className="w-full flex items-center justify-between px-3 py-2 rounded-0 text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-all cursor-pointer group"
+              >
+                <div className="flex items-center gap-2.5">
+                  <GitBranch size={14} className="  group-hover:scale-110 transition-transform" />
+                  <span className="group-hover:text-foreground transition-colors">Source Control</span>
+                </div>
+                <ExternalLink size={12} className="text-muted-foreground/50 group-hover:text-foreground transition-colors" />
+          </Link>
 
 
               {/* Dedicated Live Monitoring Link */}

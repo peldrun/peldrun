@@ -139,7 +139,19 @@ export function ManualRepoSelector() {
     !!repository && !!branch && !isLoadingRepos && !isLoadingBranches;
 
   return (
+
+
     <div className="space-y-4">
+
+            {/* Local error (repo/branch load failures) */}
+      {error && (
+        <div className="flex items-start rounded-md bg-red-50 p-3 border border-red-200">
+          <AlertCircle className="h-4 w-4 text-red-600 mr-2 flex-shrink-0 mt-0.5" />
+          <p className="text-xs text-red-700 flex-1">{error}</p>
+        </div>
+      )}
+
+
       <div>
         <h3 className="text-sm font-semibold text-foreground mb-1">
           Select Repository
@@ -149,14 +161,6 @@ export function ManualRepoSelector() {
           your current chat's files folder.
         </p>
       </div>
-
-      {/* Local error (repo/branch load failures) */}
-      {error && (
-        <div className="flex items-start rounded-md bg-red-50 p-3 border border-red-200">
-          <AlertCircle className="h-4 w-4 text-red-600 mr-2 flex-shrink-0 mt-0.5" />
-          <p className="text-xs text-red-700 flex-1">{error}</p>
-        </div>
-      )}
 
       {/* Provider */}
       <div>
