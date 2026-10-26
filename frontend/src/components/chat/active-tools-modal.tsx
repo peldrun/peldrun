@@ -301,7 +301,7 @@ export function ActiveToolsModal() {
       toolId={tool.id}
       category={tool.category}
       isMcp={tool.source === "mcp"}
-      size={14}
+      size={18}
       className="shrink-0"
     />
   );
@@ -336,11 +336,11 @@ export function ActiveToolsModal() {
             if (e.target === e.currentTarget) setIsOpen(false);
           }}
         >
-          <div className="bg-card border border-border rounded-xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden animate-in zoom-in-95 duration-150">
+          <div className="bg-card border border-card rounded-sm shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden animate-in zoom-in-95 duration-150">
             {/* Header */}
             <div className="h-14 border-b border-border bg-gigbg px-5 flex items-center justify-between shrink-0">
               <div className="flex items-center gap-2.5 min-w-0">
-                <div className="p-2 rounded-lg bg-primary/10 text-primary border border-primary/20 shrink-0">
+                <div className="WrenchIcon shrink-0">
                   <Wrench size={16} />
                 </div>
                 <div className="min-w-0">
@@ -387,7 +387,7 @@ export function ActiveToolsModal() {
             </div>
 
             {/* Filter tabs */}
-            <div className="px-5 py-2.5 bg-muted border-b border-border/60 flex items-center justify-between text-xs shrink-0">
+            <div className="px-5 py-2.5 bg-custom border-b border-border/60 flex items-center justify-between text-xs shrink-0">
               <div className="flex items-center gap-1 bg-card p-0.5 rounded-lg border border-border/60 text-[11px] shadow-sm">
                 {(["all", "builtin", "mcp"] as const).map((f) => (
                   <button
@@ -416,7 +416,7 @@ export function ActiveToolsModal() {
             </div>
 
             {/* Tools list */}
-            <div className="flex-1 overflow-y-auto p-5 space-y-2.5 bg-custom">
+            <div className="flex-1 overflow-y-auto p-5 space-y-2.5 bg-background">
               {error && (
                 <div className="p-3 rounded-lg border border-destructive/30 bg-destructive/10 text-destructive text-xs">
                   {error}
@@ -448,16 +448,16 @@ export function ActiveToolsModal() {
                 filteredTools.map((tool) => (
                   <div
                     key={`${tool.source}:${tool.id}`}
-                    className="p-3 rounded-lg border border-border/80 bg-card hover:border-primary/40 transition-colors flex items-start justify-between gap-3 shadow-xs"
+                    className="p-3 rounded-md border border-border/80 bg-muted hover:border-primary/40 transition-colors flex items-start justify-between gap-3 shadow-xs"
                   >
-                    <div className="flex items-start gap-2.5 min-w-0">
-                      <div className="p-1.5 rounded-md bg-muted/60 border border-border/50 shrink-0 mt-0.5">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <div className="toolcallcrdIcon shrink-0 mt-0.5 flex items-center justify-center">
                         {renderIcon(tool)}
                       </div>
                       <div className="min-w-0">
                         <div className="flex items-center gap-2 flex-wrap">
                           <span className="text-xs font-semibold font-mono text-foreground truncate">
-                            {tool.id}
+                            {tool.name}
                           </span>
                           {tool.category && (
                             <span className="text-[10px] px-1.5 py-0.2 rounded font-mono bg-muted text-muted-foreground border border-border/60">

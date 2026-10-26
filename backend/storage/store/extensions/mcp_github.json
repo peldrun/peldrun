@@ -2,7 +2,7 @@
   "id": "mcp_github",
   "name": "MCP GitHub Integration",
   "type": "mcp_server",
-  "status": "ready",
+  "status": "active",
   "command": "npx -y @modelcontextprotocol/server-github",
   "description": "Enables repository inspection, issues retrieval, and commit automation.",
   "is_builtin": false,

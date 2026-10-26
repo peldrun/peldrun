@@ -1,17 +1,18 @@
-﻿"use client";
+﻿// frontend\src\app\settings\setup\tabs\MCPTab.tsx
+"use client";
 
 import React, { useState, useEffect } from "react";
-import { 
-  Share2, 
-  Bot, 
-  Server, 
-  CheckCircle2, 
-  XCircle, 
-  RefreshCw, 
-  Terminal, 
-  Play, 
-  Loader2, 
-  Wrench 
+import {
+  Share2,
+  Bot,
+  Server,
+  CheckCircle2,
+  XCircle,
+  RefreshCw,
+  Terminal,
+  Play,
+  Loader2,
+  Wrench
 } from "lucide-react";
 import { showToast } from "@/components/ui/ToastNotification";
 
@@ -187,8 +188,8 @@ export function MCPTab({ config, setConfig }: MCPTabProps) {
                   <div
                     key={server.id}
                     className={`rounded-lg border p-4 space-y-3 transition-all ${
-                      isActive 
-                        ? "border-primary/40 bg-accent/20" 
+                      isActive
+                        ? "border-primary/40 bg-accent/20"
                         : "border-border bg-background"
                     }`}
                   >
