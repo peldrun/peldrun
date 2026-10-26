@@ -40,18 +40,44 @@ class MCPServerSettingsPayload(BaseModel):
     env: Optional[Dict[str, Any]] = None
 
 
-async def _fetch_server_tools_safe(manifest: Dict[str, Any], timeout: float = 3.5) -> List[str]:
-    """Discover tool names for an active server with a defensive timeout guard."""
+async def _fetch_server_tools_safe(
+    manifest: Dict[str, Any],
+    timeout: float = 3.5,
+) -> List[str]:
+    """
+    Discover tool names for an active server via the cached tool-list
+    path.
+
+    Historic behaviour used `probe_connection` here, which spawned a
+    fresh stdio subprocess on every call to GET /api/mcp — one
+    subprocess per active server per page load. `get_tools` instead
+    reuses the pooled persistent client and, after the first call,
+    serves the result from a 300s-TTL cache. The timeout guard is
+    preserved so a wedged server cannot stall the Store page.
+    """
+    server_id = manifest.get("id", "")
+    if not server_id:
+        return []
     try:
-        probe = await asyncio.wait_for(
-            mcp_session_pool.probe_connection(manifest),
+        tools = await asyncio.wait_for(
+            mcp_session_pool.get_tools(
+                server_id=server_id,
+                manifest=manifest,
+            ),
             timeout=timeout,
         )
-        if probe.get("status") == "ok":
-            return [t.get("name") for t in probe.get("tools", []) if t.get("name")]
+        return [
+            str(t.get("name"))
+            for t in (tools or [])
+            if isinstance(t, dict) and t.get("name")
+        ]
     except Exception as exc:
-        logger.debug("Non-blocking discovery skipped for server '%s': %s", manifest.get("id"), exc)
-    return []
+        logger.debug(
+            "Tool list fetch skipped for server '%s': %s",
+            server_id,
+            exc,
+        )
+        return []
 
 
 @router.get("")
@@ -107,9 +133,15 @@ async def toggle_mcp_server(server_id: str):
     if "error" in res:
         raise HTTPException(status_code=404, detail=res["error"])
 
-    # If server was deactivated, close any live persistent connection
-    if res.get("status") != "active":
-        await mcp_session_pool.close_session(server_id)
+    # Always tear down every workspace-bound session for this server.
+    # A status flip in either direction changes whether the server's
+    # tools are available; leaving a live subprocess attached to a
+    # now-inactive server means stale tool calls would still succeed,
+    # bypassing the status gate enforced by resolve_tool_runtime.
+    # close_session(server_id) only dropped the "server_id:default"
+    # key — per-workspace subprocesses survived; close_server_sessions
+    # walks every binding.
+    await mcp_session_pool.close_server_sessions(server_id)
 
     return {"status": "ok", "server": res}
 
@@ -155,8 +187,15 @@ async def update_mcp_server_settings(server_id: str, payload: MCPServerSettingsP
     except ValueError as val_err:
         raise HTTPException(status_code=400, detail=str(val_err))
 
-    # Invalidate active connection so next invocation picks up updated config
-    await mcp_session_pool.close_session(server_id)
+    # Settings and env changes can alter the effective transport:
+    #   - `command` may embed paths derived from settings (e.g.
+    #     @modelcontextprotocol/server-filesystem allowed_directories)
+    #   - env vars are passed verbatim into the subprocess
+    # A cached client bound to the old settings will silently keep
+    # calling the server with stale arguments. Tear down every
+    # workspace-bound session so the next invocation re-launches with
+    # the freshly-persisted config.
+    await mcp_session_pool.close_server_sessions(server_id)
 
     return {
         "status": "ok",
@@ -230,7 +269,11 @@ async def delete_mcp_server(server_id: str):
             "message": f"MCP bundle server '{server_id}' and all folder files purged successfully.",
         }
 
-    await mcp_session_pool.close_session(server_id)
+    # Purge every workspace-bound session before removing the manifest
+    # so no orphaned subprocess survives the deletion. The bundle
+    # branch above delegates this to `mcp_bundle_manager.delete_bundle`,
+    # which already calls close_server_sessions internally.
+    await mcp_session_pool.close_server_sessions(server_id)
     success = extension_registry.delete_extension(server_id)
     if not success:
         raise HTTPException(status_code=400, detail="Failed to delete custom server.")

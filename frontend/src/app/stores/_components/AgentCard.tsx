@@ -120,9 +120,22 @@ export function AgentCard({
   const showSettings = hasConfigurableSettings(agent) && !!onOpenSettings;
   const showTools = hasEditableTools(agent) && !!onOpenTools;
   const showMcp = !!onOpenMcp;
-  const mcpServersCount = Array.isArray((agent as any).mcp_servers)
-    ? (agent as any).mcp_servers.length
-    : 0;
+  // Read the EFFECTIVE MCP server list — this is what the runtime
+  // will actually bind to the agent after applying the user's
+  // ``disabled_mcp_servers`` / ``extra_mcp_servers`` overrides from
+  // ``agent_settings.json``.
+  //
+  // Fallback to the raw ``mcp_servers`` field for defence in depth:
+  // a backend that has not yet emitted ``effective_mcp_servers``
+  // would otherwise make the badge always show 0 even when the
+  // manifest declares servers. This fallback also keeps pre-Phase-8
+  // agents (custom, older backend, cached client payloads) correct.
+  const effectiveMcpServers = Array.isArray(agent.effective_mcp_servers)
+    ? agent.effective_mcp_servers
+    : Array.isArray(agent.mcp_servers)
+    ? agent.mcp_servers
+    : [];
+  const mcpServersCount = effectiveMcpServers.length;
 
   return (
     <div

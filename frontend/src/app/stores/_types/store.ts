@@ -36,6 +36,12 @@ export const DEFAULT_AGENT_FORM: AgentUpsertPayload = {
   description: "",
   system_prompt: "",
   tools: ["bash", "python_execute", "str_replace_editor", "web_search"],
+  // Always initialise ``mcp_servers`` to an empty array — never
+  // ``undefined`` — so a create/update that intentionally leaves
+  // MCP servers unselected sends ``[]`` rather than omitting the
+  // field. The backend treats both identically today, but this
+  // keeps the form payload shape stable for future validation.
+  mcp_servers: [],
   max_steps: 30,
 };
 

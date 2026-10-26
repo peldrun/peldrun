@@ -232,11 +232,30 @@ def resolve_tool_runtime(
                 params = copy.deepcopy(raw_input_schema)
 
         async def _mcp_tool_executor(**kwargs: Any) -> Any:
-            if not manifest:
-                raise RuntimeError(f"MCP server '{mcp_server_id}' is not registered.")
+            # Re-fetch the effective server at execution time instead of
+            # trusting the manifest captured at resolution time. This
+            # closes three failure modes that the previous implementation
+            # could not detect:
+            #   1. Server was deleted between registration and invocation.
+            #   2. Server was toggled from "active" to "ready" mid-run.
+            #   3. Server configuration (command / url / env) was edited
+            #      after the pool had already captured the old manifest.
+            # Case 3 still depends on cache invalidation (Phase 7) to
+            # fully rebuild the underlying transport; this re-fetch at
+            # least ensures the status gate and command signature match
+            # the current on-disk manifest.
+            fresh_manifest = extension_registry.get_effective_server(mcp_server_id)
+            if not fresh_manifest:
+                raise RuntimeError(
+                    f"MCP server '{mcp_server_id}' is no longer registered."
+                )
+            if fresh_manifest.get("status") != "active":
+                raise RuntimeError(
+                    f"MCP server '{mcp_server_id}' is not active."
+                )
             client = await mcp_session_pool.get_or_create_client(
                 server_id=mcp_server_id,
-                manifest=manifest,
+                manifest=fresh_manifest,
                 workspace_root=str(ws_path),
             )
             return await client.call_tool(
@@ -336,6 +355,70 @@ def resolve_authorized_tools(
         ):
             continue
         seen_ids.add(tid)
+
+        # ── Server-ID expansion (delegation path) ─────────────────
+        # A delegated child may be declared with bare server IDs
+        # (e.g. ``["filesystem"]``) rather than concrete tool IDs.
+        # This happens because the parent's manifest carries
+        # ``mcp_servers`` and the coordinator forwards them straight
+        # through. Expand each server ID into the full list of tool
+        # IDs it exposes, using the per-server cache populated by the
+        # parent's run phase.
+        #
+        # Cold-cache delegates skip silently (as before) because this
+        # resolver is synchronous by design. This is best-effort by
+        # contract: the parent run almost always warms the cache
+        # before delegating, so the common path expands cleanly.
+        if not tid.startswith(("mcp__", "mcp::")):
+            server_manifest = extension_registry.get_effective_server(tid)
+            if server_manifest and server_manifest.get("status") == "active":
+                cached_tools = mcp_session_pool.get_cached_tools(tid)
+                if cached_tools:
+                    for tool_info in cached_tools:
+                        remote_name = tool_info.get("name")
+                        if not remote_name:
+                            continue
+                        expanded_id = f"mcp__{tid}__{remote_name}"
+                        if expanded_id in seen_ids:
+                            continue
+                        seen_ids.add(expanded_id)
+                        try:
+                            adapted = resolve_tool_runtime(
+                                tool_id=expanded_id,
+                                tool_meta={
+                                    "id": expanded_id,
+                                    "server_id": tid,
+                                    "remote_tool_name": remote_name,
+                                    "parameters": tool_info.get("parameters", {}),
+                                },
+                                workspace_root=ws_path,
+                                registry=active_registry,
+                                emitter=emitter,
+                                run_id=run_id,
+                                job_id=job_id,
+                                session_id=session_id,
+                                chat_id=chat_id,
+                                project_id=project_id,
+                                search_config=search_config,
+                            )
+                            resolved_tools.append(adapted)
+                        except Exception as exc:
+                            logger.warning(
+                                "MCP tool '%s' expansion failed during "
+                                "delegation: %s",
+                                expanded_id,
+                                exc,
+                            )
+                else:
+                    logger.debug(
+                        "Skipping server-ID '%s' during delegation: "
+                        "tool cache cold.",
+                        tid,
+                    )
+                # The server ID is consumed regardless of cache state.
+                # Do not attempt to resolve it as a regular tool (it
+                # would silently fail — the id is not in the store).
+                continue
 
         # Check if the identifier represents an external MCP tool
         mcp_target = _parse_mcp_tool_id(tid)

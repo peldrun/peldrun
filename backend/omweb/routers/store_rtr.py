@@ -1268,12 +1268,29 @@ async def upload_extension_file(file: UploadFile = File(...)):
         try:
             data = json.loads(content.decode("utf-8"))
             saved = extension_registry.save_extension(data)
-            return {"status": "ok", "extension": saved}
         except Exception as e:
             raise HTTPException(
                 status_code=400,
                 detail=f"Failed to parse extension JSON: {e}",
             )
+
+        # If this upload replaced an existing server manifest with a
+        # different transport signature, save_extension() already
+        # invalidated the tool cache. Here we go one step further and
+        # tear down any live subprocess so the next invocation
+        # re-launches with the freshly-written command / url / env.
+        saved_id = (saved or {}).get("id") if isinstance(saved, dict) else None
+        if saved_id:
+            try:
+                await mcp_session_pool.close_server_sessions(saved_id)
+            except Exception as exc:
+                logger.warning(
+                    "close_server_sessions('%s') failed after extension "
+                    "upload: %s",
+                    saved_id,
+                    exc,
+                )
+        return {"status": "ok", "extension": saved}
 
     raise HTTPException(
         status_code=400,
@@ -1292,8 +1309,15 @@ async def delete_extension_endpoint(ext_id: str):
         raise HTTPException(status_code=400, detail="Cannot delete built-in extensions.")
 
     if ext.get("is_bundle"):
+        # mcp_bundle_manager.delete_bundle() calls close_server_sessions
+        # internally (Phase 5), so no extra teardown is required here.
         await mcp_bundle_manager.delete_bundle(ext_id)
         return {"status": "ok", "message": f"MCP bundle '{ext_id}' deleted successfully."}
+
+    # Non-bundle extension: tear down every workspace-bound session
+    # BEFORE removing the manifest so no orphaned subprocess survives
+    # the deletion.
+    await mcp_session_pool.close_server_sessions(ext_id)
 
     success = extension_registry.delete_extension(ext_id)
     if not success:

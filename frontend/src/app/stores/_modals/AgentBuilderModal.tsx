@@ -3,9 +3,19 @@
 "use client";
 
 import React from "react";
-import { Bot, Check, Puzzle, X } from "lucide-react";
+import { Bot, Check, Server, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { AgentUpsertPayload, ToolDefinition } from "@/lib/types";
+
+export interface McpServerOption {
+  id: string;
+  name: string;
+  description?: string;
+  transport?: string;
+  status?: string;
+  is_builtin?: boolean;
+  is_bundle?: boolean;
+}
 
 export interface AgentBuilderModalProps {
   open: boolean;
@@ -13,9 +23,22 @@ export interface AgentBuilderModalProps {
   formData: AgentUpsertPayload;
   setFormData: React.Dispatch<React.SetStateAction<AgentUpsertPayload>>;
   tools: ToolDefinition[];
+  /**
+   * MCP protocol servers available in the Store. Rendered as a
+   * second selection group below the tools list. Loaded by the
+   * parent (page.tsx) via GET /api/mcp/servers so the modal does
+   * not need to know how the store backend is laid out.
+   */
+  mcpServers: McpServerOption[];
   onSubmit: (e: React.FormEvent) => void;
   onClose: () => void;
   onToggleTool: (toolId: string) => void;
+  /**
+   * Toggle a single MCP server binding on the current agent form.
+   * The parent handles the mutation of ``formData.mcp_servers``
+   * so this modal stays purely presentational for that group.
+   */
+  onToggleMcpServer: (serverId: string) => void;
 }
 
 // Predefined colors that match the default agent identity palette
@@ -36,9 +59,11 @@ export function AgentBuilderModal({
   formData,
   setFormData,
   tools,
+  mcpServers,
   onSubmit,
   onClose,
   onToggleTool,
+  onToggleMcpServer,
 }: AgentBuilderModalProps) {
   if (!open) return null;
 
@@ -47,9 +72,11 @@ export function AgentBuilderModal({
     (t) => t.is_enabled !== false && t.status !== "disabled"
   );
 
-  // Cast formData to include core_color since AgentUpsertPayload might not officially declare it yet
-  const formDataWithColor = formData as AgentUpsertPayload & { core_color?: string };
-  const currentColor = formDataWithColor.core_color || "#10b981";
+  // ``core_color`` is now declared in AgentUpsertPayload, so no
+  // cast is needed. The field is optional; custom agents that were
+  // created before this change fall back to the default palette
+  // colour until the next save.
+  const currentColor = formData.core_color || "#10b981";
 
   const handleColorChange = (color: string) => {
     setFormData((prev) => ({ ...prev, core_color: color }) as AgentUpsertPayload);
@@ -260,28 +287,95 @@ export function AgentBuilderModal({
                 );
               })}
 
-              {/* MCP pseudo-tool toggle */}
-              <button
-                type="button"
-                onClick={() => onToggleTool("mcp")}
-                className={`flex items-center justify-between p-2.5 rounded-lg border text-left transition-all cursor-pointer col-span-2 ${
-                  formData.tools.includes("mcp")
-                    ? "bg-primary/10 border-primary/40 text-primary font-medium shadow-xs"
-                    : "bg-background border-border text-muted-foreground hover:border-border/80"
-                }`}
-                style={formData.tools.includes("mcp") ? { color: currentColor, borderColor: `${currentColor}60`, backgroundColor: `${currentColor}15` } : {}}
-              >
-                <div className="flex items-center gap-2">
-                  <Puzzle size={13} style={{ color: currentColor }} />
-                  <span className="font-mono text-[11px]">
-                    Allow Active MCP Protocol Tools
-                  </span>
-                </div>
-                {formData.tools.includes("mcp") && (
-                  <Check size={14} style={{ color: currentColor }} className="flex-shrink-0" />
-                )}
-              </button>
+              {/* (intentionally no "mcp" pseudo-tool here — MCP
+                  servers are selected in the dedicated section
+                  below, which persists to ``formData.mcp_servers``
+                  instead of the tools array. This keeps the two
+                  concepts orthogonal: tools are functions the LLM
+                  can call, MCP servers are protocol endpoints that
+                  contribute their own tools at runtime.) */}
             </div>
+          </div>
+
+          {/* MCP protocol servers */}
+          <div>
+            <label className="block text-foreground font-medium mb-2 flex items-center justify-between">
+              <span className="flex items-center gap-1.5">
+                <Server size={13} className="text-primary" />
+                MCP Protocol Servers
+              </span>
+              <span className="text-[10px] font-mono text-muted-foreground font-normal">
+                {(formData.mcp_servers || []).length} selected
+              </span>
+            </label>
+            <p className="text-[10px] text-muted-foreground mb-2 leading-relaxed">
+              External MCP servers whose tools will be available to this
+              agent at runtime. Toggle a server here to add or remove it
+              from the manifest. Per-user overrides (disable / add extra
+              servers) are managed separately from the card's Server
+              button.
+            </p>
+
+            {mcpServers.length === 0 ? (
+              <div className="p-3 text-[11px] text-muted-foreground italic border border-dashed border-border rounded-lg text-center">
+                No MCP servers are registered. Install one from the
+                Extensions section to make it available here.
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 gap-2 max-h-48 overflow-y-auto pr-1">
+                {mcpServers.map((srv) => {
+                  const selected = (formData.mcp_servers || []).includes(
+                    srv.id
+                  );
+                  const isActive = srv.status === "active";
+                  return (
+                    <button
+                      type="button"
+                      key={srv.id}
+                      onClick={() => onToggleMcpServer(srv.id)}
+                      className={`flex items-center justify-between p-2.5 rounded-lg border text-left transition-all cursor-pointer ${
+                        selected
+                          ? "bg-primary/10 border-primary/40 text-primary font-medium shadow-xs"
+                          : "bg-background border-border text-muted-foreground hover:border-border/80"
+                      }`}
+                      style={
+                        selected
+                          ? {
+                              color: currentColor,
+                              borderColor: `${currentColor}60`,
+                              backgroundColor: `${currentColor}15`,
+                            }
+                          : {}
+                      }
+                      title={srv.description || srv.id}
+                    >
+                      <div className="flex flex-col min-w-0">
+                        <span className="font-mono text-[11px] truncate flex items-center gap-1">
+                          {srv.name}
+                          {srv.is_bundle && (
+                            <span className="text-[9px] px-1 rounded bg-primary/10 text-primary font-normal">
+                              bundle
+                            </span>
+                          )}
+                          {!isActive && (
+                            <span className="text-[9px] px-1 rounded bg-amber-500/10 text-amber-600 font-normal">
+                              inactive
+                            </span>
+                          )}
+                        </span>
+                      </div>
+                      {selected && (
+                        <Check
+                          size={14}
+                          style={{ color: currentColor }}
+                          className="flex-shrink-0"
+                        />
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
           {/* Footer */}

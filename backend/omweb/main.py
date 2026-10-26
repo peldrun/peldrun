@@ -30,6 +30,7 @@ Lifespan management:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -85,9 +86,10 @@ async def lifespan(app: FastAPI):
         Initializes database migrations, environment discovery snapshot,
         and starts the adaptive sampling scheduler for Resource Monitor.
 
-    On shutdown:
-        Concludes Resource Monitor session, flushes in-memory sample buffers,
-        and gracefully terminates the shared BrowserSessionManager.
+    On shutdown (ordered so orphaned subprocesses cannot block the event loop):
+        1. Terminate active MCP subprocesses (Node / Python children).
+        2. Conclude the Resource Monitor session and flush sample buffers.
+        3. Gracefully terminate the shared BrowserSessionManager.
     """
     # 1. Start Resource Monitor subsystem
     try:
@@ -107,7 +109,32 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # 1. Shutdown Resource Monitor subsystem
+    # 1. Terminate active MCP subprocesses BEFORE anything else.
+    # On Windows, lingering Node/Python child processes hold file handles
+    # on the backend's working directory, preventing uvicorn from releasing
+    # the event loop cleanly. Shutting them down first avoids the
+    # "orphaned subprocess keeps the app alive" failure mode.
+    # A hard timeout protects against a wedged subprocess that would
+    # otherwise stall shutdown indefinitely.
+    try:
+        from omweb.extensions.mcp_pool import mcp_session_pool
+
+        await asyncio.wait_for(
+            mcp_session_pool.close_all(),
+            timeout=30.0,
+        )
+        logger.info("McpSessionPool closed cleanly on shutdown.")
+    except asyncio.TimeoutError:
+        logger.warning(
+            "McpSessionPool.close_all() exceeded 30s during shutdown; "
+            "any surviving subprocesses will be reaped by the OS."
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to close McpSessionPool on shutdown: %s", exc
+        )
+
+    # 2. Shutdown Resource Monitor subsystem
     try:
         from omweb.services.resource_monitor_service import (
             get_resource_monitor_service,
@@ -120,7 +147,7 @@ async def lifespan(app: FastAPI):
             "Failed to shutdown ResourceMonitorService on shutdown: %s", exc
         )
 
-    # 2. Close BrowserSessionManager
+    # 3. Close BrowserSessionManager
     try:
         from peldrun.tools.builtins.browser_interactive.session import (
             get_session_manager,

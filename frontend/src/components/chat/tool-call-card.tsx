@@ -179,6 +179,64 @@ async function fetchDisabledTools(agentId: string): Promise<Set<string>> {
   }
 }
 
+/**
+ * Set of MCP server IDs currently DISABLED for this agent.
+ *
+ * An MCP tool ``mcp__server__tool`` is considered disabled for the
+ * agent when either:
+ *   - its server id appears here (user disabled it via AgentMcpModal
+ *     → ``disabled_mcp_servers``), OR
+ *   - the server's manifest ``status`` is not ``"active"`` (global
+ *     toggle from the Extensions section).
+ *
+ * Both conditions are folded into the returned set so downstream
+ * callers only need a single membership check.
+ */
+const disabledMcpServersCache = new Map<string, { at: number; servers: Set<string> }>();
+
+async function fetchDisabledMcpServers(agentId: string): Promise<Set<string>> {
+  const now = Date.now();
+  const cached = disabledMcpServersCache.get(agentId);
+  if (cached && now - cached.at < DISABLED_CACHE_TTL_MS) {
+    return cached.servers;
+  }
+
+  const disabled = new Set<string>();
+  try {
+    const base = typeof window !== "undefined" && (window.location.port === "3088" || window.location.port === "3000") ? "http://localhost:8088" : "";
+
+    // Two sources must be merged:
+    //   1. Per-agent disabled_mcp_servers from agent_settings.json.
+    //   2. Global server status from the extensions registry.
+    const [agentMcpRes, allMcpRes] = await Promise.all([
+      fetch(`${base}/api/store/agents/${encodeURIComponent(agentId)}/mcp`, { cache: "no-store" }),
+      fetch(`${base}/api/mcp/servers`, { cache: "no-store" }),
+    ]);
+
+    if (agentMcpRes.ok) {
+      const data = await agentMcpRes.json();
+      const list = Array.isArray(data?.disabled_mcp_servers) ? data.disabled_mcp_servers : [];
+      for (const s of list) disabled.add(String(s));
+    }
+
+    if (allMcpRes.ok) {
+      const data = await allMcpRes.json();
+      const servers = Array.isArray(data?.servers) ? data.servers : [];
+      for (const s of servers) {
+        if (s && s.id && s.status && s.status !== "active") {
+          disabled.add(String(s.id));
+        }
+      }
+    }
+
+    disabledMcpServersCache.set(agentId, { at: now, servers: disabled });
+    return disabled;
+  } catch {
+    disabledMcpServersCache.set(agentId, { at: now, servers: disabled });
+    return disabled;
+  }
+}
+
 export interface ToolCallCardProps {
   tool: ToolPair;
   agentId?: string;
@@ -221,11 +279,21 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
     if (!agentId) return;
     let cancelled = false;
     (async () => {
-      const set = await fetchDisabledTools(agentId);
-      if (!cancelled) setDisabled(set.has(tool.tool));
+      if (mcpInfo.isMcp && mcpInfo.serverId) {
+        // MCP tool: its disabled-ness depends on the server, not
+        // the tool id itself. Check the merged set that combines
+        // per-agent ``disabled_mcp_servers`` with the server's
+        // global ``status``.
+        const disabledServers = await fetchDisabledMcpServers(agentId);
+        if (!cancelled) setDisabled(disabledServers.has(mcpInfo.serverId));
+      } else {
+        // Standard tool: check ``disabled_tools`` for the tool id.
+        const set = await fetchDisabledTools(agentId);
+        if (!cancelled) setDisabled(set.has(tool.tool));
+      }
     })();
     return () => { cancelled = true; };
-  }, [agentId, tool.tool]);
+  }, [agentId, tool.tool, mcpInfo.isMcp, mcpInfo.serverId]);
 
   const handleCopy = async (e: React.MouseEvent) => {
     e.stopPropagation();

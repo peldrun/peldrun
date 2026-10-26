@@ -185,14 +185,40 @@ export interface AgentManifest {
   name: string;
   role?: string;
   icon?: string;
+  core_color?: string;
   description?: string;
   system_prompt: string;
   tools: string[];
+  /**
+   * Raw MCP servers declared in the agent's manifest baseline.
+   * NEVER mutated by user actions — user overrides live in
+   * ``agent_settings.json`` and are surfaced via
+   * ``effective_mcp_servers`` below.
+   */
+  mcp_servers?: string[];
+  /**
+   * Effective MCP servers after applying the user's
+   * ``disabled_mcp_servers`` / ``extra_mcp_servers`` overrides.
+   * This is the field the Store UI (AgentCard, AgentMcpModal)
+   * MUST read — it is the backend's source of truth for what the
+   * runtime will actually attach to the agent.
+   */
+  effective_mcp_servers?: string[];
   max_steps: number;
   is_builtin?: boolean;
   created_at?: string;
   updated_at?: string;
   status?: "active" | "disabled" | string;
+  settings?: {
+    enabled?: boolean;
+    tools_editable?: boolean;
+    schema?: {
+      type?: string;
+      properties?: Record<string, unknown>;
+      additionalProperties?: boolean;
+    };
+    required?: string[];
+  };
 }
 
 export interface ToolDefinition {
@@ -220,9 +246,21 @@ export interface AgentUpsertPayload {
   name: string;
   role?: string;
   icon?: string;
+  core_color?: string;
   description?: string;
   system_prompt: string;
   tools: string[];
+  /**
+   * MCP server IDs to bind to this agent. Persisted in the agent
+   * manifest under ``mcp_servers`` and merged with the user's
+   * ``disabled_mcp_servers`` / ``extra_mcp_servers`` overrides at
+   * runtime to produce ``effective_mcp_servers``.
+   *
+   * Always send ``[]`` (never ``undefined``) so a save that
+   * intentionally clears MCP servers is distinguishable from a
+   * save that simply never touched the field.
+   */
+  mcp_servers?: string[];
   max_steps?: number;
 }
 

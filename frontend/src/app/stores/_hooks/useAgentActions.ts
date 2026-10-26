@@ -45,6 +45,7 @@ export interface UseAgentActionsResult {
   handleOpenEditAgentModal: (agent: AgentManifest) => void;
   handleCloseAgentModal: () => void;
   handleToggleAgentToolAssignment: (toolId: string) => void;
+  handleToggleAgentMcpServer: (serverId: string) => void;
   handleSubmitAgentModal: (e: React.FormEvent) => Promise<void>;
 
   // Chat launch
@@ -183,9 +184,24 @@ export function useAgentActions({
       name: agent.name,
       role: agent.role || "Specialist",
       icon: agent.icon || "Sparkles",
+      // Preserve ``core_color`` across edits. Previously this field
+      // was dropped on edit, causing custom agents to revert to the
+      // default builder-modal colour whenever the user changed any
+      // other field (name, prompt, tools, ...). The colour lives on
+      // the manifest, not on the user-saved settings, so losing it
+      // here was a silent data corruption.
+      core_color: agent.core_color,
       description: agent.description || "",
       system_prompt: agent.system_prompt,
       tools: agent.tools || [],
+      // Preserve ``mcp_servers`` across edits. Without this line,
+      // saving an unrelated change (e.g. renaming the agent) would
+      // submit the form with ``mcp_servers: []`` — silently wiping
+      // every MCP server binding the user had configured via the
+      // AgentMcpModal. The backend's ``update_custom_agent`` writes
+      // ``mcp_servers`` verbatim, so any drop here propagates to
+      // the manifest AND to the effective list on the next reload.
+      mcp_servers: agent.mcp_servers || [],
       max_steps: agent.max_steps || 30,
     });
     setIsAgentModalOpen(true);
@@ -210,6 +226,33 @@ export function useAgentActions({
         tools: exists
           ? prev.tools.filter((t) => t !== toolId)
           : [...prev.tools, toolId],
+      };
+    });
+  }, []);
+
+  /**
+   * Toggle a single MCP server binding inside the current agent form.
+   *
+   * Mutates ``mcp_servers`` (the manifest field) — NOT the tools
+   * array. MCP servers and tools are deliberately orthogonal in the
+   * manifest:
+   *   - ``tools[]`` are functions the LLM can call.
+   *   - ``mcp_servers[]`` are protocol endpoints whose tools are
+   *     discovered at runtime.
+   *
+   * User-level overrides (disable / add-extra) are NOT handled here;
+   * they live in the dedicated AgentMcpModal and are persisted to
+   * agent_settings.json, not the manifest.
+   */
+  const handleToggleAgentMcpServer = useCallback((serverId: string) => {
+    setAgentFormData((prev) => {
+      const existing = prev.mcp_servers || [];
+      const exists = existing.includes(serverId);
+      return {
+        ...prev,
+        mcp_servers: exists
+          ? existing.filter((s) => s !== serverId)
+          : [...existing, serverId],
       };
     });
   }, []);
@@ -275,6 +318,7 @@ export function useAgentActions({
     handleOpenEditAgentModal,
     handleCloseAgentModal,
     handleToggleAgentToolAssignment,
+    handleToggleAgentMcpServer,
     handleSubmitAgentModal,
     handleStartChatWithAgent,
   };

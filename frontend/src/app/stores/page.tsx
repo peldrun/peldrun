@@ -14,7 +14,7 @@ import {
   getSectionMeta,
 } from "./_config/sections";
 import type { AgentFilter, ToolFilter } from "./_types/store";
-
+import type { ExtensionDefinition } from "@/lib/types";
 import { useStoreData } from "./_hooks/useStoreData";
 import { useAgentActions } from "./_hooks/useAgentActions";
 import { useToolActions } from "./_hooks/useToolActions";
@@ -163,6 +163,13 @@ export default function StoresPage() {
                   onEditAgent={agentActions.handleOpenEditAgentModal}
                   onDeleteAgent={agentActions.handleDeleteAgent}
                   onStartChat={agentActions.handleStartChatWithAgent}
+                  // Refresh the agents list after the AgentMcpModal
+                  // saves MCP server overrides. Without this, the
+                  // "N MCP" badge on the card would stay at its
+                  // pre-save value because ``effective_mcp_servers``
+                  // is computed from ``agent_settings.json`` on the
+                  // backend and only re-fetched on ``reload()``.
+                  onReloadAgents={reload}
                 />
               )}
 
@@ -209,9 +216,36 @@ export default function StoresPage() {
         formData={agentActions.agentFormData}
         setFormData={agentActions.setAgentFormData}
         tools={tools}
+        // The ``extensions`` collection already carries every MCP
+        // server registered in the store (built-in, custom JSON,
+        // and bundle). Filtering on ``type`` defends against future
+        // non-MCP extensions appearing in the same collection.
+        mcpServers={extensions
+          .filter(
+            (e) =>
+              e.type === "mcp_server" ||
+              e.type === "mcp" ||
+              !e.type, // legacy extensions without a type field
+          )
+          .map((e) => ({
+            id: e.id,
+            name: e.name,
+            description: e.description,
+            transport:
+              (e as ExtensionDefinition & { transport?: string })
+                .transport || "stdio",
+            status: e.status,
+            is_builtin:
+              (e as ExtensionDefinition & { is_builtin?: boolean })
+                .is_builtin,
+            is_bundle:
+              (e as ExtensionDefinition & { is_bundle?: boolean })
+                .is_bundle,
+          }))}
         onSubmit={agentActions.handleSubmitAgentModal}
         onClose={agentActions.handleCloseAgentModal}
         onToggleTool={agentActions.handleToggleAgentToolAssignment}
+        onToggleMcpServer={agentActions.handleToggleAgentMcpServer}
       />
 
       {/* Unified upload modal (tools + extensions) */}

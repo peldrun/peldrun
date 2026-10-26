@@ -32,6 +32,23 @@ export interface AgentsSectionProps {
   onEditAgent: (agent: AgentManifest) => void;
   onDeleteAgent: (agentId: string) => void;
   onStartChat: (agent: AgentManifest) => void;
+  /**
+   * Reload the agents collection from the backend.
+   *
+   * Invoked by:
+   *   - ``AgentMcpModal.onSaved`` — after a successful MCP server
+   *     save, so the ``N MCP`` badge on the card refreshes with the
+   *     new ``effective_mcp_servers`` value.
+   *   - (future) any other modal that mutates an agent's manifest
+   *     without going through the builder form.
+   *
+   * Optional to keep this section usable in isolation (tests,
+   * storybook). When omitted, the modal still saves successfully —
+   * the card just will not reflect the change until the next full
+   * page reload. That matches the pre-Phase-10 behaviour, so this
+   * addition is strictly non-breaking.
+   */
+  onReloadAgents?: () => void | Promise<void>;
 }
 
 /**
@@ -107,6 +124,7 @@ export function AgentsSection({
   onEditAgent,
   onDeleteAgent,
   onStartChat,
+  onReloadAgents,
 }: AgentsSectionProps) {
   // Modal state — which agent (if any) is being viewed / configured.
   const [detailsAgent, setDetailsAgent] = useState<AgentWithMeta | null>(null);
@@ -252,11 +270,26 @@ export function AgentsSection({
       />
 
       {/* ── Agent MCP modal ────────────────────────────────────── */}
+      {/*
+       * ``onSaved`` must trigger a full reload of the agents list so
+       * the parent re-fetches ``effective_mcp_servers`` (which is
+       * computed from agent_settings.json on the backend). Without
+       * this, the ``N MCP`` badge on the card stays stuck at its
+       * pre-save value until the user refreshes the page — exactly
+       * the UX bug documented in the audit report.
+       *
+       * If ``onReloadAgents`` is not provided, the modal still saves
+       * successfully (the backend update is not gated on this); the
+       * card just will not reflect the change. This preserves
+       * backward compatibility with any parent that has not yet
+       * wired up a reload handler.
+       */}
       <AgentMcpModal
         open={mcpAgent !== null}
         agentId={mcpAgent?.id ?? null}
         agentName={mcpAgent?.name ?? ""}
         onClose={() => setMcpAgent(null)}
+        onSaved={onReloadAgents}
       />
     </div>
   );

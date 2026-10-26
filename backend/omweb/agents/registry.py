@@ -70,7 +70,13 @@ class AgentRegistry:
                         f"[AGENT REGISTRY] Failed loading builtin manifest {manifest_file.name}: {exc}"
                     )
 
-        # Ensure primary default agent exists even if directory was empty
+        # Ensure primary default agent exists even if directory was empty.
+        # NOTE: ``"mcp"`` is intentionally NOT included in ``tools``.
+        # MCP protocol servers are configured exclusively through the
+        # ``mcp_servers`` field and merged at runtime via
+        # ``effective_mcp_servers``. Including the pseudo-tool would
+        # surface it in the AgentToolsModal as a missing tool (the
+        # store has no such entry), confusing users.
         if "peldrun" not in agents:
             agents["peldrun"] = {
                 "id": "peldrun",
@@ -86,7 +92,6 @@ class AgentRegistry:
                     "web_search",
                     "http_fetch",
                     "ask_human",
-                    "mcp",
                 ],
                 "mcp_servers": [],
                 "max_steps": 30,
@@ -115,6 +120,59 @@ class AgentRegistry:
         except Exception as e:
             print(f"[AGENT REGISTRY ERROR] Could not save agent states: {e}")
 
+    @staticmethod
+    def _merge_mcp_state_for_agent(
+        manifest: Dict[str, Any],
+        saved_settings: Optional[Dict[str, Any]],
+    ) -> None:
+        """
+        Compute and attach ``effective_mcp_servers`` for one agent.
+
+        Mirrors the algorithm in ``get_agent_mcp_state`` but takes the
+        already-loaded settings map (rather than re-reading the file)
+        so ``list_agents`` can process N agents with 1 disk read.
+
+        Mutates the passed dict in place. Also strips the historical
+        ``"mcp"`` pseudo-tool from ``tools`` so it never surfaces in
+        the UI as a missing tool, and so agent tool-counters and
+        "not in store" warnings stay accurate.
+        """
+        manifest_mcp = [str(s) for s in (manifest.get("mcp_servers") or [])]
+        # Normalise the raw field so callers that read ``mcp_servers``
+        # directly (rather than ``effective_mcp_servers``) get a stable,
+        # always-list value — even for legacy custom agents created
+        # before the field existed.
+        manifest["mcp_servers"] = list(manifest_mcp)
+
+        disabled: List[str] = []
+        extra: List[str] = []
+        if isinstance(saved_settings, dict):
+            disabled = [str(s) for s in (saved_settings.get("disabled_mcp_servers") or [])]
+            extra = [str(s) for s in (saved_settings.get("extra_mcp_servers") or [])]
+
+        disabled_set = set(disabled) & set(manifest_mcp)
+        extra_set = set(extra) - set(manifest_mcp)
+
+        effective: List[str] = [
+            s for s in manifest_mcp if s not in disabled_set
+        ]
+        for s in extra_set:
+            if s not in effective:
+                effective.append(s)
+
+        manifest["effective_mcp_servers"] = effective
+
+        # Defense in depth: strip the ``"mcp"`` pseudo-tool from
+        # ``tools``. It is a discovery trigger at the engine level,
+        # not an invokable tool, and its presence in the tools array
+        # misrepresents the agent's scoped toolset in AgentCard /
+        # AgentToolsModal. Legacy manifests that carry it continue to
+        # work: the engine's fallback ``elif "mcp" in requested_tools``
+        # branch handles older custom agents that were never edited.
+        raw_tools = manifest.get("tools")
+        if isinstance(raw_tools, list):
+            manifest["tools"] = [t for t in raw_tools if t != "mcp"]
+
     def list_agents(self) -> List[Dict[str, Any]]:
         """List all registered agents merging built-ins with custom definitions."""
         states = self._load_states()
@@ -127,12 +185,43 @@ class AgentRegistry:
             results[aid] = copied
 
         # 2. Custom saved agents
+        #
+        # Two filters guard this loop:
+        #
+        #   (a) Explicit filename blocklist — ``agents_state.json``
+        #       stores enabled/disabled states, and ``agent_settings.json``
+        #       stores user-saved per-agent overrides. Both live in the
+        #       same directory as agent manifests by design, but neither
+        #       is an agent. Parsing them as agents would surface ghost
+        #       entries (e.g. an agent literally named "agent_settings")
+        #       in the Store UI, and would let GET /agents/{id} resolve
+        #       them as if they were real.
+        #
+        #   (b) Structural validation — a real agent manifest MUST
+        #       declare a non-empty ``system_prompt``. Any JSON that
+        #       lands here without one (backup dumps, ad-hoc containers,
+        #       future internal files) is silently dropped rather than
+        #       surfacing as a broken agent. This is defense in depth:
+        #       adding a new infrastructure file in the future does
+        #       not require updating the blocklist.
+        _INFRA_FILENAMES = {"agents_state.json", "agent_settings.json"}
         if self.custom_dir.exists():
             for p in sorted(self.custom_dir.glob("*.json")):
-                if p.name == "agents_state.json":
+                if p.name in _INFRA_FILENAMES:
                     continue
                 try:
                     data = json.loads(p.read_text(encoding="utf-8"))
+                    if not isinstance(data, dict):
+                        continue
+
+                    sp = data.get("system_prompt")
+                    if not isinstance(sp, str) or not sp.strip():
+                        logger.debug(
+                            "Skipping non-agent JSON in agents dir: %s",
+                            p.name,
+                        )
+                        continue
+
                     aid = data.get("id") or p.stem
                     data["id"] = aid
                     data["is_builtin"] = False
@@ -141,6 +230,39 @@ class AgentRegistry:
                 except Exception:
                     continue
 
+        # 3. Enrich every agent with ``effective_mcp_servers`` in a
+        #    SINGLE pass over the settings file. ``list_agents`` is
+        #    called on every /stores page load via
+        #    ``GET /api/store/agents``; re-reading and re-parsing
+        #    agent_settings.json once per agent (N reads) would scale
+        #    poorly with dozens of agents.
+        #
+        #    ``_merge_mcp_state_for_agent`` also strips the historical
+        #    ``"mcp"`` pseudo-tool from ``tools`` so:
+        #      * AgentCard tool counters stay accurate.
+        #      * AgentToolsModal does not surface "mcp — not in store".
+        #      * The engine's discovery fallback remains the only
+        #        consumer of the pseudo-tool, and only for legacy
+        #        agents that have not been re-edited.
+        try:
+            all_settings = self._load_settings()
+        except Exception as exc:
+            logger.warning(
+                "Failed to load agent_settings.json during list_agents: %s",
+                exc,
+            )
+            all_settings = {}
+        if not isinstance(all_settings, dict):
+            all_settings = {}
+
+        for aid, ameta in results.items():
+            try:
+                self._merge_mcp_state_for_agent(ameta, all_settings.get(aid))
+            except Exception as exc:
+                logger.debug(
+                    "MCP state merge failed for agent '%s': %s", aid, exc
+                )
+
         return list(results.values())
 
     def get_agent(self, agent_id: str) -> Dict[str, Any]:
@@ -148,6 +270,11 @@ class AgentRegistry:
         Retrieve an agent manifest by ID or registered alias.
 
         Enforces strict lookup without silent fallback masking.
+
+        Infrastructure files (agents_state.json, agent_settings.json)
+        are never exposed as agents — see the blocklist in
+        ``list_agents`` — so a lookup for "agent_settings" correctly
+        raises ``AgentNotFoundError``.
         """
         normalized_id = (agent_id or "").strip().lower()
         resolved_id = self._aliases.get(normalized_id, normalized_id)
@@ -357,6 +484,13 @@ class AgentRegistry:
                     effective["extra_tools"] = list(saved["extra_tools"])
 
         # ── Channel 3: MCP server overrides ──────────────────────────
+        # NOTE: ``manifest`` already carries ``effective_mcp_servers``
+        # from ``list_agents`` (via ``_merge_mcp_state_for_agent``).
+        # This block re-computes the same value idempotently because
+        # ``get_effective_agent`` is also reachable through code paths
+        # that bypass ``list_agents`` (e.g. future direct callers).
+        # Duplicated computation here is intentional: it keeps the
+        # method self-contained and safe to call on any manifest.
         saved_settings = self._load_settings().get(agent_id, {})
         manifest_mcp = [str(s) for s in (manifest.get("mcp_servers") or [])]
         if isinstance(saved_settings, dict):

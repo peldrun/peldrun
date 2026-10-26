@@ -30,6 +30,80 @@ logger = logging.getLogger("omweb.adapters.web_tool_adapter")
 from pydantic import create_model as _create_model
 
 
+# JSON Schema keywords whose presence means the schema is too complex
+# for pydantic's ``create_model`` to preserve faithfully. Every one of
+# these would be silently dropped, corrupting the OpenAI function
+# schema that reaches the LLM.
+_COMPLEX_SCHEMA_KEYS = frozenset({
+    "$ref", "$defs", "definitions",
+    "oneOf", "anyOf", "allOf", "not",
+    "if", "then", "else",
+})
+
+
+def _should_disable_args_schema(parameters: Dict[str, Any]) -> bool:
+    """
+    Return True when building a pydantic ``args_schema`` would silently
+    corrupt the JSON schema for OpenAI function calling.
+
+    pydantic's ``create_model`` treats ``array`` as bare ``list`` and
+    ``object`` as bare ``dict`` — dropping nested ``items`` and
+    ``properties``. It also drops every compositional keyword
+    (``$ref``, ``oneOf``, ``anyOf``, ``allOf``, ``not``, conditionals).
+
+    For schemas that carry those constructs the faithful behaviour is
+    to let Core use the ``parameters`` dict verbatim, which is exactly
+    what ``to_openai_tool()`` / ``to_param()`` / ``to_openai_schema()``
+    already return. Setting ``args_schema = None`` triggers that
+    fallback path.
+
+    The check is deliberately conservative: a false negative (we build
+    an args_schema that loses something) is worse than a false
+    positive (we skip args_schema and use the raw schema, which is
+    always correct).
+    """
+    if not isinstance(parameters, dict):
+        return False
+
+    props = parameters.get("properties")
+    if not isinstance(props, dict):
+        return False
+
+    # Top-level compositional keywords → whole schema is complex.
+    if any(k in parameters for k in _COMPLEX_SCHEMA_KEYS):
+        return True
+
+    for spec in props.values():
+        if not isinstance(spec, dict):
+            continue
+
+        # Compositional keyword on a property → complex.
+        if any(k in spec for k in _COMPLEX_SCHEMA_KEYS):
+            return True
+
+        ptype = spec.get("type")
+
+        # Array with nested item structure → pydantic would lose it.
+        if ptype == "array":
+            items = spec.get("items")
+            if isinstance(items, dict):
+                if any(k in items for k in _COMPLEX_SCHEMA_KEYS):
+                    return True
+                if items.get("type") in ("array", "object"):
+                    return True
+                if isinstance(items.get("properties"), dict):
+                    return True
+
+        # Object with declared properties → pydantic would lose them.
+        if ptype == "object":
+            if isinstance(spec.get("properties"), dict):
+                return True
+            if any(k in spec for k in _COMPLEX_SCHEMA_KEYS):
+                return True
+
+    return False
+
+
 def _schema_to_pydantic_model(name: str, parameters: Optional[Dict[str, Any]]) -> Optional[type]:
     """
     Build a dynamic pydantic model from a JSON schema dict so that
@@ -56,9 +130,28 @@ def _schema_to_pydantic_model(name: str, parameters: Optional[Dict[str, Any]]) -
             elif t == "boolean":
                 py_type = bool
             elif t == "array":
-                py_type = list
+                # Preserve the item type for the common scalar cases so
+                # the LLM receives ``array<string>`` / ``array<integer>``
+                # instead of a bare ``array``. Complex item types are
+                # caught upstream by _should_disable_args_schema and
+                # never reach this branch — so any remaining array here
+                # is safe to annotate with List[T].
+                items = spec.get("items")
+                items_type = items.get("type") if isinstance(items, dict) else None
+                if items_type == "integer":
+                    py_type = List[int]
+                elif items_type == "number":
+                    py_type = List[float]
+                elif items_type == "boolean":
+                    py_type = List[bool]
+                elif items_type == "string":
+                    py_type = List[str]
+                else:
+                    py_type = List[Any]
             elif t == "object":
-                py_type = dict
+                # Only reachable for object without declared properties
+                # (free-form dict). The complex case is filtered upstream.
+                py_type = Dict[str, Any]
             # else: string
 
         default = ... if prop_name in required else None
@@ -106,11 +199,25 @@ class WebToolAdapter(BaseTool):
         self.description = str(description or "").strip()
         self._parameters_schema: Dict[str, Any] = self._normalize_parameters_schema(parameters)
         self.parameters: Dict[str, Any] = self._parameters_schema
-        # Expose args_schema so Core's ToolRegistry can build proper OpenAI tool schemas
-        self.args_schema = _schema_to_pydantic_model(
-            str(name).strip() or "web_tool",
-            self._parameters_schema,
-        )
+
+        # Expose args_schema so Core's ToolRegistry can build proper
+        # OpenAI tool schemas for SIMPLE schemas. For schemas that carry
+        # compositional constructs ($ref, oneOf, anyOf, allOf, not) or
+        # nested arrays/objects, pydantic's create_model would silently
+        # flatten the structure (array→list, object→dict), producing a
+        # schema the LLM rejects or misinterprets.
+        #
+        # In those cases we set args_schema = None so that Core's
+        # schema-builder falls back to reading `self.parameters`
+        # directly (see to_openai_schema / to_openai_tool / to_param),
+        # which preserves the original JSON schema verbatim.
+        if _should_disable_args_schema(self._parameters_schema):
+            self.args_schema = None
+        else:
+            self.args_schema = _schema_to_pydantic_model(
+                str(name).strip() or "web_tool",
+                self._parameters_schema,
+            )
         self.execute_fn: Callable[..., Any] = resolved_fn
         self.workspace_root: Optional[str] = workspace_root
         self.adapter_metadata: Dict[str, Any] = dict(metadata or {})
@@ -288,6 +395,17 @@ class WebToolAdapter(BaseTool):
 
     def to_param(self) -> Dict[str, Any]:
         """Alias for OpenAI tool parameter serialization."""
+        return self.to_openai_tool()
+
+    def to_openai_schema(self) -> Dict[str, Any]:
+        """
+        Core-compatible alias matching ``DynamicMCPTool.to_openai_schema``.
+
+        Core's ToolCollection accepts either naming convention
+        depending on the code path — providing both guarantees this
+        adapter is discovered and serialised correctly regardless of
+        which method the caller probes for.
+        """
         return self.to_openai_tool()
 
     def get_schema(self) -> Dict[str, Any]:

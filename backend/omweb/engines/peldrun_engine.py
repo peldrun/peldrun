@@ -20,7 +20,7 @@ import json
 import logging
 from pathlib import Path
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 import uuid
 
 from .base import EngineRunContext, ExecutionEngine
@@ -73,12 +73,66 @@ def _collect_specialist_tool_allowlists(
                 raw_tools = ag.get("tools")
                 tools_source = list(raw_tools) if isinstance(raw_tools, list) else []
 
-            filtered = [
-                str(t).strip()
-                for t in tools_source
-                if str(t).strip() in enabled_tool_ids
-                and str(t).strip() not in ("terminate", "delegate_task", "delegate")
-            ]
+            # MCP tool identifiers (``mcp__server__tool`` or
+            # ``mcp::server::tool``) must always pass through to the
+            # coordinator, because they are not registered in the Web
+            # tool registry (`enabled_tool_ids`). The coordinator
+            # resolves them at delegation time via `resolve_tool_runtime`
+            # → MCP session pool. Filtering on `enabled_tool_ids` alone
+            # would silently strip every MCP tool from delegated
+            # children.
+            filtered: List[str] = []
+            seen_specialist_tools: Set[str] = set()
+            for raw_t in tools_source:
+                t = str(raw_t).strip()
+                if not t or t in ("terminate", "delegate_task", "delegate"):
+                    continue
+                if t in enabled_tool_ids or t.startswith(("mcp__", "mcp::")):
+                    if t not in seen_specialist_tools:
+                        seen_specialist_tools.add(t)
+                        filtered.append(t)
+
+            # ── Expand the specialist's declared MCP servers ─────
+            # ``mcp_servers`` on a manifest is a list of *server* ids
+            # (e.g. ``["filesystem"]``), not tool ids. Materialise each
+            # into the concrete tools it exposes so the coordinator can
+            # forward them to the child. We read from the per-server
+            # tool cache populated during the parent's run phase (which
+            # executes BEFORE this function, so the cache is warm).
+            # Cold-cache servers are skipped silently — their tools
+            # will be resolved lazily on first invocation by the
+            # server-ID expansion path in ``resolve_authorized_tools``.
+            try:
+                from omweb.extensions.mcp_pool import mcp_session_pool
+
+                effective_manifest = agent_registry.get_effective_agent(ag_id)
+                declared_servers = list(
+                    effective_manifest.get("effective_mcp_servers")
+                    or effective_manifest.get("mcp_servers")
+                    or []
+                )
+                for srv_id in declared_servers:
+                    sid = str(srv_id).strip()
+                    if not sid:
+                        continue
+                    cached_tools = mcp_session_pool.get_cached_tools(sid)
+                    if not cached_tools:
+                        continue
+                    for tool_info in cached_tools:
+                        remote_name = tool_info.get("name")
+                        if not remote_name:
+                            continue
+                        expanded = f"mcp__{sid}__{remote_name}"
+                        if expanded not in seen_specialist_tools:
+                            seen_specialist_tools.add(expanded)
+                            filtered.append(expanded)
+            except Exception as expansion_exc:
+                logger.debug(
+                    "Specialist MCP server expansion for '%s' skipped: %s",
+                    ag_id,
+                    expansion_exc,
+                )
+
             specialist_map[ag_id] = filtered
     except Exception as exc:
         logger.debug("Specialist tool allowlist discovery notice: %s", exc)
@@ -317,9 +371,29 @@ class PeldrunEngine(ExecutionEngine):
             # executors for them, but keep terminate/file_saver in AgentSpec.tools.
             if req_tool in ("terminate", "file_saver", "mcp"):
                 continue
-            if req_tool not in available_web_tools:
+
+            # MCP tool identifiers are resolved dynamically by
+            # `resolve_tool_runtime` — they are NOT registered in the
+            # Web tool registry. Bypass the `available_web_tools`
+            # filter for them so an MCP tool explicitly placed in
+            # `extra_tools` actually gets materialised. Without this
+            # branch, user-added MCP tool ids would vanish silently
+            # from AgentSpec.tools — the LLM would be told the tool
+            # does not exist even though the user just added it.
+            is_mcp_tool = req_tool.startswith(("mcp__", "mcp::"))
+            if not is_mcp_tool and req_tool not in available_web_tools:
                 continue
-            t_meta = available_web_tools[req_tool]
+
+            t_meta = (
+                available_web_tools[req_tool]
+                if not is_mcp_tool
+                else {
+                    "id": req_tool,
+                    "name": req_tool,
+                    "description": f"MCP tool '{req_tool}' resolved at runtime.",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            )
             try:
                 if accepts_context_kw:
                     adapter = resolve_tool_runtime(
@@ -391,27 +465,65 @@ class PeldrunEngine(ExecutionEngine):
                 )
                 target_mcp_servers = []
 
-        for srv in target_mcp_servers:
-            srv_id = srv.get("id")
-            if not srv_id:
-                continue
+        # Discover tools from every target server CONCURRENTLY. A
+        # serial loop here contributed N × probe-timeout to the total
+        # pre-task latency, so 3 wedged servers would delay the run
+        # by 45-90 seconds before any LLM call happened. The parallel
+        # gather caps the total at the slowest probe + a small
+        # bounded overhead.
+        #
+        # We also switch from `probe_connection()` to `get_tools()`:
+        #   (a) results are cached per server (TTL 300s) so repeated
+        #       runs collapse from O(N) subprocess spawns to O(1)
+        #       cached lookups per warm server;
+        #   (b) the pooled persistent client is reused across runs
+        #       instead of spawning a disposable subprocess per step.
+        async def _probe_one(
+            srv: Dict[str, Any],
+        ) -> Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]:
             try:
-                probe_res = await mcp_session_pool.probe_connection(
-                    srv, workspace_root=ws_path_str
+                tools = await mcp_session_pool.get_tools(
+                    server_id=srv.get("id", ""),
+                    manifest=srv,
+                    workspace_root=ws_path_str,
                 )
-                if not (probe_res and probe_res.get("status") == "ok"):
-                    logger.debug(
-                        "MCP server %r probe returned non-ok status; skipping.",
-                        srv_id,
-                    )
+                return srv, list(tools or [])
+            except Exception as exc:
+                logger.debug(
+                    "MCP tool discovery failed for server %r: %s",
+                    srv.get("id"),
+                    exc,
+                )
+                return srv, None
+
+        if target_mcp_servers:
+            probe_results = await asyncio.gather(
+                *[_probe_one(srv) for srv in target_mcp_servers],
+                return_exceptions=False,
+            )
+        else:
+            probe_results = []
+
+        # Materialise discovered tools serially after the parallel probe
+        # completes (adapter construction is synchronous and cheap).
+        #
+        # IMPORTANT: an adapter MUST be successfully constructed before
+        # its id is added to `requested_tools`. Otherwise AgentSpec.tools
+        # would advertise to the LLM a tool that cannot actually be
+        # invoked, producing an opaque "tool not found" at call time.
+        for srv, tools in probe_results:
+            srv_id = srv.get("id")
+            if not srv_id or not tools:
+                continue
+
+            for tool_info in tools:
+                remote_name = tool_info.get("name")
+                if not remote_name:
                     continue
-                for tool_info in probe_res.get("tools", []) or []:
-                    remote_name = tool_info.get("name")
-                    if not remote_name:
-                        continue
-                    mcp_tool_id = f"mcp__{srv_id}__{remote_name}"
-                    if mcp_tool_id in resolved_tool_ids:
-                        continue
+                mcp_tool_id = f"mcp__{srv_id}__{remote_name}"
+                if mcp_tool_id in resolved_tool_ids:
+                    continue
+                try:
                     mcp_adapter = resolve_tool_runtime(
                         tool_id=mcp_tool_id,
                         tool_meta={
@@ -428,17 +540,19 @@ class PeldrunEngine(ExecutionEngine):
                         workspace_root=ws_path,
                         registry=web_tool_registry,
                     )
-                    adapted_core_tools.append(mcp_adapter)
-                    resolved_tool_ids.append(mcp_tool_id)
-                    if mcp_tool_id not in requested_tools:
-                        requested_tools.append(mcp_tool_id)
-            except Exception as mcp_exc:
-                logger.warning(
-                    "MCP registration skipped for server %r on job %s: %s",
-                    srv_id,
-                    job_id,
-                    mcp_exc,
-                )
+                except Exception as reg_exc:
+                    logger.warning(
+                        "MCP adapter construction failed for %r on job %s: %s",
+                        mcp_tool_id,
+                        job_id,
+                        reg_exc,
+                    )
+                    continue
+
+                adapted_core_tools.append(mcp_adapter)
+                resolved_tool_ids.append(mcp_tool_id)
+                if mcp_tool_id not in requested_tools:
+                    requested_tools.append(mcp_tool_id)
 
         # The 'mcp' marker is a discovery trigger, not an invokable tool;
         # strip it now that concrete MCP tool IDs have been materialized
