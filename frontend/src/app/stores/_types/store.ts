@@ -45,3 +45,42 @@ export const DEFAULT_AGENT_FORM: AgentUpsertPayload = {
  * - "extension" → MCP server manifest (.json)
  */
 export type UploadCategory = "tool" | "extension";
+
+/**
+ * Metadata for a single tool as seen by the Agent Tools modal.
+ *
+ * ``in_manifest`` marks tools that already appear in the agent's
+ * baseline manifest (shown in the "Manifest Tools" section). Tools
+ * with ``in_manifest = false`` are eligible for the "Extra Tools"
+ * section.
+ */
+export interface AgentToolInfo {
+  id: string;
+  name: string;
+  description: string;
+  category: string;
+  is_builtin: boolean;
+  safety_level?: string | null;
+  in_manifest: boolean;
+}
+
+/**
+ * Full tool state for an agent, returned by ``GET /agents/{id}/tools``.
+ *
+ * The three user-facing lists follow the model:
+ *   - ``manifest_tools``: developer-authored baseline (never mutated)
+ *   - ``disabled_tools``: subset of manifest_tools to exclude at runtime
+ *   - ``extra_tools``:    additions from the Store catalog
+ *   - ``effective_tools``: what the runtime will actually use
+ *
+ * ``tools_editable`` reflects ``settings.tools_editable`` in the manifest
+ * (locked agents cannot open the tools modal).
+ */
+export interface AgentToolsState {
+  manifest_tools: string[];
+  disabled_tools: string[];
+  extra_tools: string[];
+  effective_tools: string[];
+  tools_editable: boolean;
+  available_tools: AgentToolInfo[];
+}

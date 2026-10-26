@@ -841,18 +841,18 @@ export function ToolDetailsModal({
       aria-label={`${t.name} details`}
     >
       <div
-        className="bg-card border border-border rounded-2xl max-w-3xl w-full max-h-[92vh] flex flex-col shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-150"
+        className=" bg-background  rounded-md max-w-3xl w-full max-h-[92vh] flex flex-col shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-150"
         onClick={(e) => e.stopPropagation()}
       >
         {/* ── Header ────────────────────────────────────────────── */}
-        <div className="flex items-start justify-between gap-4 px-6 py-4 border-b border-border bg-muted/30">
+        <div className="flex items-start justify-between gap-4 px-6 py-4 border-b border-border text-black bg-rb/10">
           <div className="flex items-start gap-3 min-w-0">
-            <div className="p-2.5 rounded-lg bg-primary/10 text-primary border border-primary/20 shrink-0 flex items-center justify-center">
+            <div className="p-2.5 shrink-0 flex items-center justify-center">
               <ToolIcon tool={t} size={20} />
             </div>
             <div className="min-w-0">
               <div className="flex items-center gap-2 min-w-0">
-                <h2 className="text-base font-bold text-foreground font-mono truncate">
+                <h2 className="text-base font-bold font-mono truncate">
                   {t.name}
                 </h2>
                 {loading && (
@@ -945,7 +945,7 @@ export function ToolDetailsModal({
         </div>
 
         {/* ── Body ──────────────────────────────────────────────── */}
-        <div className="flex-1 overflow-y-auto p-6 text-xs">
+        <div className="flex-1 overflow-y-auto p-6 text-xs bg-background">
           {activeTab === "overview" && <OverviewTab t={t} />}
           {activeTab === "technical" && <TechnicalTab t={t} />}
           {activeTab === "raw" && <RawJsonTab t={t} />}

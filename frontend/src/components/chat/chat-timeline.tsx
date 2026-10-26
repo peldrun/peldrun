@@ -1,8 +1,12 @@
-﻿"use client";
+﻿// frontend/src/components/chat/chat-timeline.tsx
 
-import React from "react";
-import { BrainCircuit, Wrench, Terminal, ChevronDown, ChevronRight } from "lucide-react";
+"use client";
+
+import React, { useEffect, useState } from "react";
+import { BrainCircuit, Terminal, ChevronDown, ChevronRight } from "lucide-react";
 import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
+import { ToolIcon } from "@/app/stores/_components/ToolIcon";
+import { resolveToolLabel, fetchToolManifest, ToolManifest } from "@/lib/tool-icon-registry";
 
 export interface StepEvent {
   id: string;
@@ -21,6 +25,45 @@ interface ChatTimelineProps {
   isRunning: boolean;
   expandedSteps: Record<string, boolean>;
   toggleStep: (key: string) => void;
+}
+
+function TimelineToolCall({ evt }: { evt: StepEvent }) {
+  const [manifest, setManifest] = useState<ToolManifest | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (evt.toolName) {
+      fetchToolManifest(evt.toolName).then((m) => {
+        if (!cancelled && m) setManifest(m);
+      });
+    }
+    return () => { cancelled = true; };
+  }, [evt.toolName]);
+
+  if (!evt.toolName) return null;
+
+  const label = manifest ? (manifest.display_name || manifest.name) : resolveToolLabel(evt.toolName);
+
+  return (
+    <div className="flex items-start gap-2 p-2.5 rounded-lg bg-muted/80 border border-border text-foreground font-mono text-xs">
+      <div className="mt-0.5 flex-shrink-0 text-foreground">
+        <ToolIcon
+          tool={{
+            id: evt.toolName,
+            name: label,
+            description: "",
+            category: manifest?.category || "",
+            icon: manifest?.icon
+          }}
+          size={14}
+        />
+      </div>
+      <div className="truncate">
+        <span className="font-semibold text-foreground mr-1">{label}:</span>
+        <span className="text-muted-foreground">{evt.content}</span>
+      </div>
+    </div>
+  );
 }
 
 export function ChatTimeline({
@@ -42,16 +85,21 @@ export function ChatTimeline({
         const key = `${prefix}-${stepNum}`;
         const isExpanded = expandedSteps[key] === true;
         const isLatestStep = isCurrentActive && stepNum === currentStepNum && isRunning;
-        const toolsUsed = Array.from(new Set(stepEvents.filter((e) => e.toolName).map((e) => e.toolName)));
+
+        // Using raw tool names for the header summary for simplicity
+        const toolsUsed = Array.from(
+          new Set(
+            stepEvents
+              .filter((e) => e.toolName)
+              .map((e) => resolveToolLabel(e.toolName!))
+          )
+        );
 
         return (
           <div key={key} className="relative group">
-            {/* Stepper Node Icon */}
             <div
               className={`absolute -left-[27px] top-1 w-3.5 h-3.5 rounded-full border-2 bg-background flex items-center justify-center transition-all ${
-                isLatestStep
-                  ? "border-primary ring-2 ring-primary/40 scale-110"
-                  : "border-emerald-500/80"
+                isLatestStep ? "border-primary ring-2 ring-primary/40 scale-110" : "border-emerald-500/80"
               }`}
             >
               {isLatestStep ? (
@@ -61,19 +109,14 @@ export function ChatTimeline({
               )}
             </div>
 
-            {/* Step Header */}
             <div className="flex items-center justify-between py-1 px-2.5 -ml-1 rounded-md hover:bg-muted/40 transition-colors">
               <button
                 type="button"
                 onClick={() => toggleStep(key)}
                 className="flex-1 flex items-center gap-2 text-left cursor-pointer"
               >
-                <span className="text-xs font-semibold text-foreground">
-                  Step {stepNum}
-                </span>
-                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-muted text-muted-foreground border border-border/50">
-                  {stepEvents.length} events
-                </span>
+                <span className="text-xs font-semibold text-foreground">Step {stepNum}</span>
+                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-muted text-muted-foreground border border-border/50">{stepEvents.length} events</span>
                 {toolsUsed.length > 0 && (
                   <span className="hidden sm:inline-flex items-center gap-1 text-[11px] font-mono text-muted-foreground truncate max-w-[240px]">
                     • {toolsUsed.join(", ")}
@@ -91,7 +134,6 @@ export function ChatTimeline({
               </button>
             </div>
 
-            {/* Expanded Step Events */}
             {isExpanded && (
               <div className="mt-2.5 space-y-2 pl-1.5 pr-1 animate-in fade-in">
                 {stepEvents.map((evt) => (
@@ -106,13 +148,7 @@ export function ChatTimeline({
                     )}
 
                     {evt.type === "tool_call" && evt.toolName && (
-                      <div className="flex items-start gap-2 p-2.5 rounded-lg bg-muted/80 border border-border text-foreground font-mono text-xs">
-                        <Wrench size={13} className="text-peldrun-info mt-0.5 flex-shrink-0" />
-                        <div className="truncate">
-                          <span className="font-semibold text-primary mr-1">{evt.toolName}:</span>
-                          <span>{evt.content}</span>
-                        </div>
-                      </div>
+                      <TimelineToolCall evt={evt} />
                     )}
 
                     {evt.type === "observation" && (

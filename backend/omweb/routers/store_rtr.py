@@ -1,19 +1,48 @@
 ﻿"""
-Store Router - Endpoints for agents, tool catalog, custom uploads, and lifecycle toggling.
+backend/omweb/routers/store_rtr.py
+
+Store Router - Endpoints for agents, tool catalog, custom uploads, and
+lifecycle toggling.
+
+Design note on agent settings
+-----------------------------
+The merge, persistence, and precedence rules for user-saved agent
+settings live entirely in ``omweb.agents.registry.AgentRegistry``
+(``get_effective_agent`` / ``get_agent_settings`` / ``save_agent_settings``).
+This keeps the runtime (``PeldrunEngine.run`` → ``get_effective_agent``)
+and the UI (``GET /agents/{id}/settings``) reading from the same source
+of truth — the merge cannot drift between the two paths.
+
+The endpoints in this file are thin wrappers. The only piece of
+logic that remains local is schema extraction (``_settings_schema_of``),
+kept here because the registry exposes effective *values* but not the
+*schema* itself. If the registry ever gains a public ``get_agent_schema``
+helper, that function should be deleted and the callsites updated.
 """
 
 from __future__ import annotations
+
 import json
 from pathlib import Path
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
 
-from omweb.agents.registry import agent_registry
-from omweb.tools.registry import tool_registry
+# jsonschema is optional: minimal deployments may not ship it. The
+# settings endpoints degrade gracefully (skip validation) rather than
+# crash at import time when it is absent.
+try:
+    import jsonschema
+    _JSONSCHEMA_AVAILABLE = True
+except ImportError:  # pragma: no cover - defensive fallback
+    _JSONSCHEMA_AVAILABLE = False
+
+from omweb.agents.registry import AgentNotFoundError, agent_registry
 from omweb.extensions.registry import extension_registry
 from omweb.tools.bundles.errors import BundleError
+from omweb.tools.registry import tool_registry
 
 router = APIRouter()
 
@@ -28,6 +57,10 @@ class AgentUpsertRequest(BaseModel):
     max_steps: Optional[int] = Field(default=30, ge=1, le=100)
 
 
+# ─────────────────────────────────────────────────────────────────
+# Agents — CRUD & lifecycle
+# ─────────────────────────────────────────────────────────────────
+
 @router.get("/agents")
 async def list_all_agents():
     return {"status": "ok", "agents": agent_registry.list_agents()}
@@ -35,9 +68,19 @@ async def list_all_agents():
 
 @router.get("/agents/{agent_id}")
 async def get_agent_detail(agent_id: str):
-    agent = agent_registry.get_agent(agent_id)
-    if not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
+    """Return the complete manifest for a single agent.
+
+    Uses ``get_agent`` (raw manifest) so the details modal always shows
+    the developer-authored baseline. User-saved overrides live on
+    ``/agents/{id}/settings`` and are merged only at runtime via
+    ``get_effective_agent``.
+    """
+    try:
+        agent = agent_registry.get_agent(agent_id)
+    except AgentNotFoundError:
+        raise HTTPException(
+            status_code=404, detail=f"Agent '{agent_id}' not found"
+        )
     return {"status": "ok", "agent": agent}
 
 
@@ -51,7 +94,10 @@ async def create_agent(req: AgentUpsertRequest):
 async def update_agent(agent_id: str, req: AgentUpsertRequest):
     updated = agent_registry.update_custom_agent(agent_id, req.model_dump())
     if not updated:
-        raise HTTPException(status_code=404, detail="Agent not found or is immutable built-in")
+        raise HTTPException(
+            status_code=404,
+            detail="Agent not found or is immutable built-in",
+        )
     return {"status": "ok", "agent": updated}
 
 
@@ -59,7 +105,10 @@ async def update_agent(agent_id: str, req: AgentUpsertRequest):
 async def delete_agent(agent_id: str):
     success = agent_registry.delete_custom_agent(agent_id)
     if not success:
-        raise HTTPException(status_code=400, detail="Cannot delete built-in agent or agent does not exist")
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete built-in agent or agent does not exist",
+        )
     return {"status": "ok", "message": f"Agent {agent_id} deleted successfully"}
 
 
@@ -70,6 +119,499 @@ async def toggle_agent(agent_id: str):
         raise HTTPException(status_code=400, detail=res["error"])
     return {"status": "ok", "agent": res}
 
+
+# ─────────────────────────────────────────────────────────────────
+# Agent tools — per-agent tool selection & activation
+# ─────────────────────────────────────────────────────────────────
+#
+# Users can disable manifest-declared tools and/or add tools from the
+# Store. Both channels are gated on ``settings.tools_editable`` in the
+# manifest, so locked agents cannot be altered even by direct API
+# calls. Changes are persisted in ``agent_settings.json`` (isolated
+# from activation state) and honoured at runtime through
+# ``get_effective_agent`` → ``PeldrunEngine.run``.
+
+
+class _AgentToolsPayload(BaseModel):
+    """Request body for PUT /agents/{id}/tools."""
+
+    disabled_tools: List[str] = Field(default_factory=list)
+    extra_tools: List[str] = Field(default_factory=list)
+
+
+@router.get("/agents/{agent_id}/tools")
+async def get_agent_tools_endpoint(agent_id: str) -> Dict[str, Any]:
+    """Return the current tool selection for an agent.
+
+    Combines:
+      - the manifest baseline (``manifest_tools``),
+      - the user's exclusions (``disabled_tools``),
+      - the user's additions (``extra_tools``),
+      - the computed ``effective_tools`` list the runtime will use,
+      - the full Store catalog (``available_tools``) so the UI can
+        render every tool with ``in_manifest`` metadata.
+    """
+    try:
+        agent = agent_registry.get_agent(agent_id)
+    except AgentNotFoundError:
+        raise HTTPException(
+            status_code=404, detail=f"Agent '{agent_id}' not found"
+        )
+
+    settings_block = agent.get("settings") or {}
+    if not settings_block.get("tools_editable", False):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Agent '{agent_id}' does not allow tool editing.",
+        )
+
+    state = agent_registry.get_agent_tools_state(agent_id)
+    manifest_set = set(state["manifest_tools"])
+
+    available_tools: List[Dict[str, Any]] = []
+    for t in tool_registry.list_tools():
+        if not t.get("is_enabled", True):
+            continue
+        tid = t["id"]
+        available_tools.append({
+            "id": tid,
+            "name": t.get("name", tid),
+            "description": t.get("description", ""),
+            "category": t.get("category", ""),
+            "is_builtin": bool(t.get("is_builtin", False)),
+            "safety_level": t.get("safety_level"),
+            "in_manifest": tid in manifest_set,
+        })
+
+    return {
+        "status": "ok",
+        **state,
+        "available_tools": available_tools,
+    }
+
+
+@router.put("/agents/{agent_id}/tools")
+async def update_agent_tools_endpoint(
+    agent_id: str, req: _AgentToolsPayload
+) -> Dict[str, Any]:
+    """Persist tool overrides for an agent.
+
+    Validation:
+      - the agent must exist and declare ``tools_editable: true``;
+      - every entry in ``disabled_tools`` must be a real manifest tool
+        (otherwise the user could silently block a tool that is not
+        even authorized);
+      - every entry in ``extra_tools`` must exist and be enabled in the
+        Store (otherwise the runtime would silently drop it later).
+    """
+    try:
+        agent = agent_registry.get_agent(agent_id)
+    except AgentNotFoundError:
+        raise HTTPException(
+            status_code=404, detail=f"Agent '{agent_id}' not found"
+        )
+
+    settings_block = agent.get("settings") or {}
+    if not settings_block.get("tools_editable", False):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Agent '{agent_id}' does not allow tool editing.",
+        )
+
+    manifest_set = set(agent.get("tools") or [])
+    for t in req.disabled_tools:
+        if t not in manifest_set:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot disable '{t}' — not in manifest tools.",
+            )
+
+    available_ids = {
+        t["id"]
+        for t in tool_registry.list_tools()
+        if t.get("is_enabled", True)
+    }
+    for t in req.extra_tools:
+        if t not in available_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot add '{t}' — not an available store tool.",
+            )
+
+    try:
+        state = agent_registry.save_agent_tools_state(
+            agent_id, req.disabled_tools, req.extra_tools
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return {"status": "ok", **state}
+
+
+# ─────────────────────────────────────────────────────────────────
+# Agent settings — thin wrappers over AgentRegistry
+# ─────────────────────────────────────────────────────────────────
+
+def _settings_schema_of(manifest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return ``settings.schema`` only when it declares properties.
+
+    An empty ``properties: {}`` block (used by zero-config agents) is
+    treated the same as no schema at all so the frontend can hide the
+    Settings button on the card without special-casing.
+    """
+    block = manifest.get("settings")
+    if not isinstance(block, dict):
+        return None
+    schema = block.get("schema")
+    if not isinstance(schema, dict):
+        return None
+    props = schema.get("properties")
+    if not isinstance(props, dict) or not props:
+        return None
+    return schema
+
+
+@router.get("/agents/{agent_id}/settings")
+async def get_agent_settings_endpoint(agent_id: str) -> Dict[str, Any]:
+    """Return the settings schema and current effective values.
+
+    Effective values follow the same precedence chain used at runtime
+    (via ``get_agent_settings``), so what the UI shows is exactly what
+    the engine will see on the next run.
+    """
+    try:
+        agent = agent_registry.get_agent(agent_id)
+    except AgentNotFoundError:
+        raise HTTPException(
+            status_code=404, detail=f"Agent '{agent_id}' not found"
+        )
+
+    schema = _settings_schema_of(agent)
+    if schema is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Agent '{agent_id}' has no configurable settings.",
+        )
+
+    values = agent_registry.get_agent_settings(agent_id)
+    return {"status": "ok", "schema": schema, "values": values}
+
+
+@router.put("/agents/{agent_id}/settings")
+async def update_agent_settings_endpoint(
+    agent_id: str, payload: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Validate and persist user-saved settings for an agent.
+
+    Two safety layers protect the store from malformed writes:
+
+      1. ``cleaned`` strips every key not declared in the schema. This
+         prevents manifest-owned fields (system_prompt, tools, ...)
+         from ever reaching the on-disk settings file, regardless of
+         whether the schema declares ``additionalProperties: false``.
+
+      2. jsonschema validation (when available) rejects values that
+         violate declared types/bounds. The registry only writes
+         after a successful call to ``save_agent_settings``, so a
+         failed validation leaves the on-disk file untouched.
+    """
+    try:
+        agent = agent_registry.get_agent(agent_id)
+    except AgentNotFoundError:
+        raise HTTPException(
+            status_code=404, detail=f"Agent '{agent_id}' not found"
+        )
+
+    schema = _settings_schema_of(agent)
+    if schema is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Agent '{agent_id}' has no configurable settings.",
+        )
+
+    allowed = set((schema.get("properties") or {}).keys())
+    cleaned = {k: v for k, v in payload.items() if k in allowed}
+
+    if _JSONSCHEMA_AVAILABLE:
+        try:
+            jsonschema.validate(instance=cleaned, schema=schema)
+        except jsonschema.ValidationError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Validation failed: {exc.message}",
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Settings validation error: {exc}",
+            )
+
+    try:
+        effective = agent_registry.save_agent_settings(agent_id, cleaned)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return {"status": "ok", "values": effective}
+
+
+# Neutral fallback icon served when an agent has no SVG file on disk.
+# Renders a Lucide-style Bot at viewBox 0 0 24 24, using currentColor
+# so callers can tint it (e.g., with core_color) without a second
+# request. Kept inline (not a file) so the fallback is guaranteed to
+# be available even if the icons directory is empty.
+_DEFAULT_AGENT_ICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" '
+    'fill="none" stroke="currentColor" stroke-width="2" '
+    'stroke-linecap="round" stroke-linejoin="round">'
+    '<path d="M12 8V4H8"/>'
+    '<rect width="16" height="12" x="4" y="8" rx="2"/>'
+    '<path d="M2 14h2"/>'
+    '<path d="M20 14h2"/>'
+    '<path d="M15 13v2"/>'
+    '<path d="M9 13v2"/>'
+    '</svg>'
+)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Agent icon — exhaustive filesystem search + always-valid response
+# ─────────────────────────────────────────────────────────────────
+
+# Neutral fallback used only when no SVG file exists anywhere.
+# Embedded here so this endpoint can ALWAYS return a valid SVG —
+# the frontend then never has to render an empty slot.
+_DEFAULT_AGENT_ICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" '
+    'fill="none" stroke="currentColor" stroke-width="2" '
+    'stroke-linecap="round" stroke-linejoin="round">'
+    '<path d="M12 8V4H8"/>'
+    '<rect width="16" height="12" x="4" y="8" rx="2"/>'
+    '<path d="M2 14h2"/>'
+    '<path d="M20 14h2"/>'
+    '<path d="M15 13v2"/>'
+    '<path d="M9 13v2"/>'
+    '</svg>'
+)
+
+
+@router.get("/agents/{agent_id}/icon.svg")
+async def get_agent_icon(agent_id: str):
+    """
+    Serve the SVG icon for an agent.
+
+    Searches every plausible on-disk location (see candidates below)
+    and returns the first match. If nothing is found, a neutral Bot
+    SVG is returned so the browser never receives a 404 / blank
+    response — the frontend always renders *something* useful.
+
+    Candidates are tried in this exact order (first existing file wins):
+
+      ── Custom agents directory (`custom_dir`) ──
+        1. custom_dir / {agent_id} / icon.svg
+        2. custom_dir / {agent_id}.svg
+        3. custom_dir / {icon field}                 (e.g. "peldrun.svg")
+        4. custom_dir / icons / {agent_id}.svg
+        5. custom_dir / icons / {icon field}
+
+      ── Built-in agents directory (`builtins_dir`) ──
+        6. builtins_dir / {agent_id} / icon.svg
+        7. builtins_dir / {agent_id} / icons / icon.svg
+        8. builtins_dir / {icon field}
+        9. builtins_dir / {agent_id}.svg
+       10. builtins_dir / icons / {agent_id}.svg     ← the path you named
+       11. builtins_dir / icons / {icon field}
+       12. builtins_dir / icons / {agent_id} / icon.svg
+       13. builtins_dir / icons / {agent_id} / icons / icon.svg
+
+    Every resolved candidate is containment-checked against
+    ``builtins_dir`` and ``custom_dir`` so a malicious manifest cannot
+    escape via "..".
+    """
+    try:
+        agent = agent_registry.get_agent(agent_id)
+    except AgentNotFoundError:
+        # Unknown agent — still serve the fallback so <img> loads.
+        return Response(
+            content=_DEFAULT_AGENT_ICON_SVG,
+            media_type="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=300"},
+        )
+
+    # ── Resolve roots defensively ───────────────────────────────
+    try:
+        builtins_dir = Path(agent_registry.builtins_dir).resolve()
+    except Exception:
+        builtins_dir = Path()
+    try:
+        custom_dir = Path(agent_registry.custom_dir).resolve()
+    except Exception:
+        custom_dir = Path()
+
+    icon_field = agent.get("icon")
+    icon_field_str = icon_field.strip() if isinstance(icon_field, str) else ""
+
+    # ── Build the full candidate list ───────────────────────────
+    candidates: list[Path] = []
+
+    # 1-3: custom per-agent + flat + manifest-declared
+    candidates.append(custom_dir / agent_id / "icon.svg")
+    candidates.append(custom_dir / f"{agent_id}.svg")
+    if icon_field_str:
+        candidates.append(custom_dir / icon_field_str)
+
+    # 4-5: custom shared icons dir
+    candidates.append(custom_dir / "icons" / f"{agent_id}.svg")
+    if icon_field_str:
+        candidates.append(custom_dir / "icons" / icon_field_str)
+
+    # 6-7: builtin per-agent dir
+    candidates.append(builtins_dir / agent_id / "icon.svg")
+    candidates.append(builtins_dir / agent_id / "icons" / "icon.svg")
+
+    # 8-9: builtin flat next to manifest + manifest-declared
+    if icon_field_str:
+        candidates.append(builtins_dir / icon_field_str)
+    candidates.append(builtins_dir / f"{agent_id}.svg")
+
+    # 10-11: builtin shared icons (THIS is where builtins/icons/peldrun.svg lives)
+    candidates.append(builtins_dir / "icons" / f"{agent_id}.svg")
+    if icon_field_str:
+        candidates.append(builtins_dir / "icons" / icon_field_str)
+
+    # 12-13: nested inside shared icons
+    candidates.append(builtins_dir / "icons" / agent_id / "icon.svg")
+    candidates.append(builtins_dir / "icons" / agent_id / "icons" / "icon.svg")
+
+    # ── Try each candidate ───────────────────────────────────────
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+
+        # Containment check.
+        if (
+            builtins_dir not in resolved.parents
+            and custom_dir not in resolved.parents
+        ):
+            continue
+
+        if not resolved.is_file():
+            continue
+
+        try:
+            return FileResponse(
+                resolved,
+                media_type="image/svg+xml",
+                headers={
+                    "Cache-Control": "public, max-age=3600",
+                    "Content-Type": "image/svg+xml",
+                },
+            )
+        except Exception:
+            # Corrupted file or permission error — fall through.
+            continue
+
+    # ── Fallback: neutral Bot SVG ────────────────────────────────
+    return Response(
+        content=_DEFAULT_AGENT_ICON_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=300"},
+    )
+    """Serve the SVG icon for an agent.
+
+    Icons can live in one of several layouts on disk, and the manifest's
+    ``icon`` field is not authoritative (some agents ship an icon
+    without declaring it, others point at a file that has since moved).
+    We try a list of candidate paths in priority order and serve the
+    first match. Every candidate is containment-checked against the
+    builtins/ and custom agents/ roots so a malicious manifest cannot
+    escape via "..".
+
+    All failure modes collapse into a 404 so the frontend can fall back
+    to a Lucide icon without needing to distinguish them.
+    """
+    try:
+        agent = agent_registry.get_agent(agent_id)
+    except AgentNotFoundError:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    builtins_dir = agent_registry.builtins_dir.resolve()
+    custom_dir = agent_registry.custom_dir.resolve()
+
+    candidates: List[Path] = []
+
+    # 1. Custom per-agent directory (user-uploaded icon beside manifest).
+    candidates.append(custom_dir / agent_id / "icon.svg")
+
+    # 2. Custom flat SVG (next to the manifest file).
+    candidates.append(custom_dir / f"{agent_id}.svg")
+
+    # 3. Builtin per-agent directory (modern layout).
+    candidates.append(builtins_dir / agent_id / "icon.svg")
+
+    # 4. Manifest-declared relative path (explicit developer intent).
+    icon_rel = agent.get("icon")
+    if isinstance(icon_rel, str) and icon_rel.strip():
+        candidates.append(builtins_dir / icon_rel)
+        candidates.append(custom_dir / icon_rel)
+
+    # 5. Builtin flat SVG next to manifest.
+    candidates.append(builtins_dir / f"{agent_id}.svg")
+
+    # 6. Shared icons directory, flat.
+    candidates.append(builtins_dir / "icons" / f"{agent_id}.svg")
+
+    # 7. Shared icons directory, per-agent subfolder.
+    candidates.append(builtins_dir / "icons" / agent_id / "icon.svg")
+
+    # 8. Nested icons directory inside per-agent dir.
+    candidates.append(builtins_dir / agent_id / "icons" / "icon.svg")
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            continue
+
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+
+        # Containment check: reject anything outside the known roots.
+        if (
+            builtins_dir not in resolved.parents
+            and custom_dir not in resolved.parents
+        ):
+            continue
+
+        if resolved.is_file():
+            return FileResponse(
+                resolved,
+                media_type="image/svg+xml",
+                headers={"Cache-Control": "public, max-age=3600"},
+            )
+
+    # No matching icon file on disk. Return a neutral fallback icon
+    # rather than a 404 so the frontend never has to render a blank
+    # slot for an agent that ships without an icon. The fallback uses
+    # currentColor and is cached for the same window as a real file,
+    # so subsequent renders cost nothing extra.
+    return Response(
+        content=_DEFAULT_AGENT_ICON_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+# ─────────────────────────────────────────────────────────────────
+# Tools — catalog, bundles, settings, environment, icons
+# ─────────────────────────────────────────────────────────────────
 
 @router.get("/tools")
 async def list_all_tools():
@@ -551,7 +1093,10 @@ async def toggle_tool(tool_id: str):
 async def upload_tool_file(file: UploadFile = File(...)):
     filename = file.filename or "custom_tool.py"
     if not (filename.endswith(".py") or filename.endswith(".json")):
-        raise HTTPException(status_code=400, detail="Only .py script or .json manifest files are supported.")
+        raise HTTPException(
+            status_code=400,
+            detail="Only .py script or .json manifest files are supported.",
+        )
 
     content = await file.read()
     res = tool_registry.save_custom_tool_file(filename, content)
@@ -564,9 +1109,16 @@ async def upload_tool_file(file: UploadFile = File(...)):
 async def delete_custom_tool(tool_id: str):
     success = tool_registry.delete_custom_tool(tool_id)
     if not success:
-        raise HTTPException(status_code=400, detail="Cannot delete built-in tool or file does not exist.")
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete built-in tool or file does not exist.",
+        )
     return {"status": "ok", "message": f"Tool {tool_id} deleted successfully"}
 
+
+# ─────────────────────────────────────────────────────────────────
+# Extensions — catalog & upload
+# ─────────────────────────────────────────────────────────────────
 
 @router.get("/extensions")
 async def list_all_extensions():
@@ -577,7 +1129,10 @@ async def list_all_extensions():
 async def upload_extension_json(file: UploadFile = File(...)):
     filename = file.filename or "mcp_extension.json"
     if not filename.endswith(".json"):
-        raise HTTPException(status_code=400, detail="Extensions must be uploaded as JSON manifest files.")
+        raise HTTPException(
+            status_code=400,
+            detail="Extensions must be uploaded as JSON manifest files.",
+        )
 
     content = await file.read()
     try:
@@ -585,4 +1140,7 @@ async def upload_extension_json(file: UploadFile = File(...)):
         saved = extension_registry.save_extension(data)
         return {"status": "ok", "extension": saved}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to parse extension JSON: {e}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to parse extension JSON: {e}",
+        )

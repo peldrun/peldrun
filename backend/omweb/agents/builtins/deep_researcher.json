@@ -2,8 +2,13 @@
   "id": "deep_researcher",
   "name": "Deep Researcher",
   "role": "Intelligence & Synthesis Analyst",
-  "icon": "Search",
+  "icon": "deep_researcher.svg",
+  "core_color": "#f59e0b",
   "description": "Deep-dives into online documentation, academic sources, technical specifications, and synthesizes structured markdown reports.",
+  "short_description": "Research analyst for deep web investigation, source cross-referencing, and structured markdown reports.",
+  "store_description": "An elite research analyst persona specialized in scouring the web for authoritative sources, cross-referencing empirical facts, and compiling exhaustive, objective reports with explicit citations. Fetches documentation, technical specifications, and academic material; synthesizes findings into structured markdown deliverables saved to the workspace. Does not execute code or shell commands by default — its scope is intentionally restricted to research and synthesis so its reasoning stays focused on source quality and evidence.",
+  "tags": ["research", "web-search", "synthesis", "citations", "analysis"],
+  "capabilities": ["web-search", "http-fetch", "file-editing", "synthesis"],
   "system_prompt": "You are an elite Research Analyst. Your purpose is to scour web resources, cross-reference empirical facts, and compile exhaustive, objective reports with explicit citations.",
   "tools": [
     "web_search",
@@ -13,5 +18,72 @@
   "max_steps": 25,
   "is_builtin": true,
   "read_only": true,
-  "created_at": "2026-09-01 00:00:00"
+  "status": "active",
+  "version": "1.0.0",
+  "release_date": "2025-01-15",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+  "license": "proprietary",
+  "license_url": "https://peldrun.ai/license",
+  "homepage": "https://peldrun.ai/agents/deep_researcher",
+  "docs_url": "https://docs.peldrun.ai/agents/deep_researcher",
+  "changelog_url": "https://peldrun.ai/agents/deep_researcher/changelog",
+  "created_at": "2026-09-01 00:00:00",
+  "settings": {
+    "enabled": true,
+    "tools_editable": true,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "max_steps": {
+          "type": "integer",
+          "title": "Max Reasoning Steps",
+          "description": "Upper bound on reasoning steps the agent may take per task run. Research tasks typically converge in 20-30 steps; raise this for exhaustive multi-source investigations.",
+          "minimum": 5,
+          "maximum": 200,
+          "default": 25
+        }
+      },
+      "additionalProperties": false
+    },
+    "required": []
+  },
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "prompt": {
+        "type": "string",
+        "description": "The research question, topic, or synthesis task to investigate."
+      }
+    },
+    "required": ["prompt"]
+  },
+  "examples": [
+    {
+      "input": {
+        "prompt": "Compare the security models of OAuth 2.0 and OpenID Connect with authoritative sources."
+      },
+      "output_preview": "Wrote oauth_vs_oidc.md (3,400 words) with 12 citations from RFC 6749, RFC 7519, and OAuth.com. Includes comparison table (scopes, token types, refresh semantics) and recommendation matrix."
+    },
+    {
+      "input": {
+        "prompt": "Investigate the current state of WebGPU support across browsers and write a compatibility report."
+      },
+      "output_preview": "Wrote webgpu_compat.md with per-browser feature matrix (Chrome 113+, Firefox 121+, Safari 26+), sourced from caniuse.com, MDN, and browser release notes. Flagged 4 open gaps."
+    },
+    {
+      "input": {
+        "prompt": "Summarize the latest 6 months of peer-reviewed research on vector databases."
+      },
+      "output_preview": "Wrote vector_db_survey.md (4,800 words) citing 8 papers (arXiv + ACM DL). Structured as: taxonomy, index algorithms, benchmarking results, and open problems."
+    }
+  ],
+  "usage_notes": "Use for any task that requires investigating external sources, cross-referencing facts across multiple references, or synthesizing structured written deliverables. Requires web_search and http_fetch. Do not use this agent for tasks answerable from workspace data alone; use data_scientist or peldrun instead. Never fabricates citations: if a fact cannot be verified from a fetched source, it is explicitly flagged. Prefers http_fetch over web_search for known URLs (docs, RFCs, papers) because it retrieves full page content rather than a search snippet. All deliverables are markdown files saved to the workspace and reported via artifact_created SSE events. max_steps and tools are user-editable via the Store UI (e.g. add python_execute for report generation); changes apply to the next task run without a restart. LLM parameters (temperature, max_tokens, timeout) are managed centrally via Settings → LLM and Settings → Model Budgets."
 }

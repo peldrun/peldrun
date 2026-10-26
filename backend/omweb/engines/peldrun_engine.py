@@ -41,7 +41,14 @@ logger = logging.getLogger(__name__)
 def _collect_specialist_tool_allowlists(
     enabled_tool_ids: Set[str],
 ) -> Dict[str, List[str]]:
-    """Build a mapping of specialist agent IDs to their authorized, enabled tool IDs."""
+    """Build a mapping of specialist agent IDs to their effective tool IDs.
+
+    Uses ``get_agent_tools_state`` so user-saved tool overrides
+    (disabled_tools / extra_tools) are honoured when an agent delegates
+    to a specialist. Falls back to the raw manifest ``tools`` field if
+    the effective lookup fails for any agent, so a corrupted settings
+    file cannot break delegation discovery.
+    """
     specialist_map: Dict[str, List[str]] = {}
     try:
         from omweb.agents.registry import agent_registry
@@ -54,15 +61,25 @@ def _collect_specialist_tool_allowlists(
             if not isinstance(ag, dict):
                 continue
             ag_id = str(ag.get("id") or "").strip().lower()
-            raw_tools = ag.get("tools")
-            if ag_id and isinstance(raw_tools, list):
-                filtered = [
-                    str(t).strip()
-                    for t in raw_tools
-                    if str(t).strip() in enabled_tool_ids
-                    and str(t).strip() not in ("terminate", "delegate_task", "delegate")
-                ]
-                specialist_map[ag_id] = filtered
+            if not ag_id:
+                continue
+
+            # Prefer the effective tool list so overrides are honoured.
+            tools_source: List[str] = []
+            try:
+                state = agent_registry.get_agent_tools_state(ag_id)
+                tools_source = list(state.get("effective_tools") or [])
+            except Exception:
+                raw_tools = ag.get("tools")
+                tools_source = list(raw_tools) if isinstance(raw_tools, list) else []
+
+            filtered = [
+                str(t).strip()
+                for t in tools_source
+                if str(t).strip() in enabled_tool_ids
+                and str(t).strip() not in ("terminate", "delegate_task", "delegate")
+            ]
+            specialist_map[ag_id] = filtered
     except Exception as exc:
         logger.debug("Specialist tool allowlist discovery notice: %s", exc)
 
@@ -115,7 +132,26 @@ class PeldrunEngine(ExecutionEngine):
         provider_name = context.provider_name
         project_dir = context.project_dir
         chat_id = context.chat_id or f"chat_{job_id}"
+
+        # Use get_effective_agent so user-saved settings from the Store
+        # settings modal (max_steps) are merged into the manifest before
+        # the runtime sees it. Only keys declared in
+        # settings.schema.properties are eligible for override; identity
+        # fields (system_prompt, tools, name, status) are always preserved.
+        # Falls back to the raw context manifest if the registry is
+        # unavailable so a broken registry never blocks execution.
         manifest = context.manifest
+        try:
+            from omweb.agents.registry import agent_registry as _agent_registry
+            manifest = _agent_registry.get_effective_agent(agent_id)
+        except Exception as _eff_err:
+            logger.debug(
+                "Effective agent manifest lookup failed for %r: %s. "
+                "Falling back to raw context manifest.",
+                agent_id,
+                _eff_err,
+            )
+
         project_id = str(manifest.get("project_id") or "default_project")
 
         print(f"\n[ENGINE PELDRUN] >>> Starting Task Execution for Job: {job_id} (Chat: {chat_id}) <<<")
@@ -225,9 +261,32 @@ class PeldrunEngine(ExecutionEngine):
         )
 
         # 3. Resolve custom Web tools to adapt into Core tools
-        requested_tools = list(manifest.get("tools", []))
-        # 'terminate' is a Core built-in; it must be present in AgentSpec.tools
-        # so Core exposes it to the LLM.
+        #
+        # The effective manifest may carry ``disabled_tools`` and
+        # ``extra_tools`` when the agent declares
+        # ``settings.tools_editable = true``. Apply them here so both the
+        # AgentSpec (tools exposed to the LLM) and the adapter list
+        # (tools invokable at runtime) reflect the user's selection.
+        #
+        # Precedence for a tool ID:
+        #   1. If it is in ``disabled_tools`` → excluded.
+        #   2. Otherwise kept from the manifest baseline.
+        #   3. Any ``extra_tools`` entry is appended if not already
+        #      present. Deduplication prevents double-resolution when the
+        #      user re-adds a tool already in the manifest.
+        manifest_tools = list(manifest.get("tools", []))
+        disabled_tools = set(manifest.get("disabled_tools") or [])
+        extra_tools = list(manifest.get("extra_tools") or [])
+
+        requested_tools: List[str] = [
+            t for t in manifest_tools if t not in disabled_tools
+        ]
+        for t in extra_tools:
+            if t not in requested_tools:
+                requested_tools.append(t)
+
+        # 'terminate' is a Core built-in; it must be present in
+        # AgentSpec.tools so Core exposes it to the LLM.
         if "terminate" not in requested_tools:
             requested_tools.append("terminate")
 
@@ -785,8 +844,21 @@ class PeldrunEngine(ExecutionEngine):
         agent_output = sanitize_final_result_text(
             run_result.output, latest_meaningful_thought
         )
+
+        # Ignore generic success strings emitted by the terminate tool so
+        # the UI does not display redundant "Task execution finished..." text.
+        _GENERIC_STRINGS = {
+            "task execution finished with status: success",
+            "task execution finished",
+            "task completed successfully",
+            "task completed.",
+            "task execution finished with status: success.",
+        }
+        _normalized = (agent_output or "").strip().lower()
         agent_output_is_meaningful = bool(
-            agent_output and agent_output.strip()
+            agent_output
+            and agent_output.strip()
+            and _normalized not in _GENERIC_STRINGS
         )
 
         if agent_output_is_meaningful:

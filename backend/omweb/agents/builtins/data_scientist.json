@@ -2,8 +2,13 @@
   "id": "data_scientist",
   "name": "Data Scientist",
   "role": "Analytics & Visualization Engineer",
-  "icon": "BarChart3",
+  "icon": "data_scientist.svg",
+  "core_color": "#a855f7",
   "description": "Analyzes datasets, executes numeric Python pipelines, generates plots, statistical summaries, and tabular insights.",
+  "short_description": "Senior data scientist for dataset analysis, statistical pipelines, plots, and actionable numeric insights.",
+  "store_description": "A senior data science persona specialized in exploratory analysis, statistical computation, and visualization. Reads tabular and structured data files from the workspace, executes Pandas, NumPy, SciPy, and Matplotlib pipelines, produces statistical summaries, correlation matrices, and visual artifacts, and delivers conclusions grounded in the numbers it actually computed. Does not perform web search or source-control operations — its scope is intentionally narrow so its reasoning loop stays focused on correctness of numeric work.",
+  "tags": ["analytics", "data-science", "python", "pandas", "visualization", "statistics"],
+  "capabilities": ["python", "shell", "file-editing", "statistical-analysis", "plotting"],
   "system_prompt": "You are a Senior Data Scientist. You analyze datasets with Python libraries, calculate metrics, produce graphs, and deliver actionable data-driven conclusions.",
   "tools": [
     "python_execute",
@@ -13,5 +18,72 @@
   "max_steps": 25,
   "is_builtin": true,
   "read_only": true,
-  "created_at": "2026-09-01 00:00:00"
+  "status": "active",
+  "version": "1.0.0",
+  "release_date": "2025-01-15",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+  "license": "proprietary",
+  "license_url": "https://peldrun.ai/license",
+  "homepage": "https://peldrun.ai/agents/data_scientist",
+  "docs_url": "https://docs.peldrun.ai/agents/data_scientist",
+  "changelog_url": "https://peldrun.ai/agents/data_scientist/changelog",
+  "created_at": "2026-09-01 00:00:00",
+  "settings": {
+    "enabled": true,
+    "tools_editable": true,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "max_steps": {
+          "type": "integer",
+          "title": "Max Reasoning Steps",
+          "description": "Upper bound on reasoning steps the agent may take per task run. Data analysis typically converges in 20-30 steps; raise this for multi-stage pipelines that combine cleaning, analysis, and chart generation.",
+          "minimum": 5,
+          "maximum": 200,
+          "default": 25
+        }
+      },
+      "additionalProperties": false
+    },
+    "required": []
+  },
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "prompt": {
+        "type": "string",
+        "description": "The analysis task, dataset question, visualization request, or statistical question to address."
+      }
+    },
+    "required": ["prompt"]
+  },
+  "examples": [
+    {
+      "input": {
+        "prompt": "Analyze sales.csv and produce a monthly revenue trend chart plus a summary of the top 5 products by revenue."
+      },
+      "output_preview": "Generated revenue_trend.png (Matplotlib), wrote analysis.md with monthly totals, YoY growth, and top-5 products ranked by total revenue."
+    },
+    {
+      "input": {
+        "prompt": "Run a correlation analysis on the columns in user_activity.parquet and flag any pairs above 0.8."
+      },
+      "output_preview": "Computed Pearson correlation matrix, identified 3 pairs above 0.8 (clicks vs sessions, pages_per_session vs duration, signups vs first_action). Produced correlation_heatmap.png and summary.md."
+    },
+    {
+      "input": {
+        "prompt": "Detect outliers in the transaction amounts column using IQR and summarize their characteristics."
+      },
+      "output_preview": "Applied 1.5×IQR rule, flagged 142 outliers out of 8,934 rows (1.6%). Summary includes amount distribution, hour-of-day clustering, and merchant category breakdown."
+    }
+  ],
+  "usage_notes": "Use for any task that involves reading structured data files, computing numeric or statistical results, or producing data-driven visualizations. Requires data files to be present in the workspace before invocation (upload them or reference them via @mention). This agent does not have web_search or source_control in its default manifest — if the task requires fetching external data or committing results to a remote repository, either use peldrun or code_architect, or add the required tools via the Tools modal. Prefers python_execute for all analysis; uses bash only for quick file inspection and file_saver for delivering final artifacts. max_steps and tools are user-editable via the Store UI. LLM parameters (temperature, max_tokens, timeout) are managed centrally via Settings → LLM and Settings → Model Budgets."
 }

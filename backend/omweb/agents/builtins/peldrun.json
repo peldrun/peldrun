@@ -2,8 +2,13 @@
   "id": "peldrun",
   "name": "Peldrun Generalist",
   "role": "General Autonomous Specialist",
-  "icon": "Bot",
+  "icon": "peldrun.svg",
+  "core_color": "#305CDE",
   "description": "Comprehensive autonomous agent equipped with terminal, python execution, file management, and browser automation.",
+  "short_description": "Full-capability autonomous specialist for coding, research, file management, and browser automation.",
+  "store_description": "The default generalist agent shipped with PELDRUN. Equipped with the complete toolset: shell execution, Python runtime, web search, HTTP fetching, file editing, human-in-the-loop confirmation, and headless browser automation. Suited for end-to-end tasks that mix multiple capabilities and require autonomous decision-making. Uses a methodical reasoning loop to decompose complex requests into concrete steps and terminates when the objective is met.",
+  "tags": ["generalist", "autonomous", "coding", "research", "automation", "browser"],
+  "capabilities": ["shell", "python", "web-browsing", "file-editing", "human-in-the-loop", "browser-automation"],
   "system_prompt": "You are peldrun, an all-capable AI agent specialized in autonomous task planning, coding, file creation, and deep web navigation. Execute tasks methodically with precision.",
   "tools": [
     "bash",
@@ -18,5 +23,66 @@
   "max_steps": 30,
   "is_builtin": true,
   "read_only": true,
-  "created_at": "2026-09-01 00:00:00"
+  "status": "active",
+  "version": "1.0.0",
+  "release_date": "2025-01-15",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+  "license": "proprietary",
+  "license_url": "https://peldrun.ai/license",
+  "homepage": "https://peldrun.ai/agents/peldrun",
+  "docs_url": "https://docs.peldrun.ai/agents/peldrun",
+  "changelog_url": "https://peldrun.ai/agents/peldrun/changelog",
+  "created_at": "2026-09-01 00:00:00",
+  "settings": {
+    "enabled": true,
+    "tools_editable": true,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "max_steps": {
+          "type": "integer",
+          "title": "Max Reasoning Steps",
+          "description": "Upper bound on reasoning steps the agent may take per task run. Raise this for long multi-stage tasks; lower it to cap cost for routine work.",
+          "minimum": 5,
+          "maximum": 200,
+          "default": 30
+        }
+      },
+      "additionalProperties": false
+    },
+    "required": []
+  },
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "prompt": {
+        "type": "string",
+        "description": "The task or objective to execute."
+      }
+    },
+    "required": ["prompt"]
+  },
+  "examples": [
+    {
+      "input": {
+        "prompt": "Create a FastAPI project that exposes a /health endpoint and returns JSON."
+      },
+      "output_preview": "Project scaffolded with main.py, requirements.txt, README.md. Server verified locally."
+    },
+    {
+      "input": {
+        "prompt": "Scrape the latest Next.js release notes and summarize breaking changes."
+      },
+      "output_preview": "Fetched release notes from GitHub; produced a markdown summary with migration checklist."
+    }
+  ],
+  "usage_notes": "Use for mixed-capability tasks that combine terminal access, Python execution, web search, and file editing in a single run. Prefer delegating to a specialist agent (code_architect, deep_researcher, data_scientist) when the task is narrowly scoped to one domain. max_steps is agent-scoped and editable via Settings. Tools are editable via the Tools modal: manifest tools can be disabled and additional store-enabled tools can be added; changes apply to the next task run without a restart. LLM parameters (temperature, max_tokens, timeout) are managed centrally via Settings → LLM and Settings → Model Budgets."
 }

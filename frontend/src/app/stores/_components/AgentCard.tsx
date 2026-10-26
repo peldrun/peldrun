@@ -5,21 +5,20 @@
 import React from "react";
 import {
   ArrowRight,
-  BarChart3,
-  Bot,
-  Code2,
   Edit2,
-  Search,
-  Sparkles,
+  Info,
+  Settings,
   Trash2,
+  Wrench,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { AgentManifest } from "@/lib/types";
+import { AgentIcon } from "./AgentIcon";
 
-/**
- * Props for {@link AgentCard}.
- * All actions are injected so the card stays purely presentational.
- */
+/* ────────────────────────────────────────────────────────────────
+ * Props
+ * ──────────────────────────────────────────────────────────────── */
+
 export interface AgentCardProps {
   agent: AgentManifest;
   /** True while a toggle request for this specific agent is in flight. */
@@ -28,35 +27,78 @@ export interface AgentCardProps {
   onEdit: (agent: AgentManifest) => void;
   onDelete: (agentId: string) => void;
   onStartChat: (agent: AgentManifest) => void;
+  onViewDetails?: (agent: AgentManifest) => void;
+  onOpenSettings?: (agent: AgentManifest) => void;
+  onOpenTools?: (agent: AgentManifest) => void;
 }
 
+/* ────────────────────────────────────────────────────────────────
+ * Visual constants — the single source of truth for the card layout
+ * ──────────────────────────────────────────────────────────────── */
+
 /**
- * Map a manifest icon identifier to its Lucide representation.
- * Falls back to a generic bot icon for unknown values so a missing
- * icon never renders a blank slot.
+ * Icon slot dimensions. The slot is the outer square that reserves
+ * space (prevents layout shift while the SVG loads); the icon itself
+ * is drawn at ICON_SIZE inside it.
+ *
+ * Change these to resize every agent icon in the app — no other file
+ * needs editing.
  */
-function renderAgentIcon(iconName?: string) {
-  switch ((iconName || "").toLowerCase()) {
-    case "code2":
-      return <Code2 className="h-5 w-5 text-cyan-600 dark:text-cyan-400" />;
-    case "search":
-      return <Search className="h-5 w-5 text-amber-600 dark:text-amber-400" />;
-    case "barchart3":
-      return <BarChart3 className="h-5 w-5 text-purple-600 dark:text-purple-400" />;
-    case "sparkles":
-      return <Sparkles className="h-5 w-5 text-primary" />;
-    default:
-      return <Bot className="h-5 w-5 text-primary" />;
-  }
+const ICON_SLOT_SIZE = 66; // px — outer box
+const ICON_SIZE = 66; // px — actual icon rendering size
+
+/* ────────────────────────────────────────────────────────────────
+ * Manifest helpers
+ * ──────────────────────────────────────────────────────────────── */
+
+interface AgentExtraFields {
+  core_color?: string;
+  settings?: {
+    tools_editable?: boolean;
+    schema?: {
+      properties?: Record<string, unknown>;
+    };
+  };
 }
+
+function hasConfigurableSettings(agent: AgentManifest): boolean {
+  const meta = agent as AgentManifest & AgentExtraFields;
+  const schema = meta.settings?.schema;
+  return !!(
+    schema?.properties &&
+    Object.keys(schema.properties).length > 0
+  );
+}
+
+function hasEditableTools(agent: AgentManifest): boolean {
+  const meta = agent as AgentManifest & AgentExtraFields;
+  return !!meta.settings?.tools_editable;
+}
+
+function getCoreColor(agent: AgentManifest): string | undefined {
+  const meta = agent as AgentManifest & AgentExtraFields;
+  const c = meta.core_color;
+  return typeof c === "string" && c.trim() ? c.trim() : undefined;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * Component
+ * ──────────────────────────────────────────────────────────────── */
 
 /**
  * Card representing a single agent in the Agents Hub.
  *
- * Visual states:
- *  - enabled  → full colour, "Start Chat" enabled
- *  - disabled → muted background, "Start Chat" disabled
- *  - protected (`peldrun`) → no toggle switch, cannot be disabled
+ * Icon rendering contract:
+ *   - ``core_color`` (from the manifest) is used ONLY for the subtle
+ *     background wash behind the card content. It is never applied to
+ *     the icon itself.
+ *   - The icon inherits the card's text color via ``currentColor``
+ *     (see ``text-foreground`` on the icon slot wrapper). Changing the
+ *     surrounding text color changes the icon color automatically —
+ *     no per-icon overrides anywhere.
+ *   - Icon size is controlled by ``ICON_SIZE`` and ``ICON_SLOT_SIZE``
+ *     above. AgentIcon is a pure renderer with no visual decisions of
+ *     its own.
  */
 export function AgentCard({
   agent,
@@ -65,30 +107,61 @@ export function AgentCard({
   onEdit,
   onDelete,
   onStartChat,
+  onViewDetails,
+  onOpenSettings,
+  onOpenTools,
 }: AgentCardProps) {
   const isDisabled = agent.status === "disabled";
   const isProtected = agent.id === "peldrun";
+  const coreColor = getCoreColor(agent);
+  const showSettings = hasConfigurableSettings(agent) && !!onOpenSettings;
+  const showTools = hasEditableTools(agent) && !!onOpenTools;
 
   return (
     <div
-      className={`group relative flex flex-col justify-between p-5 rounded-sm border transition-all duration-200 shadow-sm hover:shadow-md ${
+      className={`group relative text-[#fff] hover:text-black flex flex-col justify-between p-5 rounded-sm border transition-all duration-200 shadow-sm hover:shadow-md overflow-hidden ${
         isDisabled
           ? "bg-muted/30 border-border/60 opacity-80"
-          : "bg-card border-transparent hover:border-muted/40 shadow-md"
+          : "bg-card border-border/40 hover:border-primary/30"
       }`}
     >
-      <div>
-        {/* Card header & status toggle */}
+      {/* ── core_color wash (decorative background) ────────────── */}
+      {!isDisabled && coreColor && (
+        <div
+          className="absolute inset-0 pointer-events-none group-hover:opacity-[0.08] transition-opacity"
+          style={{ backgroundColor: coreColor}}
+          aria-hidden="true"
+        />
+      )}
+
+      <div className="relative">
+        {/* ── Header row: icon + name + toggle ─────────────────── */}
         <div className="flex items-start justify-between mb-3.5">
-          <div className="flex items-center gap-3">
-            <div className="p-2.5 rounded-sm bg-muted border border-border shadow-xs group-hover:scale-105 transition-transform">
-              {renderAgentIcon(agent.icon)}
+          <div className="flex items-center gap-3 min-w-0  text-inherit">
+            {/* Icon slot — controls size AND text color.
+                `text-foreground` is what the icon inherits via
+                currentColor. To tint the icon differently per-theme
+                (or per-state), change this class — no other file
+                needs editing. */}
+            <div
+              className="shrink-0 flex items-center justify-center text-inherit group-hover:scale-105 transition-transform"
+              style={{
+                width: ICON_SLOT_SIZE,
+                height: ICON_SLOT_SIZE,
+              }}
+            >
+              <AgentIcon
+                agentId={agent.id}
+                iconName={agent.icon}
+                size={ICON_SIZE}
+              />
             </div>
-            <div>
-              <h3 className="text-sm font-bold text-foreground group-hover:text-primary transition-colors flex items-center gap-2">
+
+            <div className="min-w-0">
+              <h3 className="text-md font-extrabold uppercase text-inherit group-hover:text-primary transition-colors truncate">
                 {agent.name}
               </h3>
-              <span className="text-[11px] font-mono text-primary">
+              <span className="text-[11px] font-mono text-inherit truncate block">
                 {agent.role || "Autonomous Agent"}
               </span>
             </div>
@@ -114,21 +187,21 @@ export function AgentCard({
           )}
         </div>
 
-        {/* Origin + status badges */}
+        {/* ── Badges ───────────────────────────────────────────── */}
         <div className="flex items-center gap-2 mb-3">
           {agent.is_builtin ? (
-            <span className="px-2 py-0.5 rounded-md text-[10px] font-mono uppercase font-semibold bg-sky-500/10 border border-sky-500/30 text-sky-700 dark:text-sky-300">
+            <span className="px-2 py-0.5 rounded-sm text-[10px] font-mono uppercase font-semibold bg-card border border-sky-500/30 text-sky-700 dark:text-sky-300">
               BUILT-IN
             </span>
           ) : (
-            <span className="px-2 py-0.5 rounded-md text-[10px] font-mono uppercase font-semibold bg-primary/10 border border-primary/30 text-primary">
+            <span className="px-2 py-0.5 rounded-sm text-[10px] font-mono uppercase font-semibold bg-card border border-primary/30 text-primary">
               CUSTOM
             </span>
           )}
           <span
-            className={`px-2 py-0.5 rounded-md text-[10px] font-mono uppercase font-semibold ${
+            className={`px-2 py-0.5 rounded-sm text-[10px] font-mono uppercase font-semibold ${
               !isDisabled
-                ? "bg-emerald-500/10 border border-emerald-500/30 text-emerald-600 dark:text-emerald-400"
+                ? "bg-card border border-emerald-500/30 text-emerald-600 dark:text-emerald-400"
                 : "bg-muted text-muted-foreground border border-border"
             }`}
           >
@@ -136,14 +209,14 @@ export function AgentCard({
           </span>
         </div>
 
-        {/* Description */}
-        <p className="text-xs text-muted-foreground line-clamp-2 mb-4 leading-relaxed">
+        {/* ── Description ──────────────────────────────────────── */}
+        <p className="text-xs text-inherit line-clamp-2 mb-4 leading-relaxed">
           {agent.description || "Custom configured autonomous specialist."}
         </p>
 
-        {/* Scoped tools */}
+        {/* ── Scoped tools ─────────────────────────────────────── */}
         <div className="mb-4">
-          <span className="text-[10px] uppercase font-semibold text-muted-foreground tracking-wider block mb-1.5">
+          <span className="text-[10px] uppercase font-semibold text-inherit tracking-wider block mb-1.5">
             Scoped Tools ({agent.tools?.length || 0})
           </span>
           <div className="flex flex-wrap gap-1.5 max-h-16 overflow-y-auto scrollbar-none">
@@ -151,7 +224,7 @@ export function AgentCard({
               agent.tools.map((t) => (
                 <span
                   key={t}
-                  className="px-2 py-0.5 rounded-md bg-muted text-[10px] text-muted-foreground font-mono border border-border"
+                  className="px-2 py-0.5 rounded-sm bg-card text-[10px] text-muted-foreground font-mono shadow-sm"
                 >
                   {t}
                 </span>
@@ -165,9 +238,45 @@ export function AgentCard({
         </div>
       </div>
 
-      {/* Footer actions */}
-      <div className="pt-3.5 border-t border-border flex items-center justify-between">
+      {/* ── Footer actions ─────────────────────────────────────── */}
+      <div className="relative pt-3.5 border-t border-border flex items-center justify-between">
         <div className="flex items-center gap-1">
+          {onViewDetails && (
+            <button
+              type="button"
+              onClick={() => onViewDetails(agent)}
+              className="p-1.5 rounded-lg hover:bg-muted text-inherit hover:text-primary transition cursor-pointer"
+              title="View details"
+              aria-label="View agent details"
+            >
+              <Info size={13} />
+            </button>
+          )}
+
+          {showTools && (
+            <button
+              type="button"
+              onClick={() => onOpenTools!(agent)}
+              className="p-1.5 rounded-lg hover:bg-muted text-inherit hover:text-primary transition cursor-pointer"
+              title="Configure agent tools"
+              aria-label="Configure agent tools"
+            >
+              <Wrench size={13} />
+            </button>
+          )}
+
+          {showSettings && (
+            <button
+              type="button"
+              onClick={() => onOpenSettings!(agent)}
+              className="p-1.5 rounded-lg hover:bg-muted text-inherit hover:text-primary transition cursor-pointer"
+              title="Configure agent settings"
+              aria-label="Configure agent settings"
+            >
+              <Settings size={13} />
+            </button>
+          )}
+
           {!agent.is_builtin && (
             <>
               <button

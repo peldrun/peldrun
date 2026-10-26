@@ -380,8 +380,14 @@ async def run_instrumented(
         cleanup_job_state(job_id)
         return
 
+    # Use ``get_effective_agent`` instead of ``get_agent`` so user-saved
+    # settings from the Store UI (max_steps, temperature, max_tokens,
+    # timeout_seconds, ...) are merged into the manifest BEFORE the
+    # runtime sees it. The merge only honours keys declared in
+    # ``settings.schema.properties``, so identity fields (system_prompt,
+    # tools, name) and the ``status`` flag below are always preserved.
     try:
-        manifest = agent_registry.get_agent(agent_id)
+        manifest = agent_registry.get_effective_agent(agent_id)
     except AgentNotFoundError as agent_err:
         err_msg = str(agent_err)
         print(f"[BRIDGE ERROR] {err_msg}")

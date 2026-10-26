@@ -2,10 +2,17 @@
 
 "use client";
 
-import React, { useMemo } from "react";
+import React, { useCallback, useMemo, useState } from "react";
 import { Bot, Plus } from "lucide-react";
 import type { AgentManifest } from "@/lib/types";
 import { AgentCard } from "../_components/AgentCard";
+import {
+  AgentDetailsModal,
+  type AgentWithMeta,
+} from "../_modals/AgentDetailsModal";
+import { AgentSettingsModal } from "../_modals/AgentSettingsModal";
+import { AgentToolsModal } from "../_modals/AgentToolsModal";
+import { getApiUrl } from "../_hooks/useStoreData";
 import type { SectionHeaderConfig } from "../_config/sections";
 import type { AgentFilter } from "../_types/store";
 
@@ -52,15 +59,43 @@ export function getAgentsHeaderConfig(ctx: {
 }
 
 /**
+ * Fetch the full manifest for a single agent.
+ *
+ * The list endpoint (`GET /agents`) returns the same payload as the
+ * detail endpoint, but the row already has the short data available.
+ * This helper exists so the details modal can lazily pull the full
+ * manifest without forcing the section to re-fetch the whole catalog.
+ */
+async function fetchAgentManifest(
+  agentId: string
+): Promise<AgentWithMeta | null> {
+  try {
+    const res = await fetch(
+      getApiUrl(`/api/store/agents/${encodeURIComponent(agentId)}`)
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const agent = data?.agent;
+    return agent && typeof agent === "object"
+      ? (agent as AgentWithMeta)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Agents Hub section content.
  *
  * Responsibilities:
  *  - Filter the agents collection by `searchQuery` + `agentFilter`.
  *  - Render a responsive grid of {@link AgentCard}.
  *  - Render a friendly empty state when no agents match.
+ *  - Own the modal state for Details and Settings (local to this
+ *    section because it does not need to be coordinated elsewhere).
  *
- * The section is stateless: every mutation is delegated to the
- * handlers supplied by the parent (backed by `useAgentActions`).
+ * The section remains otherwise stateless: every mutation is
+ * delegated to the parent (backed by `useAgentActions`).
  */
 export function AgentsSection({
   agents,
@@ -72,6 +107,61 @@ export function AgentsSection({
   onDeleteAgent,
   onStartChat,
 }: AgentsSectionProps) {
+  // Modal state — which agent (if any) is being viewed / configured.
+  const [detailsAgent, setDetailsAgent] = useState<AgentWithMeta | null>(null);
+  const [detailsLoading, setDetailsLoading] = useState(false);
+  const [settingsAgent, setSettingsAgent] = useState<AgentWithMeta | null>(
+    null
+  );
+  const [toolsAgent, setToolsAgent] = useState<AgentWithMeta | null>(null);
+
+  /**
+   * Open the details modal for an agent.
+   *
+   * Strategy (same as the Tools section):
+   *  1. Display the row's already-loaded short data immediately so the
+   *     user sees content without any delay.
+   *  2. Fetch the full manifest from `/api/store/agents/{id}` in the
+   *     background.
+   *  3. Merge the response into the currently-open agent — but only if
+   *     the modal is still showing the same agent (guards against a
+   *     race when the user closes and opens a different agent quickly).
+   */
+  const openDetails = useCallback(async (agent: AgentManifest) => {
+    const shortData = agent as AgentWithMeta;
+    setDetailsAgent(shortData);
+    setDetailsLoading(true);
+    try {
+      const full = await fetchAgentManifest(agent.id);
+      setDetailsAgent((prev) =>
+        prev && prev.id === agent.id && full
+          ? ({ ...prev, ...full } as AgentWithMeta)
+          : prev
+      );
+    } finally {
+      setDetailsLoading(false);
+    }
+  }, []);
+
+  /**
+   * Open the settings modal for an agent. The card only triggers this
+   * when `hasConfigurableSettings(agent)` is true, so we do not need
+   * to re-check the schema here — the modal itself handles the
+   * "no settings" case with a friendly 404 message if it happens.
+   */
+  const openSettings = useCallback((agent: AgentManifest) => {
+    setSettingsAgent(agent as AgentWithMeta);
+  }, []);
+
+  /**
+   * Open the tools modal for an agent. The card only triggers this
+   * when `settings.tools_editable = true`, and the backend enforces
+   * the same gate with a 403 (defense in depth).
+   */
+  const openTools = useCallback((agent: AgentManifest) => {
+    setToolsAgent(agent as AgentWithMeta);
+  }, []);
+
   const filteredAgents = useMemo(() => {
     return agents.filter((ag) => {
       const q = searchQuery.toLowerCase().trim();
@@ -105,18 +195,50 @@ export function AgentsSection({
   }
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-      {filteredAgents.map((ag) => (
-        <AgentCard
-          key={ag.id}
-          agent={ag}
-          isToggling={togglingAgentId === ag.id}
-          onToggle={onToggleAgent}
-          onEdit={onEditAgent}
-          onDelete={onDeleteAgent}
-          onStartChat={onStartChat}
-        />
-      ))}
+    <div className="space-y-6">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+        {filteredAgents.map((ag) => (
+          <AgentCard
+            key={ag.id}
+            agent={ag}
+            isToggling={togglingAgentId === ag.id}
+            onToggle={onToggleAgent}
+            onEdit={onEditAgent}
+            onDelete={onDeleteAgent}
+            onStartChat={onStartChat}
+            onViewDetails={openDetails}
+            onOpenSettings={openSettings}
+            onOpenTools={openTools}
+          />
+        ))}
+      </div>
+
+      {/* ── Agent details modal ─────────────────────────────────── */}
+      <AgentDetailsModal
+        open={detailsAgent !== null}
+        agent={detailsAgent}
+        loading={detailsLoading}
+        onClose={() => {
+          setDetailsAgent(null);
+          setDetailsLoading(false);
+        }}
+      />
+
+      {/* ── Agent settings modal ────────────────────────────────── */}
+      <AgentSettingsModal
+        open={settingsAgent !== null}
+        agentId={settingsAgent?.id ?? null}
+        agentName={settingsAgent?.name ?? ""}
+        onClose={() => setSettingsAgent(null)}
+      />
+
+      {/* ── Agent tools modal ──────────────────────────────────── */}
+      <AgentToolsModal
+        open={toolsAgent !== null}
+        agentId={toolsAgent?.id ?? null}
+        agentName={toolsAgent?.name ?? ""}
+        onClose={() => setToolsAgent(null)}
+      />
     </div>
   );
 }

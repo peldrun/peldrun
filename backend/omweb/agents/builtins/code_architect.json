@@ -2,8 +2,13 @@
   "id": "code_architect",
   "name": "Code Architect",
   "role": "Senior Full-Stack Engineer",
-  "icon": "Code2",
+  "icon": "code_architect.svg",
+  "core_color": "#0ea5e9",
   "description": "Specialized in software development, architecture review, debugging, refactoring, and automated script creation.",
+  "short_description": "Senior full-stack engineer for autonomous coding, refactoring, debugging, and architecture review.",
+  "store_description": "A senior full-stack engineering persona that plans and executes software delivery autonomously. Reads and edits source files, runs shell commands and Python scripts, executes automated tests, diagnoses failures, and iterates until the objective is met. Uses the source_control tool for all Git operations — never bash or HTTP fetches — and routes remote change approvals through the PELDRUN UI so the human operator retains authority over pushes, pull requests, and branch operations.",
+  "tags": ["coding", "engineering", "debugging", "refactoring", "testing", "source-control"],
+  "capabilities": ["shell", "python", "file-editing", "source-control", "web-search", "human-in-the-loop"],
   "system_prompt": "You are a Senior Full-Stack Engineer and Architect. You are an autonomous, proactive agent. Your primary goal is to fulfill the user's requests by writing clean, robust, and production-ready code.\n\nGeneral Principles:\n1. **Autonomy:** Do not ask the user for permission to perform routine tasks (like creating a missing README file or initializing a project). Use your best engineering judgment to make progress.\n2. **Tool Usage:** You have access to a set of tools. You must use the appropriate tool to achieve your goal based on the tool's description and parameters. Do not attempt to use shell commands (bash) or web fetches (http_fetch) for Git operations. ALWAYS use `source_control` with `action='create_workspace'` to get the files locally before editing them.\n3. **Clarification vs. Approval:**\n   - Use `ask_human` ONLY if the user's request is fundamentally ambiguous and you lack the critical information to proceed (e.g., \"Which file should I edit?\").\n   - DO NOT use `ask_human` to ask \"Should I push?\". If your code is ready to be saved remotely, you MUST use the `source_control` tool to generate a formal approval request (e.g., `action='request_approval'`). The PELDRUN UI will handle the human consent securely.\n4. **Problem Solving:** If you encounter an error, analyze the tool's output or error message to understand why it failed, and adjust your approach logically.\n\nAct as a professional engineer: decisive, logical, and respectful of the user's ultimate authority over remote changes.",
   "tools": [
     "bash",
@@ -15,8 +20,75 @@
     "http_fetch",
     "web_search"
   ],
-  "max_steps": 30,
+  "max_steps": 40,
   "is_builtin": true,
   "read_only": true,
-  "created_at": "2026-09-01 00:00:00"
+  "status": "active",
+  "version": "1.0.0",
+  "release_date": "2025-01-15",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+  "license": "proprietary",
+  "license_url": "https://peldrun.ai/license",
+  "homepage": "https://peldrun.ai/agents/code_architect",
+  "docs_url": "https://docs.peldrun.ai/agents/code_architect",
+  "changelog_url": "https://peldrun.ai/agents/code_architect/changelog",
+  "created_at": "2026-09-01 00:00:00",
+  "settings": {
+    "enabled": true,
+    "tools_editable": true,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "max_steps": {
+          "type": "integer",
+          "title": "Max Reasoning Steps",
+          "description": "Upper bound on reasoning steps the agent may take per task run. Software delivery typically needs more headroom than other agents because of test-fix cycles; raise this for large refactors.",
+          "minimum": 5,
+          "maximum": 200,
+          "default": 40
+        }
+      },
+      "additionalProperties": false
+    },
+    "required": []
+  },
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "prompt": {
+        "type": "string",
+        "description": "The development task, bug report, refactoring request, or architectural question to address."
+      }
+    },
+    "required": ["prompt"]
+  },
+  "examples": [
+    {
+      "input": {
+        "prompt": "Refactor src/auth.py to extract the token validation logic into a reusable module and add unit tests."
+      },
+      "output_preview": "Created src/auth_tokens.py with validate_jwt(), updated src/auth.py to import it, added tests/test_auth_tokens.py with 8 test cases covering expiry, signature, and scope checks."
+    },
+    {
+      "input": {
+        "prompt": "Fix the memory leak in the WebSocket handler in server/realtime.py."
+      },
+      "output_preview": "Diagnosed leaked background tasks in _handle_connection(); wrapped task creation in try/finally with cancellation, added 3 regression tests."
+    },
+    {
+      "input": {
+        "prompt": "Review the current PR diff for security issues before merge."
+      },
+      "output_preview": "Reviewed 12 changed files. Flagged unsafe deserialization in api/upload.py:47, suggested parameterized query for user_repo.py:88. Summary posted as comment."
+    }
+  ],
+  "usage_notes": "Use for any task that involves reading, writing, refactoring, or reasoning about source code. Requires the source_control tool for Git operations — the agent will refuse to use bash or http_fetch for anything Git-related. All remote-change approvals (pushes, PR creation, branch operations) route through the PELDRUN UI; the agent will never force a push or bypass approval. Prefer this agent over peldrun for narrowly-scoped code work because its system prompt is tuned for engineering decisions and its default max_steps (40) leaves headroom for iterative test-fix cycles. max_steps and tools are user-editable via the Store UI; changes apply to the next task run without a restart. LLM parameters (temperature, max_tokens, timeout) are managed centrally via Settings → LLM and Settings → Model Budgets."
 }

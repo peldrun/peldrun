@@ -1,6 +1,6 @@
 {
   "id": "ask_human",
-  "name": "Human-in-the-Loop Inquiry",
+  "name": "Human in the Loop Inquiry",
   "display_name": "Human in theLoop Inquiry",
   "category": "interaction",
   "subcategory": "human-in-the-loop",
