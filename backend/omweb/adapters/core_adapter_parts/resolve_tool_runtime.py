@@ -16,13 +16,12 @@ Resolution strategy (in order):
      visibility into the emitter, so this path cannot be expressed as
      an AdapterSpec.
 
-  3. ``get_custom_tool_instance`` fallback — user-uploaded custom
+  3. ``mcp`` protocol server tools — dynamic discovery and remote
+     invocation via mcp_session_pool and persistent MCPClient sessions.
+
+  4. ``get_custom_tool_instance`` fallback — user-uploaded custom
      tools and bundle-installed tools are resolved through the Web
      ToolRegistry exactly as before.
-
-Adding a new built-in tool adapter requires creating exactly one file
-in ``tools_adapters/`` and no changes here. Adding a new *custom* tool
-requires no changes here either (registry fallback handles it).
 """
 
 from __future__ import annotations
@@ -30,18 +29,40 @@ from __future__ import annotations
 import copy
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 try:
     from omweb.tools.registry import ToolRegistry, tool_registry
 except ImportError:
     from backend.omweb.tools.registry import ToolRegistry, tool_registry
 
+from omweb.extensions.mcp_pool import mcp_session_pool
+from omweb.extensions.registry import extension_registry
+
 from .schemas import CANONICAL_TOOL_DESCRIPTIONS, CANONICAL_TOOL_SCHEMAS
 from .tools_adapters._contract import AdapterRegistry, AdapterSpec
 from .web_tool_adapter import WebToolAdapter
 
 logger = logging.getLogger("omweb.adapters.resolve_tool_runtime")
+
+
+def _parse_mcp_tool_id(tool_id: str) -> Optional[Tuple[str, str]]:
+    """
+    Parse an MCP tool identifier into (server_id, remote_tool_name).
+    Supports both standard delimiter formats:
+      - 'mcp::{server_id}::{tool_name}'
+      - 'mcp__{server_id}__{tool_name}'
+    """
+    raw = str(tool_id or "").strip()
+    if raw.startswith("mcp::"):
+        parts = raw.split("::", 2)
+        if len(parts) == 3:
+            return parts[1].strip(), parts[2].strip()
+    elif raw.startswith("mcp__"):
+        parts = raw.split("__", 2)
+        if len(parts) == 3:
+            return parts[1].strip(), parts[2].strip()
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -170,8 +191,9 @@ def resolve_tool_runtime(
 
     Resolution order:
       1. ``ask_human`` / ``human_input`` special case.
-      2. AdapterRegistry lookup (built-in tool adapters).
-      3. ``get_custom_tool_instance`` fallback (custom + bundle tools).
+      2. MCP protocol server tool resolution (dynamic remote call).
+      3. AdapterRegistry lookup (built-in tool adapters).
+      4. ``get_custom_tool_instance`` fallback (custom + bundle tools).
     """
     meta = dict(tool_meta or {})
     active_registry = registry or tool_registry
@@ -193,6 +215,36 @@ def resolve_tool_runtime(
     # ── 1. ask_human special case ──────────────────────────────────
     if name in ("ask_human", "human_input"):
         executor = _resolve_ask_human(ws_path, emitter)
+
+    # ── 1.5. MCP protocol server tool resolution ───────────────────
+    mcp_target = _parse_mcp_tool_id(name)
+    if mcp_target is None and meta.get("server_id") and (meta.get("remote_tool_name") or meta.get("remote_name")):
+        mcp_target = (str(meta["server_id"]), str(meta.get("remote_tool_name") or meta.get("remote_name")))
+
+    if executor is None and mcp_target is not None:
+        mcp_server_id, mcp_remote_name = mcp_target
+        manifest = extension_registry.get_effective_server(mcp_server_id)
+
+        # Fallback parameters schema from MCP metadata if available
+        if not params or not params.get("properties"):
+            raw_input_schema = meta.get("inputSchema") or meta.get("parameters")
+            if isinstance(raw_input_schema, dict) and raw_input_schema.get("properties"):
+                params = copy.deepcopy(raw_input_schema)
+
+        async def _mcp_tool_executor(**kwargs: Any) -> Any:
+            if not manifest:
+                raise RuntimeError(f"MCP server '{mcp_server_id}' is not registered.")
+            client = await mcp_session_pool.get_or_create_client(
+                server_id=mcp_server_id,
+                manifest=manifest,
+                workspace_root=str(ws_path),
+            )
+            return await client.call_tool(
+                tool_name=mcp_remote_name,
+                arguments=kwargs,
+            )
+
+        executor = _mcp_tool_executor
 
     # ── 2. AdapterRegistry lookup ──────────────────────────────────
     if executor is None:
@@ -228,14 +280,6 @@ def resolve_tool_runtime(
                 executor = None
 
     # ── 3. Custom / bundle fallback ────────────────────────────────
-    #
-    # Bundle tools (and legacy custom tools) require the active
-    # workspace_root so that any file operations they perform are
-    # strictly scoped to the current chat's files directory.
-    #
-    # Without this binding, get_custom_tool_instance() would return an
-    # instance bound to the backend's CWD (or no root at all), causing
-    # silent cross-session data leaks and path-resolution failures.
     if executor is None and active_registry is not None:
         custom_inst = active_registry.get_custom_tool_instance(
             name, workspace_root=ws_path
@@ -293,26 +337,44 @@ def resolve_authorized_tools(
             continue
         seen_ids.add(tid)
 
-        tool_meta: Dict[str, Any] = {"id": tid}
-        if active_registry is not None:
-            for lookup_name in ("get_tool", "get_tool_meta", "get"):
-                lookup_fn = getattr(active_registry, lookup_name, None)
-                if callable(lookup_fn):
-                    try:
-                        found = lookup_fn(tid)
-                        if isinstance(found, dict):
-                            if found.get("enabled") is False:
-                                logger.debug(
-                                    "Skipping globally disabled tool %r "
-                                    "during resolution.",
-                                    tid,
-                                )
-                                tool_meta = {"_skip": True}
-                            else:
-                                tool_meta = dict(found)
-                            break
-                    except Exception:
-                        continue
+        # Check if the identifier represents an external MCP tool
+        mcp_target = _parse_mcp_tool_id(tid)
+        if mcp_target is not None:
+            mcp_srv_id, mcp_rem_name = mcp_target
+            server_manifest = extension_registry.get_effective_server(mcp_srv_id)
+            if not server_manifest or server_manifest.get("status") != "active":
+                logger.debug(
+                    "Skipping MCP tool %r because server %r is inactive or missing.",
+                    tid,
+                    mcp_srv_id,
+                )
+                continue
+            tool_meta = {
+                "id": tid,
+                "server_id": mcp_srv_id,
+                "remote_tool_name": mcp_rem_name,
+            }
+        else:
+            tool_meta = {"id": tid}
+            if active_registry is not None:
+                for lookup_name in ("get_tool", "get_tool_meta", "get"):
+                    lookup_fn = getattr(active_registry, lookup_name, None)
+                    if callable(lookup_fn):
+                        try:
+                            found = lookup_fn(tid)
+                            if isinstance(found, dict):
+                                if found.get("enabled") is False:
+                                    logger.debug(
+                                        "Skipping globally disabled tool %r "
+                                        "during resolution.",
+                                        tid,
+                                    )
+                                    tool_meta = {"_skip": True}
+                                else:
+                                    tool_meta = dict(found)
+                                break
+                        except Exception:
+                            continue
 
         if tool_meta.get("_skip"):
             continue

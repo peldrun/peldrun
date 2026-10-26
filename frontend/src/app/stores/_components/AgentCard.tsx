@@ -7,6 +7,7 @@ import {
   ArrowRight,
   Edit2,
   Info,
+  Server,
   Settings,
   Trash2,
   Wrench,
@@ -30,6 +31,7 @@ export interface AgentCardProps {
   onViewDetails?: (agent: AgentManifest) => void;
   onOpenSettings?: (agent: AgentManifest) => void;
   onOpenTools?: (agent: AgentManifest) => void;
+  onOpenMcp?: (agent: AgentManifest) => void;
 }
 
 /* ────────────────────────────────────────────────────────────────
@@ -110,12 +112,17 @@ export function AgentCard({
   onViewDetails,
   onOpenSettings,
   onOpenTools,
+  onOpenMcp,
 }: AgentCardProps) {
   const isDisabled = agent.status === "disabled";
   const isProtected = agent.id === "peldrun";
   const coreColor = getCoreColor(agent);
   const showSettings = hasConfigurableSettings(agent) && !!onOpenSettings;
   const showTools = hasEditableTools(agent) && !!onOpenTools;
+  const showMcp = !!onOpenMcp;
+  const mcpServersCount = Array.isArray((agent as any).mcp_servers)
+    ? (agent as any).mcp_servers.length
+    : 0;
 
   return (
     <div
@@ -216,9 +223,17 @@ export function AgentCard({
 
         {/* ── Scoped tools ─────────────────────────────────────── */}
         <div className="mb-4">
-          <span className="text-[10px] uppercase font-semibold text-inherit tracking-wider block mb-1.5">
-            Scoped Tools ({agent.tools?.length || 0})
-          </span>
+          <div className="flex items-center justify-between mb-1.5">
+            <span className="text-[10px] uppercase font-semibold text-inherit tracking-wider block">
+              Scoped Tools ({agent.tools?.length || 0})
+            </span>
+            {mcpServersCount > 0 && (
+              <span className="text-[10px] font-mono text-primary flex items-center gap-1 font-semibold">
+                <Server size={10} />
+                {mcpServersCount} MCP
+              </span>
+            )}
+          </div>
           <div className="flex flex-wrap gap-1.5 max-h-16 overflow-y-auto scrollbar-none">
             {agent.tools && agent.tools.length > 0 ? (
               agent.tools.map((t) => (
@@ -262,6 +277,18 @@ export function AgentCard({
               aria-label="Configure agent tools"
             >
               <Wrench size={13} />
+            </button>
+          )}
+
+          {showMcp && (
+            <button
+              type="button"
+              onClick={() => onOpenMcp!(agent)}
+              className="p-1.5 rounded-lg hover:bg-muted text-inherit hover:text-primary transition cursor-pointer"
+              title="Configure agent MCP servers"
+              aria-label="Configure agent MCP servers"
+            >
+              <Server size={13} />
             </button>
           )}
 

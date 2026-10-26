@@ -118,6 +118,8 @@ class PeldrunEngine(ExecutionEngine):
         from omweb.agent_bridge_parts.state import job_scoped_artifacts
         from omweb.agent_bridge_parts.text_utils import sanitize_final_result_text
         from omweb.chat_storage_engine import chat_storage_engine
+        from omweb.extensions.mcp_pool import mcp_session_pool
+        from omweb.extensions.registry import extension_registry
         from omweb.job_manager import job_manager
         from omweb.project_manager import project_manager
         from omweb.sse_events import SSEEvent, SSEEventType, dispatch_event
@@ -309,10 +311,11 @@ class PeldrunEngine(ExecutionEngine):
         except (TypeError, ValueError):
             accepts_context_kw = False
 
-        for req_tool in requested_tools:
-            # 'terminate' and 'file_saver' are Core built-ins; do not inject
-            # custom executors for them, but keep them in AgentSpec.tools.
-            if req_tool in ("terminate", "file_saver"):
+        for req_tool in list(requested_tools):
+            # 'terminate' and 'file_saver' are Core built-ins; 'mcp' is a
+            # discovery marker (not an invokable tool). Do not inject custom
+            # executors for them, but keep terminate/file_saver in AgentSpec.tools.
+            if req_tool in ("terminate", "file_saver", "mcp"):
                 continue
             if req_tool not in available_web_tools:
                 continue
@@ -346,6 +349,102 @@ class PeldrunEngine(ExecutionEngine):
                     job_id,
                     tool_resolve_err,
                 )
+
+        # ── MCP Protocol Server Tool Discovery & Registration ─────────
+        # The manifest may carry per-agent MCP servers either explicitly
+        # (effective_mcp_servers / mcp_servers) or via the generic "mcp"
+        # tool marker. We probe each active server for its live tool list
+        # and register each remote tool under the canonical name:
+        #     mcp__{server_id}__{tool_name}
+        # Double underscore is used as a separator because most LLM
+        # providers reject "::" in function names.
+        effective_mcp_servers = list(
+            manifest.get("effective_mcp_servers")
+            or manifest.get("mcp_servers")
+            or []
+        )
+
+        target_mcp_servers: List[Dict[str, Any]] = []
+        if effective_mcp_servers:
+            for s_id in effective_mcp_servers:
+                try:
+                    srv = extension_registry.get_effective_server(s_id)
+                except Exception as srv_lookup_err:
+                    logger.debug(
+                        "MCP effective-server lookup failed for %r: %s",
+                        s_id,
+                        srv_lookup_err,
+                    )
+                    srv = None
+                if srv and srv.get("status") == "active":
+                    target_mcp_servers.append(srv)
+        elif "mcp" in requested_tools:
+            # Baseline compatibility: if the agent declares the generic
+            # 'mcp' marker, expose every active MCP server.
+            try:
+                target_mcp_servers = list(
+                    extension_registry.get_active_mcp_servers() or []
+                )
+            except Exception as mcp_list_err:
+                logger.debug(
+                    "MCP active-server enumeration failed: %s", mcp_list_err
+                )
+                target_mcp_servers = []
+
+        for srv in target_mcp_servers:
+            srv_id = srv.get("id")
+            if not srv_id:
+                continue
+            try:
+                probe_res = await mcp_session_pool.probe_connection(
+                    srv, workspace_root=ws_path_str
+                )
+                if not (probe_res and probe_res.get("status") == "ok"):
+                    logger.debug(
+                        "MCP server %r probe returned non-ok status; skipping.",
+                        srv_id,
+                    )
+                    continue
+                for tool_info in probe_res.get("tools", []) or []:
+                    remote_name = tool_info.get("name")
+                    if not remote_name:
+                        continue
+                    mcp_tool_id = f"mcp__{srv_id}__{remote_name}"
+                    if mcp_tool_id in resolved_tool_ids:
+                        continue
+                    mcp_adapter = resolve_tool_runtime(
+                        tool_id=mcp_tool_id,
+                        tool_meta={
+                            "id": mcp_tool_id,
+                            "name": mcp_tool_id,
+                            "description": (
+                                f"[{srv.get('name', srv_id)}] "
+                                f"{tool_info.get('description', '')}"
+                            ).strip(),
+                            "parameters": tool_info.get("parameters", {}),
+                            "server_id": srv_id,
+                            "remote_tool_name": remote_name,
+                        },
+                        workspace_root=ws_path,
+                        registry=web_tool_registry,
+                    )
+                    adapted_core_tools.append(mcp_adapter)
+                    resolved_tool_ids.append(mcp_tool_id)
+                    if mcp_tool_id not in requested_tools:
+                        requested_tools.append(mcp_tool_id)
+            except Exception as mcp_exc:
+                logger.warning(
+                    "MCP registration skipped for server %r on job %s: %s",
+                    srv_id,
+                    job_id,
+                    mcp_exc,
+                )
+
+        # The 'mcp' marker is a discovery trigger, not an invokable tool;
+        # strip it now that concrete MCP tool IDs have been materialized
+        # into ``requested_tools`` (which feeds AgentSpec.tools below).
+        if "mcp" in requested_tools:
+            requested_tools = [t for t in requested_tools if t != "mcp"]
 
         specialist_tools_map = _collect_specialist_tool_allowlists(set(available_web_tools.keys()))
 

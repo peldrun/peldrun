@@ -14,6 +14,7 @@ import {
   EyeOff,
   HelpCircle,
   RotateCw,
+  Server,
   XCircle,
 } from "lucide-react";
 import type { ToolPair } from "@/lib/types";
@@ -28,12 +29,42 @@ function truncate(value: unknown, max = 80): string {
   return s.slice(0, max - 1) + "…";
 }
 
+export function parseMcpToolName(rawName: string): {
+  isMcp: boolean;
+  serverId?: string;
+  remoteName?: string;
+} {
+  const raw = (rawName || "").trim();
+  if (raw.startsWith("mcp__")) {
+    const parts = raw.split("__");
+    if (parts.length >= 3) {
+      return {
+        isMcp: true,
+        serverId: parts[1],
+        remoteName: parts.slice(2).join("__"),
+      };
+    }
+  } else if (raw.startsWith("mcp::")) {
+    const parts = raw.split("::");
+    if (parts.length >= 3) {
+      return {
+        isMcp: true,
+        serverId: parts[1],
+        remoteName: parts.slice(2).join("::"),
+      };
+    }
+  }
+  return { isMcp: false };
+}
+
 function buildArgsPreview(
   toolName: string,
   args: Record<string, unknown> | undefined,
 ): string {
   if (!args || typeof args !== "object") return "";
-  const key = (toolName || "").toLowerCase().trim();
+  const mcp = parseMcpToolName(toolName);
+  const targetName = mcp.isMcp && mcp.remoteName ? mcp.remoteName : toolName;
+  const key = (targetName || "").toLowerCase().trim();
 
   const pick = (...names: string[]): string => {
     for (const n of names) {
@@ -159,16 +190,23 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
   const [copied, setCopied] = useState(false);
   const [manifest, setManifest] = useState<ToolManifest | null>(null);
 
-  // Fetch the real manifest to get display_name or name
+  const mcpInfo = parseMcpToolName(tool.tool);
+
+  // Fetch the real manifest to get display_name or name for non-MCP tools
   useEffect(() => {
+    if (mcpInfo.isMcp) return;
     let cancelled = false;
     fetchToolManifest(tool.tool).then((m) => {
       if (!cancelled && m) setManifest(m);
     });
     return () => { cancelled = true; };
-  }, [tool.tool]);
+  }, [tool.tool, mcpInfo.isMcp]);
 
-  const label = manifest ? (manifest.display_name || manifest.name) : resolveToolLabel(tool.tool);
+  const label = mcpInfo.isMcp
+    ? (mcpInfo.remoteName || tool.tool)
+    : manifest
+    ? (manifest.display_name || manifest.name)
+    : resolveToolLabel(tool.tool);
 
   const isRetrying = tool.status === "retrying";
   const isFailed = tool.isError || tool.status === "failed";
@@ -251,20 +289,33 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
       >
         <div className="flex items-center gap-2 truncate min-w-0 flex-1">
           <div className="flex-shrink-0 text-foreground">
-            <ToolIcon
-              tool={{
-                id: tool.tool,
-                name: label,
-                description: "",
-                category: manifest?.category || "",
-                icon: manifest?.icon
-              }}
-              size={14}
-            />
+            {mcpInfo.isMcp ? (
+              <div className="p-0.5 rounded bg-primary/10 text-primary border border-primary/20">
+                <Server size={12} />
+              </div>
+            ) : (
+              <ToolIcon
+                tool={{
+                  id: tool.tool,
+                  name: label,
+                  description: "",
+                  category: manifest?.category || "",
+                  icon: manifest?.icon,
+                }}
+                size={14}
+              />
+            )}
           </div>
           <span className="font-semibold text-[11px] text-foreground flex-shrink-0">{label}</span>
 
-          {label.toLowerCase() !== tool.tool.toLowerCase() && (
+          {mcpInfo.isMcp && mcpInfo.serverId && (
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.2 rounded text-[9px] font-mono uppercase bg-primary/10 text-primary border border-primary/20 flex-shrink-0">
+              <Server size={8} />
+              <span>{mcpInfo.serverId}</span>
+            </span>
+          )}
+
+          {!mcpInfo.isMcp && label.toLowerCase() !== tool.tool.toLowerCase() && (
             <span className="text-[10px] font-mono text-muted-foreground/60 flex-shrink-0 hidden sm:inline">{tool.tool}</span>
           )}
 
@@ -292,6 +343,16 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
 
       {isOpen && (
         <div className="p-3 space-y-2 border-t border-border/60 bg-background/60">
+          {mcpInfo.isMcp && (
+            <div className="p-2 rounded bg-primary/5 border border-primary/20 flex items-center justify-between text-[10px] font-mono">
+              <div className="flex items-center gap-1.5 text-primary font-semibold">
+                <Server size={11} />
+                <span>Protocol: Model Context Protocol (MCP)</span>
+              </div>
+              <span className="text-muted-foreground">Server: {mcpInfo.serverId}</span>
+            </div>
+          )}
+
           {preview && (
             <div>
               <div className="text-[9px] font-mono text-muted-foreground uppercase mb-1">Summary</div>

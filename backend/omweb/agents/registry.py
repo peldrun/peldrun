@@ -88,6 +88,7 @@ class AgentRegistry:
                     "ask_human",
                     "mcp",
                 ],
+                "mcp_servers": [],
                 "max_steps": 30,
                 "is_builtin": True,
                 "status": "active",
@@ -355,6 +356,26 @@ class AgentRegistry:
                 if "extra_tools" in saved:
                     effective["extra_tools"] = list(saved["extra_tools"])
 
+        # ── Channel 3: MCP server overrides ──────────────────────────
+        saved_settings = self._load_settings().get(agent_id, {})
+        manifest_mcp = [str(s) for s in (manifest.get("mcp_servers") or [])]
+        if isinstance(saved_settings, dict):
+            disabled_mcp = list(saved_settings.get("disabled_mcp_servers") or [])
+            extra_mcp = list(saved_settings.get("extra_mcp_servers") or [])
+            effective["disabled_mcp_servers"] = disabled_mcp
+            effective["extra_mcp_servers"] = extra_mcp
+
+            dis_set = set(disabled_mcp)
+            eff_mcp = [s for s in manifest_mcp if s not in dis_set]
+            for s in extra_mcp:
+                if s not in dis_set and s not in eff_mcp:
+                    eff_mcp.append(s)
+            effective["effective_mcp_servers"] = eff_mcp
+            effective["mcp_servers"] = eff_mcp
+        else:
+            effective["effective_mcp_servers"] = list(manifest_mcp)
+            effective["mcp_servers"] = list(manifest_mcp)
+
         return effective
 
     # ─────────────────────────────────────────────────────────────
@@ -465,6 +486,56 @@ class AgentRegistry:
 
         return self.get_agent_tools_state(agent_id)
 
+    # ─────────────────────────────────────────────────────────────
+    # MCP server overrides — per-agent protocol server selection
+    # ─────────────────────────────────────────────────────────────
+
+    def get_agent_mcp_state(self, agent_id: str) -> Dict[str, Any]:
+        """Return the current MCP server selection state for an agent."""
+        manifest = self.get_agent(agent_id)
+        manifest_servers = [str(s) for s in (manifest.get("mcp_servers") or [])]
+
+        saved = self._load_settings().get(agent_id, {})
+        disabled_raw = [str(s) for s in (saved.get("disabled_mcp_servers") or [])]
+        extra_raw = [str(s) for s in (saved.get("extra_mcp_servers") or [])]
+
+        manifest_set = set(manifest_servers)
+        disabled_set = set(disabled_raw) & manifest_set
+        extra_set = set(extra_raw) - manifest_set
+
+        effective: List[str] = [
+            s for s in manifest_servers if s not in disabled_set
+        ]
+        for s in extra_set:
+            if s not in effective:
+                effective.append(s)
+
+        return {
+            "manifest_mcp_servers": manifest_servers,
+            "disabled_mcp_servers": sorted(disabled_set),
+            "extra_mcp_servers": sorted(extra_set),
+            "effective_mcp_servers": effective,
+        }
+
+    def save_agent_mcp_state(
+        self,
+        agent_id: str,
+        disabled: List[str],
+        extra: List[str],
+    ) -> Dict[str, Any]:
+        """Persist MCP server overrides for an agent atomically and return new state."""
+        # Validate existence
+        self.get_agent(agent_id)
+
+        data = self._load_settings()
+        existing = dict(data.get(agent_id, {}))
+        existing["disabled_mcp_servers"] = list(disabled)
+        existing["extra_mcp_servers"] = list(extra)
+        data[agent_id] = existing
+        self._save_settings(data)
+
+        return self.get_agent_mcp_state(agent_id)
+
     def toggle_agent_status(self, agent_id: str) -> Dict[str, Any]:
         """Toggle an agent between active and disabled states."""
         normalized_id = (agent_id or "").strip().lower()
@@ -507,6 +578,7 @@ class AgentRegistry:
         data["is_builtin"] = False
         data["status"] = "active"
         data.setdefault("tools", ["python_execute", "bash", "str_replace_editor"])
+        data.setdefault("mcp_servers", [])
 
         target = self.custom_dir / f"{aid}.json"
         target.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")

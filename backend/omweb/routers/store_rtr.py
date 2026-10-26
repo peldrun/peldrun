@@ -40,6 +40,7 @@ except ImportError:  # pragma: no cover - defensive fallback
     _JSONSCHEMA_AVAILABLE = False
 
 from omweb.agents.registry import AgentNotFoundError, agent_registry
+from omweb.extensions.bundle_manager import McpBundleError, mcp_bundle_manager
 from omweb.extensions.registry import extension_registry
 from omweb.tools.bundles.errors import BundleError
 from omweb.tools.registry import tool_registry
@@ -54,6 +55,7 @@ class AgentUpsertRequest(BaseModel):
     description: Optional[str] = ""
     system_prompt: str = Field(..., min_length=5)
     tools: List[str] = Field(default_factory=list)
+    mcp_servers: List[str] = Field(default_factory=list)
     max_steps: Optional[int] = Field(default=30, ge=1, le=100)
 
 
@@ -244,6 +246,121 @@ async def update_agent_tools_endpoint(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    return {"status": "ok", **state}
+
+
+# ─────────────────────────────────────────────────────────────────
+# Agent MCP — per-agent MCP server selection & activation
+# ─────────────────────────────────────────────────────────────────
+
+class _AgentMcpPayload(BaseModel):
+    """Request body for PUT /agents/{id}/mcp."""
+    disabled_mcp_servers: List[str] = Field(default_factory=list)
+    extra_mcp_servers: List[str] = Field(default_factory=list)
+
+
+@router.get("/agents/{agent_id}/mcp")
+async def get_agent_mcp_endpoint(agent_id: str) -> Dict[str, Any]:
+    """Return the current MCP server selection for an agent."""
+    try:
+        agent = agent_registry.get_agent(agent_id)
+    except AgentNotFoundError:
+        raise HTTPException(
+            status_code=404, detail=f"Agent '{agent_id}' not found"
+        )
+
+    manifest_mcp = list(agent.get("mcp_servers") or [])
+
+    if hasattr(agent_registry, "get_agent_mcp_state") and callable(agent_registry.get_agent_mcp_state):
+        mcp_state = agent_registry.get_agent_mcp_state(agent_id)
+    else:
+        # Fallback to persistent agent settings container
+        settings = agent_registry.get_agent_settings(agent_id) if hasattr(agent_registry, "get_agent_settings") else {}
+        saved = settings.get("_mcp_state", {}) if isinstance(settings, dict) else {}
+        disabled = list(saved.get("disabled_mcp_servers", []))
+        extra = list(saved.get("extra_mcp_servers", []))
+        effective = [s for s in manifest_mcp if s not in disabled] + [s for s in extra if s not in disabled]
+        mcp_state = {
+            "manifest_mcp_servers": manifest_mcp,
+            "disabled_mcp_servers": disabled,
+            "extra_mcp_servers": extra,
+            "effective_mcp_servers": list(dict.fromkeys(effective)),
+        }
+
+    manifest_set = set(mcp_state.get("manifest_mcp_servers", []))
+    available_servers: List[Dict[str, Any]] = []
+    for s in extension_registry.list_mcp_servers():
+        sid = s.get("id")
+        if not sid:
+            continue
+        available_servers.append({
+            "id": sid,
+            "name": s.get("name", sid),
+            "description": s.get("description", ""),
+            "transport": s.get("transport", "stdio"),
+            "status": s.get("status", "ready"),
+            "is_builtin": bool(s.get("is_builtin", False)),
+            "is_bundle": bool(s.get("is_bundle", False)),
+            "in_manifest": sid in manifest_set,
+        })
+
+    return {
+        "status": "ok",
+        **mcp_state,
+        "available_mcp_servers": available_servers,
+    }
+
+
+@router.put("/agents/{agent_id}/mcp")
+async def update_agent_mcp_endpoint(
+    agent_id: str, req: _AgentMcpPayload
+) -> Dict[str, Any]:
+    """Persist MCP server overrides for an agent."""
+    try:
+        agent = agent_registry.get_agent(agent_id)
+    except AgentNotFoundError:
+        raise HTTPException(
+            status_code=404, detail=f"Agent '{agent_id}' not found"
+        )
+
+    manifest_mcp = list(agent.get("mcp_servers") or [])
+    available_ids = {s.get("id") for s in extension_registry.list_mcp_servers() if s.get("id")}
+
+    for s in req.disabled_mcp_servers:
+        if s not in manifest_mcp:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot disable '{s}' — not in manifest MCP servers.",
+            )
+
+    for s in req.extra_mcp_servers:
+        if s not in available_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot add '{s}' — not a registered store MCP server.",
+            )
+
+    if hasattr(agent_registry, "save_agent_mcp_state") and callable(agent_registry.save_agent_mcp_state):
+        state = agent_registry.save_agent_mcp_state(
+            agent_id, req.disabled_mcp_servers, req.extra_mcp_servers
+        )
+    else:
+        disabled = list(req.disabled_mcp_servers)
+        extra = list(req.extra_mcp_servers)
+        effective = [s for s in manifest_mcp if s not in disabled] + [s for s in extra if s not in disabled]
+        state = {
+            "manifest_mcp_servers": manifest_mcp,
+            "disabled_mcp_servers": disabled,
+            "extra_mcp_servers": extra,
+            "effective_mcp_servers": list(dict.fromkeys(effective)),
+        }
+        try:
+            current_settings = agent_registry.get_agent_settings(agent_id)
+            current_settings["_mcp_state"] = state
+            agent_registry.save_agent_settings(agent_id, current_settings)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Failed to persist MCP state: {exc}")
 
     return {"status": "ok", **state}
 
@@ -1117,7 +1234,7 @@ async def delete_custom_tool(tool_id: str):
 
 
 # ─────────────────────────────────────────────────────────────────
-# Extensions — catalog & upload
+# Extensions — catalog, ZIP bundles & manifest upload, deletion
 # ─────────────────────────────────────────────────────────────────
 
 @router.get("/extensions")
@@ -1126,21 +1243,59 @@ async def list_all_extensions():
 
 
 @router.post("/extensions/upload")
-async def upload_extension_json(file: UploadFile = File(...)):
-    filename = file.filename or "mcp_extension.json"
-    if not filename.endswith(".json"):
-        raise HTTPException(
-            status_code=400,
-            detail="Extensions must be uploaded as JSON manifest files.",
-        )
-
+async def upload_extension_file(file: UploadFile = File(...)):
+    """
+    Upload an MCP server manifest (.json) or a standalone MCP bundle (.zip).
+    ZIP bundles are unpacked into an isolated directory and registered automatically.
+    """
+    filename = file.filename or "mcp_extension"
     content = await file.read()
-    try:
-        data = json.loads(content.decode("utf-8"))
-        saved = extension_registry.save_extension(data)
-        return {"status": "ok", "extension": saved}
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Failed to parse extension JSON: {e}",
-        )
+
+    # Case A: Standalone MCP bundle archive (.zip)
+    if filename.lower().endswith(".zip"):
+        try:
+            result = mcp_bundle_manager.install_bundle(content, source_filename=filename)
+            return {"status": "ok", "bundle": result, "extension": result.get("server")}
+        except McpBundleError as err:
+            raise HTTPException(status_code=400, detail=err.to_dict())
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to install MCP bundle: {exc}"
+            )
+
+    # Case B: Standard MCP server manifest (.json)
+    if filename.lower().endswith(".json"):
+        try:
+            data = json.loads(content.decode("utf-8"))
+            saved = extension_registry.save_extension(data)
+            return {"status": "ok", "extension": saved}
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to parse extension JSON: {e}",
+            )
+
+    raise HTTPException(
+        status_code=400,
+        detail="Extensions must be uploaded as .json manifest files or .zip bundle archives.",
+    )
+
+
+@router.delete("/extensions/{ext_id}")
+async def delete_extension_endpoint(ext_id: str):
+    """Delete a custom extension or MCP bundle from the Store catalog."""
+    ext = extension_registry.get_extension(ext_id)
+    if not ext:
+        raise HTTPException(status_code=404, detail=f"Extension '{ext_id}' not found.")
+
+    if ext.get("is_builtin"):
+        raise HTTPException(status_code=400, detail="Cannot delete built-in extensions.")
+
+    if ext.get("is_bundle"):
+        await mcp_bundle_manager.delete_bundle(ext_id)
+        return {"status": "ok", "message": f"MCP bundle '{ext_id}' deleted successfully."}
+
+    success = extension_registry.delete_extension(ext_id)
+    if not success:
+        raise HTTPException(status_code=400, detail="Failed to delete extension.")
+    return {"status": "ok", "message": f"Extension '{ext_id}' deleted successfully."}

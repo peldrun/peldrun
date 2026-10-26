@@ -21,10 +21,14 @@ export interface ExtensionsSectionProps {
   togglingExtId: string | null;
   /** Currently testing extension id (or null). */
   testingExtId: string | null;
+  /** Currently deleting extension id (or null). */
+  deletingExtId?: string | null;
   /** Per-extension last test result. */
   testResults: McpTestResultMap;
   onToggleExtension: (extId: string) => void;
   onTestExtension: (extId: string) => void;
+  onConfigureExtension?: (extension: ExtensionDefinition) => void;
+  onDeleteExtension?: (extId: string) => void;
 }
 
 /**
@@ -43,7 +47,7 @@ export function getExtensionsHeaderConfig(ctx: {
     actions: [
       {
         id: "upload-mcp",
-        label: "Upload MCP (.json)",
+        label: "Upload MCP (.json / .zip)",
         icon: Upload,
         variant: "primary",
         onClick: ctx.onUploadMCP,
@@ -69,9 +73,12 @@ export function ExtensionsSection({
   searchQuery,
   togglingExtId,
   testingExtId,
+  deletingExtId,
   testResults,
   onToggleExtension,
   onTestExtension,
+  onConfigureExtension,
+  onDeleteExtension,
 }: ExtensionsSectionProps) {
   const filteredExtensions = useMemo(() => {
     const q = searchQuery.toLowerCase().trim();
@@ -91,7 +98,7 @@ export function ExtensionsSection({
           No extensions found
         </h3>
         <p className="text-xs text-muted-foreground mt-1">
-          Upload an MCP server manifest (.json) to connect external tool
+          Upload an MCP server manifest (.json) or bundle (.zip) to connect external tool
           protocols.
         </p>
       </div>
@@ -106,9 +113,12 @@ export function ExtensionsSection({
           extension={ex}
           isToggling={togglingExtId === ex.id}
           isTesting={testingExtId === ex.id}
+          isDeleting={deletingExtId === ex.id}
           testResult={testResults[ex.id]}
           onToggle={onToggleExtension}
           onTest={onTestExtension}
+          onConfigure={onConfigureExtension}
+          onDelete={onDeleteExtension}
         />
       ))}
     </div>

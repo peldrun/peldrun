@@ -8,6 +8,8 @@ import {
   Cpu,
   Loader2,
   Play,
+  Settings,
+  Trash2,
   XCircle,
 } from "lucide-react";
 import type { ExtensionDefinition } from "@/lib/types";
@@ -24,10 +26,14 @@ export interface ExtensionCardProps {
   isToggling: boolean;
   /** True while a connectivity test for this specific extension is running. */
   isTesting: boolean;
+  /** True while a deletion request for this specific extension is in flight. */
+  isDeleting?: boolean;
   /** Last stored test result, if any. */
   testResult?: McpTestResult;
   onToggle: (extId: string) => void;
   onTest: (extId: string) => void;
+  onConfigure?: (extension: ExtensionDefinition) => void;
+  onDelete?: (extId: string) => void;
 }
 
 /**
@@ -43,11 +49,16 @@ export function ExtensionCard({
   extension,
   isToggling,
   isTesting,
+  isDeleting = false,
   testResult,
   onToggle,
   onTest,
+  onConfigure,
+  onDelete,
 }: ExtensionCardProps) {
   const isActive = extension.status === "active";
+  const isBundle = Boolean((extension as any).is_bundle);
+  const isBuiltin = Boolean((extension as any).is_builtin);
 
   return (
     <div
@@ -62,9 +73,23 @@ export function ExtensionCard({
             <div className="p-2 rounded-lg bg-primary/10 text-primary border border-primary/20 shrink-0">
               <Cpu size={16} />
             </div>
-            <h3 className="text-sm font-bold text-foreground truncate">
-              {extension.name}
-            </h3>
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <h3 className="text-sm font-bold text-foreground truncate">
+                  {extension.name}
+                </h3>
+                {isBuiltin && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground font-mono">
+                    builtin
+                  </span>
+                )}
+                {isBundle && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary font-mono border border-primary/20">
+                    bundle
+                  </span>
+                )}
+              </div>
+            </div>
           </div>
 
           <button
@@ -117,8 +142,8 @@ export function ExtensionCard({
         )}
       </div>
 
-      {/* Footer: status dot + test button */}
-      <div className="pt-3 border-t border-border flex items-center justify-between">
+      {/* Footer: status dot + action buttons */}
+      <div className="pt-3 border-t border-border flex items-center justify-between gap-2">
         <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
           <span
             className={`h-1.5 w-1.5 rounded-full ${
@@ -128,19 +153,50 @@ export function ExtensionCard({
           <span className="capitalize">{extension.status}</span>
         </div>
 
-        <button
-          type="button"
-          onClick={() => onTest(extension.id)}
-          disabled={isTesting}
-          className="flex items-center gap-1 text-[11px] px-2.5 py-1 rounded bg-secondary hover:bg-secondary/80 text-secondary-foreground font-medium transition cursor-pointer disabled:opacity-60"
-        >
-          {isTesting ? (
-            <Loader2 size={11} className="animate-spin text-primary" />
-          ) : (
-            <Play size={10} className="text-primary fill-primary" />
+        <div className="flex items-center gap-1.5">
+          {onConfigure && (
+            <button
+              type="button"
+              onClick={() => onConfigure(extension)}
+              className="flex items-center gap-1 text-[11px] px-2.5 py-1 rounded border border-border bg-card hover:bg-muted text-foreground transition cursor-pointer font-medium"
+              title="Configure MCP Server"
+            >
+              <Settings size={11} className="text-muted-foreground" />
+              <span>Settings</span>
+            </button>
           )}
-          <span>Test Connection</span>
-        </button>
+
+          <button
+            type="button"
+            onClick={() => onTest(extension.id)}
+            disabled={isTesting}
+            className="flex items-center gap-1 text-[11px] px-2.5 py-1 rounded bg-secondary hover:bg-secondary/80 text-secondary-foreground font-medium transition cursor-pointer disabled:opacity-60"
+          >
+            {isTesting ? (
+              <Loader2 size={11} className="animate-spin text-primary" />
+            ) : (
+              <Play size={10} className="text-primary fill-primary" />
+            )}
+            <span>Test Connection</span>
+          </button>
+
+          {!isBuiltin && onDelete && (
+            <button
+              type="button"
+              onClick={() => onDelete(extension.id)}
+              disabled={isDeleting}
+              className="p-1.5 rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition cursor-pointer disabled:opacity-50"
+              title="Delete MCP Server / Purge Bundle"
+              aria-label="Delete MCP Server"
+            >
+              {isDeleting ? (
+                <Loader2 size={13} className="animate-spin text-destructive" />
+              ) : (
+                <Trash2 size={13} />
+              )}
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );

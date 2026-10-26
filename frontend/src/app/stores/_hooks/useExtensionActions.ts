@@ -30,13 +30,24 @@ export interface UseExtensionActionsResult {
   testingExtId: string | null;
   testResults: McpTestResultMap;
   handleTestExtension: (extId: string) => Promise<void>;
+
+  // Deletion lifecycle
+  deletingExtId: string | null;
+  handleDeleteExtension: (extId: string) => Promise<void>;
+
+  // Configuration modal
+  configuringExtension: ExtensionDefinition | null;
+  isConfigModalOpen: boolean;
+  handleOpenConfigure: (ext: ExtensionDefinition) => void;
+  handleCloseConfigure: () => void;
 }
 
 /**
- * Encapsulates every action related to the Extensions & MCP section:
- *  - enabling/disabling an MCP server
- *  - running a one-shot connectivity test and storing its result
- *    per-extension so the UI can render an inline status box.
+ * Encapsulates actions related to the Extensions & MCP section:
+ *  - Enabling/disabling an MCP server
+ *  - Running a one-shot connectivity test with dynamic tool discovery
+ *  - Deleting/purging an MCP bundle or custom server
+ *  - Configuring settings and environment variables
  */
 export function useExtensionActions({
   extensions,
@@ -44,12 +55,12 @@ export function useExtensionActions({
 }: UseExtensionActionsArgs): UseExtensionActionsResult {
   const [togglingExtId, setTogglingExtId] = useState<string | null>(null);
   const [testingExtId, setTestingExtId] = useState<string | null>(null);
+  const [deletingExtId, setDeletingExtId] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<McpTestResultMap>({});
+  const [configuringExtension, setConfiguringExtension] = useState<ExtensionDefinition | null>(null);
 
   /**
    * Toggle the status of an MCP server.
-   * The server's new status is taken from the response so we stay in
-   * sync with backend-side transitions (e.g. "ready" vs "active").
    */
   const handleToggleExtension = useCallback(
     async (extId: string) => {
@@ -83,10 +94,6 @@ export function useExtensionActions({
 
   /**
    * Run an MCP connectivity test against the backend.
-   * The result is stored per-extension so the card can render an
-   * inline "success"/"failure" box. On network failure the stored
-   * result reflects the transport error so the user sees something
-   * actionable instead of a silent no-op.
    */
   const handleTestExtension = useCallback(async (extId: string) => {
     setTestingExtId(extId);
@@ -124,11 +131,51 @@ export function useExtensionActions({
     }
   }, []);
 
+  /**
+   * Delete or purge an MCP server / bundle.
+   */
+  const handleDeleteExtension = useCallback(
+    async (extId: string) => {
+      setDeletingExtId(extId);
+      try {
+        const res = await fetch(getApiUrl(`/api/mcp/servers/${extId}`), {
+          method: "DELETE",
+        });
+        if (res.ok) {
+          setExtensions((prev) => prev.filter((e) => e.id !== extId));
+          showToast.success("MCP Server Removed", `${extId} and associated bundle files purged.`);
+        } else {
+          const err = await res.json().catch(() => ({}));
+          showToast.error("Delete Failed", err.detail || "Failed to delete MCP server.");
+        }
+      } catch (err: any) {
+        showToast.error("Network Error", err.message || "Could not delete MCP server.");
+      } finally {
+        setDeletingExtId(null);
+      }
+    },
+    [setExtensions]
+  );
+
+  const handleOpenConfigure = useCallback((ext: ExtensionDefinition) => {
+    setConfiguringExtension(ext);
+  }, []);
+
+  const handleCloseConfigure = useCallback(() => {
+    setConfiguringExtension(null);
+  }, []);
+
   return {
     togglingExtId,
     handleToggleExtension,
     testingExtId,
     testResults,
     handleTestExtension,
+    deletingExtId,
+    handleDeleteExtension,
+    configuringExtension,
+    isConfigModalOpen: Boolean(configuringExtension),
+    handleOpenConfigure,
+    handleCloseConfigure,
   };
 }

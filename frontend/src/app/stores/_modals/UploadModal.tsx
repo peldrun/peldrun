@@ -3,7 +3,7 @@
 "use client";
 
 import React from "react";
-import { FileCode2, FileText, Loader2, Upload, X } from "lucide-react";
+import { Archive, FileCode2, FileText, Loader2, Upload, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { UploadCategory } from "../_types/store";
 
@@ -51,8 +51,8 @@ export function UploadModal({
   if (!open) return null;
 
   const isTool = category === "tool";
-  const accept = isTool ? ".py,.json" : ".json";
-  const title = isTool ? "Upload Custom Tool" : "Upload MCP Extension";
+  const accept = isTool ? ".py,.json" : ".json,.zip";
+  const title = isTool ? "Upload Custom Tool" : "Upload MCP Server / Bundle";
 
   /**
    * Handle the file input's change event and forward the picked file
@@ -117,7 +117,7 @@ export function UploadModal({
                     : "bg-muted/40 border-border text-muted-foreground hover:text-foreground"
                 }`}
               >
-                MCP Server (.json)
+                MCP Server / Bundle (.json / .zip)
               </button>
             </div>
           </div>
@@ -138,6 +138,8 @@ export function UploadModal({
           >
             {isTool ? (
               <FileCode2 size={28} className="text-primary mb-2 opacity-80" />
+            ) : selectedFile?.name.toLowerCase().endsWith(".zip") ? (
+              <Archive size={28} className="text-primary mb-2 opacity-80" />
             ) : (
               <FileText size={28} className="text-primary mb-2 opacity-80" />
             )}
@@ -154,10 +156,12 @@ export function UploadModal({
             ) : (
               <div>
                 <span className="text-xs font-semibold text-foreground block">
-                  Click to choose {isTool ? ".py or .json" : ".json"} file
+                  Click to choose {isTool ? ".py or .json" : ".json or .zip bundle"} file
                 </span>
                 <span className="text-[10px] text-muted-foreground mt-0.5 block">
-                  File will be verified and hot-reloaded automatically.
+                  {isTool
+                    ? "File will be verified and hot-reloaded automatically."
+                    : "Manifests and .zip bundles are extracted into isolated folders and registered automatically."}
                 </span>
               </div>
             )}

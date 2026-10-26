@@ -2,7 +2,7 @@
   "id": "mcp_filesystem",
   "name": "MCP Local Filesystem",
   "type": "mcp_server",
-  "status": "active",
+  "status": "ready",
   "command": "npx -y @modelcontextprotocol/server-filesystem",
   "description": "Exposes local filesystem directories safely to agents.",
   "is_builtin": false,

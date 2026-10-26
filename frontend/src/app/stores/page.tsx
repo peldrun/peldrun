@@ -37,6 +37,7 @@ import {
 
 import { AgentBuilderModal } from "./_modals/AgentBuilderModal";
 import { UploadModal } from "./_modals/UploadModal";
+import { MCPSettingsModal } from "./_modals/MCPSettingsModal";
 
 /**
  * Store page orchestrator.
@@ -188,9 +189,12 @@ export default function StoresPage() {
                   searchQuery={searchQuery}
                   togglingExtId={extensionActions.togglingExtId}
                   testingExtId={extensionActions.testingExtId}
+                  deletingExtId={extensionActions.deletingExtId}
                   testResults={extensionActions.testResults}
                   onToggleExtension={extensionActions.handleToggleExtension}
                   onTestExtension={extensionActions.handleTestExtension}
+                  onConfigureExtension={extensionActions.handleOpenConfigure}
+                  onDeleteExtension={extensionActions.handleDeleteExtension}
                 />
               )}
             </div>
@@ -244,6 +248,15 @@ export default function StoresPage() {
         bundle={detailsBundle}
         onClose={() => setDetailsBundle(null)}
         onUpdated={reload}
+      />
+
+      {/* MCP server configuration modal */}
+      <MCPSettingsModal
+        open={extensionActions.isConfigModalOpen}
+        serverId={extensionActions.configuringExtension?.id ?? null}
+        serverName={extensionActions.configuringExtension?.name ?? ""}
+        onClose={extensionActions.handleCloseConfigure}
+        onSaved={reload}
       />
     </div>
   );

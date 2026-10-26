@@ -12,9 +12,12 @@ import {
   Terminal,
   Play,
   Loader2,
-  Wrench
+  Settings,
+  Trash2,
+  Wrench,
 } from "lucide-react";
 import { showToast } from "@/components/ui/ToastNotification";
+import { MCPSettingsModal } from "@/app/stores/_modals/MCPSettingsModal";
 
 interface MCPTabProps {
   config: any;
@@ -31,6 +34,7 @@ interface MCPServerInfo {
   transport?: string;
   description?: string;
   is_builtin?: boolean;
+  is_bundle?: boolean;
 }
 
 export function MCPTab({ config, setConfig }: MCPTabProps) {
@@ -39,7 +43,32 @@ export function MCPTab({ config, setConfig }: MCPTabProps) {
   const [loading, setLoading] = useState<boolean>(true);
   const [togglingId, setTogglingId] = useState<string | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [configuringServer, setConfiguringServer] = useState<MCPServerInfo | null>(null);
   const [testResults, setTestResults] = useState<Record<string, { ok: boolean; message: string }>>({});
+
+  const handleDeleteServer = async (serverId: string) => {
+    if (!confirm(`Are you sure you want to delete MCP server '${serverId}' and purge all its bundle files?`)) {
+      return;
+    }
+    setDeletingId(serverId);
+    try {
+      const res = await fetch(getApiUrl(`/api/mcp/servers/${serverId}`), {
+        method: "DELETE",
+      });
+      if (res.ok) {
+        showToast.success("MCP Server Removed", `${serverId} purged successfully.`);
+        fetchMCPServers();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        showToast.error("Delete Failed", err.detail || "Failed to delete server.");
+      }
+    } catch (err: any) {
+      showToast.error("Network Error", err.message || "Failed to reach backend.");
+    } finally {
+      setDeletingId(null);
+    }
+  };
 
   const getApiUrl = (endpoint: string) => {
     if (typeof window !== "undefined" && (window.location.port === "3088" || window.location.port === "3000")) {
@@ -141,7 +170,7 @@ export function MCPTab({ config, setConfig }: MCPTabProps) {
             type="button"
             onClick={fetchMCPServers}
             disabled={loading}
-            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md border border-border bg-card hover:bg-accent text-foreground transition-colors"
+            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md border border-border bg-card hover:bg-rby text-black transition-colors"
           >
             <RefreshCw size={12} className={loading ? "animate-spin text-primary" : ""} />
             Refresh
@@ -154,7 +183,7 @@ export function MCPTab({ config, setConfig }: MCPTabProps) {
 
       <div className="w-full max-w-7xl space-y-8 pt-6 m-auto px-4">
         {/* Section 1: Registered MCP Servers */}
-        <div className="p-5 rounded-md border border-border bg-card space-y-5 shadow-sm">
+        <div className="p-5 rounded-md border border-border bg-gigbg space-y-5 shadow-sm">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <Server size={15} className="text-primary" />
@@ -189,7 +218,7 @@ export function MCPTab({ config, setConfig }: MCPTabProps) {
                     key={server.id}
                     className={`rounded-lg border p-4 space-y-3 transition-all ${
                       isActive
-                        ? "border-primary/40 bg-accent/20"
+                        ? "border-rb/20 bg-rb/5 text-black shadow-sm"
                         : "border-border bg-background"
                     }`}
                   >
@@ -201,12 +230,17 @@ export function MCPTab({ config, setConfig }: MCPTabProps) {
                             {server.name}
                           </span>
                           {server.is_builtin && (
-                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground font-mono">
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-muted text-inherit font-mono">
                               builtin
                             </span>
                           )}
+                          {server.is_bundle && (
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary border border-primary/20 font-mono">
+                              bundle
+                            </span>
+                          )}
                         </div>
-                        <p className="text-[11px] text-muted-foreground mt-0.5 line-clamp-2">
+                        <p className="text-[11px] text-inherit mt-0.5 line-clamp-2">
                           {server.description || "No description provided."}
                         </p>
                       </div>
@@ -217,7 +251,7 @@ export function MCPTab({ config, setConfig }: MCPTabProps) {
                         onClick={() => handleToggle(server.id)}
                         disabled={isToggling}
                         className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                          isActive ? "bg-primary" : "bg-muted"
+                          isActive ? "bg-green-300" : "bg-black/50"
                         }`}
                         title={isActive ? "Click to disable" : "Click to activate"}
                       >
@@ -230,7 +264,7 @@ export function MCPTab({ config, setConfig }: MCPTabProps) {
                     </div>
 
                     {/* Command / Target Display */}
-                    <div className="p-2 rounded bg-muted/50 border border-border/50 text-[11px] font-mono text-muted-foreground flex items-center gap-2 overflow-x-auto">
+                    <div className="p-2 rounded bg-muted border border-border/50 text-[11px] font-mono text-black flex items-center gap-2 overflow-x-auto">
                       <Terminal size={12} className="shrink-0 text-primary" />
                       <span className="truncate select-all">
                         {server.command || server.url || "No execution target defined"}
@@ -257,28 +291,57 @@ export function MCPTab({ config, setConfig }: MCPTabProps) {
 
                     {/* Card Actions Footer */}
                     <div className="flex items-center justify-between pt-1 border-t border-border/40">
-                      <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                      <div className="flex items-center gap-1.5 text-[10px] text-card">
                         <span
                           className={`h-1.5 w-1.5 rounded-full ${
                             isActive ? "bg-green-500 animate-pulse" : "bg-muted-foreground"
                           }`}
                         />
-                        <span className="capitalize">{server.status}</span>
+                        <span className="capitalize text-rby">{server.status}</span>
                       </div>
 
-                      <button
-                        type="button"
-                        onClick={() => handleTestConnection(server.id)}
-                        disabled={isTesting}
-                        className="flex items-center gap-1 text-[11px] px-2.5 py-1 rounded bg-secondary hover:bg-secondary/80 text-secondary-foreground font-medium transition-colors"
-                      >
-                        {isTesting ? (
-                          <Loader2 size={11} className="animate-spin text-primary" />
-                        ) : (
-                          <Play size={10} className="text-primary fill-primary" />
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => setConfiguringServer(server)}
+                          className="flex items-center gap-1 text-[11px] px-2.5 py-1 rounded border border-border bg-card hover:bg-muted text-foreground transition font-medium cursor-pointer"
+                          title="Configure Server Settings & Environment"
+                        >
+                          <Settings size={11} className="text-muted-foreground" />
+                          <span>Settings</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => handleTestConnection(server.id)}
+                          disabled={isTesting}
+                          className="flex items-center gap-1 text-[11px] px-2.5 py-1 rounded bg-secondary hover:bg-secondary/80 text-secondary-foreground font-medium transition-colors cursor-pointer"
+                        >
+                          {isTesting ? (
+                            <Loader2 size={11} className="animate-spin text-primary" />
+                          ) : (
+                            <Play size={10} className="text-primary fill-primary" />
+                          )}
+                          Test Connection
+                        </button>
+
+                        {!server.is_builtin && (
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteServer(server.id)}
+                            disabled={deletingId === server.id}
+                            className="p-1 rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition cursor-pointer disabled:opacity-50"
+                            title="Delete Server / Purge Bundle"
+                            aria-label="Delete Server"
+                          >
+                            {deletingId === server.id ? (
+                              <Loader2 size={12} className="animate-spin text-destructive" />
+                            ) : (
+                              <Trash2 size={12} />
+                            )}
+                          </button>
                         )}
-                        Test Connection
-                      </button>
+                      </div>
                     </div>
                   </div>
                 );
@@ -296,7 +359,7 @@ export function MCPTab({ config, setConfig }: MCPTabProps) {
                 {activeTools.map((tool) => (
                   <span
                     key={tool}
-                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-mono bg-accent text-accent-foreground border border-border"
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-mono bg-rby/20 text-black border border-rby"
                   >
                     <Wrench size={10} className="text-primary" />
                     {tool}
@@ -308,8 +371,8 @@ export function MCPTab({ config, setConfig }: MCPTabProps) {
         </div>
 
         {/* Section 2: Agent Delegation [runflow] */}
-        <div className="p-5 rounded-md border border-border bg-card space-y-4 shadow-sm">
-          <span className="text-xs font-semibold text-foreground uppercase tracking-wider block">
+        <div className="p-5 rounded-md border border-border bg-card space-y-4 shadow-sm text-black">
+          <span className="text-xs font-semibold text-inherit uppercase tracking-wider block">
             Agent Delegation [runflow]
           </span>
 
@@ -336,7 +399,7 @@ export function MCPTab({ config, setConfig }: MCPTabProps) {
 
         {/* Section 3: Model Context Protocol [mcp] */}
         <div className="p-5 rounded-md border border-border bg-card space-y-4 shadow-sm">
-          <span className="text-xs font-semibold text-foreground uppercase tracking-wider block">
+          <span className="text-xs font-semibold uppercase tracking-wider block text-inherit">
             Core Reference Module [mcp]
           </span>
 
@@ -362,6 +425,15 @@ export function MCPTab({ config, setConfig }: MCPTabProps) {
           </div>
         </div>
       </div>
+
+      {/* Standalone MCP Server Settings Modal */}
+      <MCPSettingsModal
+        open={configuringServer !== null}
+        serverId={configuringServer?.id ?? null}
+        serverName={configuringServer?.name ?? ""}
+        onClose={() => setConfiguringServer(null)}
+        onSaved={fetchMCPServers}
+      />
     </div>
   );
 }

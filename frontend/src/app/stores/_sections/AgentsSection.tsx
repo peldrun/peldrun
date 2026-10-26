@@ -12,6 +12,7 @@ import {
 } from "../_modals/AgentDetailsModal";
 import { AgentSettingsModal } from "../_modals/AgentSettingsModal";
 import { AgentToolsModal } from "../_modals/AgentToolsModal";
+import { AgentMcpModal } from "../_modals/AgentMcpModal";
 import { getApiUrl } from "../_hooks/useStoreData";
 import type { SectionHeaderConfig } from "../_config/sections";
 import type { AgentFilter } from "../_types/store";
@@ -114,6 +115,7 @@ export function AgentsSection({
     null
   );
   const [toolsAgent, setToolsAgent] = useState<AgentWithMeta | null>(null);
+  const [mcpAgent, setMcpAgent] = useState<AgentWithMeta | null>(null);
 
   /**
    * Open the details modal for an agent.
@@ -160,6 +162,14 @@ export function AgentsSection({
    */
   const openTools = useCallback((agent: AgentManifest) => {
     setToolsAgent(agent as AgentWithMeta);
+  }, []);
+
+  /**
+   * Open the MCP protocol servers modal for an agent to configure
+   * which external tool servers are bound to its execution runtime.
+   */
+  const openMcp = useCallback((agent: AgentManifest) => {
+    setMcpAgent(agent as AgentWithMeta);
   }, []);
 
   const filteredAgents = useMemo(() => {
@@ -209,6 +219,7 @@ export function AgentsSection({
             onViewDetails={openDetails}
             onOpenSettings={openSettings}
             onOpenTools={openTools}
+            onOpenMcp={openMcp}
           />
         ))}
       </div>
@@ -238,6 +249,14 @@ export function AgentsSection({
         agentId={toolsAgent?.id ?? null}
         agentName={toolsAgent?.name ?? ""}
         onClose={() => setToolsAgent(null)}
+      />
+
+      {/* ── Agent MCP modal ────────────────────────────────────── */}
+      <AgentMcpModal
+        open={mcpAgent !== null}
+        agentId={mcpAgent?.id ?? null}
+        agentName={mcpAgent?.name ?? ""}
+        onClose={() => setMcpAgent(null)}
       />
     </div>
   );
