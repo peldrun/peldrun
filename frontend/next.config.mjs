@@ -4,6 +4,7 @@ const nextConfig = {
   experimental: {
     workerThreads: false,
     cpus: 1,
+    agentUpgrade: "latest",
   },
   async rewrites() {
     return [
