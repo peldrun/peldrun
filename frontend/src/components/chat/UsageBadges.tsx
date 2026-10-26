@@ -358,7 +358,7 @@ export function UsageBadgeGroup({
       <button
         type="button"
         onClick={() => setExpanded((current) => !current)}
-        className={`inline-flex items-center justify-center rounded-md border border-border bg-muted/50 text-muted-foreground shadow-xs transition-colors hover:bg-muted/80 hover:text-foreground cursor-pointer ${
+        className={`inline-flex items-center justify-center text-black/50 transition-colors hover:text-foreground cursor-pointer ${
           badgeSize === "sm" ? "h-5 w-5" : "h-6 w-6"
         }`}
         title={

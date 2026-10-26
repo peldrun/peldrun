@@ -201,18 +201,18 @@ export function ChatDeliverable({
             <button
               type="button"
               onClick={() => onRegenerate(turnIndex)}
-              className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-muted/50 hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer transition-all border border-border/40 text-[11px]"
+              className="flex items-center gap-1.5 px-2.5 py-1 text-black/50 hover:text-foreground cursor-pointer transition-all text-[11px]"
               title="Regenerate Response"
             >
               <RotateCcw size={12} className="shrink-0" />
-              <span className="font-mono">Regenerate</span>
+
             </button>
           )}
 
           <button
             type="button"
             onClick={() => onCopy(displayContent, copyId)}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-muted/50 hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer transition-all border border-border/40 text-[11px]"
+            className="flex items-center gap-1.5 px-2.5 py-1 text-black/50 hover:text-foreground cursor-pointer transition-all text-[11px]"
             title="Copy Response"
           >
             {copiedSection === copyId ? (
@@ -223,7 +223,6 @@ export function ChatDeliverable({
             ) : (
               <>
                 <Copy size={12} className="shrink-0" />
-                <span className="font-mono">Copy</span>
               </>
             )}
           </button>
