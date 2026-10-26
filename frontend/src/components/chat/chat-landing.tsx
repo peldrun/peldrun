@@ -278,7 +278,7 @@ export function ChatLanding({
             onChange={(val) => setInputValue(val)}
             contentClassName={
               isExpanded
-                ? "min-h-[220px] max-h-[480px] px-2 py-2 leading-relaxed"
+                ? "min-h-[520px] max-h-[680px] px-2 py-2 leading-relaxed"
                 : "min-h-[72px] max-h-[220px] px-1 py-1 leading-relaxed"
             }
             placeholderClassName={isExpanded ? "px-2 py-2" : "px-1 py-1"}
@@ -317,10 +317,10 @@ export function ChatLanding({
               <button
                 type="button"
                 onClick={() => setWebSearchEnabled((v) => !v)}
-                className={`flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium border transition-all cursor-pointer ${
+                className={`flex items-center text-xs font-medium transition-all cursor-pointer ${
                   webSearchEnabled
-                    ? "bg-primary/15 border-primary/40 text-primary shadow-xs"
-                    : "bg-card hover:bg-muted border-border text-muted-foreground"
+                    ? "text-rb shadow-xs"
+                    : "text-muted-foreground"
                 }`}
                 title={
                   webSearchEnabled
@@ -328,9 +328,8 @@ export function ChatLanding({
                     : "Web Search: disabled. Click to enable for the next message."
                 }
               >
-                <Globe size={12} className={webSearchEnabled ? "text-primary" : "text-muted-foreground"} />
-                <span className="text-[11px]">Web Search</span>
-              </button>
+                <Globe size={14} className={webSearchEnabled ? "text-rb" : "text-muted-foreground"} />
+               </button>
             )}
 
             {/* Agent Selector, Tools, & Delegation (Agent Mode Only) */}

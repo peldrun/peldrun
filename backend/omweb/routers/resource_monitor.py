@@ -260,6 +260,7 @@ async def list_diagnostic_events(
     severity: Optional[DiagnosticSeverity] = Query(None),
     event_type: Optional[DiagnosticEventType] = Query(None),
     limit: int = Query(50, ge=1, le=200),
+    include_resolved: bool = Query(False, description="Include resolved events in the response"),
     service: ResourceMonitorService = Depends(get_resource_monitor_service),
 ) -> List[DiagnosticEventModel]:
     """Query diagnostic alert events regarding leaks, saturation, and orphaned processes."""
@@ -267,7 +268,27 @@ async def list_diagnostic_events(
         severity=severity,
         event_type=event_type,
         limit=limit,
+        include_resolved=include_resolved,
     )
+
+
+@router.post(
+    "/diagnostics/{event_id}/resolve",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Manually resolve a diagnostic event",
+)
+async def resolve_diagnostic_event(
+    event_id: str,
+    service: ResourceMonitorService = Depends(get_resource_monitor_service),
+) -> Response:
+    """Mark a diagnostic alert as resolved so it no longer appears in the active list."""
+    success = service.resolve_diagnostic_event(event_id)
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Active diagnostic event '{event_id}' not found or already resolved.",
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post(

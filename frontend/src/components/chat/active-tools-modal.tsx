@@ -314,14 +314,11 @@ export function ActiveToolsModal() {
       <button
         type="button"
         onClick={() => setIsOpen(true)}
-        className="flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium bg-transparent hover:bg-muted/70 text-foreground transition-all cursor-pointer"
-        title={`View active tools for ${displayName}`}
+        className="flex items-center mr-[5px] text-[11px] font-medium bg-transparent hover:bg-muted/70 text-foreground transition-all cursor-pointer"
+        title={`View [ ${toolCount} ] active tools for ${displayName} `}
       >
-        <Wrench size={12} className="text-primary" />
-        <span className="font-medium hidden sm:inline">Active Tools</span>
-        <span className="px-1.5 py-0.2 rounded-full text-[10px] font-mono bg-primary/10 text-primary border border-primary/20">
-          {toolCount}
-        </span>
+        <Wrench size={13} className="text-primary" />
+
         {disabledCount > 0 && (
           <span className="px-1.5 py-0.2 rounded-full text-[10px] font-mono bg-muted text-muted-foreground border border-border">
             {disabledCount} off

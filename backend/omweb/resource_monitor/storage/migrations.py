@@ -168,6 +168,15 @@ CREATE INDEX IF NOT EXISTS idx_rollups_period ON resource_rollups(period_type, p
 """
 
 
+MIGRATION_V2_SQL = """
+-- Add resolved_at column to track when a diagnostic event's condition was cleared
+ALTER TABLE diagnostic_events ADD COLUMN resolved_at TEXT;
+
+-- Index for fast lookups of active vs resolved events
+CREATE INDEX IF NOT EXISTS idx_diagnostics_resolved ON diagnostic_events(resolved_at);
+"""
+
+
 class MigrationManager:
     """Manages database schema initialization and migrations."""
 
@@ -211,6 +220,23 @@ class MigrationManager:
                         ),
                     )
             logger.info("Resource Monitor schema migration v1 applied successfully.")
+            applied.append(1)
+
+        # Version 2 Migration
+        if 2 not in applied:
+            logger.info("Applying Resource Monitor schema migration v2...")
+            with self._db.get_connection() as conn:
+                with conn:
+                    conn.executescript(MIGRATION_V2_SQL)
+                    conn.execute(
+                        "INSERT INTO schema_migrations (version, applied_at, description) VALUES (?, ?, ?);",
+                        (
+                            2,
+                            datetime.now(timezone.utc).isoformat(),
+                            "Add resolved_at column to diagnostic_events for lifecycle tracking",
+                        ),
+                    )
+            logger.info("Resource Monitor schema migration v2 applied successfully.")
 
     async def async_run_migrations(self) -> None:
         """Asynchronously execute pending migrations via worker thread."""

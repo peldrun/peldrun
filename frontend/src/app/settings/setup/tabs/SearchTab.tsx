@@ -827,9 +827,9 @@ export function SearchTab({
         <motion.div
           {...FADE_UP}
           transition={{ ...FADE_UP.transition, delay: 0.2 }}
-          className="relative p-5 rounded-md border border-border bg-card shadow-sm space-y-5"
+          className="relative p-5 rounded-md bg-gigbg shadow-sm space-y-5"
         >
-          <div className="pointer-events-none absolute top-0 left-0 right-0 h-[2px] rounded-t-md bg-gradient-to-r from-transparent via-primary/60 to-transparent" />
+          <div className="pointer-events-none absolute top-0 left-0 right-0 h-[2px] rounded-t-md from-transparent via-primary/60 to-transparent shadow-sm" />
 
           <div className="flex items-center justify-between flex-wrap gap-3">
             <div className="flex items-center gap-3">
@@ -837,7 +837,7 @@ export function SearchTab({
                 <Sliders size={16} className="text-primary" />
               </div>
               <div>
-                <h3 className="text-xs font-semibold font-heading uppercase tracking-wider">
+                <h3 className="text-md text-black font-semibold font-heading uppercase tracking-wider">
                   Global Orchestration
                 </h3>
                 <p className="text-[11px] text-muted-foreground">
@@ -1025,7 +1025,7 @@ export function SearchTab({
               className={`p-3 rounded-sm border transition-colors ${
                 validationErrors.default_max_results
                   ? "border-rose-500/60 bg-rose-500/5"
-                  : "border-border/60 bg-background/60 hover:border-primary/30"
+                  : "border-border/60 bg-card hover:border-muted/30 hover:shadow-sm"
               }`}
             >
               <label
@@ -1058,7 +1058,7 @@ export function SearchTab({
                 }}
                 aria-invalid={Boolean(validationErrors.default_max_results)}
                 aria-describedby="global-default-max-results-help"
-                className="w-full bg-transparent border-0 outline-none text-xs text-foreground font-mono focus:ring-0"
+                className="w-full border-0 outline-none text-xs text-foreground font-mono focus:ring-0 bg-transparent hover:bg-muted p-1"
               />
             </div>
 
@@ -1266,10 +1266,10 @@ function SummaryCard({ label, value, icon, accent, subtitle, delay = 0 }: any) {
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.5, delay, ease: [0.16, 1, 0.3, 1] }}
       whileHover={{ y: -4, transition: { duration: 0.2 } }}
-      className="group relative p-5 rounded-md border border-border bg-card overflow-hidden shadow-sm hover:shadow-lg hover:border-primary/30 transition-all"
+      className="group relative p-5 rounded-md border border-card bg-card overflow-hidden shadow-sm hover:shadow-lg hover:border-primary/30 transition-all"
     >
       <div
-        className="absolute top-0 left-0 right-0 h-[2px] opacity-60 group-hover:opacity-100 transition-opacity"
+        className="absolute top-0 left-0 right-0 h-[1px] opacity-30 group-hover:opacity-100 transition-opacity"
         style={{
           background: `linear-gradient(90deg, transparent 0%, ${accent} 50%, transparent 100%)`,
         }}
@@ -1318,7 +1318,7 @@ function CompactField({
   onChange: (v: number) => void;
 }) {
   return (
-    <div className="p-3 rounded-sm border border-border/60 bg-background/60 hover:border-primary/30 transition-colors">
+    <div className="p-3 rounded-sm border border-border/60 bg-card hover:border-muted/30 hover:shadow-sm transition-colors flex flex-col justify-between">
       <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-1.5">
         {label}
       </label>
@@ -1333,7 +1333,7 @@ function CompactField({
             Number.isNaN(parsed) ? min : Math.max(min, Math.min(max, parsed))
           );
         }}
-        className="w-full bg-transparent border-0 outline-none text-xs text-foreground font-mono focus:ring-0"
+        className="w-full bg-transparent border-0 outline-none text-xs text-foreground font-mono focus:ring-0 p-1 hover:bg-muted"
       />
     </div>
   );
@@ -1351,7 +1351,7 @@ function CompactTextField({
   placeholder?: string;
 }) {
   return (
-    <div className="p-3 rounded-sm border border-border/60 bg-background/60 hover:border-primary/30 transition-colors">
+    <div className="p-3 rounded-sm border border-border/60 bg-card hover:border-muted/30 hover:shadow-sm transition-colors flex flex-col justify-between">
       <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-1.5">
         {label}
       </label>
@@ -1360,7 +1360,7 @@ function CompactTextField({
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
-        className="w-full bg-transparent border-0 outline-none text-xs text-foreground font-mono focus:ring-0"
+        className="w-full bg-transparent border-0 outline-none text-xs text-foreground font-mono focus:ring-0 p-1 hover:bg-muted"
       />
     </div>
   );

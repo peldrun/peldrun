@@ -70,7 +70,6 @@ timeout = 15
 cost_per_query = 0
 safe_search = "moderate"
 estimated_cost_per_query = 0
-max_results = 20
 
 [search.searxng]
 enabled = false

@@ -254,6 +254,7 @@ export const diagnosticEventSchema = z.object({
   severity: diagnosticSeveritySchema,
   message: z.string(),
   details_json: z.string().nullable(),
+  resolved_at: isoString.nullable().optional(),
 });
 
 // ---------------------------------------------------------------------------

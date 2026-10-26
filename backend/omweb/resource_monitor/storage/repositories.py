@@ -625,8 +625,8 @@ class MonitorRepository:
         query = """
             INSERT INTO diagnostic_events (
                 event_id, session_id, run_id, recorded_at,
-                event_type, severity, message, details_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                event_type, severity, message, details_json, resolved_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         params = (
             event.event_id,
@@ -637,6 +637,7 @@ class MonitorRepository:
             event.severity.value,
             event.message,
             event.details_json,
+            event.resolved_at,
         )
         self._db.execute_write(query, params)
 
@@ -645,6 +646,7 @@ class MonitorRepository:
         severity: Optional[DiagnosticSeverity] = None,
         event_type: Optional[DiagnosticEventType] = None,
         limit: int = 50,
+        include_resolved: bool = False,
     ) -> List[DiagnosticEventModel]:
         """Query diagnostic alert events with optional filters."""
         conditions: List[str] = []
@@ -656,6 +658,8 @@ class MonitorRepository:
         if event_type:
             conditions.append("event_type = ?")
             params.append(event_type.value)
+        if not include_resolved:
+            conditions.append("resolved_at IS NULL")
 
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         query = f"""
@@ -677,9 +681,39 @@ class MonitorRepository:
                 severity=DiagnosticSeverity(r["severity"]),
                 message=r["message"],
                 details_json=r["details_json"],
+                resolved_at=r["resolved_at"],
             )
             for r in rows
         ]
+
+    def resolve_diagnostic_event(self, event_id: str) -> bool:
+        """Mark a specific diagnostic event as resolved."""
+        query = "UPDATE diagnostic_events SET resolved_at = ? WHERE event_id = ? AND resolved_at IS NULL;"
+        now_iso = datetime.now(timezone.utc).isoformat()
+        rows_affected = self._db.execute_write(query, (now_iso, event_id))
+        return rows_affected > 0
+
+    def resolve_events_by_type(self, event_type: DiagnosticEventType) -> int:
+        """Mark all active events of a specific type as resolved (bulk operation)."""
+        query = "UPDATE diagnostic_events SET resolved_at = ? WHERE event_type = ? AND resolved_at IS NULL;"
+        now_iso = datetime.now(timezone.utc).isoformat()
+        return self._db.execute_write(query, (now_iso, event_type.value))
+
+    def resolve_orphan_event_by_pid(self, pid: int) -> int:
+        """Mark ORPHAN_PROCESS events containing the given PID as resolved."""
+        query = """
+            UPDATE diagnostic_events
+            SET resolved_at = ?
+            WHERE event_type = ?
+              AND resolved_at IS NULL
+              AND details_json LIKE ?;
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+        pid_pattern = f'%"pid": {pid}%'
+        return self._db.execute_write(
+            query,
+            (now_iso, DiagnosticEventType.ORPHAN_PROCESS.value, pid_pattern)
+        )
 
     # ========================================================================
     # 8. Resource Rollups Repository

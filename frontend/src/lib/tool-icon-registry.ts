@@ -143,3 +143,94 @@ export async function fetchToolManifest(toolId: string): Promise<ToolManifest | 
     return null;
   }
 }
+
+
+export function truncateText(value: unknown, max = 80): string {
+  if (typeof value !== "string") return "";
+  const s = value.replace(/\s+/g, " ").trim();
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1) + "…";
+}
+
+/**
+ * Parses raw JSON string arguments from the backend and returns a
+ * human-readable summary instead of the raw `{ "key": "value" }` block.
+ */
+export function formatToolArgs(toolName: string, rawContent: string): string {
+  let args: Record<string, unknown>;
+  try {
+    args = JSON.parse(rawContent);
+  } catch {
+    // If it's not valid JSON, just return the raw string
+    return rawContent;
+  }
+
+  const key = (toolName || "").toLowerCase().trim();
+
+  const pick = (...names: string[]): string => {
+    for (const n of names) {
+      const v = args[n];
+      if (typeof v === "string" && v.trim()) return v.trim();
+    }
+    return "";
+  };
+
+  if (key === "bash" || key === "shell" || key === "sh") {
+    const cmd = pick("command", "cmd");
+    return cmd ? `$ ${truncateText(cmd, 90)}` : "";
+  }
+  if (key.startsWith("python")) {
+    const code = pick("code", "script", "command");
+    if (!code) return "";
+    return truncateText(code.split(/\r?\n/)[0].trim(), 90);
+  }
+  if (key.includes("search")) {
+    const q = pick("query", "q", "search_query");
+    return q ? `"${truncateText(q, 80)}"` : "";
+  }
+  if (key.includes("http") || key.includes("fetch")) {
+    const url = pick("url", "endpoint");
+    return url ? truncateText(url, 90) : "";
+  }
+
+  // Handles file creation/editing (str_replace_editor)
+  if (key.includes("editor")) {
+    const cmd = pick("command");
+    const path = pick("path", "file", "filename");
+    const text = pick("file_text", "text", "content");
+
+    if (cmd && path) return `${cmd} ${truncateText(path, 60)}`;
+    if (cmd && text) return `${cmd} "${truncateText(text.split("\n")[0], 60)}"`;
+    return cmd || (path ? truncateText(path, 90) : "");
+  }
+
+  if (key.includes("file")) {
+    const f = pick("path", "file", "filename");
+    return f ? truncateText(f, 90) : "";
+  }
+  if (key.includes("browser")) {
+    return pick("action", "operation");
+  }
+  if (key.includes("human")) {
+    const q = pick("prompt", "question", "query");
+    return q ? `"${truncateText(q, 80)}"` : "";
+  }
+  if (key.includes("source_control")) {
+    const action = pick("action");
+    const repo = pick("repo", "repository", "workspace");
+    if (action && repo) return `${action} · ${truncateText(repo, 60)}`;
+    return action || (repo ? truncateText(repo, 90) : "");
+  }
+  if (key.includes("delegate")) {
+    const target = pick("target_agent_id", "agent_id");
+    const prompt = pick("subtask_prompt", "prompt", "task");
+    if (target && prompt) return `${target} · "${truncateText(prompt, 60)}"`;
+    return target || (prompt ? `"${truncateText(prompt, 80)}"` : "");
+  }
+
+  // Fallback: show the first available string value
+  for (const v of Object.values(args)) {
+    if (typeof v === "string" && v.trim()) return truncateText(v, 90);
+  }
+  return rawContent;
+}

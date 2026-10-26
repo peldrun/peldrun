@@ -3,7 +3,7 @@
   "name": "Code Architect",
   "role": "Senior Full-Stack Engineer",
   "icon": "code_architect.svg",
-  "core_color": "#0ea5e9",
+  "core_color": "#1a1a33",
   "description": "Specialized in software development, architecture review, debugging, refactoring, and automated script creation.",
   "short_description": "Senior full-stack engineer for autonomous coding, refactoring, debugging, and architecture review.",
   "store_description": "A senior full-stack engineering persona that plans and executes software delivery autonomously. Reads and edits source files, runs shell commands and Python scripts, executes automated tests, diagnoses failures, and iterates until the objective is met. Uses the source_control tool for all Git operations — never bash or HTTP fetches — and routes remote change approvals through the PELDRUN UI so the human operator retains authority over pushes, pull requests, and branch operations.",

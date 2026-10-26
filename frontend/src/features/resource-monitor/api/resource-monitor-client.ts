@@ -233,6 +233,7 @@ export const resourceMonitorClient = {
       severity?: DiagnosticSeverity;
       event_type?: DiagnosticEventType;
       limit?: number;
+      include_resolved?: boolean;
     } = {},
   ): Promise<DiagnosticEvent[]> {
     return request(
@@ -254,6 +255,25 @@ export const resourceMonitorClient = {
       },
       terminateOrphanResponseSchema,
     );
+  },
+
+  /** POST /diagnostics/{event_id}/resolve */
+  async resolveDiagnosticEvent(eventId: string): Promise<void> {
+    const response = await fetch(
+      `${API_PREFIX}/diagnostics/${encodeURIComponent(eventId)}/resolve`,
+      {
+        method: 'POST',
+        headers: { Accept: 'application/json' },
+      },
+    );
+
+    if (!response.ok) {
+      throw new ResourceMonitorApiError(
+        `Failed to resolve diagnostic event ${eventId}`,
+        response.status,
+        `/diagnostics/${eventId}/resolve`,
+      );
+    }
   },
 
   /** GET /settings */

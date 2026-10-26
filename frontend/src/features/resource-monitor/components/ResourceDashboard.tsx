@@ -100,8 +100,29 @@ export function ResourceDashboard() {
 
   const visibleDiagnostics = diagnostics.filter((d) => !dismissedIds.has(d.event_id));
 
-  const handleDismissAlert = (eventId: string) => {
+  const handleDismissAlert = async (eventId: string) => {
+    // Optimistically hide the alert in the UI immediately
     setDismissedIds((prev) => new Set(prev).add(eventId));
+
+    try {
+      // 1. Persist resolution in the backend
+      await resourceMonitorClient.resolveDiagnosticEvent(eventId);
+
+      // 2. Trigger a custom event so the top-bar ResourceMonitorBadge updates instantly
+      window.dispatchEvent(new Event('refresh-resource-alerts'));
+
+      // 3. Refetch the diagnostics list to keep local state in sync
+      const newDiagnostics = await resourceMonitorClient.listDiagnosticEvents({ limit: 20 });
+      setDiagnostics(newDiagnostics);
+    } catch (error) {
+      console.error('Failed to resolve diagnostic event:', error);
+      // Revert the optimistic hide if the API call fails
+      setDismissedIds((prev) => {
+        const next = new Set(prev);
+        next.delete(eventId);
+        return next;
+      });
+    }
   };
 
   const handleSaveSettings = async (updates: MonitorSettingsUpdate) => {

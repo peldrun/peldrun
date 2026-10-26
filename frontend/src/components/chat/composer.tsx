@@ -626,7 +626,7 @@ export function Composer({
                 disabled={disabled || isRunning || isSubmitting}
                 className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md transition-all font-medium cursor-pointer disabled:opacity-40 ${
                   execMode === "agent"
-                    ? "bg-card text-foreground shadow-xs font-semibold"
+                    ? "bg-card text-foreground shadow-xs font-semibold  bg-emerald-100"
                     : "text-muted-foreground hover:text-foreground"
                 }`}
                 title="Autonomous Agent: multi-step planning, tool execution, bash & browser"
@@ -640,7 +640,7 @@ export function Composer({
                 disabled={disabled || isRunning || isSubmitting}
                 className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md transition-all font-medium cursor-pointer disabled:opacity-40 ${
                   execMode === "chat"
-                    ? "bg-card text-foreground shadow-xs font-semibold"
+                    ? "bg-card text-foreground shadow-xs font-semibold  bg-emerald-100"
                     : "text-muted-foreground hover:text-foreground"
                 }`}
                 title="Direct Chat: fast response, conversational completion"
@@ -661,10 +661,10 @@ export function Composer({
                 type="button"
                 onClick={() => setWebSearchEnabled((v) => !v)}
                 disabled={disabled || isRunning || isSubmitting}
-                className={`flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium border transition-all cursor-pointer disabled:opacity-40 ${
+                className={`flex items-center text-xs font-medium transition-all cursor-pointer disabled:opacity-40 ${
                   webSearchEnabled
-                    ? "bg-primary/15 border-primary/40 text-primary shadow-xs"
-                    : "bg-card hover:bg-muted border-border text-muted-foreground"
+                    ? "text-rb shadow-xs"
+                    : "text-muted-foreground"
                 }`}
                 title={
                   webSearchEnabled
@@ -672,8 +672,8 @@ export function Composer({
                     : "Web Search: disabled. Click to enable for the next message."
                 }
               >
-                <Globe size={12} className={webSearchEnabled ? "text-primary" : "text-muted-foreground"} />
-                <span className="text-[11px]">Web Search</span>
+                <Globe size={14} className={webSearchEnabled ? "text-rb" : "text-muted-foreground"} />
+
               </button>
             )}
 

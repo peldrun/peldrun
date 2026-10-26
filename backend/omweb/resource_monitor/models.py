@@ -213,6 +213,15 @@ class DiagnosticEventModel(BaseModel):
     severity: DiagnosticSeverity
     message: str
     details_json: Optional[str] = None
+    resolved_at: Optional[str] = Field(
+        default=None,
+        description="Timestamp when the underlying condition was resolved; None means still active.",
+    )
+
+    @property
+    def is_active(self) -> bool:
+        """True while the underlying anomaly has not been resolved."""
+        return self.resolved_at is None
 
 
 class ResourceRollupModel(BaseModel):

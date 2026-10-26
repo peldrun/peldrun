@@ -1,18 +1,13 @@
+// frontend/src/components/chat/AgentSelector.tsx
+
 "use client";
 
 import React, { useState, useEffect, useRef } from "react";
 import { useChatStore } from "@/stores/chat-store";
 import { fetchStoreAgents } from "@/lib/chatsApi";
 import { AgentManifest } from "@/lib/types";
-import {
-  Bot,
-  Code2,
-  Search,
-  BarChart3,
-  Sparkles,
-  ChevronDown,
-  Check
-} from "lucide-react";
+import { ChevronDown, Check } from "lucide-react";
+import { AgentIcon } from "@/app/stores/_components/AgentIcon";
 
 interface AgentSelectorProps {
   disabled?: boolean;
@@ -62,43 +57,40 @@ export function AgentSelector({ disabled = false }: AgentSelectorProps) {
     max_steps: 30
   };
 
-  const renderIcon = (iconName?: string) => {
-    switch ((iconName || "").toLowerCase()) {
-      case "code2":
-        return <Code2 className="h-3.5 w-3.5 text-cyan-400" />;
-      case "search":
-        return <Search className="h-3.5 w-3.5 text-amber-400" />;
-      case "barchart3":
-        return <BarChart3 className="h-3.5 w-3.5 text-purple-400" />;
-      case "sparkles":
-        return <Sparkles className="h-3.5 w-3.5 text-emerald-400" />;
-      default:
-        return <Bot className="h-3.5 w-3.5 text-emerald-400" />;
-    }
-  };
-
   return (
     <div className="relative inline-block text-left font-sans" ref={containerRef}>
       <button
         type="button"
         disabled={disabled}
         onClick={() => setIsOpen(!isOpen)}
-        className={`flex items-center gap-1.5 px-2.5 py-1 rounded-xs text-xs font-medium transition-all ${
+        className={`flex items-center gap-2 px-2.5 py-1 rounded-xs text-xs font-medium transition-all ${
           disabled
             ? "opacity-50 cursor-not-allowed bg-transparent border-border text-muted-foreground"
             : "bg-card hover:bg-muted border-border text-foreground shadow-peldrun-xs cursor-pointer"
         }`}
-        title={`Active: ${activeAgent.name} (Max${activeAgent.max_steps || 30} Steps)`}
+        title={`Active: ${activeAgent.name} (Max ${activeAgent.max_steps || 30} Steps)`}
       >
-        <span className="p-0.5">{renderIcon(activeAgent.icon)}</span>
-        <span className="font-semibold truncate max-w-[110px]">{activeAgent.name}</span>
-        <ChevronDown size={12} className={`text-muted-foreground transition-transform ${isOpen ? "rotate-180" : ""}`} />
+        <span className="flex-shrink-0 flex items-center justify-center text-foreground">
+          <AgentIcon
+            agentId={activeAgent.id}
+            iconName={activeAgent.icon}
+            size={19}
+          />
+        </span>
+
+        {/* Render the agent name and arrow only when the dropdown is open */}
+        {isOpen && (
+          <>
+            <span className="font-semibold truncate max-w-[110px]">{activeAgent.name}</span>
+            <ChevronDown size={12} className="text-muted-foreground transition-transform rotate-180" />
+          </>
+        )}
       </button>
 
       {isOpen && (
-        <div className="absolute left-0 bottom-full mb-1.5 w-64 rounded-sm bg-card backdrop-blur-md shadow-xl z-50 overflow-hidden font-sans text-xs animate-in fade-in zoom-in-95 duration-100">
-          <div className="px-3 py-1.5 border-b border-border bg-custom flex items-center justify-between">
-            <span className="text-[10px] font-semibold uppercase tracking-wider text-black">
+        <div className="absolute left-0 bottom-full mb-1.5 w-64 rounded-sm bg-card backdrop-blur-md shadow-xl z-50 overflow-hidden font-sans text-xs animate-in fade-in zoom-in-95 duration-100 border border-border">
+          <div className="px-3 py-1.5 border-b border-border bg-muted/50 flex items-center justify-between">
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
               Select Agent Persona
             </span>
           </div>
@@ -114,14 +106,18 @@ export function AgentSelector({ disabled = false }: AgentSelectorProps) {
                     setSelectedAgentId(ag.id);
                     setIsOpen(false);
                   }}
-                  className={`w-full flex items-start gap-2 p-1.5 rounded-xs text-left transition ${
+                  className={`flex items-center w-full gap-2 p-1.5 rounded-xs text-left transition ${
                     isSelected
-                      ? "bg-muted/60 border border-muted/20 text-foreground"
-                      : "hover:bg-muted text-muted-foreground hover:text-foreground hover:shadow-xs"
+                      ? "bg-muted/60 border-l-[2px] border-rb text-foreground"
+                      : "hover:bg-muted text-muted-foreground hover:text-foreground hover:shadow-xs border border-transparent"
                   }`}
                 >
-                  <div className="p-1 rounded-md bg-muted shrink-0 mt-0.5">
-                    {renderIcon(ag.icon)}
+                  <div className="shrink-0 mt-0.5 flex items-center justify-center text-foreground">
+                    <AgentIcon
+                      agentId={ag.id}
+                      iconName={ag.icon}
+                      size={20}
+                    />
                   </div>
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center justify-between">

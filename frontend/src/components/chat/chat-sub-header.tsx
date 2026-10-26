@@ -9,7 +9,6 @@ import type { ChatUsageSummary } from "@/lib/types";
 
 
  // app/layout.tsx أو TopBar.tsx
-import { ResourceMonitorBadge } from '@/app/resource-monitor';
 
 interface ChatSubHeaderProps {
   isFreshSession: boolean;
@@ -108,8 +107,6 @@ export function ChatSubHeader({
 
         )}
 
-
-        <div> <ResourceMonitorBadge /></div>
       </div>
 
       <div className="flex items-center gap-2.5">

@@ -6,7 +6,12 @@ import React, { useEffect, useState } from "react";
 import { BrainCircuit, Terminal, ChevronDown, ChevronRight } from "lucide-react";
 import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
 import { ToolIcon } from "@/app/stores/_components/ToolIcon";
-import { resolveToolLabel, fetchToolManifest, ToolManifest } from "@/lib/tool-icon-registry";
+import {
+  resolveToolLabel,
+  fetchToolManifest,
+  formatToolArgs,
+  ToolManifest
+} from "@/lib/tool-icon-registry";
 
 export interface StepEvent {
   id: string;
@@ -44,8 +49,11 @@ function TimelineToolCall({ evt }: { evt: StepEvent }) {
 
   const label = manifest ? (manifest.display_name || manifest.name) : resolveToolLabel(evt.toolName);
 
+  // Format the raw JSON string into a clean readable string
+  const displayContent = formatToolArgs(evt.toolName, evt.content);
+
   return (
-    <div className="flex items-start gap-2 p-2.5 rounded-lg bg-muted/80 border border-border text-foreground font-mono text-xs">
+    <div className="flex items-start gap-2 p-2.5 rounded-sm bg-custom border border-border text-foreground font-mono text-xs">
       <div className="mt-0.5 flex-shrink-0 text-foreground">
         <ToolIcon
           tool={{
@@ -59,8 +67,8 @@ function TimelineToolCall({ evt }: { evt: StepEvent }) {
         />
       </div>
       <div className="truncate">
-        <span className="font-semibold text-foreground mr-1">{label}:</span>
-        <span className="text-muted-foreground">{evt.content}</span>
+        <span className="font-extrabold text-black mr-1">{label}: </span>
+        <span className="text-muted-foreground">{displayContent}</span>
       </div>
     </div>
   );
@@ -86,7 +94,6 @@ export function ChatTimeline({
         const isExpanded = expandedSteps[key] === true;
         const isLatestStep = isCurrentActive && stepNum === currentStepNum && isRunning;
 
-        // Using raw tool names for the header summary for simplicity
         const toolsUsed = Array.from(
           new Set(
             stepEvents
@@ -152,7 +159,7 @@ export function ChatTimeline({
                     )}
 
                     {evt.type === "observation" && (
-                      <div className="p-2.5 text-xs font-mono text-foreground/90 bg-muted/60 rounded-lg border border-border flex items-start gap-2">
+                      <div className="p-2.5 text-xs font-mono text-foreground/90 bg-muted/20 rounded-md border border-border flex items-start gap-2">
                         <Terminal size={13} className="mt-0.5 flex-shrink-0 text-peldrun-success" />
                         <div className="flex-1 min-w-0 overflow-x-auto">
                           <MarkdownRenderer content={evt.content} />

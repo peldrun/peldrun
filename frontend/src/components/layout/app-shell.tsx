@@ -22,6 +22,7 @@ import { Sidebar } from "@/components/layout/sidebar";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { LanguageToggle } from "@/components/ui/language-toggle";
 import { useAppStorage } from "@/hooks/use-app-storage";
+import { SystemHealthPill } from '@/components/layout/SystemHealthPill';
 
 
 const navItems = [
@@ -146,6 +147,15 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <ThemeToggle />
             <LanguageToggle compact={true} />
           </div>
+
+          <div className="flex flex-col items-center gap-2 pt-2 border-t border-border/60">
+
+             <div className="SystemHealthPill">
+               <SystemHealthPill />
+              </div>
+
+          </div>
+
         </div>
       </aside>
 

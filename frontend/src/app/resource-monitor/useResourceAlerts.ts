@@ -74,9 +74,16 @@ export function useResourceAlerts(
     mountedRef.current = true;
     void fetchAlerts();
 
+    // Listen for custom events (e.g., when an alert is resolved elsewhere in the app)
+    const handleRefresh = () => {
+      void fetchAlerts();
+    };
+    window.addEventListener('refresh-resource-alerts', handleRefresh);
+
     if (!enabled || refreshIntervalMs <= 0) {
       return () => {
         mountedRef.current = false;
+        window.removeEventListener('refresh-resource-alerts', handleRefresh);
       };
     }
 
@@ -84,6 +91,7 @@ export function useResourceAlerts(
     return () => {
       mountedRef.current = false;
       clearInterval(id);
+      window.removeEventListener('refresh-resource-alerts', handleRefresh);
     };
   }, [fetchAlerts, enabled, refreshIntervalMs]);
 

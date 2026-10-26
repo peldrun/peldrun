@@ -423,28 +423,64 @@ class WebSearchTool(BaseTool):
         return deduped[:effective_max_results]
 
     @staticmethod
+    def _escape_md_link_text(text: str) -> str:
+        """Escape characters that would break Markdown link syntax in link text."""
+        return (text or "").replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+    @staticmethod
+    def _escape_md_link_url(url: str) -> str:
+        """Escape characters that would break Markdown link syntax inside parentheses."""
+        return (url or "").replace(" ", "%20").replace("(", "%28").replace(")", "%29")
+
+    @classmethod
     def _format_search_output(
+        cls,
         query: str,
         response: SearchResponse,
         items: List[SearchResultItem],
         effective_max_results: int,
     ) -> str:
-        """Format SearchResponse into structured readable markdown for the agent observation."""
+        """
+        Render a SearchResponse into structured Markdown suitable for agent observation.
+
+        Output contract:
+        - Top-level heading with a bullet metadata block (query / provider / counts).
+        - Optional blockquoted "Direct Answer" section when the provider supplies one.
+        - Numbered result list where each entry uses a bold Markdown link, a metadata
+          line (URL + optional publish date), and a blockquoted snippet.
+        - Link text and URL are escaped so brackets/parentheses cannot corrupt the
+          Markdown structure. `> snippet` is preferred over indented text to avoid
+          accidental code-block interpretation in strict Markdown renderers.
+        - An explicit italic line signals a valid empty search (not an error).
+        """
         provider_name = getattr(response, "provider", None) or "SearchProvider"
         answer_box = getattr(response, "answer", None)
 
         lines: List[str] = [
-            f"Web Search Results for: {query!r} (Provider: {provider_name}, Returned: {len(items)}/{effective_max_results})"
+            "## Web Search Results",
+            "",
+            f"- **Query:** `{query}`",
+            f"- **Provider:** `{provider_name}`",
+            f"- **Returned:** {len(items)} / {effective_max_results}",
         ]
 
         if answer_box and str(answer_box).strip():
-            lines.append(f"\nDirect Answer Summary:\n{str(answer_box).strip()}")
+            lines += [
+                "",
+                "### Direct Answer",
+                "",
+                f"> {str(answer_box).strip()}",
+            ]
 
         if not items:
-            lines.append("\nNo matching web search results were returned by the provider.")
+            lines += [
+                "",
+                "_No matching web search results were returned by the provider._",
+            ]
             return "\n".join(lines)
 
-        lines.append("")
+        lines += ["", "### Results", ""]
+
         for idx, item in enumerate(items[:effective_max_results], start=1):
             title = (getattr(item, "title", None) or "Untitled Result").strip()
             url = (getattr(item, "url", None) or "").strip()
@@ -454,12 +490,25 @@ class WebSearchTool(BaseTool):
                 or ""
             ).strip()
             published = getattr(item, "published_date", None)
-            header = f"{idx}. [{title}]({url})" if url else f"{idx}. {title}"
+
+            safe_title = cls._escape_md_link_text(title)
+            if url:
+                lines.append(
+                    f"{idx}. **[{safe_title}]({cls._escape_md_link_url(url)})**"
+                )
+            else:
+                lines.append(f"{idx}. **{safe_title}**")
+
+            meta_parts: List[str] = []
+            if url:
+                meta_parts.append(f"`{url}`")
             if published:
-                header += f" ({published})"
-            lines.append(header)
+                meta_parts.append(f"Published: {published}")
+            if meta_parts:
+                lines.append(f"   - {' | '.join(meta_parts)}")
+
             if snippet:
-                lines.append(f"   {snippet}")
+                lines.append(f"   > {snippet}")
 
         return "\n".join(lines)
 

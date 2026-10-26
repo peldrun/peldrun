@@ -25,7 +25,6 @@ import {
 } from "@/lib/chatsApi";
 import { useConfirmModal } from "@/components/ui/ConfirmModal";
 import { showToast, ToastContainer } from "@/components/ui/ToastNotification";
-import { ServerStatusIndicator } from "./ServerStatusIndicator";
 
 export function Sidebar() {
   const pathname = usePathname();
@@ -455,8 +454,7 @@ export function Sidebar() {
 
         {/* Dynamic Server Status Indicator */}
         <div className="flex items-center gap-2 shrink-0 p-2.5 border-t border-border flex items-center justify-between text-[11px] text-muted-foreground font-mono hover:bg-muted/70 hover:text-foreground transition-all group cursor-pointer">
-          <ServerStatusIndicator showLatency={true} />
-        </div>
+         </div>
       </aside>
 
       {/* Standalone Injected Dialog and Toasts */}

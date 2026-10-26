@@ -527,13 +527,19 @@ class ResourceMonitorService:
         severity: Optional[DiagnosticSeverity] = None,
         event_type: Optional[DiagnosticEventType] = None,
         limit: int = 50,
+        include_resolved: bool = False,
     ) -> List[DiagnosticEventModel]:
         """Fetch diagnostic events and anomalies."""
         return self._repo.list_diagnostic_events(
             severity=severity,
             event_type=event_type,
             limit=limit,
+            include_resolved=include_resolved,
         )
+
+    def resolve_diagnostic_event(self, event_id: str) -> bool:
+        """Manually resolve a diagnostic event."""
+        return self._repo.resolve_diagnostic_event(event_id)
 
     def terminate_orphan(self, pid: int, force: bool = False) -> TerminateOrphanResponse:
         """Terminate an orphaned subprocess safely."""

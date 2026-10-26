@@ -3,7 +3,7 @@
   "name": "Deep Researcher",
   "role": "Intelligence & Synthesis Analyst",
   "icon": "deep_researcher.svg",
-  "core_color": "#f59e0b",
+  "core_color": "#404080",
   "description": "Deep-dives into online documentation, academic sources, technical specifications, and synthesizes structured markdown reports.",
   "short_description": "Research analyst for deep web investigation, source cross-referencing, and structured markdown reports.",
   "store_description": "An elite research analyst persona specialized in scouring the web for authoritative sources, cross-referencing empirical facts, and compiling exhaustive, objective reports with explicit citations. Fetches documentation, technical specifications, and academic material; synthesizes findings into structured markdown deliverables saved to the workspace. Does not execute code or shell commands by default — its scope is intentionally restricted to research and synthesis so its reasoning stays focused on source quality and evidence.",

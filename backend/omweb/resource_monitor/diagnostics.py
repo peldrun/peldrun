@@ -26,6 +26,13 @@ from .models import (
 from .process_tracker import ProcessTracker
 from .storage.repositories import MonitorRepository
 
+try:
+    import psutil
+    _PSUTIL_AVAILABLE = True
+except ImportError:
+    psutil = None  # type: ignore
+    _PSUTIL_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -250,6 +257,59 @@ class DiagnosticsEngine:
 
         return None
 
+    def reconcile_resolved_events(self, current_host_cpu_percent: Optional[float] = None) -> int:
+        """Check active diagnostic events and auto-resolve those whose condition has cleared."""
+        resolved_count = 0
+
+        # 1. Reconcile ORPHAN_PROCESS events: if the PID is dead, mark as resolved
+        active_orphans = self._repo.list_diagnostic_events(
+            event_type=DiagnosticEventType.ORPHAN_PROCESS,
+            limit=100,
+            include_resolved=False
+        )
+
+        for event in active_orphans:
+            pid = None
+            if event.details_json:
+                try:
+                    details = json.loads(event.details_json)
+                    pid = details.get("pid")
+                except Exception:
+                    pass
+
+            if pid:
+                is_alive = False
+                if _PSUTIL_AVAILABLE and psutil is not None:
+                    try:
+                        p = psutil.Process(pid)
+                        is_alive = p.is_running() and p.status() != psutil.STATUS_ZOMBIE
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        is_alive = False
+                else:
+                    # If psutil is missing, we rely on process tracker or assume dead if not tracked
+                    is_alive = any(o.pid == pid for o in self._process_tracker.list_active_orphans())
+
+                if not is_alive:
+                    if self._repo.resolve_diagnostic_event(event.event_id):
+                        resolved_count += 1
+                        logger.info("Auto-resolved ORPHAN_PROCESS event %s (PID %d is dead).", event.event_id, pid)
+
+        # 2. Reconcile CPU_SATURATION events: if CPU is below threshold, mark as resolved
+        if current_host_cpu_percent is not None:
+            threshold = max(85.0, self._config.cpu_throttle_threshold_percent)
+            if current_host_cpu_percent < threshold:
+                active_cpu_events = self._repo.list_diagnostic_events(
+                    event_type=DiagnosticEventType.CPU_SATURATION,
+                    limit=10,
+                    include_resolved=False
+                )
+                for event in active_cpu_events:
+                    if self._repo.resolve_diagnostic_event(event.event_id):
+                        resolved_count += 1
+                        logger.info("Auto-resolved CPU_SATURATION event %s (CPU is back to normal).", event.event_id)
+
+        return resolved_count
+
     def evaluate_all(
         self,
         host_cpu_percent: Optional[float] = None,
@@ -257,6 +317,9 @@ class DiagnosticsEngine:
     ) -> List[DiagnosticEventModel]:
         """Run all diagnostic evaluations synchronously."""
         events: List[DiagnosticEventModel] = []
+
+        # Run reconciliation first to clean up stale alerts
+        self.reconcile_resolved_events(current_host_cpu_percent=host_cpu_percent)
 
         orphan_events = self.evaluate_orphans()
         events.extend(orphan_events)

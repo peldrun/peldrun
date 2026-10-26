@@ -216,6 +216,7 @@ export interface DiagnosticEvent {
   severity: DiagnosticSeverity;
   message: string;
   details_json: string | null;
+  resolved_at?: string | null;
 }
 
 // ============================================================================
