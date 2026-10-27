@@ -7,6 +7,7 @@ import { SourceControlSettingsProvider } from "@/features/source-control/state/s
 import { I18nProvider } from "@/components/providers/i18n-provider";
 import { AppShell } from "@/components/layout/app-shell";
 import { ToastContainer } from "@/components/ui/ToastNotification";
+import Script from "next/script";
 
 import "@/app/globals.css";
 
@@ -65,45 +66,30 @@ export default async function RootLayout({
       className={`${isDark ? "dark" : ""} ${dmSans.variable} ${libreBaskerville.variable}${cairo.variable}`}
     >
       <head>
-        {/* Anti-FOUC & Anti-Shift Execution (0ms before first paint) */}
-        <script
-          dangerouslySetInnerHTML={{
-            __html: `
-              (function() {
-                try {
-                  function cleanVal(v) {
-                    if (!v) return '';
-                    var res = decodeURIComponent(v).trim();
-                    while (res.indexOf('%22') !== -1 || res.indexOf('%20') !== -1) {
-                      try { res = decodeURIComponent(res).trim(); } catch(e) { break; }
-                    }
-                    return res.replace(/^["']+|["']+$/g, '');
-                  }
-                  function getCookie(name) {
-                    var m = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
-                    return m ? cleanVal(m[1]) : '';
-                  }
+        {/*
+          Anti-FOUC & Anti-Shift Execution (0ms before first paint).
 
-                  var t = getCookie('theme') || cleanVal(localStorage.getItem('theme')) || '${theme}';
-                  var isDark = t === 'dark' || (t === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-                  if (isDark) {
-                    document.documentElement.classList.add('dark');
-                    document.documentElement.classList.remove('light');
-                  } else {
-                    document.documentElement.classList.remove('dark');
-                    document.documentElement.classList.add('light');
-                  }
+          The theme/locale initializer lives in /public/theme-init.js
+          and is loaded as an EXTERNAL script via next/script. This is
+          intentional:
 
-                  var l = getCookie('locale') || cleanVal(localStorage.getItem('locale')) || cleanVal(localStorage.getItem('language')) || '${locale}';
-                  if (l) {
-                    var isRtl = l.indexOf('ar') === 0;
-                    document.documentElement.lang = l;
-                    document.documentElement.dir = isRtl ? 'rtl' : 'ltr';
-                  }
-                } catch(e) {}
-              })();
-            `,
-          }}
+            - React 19 warns about any <script> element rendered inside
+              a React component (inline or dangerouslySetInnerHTML),
+              and this warning is still emitted for inline
+              beforeInteractive scripts in Next.js 16 + Turbopack.
+            - Loading the same code from `/public` avoids the warning
+              entirely while preserving the anti-FOUC guarantee: Next.js
+              emits the <script src> tag in <head> BEFORE hydration, and
+              the browser executes it synchronously before first paint.
+
+          The fallback defaults ("system" and "en") match storage/schema.ts.
+          Cookie and localStorage always take precedence when present,
+          so the fallback only matters on a truly first visit.
+        */}
+        <Script
+          id="peldrun-theme-init"
+          src="/js/theme-init.js"
+          strategy="beforeInteractive"
         />
       </head>
       <body

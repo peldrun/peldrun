@@ -19,7 +19,24 @@ from typing import Any, Dict, Optional
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 PROJECT_ROOT = BACKEND_DIR.parent
 
-STORAGE_ROOT = (PROJECT_ROOT / "storage").resolve()
+# Register project root and backend in sys.path BEFORE importing
+# peldrun.storage_paths (which may not be importable otherwise).
+# Moved up from below so the storage helper can resolve correctly
+# at import time.
+for path_entry in [str(PROJECT_ROOT), str(BACKEND_DIR)]:
+    if path_entry not in sys.path:
+        sys.path.insert(0, path_entry)
+
+# Audit items 2.2 + 2.3: source storage root from the centralized
+# helper so every subsystem (pricing, usage, chat, monitor,
+# artifacts) agrees on the same location regardless of CWD.
+try:
+    from peldrun.storage_paths import get_storage_root as _get_storage_root
+
+    STORAGE_ROOT = _get_storage_root()
+except Exception:  # noqa: BLE001 — bootstrap fallback
+    STORAGE_ROOT = (PROJECT_ROOT / "storage").resolve()
+
 CHATS_DIR = STORAGE_ROOT / "chats"
 PROJECTS_DIR = STORAGE_ROOT / "projects"
 CONFIG_DIR = (PROJECT_ROOT / "config").resolve()
@@ -56,10 +73,7 @@ def resolve_peldrun_root() -> Path:
 peldrun_ROOT = resolve_peldrun_root()
 WORKSPACE_ROOT = STORAGE_ROOT
 
-# Register project root and backend strictly in sys.path
-for path_entry in [str(PROJECT_ROOT), str(BACKEND_DIR)]:
-    if path_entry not in sys.path:
-        sys.path.insert(0, path_entry)
+# (sys.path registration moved to top of file, before storage_paths import)
 
 
 def get_workspace_root() -> Path:

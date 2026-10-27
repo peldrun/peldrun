@@ -110,13 +110,9 @@ export function ActiveToolsModal() {
     "all",
   );
 
+  // Relative path only - SSR/CSR parity. See next.config.mjs.
+  // Kept as useCallback for stable identity across dependent callbacks.
   const getApiUrl = useCallback((endpoint: string): string => {
-    if (
-      typeof window !== "undefined" &&
-      (window.location.port === "3088" || window.location.port === "3000")
-    ) {
-      return `http://localhost:8088${endpoint}`;
-    }
     return endpoint;
   }, []);
 

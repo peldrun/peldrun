@@ -152,9 +152,12 @@ class SqliteUsageStore:
 
     def __init__(self, db_path: Optional[Union[str, Path]] = None) -> None:
         if db_path is None:
-            storage_dir = Path("storage").resolve()
-            storage_dir.mkdir(parents=True, exist_ok=True)
-            self.db_path = storage_dir / "peldrun_runtime.db"
+            # Audit items 2.2 + 2.3: use the centralized storage root
+            # so this database always lives at the same absolute path
+            # regardless of the CWD the application was launched from.
+            from peldrun.storage_paths import get_storage_file
+
+            self.db_path = get_storage_file("peldrun_runtime.db")
         else:
             self.db_path = Path(db_path).resolve()
             self.db_path.parent.mkdir(parents=True, exist_ok=True)

@@ -9,6 +9,7 @@ session.context.json Sidecar for LLM context optimization.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -57,6 +58,53 @@ class ChatStorageEngine:
 
     def _now_iso(self) -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    def _get_time_range_bounds(self) -> Dict[str, float]:
+        """Return local-midnight boundaries (Unix seconds) for the
+        time-range buckets supported by the API.
+
+        Using the server's local timezone keeps "today" aligned with
+        what the operator sees in their file system and logs. If a
+        deployment runs the backend in UTC but users live in another
+        zone, the section labels will be off by the offset — an
+        acceptable trade-off for a local-first product.
+        """
+        from datetime import timedelta
+
+        local_now = datetime.now()
+        today_midnight = local_now.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        return {
+            "today_start": today_midnight.timestamp(),
+            "yesterday_start": (today_midnight - timedelta(days=1)).timestamp(),
+            "seven_days_start": (today_midnight - timedelta(days=7)).timestamp(),
+            "thirty_days_start": (today_midnight - timedelta(days=30)).timestamp(),
+        }
+
+    def _matches_time_range(self, ts: float, time_range: str) -> bool:
+        """Return True when `ts` falls into the given time-range bucket.
+
+        Buckets are mutually exclusive so that every chat belongs to
+        exactly one section:
+            today         : ts >= today_start
+            yesterday     : yesterday_start <= ts < today_start
+            last_7_days   : seven_days_start <= ts < yesterday_start
+            last_30_days  : thirty_days_start <= ts < seven_days_start
+            older         : ts < thirty_days_start
+        """
+        bounds = self._get_time_range_bounds()
+        if time_range == "today":
+            return ts >= bounds["today_start"]
+        if time_range == "yesterday":
+            return bounds["yesterday_start"] <= ts < bounds["today_start"]
+        if time_range == "last_7_days":
+            return bounds["seven_days_start"] <= ts < bounds["yesterday_start"]
+        if time_range == "last_30_days":
+            return bounds["thirty_days_start"] <= ts < bounds["seven_days_start"]
+        if time_range == "older":
+            return ts < bounds["thirty_days_start"]
+        return True
 
     def _parse_created_timestamp(self, val: Any) -> float:
         if isinstance(val, (int, float)):
@@ -302,15 +350,28 @@ class ChatStorageEngine:
     # Standard Chat Storage Management
     # =========================================================================
 
-    def list_chats(
+    def _filter_and_sort_chats(
         self,
         project_id: Optional[str] = None,
         include_archived: bool = False,
         pinned_only: bool = False,
-        search: Optional[str] = None
+        archived_only: bool = False,
+        search: Optional[str] = None,
+        time_range: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        """Return the full filtered + sorted chat list.
+
+        This is the single source of truth for chat filtering and sort
+        ordering. `list_chats` and `list_chats_paginated` both delegate
+        here so that filters never drift between the paginated and
+        non-paginated paths.
+
+        Sort order (stable, deterministic):
+            1. Pinned chats first.
+            2. Within each pinned bucket, descending by created_at.
+        """
         raw_chats = project_manager.list_chats()
-        results = []
+        results: List[Dict[str, Any]] = []
 
         for c in raw_chats:
             if not isinstance(c, dict):
@@ -328,6 +389,8 @@ class ChatStorageEngine:
                 continue
             if pinned_only and not is_pinned:
                 continue
+            if archived_only and not is_archived:
+                continue
 
             if search:
                 q = search.lower().strip()
@@ -338,16 +401,178 @@ class ChatStorageEngine:
                 if not (title_match or prompt_match or id_match or job_match):
                     continue
 
+            if time_range:
+                ts = self._parse_created_timestamp(c.get("created_at"))
+                if not self._matches_time_range(ts, time_range):
+                    continue
+
             results.append(c)
 
         results.sort(
             key=lambda x: (
                 1 if (x.get("is_pinned") or x.get("pinned")) else 0,
-                self._parse_created_timestamp(x.get("created_at"))
+                self._parse_created_timestamp(x.get("created_at")),
             ),
-            reverse=True
+            reverse=True,
         )
         return results
+
+    def list_chats(
+        self,
+        project_id: Optional[str] = None,
+        include_archived: bool = False,
+        pinned_only: bool = False,
+        archived_only: bool = False,
+        search: Optional[str] = None,
+        time_range: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return the full filtered chat list (backward-compatible).
+
+        Callers that do not need pagination keep using this method.
+        New callers should use `list_chats_paginated` instead.
+        """
+        return self._filter_and_sort_chats(
+            project_id=project_id,
+            include_archived=include_archived,
+            pinned_only=pinned_only,
+            archived_only=archived_only,
+            search=search,
+            time_range=time_range,
+        )
+
+    # -----------------------------------------------------------------
+    # Cursor helpers for paginated chat listing.
+    #
+    # Cursor = base64(json({"p": pinned_flag, "t": created_ts, "i": id})).
+    # The cursor captures the sort key of the last item served, so the
+    # next page can be located precisely even when new chats are
+    # inserted concurrently at the top of the sort order.
+    # -----------------------------------------------------------------
+
+    def _encode_chat_cursor(self, item: Dict[str, Any]) -> str:
+        """Encode an opaque pagination cursor for the given chat item."""
+        pinned = 1 if (item.get("is_pinned") or item.get("pinned")) else 0
+        ts = self._parse_created_timestamp(item.get("created_at"))
+        cid = str(item.get("id", ""))
+        payload = json.dumps(
+            {"p": pinned, "t": ts, "i": cid}, separators=(",", ":")
+        )
+        return (
+            base64.urlsafe_b64encode(payload.encode())
+            .decode()
+            .rstrip("=")
+        )
+
+    def _decode_chat_cursor(self, cursor: str) -> Optional[Dict[str, Any]]:
+        """Decode a cursor produced by `_encode_chat_cursor`.
+
+        Returns None when the cursor is malformed. Callers treat a
+        malformed cursor as "start from the beginning" so that a stale
+        or corrupted cursor from an older page does not break the UI.
+        """
+        try:
+            padding = "=" * (-len(cursor) % 4)
+            raw = base64.urlsafe_b64decode(cursor + padding).decode()
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                return None
+            if not all(k in data for k in ("p", "t", "i")):
+                return None
+            return data
+        except Exception:
+            return None
+
+    def _find_chat_cursor_position(
+        self, items: List[Dict[str, Any]], cursor_data: Dict[str, Any]
+    ) -> int:
+        """Return the index of the item matching the cursor, or -1."""
+        for i, item in enumerate(items):
+            item_pinned = 1 if (item.get("is_pinned") or item.get("pinned")) else 0
+            item_ts = self._parse_created_timestamp(item.get("created_at"))
+            item_id = str(item.get("id", ""))
+            if (
+                item_pinned == cursor_data["p"]
+                and abs(item_ts - cursor_data["t"]) < 1e-6
+                and item_id == cursor_data["i"]
+            ):
+                return i
+        return -1
+
+    def list_chats_paginated(
+        self,
+        project_id: Optional[str] = None,
+        include_archived: bool = False,
+        pinned_only: bool = False,
+        archived_only: bool = False,
+        search: Optional[str] = None,
+        time_range: Optional[str] = None,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+        offset: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Return a paginated page of chats with cursor support.
+
+        Args:
+            limit:   Maximum number of items to return. When None, all
+                     matching items are returned (backward-compatible).
+            cursor:  Opaque cursor returned by a previous call. Takes
+                     precedence over `offset` when both are provided.
+            offset:  Integer offset for offset-based pagination. Ignored
+                     when `cursor` is provided.
+
+        Returns:
+            {
+                "items":       List[Dict[str, Any]],
+                "total":       int,            # total matching items
+                "next_cursor": str | None,     # None when last page
+                "has_more":    bool,
+            }
+        """
+        all_items = self._filter_and_sort_chats(
+            project_id=project_id,
+            include_archived=include_archived,
+            pinned_only=pinned_only,
+            archived_only=archived_only,
+            search=search,
+            time_range=time_range,
+        )
+        total = len(all_items)
+
+        # Determine the start index from cursor / offset / default 0.
+        start_index = 0
+        if cursor:
+            cursor_data = self._decode_chat_cursor(cursor)
+            if cursor_data:
+                found = self._find_chat_cursor_position(all_items, cursor_data)
+                if found >= 0:
+                    start_index = found + 1
+        elif offset is not None and offset >= 0:
+            start_index = offset
+
+        if start_index > total:
+            start_index = total
+
+        if limit is None:
+            items = all_items[start_index:]
+            has_more = False
+            next_cursor = None
+        else:
+            safe_limit = max(1, int(limit))
+            end_index = start_index + safe_limit
+            items = all_items[start_index:end_index]
+            has_more = end_index < total
+            next_cursor = (
+                self._encode_chat_cursor(items[-1])
+                if has_more and items
+                else None
+            )
+
+        return {
+            "items": items,
+            "total": total,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+        }
 
     def toggle_pin(self, chat_id: str) -> Optional[Dict[str, Any]]:
         idx = project_manager._read_index()

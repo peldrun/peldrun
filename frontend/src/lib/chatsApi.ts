@@ -53,11 +53,56 @@ export interface PurgeReport {
   freed_mb?: number;
 }
 
+export type ChatTimeRange =
+  | "today"
+  | "yesterday"
+  | "last_7_days"
+  | "last_30_days"
+  | "older";
+
 export interface FetchChatsOptions {
   projectId?: string;
   includeArchived?: boolean;
   pinnedOnly?: boolean;
+  archivedOnly?: boolean;
   search?: string;
+  /** Time bucket filter applied server-side before pagination. */
+  timeRange?: ChatTimeRange;
+  /** Max items to return in a single page. Clamped to [1, MAX_CHATS_PAGE_LIMIT]. */
+  limit?: number;
+  /** Opaque cursor returned by a previous paginated call. */
+  cursor?: string;
+  /** Offset-based pagination fallback for backends without cursor support. */
+  offset?: number;
+}
+
+/** Default page size used when callers omit `limit`. */
+export const DEFAULT_CHATS_PAGE_LIMIT = 50;
+
+/** Hard upper bound to protect the backend from oversized requests. */
+export const MAX_CHATS_PAGE_LIMIT = 200;
+
+/** Result of a paginated `fetchChatsPage` call. */
+export interface PaginatedChats {
+  items: ChatSession[];
+  /** Cursor for the next page, or null when the last page has been reached. */
+  nextCursor: string | null;
+  /** Total items across all pages when the backend reports it, else null. */
+  total: number | null;
+  /** True when more pages are available. */
+  hasMore: boolean;
+}
+
+/**
+ * Compute the effective page limit, clamped to the documented bounds.
+ * Exported so callers can normalize user input consistently.
+ */
+export function clampChatsPageLimit(raw: number | undefined): number {
+  if (raw === undefined || raw === null || !Number.isFinite(raw)) {
+    return DEFAULT_CHATS_PAGE_LIMIT;
+  }
+  const floored = Math.floor(raw);
+  return Math.min(Math.max(1, floored), MAX_CHATS_PAGE_LIMIT);
 }
 
 // Endpoint helper for consistent relative URL resolution
@@ -187,27 +232,35 @@ export async function deleteProject(projectId: string): Promise<boolean> {
 // ==========================================
 // Chats API
 // ==========================================
-export async function fetchChats(optionsOrProjectId?: FetchChatsOptions | string): Promise<ChatSession[]> {
+export async function fetchChats(
+  optionsOrProjectId?: FetchChatsOptions | string
+): Promise<ChatSession[]> {
   try {
-    let projectId: string | undefined;
-    let includeArchived = false;
-    let pinnedOnly = false;
-    let search: string | undefined;
-
-    if (typeof optionsOrProjectId === "string") {
-      projectId = optionsOrProjectId;
-    } else if (optionsOrProjectId) {
-      projectId = optionsOrProjectId.projectId;
-      includeArchived = !!optionsOrProjectId.includeArchived;
-      pinnedOnly = !!optionsOrProjectId.pinnedOnly;
-      search = optionsOrProjectId.search;
-    }
+    const opts: FetchChatsOptions =
+      typeof optionsOrProjectId === "string"
+        ? { projectId: optionsOrProjectId }
+        : optionsOrProjectId ?? {};
 
     const params = new URLSearchParams();
-    if (projectId) params.append("project_id", projectId);
-    if (includeArchived) params.append("include_archived", "true");
-    if (pinnedOnly) params.append("pinned_only", "true");
-    if (search) params.append("search", search);
+    if (opts.projectId) params.append("project_id", opts.projectId);
+    if (opts.includeArchived) params.append("include_archived", "true");
+    if (opts.pinnedOnly) params.append("pinned_only", "true");
+    if (opts.archivedOnly) params.append("archived_only", "true");
+    if (opts.search) params.append("search", opts.search);
+
+    // Optional pagination parameters: only sent when the caller
+    // provides them so that existing callers keep the exact same
+    // behavior (fetch all) against backends that do not implement
+    // pagination.
+    if (opts.limit !== undefined) {
+      params.append("limit", String(clampChatsPageLimit(opts.limit)));
+    }
+    if (opts.cursor) {
+      params.append("cursor", opts.cursor);
+    }
+    if (opts.offset !== undefined && opts.offset >= 0) {
+      params.append("offset", String(Math.floor(opts.offset)));
+    }
 
     const qs = params.toString() ? `?${params.toString()}` : "";
     const res = await fetch(`/api/chats${qs}`, { cache: "no-store" });
@@ -217,6 +270,84 @@ export async function fetchChats(optionsOrProjectId?: FetchChatsOptions | string
   } catch (err) {
     console.error("fetchChats error:", err);
     return [];
+  }
+}
+
+/**
+ * Cursor-based paginated variant of `fetchChats`.
+ *
+ * Returns a page of chats together with pagination metadata. Backends
+ * that do not implement `limit`/`cursor`/`offset` are supported
+ * transparently: the whole result set is returned and `hasMore` is
+ * false, so callers can fall back to single-page rendering without
+ * branching on backend capabilities.
+ *
+ * Typical usage in an infinite-scroll list:
+ *
+ *   let cursor: string | null = null;
+ *   do {
+ *     const page = await fetchChatsPage({ limit: 50, cursor: cursor ?? undefined });
+ *     append(page.items);
+ *     cursor = page.nextCursor;
+ *   } while (cursor);
+ */
+export async function fetchChatsPage(
+  options: FetchChatsOptions = {}
+): Promise<PaginatedChats> {
+  const empty: PaginatedChats = {
+    items: [],
+    nextCursor: null,
+    total: null,
+    hasMore: false,
+  };
+
+  try {
+    const params = new URLSearchParams();
+    if (options.projectId) params.append("project_id", options.projectId);
+    if (options.includeArchived) params.append("include_archived", "true");
+    if (options.pinnedOnly) params.append("pinned_only", "true");
+    if (options.archivedOnly) params.append("archived_only", "true");
+    if (options.search) params.append("search", options.search);
+    if (options.timeRange) params.append("time_range", options.timeRange);
+
+    const limit = clampChatsPageLimit(options.limit);
+    params.append("limit", String(limit));
+    if (options.cursor) params.append("cursor", options.cursor);
+    if (options.offset !== undefined && options.offset >= 0) {
+      params.append("offset", String(Math.floor(options.offset)));
+    }
+
+    const qs = params.toString() ? `?${params.toString()}` : "";
+    const res = await fetch(`/api/chats${qs}`, { cache: "no-store" });
+    if (!res.ok) return empty;
+
+    const data = await res.json();
+    const items: ChatSession[] = Array.isArray(data.chats) ? data.chats : [];
+
+    // Normalize cursor / total across common backend shapes.
+    const nextCursor: string | null =
+      typeof data.next_cursor === "string"
+        ? data.next_cursor
+        : typeof data.nextCursor === "string"
+        ? data.nextCursor
+        : null;
+
+    const total: number | null =
+      typeof data.total === "number" ? data.total : null;
+
+    const offset = options.offset ?? 0;
+    const backendHasMore =
+      typeof data.has_more === "boolean" ? (data.has_more as boolean) : null;
+    const hasMore =
+      backendHasMore !== null
+        ? backendHasMore
+        : nextCursor !== null ||
+          (total !== null && offset + items.length < total);
+
+    return { items, nextCursor, total, hasMore };
+  } catch (err) {
+    console.error("fetchChatsPage error:", err);
+    return empty;
   }
 }
 

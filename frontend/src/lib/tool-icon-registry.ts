@@ -123,7 +123,7 @@ export async function fetchToolManifest(toolId: string): Promise<ToolManifest | 
   }
 
   try {
-    const base = typeof window !== "undefined" && (window.location.port === "3088" || window.location.port === "3000") ? "http://localhost:8088" : "";
+    const base = "";
     const res = await fetch(`${base}/api/store/tools/${toolId}`);
 
     if (res.ok) {

@@ -3,6 +3,7 @@
 import React from "react";
 import { RefreshCw, Cpu, Activity, HardDrive } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { BackendStatusCard } from "@/components/system/BackendStatusCard";
 
 interface SystemTabProps {
   systemInfo: any;
@@ -99,6 +100,11 @@ export function SystemTab({ systemInfo, fetchSystemInfo }: SystemTabProps) {
             Loading hardware telemetry...
           </div>
         )}
+
+        {/* Backend connectivity diagnostic - shows live health of the
+            active API endpoint. Displays the URL configured at build
+            time and confirms which backend actually answered. */}
+        <BackendStatusCard />
       </div>
     </div>
   );

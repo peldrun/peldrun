@@ -125,8 +125,17 @@ def _check_model_metadata_reasoning(model_name: str) -> Optional[bool]:
     Safely resolves across working directories and relative paths.
     """
     try:
+        # Audit items 2.2 + 2.3: route through the centralized storage
+        # root instead of CWD-relative paths. The legacy candidates are
+        # preserved as read-only fallbacks so existing users with data
+        # in the old locations still see their metadata until they
+        # move it manually.
+        from peldrun.storage_paths import get_storage_root
+
+        canonical = get_storage_root() / "models_metadata.json"
         module_dir = Path(__file__).resolve().parent
         candidates = [
+            canonical,
             module_dir.parent.parent / "storage" / "models_metadata.json",
             Path("storage/models_metadata.json").resolve(),
             Path("backend/storage/models_metadata.json").resolve(),
@@ -166,8 +175,14 @@ def _resolve_model_max_output_tokens(model_name: str, active_llm: Optional[Dict[
                 pass
 
     try:
+        # Audit items 2.2 + 2.3: same canonical-first ordering as
+        # _check_model_metadata_reasoning above.
+        from peldrun.storage_paths import get_storage_root
+
+        canonical = get_storage_root() / "models_budget.json"
         module_dir = Path(__file__).resolve().parent
         candidates = [
+            canonical,
             module_dir.parent.parent / "storage" / "models_budget.json",
             Path("storage/models_budget.json").resolve(),
             Path("backend/storage/models_budget.json").resolve(),

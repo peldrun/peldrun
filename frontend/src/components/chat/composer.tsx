@@ -252,7 +252,10 @@ export function Composer({
   }, [setActiveModel, setActiveProvider]);
 
   const modelCaps = useMemo(() => {
-    return inferModelCapabilities(activeModel, metadataVault[activeModel]);
+    return inferModelCapabilities(
+      activeModel,
+      activeModel ? metadataVault[activeModel] : null
+    );
   }, [activeModel, metadataVault]);
 
   const isReasoningSupported = Boolean(modelCaps?.isReasoning);
@@ -277,17 +280,29 @@ export function Composer({
     // Strictly enforce role-based delegation permission in payload
     const canDelegate = execMode === "agent" && isTeamLead && Boolean(delegationAllowed);
 
+    // When no model/provider has been selected yet, omit those keys
+    // entirely. The backend will then use its config.toml defaults.
+    // Sending empty strings would override the backend defaults with
+    // empty values and break inference.
     let base: Record<string, any> = {
-      model: activeModel,
-      provider: activeProvider.toLowerCase().replace(/[^a-z0-9]/g, ""),
-      provider_name: activeProvider,
+      ...(activeModel ? { model: activeModel } : {}),
+      ...(activeProvider
+        ? {
+            provider: activeProvider.toLowerCase().replace(/[^a-z0-9]/g, ""),
+            provider_name: activeProvider,
+          }
+        : {}),
+      // NOTE: base_url remains hardcoded for now (audit report item 1.2).
+      // This is a frontend-side override of the backend LM Studio URL,
+      // not a hydration concern. See roadmap for architectural cleanup.
       base_url: "http://127.0.0.1:1234/v1",
       api_key: "",
       api_type: "",
       mode: directives.agentId ? "agent" : execMode,
       reasoning_effort: effectiveEffort,
       is_reasoning_model: isReasoning,
-      agent_id: execMode === "agent" || directives.agentId ? effectiveAgentId : "peldrun",
+      agent_id:
+        execMode === "agent" || directives.agentId ? effectiveAgentId : "peldrun",
       delegation_allowed: canDelegate,
     };
 
@@ -483,11 +498,13 @@ export function Composer({
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
 
+  const displayProvider = activeProvider || "your provider";
+  const displayModel = activeModel || "your model";
   const dynamicPlaceholder =
     placeholder ||
     (execMode === "agent"
-      ? `Ask ${activeProvider} (${activeModel}) to execute autonomous tasks...`
-      : `Chat directly with ${activeProvider} (${activeModel})...`);
+      ? `Ask ${displayProvider} (${displayModel}) to execute autonomous tasks...`
+      : `Chat directly with ${displayProvider} (${displayModel})...`);
 
   const isInputEmpty = !text.trim() && attachedFiles.length === 0;
 

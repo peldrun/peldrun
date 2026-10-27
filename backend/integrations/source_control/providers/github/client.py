@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -64,6 +65,7 @@ __all__ = [
     "DEFAULT_TIMEOUT_SECONDS",
     "DEFAULT_MAX_RETRIES",
     "MAX_PAGE_SIZE",
+    "resolve_github_api_base_url",
 ]
 
 
@@ -71,7 +73,64 @@ logger = logging.getLogger(__name__)
 
 
 #: Default REST API base URL for GitHub.com.
+#: Override via the GITHUB_API_URL environment variable for GitHub
+#: Enterprise Server or GitHub Enterprise Cloud with a custom hostname.
 DEFAULT_API_URL: str = "https://api.github.com"
+
+#: Environment variables consulted when no explicit `api_url` is provided.
+#: GITHUB_API_URL takes precedence over GITHUB_ENTERPRISE_HOST.
+_ENV_API_URL: str = "GITHUB_API_URL"
+_ENV_ENTERPRISE_HOST: str = "GITHUB_ENTERPRISE_HOST"
+
+
+def _normalize_api_url(raw: str) -> str:
+    """Return `raw` as a clean API URL with no trailing slash."""
+    return (raw or "").strip().rstrip("/")
+
+
+def _build_enterprise_url(host: str) -> str:
+    """Build the default GitHub Enterprise Server API URL from a hostname.
+
+    Accepts bare hostnames (``github.company.internal``), scheme-prefixed
+    hostnames (``https://github.company.internal``), and hostnames with a
+    port. Always produces ``<scheme>://<host>/api/v3`` as required by
+    GitHub Enterprise Server.
+    """
+    h = (host or "").strip().rstrip("/")
+    if not h:
+        return ""
+    if not h.startswith(("http://", "https://")):
+        h = f"https://{h}"
+    # If the caller already supplied an /api/vX suffix, honor it.
+    if "/api/v" in h:
+        return h
+    return f"{h}/api/v3"
+
+
+def resolve_github_api_base_url(explicit: Optional[str] = None) -> str:
+    """Resolve the GitHub REST API base URL.
+
+    Precedence:
+        1. ``explicit`` argument (caller-supplied ``api_url``)
+        2. ``GITHUB_API_URL`` environment variable (full URL)
+        3. ``GITHUB_ENTERPRISE_HOST`` environment variable (hostname)
+        4. ``DEFAULT_API_URL`` (github.com public API)
+    """
+    if explicit:
+        return _normalize_api_url(explicit)
+
+    env_url = os.environ.get(_ENV_API_URL)
+    if env_url:
+        return _normalize_api_url(env_url)
+
+    env_host = os.environ.get(_ENV_ENTERPRISE_HOST)
+    if env_host:
+        built = _build_enterprise_url(env_host)
+        if built:
+            return built
+
+    return DEFAULT_API_URL
+
 
 #: Default per-request timeout in seconds.
 DEFAULT_TIMEOUT_SECONDS: float = 30.0
@@ -116,7 +175,7 @@ class GitHubApiConfig:
                           renamed repositories.
     """
 
-    api_url: str = DEFAULT_API_URL
+    api_url: str = field(default_factory=resolve_github_api_base_url)
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     max_retries: int = DEFAULT_MAX_RETRIES
     user_agent: str = _USER_AGENT
@@ -125,14 +184,37 @@ class GitHubApiConfig:
     follow_redirects: bool = True
 
     def __post_init__(self) -> None:
-        # Normalize the API URL by stripping trailing slashes.
-        normalized = (self.api_url or DEFAULT_API_URL).rstrip("/")
+        # Normalize the API URL and re-apply env resolution when the
+        # caller relied on the default factory but also left it empty.
+        normalized = resolve_github_api_base_url(self.api_url)
         object.__setattr__(self, "api_url", normalized)
 
         if self.timeout_seconds <= 0:
             raise ValidationError("timeout_seconds must be positive.")
         if self.max_retries < 0:
             raise ValidationError("max_retries must not be negative.")
+
+    @classmethod
+    def for_enterprise(
+        cls,
+        host: str,
+        **overrides: Any,
+    ) -> "GitHubApiConfig":
+        """Build a config targeting a GitHub Enterprise Server instance.
+
+        Args:
+            host: Enterprise hostname, e.g. ``github.company.internal``
+                or ``https://github.company.internal``. The ``/api/v3``
+                path is appended automatically unless already present.
+            **overrides: Any other ``GitHubApiConfig`` field overrides.
+        """
+        api_url = _build_enterprise_url(host)
+        if not api_url:
+            raise ValidationError(
+                "Enterprise host must be a non-empty string.",
+                details={"host": host},
+            )
+        return cls(api_url=api_url, **overrides)
 
 
 # ---------------------------------------------------------------------------

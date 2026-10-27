@@ -814,10 +814,18 @@ def get_workspace_root(
     """
     Return the workspace root directory.
 
-    Resolution order:
+    Resolution order (audit items 2.2 + 2.4):
         1. The `override` argument, when provided.
         2. The `PELDRUN_WORKSPACE_ROOT` environment variable.
-        3. The `DEFAULT_WORKSPACE_ROOT` constant, with `~` expanded.
+        3. `peldrun.storage_paths.get_storage_root() / "workspaces"`
+           — the centralized storage root, so standalone workspaces
+           live next to chat-scoped workspaces and every other piece
+           of persistent state.
+        4. `<backend>/storage/workspaces` — bootstrap fallback for
+           isolated test runs where `peldrun.storage_paths` is not
+           importable.
+        5. `~/.peldrun/workspaces` — legacy fallback. Retained only
+           so pre-existing workspaces remain discoverable.
 
     The returned path is expanded and absolute but is NOT created;
     callers that need the directory to exist are responsible for
@@ -828,7 +836,7 @@ def get_workspace_root(
     elif os.environ.get(ENV_WORKSPACE_ROOT):
         candidate = Path(os.environ[ENV_WORKSPACE_ROOT])
     else:
-        candidate = Path(DEFAULT_WORKSPACE_ROOT)
+        candidate = _resolve_default_workspace_root()
 
     expanded = candidate.expanduser()
     try:
@@ -836,6 +844,43 @@ def get_workspace_root(
     except (OSError, RuntimeError):
         return expanded.absolute()
 
+
+def _resolve_default_workspace_root() -> Path:
+    """
+    Resolve the default workspace root, anchored to the centralized
+    storage root so all persistent state lives under one umbrella.
+
+    Priority (audit items 2.2 + 2.4):
+        1. `peldrun.storage_paths.get_storage_root() / "workspaces"`
+           — the canonical, project-root-anchored location.
+        2. `<backend>/storage/workspaces` — bootstrap fallback for
+           isolated test runs.
+        3. `~/.peldrun/workspaces` — legacy fallback so existing
+           workspaces in the old location remain accessible.
+
+    Before this function existed, every standalone workspace was
+    created under `~/.peldrun/workspaces`, which meant:
+        - A repository backup did not include them.
+        - Moving the project to another machine lost them.
+        - Multi-user hosts isolated them per user.
+
+    Anchoring to the storage root fixes all three problems while
+    preserving backward compatibility: the legacy path is still
+    checked as a last resort, and `_discover_workspace_on_disk()`
+    in `workspace.py` scans both locations during recovery.
+    """
+    try:
+        from peldrun.storage_paths import get_storage_root
+
+        return (get_storage_root() / "workspaces").resolve()
+    except Exception:  # noqa: BLE001 — bootstrap fallback
+        pass
+
+    try:
+        backend_root = Path(__file__).resolve().parent.parent.parent.parent
+        return (backend_root / "storage" / "workspaces").resolve()
+    except Exception:  # noqa: BLE001 — last resort
+        return Path("~/.peldrun/workspaces").expanduser().resolve()
 
 # ---------------------------------------------------------------------------
 # Default policy singleton

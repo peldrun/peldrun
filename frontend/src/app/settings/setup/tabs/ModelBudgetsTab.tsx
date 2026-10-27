@@ -92,9 +92,10 @@ interface GranularProviderGroup {
  * In production both share an origin behind a reverse proxy.
  * ============================================================ */
 function resolveBackendBase(): string {
-  if (typeof window === "undefined") return "";
-  const port = window.location.port;
-  return port === "3088" || port === "3000" ? "http://localhost:8088" : "";
+  // Return empty string so all fetch calls use relative paths routed
+  // through Next.js rewrites (see next.config.mjs). An absolute URL
+  // here would bypass rewrites and cause SSR/CSR divergence.
+  return "";
 }
 
 /* ============================================================

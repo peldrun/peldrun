@@ -57,6 +57,7 @@ from omweb.routers import (
     status,
     storage,
     store_rtr,
+    system as system_rtr,
     telemetry,
 )
 
@@ -200,6 +201,13 @@ app.include_router(
     tags=["store", "bundles"],
 )
 app.include_router(telemetry.router, prefix="/api/telemetry", tags=["telemetry"])
+
+# System diagnostics router.
+#
+# Exposes /api/system/health and /api/system/info for the frontend
+# BackendStatusCard. These endpoints are read-only and safe to expose:
+# no secrets, no filesystem paths, no config values.
+app.include_router(system_rtr.router, prefix="/api/system", tags=["system"])
 
 # Source Control Integration router.
 #

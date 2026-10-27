@@ -6,12 +6,53 @@ and model discovery.
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+
 import httpx
 
 from peldrun.llm.client import AsyncLLMClient, LLMConfig, LLMResponse, StreamChunk
 from peldrun.llm.providers.openai_compat import OpenAICompatProvider
+
+# Documented default endpoint for LM Studio.
+# Override via the LMSTUDIO_BASE_URL environment variable or
+# [llm.providers.lmstudio].base_url in config.toml.
+DEFAULT_LMSTUDIO_BASE_URL = "http://localhost:1234/v1"
+
+
+def resolve_lmstudio_base_url(config: Optional[LLMConfig]) -> str:
+    """Resolve the LM Studio base URL.
+
+    Precedence:
+        1. LMSTUDIO_BASE_URL environment variable
+        2. config.api_base (loaded from config.toml or caller-supplied)
+        3. DEFAULT_LMSTUDIO_BASE_URL
+    """
+    env_url = os.environ.get("LMSTUDIO_BASE_URL")
+    if env_url:
+        return env_url.rstrip("/")
+    if config is not None:
+        api_base = getattr(config, "api_base", None)
+        if api_base:
+            return str(api_base).rstrip("/")
+    return DEFAULT_LMSTUDIO_BASE_URL
+
+
+def _apply_lmstudio_env_override(config: Optional[LLMConfig]) -> Optional[LLMConfig]:
+    """Apply LMSTUDIO_BASE_URL override to the LLMConfig when present.
+
+    Ensures all inference calls routed through the parent provider (which reads
+    config.api_base) honor the environment variable, not only model discovery.
+    """
+    env_url = os.environ.get("LMSTUDIO_BASE_URL")
+    if not env_url or config is None or not hasattr(config, "api_base"):
+        return config
+    env_url = env_url.rstrip("/")
+    if hasattr(config, "model_copy"):
+        return config.model_copy(update={"api_base": env_url})
+    config.api_base = env_url
+    return config
 
 
 class LMStudioProvider(OpenAICompatProvider):
@@ -24,6 +65,7 @@ class LMStudioProvider(OpenAICompatProvider):
         transport: Optional[httpx.AsyncBaseTransport] = None,
         **kwargs: Any,
     ) -> None:
+        config = _apply_lmstudio_env_override(config)
         super().__init__(config=config, client=client, transport=transport, **kwargs)
         self.name = "lmstudio"
 
@@ -65,7 +107,7 @@ class LMStudioProvider(OpenAICompatProvider):
         """Query LM Studio local models discovery endpoint."""
         http_client = self._get_http_client()
         if http_client is not None:
-            base_endpoint = getattr(self.config, "api_base", "http://localhost:1234/v1")
+            base_endpoint = resolve_lmstudio_base_url(self.config)
             clean_base = str(base_endpoint).replace("/v1", "").rstrip("/")
             endpoints = [
                 f"{clean_base}/api/v1/models",
@@ -84,4 +126,8 @@ class LMStudioProvider(OpenAICompatProvider):
         return []
 
 
-__all__ = ["LMStudioProvider"]
+__all__ = [
+    "LMStudioProvider",
+    "DEFAULT_LMSTUDIO_BASE_URL",
+    "resolve_lmstudio_base_url",
+]

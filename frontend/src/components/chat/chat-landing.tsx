@@ -110,7 +110,10 @@ export function ChatLanding({
 
   // Dynamically resolve whether the currently active model supports reasoning
   const modelCaps = useMemo(() => {
-    return inferModelCapabilities(activeModel, metadataVault[activeModel]);
+    return inferModelCapabilities(
+      activeModel,
+      activeModel ? metadataVault[activeModel] : null
+    );
   }, [activeModel, metadataVault]);
 
   const isReasoningSupported = Boolean(modelCaps?.isReasoning);
@@ -147,10 +150,12 @@ export function ChatLanding({
     setWebSearchEnabled(false); // Reset after dispatch
   };
 
+  const displayProvider = activeProvider || "your provider";
+  const displayModel = activeModel || "your model";
   const dynamicPlaceholder =
     execMode === "agent"
-      ? `Ask ${activeProvider} (${activeModel}) to execute autonomous tasks...`
-      : `Chat directly with ${activeProvider} (${activeModel})...`;
+      ? `Ask ${displayProvider} (${displayModel}) to execute autonomous tasks...`
+      : `Chat directly with ${displayProvider} (${displayModel})...`;
 
   return (
     <div className="glow-wrapper flex-1 flex flex-col items-center justify-center p-6 text-center max-w-3xl mx-auto w-full font-sans relative">

@@ -108,10 +108,17 @@ export default function SettingsPage() {
   const currentSnapshot = JSON.stringify({ config, lmStudioSettings, ollamaSettings, cloudProviders, customEndpoints });
   const isDirty = initialLoadedRef.current !== "" && initialLoadedRef.current !== currentSnapshot;
 
+  // All /api/* calls go through Next.js rewrites, which route to the
+  // backend configured at build time via PELDRUN_BACKEND_URL
+  // (see next.config.mjs). Using an absolute URL here would bypass
+  // those rewrites entirely and silently pin the frontend to a
+  // specific host/port that may not match the active backend
+  // instance in staging, production, or behind a reverse proxy.
+  //
+  // The function is kept (rather than inlined) as a single extension
+  // point for future cross-cutting concerns (auth headers, request
+  // tracing) without touching every call site.
   const getApiUrl = (endpoint: string) => {
-    if (typeof window !== "undefined" && (window.location.port === "3088" || window.location.port === "3000")) {
-      return `http://localhost:8088${endpoint}`;
-    }
     return endpoint;
   };
 
@@ -258,8 +265,18 @@ export default function SettingsPage() {
       });
 
       if (typeof window !== "undefined") {
-        localStorage.setItem("omweb_active_model", loadedConfig.llm.model);
-        localStorage.setItem("omweb_active_provider", loadedConfig.llm.provider_name);
+        // Persist only meaningful values. Writing "null"/"undefined"
+        // would corrupt later reads via useAppStorage("active_model"),
+        // because the storage schema now allows null as a legitimate
+        // "unselected" state.
+        const activeModel = loadedConfig.llm.model;
+        const activeProvider = loadedConfig.llm.provider_name;
+        if (typeof activeModel === "string" && activeModel.trim()) {
+          localStorage.setItem("omweb_active_model", activeModel);
+        }
+        if (typeof activeProvider === "string" && activeProvider.trim()) {
+          localStorage.setItem("omweb_active_provider", activeProvider);
+        }
       }
     } catch (e: any) {
       console.error("Failed to load config", e);
@@ -573,22 +590,40 @@ export default function SettingsPage() {
         showToast.success("Saved Successfully", `Active: ${activeLlm.provider_name} (${activeLlm.model})`);
 
         if (typeof window !== "undefined") {
-          localStorage.setItem("omweb_active_model", activeLlm.model);
-          localStorage.setItem("omweb_active_provider", activeLlm.provider_name);
+          const safeModel =
+            typeof activeLlm.model === "string" ? activeLlm.model.trim() : "";
+          const safeProvider =
+            typeof activeLlm.provider_name === "string"
+              ? activeLlm.provider_name.trim()
+              : "";
+
+          // Skip individual writes when the value is empty. Writing an
+          // empty string here would (a) fail the storage schema's
+          // string().min(1) rule on the next read via useAppStorage,
+          // and (b) re-trigger "not configured" UI even after a save.
+          if (safeModel) {
+            localStorage.setItem("omweb_active_model", safeModel);
+          }
+          if (safeProvider) {
+            localStorage.setItem("omweb_active_provider", safeProvider);
+          }
           localStorage.setItem(
             "omweb_active_llm_override",
             JSON.stringify({
-              model: activeLlm.model,
-              provider: activeLlm.provider,
-              provider_name: activeLlm.provider_name,
-              base_url: activeLlm.base_url,
-              api_key: activeLlm.api_key,
+              model: safeModel || null,
+              provider: activeLlm.provider || null,
+              provider_name: safeProvider || null,
+              base_url: activeLlm.base_url || null,
+              api_key: activeLlm.api_key || null,
               api_type: activeLlm.api_type || "",
             })
           );
           window.dispatchEvent(
             new CustomEvent("omweb:model-change", {
-              detail: { model: activeLlm.model, provider_name: activeLlm.provider_name },
+              detail: {
+                model: safeModel || null,
+                provider_name: safeProvider || null,
+              },
             })
           );
         }

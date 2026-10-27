@@ -33,7 +33,7 @@ import re
 import threading
 import unicodedata
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 from ..ports.repository import LocalBranchPort
 from ..domain.models import BranchRef
@@ -141,6 +141,13 @@ class GitBranchManager(LocalBranchPort):
             if isinstance(default_branch, str) and default_branch.strip()
             else None
         )
+        # Cache of detected default branches, keyed by the resolved
+        # workspace path. Populated lazily on the first call to
+        # `_get_default_branch_name`. The cache exists so that
+        # `_is_default_branch` does not shell out to git on every
+        # `BranchRef` construction (which happens for every branch in
+        # a list).
+        self._detected_defaults: Dict[str, Optional[str]] = {}
 
     # --- Public API (LocalBranchPort) ----------------------------------
 
@@ -203,7 +210,7 @@ class GitBranchManager(LocalBranchPort):
         return BranchRef(
             name=branch_name,
             head_sha=head_sha,
-            is_default=self._is_default_branch(branch_name),
+            is_default=await self._is_default_branch(branch_name, target),
             is_protected=is_protected_local_branch(branch_name),
         )
 
@@ -228,7 +235,33 @@ class GitBranchManager(LocalBranchPort):
         )
         if raw.returncode != 0 and not raw.stdout:
             return ()
-        return _parse_branch_list(raw.stdout)
+
+        parsed = _parse_branch_list(raw.stdout)
+        detected_default = await self._get_default_branch_name(target)
+
+        # Reclassify: `is_default` reflects the repository's actual
+        # default branch (detected from origin/HEAD or the user's Git
+        # config), NOT which branch happens to be currently checked
+        # out. The ordering produced by `_parse_branch_list` (current
+        # first, then others) is preserved as a UX convenience.
+        reclassified: List[BranchRef] = []
+        for ref in parsed:
+            if detected_default is not None:
+                is_default = ref.name == detected_default
+            else:
+                # No authoritative source: fall back to the common
+                # names. This only triggers for local-only repos on
+                # systems where `init.defaultBranch` is unset.
+                is_default = ref.name in ("main", "master")
+            reclassified.append(
+                BranchRef(
+                    name=ref.name,
+                    head_sha=ref.head_sha,
+                    is_default=is_default,
+                    is_protected=ref.is_protected,
+                )
+            )
+        return tuple(reclassified)
 
     async def get_current_branch(
         self,
@@ -386,7 +419,7 @@ class GitBranchManager(LocalBranchPort):
         return BranchRef(
             name=branch_name,
             head_sha=head_sha,
-            is_default=self._is_default_branch(branch_name),
+            is_default=await self._is_default_branch(branch_name, target),
             is_protected=is_protected_local_branch(branch_name),
         )
 
@@ -492,7 +525,7 @@ class GitBranchManager(LocalBranchPort):
         return BranchRef(
             name=new_name,
             head_sha=head_sha,
-            is_default=self._is_default_branch(new_name),
+            is_default=await self._is_default_branch(new_name, target),
             is_protected=is_protected_local_branch(new_name),
         )
 
@@ -554,7 +587,7 @@ class GitBranchManager(LocalBranchPort):
         return BranchRef(
             name=branch_name,
             head_sha=sha,
-            is_default=self._is_default_branch(branch_name),
+            is_default=await self._is_default_branch(branch_name, target),
             is_protected=is_protected_local_branch(branch_name),
         )
 
@@ -649,14 +682,145 @@ class GitBranchManager(LocalBranchPort):
             return True
         return bool(result.stdout.strip())
 
-    def _is_default_branch(self, branch_name: str) -> bool:
+    async def _detect_repo_default_branch(
+        self, target: Path
+    ) -> Optional[str]:
         """
-        Return True when `branch_name` matches the configured default
-        branch, or when no explicit default is configured and the
-        name matches the common defaults.
+        Detect the repository's actual default branch.
+
+        Resolution order (first successful source wins):
+
+            1. ``git symbolic-ref refs/remotes/origin/HEAD`` — the
+               authoritative source when the repository was cloned
+               from a remote. Returns the branch the remote
+               considers default, which correctly handles
+               ``develop``, ``trunk``, ``release/*``, and any custom
+               name a project has chosen.
+
+            2. ``git config --get init.defaultBranch`` — the user's
+               global Git default. Used for local-only repositories
+               that were initialized but never connected to a remote
+               (e.g. ``git init`` with a global config default of
+               ``develop``).
+
+            3. ``None`` — no authoritative source is available. The
+               caller decides the final fallback.
+
+        Returning ``None`` (rather than hardcoding ``"main"`` /
+        ``"master"``) is intentional: modern Git installations and
+        many enterprise setups default to other branch names, and a
+        wrong classification here breaks the review/push UI (see
+        audit report item 6.2).
+        """
+        # 1. Remote HEAD (authoritative when a remote exists).
+        try:
+            result = await self._git.run(
+                ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                cwd=target,
+                check_returncode=False,
+            )
+        except GitExecutionError:
+            result = None
+
+        if result is not None and result.returncode == 0:
+            ref = (result.stdout or "").strip()
+            prefix = "refs/remotes/origin/"
+            if ref.startswith(prefix) and len(ref) > len(prefix):
+                return ref[len(prefix):]
+
+        # 2. User's Git default for new repositories.
+        try:
+            result = await self._git.run(
+                ["config", "--get", "init.defaultBranch"],
+                cwd=target,
+                check_returncode=False,
+            )
+        except GitExecutionError:
+            result = None
+
+        if result is not None and result.returncode == 0:
+            configured = (result.stdout or "").strip()
+            if configured:
+                return configured
+
+        # 3. No authoritative source available.
+        return None
+
+    async def _get_default_branch_name(
+        self, target: Path
+    ) -> Optional[str]:
+        """
+        Return the effective default branch name for a workspace.
+
+        Precedence:
+            1. Explicit ``default_branch`` passed to the constructor
+               (tests, embedding scenarios that override the repo).
+            2. Cached detection result for this workspace.
+            3. Fresh detection via ``_detect_repo_default_branch``.
+            4. ``None`` — the caller decides the final fallback.
         """
         if self._default_branch is not None:
-            return branch_name == self._default_branch
+            return self._default_branch
+
+        try:
+            cache_key = str(target.resolve())
+        except OSError:
+            cache_key = str(target)
+
+        if cache_key in self._detected_defaults:
+            return self._detected_defaults[cache_key]
+
+        detected = await self._detect_repo_default_branch(target)
+        self._detected_defaults[cache_key] = detected
+        return detected
+
+    def invalidate_default_branch_cache(
+        self, workspace_path: Optional[Union[str, Path]] = None
+    ) -> None:
+        """
+        Invalidate the cached default branch for a workspace (or all).
+
+        Call after operations that change the repository's remotes
+        (``git remote add``, ``git remote set-url``) or after a user
+        explicitly reconfigures the default branch. Normal branch
+        operations (create, checkout, rename) do NOT invalidate the
+        cache because the repository's default branch does not
+        change as a result.
+        """
+        if workspace_path is None:
+            self._detected_defaults.clear()
+            return
+        try:
+            key = str(Path(workspace_path).resolve())
+        except OSError:
+            key = str(workspace_path)
+        self._detected_defaults.pop(key, None)
+
+    async def _is_default_branch(
+        self, branch_name: str, target: Path
+    ) -> bool:
+        """
+        Return True when ``branch_name`` is the workspace's default
+        branch.
+
+        Unlike the previous implementation, this no longer hardcodes
+        the ``("main", "master")`` pair as the only acceptable
+        defaults. The effective default is resolved from the
+        repository (``origin/HEAD``) or the user's Git config
+        (``init.defaultBranch``), so projects whose primary branch is
+        ``"develop"``, ``"trunk"``, or a custom name are classified
+        correctly.
+
+        The last-resort ``("main", "master")`` fallback is retained
+        ONLY for repositories that have neither a remote configured
+        nor an ``init.defaultBranch`` in the user's Git environment.
+        Without it, a fresh ``git init`` on such a system would
+        report NO default branch at all, which downstream consumers
+        (review UI, push flow) treat as an error.
+        """
+        detected = await self._get_default_branch_name(target)
+        if detected is not None:
+            return branch_name == detected
         return branch_name in ("main", "master")
 
     # --- Validation ----------------------------------------------------
@@ -775,7 +939,13 @@ def _parse_branch_list(raw: str) -> Tuple[BranchRef, ...]:
         ref = BranchRef(
             name=normalized_name,
             head_sha=head_sha,
-            is_default=is_current,
+            # NOTE: `is_default` cannot be determined by the parser
+            # because it depends on the repository's actual default
+            # branch (detected via `_get_default_branch_name`). The
+            # caller (`list_local_branches`) reclassifies every entry
+            # after parsing. Setting `False` here is honest: this
+            # function is a pure parser with no repo context.
+            is_default=False,
             is_protected=is_protected_local_branch(normalized_name),
         )
         if is_current:

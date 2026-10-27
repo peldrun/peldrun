@@ -163,7 +163,7 @@ async function fetchDisabledTools(agentId: string): Promise<Set<string>> {
   }
 
   try {
-    const base = typeof window !== "undefined" && (window.location.port === "3088" || window.location.port === "3000") ? "http://localhost:8088" : "";
+    const base = "";
     const res = await fetch(`${base}/api/store/agents/${encodeURIComponent(agentId)}/tools`, { cache: "no-store" });
     if (!res.ok) {
       disabledToolsCache.set(agentId, { at: now, tools: new Set() });
@@ -203,7 +203,7 @@ async function fetchDisabledMcpServers(agentId: string): Promise<Set<string>> {
 
   const disabled = new Set<string>();
   try {
-    const base = typeof window !== "undefined" && (window.location.port === "3088" || window.location.port === "3000") ? "http://localhost:8088" : "";
+    const base = "";
 
     // Two sources must be merged:
     //   1. Per-agent disabled_mcp_servers from agent_settings.json.

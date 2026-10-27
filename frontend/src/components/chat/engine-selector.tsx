@@ -1,4 +1,6 @@
-﻿"use client";
+﻿// frontend/src/components/chat/engine-selector.tsx
+
+"use client";
 
 import React, { useState, useEffect, useRef } from "react";
 import Link from "next/link";
@@ -9,10 +11,9 @@ import {
   Server,
   ChevronDown,
   Check,
-  Plus,
   Brain,
   Eye,
-  Wrench
+  Wrench,
 } from "lucide-react";
 import { inferModelCapabilities, fetchServerMetadata } from "@/lib/modelMetadata";
 import { fetchVault } from "@/lib/vault";
@@ -45,6 +46,9 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [openUpward, setOpenUpward] = useState(false);
 
+  // Both values come from `useAppStorage`, whose schema now allows
+  // `null` to represent the "no model / no provider selected yet"
+  // state. Every use below MUST handle that case explicitly.
   const [activeModel, setActiveModel] = useAppStorage("active_model");
   const [activeProvider, setActiveProvider] = useAppStorage("active_provider");
   const [, setActiveLlmOverride] = useAppStorage("active_llm_override");
@@ -68,26 +72,42 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
     if (typeof window === "undefined") return;
 
     try {
-      const storedLM = JSON.parse(localStorage.getItem("omweb_lmstudio_vault") || "null");
-      const scanned = JSON.parse(localStorage.getItem("omweb_scanned_models") || "[]");
+      const storedLM = JSON.parse(
+        localStorage.getItem("omweb_lmstudio_vault") || "null"
+      );
+      const scanned = JSON.parse(
+        localStorage.getItem("omweb_scanned_models") || "[]"
+      );
       const baseModel = storedLM?.model || "qwen3-vl-8b-instruct";
-      const combined = Array.from(new Set([
-        baseModel,
-        ...(Array.isArray(scanned) ? scanned : []),
-        ...(storedLM?.savedModels && Array.isArray(storedLM.savedModels) ? storedLM.savedModels : [])
-      ])).filter(Boolean);
+      const combined = Array.from(
+        new Set([
+          baseModel,
+          ...(Array.isArray(scanned) ? scanned : []),
+          ...(storedLM?.savedModels && Array.isArray(storedLM.savedModels)
+            ? storedLM.savedModels
+            : []),
+        ])
+      ).filter(Boolean);
 
       setLocalGPUModels(combined);
-      setLmStudioItem(storedLM || {
-        baseUrl: "http://127.0.0.1:1234/v1",
-        model: baseModel,
-        apiKey: ""
-      });
+      setLmStudioItem(
+        storedLM || {
+          baseUrl: "http://127.0.0.1:1234/v1",
+          model: baseModel,
+          apiKey: "",
+        }
+      );
     } catch (e) {}
 
     try {
-      const storedOllama = JSON.parse(localStorage.getItem("omweb_ollama_vault") || "null");
-      if (storedOllama && Array.isArray(storedOllama.savedModels) && storedOllama.savedModels.length > 0) {
+      const storedOllama = JSON.parse(
+        localStorage.getItem("omweb_ollama_vault") || "null"
+      );
+      if (
+        storedOllama &&
+        Array.isArray(storedOllama.savedModels) &&
+        storedOllama.savedModels.length > 0
+      ) {
         setOllamaItem(storedOllama);
       } else {
         setOllamaItem(null);
@@ -97,7 +117,9 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
     }
 
     try {
-      const storedCloud = JSON.parse(localStorage.getItem("omweb_cloud_vault") || "[]");
+      const storedCloud = JSON.parse(
+        localStorage.getItem("omweb_cloud_vault") || "[]"
+      );
       if (Array.isArray(storedCloud)) {
         const configuredOnly = storedCloud.filter(
           (cp: any) =>
@@ -114,7 +136,9 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
     }
 
     try {
-      const storedCustom = JSON.parse(localStorage.getItem("omweb_custom_endpoints") || "[]");
+      const storedCustom = JSON.parse(
+        localStorage.getItem("omweb_custom_endpoints") || "[]"
+      );
       if (Array.isArray(storedCustom)) {
         setActiveCustomEndpoints(storedCustom);
       } else {
@@ -151,7 +175,10 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+      if (
+        dropdownRef.current &&
+        !dropdownRef.current.contains(e.target as Node)
+      ) {
         setIsOpen(false);
       }
     };
@@ -188,7 +215,7 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
 
     const cleanPayload: ProviderPayload = {
       ...payload,
-      base_url: cleanBaseUrl
+      base_url: cleanBaseUrl,
     };
 
     const payloadJson = JSON.stringify(cleanPayload);
@@ -204,14 +231,24 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
       localStorage.setItem("omweb_active_model", cleanPayload.model);
       localStorage.setItem("omweb_active_provider", cleanPayload.provider_name);
       localStorage.setItem("omweb_active_llm_override", payloadJson);
-      window.dispatchEvent(new CustomEvent("omweb:model-change", { detail: cleanPayload }));
+      window.dispatchEvent(
+        new CustomEvent("omweb:model-change", { detail: cleanPayload })
+      );
     }
 
     setIsOpen(false);
   };
 
-  const renderModelBadges = (modelKey: string) => {
-    if (!mounted) return null;
+  /**
+   * Render capability badges for a given model key.
+   *
+   * Now accepts `null | undefined` because `activeModel` may be null
+   * when the user has not yet chosen a model (schema allows null).
+   * In that case, no badges are shown — which is the correct UX for
+   * an "unselected" state.
+   */
+  const renderModelBadges = (modelKey: string | null | undefined) => {
+    if (!mounted || !modelKey) return null;
     const caps = inferModelCapabilities(modelKey, metadataVault[modelKey]);
     if (!caps.isReasoning && !caps.isVision && !caps.isTools) return null;
 
@@ -245,6 +282,10 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
     );
   };
 
+  // Null-safe derived values for the trigger button labels.
+  const displayProvider = activeProvider || "No provider";
+  const displayModel = activeModel || "Not selected";
+
   return (
     <div className="relative inline-block text-left" ref={dropdownRef}>
       <button
@@ -258,16 +299,25 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
           <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
           <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
         </span>
-        <span className="font-semibold text-primary truncate max-w-[130px]">{activeProvider}:</span>
-        <span className="text-foreground truncate max-w-[140px]">{activeModel}</span>
+        <span className="font-semibold text-primary truncate max-w-[130px]">
+          {displayProvider}:
+        </span>
+        <span className="text-foreground truncate max-w-[140px]">
+          {displayModel}
+        </span>
         {renderModelBadges(activeModel)}
-        <ChevronDown size={11} className={`text-muted-foreground transition-transform shrink-0 ${isOpen ? 'rotate-180' : ''}`} />
+        <ChevronDown
+          size={11}
+          className={`text-muted-foreground transition-transform shrink-0 ${
+            isOpen ? "rotate-180" : ""
+          }`}
+        />
       </button>
 
       {isOpen && (
         <div
           className={`absolute left-0 w-96 bg-card border border-border rounded-lg shadow-xl p-2 z-50 space-y-2.5 max-h-96 overflow-y-auto font-sans animate-in fade-in ${
-            openUpward ? 'bottom-full mb-1.5' : 'top-full mt-1.5'
+            openUpward ? "bottom-full mb-1.5" : "top-full mt-1.5"
           }`}
         >
           <div className="px-2 py-1 text-[10px] font-semibold text-muted-foreground uppercase tracking-wider border-b border-border/60 flex items-center justify-between">
@@ -282,13 +332,19 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
                 <span>LM Studio (Local GPU)</span>
               </span>
               <span className="text-[10px] text-muted-foreground font-mono">
-                {localGPUModels.length} {localGPUModels.length === 1 ? "model" : "models"}
+                {localGPUModels.length}{" "}
+                {localGPUModels.length === 1 ? "model" : "models"}
               </span>
             </div>
 
             <div className="space-y-0.5 pl-3">
               {localGPUModels.map((m) => {
-                const isSelected = activeProvider.includes("LM Studio") && activeModel === m;
+                // activeProvider may be null; the `|| ""` guard makes
+                // the `.includes()` check safe and returns false when
+                // no provider has been selected yet.
+                const isSelected =
+                  (activeProvider || "").includes("LM Studio") &&
+                  activeModel === m;
                 return (
                   <button
                     key={m}
@@ -298,9 +354,11 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
                         model: m,
                         provider: "lmstudio",
                         provider_name: "LM Studio (Local)",
-                        base_url: lmStudioItem?.baseUrl || "http://127.0.0.1:1234/v1",
+                        base_url:
+                          lmStudioItem?.baseUrl ||
+                          "http://127.0.0.1:1234/v1",
                         api_key: lmStudioItem?.apiKey || "",
-                        api_type: ""
+                        api_type: "",
                       })
                     }
                     className={`w-full flex items-center justify-between px-2 py-1 rounded text-xs text-left transition-colors cursor-pointer ${
@@ -313,60 +371,76 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
                       <span className="font-mono truncate">{m}</span>
                       {renderModelBadges(m)}
                     </div>
-                    {isSelected && <Check size={12} className="text-primary shrink-0 ml-1" />}
+                    {isSelected && (
+                      <Check size={12} className="text-primary shrink-0 ml-1" />
+                    )}
                   </button>
                 );
               })}
             </div>
           </div>
 
-          {ollamaItem && ollamaItem.savedModels && ollamaItem.savedModels.length > 0 && (
-            <div className="rounded-md bg-muted/20 border border-border/40 p-1.5 space-y-1">
-              <div className="flex items-center justify-between px-1 py-0.5 text-[11px] font-semibold text-foreground">
-                <span className="flex items-center gap-1.5">
-                  <Terminal size={12} className="text-amber-500" />
-                  <span>Ollama (Local Server)</span>
-                </span>
-                <span className="text-[10px] text-muted-foreground font-mono">
-                  {ollamaItem.savedModels.length} {ollamaItem.savedModels.length === 1 ? "model" : "models"}
-                </span>
-              </div>
+          {ollamaItem &&
+            ollamaItem.savedModels &&
+            ollamaItem.savedModels.length > 0 && (
+              <div className="rounded-md bg-muted/20 border border-border/40 p-1.5 space-y-1">
+                <div className="flex items-center justify-between px-1 py-0.5 text-[11px] font-semibold text-foreground">
+                  <span className="flex items-center gap-1.5">
+                    <Terminal size={12} className="text-amber-500" />
+                    <span>Ollama (Local Server)</span>
+                  </span>
+                  <span className="text-[10px] text-muted-foreground font-mono">
+                    {ollamaItem.savedModels.length}{" "}
+                    {ollamaItem.savedModels.length === 1 ? "model" : "models"}
+                  </span>
+                </div>
 
-              <div className="space-y-0.5 pl-3">
-                {ollamaItem.savedModels.map((m: string) => {
-                  const isSelected = activeProvider.includes("Ollama") && activeModel === m;
-                  const bUrl = ollamaItem.baseUrl.endsWith("/v1") ? ollamaItem.baseUrl : `${ollamaItem.baseUrl}/v1`;
-                  return (
-                    <button
-                      key={m}
-                      type="button"
-                      onClick={() =>
-                        handleSelectEngine({
-                          model: m,
-                          provider: "ollama",
-                          provider_name: "Ollama (Local)",
-                          base_url: bUrl,
-                          api_key: "",
-                          api_type: ""
-                        })
-                      }
-                      className={`w-full flex items-center justify-between px-2 py-1 rounded text-xs text-left transition-colors cursor-pointer ${
-                        isSelected
-                          ? "bg-primary/10 text-primary font-medium border border-primary/30"
-                          : "hover:bg-muted text-muted-foreground hover:text-foreground"
-                      }`}
-                    >
-                      <div className="flex items-center gap-1.5 truncate flex-1 min-w-0 mr-1.5">
-                        <span className="font-mono truncate">{m}</span>
-                        {renderModelBadges(m)}
-                      </div>
-                      {isSelected && <Check size={12} className="text-primary shrink-0 ml-1" />}
-                    </button>
-                  );
-                })}
+                <div className="space-y-0.5 pl-3">
+                  {ollamaItem.savedModels.map((m: string) => {
+                    // Null-safe check: `(activeProvider || "")` prevents
+                    // TypeError when no provider has been selected yet.
+                    const isSelected =
+                      (activeProvider || "").includes("Ollama") &&
+                      activeModel === m;
+                    const bUrl = ollamaItem.baseUrl.endsWith("/v1")
+                      ? ollamaItem.baseUrl
+                      : `${ollamaItem.baseUrl}/v1`;
+                    return (
+                      <button
+                        key={m}
+                        type="button"
+                        onClick={() =>
+                          handleSelectEngine({
+                            model: m,
+                            provider: "ollama",
+                            provider_name: "Ollama (Local)",
+                            base_url: bUrl,
+                            api_key: "",
+                            api_type: "",
+                          })
+                        }
+                        className={`w-full flex items-center justify-between px-2 py-1 rounded text-xs text-left transition-colors cursor-pointer ${
+                          isSelected
+                            ? "bg-primary/10 text-primary font-medium border border-primary/30"
+                            : "hover:bg-muted text-muted-foreground hover:text-foreground"
+                        }`}
+                      >
+                        <div className="flex items-center gap-1.5 truncate flex-1 min-w-0 mr-1.5">
+                          <span className="font-mono truncate">{m}</span>
+                          {renderModelBadges(m)}
+                        </div>
+                        {isSelected && (
+                          <Check
+                            size={12}
+                            className="text-primary shrink-0 ml-1"
+                          />
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
-            </div>
-          )}
+            )}
 
           {activeCloudProviders.length > 0 && (
             <div className="pt-1 border-t border-border/40 space-y-1.5">
@@ -375,22 +449,31 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
               </span>
 
               {activeCloudProviders.map((cp) => {
-                const modelsList = cp.savedModels && cp.savedModels.length > 0 ? cp.savedModels : [cp.model];
+                const modelsList =
+                  cp.savedModels && cp.savedModels.length > 0
+                    ? cp.savedModels
+                    : [cp.model];
                 return (
-                  <div key={cp.id} className="rounded-md bg-muted/20 border border-border/40 p-1.5 space-y-1">
+                  <div
+                    key={cp.id}
+                    className="rounded-md bg-muted/20 border border-border/40 p-1.5 space-y-1"
+                  >
                     <div className="flex items-center justify-between px-1 py-0.5 text-[11px] font-semibold text-foreground">
                       <span className="flex items-center gap-1.5">
                         <Cloud size={12} className="text-sky-500" />
                         <span>{cp.name}</span>
                       </span>
                       <span className="text-[10px] text-muted-foreground font-mono">
-                        {modelsList.length} {modelsList.length === 1 ? "model" : "models"}
+                        {modelsList.length}{" "}
+                        {modelsList.length === 1 ? "model" : "models"}
                       </span>
                     </div>
 
                     <div className="space-y-0.5 pl-3">
                       {modelsList.map((m: string) => {
-                        const isSelected = activeProvider === cp.name && activeModel === m;
+                        // Simple equality check: safe with null provider.
+                        const isSelected =
+                          activeProvider === cp.name && activeModel === m;
                         return (
                           <button
                             key={m}
@@ -402,7 +485,7 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
                                 provider_name: cp.name,
                                 base_url: cp.baseUrl,
                                 api_key: cp.apiKey,
-                                api_type: cp.type || ""
+                                api_type: cp.type || "",
                               })
                             }
                             className={`w-full flex items-center justify-between px-2 py-1 rounded text-xs text-left transition-colors cursor-pointer ${
@@ -415,7 +498,12 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
                               <span className="font-mono truncate">{m}</span>
                               {renderModelBadges(m)}
                             </div>
-                            {isSelected && <Check size={12} className="text-primary shrink-0 ml-1" />}
+                            {isSelected && (
+                              <Check
+                                size={12}
+                                className="text-primary shrink-0 ml-1"
+                              />
+                            )}
                           </button>
                         );
                       })}
@@ -433,22 +521,31 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
               </span>
 
               {activeCustomEndpoints.map((ce) => {
-                const modelsList = ce.savedModels && ce.savedModels.length > 0 ? ce.savedModels : [ce.defaultModel];
+                const modelsList =
+                  ce.savedModels && ce.savedModels.length > 0
+                    ? ce.savedModels
+                    : [ce.defaultModel];
                 return (
-                  <div key={ce.id} className="rounded-md bg-muted/20 border border-border/40 p-1.5 space-y-1">
+                  <div
+                    key={ce.id}
+                    className="rounded-md bg-muted/20 border border-border/40 p-1.5 space-y-1"
+                  >
                     <div className="flex items-center justify-between px-1 py-0.5 text-[11px] font-semibold text-foreground">
                       <span className="flex items-center gap-1.5">
                         <Terminal size={12} className="text-amber-500" />
                         <span>{ce.name}</span>
                       </span>
                       <span className="text-[10px] text-muted-foreground font-mono">
-                        {modelsList.length} {modelsList.length === 1 ? "model" : "models"}
+                        {modelsList.length}{" "}
+                        {modelsList.length === 1 ? "model" : "models"}
                       </span>
                     </div>
 
                     <div className="space-y-0.5 pl-3">
                       {modelsList.map((m: string) => {
-                        const isSelected = activeProvider === ce.name && activeModel === m;
+                        // Simple equality check: safe with null provider.
+                        const isSelected =
+                          activeProvider === ce.name && activeModel === m;
                         return (
                           <button
                             key={m}
@@ -460,7 +557,7 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
                                 provider_name: ce.name,
                                 base_url: ce.endpointUrl,
                                 api_key: ce.apiKey || "",
-                                api_type: ""
+                                api_type: "",
                               })
                             }
                             className={`w-full flex items-center justify-between px-2 py-1 rounded text-xs text-left transition-colors cursor-pointer ${
@@ -473,7 +570,12 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
                               <span className="font-mono truncate">{m}</span>
                               {renderModelBadges(m)}
                             </div>
-                            {isSelected && <Check size={12} className="text-primary shrink-0 ml-1" />}
+                            {isSelected && (
+                              <Check
+                                size={12}
+                                className="text-primary shrink-0 ml-1"
+                              />
+                            )}
                           </button>
                         );
                       })}

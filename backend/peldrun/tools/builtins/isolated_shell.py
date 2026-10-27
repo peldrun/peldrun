@@ -14,8 +14,15 @@ class ShellParameters(BaseModel):
         description="The shell command line string to execute.",
     )
     timeout: Optional[int] = Field(
-        default=60,
-        description="Command timeout in seconds.",
+        default=None,
+        description=(
+            "Optional command timeout in seconds. Omit to use the "
+            "operator-configured timeout from the bash manifest "
+            "(recommended for long-running commands such as "
+            "'npm install' or 'cargo build'). Set explicitly only "
+            "when you need a tighter deadline than the configured "
+            "default."
+        ),
     )
 
 

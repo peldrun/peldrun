@@ -28,7 +28,11 @@ export function getLocalMetadataVault(): Record<string, ModelMetadata> {
 
 export async function persistMetadataToServer(entries: Record<string, Partial<ModelMetadata>>) {
   try {
-    await fetch("http://localhost:8088/api/config/models-metadata", {
+    // Relative path so the request is routed through Next.js rewrites
+    // (configured at build time via PELDRUN_BACKEND_URL). Using an
+    // absolute localhost URL would bypass those rewrites and silently
+    // pin the frontend to a hardcoded backend.
+    await fetch("/api/config/models-metadata", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ metadata: entries })
@@ -57,8 +61,14 @@ export function saveLocalMetadataVault(newEntries: Record<string, Partial<ModelM
 /**
  * Toggle reasoning mode manually for any model and persist permanently across reloads.
  */
-export function toggleModelReasoning(modelKey: string, forceState?: boolean): boolean {
+export function toggleModelReasoning(
+  modelKey: string | null | undefined,
+  forceState?: boolean
+): boolean {
   if (typeof window === "undefined") return false;
+  if (!modelKey || typeof modelKey !== "string" || !modelKey.trim()) {
+    return false;
+  }
   const currentVault = getLocalMetadataVault();
   const currentMeta = currentVault[modelKey] || { key: modelKey, type: "llm" };
   const currentCaps = inferModelCapabilities(modelKey, currentMeta);
@@ -81,7 +91,8 @@ export function toggleModelReasoning(modelKey: string, forceState?: boolean): bo
 
 export async function fetchServerMetadata(): Promise<Record<string, ModelMetadata>> {
   try {
-    const res = await fetch("http://localhost:8088/api/config/models-metadata");
+    // Relative path - see next.config.mjs rewrites.
+    const res = await fetch("/api/config/models-metadata");
     if (res.ok) {
       const data = await res.json();
       if (data.ok && data.metadata) {
@@ -120,9 +131,35 @@ export function getModelMetadata(modelKey: string): ModelMetadata | null {
 /**
  * Universal capability inference function conforming to 2026 AI industry standards.
  */
-export function inferModelCapabilities(modelKey: string, explicitMeta?: Partial<ModelMetadata> | null): InferredCapabilities {
+export function inferModelCapabilities(
+  modelKey: string | null | undefined,
+  explicitMeta?: Partial<ModelMetadata> | null
+): InferredCapabilities {
+  // The storage schema now allows `active_model` to be `null` when the
+  // user has not yet selected a model. Every UI surface that renders
+  // model badges (chat landing, composer, engine selector, chat header)
+  // calls this function. Rather than forcing each caller to guard
+  // manually, we return a neutral capability profile here. This keeps
+  // the "unselected" state a first-class concept: no badges shown, no
+  // crash, no forced default model.
+  if (!modelKey || typeof modelKey !== "string" || !modelKey.trim()) {
+    return {
+      isVision: false,
+      isTools: false,
+      isReasoning: false,
+      contextDisplay: null,
+      paramsDisplay: null,
+      quantDisplay: null,
+      publisherDisplay: null,
+      archDisplay: null,
+      formatDisplay: null,
+      loadedContext: null,
+      maxContext: null,
+    };
+  }
+
   const meta = explicitMeta || getModelMetadata(modelKey) || {};
-  const lowerKey = (modelKey || "").toLowerCase();
+  const lowerKey = modelKey.toLowerCase();
 
   // 1. Vision Capability
   const isVision = Boolean(
@@ -206,9 +243,15 @@ export function inferModelCapabilities(modelKey: string, explicitMeta?: Partial<
   }
 
   // 6. Quantization
+  // Use `lowerKey` (already normalized above) instead of `modelKey`
+  // directly. This was the source of the runtime crash that broke
+  // /chat when `active_model` was null: `modelKey.match(...)` on a
+  // null input throws `TypeError: Cannot read properties of null`.
+  // `lowerKey` is guaranteed to be a string by the guard at the top
+  // of this function.
   let quantDisplay: string | null = meta.quantization?.name || null;
   if (!quantDisplay) {
-    const qMatch = modelKey.match(/(q\d+_[a-z0-9_]+|qat|fp16|bf16|int8|int4)/i);
+    const qMatch = lowerKey.match(/(q\d+_[a-z0-9_]+|qat|fp16|bf16|int8|int4)/i);
     if (qMatch) quantDisplay = qMatch[1].toUpperCase();
   }
 

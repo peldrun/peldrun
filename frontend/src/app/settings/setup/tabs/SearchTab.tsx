@@ -186,13 +186,8 @@ const providerIconName = (engineId: string): string =>
 const providerAccent = (engineId: string): string =>
   PROVIDERS.find((p) => p.id === engineId)?.accent || "#3b82f6";
 
+// Relative path only - SSR/CSR parity. See next.config.mjs.
 const resolveApiUrl = (endpoint: string): string => {
-  if (typeof window !== "undefined") {
-    const port = window.location.port;
-    if (port === "3088" || port === "3000") {
-      return `http://localhost:8088${endpoint}`;
-    }
-  }
   return endpoint;
 };
 

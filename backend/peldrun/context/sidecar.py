@@ -86,17 +86,115 @@ def resolve_model_budget_profile(
             except Exception as err:
                 logger.debug("Failed reading model budget from %s: %s", path, err)
 
-    # Model family heuristic fallbacks
+    # Tier 2: consult the models vault, which stores the max context
+    # reported by the model server itself (LM Studio, Ollama, and
+    # cloud endpoints all populate this field).
+    #
+    # This is the authoritative source for models that were
+    # discovered but not yet configured in Model Budgets. Without
+    # this lookup, a freshly added local model (e.g. qwen3:32b with
+    # a 262K window) would silently fall through to the 8192
+    # default and be truncated to 3% of its capacity.
+    vault_paths: List[Path] = []
+    if storage_root:
+        vault_paths.append(storage_root / "models_vault.json")
+    backend_root = Path(__file__).resolve().parent.parent.parent
+    vault_paths.append(backend_root / "data" / "models_vault.json")
+    vault_paths.append(backend_root / "storage" / "models_vault.json")
+
+    for vpath in vault_paths:
+        if not vpath.exists():
+            continue
+        try:
+            with open(vpath, "r", encoding="utf-8") as f:
+                vault = json.load(f)
+        except Exception as err:
+            logger.debug("Failed reading models_vault from %s: %s", vpath, err)
+            continue
+
+        max_ctx = _lookup_context_in_vault(vault, model_id)
+        if max_ctx is not None and max_ctx > 0:
+            # Preserve the model's true context window; reserve a
+            # conservative output budget (25% of the window, capped
+            # to 8192, floored at 1500) so large models still get a
+            # usable input budget.
+            reserve = max(1500, min(8192, max_ctx // 4))
+            return max_ctx, reserve, default_ratios
+
+    # Tier 3: extended model-family heuristic fallbacks.
+    # These cover the common families shipped by major providers and
+    # the open-weight ecosystem. They run only when the model is
+    # missing from both models_budget.json (user explicit) and
+    # models_vault.json (server-reported). See audit report item 3.2.
     mid = model_id.lower()
-    if "gemini" in mid:
+
+    # Google
+    if "gemini-2" in mid or "gemini-1.5" in mid or "gemini-exp" in mid:
         return 1048576, 8192, default_ratios
-    if "claude" in mid:
+    if "gemini" in mid:
+        return 32768, 4096, default_ratios
+
+    # Anthropic
+    if "claude-3-7" in mid or "claude-3.7" in mid or "claude-3-5" in mid or "claude-3.5" in mid:
         return 200000, 8192, default_ratios
-    if "gpt-4" in mid or "o1" in mid or "o3" in mid:
+    if "claude" in mid:
+        return 200000, 4096, default_ratios
+
+    # OpenAI
+    if "gpt-4o" in mid or "gpt-4-turbo" in mid or "o1" in mid or "o3" in mid or "o4" in mid:
         return 128000, 4096, default_ratios
+    if "gpt-4" in mid:
+        return 8192, 4096, default_ratios
+    if "gpt-3.5" in mid:
+        return 16384, 4096, default_ratios
+
+    # DeepSeek
+    if "deepseek-r1" in mid or "deepseek-v3" in mid or "deepseek-v2" in mid:
+        return 131072, 8192, default_ratios
     if "deepseek" in mid:
         return 64000, 8192, default_ratios
 
+    # Meta Llama
+    if "llama-3.1" in mid or "llama-3.2" in mid or "llama-3.3" in mid:
+        return 131072, 4096, default_ratios
+    if "llama-3" in mid:
+        return 8192, 4096, default_ratios
+
+    # Alibaba Qwen (very common in local-first setups)
+    if "qwen3" in mid:
+        return 262144, 8192, default_ratios
+    if "qwen2.5" in mid or "qwen2-5" in mid:
+        return 131072, 8192, default_ratios
+    if "qwen2" in mid:
+        return 32768, 4096, default_ratios
+
+    # Mistral
+    if "mistral-large" in mid or "codestral" in mid:
+        return 131072, 8192, default_ratios
+    if "mistral" in mid:
+        return 32768, 4096, default_ratios
+
+    # Google Gemma
+    if "gemma-3" in mid or "gemma-4" in mid:
+        return 131072, 4096, default_ratios
+    if "gemma" in mid:
+        return 8192, 2048, default_ratios
+
+    # Microsoft Phi
+    if "phi-4" in mid:
+        return 16384, 4096, default_ratios
+    if "phi-3" in mid:
+        return 131072, 4096, default_ratios
+
+    # NVIDIA Nemotron
+    if "nemotron" in mid:
+        return 1048576, 8192, default_ratios
+
+    # Tier 4: safe fallback for genuinely unknown models.
+    # We deliberately keep this conservative (8192/1500) rather than
+    # guessing a larger window. A too-small window degrades quality;
+    # a too-large window triggers a hard error from the provider.
+    # Users who need more can configure the model in Model Budgets.
     return default_context, default_output, default_ratios
 
 
@@ -484,3 +582,57 @@ def save_context_sidecar(
 
     temp_path.replace(sidecar_path)
     return sidecar_path
+
+
+def _lookup_context_in_vault(
+    vault: dict,
+    model_id: str,
+) -> Optional[int]:
+    """
+    Find the max context length for `model_id` inside a models_vault
+    payload.
+
+    The vault stores provider entries under lmstudio_vault,
+    ollama_vault, cloud_vault, and custom_endpoints. Each provider
+    may carry either a flat `savedModels` list or a richer
+    `metadata` mapping keyed by model id. Both shapes are checked so
+    that models discovered at any point are found.
+
+    Returns the context length in tokens, or None when the model is
+    not present or carries no context information.
+    """
+    if not isinstance(vault, dict):
+        return None
+
+    candidates: List[dict] = []
+    for key in ("lmstudio_vault", "ollama_vault"):
+        entry = vault.get(key)
+        if isinstance(entry, dict):
+            candidates.append(entry)
+    for key in ("cloud_vault", "custom_endpoints"):
+        entries = vault.get(key)
+        if isinstance(entries, list):
+            for e in entries:
+                if isinstance(e, dict):
+                    candidates.append(e)
+
+    for entry in candidates:
+        # Shape A: metadata mapping {model_id: {max_context_length, ...}}
+        meta_map = entry.get("metadata") or entry.get("models_metadata")
+        if isinstance(meta_map, dict) and model_id in meta_map:
+            m = meta_map[model_id]
+            if isinstance(m, dict):
+                ctx = m.get("max_context_length") or m.get("context_length")
+                if isinstance(ctx, (int, float)) and ctx > 0:
+                    return int(ctx)
+
+        # Shape B: entry for the model with a direct context field
+        if entry.get("model") == model_id:
+            ctx = entry.get("max_context_length") or entry.get("context_length")
+            if isinstance(ctx, (int, float)) and ctx > 0:
+                return int(ctx)
+
+        # Shape C: scanned_models only records ids, no context info.
+        # Nothing else to extract here.
+
+    return None

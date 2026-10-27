@@ -148,9 +148,13 @@ class SqlitePricingStore:
 
     def __init__(self, db_path: Optional[Union[str, Path]] = None) -> None:
         if db_path is None:
-            storage_dir = Path("storage").resolve()
-            storage_dir.mkdir(parents=True, exist_ok=True)
-            self.db_path = storage_dir / "peldrun_runtime.db"
+            # Audit items 2.2 + 2.3: use the centralized storage root
+            # instead of a CWD-relative path. Without this, launching
+            # the app from `backend/` created a second database there
+            # while `omweb.config.STORAGE_ROOT` pointed somewhere else.
+            from peldrun.storage_paths import get_storage_file
+
+            self.db_path = get_storage_file("peldrun_runtime.db")
         else:
             self.db_path = Path(db_path).resolve()
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -190,9 +194,9 @@ class SqlitePricingStore:
                     updated_at REAL NOT NULL
                 );
 
-                CREATE INDEX IF NOT EXISTS idx_model_pricing_lookup 
+                CREATE INDEX IF NOT EXISTS idx_model_pricing_lookup
                     ON model_pricing(active, provider, priority DESC);
-                CREATE INDEX IF NOT EXISTS idx_model_pricing_pattern 
+                CREATE INDEX IF NOT EXISTS idx_model_pricing_pattern
                     ON model_pricing(model_pattern);
             """)
 

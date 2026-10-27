@@ -106,15 +106,70 @@ async def list_chats(
     project_id: Optional[str] = None,
     include_archived: bool = Query(False),
     pinned_only: bool = Query(False),
-    search: Optional[str] = Query(None)
+    archived_only: bool = Query(False),
+    search: Optional[str] = Query(None),
+    time_range: Optional[str] = Query(
+        None,
+        description=(
+            "Time bucket filter. One of: today, yesterday, "
+            "last_7_days, last_30_days, older. Omit for all time."
+        ),
+    ),
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        le=200,
+        description=(
+            "Maximum number of chats to return. Omit to fetch every "
+            "matching chat (backward-compatible behavior)."
+        ),
+    ),
+    cursor: Optional[str] = Query(
+        None,
+        description=(
+            "Opaque cursor returned as `next_cursor` by a previous call. "
+            "Takes precedence over `offset`."
+        ),
+    ),
+    offset: Optional[int] = Query(
+        None,
+        ge=0,
+        description=(
+            "Zero-based offset. Ignored when `cursor` is provided. "
+            "Provided for callers that cannot persist a cursor."
+        ),
+    ),
 ):
-    chats = chat_storage_engine.list_chats(
+    """List chats with optional cursor-based pagination.
+
+    Response shape is strictly additive relative to the legacy version:
+
+        {
+            "chats":       [...],   # same as before
+            "total":       int,     # new: total matching items
+            "next_cursor": str|None,# new: opaque cursor for next page
+            "has_more":    bool,    # new: whether more pages exist
+        }
+
+    Existing clients that only read `data.chats` are unaffected.
+    """
+    result = chat_storage_engine.list_chats_paginated(
         project_id=project_id,
         include_archived=include_archived,
         pinned_only=pinned_only,
-        search=search
+        archived_only=archived_only,
+        search=search,
+        time_range=time_range,
+        limit=limit,
+        cursor=cursor,
+        offset=offset,
     )
-    return {"chats": chats}
+    return {
+        "chats": result["items"],
+        "total": result["total"],
+        "next_cursor": result["next_cursor"],
+        "has_more": result["has_more"],
+    }
 
 
 @router.post("")

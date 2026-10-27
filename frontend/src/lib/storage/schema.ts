@@ -1,14 +1,29 @@
 ﻿// frontend/src/lib/storage/schema.ts
+
 import { z } from "zod";
 
 /**
- * Storage Schema definition for PELDRUN-Web.
- * Explicitly separates SSR-critical cookies from client-only local storage.
- * Updated under PR 6 & PR 7: registers peldrun_delegation_allowed toggle.
+ * Storage schema for PELDRUN-Web.
+ *
+ * Explicitly separates SSR-critical cookies from client-only local
+ * storage.
+ *
+ * Design rule: this schema MUST NOT carry hardcoded defaults for any
+ * value whose authoritative source lives on the backend. Doing so
+ * silently pins the browser to stale values (a model that was
+ * uninstalled, a port that was reassigned, a provider that was
+ * replaced). Instead, the corresponding fields are nullable/empty and
+ * the application is expected to populate them on first use from the
+ * backend configuration endpoint (e.g. `/api/llm/config`) or from the
+ * active provider discovery response.
+ *
+ * Backward compatibility: existing users who already have a concrete
+ * value stored in localStorage keep it. Only the *initial* default for
+ * new users changes.
  */
 export const storageSchema = {
   // ------------------------------------------------------------
-  // SSR-critical cookies (Layout & rendering preferences)
+  // SSR-critical cookies (layout & rendering preferences)
   // ------------------------------------------------------------
   sidebar_state: {
     tier: "cookie",
@@ -35,7 +50,7 @@ export const storageSchema = {
   },
 
   // ------------------------------------------------------------
-  // Client-only configuration (Local runtime preferences)
+  // Client-only configuration (local runtime preferences)
   // ------------------------------------------------------------
   exec_mode: {
     tier: "local",
@@ -49,16 +64,22 @@ export const storageSchema = {
     defaultValue: "none",
   },
 
+  // The active model selection. `null` means "not yet selected": the
+  // consuming code MUST resolve the effective model from the backend
+  // (config.toml / model discovery) instead of assuming any name.
   active_model: {
     tier: "local",
-    schema: z.string().min(1).max(256),
-    defaultValue: "qwen3-vl-8b-instruct",
+    schema: z.string().max(256).nullable(),
+    defaultValue: null,
   },
 
+  // The active provider display label. `null` means "not yet selected":
+  // consuming code MUST resolve the effective provider from backend
+  // configuration. Do not assume a specific provider is installed.
   active_provider: {
     tier: "local",
-    schema: z.string().min(1).max(128),
-    defaultValue: "LM Studio (Local)",
+    schema: z.string().max(128).nullable(),
+    defaultValue: null,
   },
 
   selected_engine: {
@@ -73,10 +94,15 @@ export const storageSchema = {
     defaultValue: null,
   },
 
+  // The LM Studio endpoint override. Empty string means "not
+  // overridden": the backend remains the source of truth (see
+  // backend/peldrun/llm/providers/lmstudio.py, which honors
+  // LMSTUDIO_BASE_URL). Populate this only when the user explicitly
+  // chooses to bypass the backend default.
   api_base_url: {
     tier: "local",
     schema: z.string().max(2048),
-    defaultValue: "http://127.0.0.1:1234/v1",
+    defaultValue: "",
   },
 
   custom_prompt: {
@@ -85,7 +111,7 @@ export const storageSchema = {
     defaultValue: "",
   },
 
-  // Multi-Agent Delegation Governance Toggle (Phase M3 / PR 6)
+  // Multi-agent delegation governance toggle (Phase M3 / PR 6).
   peldrun_delegation_allowed: {
     tier: "local",
     schema: z.boolean(),
@@ -103,7 +129,22 @@ export type StorageSnapshot = {
 };
 
 export function isCookieKey<K extends StorageKey>(key: K): boolean {
-  // Defensive guard against undefined access
+  // Defensive guard against undefined access.
   const definition = storageSchema[key];
   return definition?.tier === "cookie";
+}
+
+/**
+ * Return true when a stored value carries no useful information and
+ * the caller should fall back to the backend-provided default.
+ *
+ * Convenience helper for consuming code so that the migration away
+ * from hardcoded defaults stays consistent across call sites:
+ *
+ *   const model = isUnset(storage.active_model)
+ *     ? await fetchBackendDefaultModel()
+ *     : storage.active_model;
+ */
+export function isUnset(value: unknown): boolean {
+  return value === null || value === undefined || value === "";
 }

@@ -19,7 +19,25 @@ from peldrun.tools.base import BaseTool, ToolResult
 class ShellExecArgs(BaseModel):
     """Pydantic schema defining arguments for ShellExecTool."""
     command: str = Field(..., description="The command-line instruction to execute.")
-    timeout: Optional[float] = Field(default=60.0, description="Execution timeout in seconds.")
+    # `default=None` (was: 60.0) is critical (audit report item 5.1).
+    # The schema is serialized and shown to the LLM as part of the
+    # tool spec. When it advertised `default: 60.0`, the LLM would
+    # often send ``{"command": "...", "timeout": 60}`` explicitly —
+    # silently overriding the operator-configured
+    # ``settings.timeout_seconds``. ``None`` communicates "use the
+    # configured default", and ``_arun`` already falls back to
+    # ``self._settings_timeout`` when timeout is None.
+    timeout: Optional[float] = Field(
+        default=None,
+        description=(
+            "Optional execution timeout in seconds. Omit to use the "
+            "operator-configured timeout from the bash manifest "
+            "(recommended for long-running commands such as "
+            "'npm install' or 'cargo build'). Set explicitly only "
+            "when you need a tighter deadline than the configured "
+            "default."
+        ),
+    )
     working_subdir: Optional[str] = Field(default=None, description="Optional relative directory to execute within.")
 
 
@@ -254,8 +272,16 @@ class ShellExecTool(BaseTool):
                 is_error=True,
             )
 
-    async def execute(self, command: str, timeout: Optional[float] = 60.0, **kwargs: Any) -> ToolResult:
-        """Public alias maintaining backward compatibility."""
+    async def execute(self, command: str, timeout: Optional[float] = None, **kwargs: Any) -> ToolResult:
+        """Public alias maintaining backward compatibility.
+
+        The previous signature declared ``timeout=60.0``, which meant
+        any caller of ``execute()`` without an explicit timeout
+        silently bypassed ``settings.timeout_seconds``. Passing
+        ``None`` (the new default) lets ``_arun`` fall back to the
+        configured value, matching the behavior of the ``aexecute``
+        path used by the adapter.
+        """
         return await self._arun(command=command, timeout=timeout, **kwargs)
 
 

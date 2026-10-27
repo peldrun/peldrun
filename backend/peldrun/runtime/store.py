@@ -56,10 +56,13 @@ class SqliteRunStore:
 
     def __init__(self, db_path: Optional[Union[str, Path]] = None) -> None:
         if db_path is None:
-            # Default to storage root if available, otherwise local storage folder
-            storage_dir = Path("storage").resolve()
-            storage_dir.mkdir(parents=True, exist_ok=True)
-            self.db_path = storage_dir / "peldrun_runtime.db"
+            # Audit items 2.2 + 2.3: centralized storage root prevents
+            # CWD-relative database creation. Runs, events, checkpoints,
+            # and human-request history now all land in the same
+            # canonical file as the usage ledger.
+            from peldrun.storage_paths import get_storage_file
+
+            self.db_path = get_storage_file("peldrun_runtime.db")
         else:
             self.db_path = Path(db_path).resolve()
             self.db_path.parent.mkdir(parents=True, exist_ok=True)

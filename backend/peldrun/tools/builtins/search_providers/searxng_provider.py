@@ -18,6 +18,7 @@ Key guarantees:
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 import urllib.parse
@@ -45,6 +46,38 @@ from peldrun.tools.builtins.search_providers.base import (
 logger = logging.getLogger("peldrun.search.searxng")
 
 
+#: Documented fallback endpoint for a local SearXNG instance.
+#: Override via the SEARXNG_URL environment variable or by passing
+#: ``base_url`` explicitly in the provider configuration. Port 8080 is
+#: highly collision-prone on developer machines and CI runners.
+DEFAULT_SEARXNG_BASE_URL: str = "http://localhost:8080"
+
+#: Environment variable consulted when no explicit ``base_url`` is set.
+_ENV_SEARXNG_URL: str = "SEARXNG_URL"
+
+
+def resolve_searxng_base_url(explicit: Optional[str] = None) -> str:
+    """Resolve the SearXNG base URL.
+
+    Precedence:
+        1. ``explicit`` argument (provider configuration).
+        2. ``SEARXNG_URL`` environment variable.
+        3. ``DEFAULT_SEARXNG_BASE_URL``.
+
+    The returned value never carries a trailing slash so that callers
+    can safely concatenate endpoint paths such as ``/search`` and
+    ``/config``.
+    """
+    if explicit:
+        return str(explicit).strip().rstrip("/")
+
+    env_url = os.environ.get(_ENV_SEARXNG_URL)
+    if env_url:
+        return env_url.strip().rstrip("/")
+
+    return DEFAULT_SEARXNG_BASE_URL
+
+
 class SearXNGSearchProvider(BaseSearchProvider):
     """
     Self-hosted meta-search provider querying a SearXNG instance's JSON API.
@@ -60,8 +93,12 @@ class SearXNGSearchProvider(BaseSearchProvider):
 
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         super().__init__(config=config)
-        raw_base = str(self.config.get("base_url", "http://localhost:8080")).strip()
-        self.base_url: str = raw_base.rstrip("/")
+        # Resolve base_url with env-first precedence (SEARXNG_URL).
+        # The config value always wins when provided explicitly.
+        configured_base = self.config.get("base_url")
+        self.base_url: str = resolve_searxng_base_url(
+            explicit=str(configured_base) if configured_base else None
+        )
         self.categories: str = (
             str(self.config.get("categories", "general")).strip() or "general"
         )
@@ -483,4 +520,8 @@ class SearXNGSearchProvider(BaseSearchProvider):
         )
 
 
-__all__ = ["SearXNGSearchProvider"]
+__all__ = [
+    "SearXNGSearchProvider",
+    "DEFAULT_SEARXNG_BASE_URL",
+    "resolve_searxng_base_url",
+]

@@ -17,21 +17,28 @@ import { listBundles, type BundleEntry } from "@/lib/bundleApi";
 import { showToast } from "@/components/ui/ToastNotification";
 
 /**
- * Resolve the backend API base URL.
- * When the dev server runs on one of the common local ports, requests
- * are routed to the dedicated backend port (8088). Otherwise the given
- * endpoint is returned unchanged so it flows through the same-origin
- * proxy that Next.js provides.
+ * Return the given API endpoint unchanged.
  *
- * Exported as a standalone helper because every action hook needs it.
+ * All /api/* requests flow through Next.js rewrites, which are
+ * configured at build time in `next.config.mjs` via the
+ * PELDRUN_BACKEND_URL environment variable. Returning an absolute URL
+ * here (based on `window.location.port`) would break SSR/CSR parity:
+ *
+ *   - On the server, `window` is undefined, so the function would
+ *     return the relative path "/api/...".
+ *   - On the client, the same call would return
+ *     "http://localhost:8088/api/...".
+ *
+ * The two results differ, so React reports a hydration mismatch on
+ * every attribute derived from this value (e.g. <img src> and
+ * mask-image in AgentIcon). Rewrites already route to the configured
+ * backend regardless of port, so the absolute URL is unnecessary.
+ *
+ * The function is kept (rather than inlined) as a single extension
+ * point for future cross-cutting concerns (auth headers, tracing)
+ * without touching every call site.
  */
 export function getApiUrl(endpoint: string): string {
-  if (typeof window !== "undefined") {
-    const port = window.location.port;
-    if (port === "3088" || port === "3000") {
-      return `http://localhost:8088${endpoint}`;
-    }
-  }
   return endpoint;
 }
 

@@ -16,9 +16,18 @@ from dataclasses import dataclass, field
 from enum import Enum
 import json
 import logging
+import os
 import time
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 import uuid
+
+# Documented fallback defaults for the universal LLM client.
+# These values are used only when neither an explicit argument nor a
+# config object supplies the corresponding setting. All three can be
+# overridden at runtime via environment variables.
+DEFAULT_LLM_BASE_URL = "http://127.0.0.1:1234/v1"
+DEFAULT_LLM_API_KEY = "EMPTY"
+DEFAULT_LLM_TIMEOUT_SECONDS = 300.0
 
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field
@@ -178,7 +187,7 @@ class LLMConfig:
     temperature: float = 0.7
     max_tokens: Optional[int] = None
     top_p: float = 1.0
-    timeout: float = 300.0
+    timeout: float = DEFAULT_LLM_TIMEOUT_SECONDS
     reasoning_effort: Optional[str] = None
     extra_headers: Dict[str, str] = field(default_factory=dict)
     extra_params: Dict[str, Any] = field(default_factory=dict)
@@ -379,9 +388,18 @@ class AsyncLLMClient:
         **kwargs: Any,
     ) -> None:
         self.config = config
-        resolved_base_url = "http://127.0.0.1:1234/v1"
-        resolved_api_key = "EMPTY"
-        resolved_timeout = float(timeout or 300.0)
+        resolved_base_url = os.environ.get(
+            "PELDRUN_LLM_DEFAULT_BASE_URL", DEFAULT_LLM_BASE_URL
+        )
+        resolved_api_key = os.environ.get(
+            "PELDRUN_LLM_DEFAULT_API_KEY", DEFAULT_LLM_API_KEY
+        )
+        resolved_timeout = float(
+            timeout
+            or os.environ.get(
+                "PELDRUN_LLM_TIMEOUT", DEFAULT_LLM_TIMEOUT_SECONDS
+            )
+        )
         self.model = "default"
         self.reasoning_effort = reasoning_effort
 

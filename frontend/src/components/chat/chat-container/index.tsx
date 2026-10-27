@@ -627,9 +627,14 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       let finalPrompt = rawText;
       const effectiveMode = customOverride?.mode || execMode;
 
+      // activeModelName is `string | null` because the storage schema
+      // allows "no model selected yet". Indexing metadataVault with a
+      // null key throws TS2538, so guard the metadata lookup. The
+      // inferModelCapabilities function already handles a null
+      // modelKey by returning a neutral capability profile.
       const activeCaps = inferModelCapabilities(
         activeModelName,
-        metadataVault[activeModelName]
+        activeModelName ? metadataVault[activeModelName] : null
       );
       const isModelReasoning =
         customOverride?.is_reasoning_model !== undefined
@@ -739,7 +744,10 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
             tokensUsed: { ...tokensUsed },
             producedFiles: [...producedFiles],
             attachedFiles: [...submittedFiles],
-            model: activeModelName,
+            // ChatTurn.model is typed `string | undefined`. Coerce
+            // `null` (unselected) to `undefined` so the shape matches
+            // the historical contract without forcing a fake default.
+            model: activeModelName ?? undefined,
             usage:
               tokensUsed.total > 0
                 ? ({
@@ -1196,7 +1204,9 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
             showRawTrace={showRawTrace}
             setShowRawTrace={setShowRawTrace}
             getLiveStatusMessage={getLiveStatusMessage}
-            activeModelName={activeModelName}
+            // ChatThreadProps.activeModelName is `string | undefined`
+            // (optional). Coerce null to undefined at the boundary.
+            activeModelName={activeModelName ?? undefined}
             chatScrollBottomRef={chatScrollBottomRef}
             tokensUsed={tokensUsed}
             costUsd={currentCostUsd}

@@ -56,3 +56,4 @@ backend/storage/
 config/config.toml
 
 backend/data/source_control*
+backup_20261027_133629/

@@ -48,13 +48,12 @@ import {
 import { Button } from "@/components/ui/button";
 import { showToast, ToastContainer } from "@/components/ui/ToastNotification";
 
+// Always return the relative path so Next.js rewrites (configured at
+// build time via PELDRUN_BACKEND_URL in next.config.mjs) route the
+// request to the active backend on both server and client. Returning
+// an absolute URL on the client only caused SSR/CSR divergence and
+// hydration mismatches.
 const resolveApiUrl = (endpoint: string): string => {
-  if (typeof window !== "undefined") {
-    const port = window.location.port;
-    if (port === "3088" || port === "3000") {
-      return `http://localhost:8088${endpoint}`;
-    }
-  }
   return endpoint;
 };
 

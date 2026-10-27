@@ -34,9 +34,12 @@ class SqliteArtifactStore:
 
     def __init__(self, db_path: Optional[Union[str, Path]] = None) -> None:
         if db_path is None:
-            storage_dir = Path("storage").resolve()
-            storage_dir.mkdir(parents=True, exist_ok=True)
-            self.db_path = storage_dir / "peldrun_runtime.db"
+            # Audit items 2.2 + 2.3: use the centralized storage root
+            # so artifact manifests and history always land in the
+            # same canonical peldrun_runtime.db regardless of CWD.
+            from peldrun.storage_paths import get_storage_file
+
+            self.db_path = get_storage_file("peldrun_runtime.db")
         else:
             self.db_path = Path(db_path).resolve()
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -87,13 +90,13 @@ class SqliteArtifactStore:
                     timestamp REAL NOT NULL
                 );
 
-                CREATE INDEX IF NOT EXISTS idx_artifact_history_workspace 
+                CREATE INDEX IF NOT EXISTS idx_artifact_history_workspace
                     ON artifact_history(workspace_id, timestamp);
-                CREATE INDEX IF NOT EXISTS idx_artifact_history_chat 
+                CREATE INDEX IF NOT EXISTS idx_artifact_history_chat
                     ON artifact_history(chat_id, timestamp);
-                CREATE INDEX IF NOT EXISTS idx_artifact_history_path 
+                CREATE INDEX IF NOT EXISTS idx_artifact_history_path
                     ON artifact_history(workspace_id, relative_path);
-                CREATE INDEX IF NOT EXISTS idx_artifact_history_run 
+                CREATE INDEX IF NOT EXISTS idx_artifact_history_run
                     ON artifact_history(run_id);
             """)
 

@@ -37,7 +37,16 @@ logger = logging.getLogger("omweb.adapters.tools_adapters.bash")
 
 def create_bash_executor(
     workspace_dir: WorkspacePathType = None,
-    timeout: float = 60.0,
+    # Raised from 60s to 300s (audit report item 5.1). The factory
+    # default is a last-resort fallback used only when neither the
+    # manifest (`bash.json → settings.defaults.timeout_seconds`) nor
+    # the per-call argument supplies a value. 60s was too short for
+    # legitimate long-running commands (``npm install``,
+    # ``cargo build``, ``pip install``); 300s covers the vast
+    # majority of real builds while still bounding runaway commands.
+    # Operators who need more can raise it up to 600 from the tool
+    # settings UI.
+    timeout: float = 300.0,
     *,
     settings: Optional[Dict[str, Any]] = None,
     **kwargs: Any,

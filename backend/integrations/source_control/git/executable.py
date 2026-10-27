@@ -70,6 +70,10 @@ __all__ = [
     "reset_default_git_executable",
     "MAX_OUTPUT_BYTES",
     "DEFAULT_TIMEOUT_SECONDS",
+    "NETWORK_TIMEOUT_SECONDS",
+    "LONG_OPERATION_TIMEOUT_SECONDS",
+    "NETWORK_COMMANDS",
+    "LONG_OPERATION_COMMANDS",
     "MINIMUM_GIT_VERSION",
 ]
 
@@ -86,8 +90,51 @@ def _utc_now() -> datetime:
 #: exceed this limit are truncated with a marker appended.
 MAX_OUTPUT_BYTES: int = 5 * 1024 * 1024  # 5 MiB
 
-#: Default subprocess timeout for a Git command.
+#: Default subprocess timeout for LOCAL Git commands
+#: (status, commit, log, diff, add, reset, branch, checkout, ...).
+#: These operations touch only the local repository and should
+#: complete in under a minute even on very large trees.
 DEFAULT_TIMEOUT_SECONDS: int = 60
+
+#: Timeout for NETWORK-bound Git commands (clone, fetch, push,
+#: pull, ls-remote). These commands depend on the remote server
+#: and the network path between the client and the server, so a
+#: 60-second ceiling routinely kills legitimate operations:
+#:
+#:   - ``git clone`` of a 1+ GB repository: 3-10 minutes
+#:   - ``git fetch`` over a slow corporate VPN: 1-5 minutes
+#:   - ``git push`` of a large branch to a distant server: 1-3 minutes
+#:
+#: 300 seconds covers the vast majority of real-world cases while
+#: still bounding a genuinely wedged command. Callers that need a
+#: tighter deadline must pass ``timeout_seconds`` explicitly.
+NETWORK_TIMEOUT_SECONDS: int = 300
+
+#: Timeout for computationally HEAVY LOCAL Git commands that
+#: intentionally scan or rewrite large parts of the object graph:
+#:
+#:   - ``filter-branch``: rewrites every commit in the history
+#:   - ``gc`` / ``repack``: pack objects across the whole repo
+#:   - ``fsck``: verify integrity of every object
+#:   - ``reflog expire``: walk the whole reflog
+#:   - ``prune`` / ``bundle``: scan the object store
+#:
+#: These are rarely called but can legitimately take several
+#: minutes on multi-GB repositories.
+LONG_OPERATION_TIMEOUT_SECONDS: int = 600
+
+#: Git subcommands classified as NETWORK-bound. Used by
+#: ``GitExecutable._timeout_for_args`` to pick the appropriate
+#: default timeout when the caller does not pass one explicitly.
+NETWORK_COMMANDS: frozenset[str] = frozenset(
+    {"clone", "fetch", "push", "pull", "ls-remote"}
+)
+
+#: Git subcommands classified as computationally HEAVY local
+#: operations. Used by ``GitExecutable._timeout_for_args``.
+LONG_OPERATION_COMMANDS: frozenset[str] = frozenset(
+    {"filter-branch", "gc", "repack", "prune", "reflog", "fsck", "bundle"}
+)
 
 #: Minimum supported Git version. Older versions do not support
 #: `worktree` (2.5) with all the flags we rely on, and they lack
@@ -341,11 +388,22 @@ class GitExecutable:
         *,
         git_binary: Optional[str] = None,
         default_timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        network_timeout_seconds: int = NETWORK_TIMEOUT_SECONDS,
+        long_operation_timeout_seconds: int = LONG_OPERATION_TIMEOUT_SECONDS,
         max_output_bytes: int = MAX_OUTPUT_BYTES,
         validate_version: bool = True,
     ) -> None:
         self._git_binary = self._resolve_binary(git_binary)
         self._default_timeout = max(1, int(default_timeout_seconds))
+        # Audit report item 5.2: a single 60s ceiling broke legitimate
+        # network operations (clone/fetch/push) and heavy local
+        # operations (gc/repack/filter-branch). Three separate
+        # defaults are now applied based on the subcommand, with
+        # caller-supplied timeouts still taking precedence.
+        self._network_timeout = max(1, int(network_timeout_seconds))
+        self._long_operation_timeout = max(
+            1, int(long_operation_timeout_seconds)
+        )
         self._max_output_bytes = max(1024, int(max_output_bytes))
         self._version_lock = threading.RLock()
         self._cached_version: Optional[Tuple[int, int, int]] = None
@@ -362,8 +420,18 @@ class GitExecutable:
 
     @property
     def default_timeout_seconds(self) -> int:
-        """Return the default timeout applied to Git commands."""
+        """Return the default timeout applied to local Git commands."""
         return self._default_timeout
+
+    @property
+    def network_timeout_seconds(self) -> int:
+        """Return the timeout applied to network-bound Git commands."""
+        return self._network_timeout
+
+    @property
+    def long_operation_timeout_seconds(self) -> int:
+        """Return the timeout applied to heavy local Git commands."""
+        return self._long_operation_timeout
 
     @property
     def max_output_bytes(self) -> int:
@@ -431,7 +499,7 @@ class GitExecutable:
                 `check_returncode` is True.
         """
         self._validate_args(args)
-        timeout = self._coerce_timeout(timeout_seconds)
+        timeout = self._coerce_timeout(timeout_seconds, args)
         cwd_path = self._validate_cwd(cwd)
         effective_args = self._inject_crlf_configs(args)
         command = (self._git_binary, *effective_args)
@@ -565,7 +633,7 @@ class GitExecutable:
         `extra_env` follows the same contract as in `run()`.
         """
         self._validate_args(args)
-        timeout = self._coerce_timeout(timeout_seconds)
+        timeout = self._coerce_timeout(timeout_seconds, args)
         cwd_path = self._validate_cwd(cwd)
         effective_args = self._inject_crlf_configs(args)
         command = (self._git_binary, *effective_args)
@@ -818,14 +886,67 @@ class GitExecutable:
                     details={"index": index},
                 )
 
-    def _coerce_timeout(self, value: Optional[int]) -> int:
-        if value is None:
+    def _coerce_timeout(
+        self,
+        value: Optional[int],
+        args: Optional[Sequence[str]] = None,
+    ) -> int:
+        """
+        Resolve the timeout for a Git command.
+
+        Precedence:
+            1. ``value`` when supplied (explicit caller override).
+            2. Command-aware default resolved from ``args`` (see
+               ``_timeout_for_args``).
+            3. ``self._default_timeout`` as a last resort (used only
+               when ``args`` is None, which happens for internal
+               callers that already know the timeout).
+        """
+        if value is not None:
+            if not isinstance(value, int) or value <= 0:
+                raise ValidationError(
+                    "timeout_seconds must be a positive integer."
+                )
+            return value
+        if args is not None:
+            return self._timeout_for_args(args)
+        return self._default_timeout
+
+    def _timeout_for_args(self, args: Sequence[str]) -> int:
+        """
+        Return the appropriate default timeout based on the Git
+        subcommand (audit report item 5.2).
+
+        Classification:
+            - NETWORK_COMMANDS (clone, fetch, push, pull, ls-remote)
+              → ``NETWORK_TIMEOUT_SECONDS`` (300s by default)
+            - LONG_OPERATION_COMMANDS (gc, repack, filter-branch, ...)
+              → ``LONG_OPERATION_TIMEOUT_SECONDS`` (600s by default)
+            - everything else (status, commit, log, diff, ...)
+              → ``DEFAULT_TIMEOUT_SECONDS`` (60s by default)
+
+        The caller can always override the resolved timeout by
+        passing ``timeout_seconds`` explicitly.
+        """
+        if not args:
             return self._default_timeout
-        if not isinstance(value, int) or value <= 0:
-            raise ValidationError(
-                "timeout_seconds must be a positive integer."
-            )
-        return value
+
+        # Skip past any leading ``-c key=value`` pairs that either
+        # the caller or ``_inject_crlf_configs`` may have prepended.
+        # Without this, a call like ``["-c", "foo=bar", "clone", ...]``
+        # would misclassify ``-c`` as the subcommand.
+        index = 0
+        while index < len(args) and args[index] == "-c":
+            index += 2  # skip "-c" and its value
+        if index >= len(args):
+            return self._default_timeout
+
+        command = args[index].lower().lstrip("-")
+        if command in NETWORK_COMMANDS:
+            return self._network_timeout
+        if command in LONG_OPERATION_COMMANDS:
+            return self._long_operation_timeout
+        return self._default_timeout
 
     @staticmethod
     def _validate_cwd(cwd: Optional[Union[str, Path]]) -> Optional[Path]:

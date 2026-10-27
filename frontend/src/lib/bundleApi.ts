@@ -86,12 +86,7 @@ export interface BundleHealthReport {
 // ---------------------------------------------------------------------------
 
 function getApiUrl(endpoint: string): string {
-  if (
-    typeof window !== "undefined" &&
-    (window.location.port === "3088" || window.location.port === "3000")
-  ) {
-    return `http://localhost:8088${endpoint}`;
-  }
+  // Relative path only - SSR/CSR parity. See next.config.mjs.
   return endpoint;
 }
 

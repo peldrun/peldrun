@@ -21,10 +21,13 @@ export default function ArtifactsViewer({ activeFile, onSelectFile }: { activeFi
   const fetchArtifacts = async () => {
     setLoading(true);
     try {
-      const res = await fetch("http://localhost:8088/api/files");
+      // Relative path so the request is routed through Next.js rewrites
+      // (configured at build time via PELDRUN_BACKEND_URL in
+      // next.config.mjs).
+      const res = await fetch("/api/files");
       if (res.ok) {
         const data = await res.json();
-        const artifactItems = (data.files || []).filter((f: any) => 
+        const artifactItems = (data.files || []).filter((f: any) =>
           ["html", "markdown", "data", "image"].includes(f.type)
         );
         setFiles(artifactItems);
@@ -53,7 +56,7 @@ export default function ArtifactsViewer({ activeFile, onSelectFile }: { activeFi
 
   useEffect(() => {
     if (selectedArtifact) {
-      fetch(`http://localhost:8088/api/files/content/${selectedArtifact}`)
+      fetch(`/api/files/content/${selectedArtifact}`)
         .then((res) => res.json())
         .then((data) => setFileContent(data.content || ""))
         .catch(() => setFileContent(""));
@@ -129,7 +132,13 @@ export default function ArtifactsViewer({ activeFile, onSelectFile }: { activeFi
           <div className="flex-1 bg-white overflow-hidden relative">
             {isHtml && previewMode === "render" ? (
               <iframe
-                src={`http://localhost:8088/api/files/raw/${selectedArtifact}`}
+                // Relative src is resolved by the browser against the
+                // document origin (the Next.js server) and routed to the
+                // backend via the /api/:path* rewrite. Using an absolute
+                // localhost URL here would bypass the rewrite and break
+                // for anyone loading the frontend from a non-localhost
+                // origin (staging, LAN access, reverse proxy).
+                src={`/api/files/raw/${selectedArtifact}`}
                 title="Artifact Preview"
                 className="w-full h-full border-0 bg-white"
                 sandbox="allow-scripts allow-same-origin"

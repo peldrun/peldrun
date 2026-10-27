@@ -1,6 +1,8 @@
-﻿"use client";
+﻿// frontend/src/app/history/page.tsx
 
-import React, { useState, useEffect, useMemo } from "react";
+"use client";
+
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import Link from "next/link";
 import {
   History,
@@ -15,10 +17,12 @@ import {
   Search,
   X,
   FolderOpen,
-  ChevronDown
+  ChevronDown,
+  Loader2,
+  AlertCircle,
 } from "lucide-react";
 import {
-  fetchChats,
+  fetchChatsPage,
   fetchStorageStats,
   sweepStorageOrphans,
   togglePinChat,
@@ -26,53 +30,263 @@ import {
   deleteChat,
   deleteAllChats,
   formatChatDateTime,
-  categorizeChatTimeBucket,
   ChatSession,
+  ChatTimeRange,
   StorageStats,
   SweepReport,
-  PurgeReport
+  PurgeReport,
 } from "@/lib/chatsApi";
 import { Button } from "@/components/ui/button";
 import { useConfirmModal } from "@/components/ui/ConfirmModal";
 import { showToast, ToastContainer } from "@/components/ui/ToastNotification";
 
+/**
+ * Number of chats loaded per section per "Load More" click. Chosen to
+ * keep the initial render fast while still showing meaningful context.
+ */
+const SECTION_PAGE_SIZE = 10;
+
+/** Debounce window for the search input (milliseconds). */
+const SEARCH_DEBOUNCE_MS = 300;
+
+type TabKey = "all" | "active" | "pinned" | "archived";
+
+const TIME_RANGES: ChatTimeRange[] = [
+  "today",
+  "yesterday",
+  "last_7_days",
+  "last_30_days",
+  "older",
+];
+
+const SECTION_LABELS: Record<ChatTimeRange, string> = {
+  today: "Today",
+  yesterday: "Yesterday",
+  last_7_days: "Last 7 Days",
+  last_30_days: "Last 30 Days",
+  older: "Older",
+};
+
+interface SectionState {
+  items: ChatSession[];
+  total: number | null;
+  nextCursor: string | null;
+  hasMore: boolean;
+  loadingInitial: boolean;
+  loadingMore: boolean;
+  error: string | null;
+}
+
+const emptySection = (): SectionState => ({
+  items: [],
+  total: null,
+  nextCursor: null,
+  hasMore: false,
+  loadingInitial: false,
+  loadingMore: false,
+  error: null,
+});
+
+const buildInitialSections = (): Record<ChatTimeRange, SectionState> =>
+  TIME_RANGES.reduce(
+    (acc, r) => ({ ...acc, [r]: emptySection() }),
+    {} as Record<ChatTimeRange, SectionState>
+  );
+
 export default function HistoryPage() {
   const { confirm, ConfirmDialog } = useConfirmModal();
 
-  const [chats, setChats] = useState<ChatSession[]>([]);
+  const [sections, setSections] = useState<Record<ChatTimeRange, SectionState>>(
+    buildInitialSections
+  );
   const [stats, setStats] = useState<StorageStats | null>(null);
-  const [loading, setLoading] = useState(true);
+
   const [sweeping, setSweeping] = useState(false);
   const [clearingAll, setClearingAll] = useState(false);
+
   const [searchQuery, setSearchQuery] = useState("");
-  const [activeTab, setActiveTab] = useState<"all" | "active" | "pinned" | "archived">("all");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [activeTab, setActiveTab] = useState<TabKey>("all");
 
-  // 10 items pagination limit per time section
-  const [todayLimit, setTodayLimit] = useState(10);
-  const [weekLimit, setWeekLimit] = useState(10);
-  const [olderLimit, setOlderLimit] = useState(10);
+  // Monotonic generation: any section request tagged with an older
+  // generation must be discarded. Guards against rapid tab/search
+  // switches.
+  const generationRef = useRef(0);
+  const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const loadData = async () => {
-    setLoading(true);
-    try {
-      const [allChats, storageStats] = await Promise.all([
-        fetchChats({ includeArchived: true }),
-        fetchStorageStats()
-      ]);
-      setChats(allChats || []);
-      setStats(storageStats || null);
-    } catch (err: any) {
-      console.error("Failed to load history data:", err);
-      showToast.error("Load Error", err.message || "Failed to load chats from disk");
-    } finally {
-      setLoading(false);
+  // ----------------------------------------------------------------
+  // Param builder: shared filter context for every section.
+  // ----------------------------------------------------------------
+  const buildBaseParams = useCallback(() => {
+    const base: {
+      limit: number;
+      includeArchived?: boolean;
+      pinnedOnly?: boolean;
+      archivedOnly?: boolean;
+      search?: string;
+    } = { limit: SECTION_PAGE_SIZE };
+    if (debouncedSearch) base.search = debouncedSearch;
+
+    switch (activeTab) {
+      case "active":
+        base.includeArchived = false;
+        break;
+      case "pinned":
+        base.includeArchived = true;
+        base.pinnedOnly = true;
+        break;
+      case "archived":
+        base.includeArchived = true;
+        base.archivedOnly = true;
+        break;
+      case "all":
+      default:
+        base.includeArchived = true;
+        break;
     }
-  };
+    return base;
+  }, [activeTab, debouncedSearch]);
 
-  useEffect(() => {
-    loadData();
+  // ----------------------------------------------------------------
+  // Section loaders
+  // ----------------------------------------------------------------
+  const loadSection = useCallback(
+    async (
+      range: ChatTimeRange,
+      mode: "initial" | "more",
+      cursorOverride?: string | null
+    ) => {
+      const myGen = generationRef.current;
+      setSections((prev) => {
+        const current = prev[range];
+        return {
+          ...prev,
+          [range]: {
+            ...current,
+            loadingInitial: mode === "initial" ? true : current.loadingInitial,
+            loadingMore: mode === "more" ? true : current.loadingMore,
+            error: null,
+          },
+        };
+      });
+
+      try {
+        const cursor =
+          mode === "more" ? cursorOverride ?? undefined : undefined;
+        const page = await fetchChatsPage({
+          ...buildBaseParams(),
+          timeRange: range,
+          cursor: cursor || undefined,
+        });
+        if (myGen !== generationRef.current) return;
+
+        setSections((prev) => {
+          const current = prev[range];
+          const items =
+            mode === "initial"
+              ? page.items
+              : [...current.items, ...page.items];
+          return {
+            ...prev,
+            [range]: {
+              items,
+              total: page.total,
+              nextCursor: page.nextCursor,
+              hasMore: page.hasMore,
+              loadingInitial: false,
+              loadingMore: false,
+              error: null,
+            },
+          };
+        });
+      } catch (err: any) {
+        if (myGen !== generationRef.current) return;
+        setSections((prev) => ({
+          ...prev,
+          [range]: {
+            ...prev[range],
+            loadingInitial: false,
+            loadingMore: false,
+            error: err?.message || "Failed to load section",
+          },
+        }));
+      }
+    },
+    [buildBaseParams]
+  );
+
+  const loadAllSections = useCallback(() => {
+    generationRef.current += 1;
+    setSections(buildInitialSections());
+    // Fire all section requests in parallel.
+    TIME_RANGES.forEach((range) => {
+      loadSection(range, "initial");
+    });
+  }, [loadSection]);
+
+  const refreshStats = useCallback(() => {
+    fetchStorageStats().then((s) => s && setStats(s));
   }, []);
 
+  // ----------------------------------------------------------------
+  // Effects
+  // ----------------------------------------------------------------
+  useEffect(() => {
+    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+    searchDebounceRef.current = setTimeout(() => {
+      setDebouncedSearch(searchQuery);
+    }, SEARCH_DEBOUNCE_MS);
+    return () => {
+      if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+    };
+  }, [searchQuery]);
+
+  useEffect(() => {
+    loadAllSections();
+  }, [loadAllSections]);
+
+  useEffect(() => {
+    refreshStats();
+  }, [refreshStats]);
+
+  // ----------------------------------------------------------------
+  // Derived counts for tab badges
+  // ----------------------------------------------------------------
+  const allCount = useMemo(
+    () => stats?.total_chats ?? 0,
+    [stats]
+  );
+  const activeCount = useMemo(
+    () => stats?.active_chats ?? 0,
+    [stats]
+  );
+  const pinnedCount = useMemo(
+    () => stats?.pinned_chats ?? 0,
+    [stats]
+  );
+  const archivedCount = useMemo(
+    () => stats?.archived_chats ?? 0,
+    [stats]
+  );
+
+  const anyLoading = useMemo(
+    () => TIME_RANGES.some((r) => sections[r].loadingInitial),
+    [sections]
+  );
+
+  const totalVisible = useMemo(
+    () => TIME_RANGES.reduce((sum, r) => sum + sections[r].items.length, 0),
+    [sections]
+  );
+
+  const hasAnyError = useMemo(
+    () => TIME_RANGES.some((r) => !!sections[r].error),
+    [sections]
+  );
+
+  // ----------------------------------------------------------------
+  // Handlers
+  // ----------------------------------------------------------------
   const handleSweepStorage = async () => {
     setSweeping(true);
     try {
@@ -82,12 +296,13 @@ export default function HistoryPage() {
           "Storage Swept Clean",
           `Cleaned ${report.removed_orphans_count} orphans and freed ${report.freed_mb} MB.`
         );
-        loadData();
+        loadAllSections();
+        refreshStats();
       } else {
         showToast.info("Sweep Clean", "No orphaned workspace folders found on disk.");
       }
     } catch (err: any) {
-      showToast.error("Sweep Error", err.message || "Failed");
+      showToast.error("Sweep Error", err?.message || "Failed");
     } finally {
       setSweeping(false);
     }
@@ -96,29 +311,28 @@ export default function HistoryPage() {
   const handleClearAllChats = async () => {
     const ok = await confirm({
       title: "Purge All Chats & Workspace Artifacts?",
-      description: "Warning: This action will permanently wipe all chats, delete all workspace folders, and completely reset jobs.json to empty. This cannot be undone.",
+      description:
+        "Warning: This action will permanently wipe all chats, delete all workspace folders, and completely reset jobs.json to empty. This cannot be undone.",
       variant: "danger",
-      confirmText: "Purge Everything"
+      confirmText: "Purge Everything",
     });
-
     if (!ok) return;
-
     setClearingAll(true);
     try {
       const report: PurgeReport | null = await deleteAllChats();
       if (report && report.status === "ok") {
-        setChats([]);
         showToast.success(
           "Complete Disk Purge",
           `Purged ${report.deleted_sessions_count} sessions and freed ${report.freed_mb} MB.`
         );
         window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
-        loadData();
+        loadAllSections();
+        refreshStats();
       } else {
         showToast.error("Purge Failed", "Server could not complete deep purge.");
       }
     } catch (err: any) {
-      showToast.error("Purge Error", err.message);
+      showToast.error("Purge Error", err?.message);
     } finally {
       setClearingAll(false);
     }
@@ -128,16 +342,16 @@ export default function HistoryPage() {
     try {
       const updated = await togglePinChat(chatId);
       if (updated) {
-        setChats((prev) =>
-          prev.map((c) =>
-            c.id === chatId ? { ...c, is_pinned: updated.is_pinned, pinned: updated.is_pinned } : c
-          )
+        showToast.success(
+          "Updated",
+          updated.is_pinned ? "Session pinned to top." : "Session unpinned."
         );
-        showToast.success("Updated", updated.is_pinned ? "Session pinned to top." : "Session unpinned.");
         window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
+        loadAllSections();
+        refreshStats();
       }
     } catch (err: any) {
-      showToast.error("Error", err.message);
+      showToast.error("Error", err?.message);
     }
   };
 
@@ -145,88 +359,56 @@ export default function HistoryPage() {
     try {
       const updated = await toggleArchiveChat(chatId);
       if (updated) {
-        setChats((prev) =>
-          prev.map((c) => (c.id === chatId ? { ...c, is_archived: updated.is_archived } : c))
-        );
         showToast.info(
           "Status Updated",
-          updated.is_archived ? "Archived and hidden from sidebar." : "Restored to active sidebar."
+          updated.is_archived
+            ? "Archived and hidden from sidebar."
+            : "Restored to active sidebar."
         );
         window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
+        loadAllSections();
+        refreshStats();
       }
     } catch (err: any) {
-      showToast.error("Error", err.message);
+      showToast.error("Error", err?.message);
     }
   };
 
   const handleDelete = async (chatId: string) => {
     const ok = await confirm({
       title: "Purge Session",
-      description: "Permanently delete this session? Deliverables, workspace logs, and jobs.json records will be wiped.",
+      description:
+        "Permanently delete this session? Deliverables, workspace logs, and jobs.json records will be wiped.",
       variant: "danger",
-      confirmText: "Delete Permanently"
+      confirmText: "Delete Permanently",
     });
-
     if (!ok) return;
-
     try {
       const success = await deleteChat(chatId);
       if (success) {
-        setChats((prev) => prev.filter((c) => c.id !== chatId));
         showToast.success("Session Purged", `Session ${chatId} completely removed.`);
         window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
-        fetchStorageStats().then(setStats);
+        loadAllSections();
+        refreshStats();
       } else {
         showToast.error("Delete Failed", "Server could not delete session.");
       }
     } catch (err: any) {
-      showToast.error("Delete Error", err.message);
+      showToast.error("Delete Error", err?.message);
     }
   };
 
-  // Deep Search across title, prompt, id, job_id, and project
-  const filteredChats = useMemo(() => {
-    return chats.filter((c) => {
-      const q = searchQuery.toLowerCase().trim();
-      const matchesQuery =
-        !q ||
-        (c.title || "").toLowerCase().includes(q) ||
-        (c.prompt || "").toLowerCase().includes(q) ||
-        (c.id || "").toLowerCase().includes(q) ||
-        (c.job_id || "").toLowerCase().includes(q) ||
-        (c.project_id || "").toLowerCase().includes(q);
-
-      if (!matchesQuery) return false;
-      if (activeTab === "active") return !c.is_archived;
-      if (activeTab === "pinned") return !!(c.is_pinned || c.pinned);
-      if (activeTab === "archived") return !!c.is_archived;
-      return true;
-    });
-  }, [chats, searchQuery, activeTab]);
-
-  const todayChats = useMemo(() => {
-    return filteredChats.filter((c) => categorizeChatTimeBucket(c.created_at) === "today");
-  }, [filteredChats]);
-
-  const thisWeekChats = useMemo(() => {
-    return filteredChats.filter((c) => categorizeChatTimeBucket(c.created_at) === "this_week");
-  }, [filteredChats]);
-
-  const olderChats = useMemo(() => {
-    return filteredChats.filter((c) => categorizeChatTimeBucket(c.created_at) === "older");
-  }, [filteredChats]);
-
-  // Paginated views by 10 items
-  const visibleTodayChats = useMemo(() => todayChats.slice(0, todayLimit), [todayChats, todayLimit]);
-  const visibleWeekChats = useMemo(() => thisWeekChats.slice(0, weekLimit), [thisWeekChats, weekLimit]);
-  const visibleOlderChats = useMemo(() => olderChats.slice(0, olderLimit), [olderChats, olderLimit]);
+  // ----------------------------------------------------------------
+  // Render
+  // ----------------------------------------------------------------
+  const isEmpty = !anyLoading && totalVisible === 0 && !hasAnyError;
 
   return (
     <>
       <div className="flex flex-col flex-1 h-full w-full bg-background text-foreground overflow-hidden font-sans">
         {/* Header Bar */}
         <header className="border-b border-border bg-card/80 backdrop-blur-md sticky top-0 z-10 shrink-0">
-          <div className=" mx-auto w-full px-4 sm:px-6 lg:px-8 py-3.5 flex flex-wrap items-center justify-between gap-4">
+          <div className="mx-auto w-full px-4 sm:px-6 lg:px-8 py-3.5 flex flex-wrap items-center justify-between gap-4">
             <div className="flex items-center gap-3">
               <div className="p-2 rounded-xl bg-primary/10 text-primary border border-primary/20 shadow-xs">
                 <History className="h-5 w-5" />
@@ -241,18 +423,17 @@ export default function HistoryPage() {
                   </span>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  Deep disk search, progressive pagination (10 per page), and cascaded purging
+                  Time-bucketed sessions, per-section pagination, and cascaded purging
                 </p>
               </div>
             </div>
 
             <div className="flex items-center gap-2">
-              {/* Clear All / Deep Purge Button */}
               <Button
                 variant="outline"
                 size="sm"
                 onClick={handleClearAllChats}
-                disabled={clearingAll || chats.length === 0}
+                disabled={clearingAll || allCount === 0}
                 className="text-xs border-destructive/40 bg-destructive/10 hover:bg-destructive/20 text-destructive transition shadow-xs h-8 cursor-pointer"
                 title="Permanently wipe all chats, files, and jobs.json"
               >
@@ -268,18 +449,27 @@ export default function HistoryPage() {
                 className="text-xs border-border bg-muted/50 hover:bg-muted text-foreground transition shadow-xs h-8 cursor-pointer"
                 title="Sweep orphaned workspace files not linked to existing sessions"
               >
-                <HardDrive size={13} className={`mr-1.5 text-primary ${sweeping ? "animate-spin" : ""}`} />
+                <HardDrive
+                  size={13}
+                  className={`mr-1.5 text-primary ${sweeping ? "animate-spin" : ""}`}
+                />
                 <span>Sweep Orphan Storage</span>
               </Button>
 
               <Button
                 variant="outline"
                 size="sm"
-                onClick={loadData}
-                disabled={loading}
+                onClick={() => {
+                  loadAllSections();
+                  refreshStats();
+                }}
+                disabled={anyLoading}
                 className="text-xs border-border bg-muted/50 hover:bg-muted text-foreground transition shadow-xs h-8 cursor-pointer"
               >
-                <RefreshCw size={13} className={`mr-1.5 ${loading ? "animate-spin text-primary" : ""}`} />
+                <RefreshCw
+                  size={13}
+                  className={`mr-1.5 ${anyLoading ? "animate-spin text-primary" : ""}`}
+                />
                 Refresh
               </Button>
             </div>
@@ -290,114 +480,46 @@ export default function HistoryPage() {
         {stats && (
           <div className="border-b border-border bg-muted/15 py-3 shrink-0 font-sans">
             <div className="max-w-[1240px] mx-auto px-4 sm:px-6 lg:px-8 grid grid-cols-2 sm:grid-cols-4 gap-3">
-              <div className="p-2.5 rounded-lg border border-border/80 bg-card shadow-xs flex items-center justify-between">
-                <div>
-                  <span className="text-[10px] uppercase font-bold text-muted-foreground">Total Sessions</span>
-                  <p className="text-sm font-bold font-mono text-foreground">{stats.total_chats}</p>
-                </div>
-                <div className="p-1.5 rounded-md bg-muted text-muted-foreground">
-                  <FolderOpen size={14} />
-                </div>
-              </div>
-
-              <div className="p-2.5 rounded-lg border border-border/80 bg-card shadow-xs flex items-center justify-between">
-                <div>
-                  <span className="text-[10px] uppercase font-bold text-muted-foreground">Pinned Active</span>
-                  <p className="text-sm font-bold font-mono text-primary">{stats.pinned_chats}</p>
-                </div>
-                <div className="p-1.5 rounded-md bg-primary/10 text-primary">
-                  <Pin size={14} className="rotate-45" />
-                </div>
-              </div>
-
-              <div className="p-2.5 rounded-lg border border-border/80 bg-card shadow-xs flex items-center justify-between">
-                <div>
-                  <span className="text-[10px] uppercase font-bold text-muted-foreground">Archived</span>
-                  <p className="text-sm font-bold font-mono text-muted-foreground">{stats.archived_chats}</p>
-                </div>
-                <div className="p-1.5 rounded-md bg-muted text-muted-foreground">
-                  <Archive size={14} />
-                </div>
-              </div>
-
-              <div className="p-2.5 rounded-lg border border-border/80 bg-card shadow-xs flex items-center justify-between">
-                <div>
-                  <span className="text-[10px] uppercase font-bold text-muted-foreground">Disk Consumption</span>
-                  <p className="text-sm font-bold font-mono text-emerald-600 dark:text-emerald-400">{stats.disk_size_mb} MB</p>
-                </div>
-                <div className="p-1.5 rounded-md bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
-                  <HardDrive size={14} />
-                </div>
-              </div>
+              <MetricCard label="Total Sessions" value={stats.total_chats} icon={<FolderOpen size={14} />} />
+              <MetricCard
+                label="Pinned Active"
+                value={stats.pinned_chats}
+                valueClass="text-primary"
+                icon={<Pin size={14} className="rotate-45" />}
+                iconClass="bg-primary/10 text-primary"
+              />
+              <MetricCard label="Archived" value={stats.archived_chats} icon={<Archive size={14} />} />
+              <MetricCard
+                label="Disk Consumption"
+                value={`${stats.disk_size_mb} MB`}
+                valueClass="text-emerald-600 dark:text-emerald-400"
+                icon={<HardDrive size={14} />}
+                iconClass="bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+              />
             </div>
           </div>
         )}
 
-        {/* Tabs & Deep Search Filter Navigation */}
+        {/* Tabs & Search */}
         <div className="w-full border-b border-border bg-custom">
           <div className="max-w-[1240px] mx-auto w-full px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div className="flex items-center gap-1 overflow-x-auto pt-2 scrollbar-none">
-              <button
-                type="button"
-                onClick={() => setActiveTab("all")}
-                className={`flex items-center gap-2 px-4 py-2.5 text-xs font-semibold border-b-2 whitespace-nowrap transition-all cursor-pointer ${
-                  activeTab === "all"
-                    ? "border-primary text-primary bg-primary/5"
-                    : "border-transparent text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                <span>All Sessions</span>
-                <span className="ml-1 px-1.5 py-0.5 rounded-full text-[10px] font-mono bg-muted text-muted-foreground border border-border">
-                  {chats.length}
-                </span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setActiveTab("active")}
-                className={`flex items-center gap-2 px-4 py-2.5 text-xs font-semibold border-b-2 whitespace-nowrap transition-all cursor-pointer ${
-                  activeTab === "active"
-                    ? "border-primary text-primary bg-primary/5"
-                    : "border-transparent text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                <span>Active</span>
-                <span className="ml-1 px-1.5 py-0.5 rounded-full text-[10px] font-mono bg-muted text-muted-foreground border border-border">
-                  {chats.filter((c) => !c.is_archived).length}
-                </span>
-              </button>
-
-              <button
-                type="button"
+              <TabButton label="All Sessions" count={allCount} active={activeTab === "all"} onClick={() => setActiveTab("all")} />
+              <TabButton label="Active" count={activeCount} active={activeTab === "active"} onClick={() => setActiveTab("active")} />
+              <TabButton
+                label="Pinned"
+                count={pinnedCount}
+                active={activeTab === "pinned"}
                 onClick={() => setActiveTab("pinned")}
-                className={`flex items-center gap-2 px-4 py-2.5 text-xs font-semibold border-b-2 whitespace-nowrap transition-all cursor-pointer ${
-                  activeTab === "pinned"
-                    ? "border-primary text-primary bg-primary/5"
-                    : "border-transparent text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                <Pin size={12} className="rotate-45" />
-                <span>Pinned</span>
-                <span className="ml-1 px-1.5 py-0.5 rounded-full text-[10px] font-mono bg-muted text-muted-foreground border border-border">
-                  {chats.filter((c) => c.is_pinned || c.pinned).length}
-                </span>
-              </button>
-
-              <button
-                type="button"
+                icon={<Pin size={12} className="rotate-45" />}
+              />
+              <TabButton
+                label="Archived"
+                count={archivedCount}
+                active={activeTab === "archived"}
                 onClick={() => setActiveTab("archived")}
-                className={`flex items-center gap-2 px-4 py-2.5 text-xs font-semibold border-b-2 whitespace-nowrap transition-all cursor-pointer ${
-                  activeTab === "archived"
-                    ? "border-primary text-primary bg-primary/5"
-                    : "border-transparent text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                <Archive size={12} />
-                <span>Archived</span>
-                <span className="ml-1 px-1.5 py-0.5 rounded-full text-[10px] font-mono bg-muted text-muted-foreground border border-border">
-                  {chats.filter((c) => c.is_archived).length}
-                </span>
-              </button>
+                icon={<Archive size={12} />}
+              />
             </div>
 
             <div className="flex items-center gap-2.5 pb-2 sm:pb-0">
@@ -424,156 +546,222 @@ export default function HistoryPage() {
           </div>
         </div>
 
-        {/* Main Content Area - Linear List with 10-Item Progressive Pagination */}
+        {/* Main Content Area */}
         <main className="w-full flex-1 overflow-y-auto scrollbar-thin">
           <div className="max-w-[1240px] mx-auto w-full px-4 sm:px-6 lg:px-8 py-6 space-y-6">
-            {loading ? (
-              <div className="flex items-center justify-center py-20 text-muted-foreground text-xs animate-pulse">
-                Reading session catalog and disk metrics...
-              </div>
-            ) : filteredChats.length === 0 ? (
+            {isEmpty ? (
               <div className="flex flex-col items-center justify-center p-12 text-center rounded-2xl border border-dashed border-border bg-card/40">
                 <History className="h-10 w-10 text-muted-foreground mb-3" />
-                <h3 className="text-sm font-semibold text-foreground">No sessions match your filter</h3>
+                <h3 className="text-sm font-semibold text-foreground">
+                  No sessions match your filter
+                </h3>
                 <p className="text-xs text-muted-foreground max-w-sm mt-1">
-                  {searchQuery ? "Try refining your search keyword." : "Start a new task in Chat to create sessions."}
+                  {searchQuery
+                    ? "Try refining your search keyword."
+                    : "Start a new task in Chat to create sessions."}
                 </p>
               </div>
             ) : (
               <>
-                {/* GROUP 1: Today */}
-                {todayChats.length > 0 && (
-                  <div>
-                    <div className="flex items-center justify-between mb-2.5 px-1">
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs font-bold uppercase tracking-wider text-foreground">
-                          Today (اليوم)
-                        </span>
-                        <span className="text-[10px] font-mono px-2 py-0.2 rounded-full bg-primary/10 text-primary border border-primary/20">
-                          {visibleTodayChats.length}/{todayChats.length}
-                        </span>
-                      </div>
-                    </div>
-                    <div className="space-y-1.5">
-                      {visibleTodayChats.map((chat) => (
-                        <HistoryListRow
-                          key={chat.id}
-                          chat={chat}
-                          onTogglePin={handleTogglePin}
-                          onToggleArchive={handleToggleArchive}
-                          onDelete={handleDelete}
-                        />
-                      ))}
-                    </div>
-
-                    {visibleTodayChats.length < todayChats.length && (
-                      <div className="pt-2.5 flex justify-center">
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => setTodayLimit((prev) => prev + 10)}
-                          className="text-xs border-border bg-card hover:bg-muted text-foreground transition shadow-xs cursor-pointer gap-1.5 h-7"
-                        >
-                          <ChevronDown size={12} />
-                          <span>Load More Today (+10)</span>
-                        </Button>
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {/* GROUP 2: This Week */}
-                {thisWeekChats.length > 0 && (
-                  <div>
-                    <div className="flex items-center justify-between mb-2.5 px-1">
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs font-bold uppercase tracking-wider text-foreground">
-                          This Week (هذا الأسبوع)
-                        </span>
-                        <span className="text-[10px] font-mono px-2 py-0.2 rounded-full bg-muted text-muted-foreground border border-border">
-                          {visibleWeekChats.length}/{thisWeekChats.length}
-                        </span>
-                      </div>
-                    </div>
-                    <div className="space-y-1.5">
-                      {visibleWeekChats.map((chat) => (
-                        <HistoryListRow
-                          key={chat.id}
-                          chat={chat}
-                          onTogglePin={handleTogglePin}
-                          onToggleArchive={handleToggleArchive}
-                          onDelete={handleDelete}
-                        />
-                      ))}
-                    </div>
-
-                    {visibleWeekChats.length < thisWeekChats.length && (
-                      <div className="pt-2.5 flex justify-center">
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => setWeekLimit((prev) => prev + 10)}
-                          className="text-xs border-border bg-card hover:bg-muted text-foreground transition shadow-xs cursor-pointer gap-1.5 h-7"
-                        >
-                          <ChevronDown size={12} />
-                          <span>Load More This Week (+10)</span>
-                        </Button>
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {/* GROUP 3: Older than a week */}
-                {olderChats.length > 0 && (
-                  <div>
-                    <div className="flex items-center justify-between mb-2.5 px-1">
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs font-bold uppercase tracking-wider text-muted-foreground">
-                          Older than a week (أقدم من أسبوع)
-                        </span>
-                        <span className="text-[10px] font-mono px-2 py-0.2 rounded-full bg-muted text-muted-foreground border border-border">
-                          {visibleOlderChats.length}/{olderChats.length}
-                        </span>
-                      </div>
-                    </div>
-
-                    <div className="space-y-1.5">
-                      {visibleOlderChats.map((chat) => (
-                        <HistoryListRow
-                          key={chat.id}
-                          chat={chat}
-                          onTogglePin={handleTogglePin}
-                          onToggleArchive={handleToggleArchive}
-                          onDelete={handleDelete}
-                        />
-                      ))}
-                    </div>
-
-                    {visibleOlderChats.length < olderChats.length && (
-                      <div className="pt-3 flex justify-center">
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => setOlderLimit((prev) => prev + 10)}
-                          className="text-xs border-border bg-card hover:bg-muted text-foreground transition shadow-xs cursor-pointer gap-1.5"
-                        >
-                          <ChevronDown size={13} />
-                          <span>Load More Older Sessions ({olderChats.length - visibleOlderChats.length} remaining)</span>
-                        </Button>
-                      </div>
-                    )}
-                  </div>
-                )}
+                {TIME_RANGES.map((range) => (
+                  <SectionBlock
+                    key={range}
+                    range={range}
+                    label={SECTION_LABELS[range]}
+                    state={sections[range]}
+                    onLoadMore={(cursor) => loadSection(range, "more", cursor)}
+                    onRetry={() => loadSection(range, "initial")}
+                    onTogglePin={handleTogglePin}
+                    onToggleArchive={handleToggleArchive}
+                    onDelete={handleDelete}
+                  />
+                ))}
               </>
             )}
           </div>
         </main>
       </div>
 
-      {/* Standalone Injected Dialog and Toasts (Zero Layout footprint) */}
       <ConfirmDialog />
       <ToastContainer />
     </>
+  );
+}
+
+// ----------------------------------------------------------------
+// Sub-components
+// ----------------------------------------------------------------
+
+interface MetricCardProps {
+  label: string;
+  value: number | string;
+  valueClass?: string;
+  icon: React.ReactNode;
+  iconClass?: string;
+}
+
+function MetricCard({ label, value, valueClass, icon, iconClass }: MetricCardProps) {
+  return (
+    <div className="p-2.5 rounded-lg border border-border/80 bg-card shadow-xs flex items-center justify-between">
+      <div>
+        <span className="text-[10px] uppercase font-bold text-muted-foreground">
+          {label}
+        </span>
+        <p className={`text-sm font-bold font-mono ${valueClass ?? "text-foreground"}`}>
+          {value}
+        </p>
+      </div>
+      <div className={`p-1.5 rounded-md ${iconClass ?? "bg-muted text-muted-foreground"}`}>
+        {icon}
+      </div>
+    </div>
+  );
+}
+
+interface TabButtonProps {
+  label: string;
+  count: number;
+  active: boolean;
+  onClick: () => void;
+  icon?: React.ReactNode;
+}
+
+function TabButton({ label, count, active, onClick, icon }: TabButtonProps) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`flex items-center gap-2 px-4 py-2.5 text-xs font-semibold border-b-2 whitespace-nowrap transition-all cursor-pointer ${
+        active
+          ? "border-primary text-primary bg-primary/5"
+          : "border-transparent text-muted-foreground hover:text-foreground"
+      }`}
+    >
+      {icon}
+      <span>{label}</span>
+      <span className="ml-1 px-1.5 py-0.5 rounded-full text-[10px] font-mono bg-muted text-muted-foreground border border-border">
+        {count}
+      </span>
+    </button>
+  );
+}
+
+interface SectionBlockProps {
+  range: ChatTimeRange;
+  label: string;
+  state: SectionState;
+  onLoadMore: (cursor: string | null) => void;
+  onRetry: () => void;
+  onTogglePin: (chatId: string) => void;
+  onToggleArchive: (chatId: string) => void;
+  onDelete: (chatId: string) => void;
+}
+
+function SectionBlock({
+  label,
+  state,
+  onLoadMore,
+  onRetry,
+  onTogglePin,
+  onToggleArchive,
+  onDelete,
+}: SectionBlockProps) {
+  const {
+    items,
+    total,
+    nextCursor,
+    hasMore,
+    loadingInitial,
+    loadingMore,
+    error,
+  } = state;
+
+  // Hide empty sections entirely (but keep them visible while loading
+  // their first page so the user sees progress).
+  if (!loadingInitial && !error && items.length === 0) {
+    return null;
+  }
+
+  const remaining = total !== null ? Math.max(0, total - items.length) : 0;
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-2.5 px-1">
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-bold uppercase tracking-wider text-foreground">
+            {label}
+          </span>
+          {total !== null && (
+            <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-primary/10 text-primary border border-primary/20">
+              {items.length}/{total}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {error ? (
+        <div className="flex items-start gap-3 p-3 rounded-lg border border-destructive/40 bg-destructive/10 text-destructive text-xs">
+          <AlertCircle size={14} className="mt-0.5 flex-shrink-0" />
+          <div className="flex-1">
+            <p className="font-semibold">Failed to load {label.toLowerCase()}</p>
+            <p className="text-destructive/80">{error}</p>
+          </div>
+          <button
+            type="button"
+            onClick={onRetry}
+            className="text-xs font-medium underline cursor-pointer"
+          >
+            Retry
+          </button>
+        </div>
+      ) : loadingInitial ? (
+        <div className="flex items-center justify-center py-6 text-xs text-muted-foreground gap-2">
+          <Loader2 size={13} className="animate-spin" />
+          Loading {label.toLowerCase()}...
+        </div>
+      ) : (
+        <>
+          <div className="space-y-1.5">
+            {items.map((chat) => (
+              <HistoryListRow
+                key={chat.id}
+                chat={chat}
+                onTogglePin={onTogglePin}
+                onToggleArchive={onToggleArchive}
+                onDelete={onDelete}
+              />
+            ))}
+          </div>
+
+          {hasMore && (
+            <div className="pt-2.5 flex justify-center">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => onLoadMore(nextCursor)}
+                disabled={loadingMore}
+                className="text-xs border-border bg-card hover:bg-muted text-foreground transition shadow-xs cursor-pointer gap-1.5 h-7"
+              >
+                {loadingMore ? (
+                  <>
+                    <Loader2 size={12} className="animate-spin" />
+                    <span>Loading...</span>
+                  </>
+                ) : (
+                  <>
+                    <ChevronDown size={12} />
+                    <span>
+                      Load More {label}
+                      {remaining > 0 ? ` (+${Math.min(SECTION_PAGE_SIZE, remaining)})` : ""}
+                    </span>
+                  </>
+                )}
+              </Button>
+            </div>
+          )}
+        </>
+      )}
+    </div>
   );
 }
 
@@ -584,7 +772,12 @@ interface HistoryListRowProps {
   onDelete: (chatId: string) => void;
 }
 
-function HistoryListRow({ chat, onTogglePin, onToggleArchive, onDelete }: HistoryListRowProps) {
+function HistoryListRow({
+  chat,
+  onTogglePin,
+  onToggleArchive,
+  onDelete,
+}: HistoryListRowProps) {
   const isPinned = chat.is_pinned || chat.pinned;
   const isArchived = chat.is_archived;
   const effectiveTarget = chat.job_id || chat.id;

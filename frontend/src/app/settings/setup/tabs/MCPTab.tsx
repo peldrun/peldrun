@@ -70,10 +70,8 @@ export function MCPTab({ config, setConfig }: MCPTabProps) {
     }
   };
 
+  // Relative path only - SSR/CSR parity. See next.config.mjs.
   const getApiUrl = (endpoint: string) => {
-    if (typeof window !== "undefined" && (window.location.port === "3088" || window.location.port === "3000")) {
-      return `http://localhost:8088${endpoint}`;
-    }
     return endpoint;
   };
 
