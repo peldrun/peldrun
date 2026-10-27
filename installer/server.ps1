@@ -1,7 +1,7 @@
 # installer/server.ps1
 $ErrorActionPreference = "Stop"
 
-# Force UTF-8 console
+# Force UTF-8 console output
 chcp 65001 > $null
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
@@ -23,7 +23,7 @@ $script:InstallProcess = $null
 $script:InstallStarted = $false
 
 # ---------------------------------------------------------
-# البحث التلقائي عن منفذ شاغر
+# Automatically find an available port
 # ---------------------------------------------------------
 $listener = $null
 $Prefix   = $null
@@ -120,7 +120,7 @@ function Read-AllLines {
                     if ($null -ne $line) { [void]$collected.Add($line) }
                 }
             } finally { $sr.Close() }
-            $result = $collected.ToArray()
+            $result.lines = $collected.ToArray()
         } finally { $fs.Close() }
     } catch { }
     return $result
@@ -142,8 +142,21 @@ try {
                     $response.ContentLength64 = $bytes.Length
                     $response.OutputStream.Write($bytes, 0, $bytes.Length)
                 }
+
                 "/favicon.ico" {
                     $response.StatusCode = 204
+                }
+
+                "/assets/image/peldrun-logo-light.svg" {
+                    $logoPath = Join-Path $ProjectRoot "assets\image\peldrun-logo-light.svg"
+                    if (Test-Path $logoPath) {
+                        $bytes = [System.IO.File]::ReadAllBytes($logoPath)
+                        $response.ContentType = "image/svg+xml"
+                        $response.ContentLength64 = $bytes.Length
+                        $response.OutputStream.Write($bytes, 0, $bytes.Length)
+                    } else {
+                        $response.StatusCode = 404
+                    }
                 }
 
                 "/api/check" {

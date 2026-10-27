@@ -4,19 +4,41 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PELDRUN Web — Setup</title>
+    <title>PELDRUN — Setup & Installation</title>
     <style>
+        /* ==========================================================================
+           Design Tokens & CSS Variables
+           ========================================================================== */
         :root {
-            --bg: #0f172a;
-            --card-bg: rgba(30, 41, 59, 0.7);
-            --border: rgba(148, 163, 184, 0.15);
-            --text: #e2e8f0;
-            --muted: #94a3b8;
+            --bg-dark: #090d16;
+            --bg-gradient-top: #162032;
+            --card-bg: rgba(15, 23, 42, 0.75);
+            --card-border: rgba(148, 163, 184, 0.14);
+            --card-border-hover: rgba(148, 163, 184, 0.25);
+            --text-main: #f1f5f9;
+            --text-secondary: #cbd5e1;
+            --text-muted: #94a3b8;
             --primary: #0ea5e9;
+            --primary-glow: rgba(14, 165, 233, 0.35);
+            --accent: #6366f1;
             --success: #10b981;
+            --success-bg: rgba(16, 185, 129, 0.08);
+            --success-border: rgba(16, 185, 129, 0.3);
+            --warning: #f59e0b;
+            --warning-bg: rgba(245, 158, 11, 0.08);
+            --warning-border: rgba(245, 158, 11, 0.3);
             --error: #ef4444;
+            --error-bg: rgba(239, 68, 68, 0.08);
+            --error-border: rgba(239, 68, 68, 0.35);
+            --terminal-bg: #050811;
+            --radius-lg: 16px;
+            --radius-md: 12px;
+            --radius-sm: 8px;
         }
 
+        /* ==========================================================================
+           Reset & Base Styles
+           ========================================================================== */
         * {
             margin: 0;
             padding: 0;
@@ -24,55 +46,90 @@
         }
 
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: radial-gradient(ellipse at top, #1e293b 0%, var(--bg) 60%);
-            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+            background: radial-gradient(ellipse at top, var(--bg-gradient-top) 0%, var(--bg-dark) 65%);
+            color: var(--text-main);
             min-height: 100vh;
             display: flex;
             justify-content: center;
-            padding: 40px 20px;
+            padding: 40px 20px 60px;
+            line-height: 1.5;
+            -webkit-font-smoothing: antialiased;
         }
 
         .container {
-            max-width: 800px;
+            max-width: 900px;
             width: 100%;
         }
 
+        /* ==========================================================================
+           Header & Brand Identity
+           ========================================================================== */
         .header {
             text-align: center;
-            margin-bottom: 40px;
+            margin-bottom: 36px;
         }
 
-        .logo {
-            font-size: 48px;
+        .logo-wrapper {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 12px;
+            min-height: 56px;
+        }
+
+        .logo-img {
+            height: 120px;
+            width: auto;
+            max-width: 300px;
+            object-fit: contain;
+            filter: drop-shadow(0 4px 16px rgba(56, 189, 248, 0.2));
+        }
+
+        .logo-fallback {
+            display: none;
+            font-size: 46px;
             font-weight: 800;
             letter-spacing: -1px;
             background: linear-gradient(135deg, #38bdf8 0%, #818cf8 50%, #c084fc 100%);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
-            margin-bottom: 8px;
         }
 
         .tagline {
-            color: var(--muted);
-            font-size: 16px;
-            letter-spacing: 0.5px;
+            color: var(--text-muted);
+            font-size: 15px;
+            letter-spacing: 0.4px;
+            font-weight: 400;
         }
 
+        /* ==========================================================================
+           Cards & Layout Containers
+           ========================================================================== */
         .card {
             background: var(--card-bg);
-            border: 1px solid var(--border);
-            border-radius: 16px;
-            padding: 32px;
+            border: 1px solid var(--card-border);
+            border-radius: var(--radius-lg);
+            padding: 28px 32px;
             margin-bottom: 24px;
-            backdrop-filter: blur(10px);
+            backdrop-filter: blur(12px);
+            box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+            transition: border-color 0.25s ease;
+        }
+
+        .card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            gap: 12px;
         }
 
         .card-title {
-            font-size: 18px;
+            font-size: 17px;
             font-weight: 600;
-            margin-bottom: 18px;
-            color: #f1f5f9;
+            color: var(--text-main);
             display: flex;
             align-items: center;
             gap: 10px;
@@ -81,195 +138,381 @@
         .card-title::before {
             content: "";
             width: 4px;
-            height: 20px;
+            height: 18px;
             border-radius: 2px;
-            background: linear-gradient(180deg, #38bdf8, #818cf8);
+            background: linear-gradient(180deg, var(--primary), var(--accent));
         }
 
-        /* Stepper */
-        .stepper {
+        .status-badge {
+            font-size: 12px;
+            font-weight: 600;
+            padding: 4px 12px;
+            border-radius: 999px;
+            letter-spacing: 0.3px;
+            text-transform: uppercase;
+            background: rgba(148, 163, 184, 0.12);
+            color: var(--text-muted);
+            border: 1px solid rgba(148, 163, 184, 0.2);
+        }
+
+        .status-badge.running {
+            background: rgba(14, 165, 233, 0.12);
+            color: #38bdf8;
+            border-color: rgba(14, 165, 233, 0.3);
+        }
+
+        .status-badge.completed {
+            background: var(--success-bg);
+            color: var(--success);
+            border-color: var(--success-border);
+        }
+
+        .status-badge.failed {
+            background: var(--error-bg);
+            color: var(--error);
+            border-color: var(--error-border);
+        }
+
+        /* ==========================================================================
+           Overall Progress Bar & Timer
+           ========================================================================== */
+        .progress-container {
+            margin-bottom: 24px;
+            background: rgba(2, 6, 23, 0.45);
+            padding: 14px 18px;
+            border-radius: var(--radius-md);
+            border: 1px solid rgba(148, 163, 184, 0.08);
+        }
+
+        .progress-meta {
             display: flex;
-            flex-direction: column;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 13px;
+            margin-bottom: 10px;
+        }
+
+        .progress-label {
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+
+        .progress-stats {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            color: var(--text-muted);
+            font-variant-numeric: tabular-nums;
+        }
+
+        .progress-track {
+            width: 100%;
+            height: 8px;
+            background: rgba(30, 41, 59, 0.8);
+            border-radius: 999px;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, var(--primary), var(--accent), var(--success));
+            border-radius: 999px;
+            transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .progress-fill.has-error {
+            background: linear-gradient(90deg, var(--primary), var(--error));
+        }
+
+        /* ==========================================================================
+           Installation Phases Stepper Grid
+           ========================================================================== */
+        .stepper {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
             gap: 12px;
+        }
+
+        @media (max-width: 640px) {
+            .stepper {
+                grid-template-columns: 1fr;
+            }
+
+            .card {
+                padding: 20px;
+            }
         }
 
         .step {
             display: flex;
             align-items: center;
-            gap: 16px;
-            padding: 16px;
-            border-radius: 12px;
-            background: rgba(15, 23, 42, 0.4);
-            border: 1px solid transparent;
-            transition: all 0.3s ease;
+            gap: 14px;
+            padding: 14px 16px;
+            border-radius: var(--radius-md);
+            background: rgba(2, 6, 23, 0.4);
+            border: 1px solid rgba(148, 163, 184, 0.08);
+            transition: all 0.25s ease;
         }
 
         .step.pending {
-            opacity: 0.6;
+            opacity: 0.65;
         }
 
         .step.installing {
-            border-color: rgba(14, 165, 233, 0.3);
-            background: rgba(14, 165, 233, 0.05);
+            border-color: rgba(14, 165, 233, 0.4);
+            background: rgba(14, 165, 233, 0.07);
+            box-shadow: 0 0 20px -5px rgba(14, 165, 233, 0.2);
             opacity: 1;
         }
 
         .step.installed {
-            background: rgba(16, 185, 129, 0.05);
+            border-color: rgba(16, 185, 129, 0.22);
+            background: var(--success-bg);
+            opacity: 1;
+        }
+
+        .step.warning {
+            border-color: var(--warning-border);
+            background: var(--warning-bg);
             opacity: 1;
         }
 
         .step.error {
-            background: rgba(239, 68, 68, 0.05);
-            border-color: rgba(239, 68, 68, 0.3);
+            border-color: var(--error-border);
+            background: var(--error-bg);
             opacity: 1;
         }
 
         .step-icon {
-            width: 28px;
-            height: 28px;
+            width: 30px;
+            height: 30px;
             border-radius: 50%;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 14px;
-            font-weight: bold;
             flex-shrink: 0;
+            font-size: 13px;
+            font-weight: 700;
+            transition: all 0.25s ease;
         }
 
         .step.pending .step-icon {
-            background: rgba(148, 163, 184, 0.1);
-            color: var(--muted);
+            background: rgba(148, 163, 184, 0.12);
+            color: var(--text-muted);
+        }
+
+        .step.installing .step-icon {
+            background: rgba(14, 165, 233, 0.2);
+            color: var(--primary);
         }
 
         .step.installed .step-icon {
             background: var(--success);
-            color: #fff;
+            color: #ffffff;
         }
 
-        .step.installing .step-icon {
-            background: var(--primary);
-            color: #fff;
-            animation: pulse-ring 1.5s infinite;
+        .step.warning .step-icon {
+            background: var(--warning);
+            color: #ffffff;
         }
 
         .step.error .step-icon {
             background: var(--error);
-            color: #fff;
+            color: #ffffff;
         }
 
-        @keyframes pulse-ring {
+        .spinner {
+            width: 16px;
+            height: 16px;
+            border: 2.5px solid rgba(56, 189, 248, 0.25);
+            border-top-color: #38bdf8;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
 
-            0%,
-            100% {
-                box-shadow: 0 0 0 0 rgba(14, 165, 233, 0.7);
-            }
-
-            50% {
-                box-shadow: 0 0 0 8px rgba(14, 165, 233, 0);
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
             }
         }
 
         .step-content {
             flex-grow: 1;
+            min-width: 0;
         }
 
         .step-title {
-            font-size: 15px;
-            font-weight: 500;
-            color: #e2e8f0;
-            margin-bottom: 4px;
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-main);
+            margin-bottom: 2px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
 
         .step-desc {
-            font-size: 13px;
-            color: var(--muted);
+            font-size: 12px;
+            color: var(--text-muted);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
 
         .step-status {
-            font-size: 13px;
-            font-weight: 500;
+            font-size: 12px;
+            font-weight: 600;
+            flex-shrink: 0;
         }
 
         .step.pending .step-status {
-            color: var(--muted);
+            color: var(--text-muted);
+        }
+
+        .step.installing .step-status {
+            color: #38bdf8;
         }
 
         .step.installed .step-status {
             color: var(--success);
         }
 
-        .step.installing .step-status {
-            color: var(--primary);
+        .step.warning .step-status {
+            color: var(--warning);
         }
 
         .step.error .step-status {
             color: var(--error);
         }
 
-        /* Buttons */
+        /* ==========================================================================
+           Action Buttons
+           ========================================================================== */
+        .actions-row {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+        }
+
         .btn {
             width: 100%;
-            padding: 18px 24px;
-            font-size: 16px;
+            padding: 16px 24px;
+            font-size: 15px;
             font-weight: 600;
             border: none;
-            border-radius: 12px;
+            border-radius: var(--radius-md);
             cursor: pointer;
-            transition: all 0.2s;
+            transition: all 0.2s ease;
             font-family: inherit;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
         }
 
         .btn-primary {
-            background: linear-gradient(135deg, var(--primary), #6366f1);
-            color: white;
-            box-shadow: 0 4px 20px rgba(99, 102, 241, 0.35);
+            background: linear-gradient(135deg, var(--primary), var(--accent));
+            color: #ffffff;
+            box-shadow: 0 4px 20px rgba(99, 102, 241, 0.3);
         }
 
         .btn-primary:hover:not(:disabled) {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 28px rgba(99, 102, 241, 0.5);
+            transform: translateY(-1px);
+            box-shadow: 0 8px 26px rgba(99, 102, 241, 0.45);
+        }
+
+        .btn-primary:active:not(:disabled) {
+            transform: translateY(0);
         }
 
         .btn-primary:disabled {
-            opacity: 0.5;
+            opacity: 0.55;
             cursor: not-allowed;
+            box-shadow: none;
         }
 
-        /* Console */
+        .btn-secondary {
+            width: auto;
+            padding: 8px 14px;
+            font-size: 12px;
+            font-weight: 500;
+            background: rgba(30, 41, 59, 0.75);
+            color: var(--text-secondary);
+            border: 1px solid var(--card-border);
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+
+        .btn-secondary:hover {
+            background: rgba(51, 65, 85, 0.85);
+            color: #ffffff;
+            border-color: var(--card-border-hover);
+        }
+
+        /* ==========================================================================
+           Live Console / Terminal Output
+           ========================================================================== */
         details.console-details {
-            margin-top: 16px;
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            background: #020617;
+            margin-top: 18px;
+            border: 1px solid var(--card-border);
+            border-radius: var(--radius-md);
+            background: var(--terminal-bg);
             overflow: hidden;
         }
 
         details.console-details summary {
-            padding: 16px;
+            padding: 14px 18px;
             cursor: pointer;
-            font-size: 14px;
+            font-size: 13px;
             font-weight: 500;
-            color: var(--muted);
-            background: rgba(30, 41, 59, 0.5);
+            color: var(--text-secondary);
+            background: rgba(15, 23, 42, 0.85);
             outline: none;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            user-select: none;
+            list-style: none;
         }
 
-        details.console-details summary:hover {
-            color: var(--text);
+        details.console-details summary::-webkit-details-marker {
+            display: none;
+        }
+
+        .summary-left {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .summary-chevron {
+            transition: transform 0.2s ease;
+            color: var(--text-muted);
+        }
+
+        details.console-details[open] .summary-chevron {
+            transform: rotate(90deg);
+        }
+
+        .console-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
         }
 
         details.console-details[open] summary {
-            border-bottom: 1px solid var(--border);
+            border-bottom: 1px solid var(--card-border);
         }
 
         .console {
             padding: 16px;
-            height: 300px;
+            height: 320px;
             overflow-y: auto;
-            font-family: "Cascadia Code", "Consolas", monospace;
-            font-size: 13px;
-            line-height: 1.6;
+            font-family: "Cascadia Code", "JetBrains Mono", "Consolas", monospace;
+            font-size: 12.5px;
+            line-height: 1.65;
         }
 
         .console::-webkit-scrollbar {
@@ -277,17 +520,22 @@
         }
 
         .console::-webkit-scrollbar-track {
-            background: #020617;
+            background: var(--terminal-bg);
         }
 
         .console::-webkit-scrollbar-thumb {
-            background: #334155;
+            background: #1e293b;
             border-radius: 4px;
+        }
+
+        .console::-webkit-scrollbar-thumb:hover {
+            background: #334155;
         }
 
         .console-line {
             white-space: pre-wrap;
             word-break: break-word;
+            padding: 1px 0;
         }
 
         .console-line.stdout {
@@ -295,235 +543,665 @@
         }
 
         .console-line.stderr {
-            color: var(--error);
+            color: #f87171;
+        }
+
+        .console-line.warn {
+            color: var(--warning);
+        }
+
+        .console-line.phase {
+            color: #38bdf8;
+            font-weight: 600;
+            margin-top: 6px;
         }
 
         .console-line.info {
-            color: var(--primary);
+            color: var(--text-muted);
             font-style: italic;
         }
 
         .console-line.done {
             color: var(--success);
             font-weight: 700;
+            margin-top: 6px;
         }
 
         .console-line.error {
             color: var(--error);
             font-weight: 700;
+            margin-top: 6px;
         }
 
+        /* ==========================================================================
+           Next Steps Launch Card
+           ========================================================================== */
+        .next-steps-card {
+            display: none;
+            border-color: var(--success-border);
+            background: linear-gradient(180deg, rgba(16, 185, 129, 0.08) 0%, var(--card-bg) 100%);
+        }
+
+        .next-steps-card.visible {
+            display: block;
+            animation: fadeIn 0.35s ease;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(8px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .next-steps-desc {
+            color: var(--text-secondary);
+            font-size: 14px;
+            margin-bottom: 16px;
+        }
+
+        .cmd-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 12px;
+        }
+
+        .cmd-box {
+            background: var(--terminal-bg);
+            border: 1px solid var(--card-border);
+            border-radius: var(--radius-sm);
+            padding: 12px 14px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+        }
+
+        .cmd-meta {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            min-width: 0;
+        }
+
+        .cmd-label {
+            font-size: 11px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.4px;
+        }
+
+        .cmd-code {
+            font-family: "Cascadia Code", "Consolas", monospace;
+            font-size: 13px;
+            color: var(--success);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+
+        .ascii,.pflex{
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .pflex{
+            text-align: center;
+            width: 100%;
+        }
+        .ascii-logo {
+            text-align: left;
+            font-family: "Cascadia Mono", "Consolas", monospace;
+            font-size: 10px;
+            line-height: 1.05;
+            letter-spacing: 0;
+            color: var(--primary);
+            margin: 0 auto 14px;
+            overflow-x: hidden;
+            overflow: hidden;
+            margin: auto;
+            width: auto;
+        }
+
+            .logo-wrapper.is-fallback + .ascii-logo {
+                display: inline-block;
+            }
+
+            .tagline {
+                color: var(--text-muted);
+                font-size: 15px;
+                letter-spacing: 0.4px;
+                font-weight: 400;
+                margin-top: 4px;
+            }
+
+
+
+        /* ==========================================================================
+           Footer
+           ========================================================================== */
         .footer-note {
             text-align: center;
             color: #64748b;
             font-size: 13px;
             margin-top: 24px;
         }
+
+        .footer-note strong {
+            color: var(--text-muted);
+        }
     </style>
 </head>
 
 <body>
     <div class="container">
-        <div class="header">
-            <div class="logo">PELDRUN</div>
-            <div class="tagline">Professional AI Agent — First-Time Setup</div>
-        </div>
+        <!-- Brand Header -->
+        <header class="header">
+            <div class="logo-wrapper">
+                <img id="brand-logo" class="logo-img" src="/assets/image/peldrun-logo-light.svg" alt="PELDRUN" />
+                <div id="brand-logo-fallback" class="logo-fallback">PELDRUN</div>
+            </div>
+            <div class="tagline">
 
-        <div class="card">
-            <div class="card-title">Installation Phases</div>
+
+                <div class="ascii">
+<pre class="ascii-logo" aria-hidden="true">
+ ███████████  ██████████ █████       ██████████   ███████████   █████  █████ ██████   █████
+░░███░░░░░███░░███░░░░░█░░███       ░░███░░░░███ ░░███░░░░░███ ░░███  ░░███ ░░██████ ░░███
+ ░███    ░███ ░███  █ ░  ░███        ░███   ░░███ ░███    ░███  ░███   ░███  ░███░███ ░███
+ ░██████████  ░██████    ░███        ░███    ░███ ░██████████   ░███   ░███  ░███░░███░███
+ ░███░░░░░░   ░███░░█    ░███        ░███    ░███ ░███░░░░░███  ░███   ░███  ░███ ░░██████
+ ░███         ░███ ░   █ ░███      █ ░███    ███  ░███    ░███  ░███   ░███  ░███  ░░█████
+ █████        ██████████ ███████████ ██████████   █████   █████ ░░████████   █████  ░░█████
+░░░░░        ░░░░░░░░░░ ░░░░░░░░░░░ ░░░░░░░░░░   ░░░░░   ░░░░░   ░░░░░░░░   ░░░░░    ░░░░░
+</pre>
+            </div>
+
+                 <p class="pflex">
+                    <span>AI Agent — Environment Setup &amp; Verification</span>
+                </p>
+            </div>
+        </header>
+
+        <!-- Installation Phases Card -->
+        <section class="card">
+            <div class="card-header">
+                <div class="card-title">Installation Phases</div>
+                <span id="overall-badge" class="status-badge">Checking...</span>
+            </div>
+
+            <!-- Overall Progress & Elapsed Timer -->
+            <div class="progress-container">
+                <div class="progress-meta">
+                    <span id="progress-text" class="progress-label">0 / 9 Completed (0%)</span>
+                    <div class="progress-stats">
+                        <span id="elapsed-time" title="Elapsed installation time">00:00</span>
+                    </div>
+                </div>
+                <div class="progress-track">
+                    <div id="progress-fill" class="progress-fill"></div>
+                </div>
+            </div>
+
+            <!-- Stepper Grid -->
             <div class="stepper" id="stepper"></div>
-        </div>
+        </section>
 
-        <div class="card">
-            <div class="card-title">Actions</div>
-            <button id="start-btn" class="btn btn-primary">Start Installation</button>
-            <details class="console-details">
-                <summary>Show Live Terminal Output</summary>
+        <!-- Next Steps Card (Revealed when all phases are installed) -->
+        <section id="next-steps-card" class="card next-steps-card">
+            <div class="card-header">
+                <div class="card-title">Ready to Launch</div>
+                <span class="status-badge completed">Environment Verified</span>
+            </div>
+            <p class="next-steps-desc">
+                All required dependencies and runtime components are configured. Run any of the following PowerShell
+                commands from the project root to start PELDRUN:
+            </p>
+            <div class="cmd-grid">
+                <div class="cmd-box">
+                    <div class="cmd-meta">
+                        <span class="cmd-label">Start Full Platform</span>
+                        <code class="cmd-code">.\start-all.ps1</code>
+                    </div>
+                    <button type="button" class="btn-secondary copy-cmd-btn" data-cmd=".\start-all.ps1">Copy</button>
+                </div>
+                <div class="cmd-box">
+                    <div class="cmd-meta">
+                        <span class="cmd-label">Backend Only</span>
+                        <code class="cmd-code">.\start-backend.ps1</code>
+                    </div>
+                    <button type="button" class="btn-secondary copy-cmd-btn"
+                        data-cmd=".\start-backend.ps1">Copy</button>
+                </div>
+                <div class="cmd-box">
+                    <div class="cmd-meta">
+                        <span class="cmd-label">Frontend Only</span>
+                        <code class="cmd-code">.\start-frontend.ps1</code>
+                    </div>
+                    <button type="button" class="btn-secondary copy-cmd-btn"
+                        data-cmd=".\start-frontend.ps1">Copy</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- Actions & Live Terminal Card -->
+        <section class="card">
+            <div class="card-header">
+                <div class="card-title">Controls &amp; Live Diagnostics</div>
+                <button id="recheck-btn" type="button" class="btn-secondary">Re-check Environment</button>
+            </div>
+
+            <div class="actions-row">
+                <button id="start-btn" type="button" class="btn btn-primary">Start Installation</button>
+            </div>
+
+            <details id="console-details" class="console-details">
+                <summary>
+                    <div class="summary-left">
+                        <svg class="summary-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                            stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="9 18 15 12 9 6"></polyline>
+                        </svg>
+                        <span>Live Terminal Output</span>
+                    </div>
+                    <div class="console-toolbar">
+                        <button id="copy-logs-btn" type="button" class="btn-secondary"
+                            title="Copy all terminal output">Copy Logs</button>
+                        <button id="clear-logs-btn" type="button" class="btn-secondary"
+                            title="Clear terminal view">Clear</button>
+                    </div>
+                </summary>
                 <div id="console" class="console">
                     <div class="console-line info">Waiting for installation to start...</div>
                 </div>
             </details>
-        </div>
+        </section>
 
-        <div class="footer-note">
-            Estimated time: <strong>5-15 minutes</strong> · Total disk usage: <strong>~1.4 GB</strong> · Keep this tab
-            open
-        </div>
+        <footer class="footer-note">
+            Estimated time: <strong>5–15 minutes</strong> &middot; Total disk usage: <strong>~1.4 GB</strong> &middot;
+            Keep this browser tab open during installation
+        </footer>
     </div>
 
     <script>
         (function () {
+            'use strict';
+
+            /* ------------------------------------------------------------------
+               Logo Fallback Handling
+               Tries /assets/image/peldrun-logo-light.svg first, then relative
+               path ../assets/image/peldrun-logo-light.svg, and finally falls
+               back to the gradient text logo if neither is reachable.
+               ------------------------------------------------------------------ */
+            const logoImg = document.getElementById('brand-logo');
+            const logoFallback = document.getElementById('brand-logo-fallback');
+            let triedRelativeLogo = false;
+
+            logoImg.addEventListener('error', function () {
+                if (!triedRelativeLogo) {
+                    triedRelativeLogo = true;
+                    logoImg.src = '../assets/image/peldrun-logo-light.svg';
+                } else {
+                    logoImg.style.display = 'none';
+                    logoFallback.style.display = 'block';
+                }
+            });
+
+            /* ------------------------------------------------------------------
+               Phase Definitions
+               Synchronized with check.ps1 and setup.ps1 (steps 1 through 9).
+               ------------------------------------------------------------------ */
             const phases = [
-                { id: 'config', title: 'Configuration File', desc: 'config/config.toml' },
-                { id: 'python', title: 'Python 3.12+', desc: 'Python runtime' },
-                { id: 'venv', title: 'Virtual Environment', desc: 'backend/.venv' },
-                { id: 'backendDeps', title: 'Backend Dependencies', desc: 'Python packages' },
-                { id: 'keyring', title: 'Secure Vault', desc: 'Windows Credential Manager' },
-                { id: 'playwright', title: 'Playwright Chromium', desc: 'Browser automation' },
-                { id: 'appImport', title: 'Application Integrity', desc: 'omweb.main verification' },
-                { id: 'node', title: 'Node.js 20.9+', desc: 'Node.js runtime' },
-                { id: 'frontendDeps', title: 'Frontend Dependencies', desc: 'React, Next.js, etc.' }
+                { id: 'config', title: 'Configuration File', defaultDesc: 'config/config.toml' },
+                { id: 'python', title: 'Python 3.12+', defaultDesc: 'Python runtime' },
+                { id: 'venv', title: 'Virtual Environment', defaultDesc: 'backend/.venv' },
+                { id: 'backendDeps', title: 'Backend Dependencies', defaultDesc: 'Python packages' },
+                { id: 'keyring', title: 'Secure Vault', defaultDesc: 'Windows Credential Manager' },
+                { id: 'playwright', title: 'Playwright Chromium', defaultDesc: 'Project-local browser' },
+                { id: 'appImport', title: 'Application Integrity', defaultDesc: 'omweb.main verification' },
+                { id: 'node', title: 'Node.js 20.9+', defaultDesc: 'Node.js LTS runtime' },
+                { id: 'frontendDeps', title: 'Frontend Dependencies', defaultDesc: 'React, Next.js, npm packages' }
             ];
 
-            phases.forEach((p, i) => { p.state = 'pending'; p.detail = 'Waiting...'; p.index = i; });
+            phases.forEach((p, idx) => {
+                p.state = 'pending';
+                p.detail = p.defaultDesc;
+                p.hasWarning = false;
+                p.index = idx;
+            });
 
+            /* ------------------------------------------------------------------
+               DOM References & State Variables
+               ------------------------------------------------------------------ */
             const stepperEl = document.getElementById('stepper');
-            const btn = document.getElementById('start-btn');
+            const startBtn = document.getElementById('start-btn');
+            const recheckBtn = document.getElementById('recheck-btn');
             const consoleEl = document.getElementById('console');
+            const consoleDetails = document.getElementById('console-details');
+            const copyLogsBtn = document.getElementById('copy-logs-btn');
+            const clearLogsBtn = document.getElementById('clear-logs-btn');
+            const progressTextEl = document.getElementById('progress-text');
+            const progressFillEl = document.getElementById('progress-fill');
+            const elapsedTimeEl = document.getElementById('elapsed-time');
+            const overallBadgeEl = document.getElementById('overall-badge');
+            const nextStepsCard = document.getElementById('next-steps-card');
 
             let pollTimer = null;
-            let since = 0;
+            let timerHandle = null;
+            let startTimeMs = null;
+            let sincePos = 0;
             let isInstalling = false;
+
+            // Tracks seen stderr lines because server.ps1 reads the entire install.err file on each poll
+            const seenStderrLines = new Set();
+
+            /* ------------------------------------------------------------------
+               SVG Icons for Stepper States
+               ------------------------------------------------------------------ */
+            const ICONS = {
+                pending: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="8"/></svg>',
+                installing: '<div class="spinner"></div>',
+                installed: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
+                warning: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
+                error: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>'
+            };
+
+            /* ------------------------------------------------------------------
+               UI Rendering Helpers
+               ------------------------------------------------------------------ */
+            function escapeHtml(str) {
+                return String(str)
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/"/g, '&quot;');
+            }
 
             function renderStepper() {
                 let html = '';
                 phases.forEach(p => {
-                    let icon = '○';
-                    if (p.state === 'installed') icon = '✓';
-                    else if (p.state === 'installing') icon = '◌';
-                    else if (p.state === 'error') icon = '✗';
+                    const effectiveState = (p.state === 'installed' && p.hasWarning) ? 'warning' : p.state;
+                    const iconHtml = ICONS[effectiveState] || ICONS.pending;
 
-                    let statusText = 'Pending';
-                    if (p.state === 'installed') statusText = 'Installed';
-                    else if (p.state === 'installing') statusText = 'Installing...';
-                    else if (p.state === 'error') statusText = 'Failed';
+                    let statusLabel = 'Pending';
+                    if (effectiveState === 'installed') statusLabel = 'Installed';
+                    else if (effectiveState === 'warning') statusLabel = 'Warning';
+                    else if (effectiveState === 'installing') statusLabel = 'Installing...';
+                    else if (effectiveState === 'error') statusLabel = 'Failed';
 
                     html += `
-        <div class="step ${p.state}">
-          <div class="step-icon">${icon}</div>
-          <div class="step-content">
-            <div class="step-title">${p.title}</div>
-            <div class="step-desc">${p.detail}</div>
-          </div>
-          <div class="step-status">${statusText}</div>
-        </div>
-      `;
+                        <div class="step ${effectiveState}">
+                            <div class="step-icon">${iconHtml}</div>
+                            <div class="step-content">
+                                <div class="step-title">${escapeHtml(p.title)}</div>
+                                <div class="step-desc" title="${escapeHtml(p.detail)}">${escapeHtml(p.detail)}</div>
+                            </div>
+                            <div class="step-status">${statusLabel}</div>
+                        </div>
+                    `;
                 });
                 stepperEl.innerHTML = html;
+                updateProgressBar();
             }
 
-            function stripAnsi(str) {
-                return str.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '');
-            }
+            function updateProgressBar() {
+                const completedCount = phases.filter(p => p.state === 'installed').length;
+                const hasError = phases.some(p => p.state === 'error');
+                const total = phases.length;
+                const pct = Math.round((completedCount / total) * 100);
 
-            function appendConsole(type, text) {
-                const div = document.createElement('div');
-                div.className = 'console-line ' + type;
-                div.textContent = text;
-                consoleEl.appendChild(div);
-                consoleEl.scrollTop = consoleEl.scrollHeight;
-            }
+                progressTextEl.textContent = `${completedCount} / ${total} Completed (${pct}%)`;
+                progressFillEl.style.width = `${pct}%`;
 
-            async function checkState() {
-                try {
-                    const res = await fetch('/api/check');
-                    const data = await res.json();
-
-                    phases[0].detail = data.config ? 'Found' : 'Missing';
-                    if (data.config) phases[0].state = 'installed';
-
-                    phases[1].detail = data.pythonVersion ? `Version ${data.pythonVersion}` : 'Not found';
-                    if (data.python) phases[1].state = 'installed';
-
-                    phases[2].detail = data.venv ? 'Exists' : 'Not found';
-                    if (data.venv) phases[2].state = 'installed';
-
-                    phases[3].detail = data.backendDeps ? 'Installed' : 'Missing';
-                    if (data.backendDeps) phases[3].state = 'installed';
-
-                    phases[4].detail = data.keyring ? 'Configured' : 'Not configured';
-                    if (data.keyring) phases[4].state = 'installed';
-
-                    phases[5].detail = data.playwright ? 'Downloaded' : 'Missing';
-                    if (data.playwright) phases[5].state = 'installed';
-
-                    phases[6].detail = data.appImport ? 'Verified' : 'Pending';
-                    if (data.appImport) phases[6].state = 'installed';
-
-                    phases[7].detail = data.nodeVersion ? `Version ${data.nodeVersion}` : 'Not found';
-                    if (data.node) phases[7].state = 'installed';
-
-                    phases[8].detail = data.frontendDeps ? 'Installed' : 'Missing';
-                    if (data.frontendDeps) phases[8].state = 'installed';
-
-                    renderStepper();
-                } catch (err) {
-                    console.error('check failed', err);
+                if (hasError) {
+                    progressFillEl.classList.add('has-error');
+                } else {
+                    progressFillEl.classList.remove('has-error');
                 }
             }
 
-            function processLine(type, data) {
-                data = stripAnsi(data);
-                appendConsole(type, data);
+            function setOverallBadge(state, text) {
+                overallBadgeEl.className = 'status-badge ' + (state || '');
+                overallBadgeEl.textContent = text;
+            }
 
-                const match = data.match(/^>>> \[(\d+)\/(?:7|9)\] (.*)/);
-                if (match) {
-                    const stepIdx = parseInt(match[1]) - 1;
-                    const rawDesc = match[2];
+            /* ------------------------------------------------------------------
+               Elapsed Time Counter
+               ------------------------------------------------------------------ */
+            function startTimer() {
+                if (timerHandle) clearInterval(timerHandle);
+                startTimeMs = Date.now();
+                elapsedTimeEl.textContent = '00:00';
+                timerHandle = setInterval(() => {
+                    const totalSecs = Math.floor((Date.now() - startTimeMs) / 1000);
+                    const mins = String(Math.floor(totalSecs / 60)).padStart(2, '0');
+                    const secs = String(totalSecs % 60).padStart(2, '0');
+                    elapsedTimeEl.textContent = `${mins}:${secs}`;
+                }, 1000);
+            }
 
-                    for (let i = 0; i < stepIdx; i++) {
+            function stopTimer() {
+                if (timerHandle) {
+                    clearInterval(timerHandle);
+                    timerHandle = null;
+                }
+            }
+
+            /* ------------------------------------------------------------------
+               Console Management (Smart Auto-Scroll & ANSI Stripping)
+               ------------------------------------------------------------------ */
+            function stripAnsi(str) {
+                return String(str).replace(/\[[0-9;]*[a-zA-Z]/g, '');
+            }
+
+            function appendConsole(type, rawText) {
+                const text = stripAnsi(rawText);
+                if (!text && type === 'stdout') return;
+
+                // Prevent duplicate stderr lines across polling intervals
+                if (type === 'stderr') {
+                    const trimmed = text.trim();
+                    if (!trimmed || seenStderrLines.has(trimmed)) return;
+                    seenStderrLines.add(trimmed);
+                }
+
+                // Only auto-scroll if user is already near the bottom of the terminal
+                const isNearBottom = (consoleEl.scrollHeight - consoleEl.scrollTop - consoleEl.clientHeight) < 60;
+
+                const lineEl = document.createElement('div');
+                lineEl.className = 'console-line ' + type;
+                lineEl.textContent = text;
+                consoleEl.appendChild(lineEl);
+
+                if (isNearBottom) {
+                    consoleEl.scrollTop = consoleEl.scrollHeight;
+                }
+            }
+
+            /* ------------------------------------------------------------------
+               Environment Check (/api/check)
+               ------------------------------------------------------------------ */
+            async function checkEnvironment() {
+                try {
+                    const res = await fetch('/api/check');
+                    if (!res.ok) return;
+                    const data = await res.json();
+
+                    phases[0].detail = data.config ? 'Found (config/config.toml)' : 'Missing';
+                    phases[0].state = data.config ? 'installed' : 'pending';
+
+                    phases[1].detail = data.pythonVersion ? `Python ${data.pythonVersion}` : 'Not detected';
+                    phases[1].state = data.python ? 'installed' : 'pending';
+
+                    phases[2].detail = data.venv ? 'Ready (backend/.venv)' : 'Not created';
+                    phases[2].state = data.venv ? 'installed' : 'pending';
+
+                    phases[3].detail = data.backendDeps ? 'Installed (uvicorn verified)' : 'Missing packages';
+                    phases[3].state = data.backendDeps ? 'installed' : 'pending';
+
+                    phases[4].detail = data.keyring ? 'Configured (keyring active)' : 'Not configured';
+                    phases[4].state = data.keyring ? 'installed' : 'pending';
+
+                    phases[5].detail = data.playwright ? 'Chromium installed locally' : 'Browser missing';
+                    phases[5].state = data.playwright ? 'installed' : 'pending';
+
+                    phases[6].detail = data.appImport ? 'omweb.main verified' : 'Verification pending';
+                    phases[6].state = data.appImport ? 'installed' : 'pending';
+
+                    phases[7].detail = data.nodeVersion ? `Node.js ${data.nodeVersion}` : 'Not detected';
+                    phases[7].state = data.node ? 'installed' : 'pending';
+
+                    phases[8].detail = data.frontendDeps ? 'Installed (Next.js verified)' : 'Missing node_modules';
+                    phases[8].state = data.frontendDeps ? 'installed' : 'pending';
+
+                    renderStepper();
+
+                    const allInstalled = phases.every(p => p.state === 'installed');
+                    if (allInstalled && !isInstalling) {
+                        setOverallBadge('completed', 'Ready');
+                        startBtn.textContent = 'Re-verify / Repair Setup';
+                        nextStepsCard.classList.add('visible');
+                    } else if (!isInstalling) {
+                        const installedCount = phases.filter(p => p.state === 'installed').length;
+                        setOverallBadge('', installedCount > 0 ? 'Partially Installed' : 'Ready to Install');
+                    }
+                } catch (err) {
+                    console.error('Environment check failed:', err);
+                }
+            }
+
+            /* ------------------------------------------------------------------
+               Output Line Parser
+               ------------------------------------------------------------------ */
+            function processOutputLine(streamType, rawLine) {
+                const cleanLine = stripAnsi(rawLine);
+
+                // Match phase header lines emitted by setup.ps1: >>> [X/7] or >>> [X/9]
+                const stepMatch = cleanLine.match(/^>>> \[(\d+)\/(?:7|9)\]\s*(.*)/);
+                if (stepMatch) {
+                    const stepIdx = parseInt(stepMatch[1], 10) - 1;
+                    const stepHeadline = stepMatch[2].replace(/\.\.\.$/, '').trim();
+
+                    // Mark all prior phases that were installing or pending as installed
+                    for (let i = 0; i < stepIdx && i < phases.length; i++) {
                         if (phases[i].state === 'installing' || phases[i].state === 'pending') {
                             phases[i].state = 'installed';
-                            if (phases[i].detail === 'Waiting...') phases[i].detail = 'Installed';
+                            if (phases[i].detail === 'Waiting...') {
+                                phases[i].detail = 'Completed';
+                            }
                         }
                     }
 
                     if (stepIdx >= 0 && stepIdx < phases.length) {
                         phases[stepIdx].state = 'installing';
-                        phases[stepIdx].detail = rawDesc.replace(/\.\.\.$/, '');
+                        phases[stepIdx].detail = stepHeadline || 'In progress...';
                         renderStepper();
                     }
-                } else if (data.includes('[FATAL]')) {
-                    const current = phases.find(p => p.state === 'installing');
-                    if (current) {
-                        current.state = 'error';
-                        current.detail = data.trim();
-                        renderStepper();
-                    }
+
+                    appendConsole('phase', cleanLine);
+                    return;
                 }
+
+                // Detect fatal errors
+                if (cleanLine.includes('[FATAL]')) {
+                    const activePhase = phases.find(p => p.state === 'installing');
+                    if (activePhase) {
+                        activePhase.state = 'error';
+                        activePhase.detail = cleanLine.replace('[FATAL]', '').trim();
+                        renderStepper();
+                    }
+                    consoleDetails.open = true;
+                    appendConsole('error', cleanLine);
+                    return;
+                }
+
+                // Detect non-fatal warnings
+                if (cleanLine.includes('[WARN]')) {
+                    const activePhase = phases.find(p => p.state === 'installing');
+                    if (activePhase) {
+                        activePhase.hasWarning = true;
+                        renderStepper();
+                    }
+                    appendConsole('warn', cleanLine);
+                    return;
+                }
+
+                appendConsole(streamType, cleanLine);
             }
 
+            /* ------------------------------------------------------------------
+               Polling Loop (/api/output)
+               ------------------------------------------------------------------ */
             async function pollOutput() {
                 if (!isInstalling) return;
 
                 try {
-                    const res = await fetch('/api/output?since=' + since);
+                    const res = await fetch('/api/output?since=' + sincePos);
                     if (!res.ok) return;
 
                     const data = await res.json();
 
-                    if (data.lines && data.lines.length > 0) {
-                        data.lines.forEach(line => processLine(line.type || 'stdout', line.data || ''));
+                    if (Array.isArray(data.lines) && data.lines.length > 0) {
+                        data.lines.forEach(item => {
+                            processOutputLine(item.type || 'stdout', item.data || '');
+                        });
                     }
 
-                    since = data.nextPos || 0;
+                    if (typeof data.nextPos === 'number') {
+                        sincePos = data.nextPos;
+                    }
 
                     if (data.done) {
                         stopPolling();
-                        phases.forEach(p => {
-                            if (p.state !== 'error') p.state = 'installed';
-                        });
-                        renderStepper();
+                        stopTimer();
+                        isInstalling = false;
+                        recheckBtn.disabled = false;
 
-                        if (data.exitCode === 0 || data.exitCode === null) {
-                            appendConsole('done', '✓ Installation completed successfully.');
-                            btn.textContent = 'Installation Complete';
-                            btn.disabled = true;
+                        const succeeded = (data.exitCode === 0 || data.exitCode === null);
+
+                        if (succeeded) {
+                            // Mark remaining non-error steps as installed and run a live verification check
+                            phases.forEach(p => {
+                                if (p.state !== 'error') p.state = 'installed';
+                            });
+                            renderStepper();
+                            await checkEnvironment();
+
+                            setOverallBadge('completed', 'Completed');
+                            appendConsole('done', '✓ Setup completed successfully.');
+                            startBtn.textContent = 'Re-verify / Repair Setup';
+                            startBtn.disabled = false;
+                            nextStepsCard.classList.add('visible');
                         } else {
-                            appendConsole('error', '✗ Installation exited with code ' + data.exitCode + '.');
-                            btn.textContent = 'Retry Installation';
-                            btn.disabled = false;
-                            isInstalling = false;
+                            // Only mark the active installing phase as failed; leave subsequent phases pending
+                            const activePhase = phases.find(p => p.state === 'installing');
+                            if (activePhase) {
+                                activePhase.state = 'error';
+                            }
+                            renderStepper();
+
+                            setOverallBadge('failed', 'Installation Failed');
+                            consoleDetails.open = true;
+                            appendConsole('error', `✗ Setup exited with error code ${data.exitCode}. Inspect the logs above for details.`);
+                            startBtn.textContent = 'Retry Installation';
+                            startBtn.disabled = false;
                         }
                     }
                 } catch (err) {
-                    // Ignore transient network errors — polling continues
+                    // Ignore transient polling errors
                 }
             }
 
             function startPolling() {
                 if (pollTimer) return;
-                pollTimer = setInterval(pollOutput, 400);
+                pollTimer = setInterval(pollOutput, 350);
             }
 
             function stopPolling() {
@@ -533,15 +1211,59 @@
                 }
             }
 
-            async function startInstall() {
+            /* ------------------------------------------------------------------
+               Session Recovery (/api/status)
+               Resumes UI state automatically if user refreshes the browser tab
+               while setup.ps1 is actively running in the background.
+               ------------------------------------------------------------------ */
+            async function syncServerStatus() {
+                try {
+                    const res = await fetch('/api/status');
+                    if (!res.ok) return;
+                    const data = await res.json();
+
+                    if (data.status === 'running') {
+                        isInstalling = true;
+                        sincePos = 0;
+                        startBtn.disabled = true;
+                        recheckBtn.disabled = true;
+                        startBtn.textContent = 'Installing...';
+                        setOverallBadge('running', 'In Progress');
+                        consoleEl.innerHTML = '';
+                        appendConsole('info', 'Reconnected to active installation session...');
+                        startTimer();
+                        startPolling();
+                    } else if (data.status === 'done' && data.started) {
+                        // Fetch buffered output from the finished run
+                        isInstalling = true;
+                        await pollOutput();
+                    }
+                } catch (err) {
+                    console.error('Status check failed:', err);
+                }
+            }
+
+            /* ------------------------------------------------------------------
+               Start Installation Handler (/api/install)
+               ------------------------------------------------------------------ */
+            async function startInstallation() {
                 if (isInstalling) return;
 
                 isInstalling = true;
-                since = 0;
-                btn.disabled = true;
-                btn.textContent = 'Installing...';
+                sincePos = 0;
+                seenStderrLines.clear();
+
+                startBtn.disabled = true;
+                recheckBtn.disabled = true;
+                startBtn.textContent = 'Installing...';
+                nextStepsCard.classList.remove('visible');
+                setOverallBadge('running', 'Installing');
+
+                consoleEl.innerHTML = '';
+                appendConsole('info', 'Initializing PELDRUN setup process...');
 
                 phases.forEach(p => {
+                    p.hasWarning = false;
                     if (p.state !== 'installed') {
                         p.state = 'pending';
                         p.detail = 'Waiting...';
@@ -551,21 +1273,70 @@
 
                 try {
                     const res = await fetch('/api/install', { method: 'POST' });
-                    if (!res.ok) throw new Error('HTTP ' + res.status);
+                    if (!res.ok) {
+                        throw new Error('Server returned HTTP ' + res.status);
+                    }
                 } catch (err) {
                     appendConsole('error', 'Could not start installation: ' + err.message);
-                    btn.disabled = false;
-                    btn.textContent = 'Retry Installation';
+                    setOverallBadge('failed', 'Connection Error');
+                    startBtn.disabled = false;
+                    recheckBtn.disabled = false;
+                    startBtn.textContent = 'Retry Installation';
                     isInstalling = false;
                     return;
                 }
 
+                startTimer();
                 startPolling();
             }
 
-            btn.addEventListener('click', startInstall);
+            /* ------------------------------------------------------------------
+               Event Listeners (Controls & Clipboard Helpers)
+               ------------------------------------------------------------------ */
+            startBtn.addEventListener('click', startInstallation);
+
+            recheckBtn.addEventListener('click', async function () {
+                if (isInstalling) return;
+                recheckBtn.textContent = 'Checking...';
+                await checkEnvironment();
+                setTimeout(() => { recheckBtn.textContent = 'Re-check Environment'; }, 400);
+            });
+
+            copyLogsBtn.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                const text = Array.from(consoleEl.querySelectorAll('.console-line'))
+                    .map(el => el.textContent)
+                    .join('');
+                navigator.clipboard.writeText(text).then(() => {
+                    const orig = copyLogsBtn.textContent;
+                    copyLogsBtn.textContent = 'Copied!';
+                    setTimeout(() => { copyLogsBtn.textContent = orig; }, 1500);
+                });
+            });
+
+            clearLogsBtn.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                consoleEl.innerHTML = '<div class="console-line info">Console view cleared.</div>';
+            });
+
+            document.querySelectorAll('.copy-cmd-btn').forEach(btnEl => {
+                btnEl.addEventListener('click', function () {
+                    const cmd = btnEl.getAttribute('data-cmd');
+                    navigator.clipboard.writeText(cmd).then(() => {
+                        const orig = btnEl.textContent;
+                        btnEl.textContent = 'Copied!';
+                        setTimeout(() => { btnEl.textContent = orig; }, 1500);
+                    });
+                });
+            });
+
+            /* ------------------------------------------------------------------
+               Initialize Application
+               ------------------------------------------------------------------ */
             renderStepper();
-            checkState();
+            checkEnvironment().then(syncServerStatus);
         })();
     </script>
 </body>
