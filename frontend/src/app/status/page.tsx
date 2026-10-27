@@ -25,6 +25,11 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
+
+import { BackendStatusCard } from "@/components/system/BackendStatusCard";
+import { VersionCard } from "@/components/system/VersionCard";
+
+
 export default function SystemStatusPage() {
   const [report, setReport] = useState<DiagnosticsReport | null>(null);
   const [probes, setProbes] = useState<EndpointProbeResult[]>([]);
@@ -337,6 +342,12 @@ export default function SystemStatusPage() {
               </div>
             </div>
           </div>
+
+            {/* Backend & Version diagnostics */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <BackendStatusCard />
+              <VersionCard />
+            </div>
 
           {/* 100% Live Dynamic Network Probes Table */}
           <div className="p-6 rounded-2xl border border-border bg-card shadow-sm space-y-4">
