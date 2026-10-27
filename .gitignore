@@ -57,3 +57,8 @@ config/config.toml
 
 backend/data/source_control*
 backup_20261027_133629/
+# Playwright project-local browsers (recreated by setup.ps1)
+.playwright-browsers/
+# Installer runtime artifacts
+installer/install.log
+installer/install.err
