@@ -334,10 +334,33 @@ export function SearchTab({
           setConfigErrorBanner(null);
         }
 
-        setConfig((prev: any) => ({
-          ...prev,
-          search: { ...(prev.search || {}), ...authoritative },
-        }));
+        // Deep-merge: user changes (prev.search) WIN over server values.
+        // Only keys missing from prev.search are adopted from the server.
+        // Nested provider sub-tables are merged one level deep so a user
+        // change to duckduckgo.safesearch does not wipe enabled/backend
+        // /timeout that the server returned.
+        setConfig((prev: any) => {
+          const prevSearch: Record<string, any> = prev.search || {};
+          const merged: Record<string, any> = { ...prevSearch };
+
+          for (const [key, serverVal] of Object.entries(authoritative)) {
+            const localVal = merged[key];
+            if (localVal === undefined || localVal === null) {
+              merged[key] = serverVal;
+            } else if (
+              typeof serverVal === "object" &&
+              serverVal !== null &&
+              !Array.isArray(serverVal) &&
+              typeof localVal === "object" &&
+              localVal !== null &&
+              !Array.isArray(localVal)
+            ) {
+              merged[key] = { ...serverVal, ...localVal };
+            }
+          }
+
+          return { ...prev, search: merged };
+        });
 
         setConfigLoaded(true);
         lastSnapshotRef.current = JSON.stringify(authoritative);
@@ -1682,8 +1705,12 @@ function ProviderListRow({
                 )}
               </div>
 
-              {/* Provider-specific fields & credentials */}
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 pt-1">
+              {/* Provider-specific fields & credentials.
+                  `pt-3` provides a clear visual separation from the
+                  "Max Results per Query" card above. `pt-1` (previous
+                  value) was too tight, causing the SafeSearch label
+                  to appear clipped against the inherited-default box. */}
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 pt-3">
                 {provider.fields.map((field) => {
                   if (field.type === "password") {
                     const isVisible = showKeys[field.secretKey || provider.id];

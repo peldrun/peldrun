@@ -105,10 +105,10 @@ function MatrixRow({
   onRevert,
 }: MatrixRowProps) {
   return (
-    <div className="py-2.5 flex items-center justify-between gap-3">
+    <div className="py-3.5 flex items-center justify-between gap-3  p-5 hover:bg-muted">
       <div className="flex items-center gap-2 min-w-0">
         <StatusDot state={state} />
-        <span className="shrink-0 flex items-center justify-center text-muted-foreground rounded rounded-Xl bg-muted p-1">
+        <span className="shrink-0 flex items-center justify-center text-muted-foreground rounded rounded-Xl bg-muted p-1.5">
           <Icon name={iconName} size={14}    title={`${label} logo`} />
         </span>
         <span className="font-semibold text-foreground truncate">{label}</span>
@@ -185,12 +185,13 @@ export function ConnectivityMatrix({
   return (
     <motion.div
       {...FADE_UP}
-      className="relative p-5 rounded-md border border-border bg-card shadow-sm space-y-4"
+      className="relative p-5 rounded-md border border-card bg-card shadow-md space-y-4 "
     >
-      <div className="pointer-events-none absolute top-0 left-0 right-0 h-[2px] rounded-t-md bg-gradient-to-r from-transparent via-primary/60 to-transparent" />
+      <div className="pointer-events-none absolute top-0 left-0 right-0 h-[2px] rounded-t-md
+      bg-gradient-to-r from-transparent via-card to-transparent" />
 
       {/* Header */}
-      <div className="flex items-center justify-between border-b border-border/60 pb-3 flex-wrap gap-2">
+      <div className="flex items-center justify-between pb-3 flex-wrap gap-2">
         <div className="flex items-center gap-2.5">
           <div className="p-2 icon">
             <Activity size={16} className="text-primary" />
@@ -207,15 +208,16 @@ export function ConnectivityMatrix({
 
         <Button
           type="button"
-          variant="outline"
+          variant="rb"
           size="sm"
           onClick={handleTestAll}
           disabled={testingAll}
-          className="h-7 text-xs border-border bg-background hover:bg-muted text-foreground cursor-pointer hover:scale-105 transition-transform disabled:hover:scale-100 flex items-center gap-1.5"
+          className="h-7 text-xs cursor-pointer hover:shadow-xl transition-transform
+          disabled:hover:scale-1 flex items-center gap-1.5"
         >
           <RefreshCw
             size={11}
-            className={`text-primary ${testingAll ? "animate-spin" : ""}`}
+            className={`text-inherit ${testingAll ? "animate-spin" : ""}`}
           />
           <span>{testingAll ? "Pinging Endpoints…" : "Test All Endpoints"}</span>
         </Button>

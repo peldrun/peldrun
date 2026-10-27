@@ -67,7 +67,7 @@ export function CloudProviderCard({
     <motion.div
       {...FADE_UP}
       whileHover={{ y: -2, transition: { duration: 0.15 } }}
-      className="relative p-4 rounded-md border border-border bg-card space-y-3.5 shadow-sm hover:border-primary/30 transition-all"
+      className="relative p-4 rounded-md border border-card bg-gigbg space-y-3.5 shadow-sm transition-all"
     >
       <div className="pointer-events-none absolute top-0 left-0 right-0 h-[2px] rounded-t-md bg-gradient-to-r from-transparent via-primary/40 to-transparent opacity-0 hover:opacity-100 transition-opacity" />
 
@@ -77,7 +77,7 @@ export function CloudProviderCard({
           <span className="shrink-0 flex items-center justify-center text-primary">
             <Icon
               name={iconName}
-              size={16}
+              size={25}
               title={`${provider.name} logo`}
              variant="light"
             />
@@ -150,7 +150,8 @@ export function CloudProviderCard({
                   onChange({ model: e.target.value });
                 }
               }}
-              className="w-full bg-background border border-border rounded-sm px-2.5 py-1 text-xs text-foreground font-mono shadow-sm focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow cursor-pointer"
+              className="w-full bg-card border border-border rounded-sm px-2.5
+              py-1.5 text-xs text-foreground font-mono shadow-sm focus:outline-none focus:ring-1 focus:ring-muted/40 transition-shadow cursor-pointer"
             >
               {provider.savedModels && provider.savedModels.length > 0 && (
                 <optgroup label="Discovered & Saved Models">
@@ -176,7 +177,8 @@ export function CloudProviderCard({
               value={provider.model}
               onChange={(e) => onChange({ model: e.target.value })}
               placeholder="Model identifier…"
-              className="w-full bg-background border border-border rounded-sm px-2.5 py-1 text-[11px] text-foreground font-mono shadow-sm focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow"
+              className="w-full bg-background border border-border rounded-sm
+              px-2.5 py-1.5 text-[11px] text-foreground font-mono shadow-sm focus:outline-none focus:ring-1 focus:ring-br/40 transition-shadow"
             />
           </div>
         </div>
@@ -192,7 +194,8 @@ export function CloudProviderCard({
             onChange={(e) =>
               onChange({ baseUrl: e.target.value, status: "untested" })
             }
-            className="w-full bg-background border border-border rounded-sm px-2.5 py-1 text-xs text-foreground font-mono shadow-sm focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow"
+            className="w-full bg-card border border-border rounded-sm px-2.5 py-1.5
+            text-xs text-foreground font-mono shadow-sm focus:outline-none focus:ring-1 focus:ring-rb transition-shadow"
           />
         </div>
 
@@ -218,7 +221,8 @@ export function CloudProviderCard({
               onChange({ apiKey: e.target.value, status: "untested" })
             }
             placeholder={`Enter key for ${provider.name}…`}
-            className="w-full bg-background border border-border rounded-sm px-2.5 py-1 text-xs text-foreground font-mono shadow-sm focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow"
+            className="w-full bg-card border border-border rounded-sm
+            px-2.5 py-1.5 text-xs text-foreground font-mono shadow-sm focus:outline-none focus:ring-1 focus:ring-rb transition-shadow"
           />
           <span className="text-[9px] text-muted-foreground block mt-1 font-mono">
             {provider.keyPrefixHint}

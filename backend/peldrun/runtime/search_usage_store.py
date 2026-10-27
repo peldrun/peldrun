@@ -80,15 +80,20 @@ class SearchUsageStore:
 
     def __init__(self, db_path: Optional[Union[str, Path]] = None) -> None:
         if db_path is None:
-            project_root = Path(__file__).resolve().parent.parent.parent.parent
-            storage_dir = project_root / "backend" / "storage"
-            if not storage_dir.exists():
-                storage_dir = project_root / "storage"
-            self.db_path = (storage_dir / "peldrun_search_usage.db").resolve()
+            # Audit items 2.2 + 2.3: use the centralized storage root so
+            # this database always lives at the same absolute path
+            # regardless of the CWD the application was launched from.
+            # Previously it picked between backend/storage and storage/
+            # based on a runtime existence check, which silently routed
+            # writes to a new empty database the moment backend/storage
+            # was recreated by an unrelated subsystem.
+            from peldrun.storage_paths import get_storage_file
+
+            self.db_path = get_storage_file("peldrun_search_usage.db")
         else:
             self.db_path = Path(db_path).resolve()
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_database()
 
     def _init_database(self) -> None:

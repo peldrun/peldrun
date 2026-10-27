@@ -1,7 +1,7 @@
 [llm]
 provider = "lmstudio"
 provider_name = "LM Studio (Local)"
-model = "qwen3-vl-8b-instruct"
+model = "nvidia-nemotron-3-nano-4b"
 base_url = "http://127.0.0.1:1234/v1"
 api_key = "sk-lm-gFTaiAB5:PL9ecC0F3WiJjhr0nLja"
 max_tokens = 262144
@@ -51,7 +51,7 @@ use_data_analysis_agent = false
 [llm.vision]
 provider = "lmstudio"
 provider_name = "LM Studio (Local)"
-model = "qwen3-vl-8b-instruct"
+model = "nvidia-nemotron-3-nano-4b"
 base_url = "http://127.0.0.1:1234/v1"
 api_key = ""
 max_tokens = 8192
@@ -64,12 +64,13 @@ password = ""
 
 [search.duckduckgo]
 enabled = true
-safesearch = "on"
+safesearch = "moderate"
 backend = "auto"
 timeout = 15
 cost_per_query = 0
 safe_search = "moderate"
 estimated_cost_per_query = 0
+max_results = 10
 
 [search.searxng]
 enabled = false
@@ -109,7 +110,7 @@ estimated_cost_per_query = 0.005
 
 [search.jina]
 enabled = true
-api_key = "jina_330c240e759743cdb99eb438bcf7f336o5v3iba1AQy2dOd7MDAFIjCcTIZj"
+api_key = "jina••••••••TIZj"
 timeout = 20
 cost_per_query = 0.002
 estimated_cost_per_query = 0.002

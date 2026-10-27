@@ -809,6 +809,47 @@ def _period_to_cutoff(period: str) -> float:
     return 0.0
 
 
+def _record_search_telemetry(
+    *,
+    query: str,
+    provider: str,
+    results_count: int,
+    latency_ms: float,
+    cost_usd: float,
+    is_success: bool,
+    status: str,
+    error_message: Optional[str],
+    request_count: int,
+    cost_basis: str,
+    privacy_mode: bool,
+) -> None:
+    """Persist a search telemetry fact to the local SQLite ledger.
+
+    This helper centralizes the recording call so both /test outcome
+    branches (success and failure) share exactly the same persistence
+    logic. Failures are logged at DEBUG level so a broken store cannot
+    break the user-facing response.
+    """
+    try:
+        from peldrun.runtime.search_usage_store import get_search_usage_store
+
+        get_search_usage_store().record_search(
+            query=query,
+            provider=provider,
+            results_count=results_count,
+            latency_ms=latency_ms,
+            cost_usd=cost_usd,
+            is_success=is_success,
+            status=status,
+            error_message=error_message,
+            request_count=request_count,
+            cost_basis=cost_basis,
+            privacy_mode=privacy_mode,
+        )
+    except Exception as exc:
+        logger.debug("Failed to record search usage: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -1064,6 +1105,19 @@ async def run_diagnostic_search_test(request: TestQueryRequest) -> Dict[str, Any
     except SearchProviderError as exc:
         latency_ms = round((time.perf_counter() - start_ts) * 1000.0, 2)
         usage_evidence = _extract_exception_usage_evidence(exc)
+        _record_search_telemetry(
+            query=request.query,
+            provider=pre_audit["provider"],
+            results_count=0,
+            latency_ms=latency_ms,
+            cost_usd=float(usage_evidence["estimated_cost_usd"]),
+            is_success=False,
+            status="error",
+            error_message=str(exc),
+            request_count=int(usage_evidence["request_count"]),
+            cost_basis=usage_evidence["cost_basis"],
+            privacy_mode=bool(active_search_cfg.get("privacy_mode", False)),
+        )
         return {
             "status": "error",
             "ok": False,
@@ -1088,6 +1142,19 @@ async def run_diagnostic_search_test(request: TestQueryRequest) -> Dict[str, Any
         latency_ms = round((time.perf_counter() - start_ts) * 1000.0, 2)
         err_msg = str(exc) or type(exc).__name__
         usage_evidence = _extract_exception_usage_evidence(exc)
+        _record_search_telemetry(
+            query=request.query,
+            provider=pre_audit["provider"],
+            results_count=0,
+            latency_ms=latency_ms,
+            cost_usd=float(usage_evidence["estimated_cost_usd"]),
+            is_success=False,
+            status="error",
+            error_message=err_msg,
+            request_count=int(usage_evidence["request_count"]),
+            cost_basis=usage_evidence["cost_basis"],
+            privacy_mode=bool(active_search_cfg.get("privacy_mode", False)),
+        )
         return {
             "status": "error",
             "ok": False,
@@ -1184,6 +1251,24 @@ async def run_diagnostic_search_test(request: TestQueryRequest) -> Dict[str, Any
     # When a failure still carries partial results we surface them, but status
     # remains "error" — the tool has explicitly declared the underlying call failed.
     final_status = "ok" if is_ok else ("empty" if is_empty else "error")
+
+    # Record the telemetry fact so /metrics and the Search Intelligence
+    # page can show this test alongside agent-driven searches. The
+    # helper is a no-op on store failure so a persistence hiccup cannot
+    # break the diagnostic response the user is waiting for.
+    _record_search_telemetry(
+        query=request.query,
+        provider=resolved_provider_name,
+        results_count=len(serialized),
+        latency_ms=float(getattr(response, "latency_ms", None) or latency_ms),
+        cost_usd=response_cost_usd,
+        is_success=is_ok,
+        status=provider_status_value or final_status,
+        error_message=error_message,
+        request_count=response_request_count,
+        cost_basis=response_cost_basis,
+        privacy_mode=bool(active_search_cfg.get("privacy_mode", False)),
+    )
 
     return {
         "status": final_status,

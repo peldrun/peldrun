@@ -150,9 +150,10 @@ export function LocalEnginesTab({
       {/* =================================================================== */}
       <motion.div
         {...FADE_UP}
-        className="relative p-5 rounded-md border border-border bg-card shadow-sm space-y-4"
+        className="relative p-5 rounded-md border border-card bg-gigbg shadow-sm space-y-4"
       >
-        <div className="pointer-events-none absolute top-0 left-0 right-0 h-[2px] rounded-t-md bg-gradient-to-r from-transparent via-primary/60 to-transparent" />
+        <div className="pointer-events-none absolute top-0 left-0 right-0 h-[2px] rounded-t-md
+        bg-gradient-to-r from-transparent via-rb/10 to-transparent" />
 
         {/* Header */}
         <div className="flex items-center justify-between border-b border-border/60 pb-3 flex-wrap gap-2">
@@ -258,7 +259,8 @@ export function LocalEnginesTab({
                   ""
                 )
               }
-              className="h-7 text-xs bg-primary text-primary-foreground font-medium cursor-pointer hover:scale-105 transition-transform shadow-sm"
+              className="h-7 text-xs bg-primary text-primary-foreground hover:bg-primary/70 font-medium cursor-pointer hover:scale-105
+              transition-transform shadow-sm"
             >
               Set as Active Primary
             </Button>

@@ -118,7 +118,7 @@ export function CustomEndpointsTab({
               <motion.div
                 key={ce.id}
                 whileHover={{ y: -2, transition: { duration: 0.15 } }}
-                className="relative p-4 rounded-md border border-border bg-card shadow-sm hover:border-primary/30 transition-all flex items-center justify-between gap-3 flex-wrap"
+                className="relative p-4 rounded-md border border-card bg-muted shadow-md transition-all flex items-center justify-between gap-3 flex-wrap"
               >
                 <div className="flex items-center gap-3 min-w-0">
                   <span className="shrink-0 w-9 h-9 flex items-center justify-center text-primary">
@@ -202,9 +202,10 @@ export function CustomEndpointsTab({
       <motion.div
         {...FADE_UP}
         transition={{ ...FADE_UP.transition, delay: 0.1 }}
-        className="relative p-5 rounded-md border border-border bg-card shadow-sm space-y-4"
+        className="relative p-5 rounded-md border border-border bg-gigbg shadow-sm space-y-4"
       >
-        <div className="pointer-events-none absolute top-0 left-0 right-0 h-[2px] rounded-t-md bg-gradient-to-r from-transparent via-primary/60 to-transparent" />
+        <div className="pointer-events-none absolute top-0 left-0 right-0 h-[2px] rounded-t-md
+         bg-gradient-to-r from-transparent via-rb/60 to-transparent" />
 
         {/* Header */}
         <div className="flex items-center gap-2.5 pb-2 border-b border-border/60">
@@ -284,7 +285,7 @@ export function CustomEndpointsTab({
             <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-1.5">
               API Mode
             </label>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-1 p-1 rounded-sm bg-muted/40 border border-border">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-1 p-1 rounded-sm bg-custom border border-border">
               {API_MODES.map((mode) => {
                 const isActive = endpointForm.apiMode === mode;
                 return (

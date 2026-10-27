@@ -59,10 +59,10 @@ export function LLMHeader({ activeSubTab, onSubTabChange }: LLMHeaderProps) {
       initial={{ opacity: 0, y: -12 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-      className="border-b border-border bg-card/60 backdrop-blur-xl w-full"
+      className="border-b border-border backdrop-blur-xl w-full bg-muted"
     >
       {/* Title row */}
-      <div className="max-w-7xl mx-auto px-4 pt-4 flex items-center gap-2.5">
+      <div className="max-w-full mx-auto px-4 pt-4 flex items-center gap-2.5">
         <div className="p-2 icon">
           <Sparkles size={16} className="text-primary" />
         </div>
@@ -72,13 +72,13 @@ export function LLMHeader({ activeSubTab, onSubTabChange }: LLMHeaderProps) {
       </div>
 
       {/* Description */}
-      <p className="max-w-7xl mx-auto px-4 pt-0.5 pb-3 text-xs text-muted-foreground">
+      <p className="max-w-full mx-auto px-4 pt-0.5 pb-3 text-xs text-muted-foreground">
         Dedicated engines for local GPUs, Ollama, cloud credentials, custom
         endpoints, and role routing.
       </p>
 
       {/* Sub-tab navigation */}
-      <div className="max-w-7xl mx-auto">
+      <div className="w-full mx-auto bg-custom">
         <div className="flex items-center gap-1 border-b border-border/60 overflow-x-auto scrollbar-thin">
           {SUB_TABS.map((tab) => {
             const isActive = activeSubTab === tab.id;

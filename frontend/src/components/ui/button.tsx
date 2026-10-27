@@ -1,7 +1,7 @@
 ﻿import React from "react";
 
 export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
-  variant?: "primary" | "secondary" | "outline" | "glow" | "ghost" | "danger" | "destructive" | "save";
+  variant?: "primary" | "secondary" | "outline" | "glow" | "ghost" | "danger" | "destructive" | "save" | "rb";
   size?: "sm" | "md" | "lg";
   children?: React.ReactNode;
 }
@@ -13,12 +13,13 @@ export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
     const variants: Record<string, string> = {
       primary: "bg-primary hover:text-primary-foreground hover:bg-primary/90 shadow-peldrun-xs",
       secondary: "bg-muted text-foreground hover:bg-muted/80 shadow-peldrun-xs",
-      outline: "border border-border bg-background hover:bg-muted text-foreground shadow-peldrun-xs",
+      outline: "border border-rb bg-transparent hover:bg-rb text-black hover:text-[#fff] shadow-peldrun-xs ",
       glow: "bg-primary text-primary-foreground shadow-[0_0_15px_rgba(136,81,255,0.4)] hover:shadow-[0_0_20px_rgba(136,81,255,0.6)]",
       ghost: "hover:bg-muted text-muted-foreground hover:text-foreground",
       danger: "bg-destructive text-destructive-foreground hover:bg-destructive/90 shadow-peldrun-xs",
       destructive: "bg-destructive text-destructive-foreground hover:bg-destructive/90 shadow-peldrun-xs",
       save: "bg-[#101010] text-[#fff] hover:text-primary-foreground hover:bg-primary/90 shadow-peldrun-xs",
+      rb: "border border-rb bg-rb hover:bg-rb/90 text-[#fff] shadow-peldrun-xs",
     };
 
     const sizes: Record<string, string> = {

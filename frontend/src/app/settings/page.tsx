@@ -221,6 +221,14 @@ export default function SettingsPage() {
           },
         },
         search: {
+          // Preserve the entire search section from the backend
+          // (including duckduckgo, searxng, tavily, default_max_results,
+          // privacy_mode, etc.). Without `...(cfg.search)`, fetchConfig
+          // would overwrite the full state produced by SearchTab with
+          // a partial object of just the six basic fields. That made
+          // the global Save button send an incomplete payload and made
+          // the UI appear to lose the settings after a page reload.
+          ...(cfg.search || {}),
           engine: cfg.search?.engine || "Google",
           fallback_engines: Array.isArray(cfg.search?.fallback_engines)
             ? cfg.search.fallback_engines

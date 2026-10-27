@@ -60,14 +60,14 @@ function EngineCard({
       {...FADE_UP}
       transition={{ ...FADE_UP.transition, delay }}
       whileHover={{ y: -2, transition: { duration: 0.15 } }}
-      className={`relative p-4 rounded-md border space-y-3 shadow-sm transition-all ${accentClassName}`}
+      className={`relative p-4 rounded-md border space-y-3 shadow-md transition-all ${accentClassName}`}
     >
       <div className="flex items-center justify-between gap-2 flex-wrap">
         <div className="flex items-center gap-2">
           <span className="shrink-0 flex items-center justify-center text-primary">
-            <Icon name={iconName} size={16} title={`${providerName} logo`} />
+            <Icon name={iconName} size={20} title={`${providerName} logo`} />
           </span>
-          <span className="text-[10px] font-bold text-primary uppercase tracking-wider">
+          <span className="text-[14px] font-extrabold text-rb uppercase tracking-wider">
             {title}
           </span>
         </div>
@@ -83,7 +83,7 @@ function EngineCard({
       </div>
 
       <div className="flex items-center justify-between gap-2 flex-wrap">
-        <span className="text-sm font-bold font-mono text-foreground truncate">
+        <span className="text-sm font-bold font-mono text-black truncate">
           {model}
         </span>
         <span className="text-[10px] font-bold px-2 py-0.5 rounded-sm bg-card border border-border text-foreground">
@@ -143,7 +143,7 @@ export function OverviewTab({
           title="Primary Autonomous Engine [llm]"
           badgeLabel="Active"
           badgeClassName="text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 border-emerald-500/20"
-          accentClassName="border-primary/50 bg-primary/5 ring-1 ring-primary/20"
+          accentClassName="border-card bg-gigbg ring-1 ring-card/20"
           providerId={config.llm.provider}
           providerName={primaryProviderName}
           model={config.llm.model}
