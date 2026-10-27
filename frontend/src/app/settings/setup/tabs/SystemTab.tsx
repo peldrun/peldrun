@@ -4,6 +4,7 @@ import React from "react";
 import { RefreshCw, Cpu, Activity, HardDrive } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { BackendStatusCard } from "@/components/system/BackendStatusCard";
+import { VersionCard } from "@/components/system/VersionCard";
 
 interface SystemTabProps {
   systemInfo: any;
@@ -105,6 +106,7 @@ export function SystemTab({ systemInfo, fetchSystemInfo }: SystemTabProps) {
             active API endpoint. Displays the URL configured at build
             time and confirms which backend actually answered. */}
         <BackendStatusCard />
+        <VersionCard />
       </div>
     </div>
   );

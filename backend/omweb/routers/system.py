@@ -96,3 +96,90 @@ async def info(request: Request) -> Dict[str, Any]:
         "client_host": request.client.host if request.client else None,
         "server_time": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Version introspection (audit-adjacent feature)
+# ---------------------------------------------------------------------------
+
+def _repo_root() -> Path:
+    """Resolve the PELDRUN repository root from this file's location."""
+    # backend/omweb/routers/system.py → repo root = parents[3]
+    return Path(__file__).resolve().parents[3]
+
+
+def _read_version_file(path: Path) -> Optional[Dict[str, Any]]:
+    """Return parsed VERSION.json, or None when missing/unparseable."""
+    import json as _json
+
+    try:
+        if not path.exists():
+            return None
+        return _json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@router.get("/version")
+async def version() -> Dict[str, Any]:
+    """Return the app version and every component version.
+
+    Response shape:
+
+        {
+            "app": {
+                "version": "1.0.0",
+                "released_at": "...",
+                "released_commit": "...",
+            },
+            "components": {
+                "omweb":    {"version": "0.20.1", "released_commit": "..."},
+                "peldrun":  {"version": "0.1.0",  "released_commit": "..."},
+                "frontend": {"version": "0.1.0",  "released_commit": "..."},
+            },
+            "all_in_sync": true,
+            "source": "VERSION.json files",
+        }
+
+    When a VERSION.json file is missing or unreadable, that component
+    is reported with a null version so the caller can surface a
+    diagnostic instead of crashing.
+    """
+    repo = _repo_root()
+
+    app_doc = _read_version_file(repo / "VERSION.json")
+    app_version = (app_doc or {}).get("version", "unknown")
+    app_released_at = (app_doc or {}).get("released_at")
+    app_released_commit = (app_doc or {}).get("released_commit")
+
+    components: Dict[str, Dict[str, Any]] = {}
+    component_paths = {
+        "omweb": repo / "backend" / "omweb" / "VERSION.json",
+        "peldrun": repo / "backend" / "peldrun" / "VERSION.json",
+        "frontend": repo / "frontend" / "VERSION.json",
+    }
+    all_in_sync = True
+    for name, path in component_paths.items():
+        doc = _read_version_file(path)
+        if doc is None:
+            components[name] = {"version": None, "released_commit": None}
+            all_in_sync = False
+            continue
+        components[name] = {
+            "version": doc.get("version"),
+            "released_commit": doc.get("released_commit"),
+        }
+        expected = ((app_doc or {}).get("components") or {}).get(name, {}).get("version")
+        if expected and expected != doc.get("version"):
+            all_in_sync = False
+
+    return {
+        "app": {
+            "version": app_version,
+            "released_at": app_released_at,
+            "released_commit": app_released_commit,
+        },
+        "components": components,
+        "all_in_sync": all_in_sync,
+        "source": "VERSION.json files",
+    }

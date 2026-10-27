@@ -1,0 +1,18 @@
+{
+  "version": "1.0.0",
+  "released_at": "2026-10-27T00:00:00Z",
+  "released_commit": "initial",
+  "components": {
+    "omweb": { "version": "0.20.1", "commit": "initial" },
+    "peldrun": { "version": "0.1.0", "commit": "initial" },
+    "frontend": { "version": "0.1.0", "commit": "initial" }
+  },
+  "history": [
+    {
+      "version": "1.0.0",
+      "at": "2026-10-27T00:00:00Z",
+      "kind": "initial",
+      "summary": "Initial version system after audit report completion"
+    }
+  ]
+}

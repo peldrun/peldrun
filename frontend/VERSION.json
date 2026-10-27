@@ -1,0 +1,14 @@
+{
+  "component": "frontend",
+  "version": "0.1.0",
+  "released_at": "2026-10-27T00:00:00Z",
+  "released_commit": "initial",
+  "history": [
+    {
+      "version": "0.1.0",
+      "at": "2026-10-27T00:00:00Z",
+      "kind": "initial",
+      "summary": "Version baseline — Next.js UI with auth, chat, source control, settings"
+    }
+  ]
+}
