@@ -501,21 +501,101 @@ _DEFAULT_AGENT_ICON_SVG = (
 # Agent icon — exhaustive filesystem search + always-valid response
 # ─────────────────────────────────────────────────────────────────
 
-# Neutral fallback used only when no SVG file exists anywhere.
-# Embedded here so this endpoint can ALWAYS return a valid SVG —
-# the frontend then never has to render an empty slot.
-_DEFAULT_AGENT_ICON_SVG = (
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" '
-    'fill="none" stroke="currentColor" stroke-width="2" '
-    'stroke-linecap="round" stroke-linejoin="round">'
-    '<path d="M12 8V4H8"/>'
-    '<rect width="16" height="12" x="4" y="8" rx="2"/>'
-    '<path d="M2 14h2"/>'
-    '<path d="M20 14h2"/>'
-    '<path d="M15 13v2"/>'
-    '<path d="M9 13v2"/>'
-    '</svg>'
-)
+# Map of common Lucide icon names to their SVG path markup.
+#
+# Keys are stored in a canonical, normalized form (lowercase, no
+# hyphens, no underscores) so that "Sparkles", "sparkles",
+# "BarChart3", "bar-chart-3", and "barchart3" all resolve to the
+# same entry. The normalization is performed in ``_lucide_svg_for``
+# before lookup, so this dict only needs the canonical form.
+#
+# Values are the raw <path>/<circle>/<rect> elements from the
+# corresponding Lucide icon at a 24x24 viewBox. The wrapping <svg>
+# element is added by ``_lucide_svg_for`` so every rendered icon
+# shares the same stroke/fill/viewBox setup.
+#
+# Adding a new icon means adding one entry here — no other code
+# needs to change. Unknown names fall through to the neutral Bot
+# SVG so the frontend never sees an HTTP error.
+_LUCIDE_ICON_PATHS: Dict[str, str] = {
+    "sparkles": (
+        '<path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/>'
+        '<path d="M5 3v4"/>'
+        '<path d="M19 17v4"/>'
+        '<path d="M3 5h4"/>'
+        '<path d="M17 19h4"/>'
+    ),
+    "code2": (
+        '<path d="m18 16 4-4-4-4"/>'
+        '<path d="m6 8-4 4 4 4"/>'
+        '<path d="m14.5 4-5 16"/>'
+    ),
+    "search": (
+        '<circle cx="11" cy="11" r="8"/>'
+        '<path d="m21 21-4.3-4.3"/>'
+    ),
+    "barchart3": (
+        '<path d="M3 3v18h18"/>'
+        '<path d="M18 17V9"/>'
+        '<path d="M13 17V5"/>'
+        '<path d="M8 17v-3"/>'
+    ),
+    "bot": (
+        '<path d="M12 8V4H8"/>'
+        '<rect width="16" height="12" x="4" y="8" rx="2"/>'
+        '<path d="M2 14h2"/>'
+        '<path d="M20 14h2"/>'
+        '<path d="M15 13v2"/>'
+        '<path d="M9 13v2"/>'
+    ),
+    "user": (
+        '<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/>'
+        '<circle cx="12" cy="7" r="4"/>'
+    ),
+    "puzzle": (
+        '<path d="M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1-1.705.707 2.402 2.402 0 0 1-1.704-.706l-1.568-1.568a1.026 1.026 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.026 1.026 0 0 0-.289-.877l-1.568-1.568A2.402 2.402 0 0 1 1.998 12c0-.617.236-1.234.706-1.704L4.23 8.77c.24-.24.581-.353.917-.303.515.077.877.528 1.073 1.01a2.5 2.5 0 1 0 3.259-3.259c-.482-.196-.933-.558-1.01-1.073-.05-.336.062-.676.303-.917l1.525-1.525A2.402 2.402 0 0 1 12 1.998c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.967 1.02Z"/>'
+    ),
+    "filecode2": (
+        '<path d="M4 22h14a2 2 0 0 0 2-2V7l-5-5H6a2 2 0 0 0-2 2v4"/>'
+        '<path d="M14 2v4a2 2 0 0 0 2 2h4"/>'
+        '<path d="m5 12-3 3 3 3"/>'
+        '<path d="m9 18 3-3-3-3"/>'
+    ),
+}
+
+
+def _lucide_svg_for(icon_name: str) -> Optional[str]:
+    """Return a complete SVG document for a Lucide icon name.
+
+    Returns ``None`` when the name is empty, unknown, or has no
+    entry in ``_LUCIDE_ICON_PATHS``. Callers MUST fall through to a
+    neutral fallback in that case.
+
+    Normalization:
+      * Strip whitespace.
+      * Strip a trailing ``.svg`` extension.
+      * Lowercase.
+      * Remove ``-`` and ``_`` separators so ``BarChart3``,
+        ``bar-chart-3``, and ``barchart3`` resolve identically.
+    """
+    if not isinstance(icon_name, str):
+        return None
+    key = icon_name.strip().lower()
+    if key.endswith(".svg"):
+        key = key[:-4]
+    key = key.replace("-", "").replace("_", "")
+    if not key:
+        return None
+    inner = _LUCIDE_ICON_PATHS.get(key)
+    if not inner:
+        return None
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" '
+        'fill="none" stroke="currentColor" stroke-width="2" '
+        'stroke-linecap="round" stroke-linejoin="round">'
+        f"{inner}"
+        "</svg>"
+    )
 
 
 @router.get("/agents/{agent_id}/icon.svg")
@@ -640,99 +720,30 @@ async def get_agent_icon(agent_id: str):
             # Corrupted file or permission error — fall through.
             continue
 
-    # ── No matching SVG file on disk ─────────────────────────────
-    # Return 404 so the frontend's <img onError> handler fires and
-    # the AgentIcon component falls back to its Lucide registry.
-    # The registry is keyed on the agent's ``icon`` field (e.g.
-    # "Sparkles", "Code2"), which is exactly what the user selected
-    # in the builder modal. Without this, every custom agent — which
-    # has no SVG file by design — would show a generic bot instead
-    # of the chosen icon.
-    raise HTTPException(status_code=404, detail="Icon file missing")
-    """Serve the SVG icon for an agent.
+    # ── Fallback: resolve the ``icon`` field to a Lucide SVG ────
+    # Custom agents do not ship SVG files on disk; their ``icon``
+    # field names a Lucide icon (e.g. "Sparkles", "Code2"). We
+    # generate the corresponding SVG here and return it with a 200
+    # so both the <img> probe and the mask render in AgentIcon.tsx
+    # receive a valid image with no HTTP error. Returning 404 caused
+    # <img onError> to fire but left the mask URL retrying on every
+    # render, which produced a request storm for multi-agent views.
+    lucide_svg = _lucide_svg_for(icon_field_str)
+    if lucide_svg:
+        return Response(
+            content=lucide_svg,
+            media_type="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=300"},
+        )
 
-    Icons can live in one of several layouts on disk, and the manifest's
-    ``icon`` field is not authoritative (some agents ship an icon
-    without declaring it, others point at a file that has since moved).
-    We try a list of candidate paths in priority order and serve the
-    first match. Every candidate is containment-checked against the
-    builtins/ and custom agents/ roots so a malicious manifest cannot
-    escape via "..".
-
-    All failure modes collapse into a 404 so the frontend can fall back
-    to a Lucide icon without needing to distinguish them.
-    """
-    try:
-        agent = agent_registry.get_agent(agent_id)
-    except AgentNotFoundError:
-        raise HTTPException(status_code=404, detail="Agent not found")
-
-    builtins_dir = agent_registry.builtins_dir.resolve()
-    custom_dir = agent_registry.custom_dir.resolve()
-
-    candidates: List[Path] = []
-
-    # 1. Custom per-agent directory (user-uploaded icon beside manifest).
-    candidates.append(custom_dir / agent_id / "icon.svg")
-
-    # 2. Custom flat SVG (next to the manifest file).
-    candidates.append(custom_dir / f"{agent_id}.svg")
-
-    # 3. Builtin per-agent directory (modern layout).
-    candidates.append(builtins_dir / agent_id / "icon.svg")
-
-    # 4. Manifest-declared relative path (explicit developer intent).
-    icon_rel = agent.get("icon")
-    if isinstance(icon_rel, str) and icon_rel.strip():
-        candidates.append(builtins_dir / icon_rel)
-        candidates.append(custom_dir / icon_rel)
-
-    # 5. Builtin flat SVG next to manifest.
-    candidates.append(builtins_dir / f"{agent_id}.svg")
-
-    # 6. Shared icons directory, flat.
-    candidates.append(builtins_dir / "icons" / f"{agent_id}.svg")
-
-    # 7. Shared icons directory, per-agent subfolder.
-    candidates.append(builtins_dir / "icons" / agent_id / "icon.svg")
-
-    # 8. Nested icons directory inside per-agent dir.
-    candidates.append(builtins_dir / agent_id / "icons" / "icon.svg")
-
-    seen: set[Path] = set()
-    for candidate in candidates:
-        try:
-            resolved = candidate.resolve()
-        except Exception:
-            continue
-
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-
-        # Containment check: reject anything outside the known roots.
-        if (
-            builtins_dir not in resolved.parents
-            and custom_dir not in resolved.parents
-        ):
-            continue
-
-        if resolved.is_file():
-            return FileResponse(
-                resolved,
-                media_type="image/svg+xml",
-                headers={"Cache-Control": "public, max-age=3600"},
-            )
-
-    # No matching icon file on disk. Return a neutral fallback icon
-    # rather than a 404 so the frontend never has to render a blank
-    # slot for an agent that ships without an icon. The fallback uses
-    # currentColor and is cached for the same window as a real file,
-    # so subsequent renders cost nothing extra.
+    # ── Final fallback: neutral Bot SVG ─────────────────────────
+    # Reached only when the ``icon`` field is empty or names an
+    # unknown Lucide icon. Returning 200 with a neutral bot SVG is
+    # safer than 404 because the frontend never sees an HTTP error.
     return Response(
         content=_DEFAULT_AGENT_ICON_SVG,
         media_type="image/svg+xml",
-        headers={"Cache-Control": "public, max-age=3600"},
+        headers={"Cache-Control": "public, max-age=300"},
     )
 
 
