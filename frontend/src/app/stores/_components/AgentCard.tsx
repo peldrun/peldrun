@@ -139,16 +139,17 @@ export function AgentCard({
 
   return (
     <div
-      className={`group relative text-[#fff] hover:text-black flex flex-col justify-between p-5 rounded-sm border transition-all duration-200 shadow-sm hover:shadow-md overflow-hidden ${
+      className={`group relative text-black hover:text-[#fff] flex flex-col justify-between p-5 rounded-sm
+        border transition-all duration-200 shadow-md hover:shadow-sm overflow-hidden ${
         isDisabled
           ? "bg-muted/30 border-border/60 opacity-80"
-          : "bg-card border-border/40 hover:border-primary/30"
+          : "bg-card border-card hover:border-card/50"
       }`}
     >
       {/* ── core_color wash (decorative background) ────────────── */}
       {!isDisabled && coreColor && (
         <div
-          className="absolute inset-0 pointer-events-none group-hover:opacity-[0.08] transition-opacity"
+          className="absolute inset-0 pointer-events-none opacity-[0.08] group-hover:opacity-[1.0] transition-opacity"
           style={{ backgroundColor: coreColor}}
           aria-hidden="true"
         />
@@ -157,7 +158,7 @@ export function AgentCard({
       <div className="relative">
         {/* ── Header row: icon + name + toggle ─────────────────── */}
         <div className="flex items-start justify-between mb-3.5">
-          <div className="flex items-center gap-3 min-w-0  text-inherit">
+          <div className="flex items-center gap-3 min-w-0  text-inherit ">
             {/* Icon slot — controls size AND text color.
                 `text-foreground` is what the icon inherits via
                 currentColor. To tint the icon differently per-theme
@@ -178,7 +179,7 @@ export function AgentCard({
             </div>
 
             <div className="min-w-0">
-              <h3 className="text-md font-extrabold uppercase text-inherit group-hover:text-primary transition-colors truncate">
+              <h3 className="text-md font-extrabold uppercase text-inherit group-hover:text-inherit transition-colors truncate">
                 {agent.name}
               </h3>
               <span className="text-[11px] font-mono text-inherit truncate block">

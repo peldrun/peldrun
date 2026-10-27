@@ -47,6 +47,8 @@ export interface UseAgentActionsResult {
   handleToggleAgentToolAssignment: (toolId: string) => void;
   handleToggleAgentMcpServer: (serverId: string) => void;
   handleSubmitAgentModal: (e: React.FormEvent) => Promise<void>;
+  /** True while a create/update agent request is in flight. */
+  isSubmittingAgent: boolean;
 
   // Chat launch
   handleStartChatWithAgent: (agent: AgentManifest) => void;
@@ -70,6 +72,7 @@ export function useAgentActions({
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
   const [agentFormData, setAgentFormData] =
     useState<AgentUpsertPayload>(DEFAULT_AGENT_FORM);
+  const [isSubmittingAgent, setIsSubmittingAgent] = useState(false);
 
   /**
    * Launch a chat session bound to the selected agent.
@@ -264,6 +267,13 @@ export function useAgentActions({
   const handleSubmitAgentModal = useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault();
+
+      // Guard against double-clicks while a save is in flight.
+      // Without this, the builder modal sends multiple POSTs to
+      // /api/store/agents in quick succession, producing duplicated
+      // 422 errors in the backend log and a confusing UX.
+      if (isSubmittingAgent) return;
+
       if (!agentFormData.name.trim() || !agentFormData.system_prompt.trim()) {
         showToast.warning(
           "Validation Error",
@@ -272,38 +282,54 @@ export function useAgentActions({
         return;
       }
 
+      setIsSubmittingAgent(true);
       try {
         if (editingAgentId) {
           const updated = await updateStoreAgent(editingAgentId, agentFormData);
-          if (updated) {
-            setAgents((prev) =>
-              prev.map((a) => (a.id === editingAgentId ? updated : a))
-            );
-            handleCloseAgentModal();
-            showToast.success(
-              "Agent Updated",
-              `Updated ${agentFormData.name} successfully.`
-            );
+          if (!updated) {
+            throw new Error("Update failed: server returned no agent.");
           }
+          setAgents((prev) =>
+            prev.map((a) => (a.id === editingAgentId ? updated : a))
+          );
+          handleCloseAgentModal();
+          showToast.success(
+            "Agent Updated",
+            `Updated ${agentFormData.name} successfully.`
+          );
         } else {
           const created = await createStoreAgent(agentFormData);
-          if (created) {
-            setAgents((prev) => [...prev, created]);
-            handleCloseAgentModal();
-            showToast.success(
-              "Agent Created",
-              `Created ${agentFormData.name} successfully.`
-            );
+          if (!created) {
+            throw new Error("Create failed: server returned no agent.");
           }
+          setAgents((prev) => [...prev, created]);
+          handleCloseAgentModal();
+          showToast.success(
+            "Agent Created",
+            `Created ${agentFormData.name} successfully.`
+          );
         }
       } catch (err: any) {
-        showToast.error(
-          "Save Failed",
-          err.message || "Could not save agent configuration."
-        );
+        // Surface the real backend error message. Previously the
+        // helper returned `null` on failure, which caused this
+        // catch to never fire — the user saw nothing happen and
+        // repeatedly clicked Save.
+        const message =
+          typeof err?.message === "string" && err.message.trim()
+            ? err.message
+            : "Could not save agent configuration.";
+        showToast.error("Save Failed", message);
+      } finally {
+        setIsSubmittingAgent(false);
       }
     },
-    [agentFormData, editingAgentId, setAgents, handleCloseAgentModal]
+    [
+      agentFormData,
+      editingAgentId,
+      setAgents,
+      handleCloseAgentModal,
+      isSubmittingAgent,
+    ]
   );
 
   return {
@@ -320,6 +346,7 @@ export function useAgentActions({
     handleToggleAgentToolAssignment,
     handleToggleAgentMcpServer,
     handleSubmitAgentModal,
+    isSubmittingAgent,
     handleStartChatWithAgent,
   };
 }

@@ -458,9 +458,28 @@ export async function createStoreAgent(payload: AgentUpsertPayload): Promise<Age
   const res = await fetch("/api/store/agents", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
   });
-  if (!res.ok) return null;
+
+  if (!res.ok) {
+    // Surface the backend validation error instead of silently
+    // returning null. FastAPI returns {detail: [...]} or {detail: "..."}.
+    const body = await res.json().catch(() => ({}));
+    let detail: string = `HTTP ${res.status}`;
+    if (typeof body.detail === "string") {
+      detail = body.detail;
+    } else if (Array.isArray(body.detail)) {
+      // Pydantic field errors: [{loc, msg, type}, ...]
+      detail = body.detail
+        .map((e: any) => {
+          const loc = Array.isArray(e.loc) ? e.loc.slice(1).join(".") : "";
+          return loc ? `${loc}: ${e.msg}` : e.msg;
+        })
+        .join("; ");
+    }
+    throw new Error(detail);
+  }
+
   const data = await res.json();
   return data.agent || null;
 }
@@ -469,9 +488,25 @@ export async function updateStoreAgent(agentId: string, payload: AgentUpsertPayl
   const res = await fetch(`/api/store/agents/${encodeURIComponent(agentId)}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
   });
-  if (!res.ok) return null;
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    let detail: string = `HTTP ${res.status}`;
+    if (typeof body.detail === "string") {
+      detail = body.detail;
+    } else if (Array.isArray(body.detail)) {
+      detail = body.detail
+        .map((e: any) => {
+          const loc = Array.isArray(e.loc) ? e.loc.slice(1).join(".") : "";
+          return loc ? `${loc}: ${e.msg}` : e.msg;
+        })
+        .join("; ");
+    }
+    throw new Error(detail);
+  }
+
   const data = await res.json();
   return data.agent || null;
 }

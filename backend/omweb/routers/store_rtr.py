@@ -52,6 +52,13 @@ class AgentUpsertRequest(BaseModel):
     name: str = Field(..., min_length=2)
     role: Optional[str] = "Specialist"
     icon: Optional[str] = "Sparkles"
+    # ``core_color`` is the accent color used by the agent card and
+    # details modal. It must be declared here, otherwise FastAPI
+    # silently drops it from the incoming payload (Pydantic ignores
+    # undeclared fields), and the color the user picked in the
+    # builder modal never reaches ``create_custom_agent`` — leaving
+    # it absent from the persisted manifest.
+    core_color: Optional[str] = None
     description: Optional[str] = ""
     system_prompt: str = Field(..., min_length=5)
     tools: List[str] = Field(default_factory=list)
@@ -547,12 +554,12 @@ async def get_agent_icon(agent_id: str):
     try:
         agent = agent_registry.get_agent(agent_id)
     except AgentNotFoundError:
-        # Unknown agent — still serve the fallback so <img> loads.
-        return Response(
-            content=_DEFAULT_AGENT_ICON_SVG,
-            media_type="image/svg+xml",
-            headers={"Cache-Control": "public, max-age=300"},
-        )
+        # Return 404 so the frontend's <img onError> handler fires
+        # and renders the Lucide fallback icon instead of a generic
+        # bot. The previous behaviour (200 + bot SVG) prevented the
+        # onError handler from ever running, so users always saw a
+        # bot regardless of the manifest's ``icon`` field.
+        raise HTTPException(status_code=404, detail="Agent not found")
 
     # ── Resolve roots defensively ───────────────────────────────
     try:
@@ -633,12 +640,15 @@ async def get_agent_icon(agent_id: str):
             # Corrupted file or permission error — fall through.
             continue
 
-    # ── Fallback: neutral Bot SVG ────────────────────────────────
-    return Response(
-        content=_DEFAULT_AGENT_ICON_SVG,
-        media_type="image/svg+xml",
-        headers={"Cache-Control": "public, max-age=300"},
-    )
+    # ── No matching SVG file on disk ─────────────────────────────
+    # Return 404 so the frontend's <img onError> handler fires and
+    # the AgentIcon component falls back to its Lucide registry.
+    # The registry is keyed on the agent's ``icon`` field (e.g.
+    # "Sparkles", "Code2"), which is exactly what the user selected
+    # in the builder modal. Without this, every custom agent — which
+    # has no SVG file by design — would show a generic bot instead
+    # of the chosen icon.
+    raise HTTPException(status_code=404, detail="Icon file missing")
     """Serve the SVG icon for an agent.
 
     Icons can live in one of several layouts on disk, and the manifest's

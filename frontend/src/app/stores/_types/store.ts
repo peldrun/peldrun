@@ -33,6 +33,7 @@ export const DEFAULT_AGENT_FORM: AgentUpsertPayload = {
   name: "",
   role: "Specialist",
   icon: "Sparkles",
+  core_color: "#10b981",
   description: "",
   system_prompt: "",
   tools: ["bash", "python_execute", "str_replace_editor", "web_search"],
