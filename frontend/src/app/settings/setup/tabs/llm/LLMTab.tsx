@@ -126,9 +126,57 @@ export function LLMTab(props: LLMTabProps) {
 
   /* -------------------------- Derived values ---------------------------- */
 
+  // [FIX-OVERVIEW-BUDGET] Read the active model's authoritative budget from
+  // `models_budget.json` (the "Per-Model Context Windows" tab source of
+  // truth) instead of only `config.toml`. Previously, when a user set a
+  // per-model max_output_tokens of 4096, the Overview panel still displayed
+  // the global config.toml fallback (1500), making the two panels
+  // contradict each other.
+  const [activeModelBudget, setActiveModelBudget] = useState<{
+    context_window?: number;
+    max_output_tokens?: number;
+    temperature?: number;
+  } | null>(null);
+
+  useEffect(() => {
+    const activeModel = config.llm.model;
+    if (!activeModel) {
+      setActiveModelBudget(null);
+      return;
+    }
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/config/model-budgets", {
+          cache: "no-store",
+        });
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        if (!cancelled && data?.ok && data.budgets) {
+          setActiveModelBudget(data.budgets[activeModel] || null);
+        }
+      } catch {
+        /* Keep null → fallback to config.toml values. */
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [config.llm.model]);
+
   const effectiveContextWindow =
-    config.llm.context_window || config.llm.max_tokens || 8192;
-  const effectiveMaxOutput = config.llm.max_output_tokens || 1500;
+    activeModelBudget?.context_window ??
+    config.llm.context_window ??
+    config.llm.max_tokens ??
+    8192;
+
+  const effectiveMaxOutput =
+    activeModelBudget?.max_output_tokens ??
+    config.llm.max_output_tokens ??
+    1500;
+
   const effectiveInputBudget = Math.max(
     100,
     effectiveContextWindow - effectiveMaxOutput

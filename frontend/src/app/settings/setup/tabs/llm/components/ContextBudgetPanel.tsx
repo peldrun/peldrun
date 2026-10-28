@@ -1,9 +1,9 @@
 // frontend/src/app/settings/setup/tabs/llm/components/ContextBudgetPanel.tsx
 "use client";
 
-import React from "react";
-import { motion } from "framer-motion";
-import { Gauge, Sliders, Sparkles } from "lucide-react";
+import React, { useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import { Gauge, Sliders, Sparkles, Info } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { ContextBudgetPanelProps } from "../types";
 
@@ -57,6 +57,11 @@ export function ContextBudgetPanel({
   sanitizeTokenInput,
   onAutoDetect,
 }: ContextBudgetPanelProps) {
+  // Toggles the inline explanation under the Global Default Temperature
+  // slider. Collapsed by default so the panel stays compact; expanded on
+  // demand for users who want to understand the precedence rules.
+  const [showTempInfo, setShowTempInfo] = useState(false);
+
   return (
     <motion.div
       {...FADE_UP}
@@ -88,57 +93,108 @@ export function ContextBudgetPanel({
         </Button>
       </div>
 
-      {/* Main controls */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        {/* Context window */}
-        <div className="p-3 rounded-sm border border-border/60 bg-background/60 hover:border-primary/30 transition-colors">
+      {/* Main controls.
+          NOTE: "Context Window" and "Max Output Tokens" were removed from
+          this panel. Both are per-model settings and their single source of
+          truth is the "Model Budgets & Context" tab. Editing them here
+          previously showed the global default (1500) while the runtime
+          actually used the per-model budget (4096), which made the two
+          panels contradict each other and confused the user.
+          Temperature is truly global and therefore belongs here — but it is
+          intentionally placed in its OWN box (below the read-only summary)
+          so it does not read as "part of the active model config". A small
+          (i) button toggles an explanation of the precedence chain. */}
+      <div className="space-y-3">
+        {/* Active model summary (read-only) */}
+        <div className="p-3 rounded-sm border border-border/60 bg-background/60">
           <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-1.5">
-            Context Window (Total Capacity)
+            Active Model Budgets
           </label>
-          <input
-            type="number"
-            value={effectiveContextWindow}
-            onChange={(e) => {
-              const val = sanitizeTokenInput(e.target.value, 8192);
-              setConfig({
-                ...config,
-                llm: { ...config.llm, context_window: val, max_tokens: val },
-              });
-            }}
-            className="w-full bg-transparent border-0 outline-none text-xs text-foreground font-mono focus:ring-0"
-          />
+          <div className="text-xs text-foreground font-mono space-y-0.5">
+            <div>
+              Context:{" "}
+              <span className="font-bold">
+                {effectiveContextWindow.toLocaleString()}
+              </span>{" "}
+              tokens
+            </div>
+            <div>
+              Max Output:{" "}
+              <span className="font-bold">
+                {effectiveMaxOutput.toLocaleString()}
+              </span>{" "}
+              tokens
+            </div>
+          </div>
           <span className="text-[10px] text-muted-foreground mt-1 block">
-            Total available token window (inputs + outputs)
+            These values are resolved per-model. Edit them in{" "}
+            <strong>Model Budgets &amp; Context</strong>.
           </span>
         </div>
 
-        {/* Max output tokens */}
-        <div className="p-3 rounded-sm border border-border/60 bg-background/60 hover:border-primary/30 transition-colors">
-          <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-1.5">
-            Max Output Tokens (Completion Budget)
-          </label>
-          <input
-            type="number"
-            value={effectiveMaxOutput}
-            onChange={(e) => {
-              const val = sanitizeTokenInput(e.target.value, 1500);
-              setConfig({
-                ...config,
-                llm: { ...config.llm, max_output_tokens: val },
-              });
-            }}
-            className="w-full bg-transparent border-0 outline-none text-xs text-foreground font-mono focus:ring-0"
-          />
-          <span className="text-[10px] text-muted-foreground mt-1 block">
-            Reserved token buffer strictly for LLM generation
-          </span>
-        </div>
+        {/* Global Default Temperature (its own box) */}
+        <div className="p-3 rounded-sm border border-border/60 bg-background/60 hover:border-primary/30 transition-colors space-y-2">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-1.5">
+              <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                Global Default Temperature
+              </label>
+              <button
+                type="button"
+                onClick={() => setShowTempInfo((v) => !v)}
+                className="text-muted-foreground hover:text-primary cursor-pointer transition-colors"
+                aria-label="How temperature is resolved"
+                title="How temperature is resolved"
+              >
+                <Info size={12} />
+              </button>
+            </div>
+            <span className="text-xs font-mono font-bold text-primary tabular-nums">
+              {Number(config.llm.temperature).toFixed(2)}
+            </span>
+          </div>
 
-        {/* Temperature */}
-        <div className="p-3 rounded-sm border border-border/60 bg-background/60 hover:border-primary/30 transition-colors">
-          <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-1.5">
-            Temperature: {Number(config.llm.temperature).toFixed(2)}
-          </label>
+          {/* Collapsible explanation */}
+          <AnimatePresence initial={false}>
+            {showTempInfo && (
+              <motion.div
+                key="temp-info"
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: "auto", opacity: 1 }}
+                exit={{ height: 0, opacity: 0 }}
+                transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
+                className="overflow-hidden"
+              >
+                <div className="p-3 rounded-md border border-primary/20 bg-primary/5 text-[11px] text-foreground/90 leading-relaxed space-y-1.5">
+                  <p className="font-semibold text-primary">
+                    How temperature is resolved
+                  </p>
+                  <ol className="list-decimal list-inside space-y-1">
+                    <li>
+                      <strong>Per-model override</strong> (highest priority):
+                      if you set a temperature for this model in{" "}
+                      <strong>Model Budgets &amp; Context</strong>, that value
+                      wins — regardless of what is shown here.
+                    </li>
+                    <li>
+                      <strong>Global default</strong> (this slider): used for
+                      any model that has no per-model override.
+                    </li>
+                    <li>
+                      <strong>Built-in fallback</strong>: if neither is
+                      configured, the runtime uses its historical default
+                      (0.7 for chat, 0.2 for agent mode).
+                    </li>
+                  </ol>
+                  <p className="text-muted-foreground">
+                    Range: 0.00 = fully deterministic · 1.50 = most creative.
+                    This value is saved via <strong>Save Config</strong>.
+                  </p>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
           <input
             type="range"
             min="0.0"
@@ -154,11 +210,13 @@ export function ContextBudgetPanel({
                 },
               })
             }
-            className="w-full accent-primary cursor-pointer mt-2"
+            className="w-full accent-primary cursor-pointer mt-1"
           />
-          <span className="text-[10px] text-muted-foreground mt-1 block">
-            Deterministic (0.0) to Creative (1.5)
-          </span>
+          <div className="flex items-center justify-between text-[10px] text-muted-foreground font-mono">
+            <span>Deterministic (0.00)</span>
+            <span>Balanced (0.70)</span>
+            <span>Creative (1.50)</span>
+          </div>
         </div>
       </div>
 

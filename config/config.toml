@@ -4,9 +4,11 @@ provider_name = "LM Studio (Local)"
 model = "nvidia-nemotron-3-nano-4b"
 base_url = "http://127.0.0.1:1234/v1"
 api_key = "sk-lm-gFTaiAB5:PL9ecC0F3WiJjhr0nLja"
-max_tokens = 262144
+max_tokens = 1048576
 temperature = 0
 api_type = ""
+max_output_tokens = 12000
+context_window = 1048576
 
 [browser]
 headless = false
@@ -15,15 +17,15 @@ cdp_url = "http://localhost:9222"
 max_content_length = 2000
 
 [search]
-engine = "DuckDuckGo"
-fallback_engines = [ "Jina",]
+engine = "Google"
+fallback_engines = [ "DuckDuckGo", "Baidu", "Bing",]
 enabled = true
 lang = "en"
 country = "us"
 default_max_results = 10
 total_budget_seconds = 22
-max_retries = 0
-retry_delay = 2
+max_retries = 3
+retry_delay = 60
 privacy_mode = false
 
 [sandbox]

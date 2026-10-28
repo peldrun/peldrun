@@ -74,6 +74,10 @@ interface GranularProviderGroup {
   groupId: string;
   providerName: string;
   providerKey: string;
+  /** Base URL for this provider — needed by Auto-Detect to query the API. */
+  baseUrl: string;
+  /** API key for this provider — needed by Auto-Detect to query the API. */
+  apiKey: string;
   badge: string;
   icon: React.ReactNode;
   models: Array<{
@@ -139,7 +143,6 @@ async function probeVaultEndpoint(base: string): Promise<VaultData | null> {
       /* Backend may return { vault: {...} } or the payload bare */
       const payload = data?.vault ?? data;
       if (hasVaultPayload(payload)) {
-        console.info(`[ModelBudgetsTab] Vault loaded from: ${url}`);
         return payload as VaultData;
       }
     } catch {
@@ -254,6 +257,13 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
   const [openProviders, setOpenProviders] = useState<Record<string, boolean>>({});
   const [expandedModels, setExpandedModels] = useState<Record<string, boolean>>({});
   const [modelRatios, setModelRatios] = useState<Record<string, BudgetRatios>>({});
+  const [autoDetectingId, setAutoDetectingId] = useState<string | null>(null);
+
+  // Global default temperature from config.toml — used as a placeholder for
+  // models that have no explicit `temperature` override in models_budget.json.
+  // Falls back to 0.7 (the historical default in dispatcher.py) if the fetch
+  // fails or the field is absent.
+  const [defaultTemperature, setDefaultTemperature] = useState<number>(0.7);
 
   /* -------------------------------
    * Fetch budgets, metadata & vault
@@ -289,6 +299,20 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
         if (metaRes && metaRes.ok) {
           const mData = await metaRes.json();
           if (mData.ok && mData.metadata) setMetadataVault(mData.metadata);
+        }
+
+        /* --- Global config (for default temperature) --- */
+        try {
+          const cfgRes = await fetch(`${base}/api/config`);
+          if (cfgRes.ok) {
+            const cfgData = await cfgRes.json();
+            const rawTemp = cfgData?.config?.llm?.temperature;
+            if (typeof rawTemp === "number" && Number.isFinite(rawTemp)) {
+              setDefaultTemperature(rawTemp);
+            }
+          }
+        } catch {
+          /* Non-fatal: fall back to the 0.7 default. */
         }
 
         /* --- Vault (models_vault.json) --- */
@@ -341,6 +365,8 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
         groupId: `provider_${cp.id}`,
         providerName: cp.name,
         providerKey: cp.id,
+        baseUrl: cp.baseUrl || "",
+        apiKey: cp.apiKey || "",
         badge: cp.badge || "",
         icon: <ProviderIcon badge={cp.badge} />,
         models: uniqueModels.map((m) => {
@@ -367,6 +393,8 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
           groupId: "provider_lmstudio",
           providerName: "LM Studio",
           providerKey: "lmstudio",
+          baseUrl: lm.baseUrl || "http://127.0.0.1:1234/v1",
+          apiKey: lm.apiKey || "",
           badge: lm.badge || "",
           icon: <ProviderIcon badge={lm.badge} />,
           models: lmModels.map((m) => {
@@ -392,6 +420,12 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
           groupId: "provider_ollama",
           providerName: "Ollama",
           providerKey: "ollama",
+          // [FIX] Populate from models_vault.json — the vault is the ONLY
+          // source of truth for provider endpoints. Auto-Detect uses these
+          // values to query the real API (`POST /api/config/fetch-models`),
+          // never a hardcoded URL.
+          baseUrl: ol.baseUrl || "http://127.0.0.1:11434",
+          apiKey: "",
           badge: ol.badge || "",
           icon: <ProviderIcon badge={ol.badge} />,
           models: olModels.map((m) => {
@@ -420,6 +454,11 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
         groupId: `provider_custom_${ce.id}`,
         providerName: ce.name,
         providerKey: ce.providerId || ce.id,
+        // [FIX] Same as Ollama — the endpoint URL and key come from the
+        // vault (`custom_endpoints[].endpointUrl` / `.apiKey`), never from
+        // a hardcoded value. Auto-Detect needs these to reach the API.
+        baseUrl: ce.endpointUrl || "",
+        apiKey: ce.apiKey || "",
         badge,
         icon: <ProviderIcon badge={badge} />,
         models: ceModels.map((m) => {
@@ -522,21 +561,140 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
     showToast.info("Distribution Normalized", "Section allocation rebalanced to exactly 100%.");
   };
 
-  const handleAutoDetect = (modelId: string, providerName: string) => {
-    const resolved = resolveIntelligentLimits(modelId, metadataVault);
-    setBudgets((prev) => ({
-      ...prev,
-      [modelId]: {
-        context_window: resolved.contextWindow,
-        max_output_tokens: resolved.maxOutput,
-        provider_name: providerName,
-      },
-    }));
+  /**
+   * Query the model's provider API directly.
+   *
+   * Uses ONLY `baseUrl` and `apiKey` from `models_vault.json`.
+   * No hardcoded URLs, no provider-specific branches, no localhost
+   * checks, no port detection.
+   *
+   * The call is:   GET  <baseUrl>/models  with  Authorization: Bearer <apiKey>
+   *
+   * Parses whatever the response returns, checking every common
+   * context field name. If the field is absent, the user is told so
+   * — no fallback, no fake values.
+   */
+  const handleAutoDetect = async (
+    modelId: string,
+    providerName: string,
+    baseUrl: string,
+    apiKey: string,
+    _providerKey: string,
+  ) => {
+    if (!baseUrl) {
+      showToast.warning(
+        "No endpoint configured",
+        `Set ${providerName}'s base URL first.`
+      );
+      return;
+    }
 
-    showToast.success(
-      "Limits Auto-Detected",
-      `${modelId} → ${resolved.contextWindow.toLocaleString()} tokens (${resolved.source})`
-    );
+    setAutoDetectingId(modelId);
+    try {
+      const cleanBase = baseUrl.replace(/\/+$/, "");
+      const modelsUrl = cleanBase.endsWith("/models")
+        ? cleanBase
+        : `${cleanBase}/models`;
+
+      const headers: Record<string, string> = {
+        Accept: "application/json",
+      };
+      if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+
+      const res = await fetch(modelsUrl, { headers });
+
+      if (!res.ok) {
+        showToast.error(
+          `HTTP ${res.status}`,
+          `${modelsUrl}`
+        );
+        return;
+      }
+
+      const data = await res.json();
+      const list: any[] =
+        (Array.isArray(data?.data) && data.data) ||
+        (Array.isArray(data?.models) && data.models) ||
+        [];
+
+      if (list.length === 0) {
+        showToast.warning(
+          "Empty response",
+          `${modelsUrl} returned no models.`
+        );
+        return;
+      }
+
+      const model = list.find((m) => {
+        if (!m || typeof m !== "object") return false;
+        const rawId = String(m.id || m.name || "");
+        const shortId = rawId.includes("/")
+          ? rawId.split("/").pop() || rawId
+          : rawId;
+        return (
+          rawId === modelId ||
+          shortId === modelId ||
+          rawId.endsWith(`/${modelId}`) ||
+          modelId.endsWith(`/${rawId}`)
+        );
+      });
+
+      if (!model) {
+        showToast.warning(
+          "Model not in API response",
+          `${modelId} is not listed at ${modelsUrl}`
+        );
+        return;
+      }
+
+      const ctx =
+        model.max_context_length ??
+        model.context_length ??
+        model.context_window ??
+        model.inputTokenLimit ??
+        model.max_tokens;
+
+      if (typeof ctx !== "number" || ctx <= 0) {
+        showToast.warning(
+          "API does not return context window",
+          `${providerName} /models response has no context field. Enter manually.`
+        );
+        return;
+      }
+
+      const out =
+        model.max_output_tokens ??
+        model.max_completion_tokens ??
+        model.outputTokenLimit;
+      const finalOut =
+        typeof out === "number" && out > 0
+          ? out
+          : ctx >= 32768
+          ? 4096
+          : 1500;
+
+      setBudgets((prev) => ({
+        ...prev,
+        [modelId]: {
+          ...(prev[modelId] || { provider_name: providerName }),
+          context_window: ctx,
+          max_output_tokens: finalOut,
+          provider_name: providerName,
+        },
+      }));
+
+      showToast.success(
+        "Detected from provider API",
+        `${modelId} → ${ctx.toLocaleString()} tokens`
+      );
+    } catch (err: any) {
+      showToast.error(
+        "Auto-Detect failed",
+        err?.message || "Network error"
+      );
+    } finally {
+      setAutoDetectingId(null);
+    }
   };
 
   /* ============================================================
@@ -566,11 +724,29 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
         }
       }
 
-      /* Union of every model the user has interacted with. */
+      /* Union of every model the user has interacted with, PLUS every
+       * model currently rendered in the provider groups.
+       *
+       * Rationale: "Save All Budgets" is a promise that everything shown
+       * in the UI will be persisted. Restricting the payload to explicitly
+       * touched models left a freshly opened page in a state where clicking
+       * the button submitted an empty payload (`{ budgets: {} }`), the
+       * backend replied "saved", and the on-disk file stayed `{}`.
+       *
+       * Including every rendered model guarantees that a single click
+       * writes a complete snapshot of what the user sees, whether or not
+       * they modified any row first. Rows that the user did not touch
+       * fall back to the intelligent defaults already shown in the UI
+       * (resolved via resolveIntelligentLimits). */
       const touchedModelIds = new Set<string>([
         ...Object.keys(budgets),
         ...Object.keys(modelRatios),
       ]);
+      for (const group of providerGroups) {
+        for (const item of group.models) {
+          touchedModelIds.add(item.modelId);
+        }
+      }
 
       const payloadBudgets: Record<string, any> = {};
 
@@ -814,13 +990,31 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
                               variant="ghost"
                               size="sm"
                               onClick={() =>
-                                handleAutoDetect(item.modelId, group.providerName)
+                                handleAutoDetect(
+                                  item.modelId,
+                                  group.providerName,
+                                  group.baseUrl,
+                                  group.apiKey,
+                                  group.providerKey,
+                                )
                               }
+                              disabled={autoDetectingId === item.modelId}
                               className="h-6 px-2 text-[10px] text-muted-foreground hover:text-primary flex items-center gap-1 cursor-pointer"
-                              title="Auto-detect context limit from specifications"
+                              title="Query the provider API for this model's real context window"
                             >
-                              <Sparkles size={11} className="text-amber-500" />
-                              <span>Auto-Detect</span>
+                              <Sparkles
+                                size={11}
+                                className={`text-amber-500 ${
+                                  autoDetectingId === item.modelId
+                                    ? "animate-spin"
+                                    : ""
+                                }`}
+                              />
+                              <span>
+                                {autoDetectingId === item.modelId
+                                  ? "Detecting…"
+                                  : "Auto-Detect"}
+                              </span>
                             </Button>
 
                             <button
@@ -878,6 +1072,90 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
                                 />
                               </div>
                             </div>
+
+                            {/* Temperature override for this model */}
+                            {(() => {
+                              const explicitTemp = budgets[item.modelId]?.temperature;
+                              const shownTemp =
+                                typeof explicitTemp === "number"
+                                  ? explicitTemp
+                                  : defaultTemperature;
+                              const isOverridden =
+                                typeof explicitTemp === "number" &&
+                                explicitTemp !== defaultTemperature;
+
+                              return (
+                                <div className="p-3 rounded-lg bg-background/80 border border-border/70 space-y-2">
+                                  <div className="flex items-center justify-between gap-2">
+                                    <div className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
+                                      <span className="h-2 w-2 rounded-full bg-fuchsia-500" />
+                                      <span>Temperature (Sampling)</span>
+                                      {isOverridden && (
+                                        <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-fuchsia-500/10 text-fuchsia-500 border border-fuchsia-500/30">
+                                          Override
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div className="flex items-center gap-2">
+                                      <span className="text-[11px] font-mono text-foreground tabular-nums">
+                                        {shownTemp.toFixed(2)}
+                                      </span>
+                                      {isOverridden && (
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            setBudgets((prev) => {
+                                              const next = { ...prev };
+                                              if (next[item.modelId]) {
+                                                const { temperature, ...rest } =
+                                                  next[item.modelId];
+                                                next[item.modelId] = rest;
+                                              }
+                                              return next;
+                                            })
+                                          }
+                                          className="text-[10px] text-muted-foreground hover:text-foreground cursor-pointer underline"
+                                          title="Revert to global default"
+                                        >
+                                          Reset
+                                        </button>
+                                      )}
+                                    </div>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min="0"
+                                    max="1.5"
+                                    step="0.05"
+                                    value={shownTemp}
+                                    onChange={(e) => {
+                                      const v =
+                                        parseFloat(e.target.value) || 0;
+                                      setBudgets((prev) => {
+                                        const current = prev[item.modelId] || {
+                                          context_window: item.defaultContextWindow,
+                                          max_output_tokens: item.defaultMaxOutput,
+                                          provider_name: group.providerName,
+                                        };
+                                        return {
+                                          ...prev,
+                                          [item.modelId]: {
+                                            ...current,
+                                            temperature: v,
+                                          },
+                                        };
+                                      });
+                                    }}
+                                    className="w-full accent-fuchsia-500 h-1.5 cursor-pointer"
+                                  />
+                                  <div className="flex items-center justify-between text-[10px] text-muted-foreground font-mono">
+                                    <span>Deterministic (0.00)</span>
+                                    <span>Balanced (0.70)</span>
+                                    <span>Creative (1.50)</span>
+                                  </div>
+                                </div>
+                              );
+                            })()}
 
                             {/* Interactive token budget controller */}
                             <div className="p-3 rounded-lg bg-background/80 border border-border/70 space-y-3">

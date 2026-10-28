@@ -58,7 +58,6 @@ import {
 import {
   PRESET_DEFINITIONS,
   getActivePreset,
-  getEffectiveMaxTokens,
   useGenerativeUIStore,
   type RenderingFeatureKey,
   type RenderingPreset,
@@ -81,8 +80,8 @@ const PIE_COLORS = [
 const RADIAL_COLORS = ["#10b981", "#3b82f6", "#8b5cf6", "#f59e0b"];
 
 const CHART_TOOLTIP_STYLE = {
-  backgroundColor: "rgba(17, 24, 39, 0.95)",
-  border: "1px solid rgba(55, 65, 81, 0.8)",
+  backgroundColor: "hsl(var(--card))",
+  border: "1px solid hsl(var(--card))",
   fontSize: "11px",
   borderRadius: "10px",
   padding: "8px 12px",
@@ -158,7 +157,6 @@ export function GenerativeUITab(): React.JSX.Element {
   const maxRetries = useGenerativeUIStore((s) => s.max_retries);
   const telemetry = useGenerativeUIStore((s) => s.telemetry);
   const activePreset: RenderingPreset = useGenerativeUIStore(getActivePreset);
-  const effectiveMaxTokens = useGenerativeUIStore(getEffectiveMaxTokens);
 
   // ---- Read actions ----
   const setEnabled = useGenerativeUIStore((s) => s.setEnabled);
@@ -460,18 +458,6 @@ export function GenerativeUITab(): React.JSX.Element {
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <LimitSlider
-                icon={<Coins className="h-3.5 w-3.5 text-muted-foreground" />}
-                label="Max Output Tokens"
-                value={limits.max_output_tokens}
-                displayValue={`${effectiveMaxTokens} tokens`}
-                min={512}
-                max={8192}
-                step={256}
-                hint="Upper bound on completion tokens per response."
-                onChange={(v) => setLimits({ max_output_tokens: v })}
-                delay={0.3}
-              />
-              <LimitSlider
                 icon={<GitFork className="h-3.5 w-3.5 text-muted-foreground" />}
                 label="Max Mermaid Nodes"
                 value={limits.max_mermaid_nodes}
@@ -515,7 +501,7 @@ export function GenerativeUITab(): React.JSX.Element {
                 min={0}
                 max={5}
                 step={1}
-                hint="Retry attempts on parse failure before falling back to plain Markdown."
+                hint="Progressive fallback attempts when rendering fails. Values above 3 saturate at the number of available strategies."
                 onChange={(v) => setMaxRetries(v)}
                 delay={0.5}
               />

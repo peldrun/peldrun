@@ -224,6 +224,37 @@ export interface ModelBudgetItemConfig {
   max_output_tokens: number;
   provider?: string;
   provider_name?: string;
+
+  /**
+   * Optional per-model sampling temperature override.
+   *
+   * When present, `dispatcher.py::_resolve_model_temperature` applies this
+   * value to the LLM call instead of the global `config.toml` default.
+   * When absent (or undefined), the dispatcher falls back to
+   * `active_llm["temperature"]` — preserving the historical behavior for
+   * models the user has never configured.
+   *
+   * Range: 0.0 (deterministic) – 1.5 (creative).
+   */
+  temperature?: number;
+
+  /**
+   * Optional per-model token distribution ratios for the five context
+   * slices (System / Summary / Recent / Execution / Current).
+   *
+   * Persisted by the "Interactive Budget Distribution" panel in
+   * ModelBudgetsTab.tsx and consumed by
+   * `peldrun/context/sidecar.py::resolve_model_budget_profile` when
+   * building the ContextSidecar for a run. Each value is a percentage;
+   * the sum should be exactly 100.
+   */
+  ratios?: {
+    system: number;
+    summary: number;
+    recent: number;
+    execution: number;
+    current: number;
+  };
 }
 
 export type ModelBudgetsMap = Record<string, ModelBudgetItemConfig>;

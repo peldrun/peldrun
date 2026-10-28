@@ -48,6 +48,7 @@ from omweb.routers import (
     chats,
     config_rtr,
     files,
+    generative_ui_rtr,
     mcp,
     resource_monitor,
     run,
@@ -189,6 +190,11 @@ app.include_router(chats.router, prefix="/api/chats", tags=["chats"])
 app.include_router(run.router, prefix="/api/run", tags=["run"])
 app.include_router(status.router, prefix="/api/status", tags=["status"])
 app.include_router(config_rtr.router, prefix="/api/config", tags=["config"])
+app.include_router(
+    generative_ui_rtr.router,
+    prefix="/api/config",
+    tags=["config", "generative-ui"],
+)
 app.include_router(search_rtr.router, prefix="/api/search", tags=["search"])
 app.include_router(files.router, prefix="/api/files", tags=["files"])
 app.include_router(mcp.router, prefix="/api/mcp", tags=["mcp"])

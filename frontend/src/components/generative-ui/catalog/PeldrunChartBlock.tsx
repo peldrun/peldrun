@@ -444,30 +444,148 @@ function resolveValueKey(
 }
 
 /**
+ * Level 2 fallback: extracts a JSON object from surrounding text.
+ *
+ * Common LLM failure modes:
+ *   - Wraps the JSON in extra markdown fences that slipped through the
+ *     renderer's fence stripping.
+ *   - Prefixes it with prose ("Here is the chart: { ... }").
+ *
+ * The extractor walks the source character by character tracking brace depth
+ * and string state, so nested objects and escaped quotes are preserved.
+ */
+function extractChartJsonBlock(source: string): string | null {
+  if (!source) return null;
+
+  // Strip any residual fences
+  const stripped = source
+    .replace(/```(?:json)?\s*/gi, "")
+    .replace(/```\s*$/g, "")
+    .trim();
+
+  if (stripped !== source.trim()) {
+    return stripped;
+  }
+
+  // Walk to find the first complete top-level {...} block
+  const firstBrace = stripped.indexOf("{");
+  if (firstBrace === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = firstBrace; i < stripped.length; i += 1) {
+    const ch = stripped[i];
+    if (escape) { escape = false; continue; }
+    if (ch === "\\") { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        const extracted = stripped.slice(firstBrace, i + 1);
+        return extracted === source ? null : extracted;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Level 3 fallback: repairs the single most common syntax error LLMs emit
+ * — a trailing comma before a closing brace or bracket.
+ *
+ * Example:
+ *   { "data": [1, 2, 3,] }   →   { "data": [1, 2, 3] }
+ *
+ * Deliberately does NOT attempt to fix single-quoted strings or unquoted
+ * keys — those transformations risk corrupting legitimate string values
+ * that contain apostrophes or special characters, and a corrupted string
+ * is worse than a clear parse error.
+ */
+function repairChartJson(source: string): string | null {
+  if (!source) return null;
+  const repaired = source.replace(/,(\s*[}\]])/g, "$1");
+  return repaired === source ? null : repaired;
+}
+
+/**
+ * Builds the ordered list of candidates to try, capped at
+ * `min(max_retries + 1, strategies_available)`.
+ */
+function buildChartAttempts(source: string, maxRetries: number): string[] {
+  const candidates: Array<string | null> = [
+    source,
+    maxRetries >= 1 ? extractChartJsonBlock(source) : null,
+    maxRetries >= 2 ? repairChartJson(extractChartJsonBlock(source) || source) : null,
+    maxRetries >= 3 ? repairChartJson(source) : null,
+  ];
+
+  const out: string[] = [];
+  let previous: string | null = null;
+  for (const candidate of candidates) {
+    if (!candidate || candidate === previous) continue;
+    out.push(candidate);
+    previous = candidate;
+  }
+  return out;
+}
+
+/**
  * Parses and validates a raw JSON string into a ChartPayload.
  *
  * See the header comment for the three supported payload shapes.
+ *
+ * Retries: if `maxRetries > 0`, the parser tries alternative extractions of
+ * the same source (see `buildChartAttempts`) before giving up. Validation
+ * errors (wrong shape, missing keys) are NOT retried — the data itself is
+ * wrong, and re-parsing cannot fix a missing `label` field.
  */
 function parseChartPayload(
   source: string,
-  maxPoints: number
+  maxPoints: number,
+  maxRetries: number = 0,
 ): ParseResult | ParseError {
   if (!source || !source.trim()) {
     return { ok: false, reason: "Empty chart block." };
   }
 
-  let raw: unknown;
-  try {
-    raw = JSON.parse(source);
-  } catch (err) {
-    return {
-      ok: false,
-      reason:
-        (err as { message?: string })?.message ||
-        "Chart payload is not valid JSON.",
-    };
+  const attempts = buildChartAttempts(source, maxRetries);
+  let lastError: ParseError | null = null;
+
+  for (const candidate of attempts) {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(candidate);
+    } catch (err) {
+      lastError = {
+        ok: false,
+        reason:
+          (err as { message?: string })?.message ||
+          "Chart payload is not valid JSON.",
+      };
+      continue;
+    }
+
+    // Delegate the parsed object to the existing validation logic by
+    // re-parsing a serialized copy — kept as-is to avoid duplicating the
+    // ~120-line validator that follows.
+    return parseChartPayloadFromObject(raw, maxPoints);
   }
 
+  return lastError || { ok: false, reason: "All chart parse attempts failed." };
+}
+
+/**
+ * Validator extracted from the original `parseChartPayload` body. Takes an
+ * already-parsed object and applies the full shape check.
+ */
+function parseChartPayloadFromObject(
+  raw: unknown,
+  maxPoints: number
+): ParseResult | ParseError {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return { ok: false, reason: "Chart payload must be a JSON object." };
   }
@@ -664,13 +782,14 @@ export function PeldrunChartBlock({
   telemetry = true,
 }: PeldrunChartBlockProps): React.JSX.Element {
   const maxPoints = useGenerativeUIStore((s) => s.limits.max_chart_points);
+  // [FIX-MAX-RETRIES] Read the configured retry budget so the chart parser
+  // can attempt alternative extractions when the initial JSON.parse fails.
+  const maxRetries = useGenerativeUIStore((s) => s.max_retries);
 
-  // Store actions are read through refs so that the telemetry effect never
-  // re-runs due to action identity changes.
-  const recordErrorRef = useRef(useGenerativeUIStore.getState().recordError);
-  const recordSuccessRef = useRef(
-    useGenerativeUIStore.getState().recordSuccess
-  );
+  // [FIX-TELEMETRY-2] Actions are read via getState() at call time (see the
+  // parallel fix in PeldrunDiagram.tsx) so rehydration cannot route updates
+  // into a stale store instance. The previous useRef pattern was the same
+  // stale-closure pitfall.
 
   // Ensures a single chart instance reports at most one telemetry event per
   // unique source string, even across re-renders.
@@ -695,8 +814,8 @@ export function PeldrunChartBlock({
   }, []);
 
   const parsed = useMemo(
-    () => parseChartPayload(source, maxPoints),
-    [source, maxPoints]
+    () => parseChartPayload(source, maxPoints, maxRetries),
+    [source, maxPoints, maxRetries]
   );
 
   useEffect(() => {
@@ -704,10 +823,13 @@ export function PeldrunChartBlock({
     if (recordedSourceRef.current === source) return;
     recordedSourceRef.current = source;
 
+    // [FIX-TELEMETRY-2] Fetch the live action to avoid writing into a stale
+    // store instance after HMR / rehydration.
+    const store = useGenerativeUIStore.getState();
     if (parsed.ok) {
-      recordSuccessRef.current(0);
+      store.recordSuccess(0);
     } else {
-      recordErrorRef.current("chart");
+      store.recordError("chart");
     }
   }, [parsed, source, telemetry]);
 

@@ -159,24 +159,23 @@ def _check_model_metadata_reasoning(model_name: str) -> Optional[bool]:
 
 def _resolve_model_max_output_tokens(model_name: str, active_llm: Optional[Dict[str, Any]] = None) -> int:
     """
-    Dynamically resolve max output tokens for the target model:
-    1. Check explicit active_llm overrides (max_output_tokens or max_tokens).
-    2. Check persisted storage/models_budget.json configured via UI.
-    3. Fallback to 8192 default.
-    """
-    if active_llm:
-        val = active_llm.get("max_output_tokens") or active_llm.get("max_tokens")
-        if val is not None:
-            try:
-                parsed = int(val)
-                if parsed > 0:
-                    return parsed
-            except (ValueError, TypeError):
-                pass
+    Dynamically resolve max output tokens for the target model.
 
+    Priority order (highest → lowest):
+    1. Per-model budget from storage/models_budget.json. This is the
+       authoritative source set in the "Model Budgets & Context" tab.
+    2. Explicit active_llm override (max_output_tokens or max_tokens).
+       Falls back here only when no per-model budget exists.
+    3. 8192 default.
+
+    The previous ordering let the global config.llm.max_output_tokens (shown
+    in the "Context Window & Token Budget Architecture" panel) silently
+    override the per-model value stored in models_budget.json. Users editing
+    the per-model tab saw no effect because the global value was checked
+    first.
+    """
     try:
-        # Audit items 2.2 + 2.3: same canonical-first ordering as
-        # _check_model_metadata_reasoning above.
+        # Per-model budgets are authoritative.
         from peldrun.storage_paths import get_storage_root
 
         canonical = get_storage_root() / "models_budget.json"
@@ -200,7 +199,77 @@ def _resolve_model_max_output_tokens(model_name: str, active_llm: Optional[Dict[
     except Exception as e:
         logger.debug("Could not load budget cache for %s: %s", model_name, e)
 
+    # Fallback: global override from active_llm (config.toml / per-request).
+    if active_llm:
+        val = active_llm.get("max_output_tokens") or active_llm.get("max_tokens")
+        if val is not None:
+            try:
+                parsed = int(val)
+                if parsed > 0:
+                    return parsed
+            except (ValueError, TypeError):
+                pass
+
     return 8192
+
+
+def _resolve_model_temperature(
+    model_name: str,
+    active_llm: Optional[Dict[str, Any]] = None,
+) -> Optional[float]:
+    """
+    Resolve the per-model sampling temperature.
+
+    Priority order (highest → lowest):
+    1. Per-model `temperature` in storage/models_budget.json — an explicit
+       override the user set in the "Per-Model Context Windows" tab.
+    2. Global `active_llm["temperature"]` (config.toml / per-request override).
+    3. None — caller falls back to its own historical default.
+
+    Returns None when no value is available anywhere, signalling the caller
+    to leave its default untouched. This preserves the historical behavior
+    for models the user never configured (0.7 for chat, 0.2 for agent),
+    instead of forcing a hardcoded value.
+    """
+    try:
+        from peldrun.storage_paths import get_storage_root
+
+        canonical = get_storage_root() / "models_budget.json"
+        module_dir = Path(__file__).resolve().parent
+        candidates = [
+            canonical,
+            module_dir.parent.parent / "storage" / "models_budget.json",
+            Path("storage/models_budget.json").resolve(),
+            Path("backend/storage/models_budget.json").resolve(),
+        ]
+        for p in candidates:
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                cfg = data.get(model_name) or data.get(model_name.lower())
+                if isinstance(cfg, dict) and "temperature" in cfg:
+                    raw = cfg["temperature"]
+                    if raw is not None:
+                        parsed = float(raw)
+                        # Clamp to a safe range — reject nonsense values
+                        # that would confuse the LLM provider.
+                        if 0.0 <= parsed <= 2.0:
+                            return parsed
+    except Exception as e:
+        logger.debug(
+            "Could not load per-model temperature for %s: %s", model_name, e
+        )
+
+    if active_llm:
+        raw = active_llm.get("temperature")
+        if raw is not None:
+            try:
+                parsed = float(raw)
+                if 0.0 <= parsed <= 2.0:
+                    return parsed
+            except (ValueError, TypeError):
+                pass
+
+    return None
 
 
 def _is_reasoning_model(model_name: str, active_llm: Optional[Dict[str, Any]] = None) -> bool:
@@ -453,6 +522,22 @@ async def run_instrumented(
                 active_llm["provider_name"] = active_llm.get("provider") or active_llm.get("model")
         active_llm.update(llm_override)
 
+    # [FIX-GENUI-DISK] Populate the rendering configuration from the on-disk
+    # store when the request did not carry an explicit override. This is the
+    # single source of truth for agent dispatch: the frontend no longer
+    # ships `generative_ui` per-request, so without this block the engine
+    # would always see the value as missing and fall back to "disabled".
+    if not active_llm.get("generative_ui"):
+        try:
+            from .generative_ui_store import load_generative_ui_settings
+            active_llm["generative_ui"] = load_generative_ui_settings()
+        except Exception as _genui_err:
+            logger.debug(
+                "Could not load GenUI settings from disk for job %s: %s",
+                job_id,
+                _genui_err,
+            )
+
     if "reasoning_effort" in active_llm and active_llm["reasoning_effort"]:
         raw_eff = str(active_llm["reasoning_effort"]).lower().strip()
         if raw_eff in ("none", "off", "0"):
@@ -531,6 +616,14 @@ async def run_instrumented(
 
     resolved_max_tokens = _resolve_model_max_output_tokens(model_name, active_llm)
     active_llm["max_tokens"] = resolved_max_tokens
+
+    # [FIX-PER-MODEL-TEMP] Apply the per-model temperature override if one
+    # is present in models_budget.json. When absent, the original
+    # active_llm["temperature"] (or the engine's historical default) is
+    # preserved untouched.
+    resolved_temperature = _resolve_model_temperature(model_name, active_llm)
+    if resolved_temperature is not None:
+        active_llm["temperature"] = resolved_temperature
 
     # ─────────────────────────────────────────────────────────────────
     # [FIX-4.2] Resolve user file references and inject their contents
@@ -684,6 +777,20 @@ async def run_direct_chat(
             if "1234" not in str(active_llm.get("base_url", "")):
                 active_llm["provider_name"] = active_llm.get("provider") or active_llm.get("model")
         active_llm.update(llm_override)
+
+    # [FIX-GENUI-DISK] Same fallback as in `run_instrumented`. Direct-chat
+    # dispatch also needs the persisted rendering configuration because the
+    # frontend no longer ships it per message.
+    if not active_llm.get("generative_ui"):
+        try:
+            from .generative_ui_store import load_generative_ui_settings
+            active_llm["generative_ui"] = load_generative_ui_settings()
+        except Exception as _genui_err:
+            logger.debug(
+                "Could not load GenUI settings from disk for job %s: %s",
+                job_id,
+                _genui_err,
+            )
 
     p_cand = active_llm.get("provider_name") or active_llm.get("provider") or ""
     b_cand = str(active_llm.get("base_url") or "")
@@ -862,7 +969,13 @@ async def run_direct_chat(
         max_tokens = _resolve_model_max_output_tokens(model_name, active_llm)
         active_llm["max_tokens"] = max_tokens
 
-
+        # [FIX-PER-MODEL-TEMP] Same override as in `run_instrumented`. The
+        # temperature used by the completion request reflects the per-model
+        # value from models_budget.json when present, otherwise the global
+        # default from config.toml.
+        resolved_temperature = _resolve_model_temperature(model_name, active_llm)
+        if resolved_temperature is not None:
+            active_llm["temperature"] = resolved_temperature
 
         async def _handle_chunk(delta_text: str) -> None:
             await dispatch_event(

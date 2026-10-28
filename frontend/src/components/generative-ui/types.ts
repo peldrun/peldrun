@@ -59,7 +59,14 @@ export interface RenderingLimits {
   /** Maximum number of rows in a single Markdown table. */
   max_table_rows: number;
 
-  /** Maximum output tokens for the model call. Clamped to [512, 8192]. */
+  /**
+   * @deprecated Not consumed by any renderer or backend code path. The
+   * effective `max_tokens` for an LLM call is controlled per-model (via
+   * `config.toml` / `storage/models_budget.json`), not by Generative UI
+   * settings. This field remains in the schema solely to preserve on-disk
+   * compatibility with previously saved settings; the UI no longer exposes
+   * it, and no new code should read or write it.
+   */
   max_output_tokens: number;
 }
 

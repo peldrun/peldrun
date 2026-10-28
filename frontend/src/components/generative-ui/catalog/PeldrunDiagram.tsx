@@ -133,6 +133,80 @@ function simplifyMermaidSource(source: string): string {
     .trim();
 }
 
+/**
+ * Level 2 fallback: builds on `simplifyMermaidSource` by removing constructs
+ * that frequently break Mermaid's strict parser:
+ *
+ *   - `subgraph ... end` blocks (nesting is fragile)
+ *   - Edge labels (`-->|label|`, `-- label -->`) — kept the edges, dropped labels
+ *
+ * Node labels and shapes are preserved, so the diagram remains readable.
+ */
+function aggressivelySimplifyMermaidSource(source: string): string {
+  if (!source) return "";
+
+  let out = simplifyMermaidSource(source);
+
+  // Drop single-level subgraph blocks (nested subgraphs are rare in LLM output
+  // and any nesting left behind will simply fail into the next strategy).
+  out = out.replace(/^\s*subgraph\s+[^\n]*$/gm, "");
+  out = out.replace(/^\s*end\s*$/gm, "");
+
+  // Strip edge labels but keep the edges:
+  //   A -->|label| B      => A --> B
+  //   A -- label --> B    => A --> B
+  //   A -. label .-> B    => A -.-> B
+  out = out.replace(/(-->|---|-\.->|==>)\s*\|[^|\n]*\|/g, "$1");
+  out = out.replace(/\s--\s[^-][^\n]*?\s+-->/g, " -->");
+
+  return out.replace(/\n{2,}/g, "\n").trim();
+}
+
+/**
+ * Level 3 fallback: last-resort structural extraction. Keeps only the
+ * diagram directive and the edges between node IDs. Every node label, shape,
+ * and style is removed.
+ *
+ * The result renders a "bare" topology (nodes as raw IDs, edges connected).
+ * This sacrifices readability for a chance to at least display the structure
+ * when the original source is malformed beyond repair.
+ */
+function minimalMermaidSource(source: string): string {
+  if (!source) return "";
+
+  let out = aggressivelySimplifyMermaidSource(source);
+
+  // Collapse node shapes to bare IDs — order matters, longer forms first.
+  //   A([Label])    => A
+  //   A[[Label]]    => A
+  //   A[(Label)]    => A
+  //   A((Label))    => A
+  //   A[Label]      => A
+  //   A(Label)      => A
+  //   A{Label}      => A
+  out = out.replace(/([A-Za-z0-9_-]+)\s*\(\[.*?\]\)/g, "$1");
+  out = out.replace(/([A-Za-z0-9_-]+)\s*\[\[.*?\]\]/g, "$1");
+  out = out.replace(/([A-Za-z0-9_-]+)\s*\[\(.*?\)\]/g, "$1");
+  out = out.replace(/([A-Za-z0-9_-]+)\s*\(\(.*?\)\)/g, "$1");
+  out = out.replace(/([A-Za-z0-9_-]+)\s*\[.*?\]/g, "$1");
+  out = out.replace(/([A-Za-z0-9_-]+)\s*\(.*?\)/g, "$1");
+  out = out.replace(/([A-Za-z0-9_-]+)\s*\{.*?\}/g, "$1");
+
+  return out.trim();
+}
+
+/**
+ * Ordered fallback strategies for Mermaid rendering. The renderer runs the
+ * first `min(max_retries + 1, length)` of them, skipping strategies whose
+ * output matches the previous candidate (avoids duplicate work).
+ */
+const MERMAID_FALLBACK_STRATEGIES: ReadonlyArray<(src: string) => string> = [
+  (src) => src,
+  simplifyMermaidSource,
+  aggressivelySimplifyMermaidSource,
+  minimalMermaidSource,
+];
+
 // ---------------------------------------------------------------------------
 // Hidden render container
 // ---------------------------------------------------------------------------
@@ -304,12 +378,12 @@ export function PeldrunDiagram({
   const [copied, setCopied] = useState(false);
   const [showSource, setShowSource] = useState(false);
 
-  // Store actions are read through refs so the telemetry effect never
-  // re-runs due to action identity changes.
-  const recordErrorRef = useRef(useGenerativeUIStore.getState().recordError);
-  const recordSuccessRef = useRef(
-    useGenerativeUIStore.getState().recordSuccess
-  );
+  // [FIX-TELEMETRY-2] Previously captured actions via useRef at mount time.
+  // If the store module is re-instantiated (HMR, or persist rehydration),
+  // the captured reference kept mutating the OLD store instance, so counters
+  // incremented there were invisible to components reading the NEW store.
+  // Reading `getState()` at call time always hits the current instance.
+  // (The refs are removed entirely — no need to hold references.)
 
   // Ensures a single diagram instance reports at most one telemetry event
   // per unique source string, even across re-renders.
@@ -317,11 +391,13 @@ export function PeldrunDiagram({
 
   const reactId = useId().replace(/:/g, "_");
 
+  // [FIX-MAX-RETRIES] Subscribe to the user's retry budget so the number of
+  // render attempts reflects the setting in the Settings panel. Previously
+  // the renderer always attempted exactly two strategies regardless of the
+  // configured value.
+  const maxRetries = useGenerativeUIStore((s) => s.max_retries);
+
   const normalizedSource = useMemo(() => normalizeMermaidSource(code), [code]);
-  const simplifiedSource = useMemo(
-    () => simplifyMermaidSource(normalizedSource),
-    [normalizedSource]
-  );
 
   // -------------------------------------------------------------------------
   // Hidden host container lifecycle
@@ -363,18 +439,18 @@ export function PeldrunDiagram({
         return;
       }
 
-      const reportSuccess = () => {
+      const reportSuccess = (latencyMs: number = 0) => {
         if (!telemetry) return;
         if (recordedSourceRef.current === normalizedSource) return;
         recordedSourceRef.current = normalizedSource;
-        recordSuccessRef.current(0);
+        useGenerativeUIStore.getState().recordSuccess(latencyMs);
       };
 
       const reportError = () => {
         if (!telemetry) return;
         if (recordedSourceRef.current === normalizedSource) return;
         recordedSourceRef.current = normalizedSource;
-        recordErrorRef.current("mermaid");
+        useGenerativeUIStore.getState().recordError("mermaid");
       };
 
       try {
@@ -390,7 +466,17 @@ export function PeldrunDiagram({
         mermaid.initialize({
           startOnLoad: false,
           suppressErrorRendering: true,
-          theme: isDark ? "dark" : "neutral",
+          // [FIX-DIAGRAM-COLORS] "neutral" is Mermaid's deliberately
+          // desaturated theme (grayscale nodes, muted borders) intended for
+          // print. It made every diagram look like a wireframe.
+          //
+          // "default" (light) / "dark" (dark) use proper pastel palettes
+          // for node backgrounds, contrasting borders, and colored edges.
+          //
+          // The custom themeVariables below only override `xyChart` and
+          // `gantt` — flowchart / sequence / state / class / ER diagrams
+          // inherit the full built-in palette and render with real colors.
+          theme: isDark ? "dark" : "default",
           securityLevel: "strict",
           fontFamily: "ui-sans-serif, system-ui, sans-serif",
           themeVariables: buildThemeVariables(isDark),
@@ -398,9 +484,27 @@ export function PeldrunDiagram({
           journey: { useMaxWidth: true },
         });
 
-        const attempts: string[] = [normalizedSource];
-        if (simplifiedSource && simplifiedSource !== normalizedSource) {
-          attempts.push(simplifiedSource);
+        // [FIX-MAX-RETRIES] Build the attempt list from `max_retries`.
+        //
+        //   max_retries = 0  →  [original]                       (1 attempt)
+        //   max_retries = 1  →  [original, simplified]           (2 attempts)
+        //   max_retries = 2  →  [original, simp, aggressive]     (3 attempts)
+        //   max_retries ≥ 3  →  all 4 strategies                 (4 attempts)
+        //
+        // Values above 3 saturate at the number of available strategies —
+        // beyond that there is nothing left to simplify, so extra retries
+        // would just repeat the previous candidate.
+        const attemptCap = Math.min(
+          Math.max(0, maxRetries) + 1,
+          MERMAID_FALLBACK_STRATEGIES.length
+        );
+        const attempts: string[] = [];
+        let previousCandidate: string | null = null;
+        for (let i = 0; i < attemptCap; i += 1) {
+          const candidate = MERMAID_FALLBACK_STRATEGIES[i](normalizedSource);
+          if (!candidate || candidate === previousCandidate) continue;
+          attempts.push(candidate);
+          previousCandidate = candidate;
         }
 
         let lastError: unknown = null;
@@ -416,14 +520,20 @@ export function PeldrunDiagram({
           }
 
           try {
+            const _renderStartedAt =
+              typeof performance !== "undefined" ? performance.now() : 0;
             const { svg } = await mermaid.render(renderId, candidate, host);
+            const _renderDurationMs =
+              typeof performance !== "undefined"
+                ? Math.round(performance.now() - _renderStartedAt)
+                : 0;
 
             if (isMounted) {
               const sanitized = sanitizeSvg(svg);
               setSvgHtml(sanitized);
               setError(null);
             }
-            reportSuccess();
+            reportSuccess(_renderDurationMs);
             return;
           } catch (attemptErr) {
             lastError = attemptErr;
@@ -459,7 +569,7 @@ export function PeldrunDiagram({
     return () => {
       isMounted = false;
     };
-  }, [normalizedSource, simplifiedSource, reactId, telemetry]);
+  }, [normalizedSource, maxRetries, reactId, telemetry]);
 
   const handleCopyCode = () => {
     navigator.clipboard.writeText(normalizedSource);

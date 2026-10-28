@@ -319,7 +319,12 @@ export const useGenerativeUIStore = create<RenderingState>()(
           features: { ...current.features, ...(p.features ?? {}) },
           limits: { ...current.limits, ...(p.limits ?? {}) },
           max_retries: p.max_retries ?? current.max_retries,
-          telemetry: { ...EMPTY_TELEMETRY },
+          // [FIX-TELEMETRY-MERGE] Telemetry is NOT part of `partialize`, so
+          // it never appears in `p`. Wiping it here meant any rehydration
+          // (HMR, cross-tab StorageEvent, explicit rehydrate) reset the
+          // counters that had already been incremented in this session.
+          // Preserve the in-memory value on rehydration instead.
+          telemetry: current.telemetry,
         };
       },
     },

@@ -54,6 +54,12 @@ DEFAULT_LIMITS: Dict[str, int] = {
     "max_mermaid_nodes": 40,
     "max_chart_points": 30,
     "max_table_rows": 50,
+    # DEPRECATED: this field is retained only for on-disk compatibility with
+    # previously saved settings. It is NOT consumed by any code path — the
+    # effective `max_tokens` is resolved per-model by
+    # `omweb.agent_bridge_parts.dispatcher._resolve_model_max_output_tokens`
+    # from `active_llm` and `storage/models_budget.json`. Do not introduce
+    # new usages of this field.
     "max_output_tokens": DEFAULT_OUTPUT_TOKENS,
 }
 
@@ -265,6 +271,21 @@ _CODE_RULES = (
     "- Do not wrap ordinary prose in a code block."
 )
 
+# Uses $max_rows as a Template placeholder.
+# Tables are Markdown-native, so they don't require a dedicated feature
+# toggle — they are gated by the same directive-emission rule as
+# `_CODE_RULES`. The row cap is a hard advisory to the model; the renderer
+# itself does not truncate (a truncated table would silently lose data).
+_TABLE_RULES = (
+    "[TABLES]\n"
+    "- Use Markdown pipe tables for structured tabular data.\n"
+    "- Never emit HTML tables; the renderer understands Markdown pipes only.\n"
+    "- Every table must have a header row followed by a separator row "
+    "(`|---|---|`).\n"
+    "- Keep each table at most $max_rows rows; split larger datasets into "
+    "multiple tables with a heading above each."
+)
+
 
 def _build_sections(
     features: Dict[str, bool],
@@ -278,6 +299,17 @@ def _build_sections(
     KeyError at runtime.
     """
     sections: List[str] = [_BASE_RULES]
+
+    # Table constraints are emitted whenever any directive section is
+    # produced (i.e., at least one of mermaid / latex / charts is active).
+    # They are intentionally placed right after the base rules because the
+    # row cap applies regardless of which visual format the model chooses.
+    table_template = Template(_TABLE_RULES)
+    sections.append(
+        table_template.safe_substitute(
+            max_rows=limits["max_table_rows"],
+        )
+    )
 
     if features.get("mermaid"):
         template = Template(_MERMAID_RULES)

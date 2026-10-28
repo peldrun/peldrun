@@ -280,8 +280,6 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
                 s_data["agent_id"] = effective_agent
                 if "reasoning_effort" in llm_override:
                     s_data["reasoning_effort"] = llm_override["reasoning_effort"]
-                if "generative_ui" in llm_override:
-                    s_data["generative_ui"] = llm_override["generative_ui"]
             session_file.write_text(
                 json.dumps(s_data, indent=2, ensure_ascii=False),
                 encoding="utf-8",
