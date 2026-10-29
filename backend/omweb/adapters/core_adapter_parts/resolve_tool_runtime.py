@@ -185,6 +185,7 @@ def resolve_tool_runtime(
     chat_id: Optional[str] = None,
     project_id: Optional[str] = None,
     search_config: Optional[Dict[str, Any]] = None,
+    env_override: Optional[Dict[str, str]] = None,
 ) -> WebToolAdapter:
     """
     Resolve a platform tool ID to an executable ``WebToolAdapter``.
@@ -240,10 +241,6 @@ def resolve_tool_runtime(
             #   2. Server was toggled from "active" to "ready" mid-run.
             #   3. Server configuration (command / url / env) was edited
             #      after the pool had already captured the old manifest.
-            # Case 3 still depends on cache invalidation (Phase 7) to
-            # fully rebuild the underlying transport; this re-fetch at
-            # least ensures the status gate and command signature match
-            # the current on-disk manifest.
             fresh_manifest = extension_registry.get_effective_server(mcp_server_id)
             if not fresh_manifest:
                 raise RuntimeError(
@@ -253,10 +250,144 @@ def resolve_tool_runtime(
                 raise RuntimeError(
                     f"MCP server '{mcp_server_id}' is not active."
                 )
+
+            # ── Lazy MCP auth resolution ──────────────────────────
+            # This is the ONLY place where per-chat credentials are
+            # resolved for MCP. Running it here — instead of eagerly
+            # in peldrun_engine before the model is even called —
+            # makes "hi" work without opening the auth modal, while
+            # still prompting correctly the moment the agent
+            # actually tries to use an MCP tool.
+            #
+            # We deliberately do NOT rely on the caller's
+            # ``env_override`` being non-None for auth-required
+            # servers: the pre-flight gate was removed because it
+            # fired on every message regardless of whether MCP was
+            # needed.
+            effective_env_override = env_override
+
+            if effective_env_override is None and job_id and chat_id:
+                from omweb.extensions.chat_mcp_auth import (
+                    get_chat_mcp_auth_store,
+                )
+                from omweb.extensions.mcp_auth_state import (
+                    manifest_needs_auth,
+                    mark_auth_required,
+                )
+
+                store = get_chat_mcp_auth_store()
+                mode = store.get_mode(chat_id, mcp_server_id)
+
+                if mode == "custom":
+                    env = store.get_env(chat_id, mcp_server_id) or {}
+                    oauth = store.get_oauth_tokens(chat_id, mcp_server_id)
+                    if isinstance(oauth, dict) and oauth.get("access_token"):
+                        env = dict(env)
+                        env["_oauth_access_token"] = str(oauth["access_token"])
+                        env["_oauth_token_type"] = str(
+                            oauth.get("token_type") or "Bearer"
+                        )
+                    effective_env_override = env or None
+                elif mode == "ephemeral":
+                    env = store.get_ephemeral(chat_id, mcp_server_id) or {}
+                    oauth = store.get_ephemeral_oauth(chat_id, mcp_server_id)
+                    if isinstance(oauth, dict) and oauth.get("access_token"):
+                        env = dict(env)
+                        env["_oauth_access_token"] = str(oauth["access_token"])
+                        env["_oauth_token_type"] = str(
+                            oauth.get("token_type") or "Bearer"
+                        )
+                    effective_env_override = env or None
+                elif mode == "use_global":
+                    # Fall through to global settings via mcp_pool.
+                    effective_env_override = None
+                elif mode is None:
+                    # No decision recorded. If the server genuinely
+                    # requires credentials, signal the engine, emit
+                    # the SSE event, and raise so this tool call
+                    # fails cleanly.
+                    if manifest_needs_auth(fresh_manifest):
+                        mark_auth_required(
+                            job_id,
+                            chat_id=chat_id,
+                            server_id=mcp_server_id,
+                            manifest=fresh_manifest,
+                        )
+
+                        try:
+                            from omweb.job_manager import job_manager
+                            from omweb.sse_events import (
+                                SSEEvent,
+                                SSEEventType,
+                                dispatch_event,
+                            )
+
+                            await dispatch_event(
+                                job_id,
+                                SSEEvent(
+                                    type=SSEEventType.MCP_AUTH_REQUIRED,
+                                    step=0,
+                                    data={
+                                        "server_id": mcp_server_id,
+                                        "server_name": (
+                                            fresh_manifest.get("name")
+                                            or mcp_server_id
+                                        ),
+                                        "auth_method": str(
+                                            fresh_manifest.get("auth_strategy")
+                                            or "env"
+                                        ),
+                                        "env_schema": fresh_manifest.get(
+                                            "env_schema"
+                                        ),
+                                        "oauth_supported": bool(
+                                            fresh_manifest.get("url")
+                                        ),
+                                        "chat_id": chat_id,
+                                        "seq": 0,
+                                    },
+                                ),
+                            )
+                            job_manager.fail_job(
+                                job_id,
+                                f"MCP_AUTH_REQUIRED: MCP server "
+                                f"'{mcp_server_id}' requires authentication "
+                                f"for this chat.",
+                            )
+                        except Exception as emit_err:  # noqa: BLE001
+                            logger.warning(
+                                "Failed to emit mcp_auth_required event: %s",
+                                emit_err,
+                            )
+
+                        # Best-effort cancel so the agent loop does
+                        # not keep taking additional steps after
+                        # auth failure. Not fatal if it throws — the
+                        # engine's post-run auth check handles the
+                        # outcome either way.
+                        try:
+                            from peldrun.runtime.executor import (
+                                core_executor as _core_executor,
+                            )
+
+                            _core_executor.cancel(job_id)
+                        except Exception as cancel_err:  # noqa: BLE001
+                            logger.debug(
+                                "Could not cancel run after auth failure: %s",
+                                cancel_err,
+                            )
+
+                        raise RuntimeError(
+                            f"MCP_AUTH_REQUIRED: The '{mcp_server_id}' MCP "
+                            f"server requires credentials for this chat. "
+                            f"Authenticate and retry."
+                        )
+
             client = await mcp_session_pool.get_or_create_client(
                 server_id=mcp_server_id,
                 manifest=fresh_manifest,
                 workspace_root=str(ws_path),
+                env_override=effective_env_override,
             )
             return await client.call_tool(
                 tool_name=mcp_remote_name,

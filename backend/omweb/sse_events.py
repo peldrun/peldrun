@@ -62,6 +62,24 @@ class SSEEventType(str, Enum):
     # the frontend to display a "Referenced files" chip in the timeline.
     REFS_RESOLVED = "refs_resolved"
 
+    # MCP Authentication Events
+    # Emitted by the execution engine when an MCP server requires
+    # user-provided credentials (OAuth or env vars) and no decision
+    # has been recorded for the current chat. The frontend responds
+    # by opening the per-chat auth modal.
+    #
+    # Payload shape:
+    #   {
+    #     "server_id": "<id>",
+    #     "server_name": "<display name>",
+    #     "auth_method": "oauth" | "env",
+    #     "env_schema": {...} | None,
+    #     "oauth_supported": bool,
+    #     "chat_id": "<id>",
+    #     "model": "<model name>"
+    #   }
+    MCP_AUTH_REQUIRED = "mcp_auth_required"
+
     # Terminal Events
     FINAL = "final"
     ERROR = "error"
@@ -143,12 +161,18 @@ async def subscribe_events(
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=keepalive_interval)
                 yield event
-
                 if event.type in (
                     SSEEventType.FINAL,
                     SSEEventType.ERROR,
                     SSEEventType.CANCELLED,
                     SSEEventType.DONE,
+                    # MCP_AUTH_REQUIRED is terminal from the stream's
+                    # perspective: the underlying job has already been
+                    # failed server-side (see resolve_tool_runtime's
+                    # lazy MCP auth check). No further events will arrive
+                    # on this stream, so the generator must exit rather
+                    # than keep emitting PING heartbeats forever.
+                    SSEEventType.MCP_AUTH_REQUIRED,
                 ):
                     break
             except asyncio.TimeoutError:

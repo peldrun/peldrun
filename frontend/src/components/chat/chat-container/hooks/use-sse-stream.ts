@@ -19,6 +19,39 @@ import type {
   UsageMetrics,
 } from "../types";
 
+/**
+ * Metadata for an MCP server that requires credentials before it can
+ * be used in the current chat.
+ *
+ * Emitted by the backend's pre-flight auth gate as an SSE
+ * `mcp_auth_required` event. The corresponding job is already in a
+ * failed state server-side, so the stream is closed immediately after
+ * this payload reaches the container.
+ *
+ * The container is responsible for:
+ *   1. Opening the auth modal with this payload.
+ *   2. Recording the user's choice via the appropriate /mcp-auth
+ *      endpoint.
+ *   3. Re-issuing POST /api/run with the same prompt so the fresh
+ *      job picks up the newly-recorded credentials.
+ */
+export interface McpAuthRequiredPayload {
+  /** Registry id of the MCP server (e.g. "mcp_github"). */
+  serverId: string;
+
+  /** Human-friendly display name for the modal heading. */
+  serverName: string;
+
+  /** Declared mechanism: "oauth" | "env" | "apikey" | "bearer" | etc. */
+  authMethod: string;
+
+  /** Raw JSON Schema for env vars (used to render the form), or null. */
+  envSchema: Record<string, unknown> | null;
+
+  /** Whether the server exposes an HTTP URL, i.e. can do OAuth. */
+  oauthSupported: boolean;
+}
+
 interface UseSseStreamParams {
   currentStepNumRef: React.MutableRefObject<number>;
   activeChatIdRef: React.MutableRefObject<string | null>;
@@ -40,6 +73,14 @@ interface UseSseStreamParams {
     React.SetStateAction<Record<string, DelegationApprovalRequest>>
   >;
   fetchJobFiles: (jobId: string) => void;
+
+  /**
+   * Invoked when the backend emits `mcp_auth_required`. The container
+   * uses this to open the per-chat authentication modal. Optional so
+   * existing call sites that do not need MCP auth are unaffected —
+   * the handler path simply becomes a no-op.
+   */
+  onMcpAuthRequired?: (payload: McpAuthRequiredPayload) => void;
 }
 
 /**
@@ -424,6 +465,97 @@ export function useSseStream(params: UseSseStreamParams) {
                 chatId: ctx.activeChatIdRef.current,
                 jobId,
                 status: "completed",
+              },
+            })
+          );
+          window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
+        }
+      } else if (eventType === "mcp_auth_required") {
+        // ── MCP per-chat authentication gate ────────────────────────
+        //
+        // The backend's pre-flight check in peldrun_engine rejected
+        // the run because an MCP server declared in the agent's
+        // manifest requires credentials that have no recorded decision
+        // for this chat. The job has already been marked failed
+        // server-side, so this stream will receive no further events.
+        //
+        // Behaviour:
+        //   1. Surface metadata to the container via the callback.
+        //      The container opens the auth modal. If the callback is
+        //      absent (older integrations), we still close the stream
+        //      and show the fallback message.
+        //   2. Set a visible terminal message. If the user closes the
+        //      modal without authenticating, this message explains
+        //      the failure. If they do authenticate, the container
+        //      will re-issue the run with the same prompt and start a
+        //      new stream.
+        //   3. Mark the run "failed" — the backend status reflects
+        //      that the run has terminated; the modal is the "auth
+        //      in progress" surface.
+        //   4. Do NOT touch humanQuery. A pending ask_human card, if
+        //      any, must survive this event unchanged.
+        const serverId = String(payload.data?.server_id || "");
+        const serverName = String(
+          payload.data?.server_name || serverId || "MCP server"
+        );
+        const authMethod = String(payload.data?.auth_method || "env");
+        const oauthSupported = Boolean(payload.data?.oauth_supported);
+        const envSchema =
+          payload.data?.env_schema &&
+          typeof payload.data.env_schema === "object"
+            ? (payload.data.env_schema as Record<string, unknown>)
+            : null;
+
+        // Do NOT set finalResult to a big red error box here.
+        // The modal opens automatically and guides the user. If
+        // the user closes the modal, the turn simply ends with no
+        // visual error, which is much cleaner than a red block.
+        ctx.setFinalResult(null);
+        ctx.setStatus("idle"); // Hide the spinner
+
+        // Note: The backend already failed the job. If the user
+        // dismisses the modal, they can just re-send their prompt.
+
+        if (typeof window !== "undefined") {
+          logEntry(
+            `[${logTimestamp}] [MCP_AUTH_REQUIRED] ${serverName} — ${authMethod}`
+          );
+          window.dispatchEvent(new CustomEvent("peldrun:run-completed"));
+        }
+
+        ctx.fetchJobFiles(jobId);
+
+        // Forward to the container so it can open the auth modal.
+        // A throwing callback must NOT prevent us from closing the
+        // stream — the stream is already dead from the backend's
+        // perspective, and leaving it open only delays the retry.
+        try {
+          ctx.onMcpAuthRequired?.({
+            serverId,
+            serverName,
+            authMethod,
+            envSchema,
+            oauthSupported,
+          });
+        } catch (cbErr) {
+          if (DEBUG_SSE) {
+            console.warn(
+              "[SSE] onMcpAuthRequired callback threw; stream will still close:",
+              cbErr
+            );
+          }
+        }
+
+        intentionallyClosed = true;
+        es.close();
+
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(
+            new CustomEvent("omweb:chat-status-changed", {
+              detail: {
+                chatId: ctx.activeChatIdRef.current,
+                jobId,
+                status: "failed",
               },
             })
           );

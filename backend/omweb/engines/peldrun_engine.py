@@ -140,6 +140,82 @@ def _collect_specialist_tool_allowlists(
     return specialist_map
 
 
+# ---------------------------------------------------------------------------
+# MCP per-chat authentication helpers
+# ---------------------------------------------------------------------------
+#
+# The engine no longer enforces MCP auth eagerly. It resolves whatever
+# per-chat credentials the user has ALREADY recorded so that tool
+# discovery works with the correct auth context, and defers enforcement
+# to the MCP tool executor in resolve_tool_runtime.py — see
+# _mcp_tool_executor. That design makes "hi" work without opening the
+# auth modal, while still prompting correctly the moment the agent
+# actually tries to use an MCP tool.
+#
+# The helper below is pure and side-effect free. All SSE emission,
+# job-failure signalling, and run cancellation live in:
+#   * omweb.extensions.mcp_auth_state   (state registry)
+#   * omweb.adapters.core_adapter_parts.resolve_tool_runtime (lazy gate)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_mcp_env_optional(
+    *,
+    chat_id: str,
+    server_id: str,
+) -> Optional[Dict[str, str]]:
+    """
+    Return the per-chat env override for an MCP server, or None.
+
+    Unlike `_ensure_mcp_auth`, this function has NO side effects: it
+    does not emit SSE events, does not fail the job, and does not
+    raise. It simply reports what credentials (if any) the user has
+    already recorded for this chat.
+
+    Used only for tool *discovery* so the agent sees the correct
+    tool list. Auth enforcement happens lazily inside the MCP tool
+    executor at invocation time.
+
+    Returns:
+      * The env dict (with OAuth meta-keys when applicable) if the
+        user recorded "custom" or "ephemeral" credentials.
+      * None if there is no decision, or the decision was "use_global"
+        (the caller should then fall back to settings_manager).
+    """
+    from omweb.extensions.chat_mcp_auth import (
+        MODE_CUSTOM,
+        MODE_EPHEMERAL,
+        get_chat_mcp_auth_store,
+    )
+
+    store = get_chat_mcp_auth_store()
+    mode = store.get_mode(chat_id, server_id)
+
+    if mode == MODE_CUSTOM:
+        env = store.get_env(chat_id, server_id) or {}
+        oauth = store.get_oauth_tokens(chat_id, server_id)
+        if isinstance(oauth, dict) and oauth.get("access_token"):
+            env = dict(env)
+            env["_oauth_access_token"] = str(oauth["access_token"])
+            env["_oauth_token_type"] = str(
+                oauth.get("token_type") or "Bearer"
+            )
+        return env or None
+
+    if mode == MODE_EPHEMERAL:
+        env = store.get_ephemeral(chat_id, server_id) or {}
+        oauth = store.get_ephemeral_oauth(chat_id, server_id)
+        if isinstance(oauth, dict) and oauth.get("access_token"):
+            env = dict(env)
+            env["_oauth_access_token"] = str(oauth["access_token"])
+            env["_oauth_token_type"] = str(
+                oauth.get("token_type") or "Bearer"
+            )
+        return env or None
+
+    return None
+
+
 class PeldrunEngine(ExecutionEngine):
     """Isolated Web execution adapter powered by local PELDRUN Core."""
 
@@ -465,6 +541,98 @@ class PeldrunEngine(ExecutionEngine):
                 )
                 target_mcp_servers = []
 
+        # ── Lazy MCP credential resolution (NO pre-flight gate) ────
+        #
+        # We deliberately do NOT fail the run up-front when an MCP
+        # server requires credentials that have not been recorded for
+        # this chat. Doing so broke the simple case: sending "hi"
+        # through an agent that happens to have an authenticated MCP
+        # server bound used to fail immediately without the model
+        # ever being called.
+        #
+        # Instead, credentials are resolved here on a best-effort
+        # basis for tool DISCOVERY (so the agent knows which MCP
+        # tools it could use), and the actual auth check is deferred
+        # to the moment the agent tries to invoke an MCP tool — see
+        # ``_mcp_tool_executor`` in resolve_tool_runtime.py.
+        #
+        # A server that requires auth and has no decision simply
+        # contributes no MCP tools to this run. If the user's
+        # request genuinely needs them, the agent will try to call
+        # one, the executor will detect the missing auth, and the
+        # modal will open exactly when it's needed.
+        env_overrides: Dict[str, Optional[Dict[str, str]]] = {}
+        for srv in target_mcp_servers:
+            pre_sid = srv.get("id")
+            if not pre_sid:
+                continue
+            env_overrides[pre_sid] = _resolve_mcp_env_optional(
+                chat_id=chat_id,
+                server_id=pre_sid,
+            )
+
+        # ── Inject MCP access hint into system prompt ─────────────
+        # Some models (e.g. GigaChat) hallucinate and refuse to use
+        # MCP tools if they see a past "Authentication Required" error
+        # in the conversation history. This block explicitly informs
+        # the model that it has active, working access to these servers.
+        _authenticated_mcp_servers = []
+        if target_mcp_servers:
+            from omweb.extensions.chat_mcp_auth import get_chat_mcp_auth_store
+            from omweb.extensions.mcp_auth_state import manifest_needs_auth
+
+            _auth_store = get_chat_mcp_auth_store()
+            for srv in target_mcp_servers:
+                s_id = srv.get("id")
+                if not s_id:
+                    continue
+                mode = _auth_store.get_mode(chat_id, s_id)
+                # It is "authenticated" if the user made a choice OR
+                # if the server doesn't actually need auth.
+                if mode in ("custom", "use_global", "ephemeral") or not manifest_needs_auth(srv):
+                    _authenticated_mcp_servers.append(srv.get("name") or s_id)
+
+        if _authenticated_mcp_servers:
+            system_prompt = system_prompt.rstrip() + (
+                "\n\n[MCP SERVER ACCESS]\n"
+                "You have active, authenticated access to the following MCP servers: "
+                + ", ".join(_authenticated_mcp_servers)
+                + ".\n"
+                "Use their tools freely to accomplish the user's task. "
+                "Do NOT refuse to use them or claim you lack access."
+            )
+
+        # ── Inject MCP access hint into system prompt ─────────────
+        # Some models (e.g. GigaChat) hallucinate and refuse to use
+        # MCP tools if they see a past "Authentication Required" error
+        # in the conversation history. This block explicitly informs
+        # the model that it has active, working access to these servers.
+        _authenticated_mcp_servers = []
+        if target_mcp_servers:
+            from omweb.extensions.chat_mcp_auth import get_chat_mcp_auth_store
+            from omweb.extensions.mcp_auth_state import manifest_needs_auth
+
+            _auth_store = get_chat_mcp_auth_store()
+            for srv in target_mcp_servers:
+                s_id = srv.get("id")
+                if not s_id:
+                    continue
+                mode = _auth_store.get_mode(chat_id, s_id)
+                # It is "authenticated" if the user made a choice OR
+                # if the server doesn't actually need auth.
+                if mode in ("custom", "use_global", "ephemeral") or not manifest_needs_auth(srv):
+                    _authenticated_mcp_servers.append(srv.get("name") or s_id)
+
+        if _authenticated_mcp_servers:
+            system_prompt = system_prompt.rstrip() + (
+                "\n\n[MCP SERVER ACCESS]\n"
+                "You have active, authenticated access to the following MCP servers: "
+                + ", ".join(_authenticated_mcp_servers)
+                + ".\n"
+                "Use their tools freely to accomplish the user's task. "
+                "Do NOT refuse to use them or claim you lack access."
+            )
+
         # Discover tools from every target server CONCURRENTLY. A
         # serial loop here contributed N × probe-timeout to the total
         # pre-task latency, so 3 wedged servers would delay the run
@@ -478,14 +646,20 @@ class PeldrunEngine(ExecutionEngine):
         #       cached lookups per warm server;
         #   (b) the pooled persistent client is reused across runs
         #       instead of spawning a disposable subprocess per step.
+        #
+        # The per-chat env_override resolved in the pre-flight gate
+        # above is forwarded to get_tools so both the MCP client's
+        # credentials and the tool-cache key are scoped to the chat.
         async def _probe_one(
             srv: Dict[str, Any],
         ) -> Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]:
             try:
+                srv_id_probe = srv.get("id", "")
                 tools = await mcp_session_pool.get_tools(
-                    server_id=srv.get("id", ""),
+                    server_id=srv_id_probe,
                     manifest=srv,
                     workspace_root=ws_path_str,
+                    env_override=env_overrides.get(srv_id_probe),
                 )
                 return srv, list(tools or [])
             except Exception as exc:
@@ -539,6 +713,13 @@ class PeldrunEngine(ExecutionEngine):
                         },
                         workspace_root=ws_path,
                         registry=web_tool_registry,
+                        # job_id and chat_id are required so the
+                        # executor can perform lazy per-chat auth
+                        # resolution at tool-call time. No env_override
+                        # is passed: the executor always checks the
+                        # store first, then falls back to global.
+                        job_id=job_id,
+                        chat_id=chat_id,
                     )
                 except Exception as reg_exc:
                     logger.warning(
@@ -920,6 +1101,29 @@ class PeldrunEngine(ExecutionEngine):
             await _sync_and_dispatch_artifacts(run_result.total_steps or current_core_step)
             await event_queue.put(None)
             await consumer_task
+
+            # ── Post-run auth check ───────────────────────────────
+            # If a lazy MCP auth failure occurred during the run, the
+            # MCP tool executor has already:
+            #   1. Recorded the failure in mcp_auth_state.
+            #   2. Emitted the mcp_auth_required SSE event (modal opens).
+            #   3. Called job_manager.fail_job with the correct message.
+            #   4. Signalled core_executor.cancel (best-effort).
+            #
+            # Our only responsibility here is to NOT overwrite that
+            # failure with a successful completion. We simply return.
+            from omweb.extensions.mcp_auth_state import pop_auth_required
+
+            _auth_flag = pop_auth_required(job_id)
+            if _auth_flag:
+                logger.info(
+                    "[MCP AUTH] Job %s terminated due to lazy auth "
+                    "requirement for server '%s' (chat=%s)",
+                    job_id,
+                    _auth_flag.get("server_id"),
+                    _auth_flag.get("chat_id"),
+                )
+                return
 
         except asyncio.CancelledError:
             core_executor.cancel(job_id)

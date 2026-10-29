@@ -50,6 +50,7 @@ from omweb.routers import (
     files,
     generative_ui_rtr,
     mcp,
+    mcp_auth,
     resource_monitor,
     run,
     search_rtr,
@@ -227,6 +228,14 @@ app.include_router(source_control.router)
 # NOTE: The router defines its internal prefix as `/api/resource-monitor`
 # (see `routers/resource_monitor.py`). Do NOT pass a `prefix=` argument here.
 app.include_router(resource_monitor.router)
+
+# MCP OAuth 2.1 and per-chat credentials router.
+#
+# NOTE: This router defines its internal paths with absolute prefixes
+# (`/api/chats/...` and `/api/mcp/...`). Do NOT pass a prefix= argument
+# here, or the paths would be double-prefixed. This matches the
+# source_control and resource_monitor router convention.
+app.include_router(mcp_auth.router)
 
 # Mount Storage Filesystem for Deliverables and Downloads
 STORAGE_ROOT.mkdir(parents=True, exist_ok=True)

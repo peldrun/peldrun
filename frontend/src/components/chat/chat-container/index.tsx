@@ -58,7 +58,10 @@ import { useMetadataVault } from "./hooks/use-metadata-vault";
 import { useElapsedTimer } from "./hooks/use-elapsed-timer";
 import { useJobFiles } from "./hooks/use-job-files";
 import { useSseStream } from "./hooks/use-sse-stream";
+import type { McpAuthRequiredPayload } from "./hooks/use-sse-stream";
 import { useJobDetails } from "./hooks/use-job-details";
+import { MCPAuthModal } from "@/components/chat/mcp-auth/MCPAuthModal";
+import { showToast } from "@/components/ui/ToastNotification";
 
 export type { ChatContainerProps };
 
@@ -109,6 +112,15 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   const [pendingApprovals, setPendingApprovals] = useState<
     Record<string, DelegationApprovalRequest>
   >({});
+
+  // Payload of the in-flight MCP authentication request, or null when
+  // no modal is open. Populated by the SSE handler when the backend
+  // emits `mcp_auth_required` (see use-sse-stream.ts). Cleared either
+  // by the modal's onClose (user declined) or by onSuccess after a
+  // decision has been recorded, at which point the container re-issues
+  // POST /api/run with the same prompt.
+  const [mcpAuthRequiredPayload, setMcpAuthRequiredPayload] =
+    useState<McpAuthRequiredPayload | null>(null);
 
   // --- Persisted user preferences ------------------------------------------
   //
@@ -291,6 +303,10 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     setActiveChildRuns,
     setPendingApprovals,
     fetchJobFiles,
+    // Opens the per-chat MCP auth modal. The SSE handler calls this
+    // before closing the stream, so we still get the payload even
+    // though the underlying job has already failed server-side.
+    onMcpAuthRequired: setMcpAuthRequiredPayload,
   });
 
   const fetchJobDetails = useJobDetails({
@@ -457,6 +473,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     setSourceControlDefaultMode("browse");
     setActiveChildRuns({});
     setPendingApprovals({});
+    setMcpAuthRequiredPayload(null);
     router.push("/chat");
   }, [
     closeStream,
@@ -609,7 +626,8 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     async (
       customPrompt?: string,
       customOverride?: any,
-      filesToUpload?: File[]
+      filesToUpload?: File[],
+      isAuthRetry: boolean = false
     ): Promise<{ accepted: true; jobId: string; chatId: string }> => {
       const rawText = (
         customPrompt !== undefined ? customPrompt : inputValue
@@ -882,6 +900,53 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       setElapsedSeconds,
     ]
   );
+
+  // --- MCP Authentication Handlers ------------------------------------------
+  //
+  // Flow recap:
+  //   1. Backend emits `mcp_auth_required` with a per-server payload.
+  //   2. use-sse-stream forwards it via setMcpAuthRequiredPayload and
+  //      closes the stream. The job is already failed server-side.
+  //   3. The modal records the user's decision via one of the three
+  //      /mcp-auth endpoints (or completes an OAuth flow in a popup).
+  //   4. onSuccess fires: we clear the payload and re-issue
+  //      POST /api/run with the SAME prompt. The `activeChatId` is
+  //      preserved, so the backend picks up the newly-recorded
+  //      credentials and the run proceeds normally.
+  //
+  // If the user dismisses the modal without deciding, onClose fires:
+  // we clear the payload and leave the UI on the failed turn, whose
+  // finalResult already explains that authentication is required.
+  const handleMcpAuthSuccess = useCallback(() => {
+    const promptToRetry = submittedPrompt;
+    setMcpAuthRequiredPayload(null);
+
+    if (!promptToRetry) {
+      showToast.error(
+        "Retry Failed",
+        "The original prompt is no longer available. Please re-send it."
+      );
+      return;
+    }
+
+    // Delegate to the normal dispatch path. handleStartTask archives
+    // the current (failed-auth) turn into historyTurns, resets the
+    // current-run state, and issues POST /api/run against the same
+    // chat_id. Its returned promise is intentionally not awaited here:
+    // the modal has already closed, and any failure surfaces through
+    // the toast below.
+    handleStartTask(promptToRetry).catch((err: any) => {
+      console.error("[ChatContainer] MCP auth retry failed:", err);
+      showToast.error(
+        "Retry Failed",
+        err?.message || "Could not resume the task after authentication."
+      );
+    });
+  }, [submittedPrompt, handleStartTask]);
+
+  const handleMcpAuthClose = useCallback(() => {
+    setMcpAuthRequiredPayload(null);
+  }, []);
 
   // --- Turn Regeneration Handler --------------------------------------------
   const handleRegenerate = useCallback(
@@ -1258,6 +1323,28 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
             />
           )}
         </div>
+      )}
+
+      {/* MCP per-chat authentication modal.
+       *
+       * The wrapper is a `fixed inset-0` overlay, so its position in the
+       * DOM tree does not affect layout. We render it as the last child
+       * of the root flex container to keep the sibling tree tidy.
+       *
+       * The `activeChatId` guard is defensive: in practice the backend
+       * sets chat_id on every successful POST /api/run, so SSE for an
+       * in-flight job always reaches us with a valid chat. But typing
+       * requires the explicit string guard, and if the invariant ever
+       * regressed we would simply not open the modal rather than crash
+       * with a null prop. */}
+      {activeChatId && mcpAuthRequiredPayload && (
+        <MCPAuthModal
+          open={!!mcpAuthRequiredPayload}
+          payload={mcpAuthRequiredPayload}
+          chatId={activeChatId}
+          onClose={handleMcpAuthClose}
+          onSuccess={handleMcpAuthSuccess}
+        />
       )}
     </div>
   );

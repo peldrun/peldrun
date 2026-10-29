@@ -39,41 +39,193 @@ class McpSettingsManager:
         self.settings_dir = self.storage_dir / "store" / "extensions" / "settings"
         self.settings_dir.mkdir(parents=True, exist_ok=True)
 
+        # Initialize secret storage eagerly: a corrupt key must fail fast
+        # at startup, not silently fall back to plaintext writes.
+        # Lazy import avoids a circular dependency at module load time.
+        from omweb.extensions.secret_storage import get_global_secret_storage
+
+        self._secrets = get_global_secret_storage()
+
+        # One-time migration of any legacy plaintext env blocks.
+        # Idempotent: files already carrying env_enc are skipped.
+        try:
+            migrated = self.migrate_plaintext_files()
+            if migrated:
+                logger.info(
+                    "Migrated %d plaintext settings file(s) to encrypted storage.",
+                    migrated,
+                )
+        except Exception as exc:  # noqa: BLE001
+            # Migration failure must not prevent the app from starting,
+            # but it must be loud enough to notice in logs.
+            logger.warning("Startup plaintext migration failed: %s", exc)
+
     def _get_server_file_path(self, server_id: str) -> Path:
         """Resolve the atomic storage file path for a given MCP server identifier."""
         safe_id = "".join(c for c in server_id if c.isalnum() or c in ("-", "_"))
         return self.settings_dir / f"{safe_id}.json"
 
     def _read_server_payload(self, server_id: str) -> Dict[str, Any]:
-        """Read the raw persisted configuration container for the server."""
+        """
+        Read and normalize the persisted configuration container.
+
+        The on-disk format has two eras:
+          * v2 (current): {"settings": {...}, "env_enc": "<base64>", "schema_version": 2}
+          * v1 (legacy):  {"settings": {...}, "env": {...}}            ← plaintext
+
+        Decryption is attempted only when env_enc is present. If the
+        ciphertext cannot be decrypted (tampered, wrong key), we return
+        an empty env rather than silently serving stale plaintext —
+        failing closed is the correct behavior for a secret store.
+        """
         path = self._get_server_file_path(server_id)
         if not path.exists():
             return {"settings": {}, "env": {}}
+
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return {
-                    "settings": data.get("settings", {}) if isinstance(data.get("settings"), dict) else {},
-                    "env": data.get("env", {}) if isinstance(data.get("env"), dict) else {},
-                }
         except Exception as exc:
-            logger.warning("Failed to parse settings container for MCP server '%s': %s", server_id, exc)
-        return {"settings": {}, "env": {}}
+            logger.warning(
+                "Failed to parse settings container for MCP server '%s': %s",
+                server_id,
+                exc,
+            )
+            return {"settings": {}, "env": {}}
+
+        if not isinstance(data, dict):
+            return {"settings": {}, "env": {}}
+
+        settings = data.get("settings", {})
+        if not isinstance(settings, dict):
+            settings = {}
+
+        env: Dict[str, Any] = {}
+        env_enc = data.get("env_enc")
+        if isinstance(env_enc, str) and env_enc:
+            # v2 path: decrypt
+            try:
+                plaintext = self._secrets.decrypt(
+                    env_enc, aad=f"global:{server_id}"
+                )
+                parsed = json.loads(plaintext)
+                if isinstance(parsed, dict):
+                    env = parsed
+            except Exception as exc:
+                logger.warning(
+                    "Failed to decrypt env for MCP server '%s': %s",
+                    server_id,
+                    exc,
+                )
+                # Do NOT fall back to plaintext if env_enc exists but
+                # failed — that would mask corruption or a wrong key.
+        else:
+            # v1 path: legacy plaintext (migrated on next write or by
+            # the startup migration routine).
+            legacy = data.get("env", {})
+            if isinstance(legacy, dict):
+                env = legacy
+
+        return {"settings": settings, "env": env}
 
     def _write_server_payload(self, server_id: str, payload: Dict[str, Any]) -> None:
-        """Write configuration container to disk atomically using os.replace."""
+        """
+        Persist the configuration container atomically (write + rename).
+
+        Security invariants enforced here:
+          * ``env`` is ALWAYS encrypted before reaching the disk. There
+            is no code path that writes plaintext credentials.
+          * ``env_enc`` is omitted entirely when ``env`` is empty — no
+            point encrypting the empty object, and omitting it keeps
+            the v1/v2 read logic unambiguous.
+          * The AAD binds the ciphertext to ``global:{server_id}`` so a
+            token copied from server A cannot be presented as server B.
+        """
         path = self._get_server_file_path(server_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = path.with_suffix(".tmp")
 
+        settings = payload.get("settings", {}) or {}
+        env = payload.get("env", {}) or {}
+
+        disk_payload: Dict[str, Any] = {
+            "settings": settings if isinstance(settings, dict) else {},
+            "schema_version": 2,
+        }
+
+        if isinstance(env, dict) and env:
+            env_json = json.dumps(env, ensure_ascii=False)
+            disk_payload["env_enc"] = self._secrets.encrypt(
+                env_json, aad=f"global:{server_id}"
+            )
+
         try:
-            tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            tmp_path.write_text(
+                json.dumps(disk_payload, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
             os.replace(tmp_path, path)
         except Exception as exc:
             if tmp_path.exists():
-                tmp_path.unlink()
-            logger.error("Failed to atomically save configuration for MCP server '%s': %s", server_id, exc)
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            logger.error(
+                "Failed to atomically save configuration for MCP server '%s': %s",
+                server_id,
+                exc,
+            )
             raise
+
+    def migrate_plaintext_files(self) -> int:
+        """
+        Encrypt every legacy plaintext ``env`` block found under settings/.
+
+        Returns the number of files migrated. Idempotent: files that
+        already carry a non-empty ``env_enc`` are skipped, so running
+        this on every process start is safe.
+
+        Failure to migrate a single file is logged and skipped — one
+        broken JSON does not block the rest of the sweep.
+        """
+        migrated = 0
+        if not self.settings_dir.exists():
+            return 0
+
+        for path in self.settings_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    continue
+
+                # Already migrated?
+                env_enc = data.get("env_enc")
+                if isinstance(env_enc, str) and env_enc:
+                    continue
+
+                legacy_env = data.get("env")
+                if not isinstance(legacy_env, dict) or not legacy_env:
+                    # Nothing to encrypt (empty or missing env).
+                    continue
+
+                server_id = path.stem
+                # Route through the normal writer so encryption and
+                # atomic-rename semantics are identical to save_env().
+                self._write_server_payload(
+                    server_id,
+                    {
+                        "settings": data.get("settings", {}) or {},
+                        "env": legacy_env,
+                    },
+                )
+                migrated += 1
+                logger.info(
+                    "Migrated plaintext env for MCP server '%s'", server_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to migrate %s: %s", path, exc)
+
+        return migrated
 
     def _extract_defaults(self, schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """Extract default values declared within a JSON schema properties block."""

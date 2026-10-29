@@ -16,6 +16,8 @@ Responsibilities:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import shlex
@@ -42,6 +44,100 @@ logger = logging.getLogger("omweb.extensions.mcp_pool")
 DEFAULT_CACHE_TTL_SECONDS: float = 300.0
 
 
+# ---------------------------------------------------------------------------
+# Per-chat credential override contract
+# ---------------------------------------------------------------------------
+#
+# When ``env_override`` is passed to get_or_create_client / build_transport,
+# it FULLY REPLACES the manifest's global env. This is the per-chat
+# isolation contract: a chat that chose "custom" credentials must not
+# silently inherit any global variable.
+#
+# Two keys inside ``env_override`` are treated as META-keys rather than
+# environment variables:
+#
+#   _oauth_access_token : Bearer token for HTTP/SSE transports.
+#                         Never forwarded as an env var to stdio
+#                         subprocesses (there is no HTTP there).
+#   _oauth_token_type   : Authorization scheme, default "Bearer".
+#
+# Both participate in the session-key fingerprint so a token refresh
+# produces a fresh client instead of silently reusing a stale session.
+_OAUTH_ACCESS_TOKEN_KEY = "_oauth_access_token"
+_OAUTH_TOKEN_TYPE_KEY = "_oauth_token_type"
+_OAUTH_PREFIX = "_oauth_"
+
+
+def _split_env_override(
+    env_override: Optional[Dict[str, str]],
+) -> Tuple[Optional[Dict[str, str]], Optional[str], str]:
+    """
+    Split an ``env_override`` into three components.
+
+    Returns ``(real_env, access_token, token_type)``:
+
+      * ``real_env``     — environment variables, or None if empty.
+      * ``access_token`` — Bearer token for HTTP/SSE Authorization
+                           header, or None if not supplied.
+      * ``token_type``   — scheme, defaults to "Bearer".
+
+    ``_oauth_*`` keys are stripped from ``real_env`` so a stdio
+    subprocess never sees them as environment variables — a token that
+    only makes sense for HTTP must not leak into a process env dump.
+    """
+    if not env_override:
+        return None, None, "Bearer"
+
+    real_env: Dict[str, str] = {}
+    access_token: Optional[str] = None
+    token_type = "Bearer"
+
+    for key, value in env_override.items():
+        sk = str(key)
+        if sk == _OAUTH_ACCESS_TOKEN_KEY:
+            access_token = str(value) if value is not None else None
+            continue
+        if sk == _OAUTH_TOKEN_TYPE_KEY:
+            if value:
+                token_type = str(value)
+            continue
+        if sk.startswith(_OAUTH_PREFIX):
+            # Unknown meta-key — consumed here, never forwarded.
+            continue
+        real_env[str(sk)] = str(value) if value is not None else ""
+
+    return (real_env or None), access_token, token_type
+
+
+def _compute_creds_hash(
+    env_override: Optional[Dict[str, str]],
+) -> Optional[str]:
+    """
+    Fingerprint the effective credentials for session-key purposes.
+
+    The hash covers ALL keys — including ``_oauth_access_token`` — so
+    a token refresh yields a new session-key and a fresh client. The
+    hash is truncated to 12 hex chars; collisions at this scale are
+    astronomically unlikely within a single server pool.
+    """
+    if not env_override:
+        return None
+    try:
+        payload = json.dumps(
+            env_override, sort_keys=True, ensure_ascii=False
+        )
+    except (TypeError, ValueError):
+        # Defensive fallback for pathological inputs (non-serialisable
+        # values that should never occur given the type contract).
+        payload = repr(
+            sorted(
+                ((str(k), str(v)) for k, v in env_override.items()),
+                key=lambda kv: kv[0],
+            )
+        )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
 class McpSessionPool:
     """Manages persistent active connections and dynamic sessions for MCP servers."""
 
@@ -65,10 +161,21 @@ class McpSessionPool:
     # Key construction
     # ─────────────────────────────────────────────────────────────
 
-    def _get_session_key(self, server_id: str, workspace_root: Optional[str] = None) -> str:
-        """Construct a unique cache key per server and isolated workspace root."""
+    def _get_session_key(
+        self,
+        server_id: str,
+        workspace_root: Optional[str] = None,
+        creds_hash: Optional[str] = None,
+    ) -> str:
+        """
+        Construct a unique cache key per server, workspace, and
+        credential set. The creds_hash segment is omitted when no
+        env_override is in play, preserving the historical key shape
+        for the common global-settings case.
+        """
         normalized_root = str(Path(workspace_root).resolve()) if workspace_root else "default"
-        return f"{server_id}:{normalized_root}"
+        base = f"{server_id}:{normalized_root}"
+        return f"{base}:{creds_hash}" if creds_hash else base
 
     def _server_prefix(self, server_id: str) -> str:
         return f"{server_id}:"
@@ -141,10 +248,31 @@ class McpSessionPool:
         self,
         manifest: Dict[str, Any],
         workspace_root: Optional[str] = None,
-    ) -> Tuple[Optional[BaseMCPTransport], Optional[str]]:
+        env_override: Optional[Dict[str, str]] = None,
+    ) -> Tuple[Optional[BaseMCPTransport], Optional[str], Optional[str]]:
         """
         Construct the designated MCP transport based on manifest specification.
-        Returns a tuple of (transport_instance, fallback_http_url).
+
+        Returns ``(transport_instance, fallback_http_url, auth_token)``.
+
+        ``env_override`` semantics (per-chat credential isolation):
+
+          * When provided, it FULLY REPLACES the manifest's global env.
+            No merge — a chat that chose "custom" credentials sees only
+            those, never a mix.
+          * Meta-keys (``_oauth_access_token``, ``_oauth_token_type``)
+            are extracted here, not forwarded to the subprocess. The
+            access token becomes an ``Authorization`` header for
+            HTTP/SSE transports — this is the correct OAuth 2.1 wire
+            format and is what the server expects.
+          * For stdio transports, the access token is simply dropped:
+            a stdio MCP server has no HTTP stack to receive it, and
+            forwarding it as an env var would leak the secret into a
+            process env dump.
+
+        The third tuple slot (``auth_token``) is only non-None for the
+        fallback HTTP JSON-RPC path — the SSE and stdio paths carry
+        auth inside the transport instance.
         """
         server_id = manifest.get("id", "unknown")
         transport_type = manifest.get("transport", "stdio").lower()
@@ -153,7 +281,16 @@ class McpSessionPool:
 
         runtime_config = mcp_settings_manager.get_effective_runtime_config(server_id, manifest)
         settings = runtime_config.get("settings", {})
-        env_vars = {str(k): str(v) for k, v in runtime_config.get("env", {}).items()}
+
+        if env_override is not None:
+            # Full replacement: per-chat isolation.
+            env_vars, oauth_token, token_type = _split_env_override(env_override)
+            env_vars = env_vars or {}
+        else:
+            # Global fallback.
+            env_vars = {str(k): str(v) for k, v in runtime_config.get("env", {}).items()}
+            oauth_token = None
+            token_type = "Bearer"
 
         if transport_type == "stdio":
             if not command:
@@ -169,7 +306,9 @@ class McpSessionPool:
                 cwd=workspace_root,
                 timeout=float(manifest.get("timeout", 30.0)),
             )
-            return transport, None
+            # Note: oauth_token is intentionally NOT forwarded to a
+            # stdio subprocess — it is an HTTP-layer credential.
+            return transport, None, None
 
         elif transport_type in ("sse", "http"):
             if not target_url:
@@ -177,16 +316,32 @@ class McpSessionPool:
                     f"MCP server '{server_id}' specifies '{transport_type}' transport but lacks 'url'."
                 )
 
+            # Compose the outbound headers: static manifest headers
+            # first, then the Authorization header from OAuth. The
+            # merge order means a manifest-declared Authorization
+            # header is overridden by a per-chat OAuth token — that
+            # is deliberate: the per-chat decision is user-driven
+            # and supersedes a static placeholder.
+            headers: Dict[str, str] = {"Content-Type": "application/json"}
+            manifest_headers = manifest.get("headers")
+            if isinstance(manifest_headers, dict):
+                for hk, hv in manifest_headers.items():
+                    headers[str(hk)] = str(hv)
+            if oauth_token:
+                headers["Authorization"] = f"{token_type} {oauth_token}"
+
             if transport_type == "sse" and SSETransport is not None:
                 transport = SSETransport(
                     url=target_url,
-                    headers={"Content-Type": "application/json"},
+                    headers=headers,
                     timeout=float(manifest.get("timeout", 30.0)),
                 )
-                return transport, None
+                return transport, None, None
 
-            # Fallback to direct HTTP JSON-RPC client
-            return None, target_url
+            # Fallback to direct HTTP JSON-RPC client. The auth token
+            # is surfaced so get_or_create_client can pass it to
+            # MCPClient, which builds its own Authorization header.
+            return None, target_url, oauth_token
 
         raise ValueError(
             f"Unsupported transport type '{transport_type}' for MCP server '{server_id}'."
@@ -201,9 +356,19 @@ class McpSessionPool:
         server_id: str,
         manifest: Dict[str, Any],
         workspace_root: Optional[str] = None,
+        env_override: Optional[Dict[str, str]] = None,
     ) -> MCPClient:
         """
         Retrieve an active MCPClient instance or initialize a new one thread-safely.
+
+        ``env_override`` (per-chat credential isolation):
+
+          * When provided, it fully replaces the manifest's global env
+            (see build_transport for the exact contract).
+          * The full override — including meta-keys — participates in
+            the session-key hash, so a token refresh (which mutates
+            ``_oauth_access_token``) produces a fresh client rather
+            than reusing a session bound to the expired token.
 
         Concurrency model:
           1. Acquire the per-session lock (serialises lifecycle work for a key).
@@ -214,7 +379,8 @@ class McpSessionPool:
           4. Before storing the new client, re-check the closing set under
              the global lock.
         """
-        session_key = self._get_session_key(server_id, workspace_root)
+        creds_hash = _compute_creds_hash(env_override)
+        session_key = self._get_session_key(server_id, workspace_root, creds_hash)
 
         async with self._global_lock:
             if session_key not in self._locks:
@@ -245,8 +411,14 @@ class McpSessionPool:
                 else:
                     return existing_client
 
-            transport, fallback_url = self.build_transport(manifest, workspace_root)
-            auth_token = manifest.get("auth_token")
+            transport, fallback_url, effective_auth_token = self.build_transport(
+                manifest, workspace_root, env_override
+            )
+            # A per-chat OAuth token supersedes the manifest's static
+            # auth_token. Falling back to manifest.auth_token preserves
+            # the historical behaviour for HTTP servers that were
+            # pre-configured with a baked-in token.
+            auth_token = effective_auth_token or manifest.get("auth_token")
 
             client = MCPClient(
                 server_url=fallback_url,
@@ -289,6 +461,7 @@ class McpSessionPool:
         workspace_root: Optional[str] = None,
         *,
         force_refresh: bool = False,
+        env_override: Optional[Dict[str, str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Return the discovered tool list for a server, using a per-server cache.
@@ -306,7 +479,13 @@ class McpSessionPool:
           * TTL fallback: after `cache_ttl_seconds` a fresh tools/list
             is issued on the next call.
         """
-        cache_key = server_id
+        # Cache key includes the creds hash so two users of the same
+        # server do not cross-pollute tool lists. Some MCP servers
+        # expose a different tool surface based on the authenticated
+        # scope; treating the cache as per-credential is the safe
+        # default.
+        creds_hash = _compute_creds_hash(env_override)
+        cache_key = f"{server_id}:{creds_hash}" if creds_hash else server_id
 
         if not force_refresh:
             cached = self._tool_cache.get(cache_key)
@@ -332,6 +511,7 @@ class McpSessionPool:
                 server_id=server_id,
                 manifest=manifest,
                 workspace_root=workspace_root,
+                env_override=env_override,
             )
 
             # Direct JSON-RPC call so that failures are surfaced to the
@@ -369,22 +549,40 @@ class McpSessionPool:
             return list(tools)
 
     async def invalidate_cache(self, server_id: str) -> None:
-        """Drop any cached tool list for the given server."""
+        """
+        Drop every cached tool list for the given server, regardless
+        of credential variant. Used when the server's configuration
+        changes in a way that could invalidate every cred-scoped
+        cache entry at once (bundle reinstall, settings update,
+        status toggle).
+        """
+        prefix = f"{server_id}:"
         async with self._global_lock:
-            self._tool_cache.pop(server_id, None)
+            keys_to_drop = [
+                k for k in list(self._tool_cache.keys())
+                if k == server_id or k.startswith(prefix)
+            ]
+            for k in keys_to_drop:
+                self._tool_cache.pop(k, None)
 
     def invalidate_cache_sync(self, server_id: str) -> None:
         """
         Synchronous cache invalidation for callers outside the async loop.
 
         Used by ``McpBundleManager.install_bundle`` (synchronous by
-        contract) to evict a stale tool list when a bundle is being
-        re-uploaded under the same id. The underlying ``dict.pop`` is
-        atomic under the GIL, so no lock is required here — and
-        acquiring the async lock from a sync context is impossible
-        without an event loop.
+        contract) to evict every cred-scoped variant of a stale tool
+        list when a bundle is being re-uploaded under the same id.
+        The underlying dict mutations are atomic under the GIL, so no
+        lock is required here — and acquiring the async lock from a
+        sync context is impossible without an event loop.
         """
-        self._tool_cache.pop(server_id, None)
+        prefix = f"{server_id}:"
+        keys_to_drop = [
+            k for k in list(self._tool_cache.keys())
+            if k == server_id or k.startswith(prefix)
+        ]
+        for k in keys_to_drop:
+            self._tool_cache.pop(k, None)
 
     def get_cached_tools(
         self, server_id: str
@@ -392,14 +590,23 @@ class McpSessionPool:
         """
         Return the cached tool list for a server without any I/O.
 
-        Used by the delegation resolver (which is synchronous by design)
-        to expand bare server IDs into concrete MCP tool IDs. Returns
-        ``None`` if the cache is cold or expired, so callers can fall
-        back gracefully instead of blocking on a subprocess spawn.
+        Used by the delegation resolver (which is synchronous by design
+        and does not know the caller's credential context) to expand
+        bare server IDs into concrete MCP tool IDs. Any fresh
+        cred-scoped entry is returned; if only stale entries exist,
+        ``None`` is returned so the caller falls back gracefully.
         """
         cached = self._tool_cache.get(server_id)
         if cached and (time.monotonic() - cached["fetched_at"]) < self._cache_ttl:
             return list(cached["tools"])
+
+        # Try any cred-scoped variant.
+        prefix = f"{server_id}:"
+        for key, entry in self._tool_cache.items():
+            if key.startswith(prefix) and (
+                time.monotonic() - entry["fetched_at"]
+            ) < self._cache_ttl:
+                return list(entry["tools"])
         return None
 
     # ─────────────────────────────────────────────────────────────
@@ -410,6 +617,7 @@ class McpSessionPool:
         self,
         manifest: Dict[str, Any],
         workspace_root: Optional[str] = None,
+        env_override: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         Perform an isolated one-shot connectivity check and discover exposed tools.
@@ -424,10 +632,12 @@ class McpSessionPool:
         server_id = manifest.get("id", "probe_test")
         client: Optional[MCPClient] = None
         try:
-            transport, fallback_url = self.build_transport(manifest, workspace_root)
+            transport, fallback_url, effective_auth_token = self.build_transport(
+                manifest, workspace_root, env_override
+            )
             client = MCPClient(
                 server_url=fallback_url,
-                auth_token=manifest.get("auth_token"),
+                auth_token=effective_auth_token or manifest.get("auth_token"),
                 timeout=float(manifest.get("timeout", 15.0)),
                 transport=transport,
             )

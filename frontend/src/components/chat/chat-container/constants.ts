@@ -41,6 +41,19 @@ export const SSE_EVENT_TYPES = [
   "artifact_moved",
   "artifact",
 
+  // MCP authentication — terminal for the current stream.
+  //
+  // Emitted by peldrun_engine's pre-flight gate when an MCP server
+  // requires credentials that have not been resolved for the current
+  // chat (no custom / ephemeral / use_global decision recorded).
+  //
+  // The SSE handler MUST close the stream on this event and delegate
+  // to the auth modal: the underlying job is already failed server-
+  // side, so no more events will arrive on this stream. When the user
+  // completes authentication, the container re-issues POST /api/run
+  // with the same prompt, which starts a fresh job and a fresh stream.
+  "mcp_auth_required",
+
   // Terminal
   "final",
   "done",
