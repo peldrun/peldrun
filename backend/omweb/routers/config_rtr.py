@@ -350,6 +350,12 @@ class FetchModelsRequest(BaseModel):
     api_key: Optional[str] = ""
     provider_type: Optional[str] = ""
     provider_id: Optional[str] = ""
+    # Optional explicit metadata endpoint supplied by the frontend from the
+    # vault's `metadataEndpoint` field. When present, it takes priority over
+    # `<base_url>/models`. This lets providers whose `/models` route returns
+    # only IDs (LM Studio, Google) point to their richer endpoint without
+    # hardcoded branches here.
+    metadata_endpoint: Optional[str] = ""
 
 
 @router.post("/fetch-models")
@@ -367,61 +373,250 @@ async def fetch_available_models(payload: FetchModelsRequest):
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
+    # ------------------------------------------------------------------
+    # Helper: parse a list of model dicts and extract context metadata.
+    # Shared by all branches to keep parsing consistent.
+    # ------------------------------------------------------------------
+    def _parse_model_list(raw_list: list) -> tuple:
+        ids: list = []
+        meta: dict = {}
+        for m in raw_list:
+            if not isinstance(m, dict):
+                continue
+            mid = m.get("id") or m.get("name") or m.get("key")
+            if not mid:
+                continue
+            mid_str = str(mid)
+            ids.append(mid_str)
+
+            # Also index the short form for "models/xxx" style IDs.
+            if "/" in mid_str:
+                short = mid_str.rsplit("/", 1)[-1]
+                if short and short != mid_str:
+                    ids.append(short)
+
+            ctx = (
+                m.get("max_context_length")
+                or m.get("context_length")
+                or m.get("context_window")
+                or m.get("inputTokenLimit")
+                or m.get("max_tokens")
+            )
+            out = (
+                m.get("max_output_tokens")
+                or m.get("max_completion_tokens")
+                or m.get("outputTokenLimit")
+            )
+            if ctx is not None or out is not None:
+                entry = {
+                    "key": mid_str,
+                    "type": m.get("type", "llm"),
+                    "display_name": m.get("display_name")
+                    or m.get("displayName")
+                    or mid_str,
+                    "max_context_length": int(ctx) if ctx else None,
+                    "max_output_tokens": int(out) if out else None,
+                }
+                meta[mid_str] = entry
+                if "/" in mid_str:
+                    short = mid_str.rsplit("/", 1)[-1]
+                    if short and short not in meta:
+                        meta[short] = {**entry, "key": short}
+        return sorted(set(ids)), meta
+
+    # ------------------------------------------------------------------
+    # Branch 1: Explicit metadata endpoint from the vault (highest priority).
+    # Zero hardcoded provider logic.
+    # ------------------------------------------------------------------
+    explicit_meta = (payload.metadata_endpoint or "").strip()
+    if explicit_meta:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(explicit_meta, headers=headers)
+                if resp.status_code != 200:
+                    return {
+                        "ok": False,
+                        "error": f"HTTP {resp.status_code} from metadata endpoint",
+                        "models": [],
+                        "models_metadata": {},
+                    }
+                data = resp.json()
+                raw_list = data.get("data") or data.get("models") or []
+                model_ids, metadata = _parse_model_list(raw_list)
+                if metadata:
+                    save_metadata_cache(metadata)
+                return {
+                    "ok": True,
+                    "models": model_ids,
+                    "models_metadata": metadata,
+                }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"Metadata endpoint failed: {exc}",
+                "models": [],
+                "models_metadata": {},
+            }
+
+    # ------------------------------------------------------------------
+    # Branch 2: LM Studio fallback when no explicit endpoint is set.
+    # Tries /api/v1/models, /api/v0/models, then <base>/models.
+    # This is best-effort only; the preferred path is Branch 1.
+    # ------------------------------------------------------------------
     if "lmstudio" in p_id or "lmstudio" in p_type or "1234" in base:
         clean_base = base.replace("/v1", "").rstrip("/")
-        endpoints_to_try = [
+        for ep in (
             f"{clean_base}/api/v1/models",
             f"{clean_base}/api/v0/models",
             f"{base}/models" if not base.endswith("/models") else base,
-        ]
-        for ep in endpoints_to_try:
+        ):
             try:
                 async with httpx.AsyncClient(timeout=6.0) as client:
                     resp = await client.get(ep, headers=headers)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        raw_models = data.get("models") or data.get("data") or []
-                        if raw_models:
-                            model_ids = []
-                            metadata = {}
-                            for m in raw_models:
-                                if isinstance(m, dict):
-                                    mid = m.get("key") or m.get("id") or m.get("display_name")
-                                    if not mid or any(
-                                        x in str(mid).lower()
-                                        for x in ["tts-", "whisper-", "embedding", "dall-e"]
-                                    ):
-                                        continue
-                                    mid_str = str(mid)
-                                    model_ids.append(mid_str)
-                                    metadata[mid_str] = {
-                                        "key": mid_str,
-                                        "type": m.get("type", "llm"),
-                                        "display_name": m.get("display_name", mid_str),
-                                        "max_context_length": m.get("max_context_length") or m.get("context_length") or 8192,
-                                        "capabilities": {"vision": True, "trained_for_tool_use": True},
-                                    }
-                            save_metadata_cache(metadata)
-                            return {
-                                "ok": True,
-                                "models": sorted(list(set(model_ids))),
-                                "models_metadata": metadata,
-                            }
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json()
+                    raw_models = data.get("models") or data.get("data") or []
+                    if not raw_models:
+                        continue
+                    model_ids, metadata = _parse_model_list(raw_models)
+                    if metadata:
+                        save_metadata_cache(metadata)
+                    return {
+                        "ok": True,
+                        "models": model_ids,
+                        "models_metadata": metadata,
+                    }
             except Exception:
                 continue
+        # If all LM Studio endpoints failed, fall through to Branch 3.
 
+    # ------------------------------------------------------------------
+    # Branch 3: Generic `<base>/models` — works for DeepSeek, Anthropic,
+    # OpenAI-compat servers. Providers that don't return context there
+    # simply yield empty `models_metadata`; the UI reports this honestly.
+    # ------------------------------------------------------------------
     url = base if base.endswith("/models") else f"{base}/models"
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(url, headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                raw_list = data.get("data", []) or data.get("models", [])
-                model_ids = [m.get("id") for m in raw_list if isinstance(m, dict) and m.get("id")]
-                return {"ok": True, "models": sorted(list(set(model_ids))), "models_metadata": {}}
-            return {"ok": False, "error": f"HTTP {resp.status_code}", "models": []}
+            if resp.status_code != 200:
+                return {
+                    "ok": False,
+                    "error": f"HTTP {resp.status_code}",
+                    "models": [],
+                    "models_metadata": {},
+                }
+            data = resp.json()
+            raw_list = data.get("data", []) or data.get("models", [])
+            model_ids, metadata = _parse_model_list(raw_list)
+            if metadata:
+                save_metadata_cache(metadata)
+            return {
+                "ok": True,
+                "models": model_ids,
+                "models_metadata": metadata,
+            }
     except Exception as e:
-        return {"ok": False, "error": f"Failed: {str(e)}", "models": []}
+        return {
+            "ok": False,
+            "error": f"Failed: {str(e)}",
+            "models": [],
+            "models_metadata": {},
+        }
+
+    # ------------------------------------------------------------------
+    # Query the endpoint EXACTLY as configured in the vault. No provider
+    # branching, no URL rewriting, no field-name guessing per provider.
+    #
+    # The vault's `baseUrl` is the single source of truth. If a provider
+    # doesn't return context info from `<baseUrl>/models`, that is the
+    # provider's limitation — the caller (UI) reports it honestly.
+    # ------------------------------------------------------------------
+    url = base if base.endswith("/models") else f"{base}/models"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                return {
+                    "ok": False,
+                    "error": f"HTTP {resp.status_code}",
+                    "models": [],
+                    "models_metadata": {},
+                }
+
+            data = resp.json()
+            raw_list = data.get("data", []) or data.get("models", [])
+
+            model_ids: list = []
+            metadata: dict = {}
+
+            for m in raw_list:
+                if not isinstance(m, dict):
+                    continue
+
+                mid = m.get("id") or m.get("name")
+                if not mid:
+                    continue
+                mid_str = str(mid)
+                model_ids.append(mid_str)
+
+                # If the model id contains a slash (Google's "models/xxx"
+                # format), also index it by the short name so lookups by
+                # either form succeed.
+                if "/" in mid_str:
+                    short = mid_str.rsplit("/", 1)[-1]
+                    if short and short != mid_str:
+                        model_ids.append(short)
+
+                # Extract context window from any field present. The
+                # caller decides what to do if none exists — we do not
+                # fabricate values.
+                ctx = (
+                    m.get("max_context_length")
+                    or m.get("context_length")
+                    or m.get("context_window")
+                    or m.get("inputTokenLimit")
+                    or m.get("max_tokens")
+                )
+                out = (
+                    m.get("max_output_tokens")
+                    or m.get("max_completion_tokens")
+                    or m.get("outputTokenLimit")
+                )
+
+                if ctx is not None or out is not None:
+                    entry = {
+                        "key": mid_str,
+                        "type": m.get("type", "llm"),
+                        "display_name": m.get("display_name")
+                        or m.get("displayName")
+                        or mid_str,
+                        "max_context_length": int(ctx) if ctx else None,
+                        "max_output_tokens": int(out) if out else None,
+                    }
+                    metadata[mid_str] = entry
+                    if "/" in mid_str:
+                        short = mid_str.rsplit("/", 1)[-1]
+                        if short and short not in metadata:
+                            metadata[short] = {**entry, "key": short}
+
+            if metadata:
+                save_metadata_cache(metadata)
+
+            return {
+                "ok": True,
+                "models": sorted(list(set(model_ids))),
+                "models_metadata": metadata,
+            }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"Failed: {str(e)}",
+            "models": [],
+            "models_metadata": {},
+        }
 
 
 # ============================================================

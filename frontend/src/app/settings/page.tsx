@@ -128,6 +128,106 @@ export default function SettingsPage() {
     return num;
   };
 
+  // [ENRICH-METADATA] Resolve a provider's metadata endpoint to its
+  // canonical URL when the user left the field empty. This prevents
+  // models_vault.json from storing `"metadataEndpoint": ""` for providers
+  // whose endpoint is computable (LM Studio, Ollama, Google, Anthropic,
+  // DeepSeek). OpenAI and unknown custom servers legitimately remain "".
+  const resolveMetadataEndpoint = (
+    providerId: string,
+    baseUrl: string,
+    providerName?: string,
+    userValue?: string,
+  ): string => {
+    const explicit = (userValue || "").trim();
+    if (explicit) return explicit;
+
+    const id = String(providerId || providerName || "").toLowerCase();
+    const base = String(baseUrl || "").trim().replace(/\/+$/, "");
+
+    if (
+      id.includes("lmstudio") ||
+      id.includes("lm-studio") ||
+      id.includes("lm_studio") ||
+      base.includes(":1234")
+    ) {
+      return `${base.replace(/\/v1$/, "")}/api/v0/models`;
+    }
+    if (id === "ollama" || base.includes(":11434")) {
+      return `${base.replace(/\/v1$/, "")}/api/tags`;
+    }
+    if (id === "google" || id === "gemini" || base.includes("googleapis.com")) {
+      const native = base
+        .replace(/\/openai\/v1$/, "")
+        .replace(/\/openai$/, "")
+        .replace(/\/v1beta$/, "")
+        .replace(/\/v1$/, "");
+      return `${native}/v1beta/models`;
+    }
+    if (id === "anthropic" || id === "claude" || base.includes("anthropic.com")) {
+      return "https://api.anthropic.com/v1/models";
+    }
+    if (id === "deepseek" || base.includes("deepseek.com")) {
+      return "https://api.deepseek.com/models";
+    }
+    return "";
+  };
+
+  // Build an enriched snapshot of all four provider stores with
+  // `metadataEndpoint` resolved to real URLs where possible.
+  const enrichVaultDefaults = (sources: {
+    lmStudioSettings: LMStudioSettings;
+    ollamaSettings: OllamaSettings;
+    cloudProviders: CloudProviderVaultItem[];
+    customEndpoints: CustomEndpoint[];
+  }) => {
+    const lm: LMStudioSettings = {
+      ...sources.lmStudioSettings,
+      metadataEndpoint:
+        resolveMetadataEndpoint(
+          "lmstudio",
+          sources.lmStudioSettings.baseUrl,
+          "LM Studio",
+          sources.lmStudioSettings.metadataEndpoint,
+        ) || undefined,
+    };
+
+    const ol: OllamaSettings = {
+      ...sources.ollamaSettings,
+      metadataEndpoint:
+        resolveMetadataEndpoint(
+          "ollama",
+          sources.ollamaSettings.baseUrl,
+          "Ollama",
+          sources.ollamaSettings.metadataEndpoint,
+        ) || undefined,
+    };
+
+    const clouds = sources.cloudProviders.map((cp) => ({
+      ...cp,
+      metadataEndpoint:
+        resolveMetadataEndpoint(
+          cp.id,
+          cp.baseUrl,
+          cp.name,
+          cp.metadataEndpoint,
+        ) || undefined,
+    }));
+
+    const customs = sources.customEndpoints.map((ce) => ({
+      ...ce,
+      metadataEndpoint:
+        resolveMetadataEndpoint(
+          ce.providerId || ce.id,
+          ce.endpointUrl,
+          ce.name,
+          ce.metadataEndpoint,
+        ) || undefined,
+    }));
+
+    return { lm, ol, clouds, customs };
+  };
+
   const fetchConfig = async () => {
     try {
       const res = await fetch(getApiUrl("/api/config"));
@@ -258,18 +358,27 @@ export default function SettingsPage() {
         runflow: { use_data_analysis_agent: cfg.runflow?.use_data_analysis_agent ?? false },
       };
 
-      setLmStudioSettings(storedLM);
-      setOllamaSettings(storedOllama);
-      setCloudProviders(storedCloud);
-      setCustomEndpoints(storedCustom);
-      setConfig(loadedConfig);
-
-      initialLoadedRef.current = JSON.stringify({
-        config: loadedConfig,
+      // Enrich on load: fill empty `metadataEndpoint` fields with the
+      // computed default so the UI immediately shows the working URL.
+      const enriched = enrichVaultDefaults({
         lmStudioSettings: storedLM,
         ollamaSettings: storedOllama,
         cloudProviders: storedCloud,
         customEndpoints: storedCustom,
+      });
+
+      setLmStudioSettings(enriched.lm);
+      setOllamaSettings(enriched.ol);
+      setCloudProviders(enriched.clouds);
+      setCustomEndpoints(enriched.customs);
+      setConfig(loadedConfig);
+
+      initialLoadedRef.current = JSON.stringify({
+        config: loadedConfig,
+        lmStudioSettings: enriched.lm,
+        ollamaSettings: enriched.ol,
+        cloudProviders: enriched.clouds,
+        customEndpoints: enriched.customs,
       });
 
       if (typeof window !== "undefined") {
@@ -309,6 +418,66 @@ export default function SettingsPage() {
     fetchSystemInfo();
     fetchServerMetadata();
   }, []);
+
+  // [AUTO-SAVE-METADATA] Persist `metadataEndpoint` changes automatically.
+  //
+  // The Metadata Endpoint field is a small, focused setting that users are
+  // unlikely to remember to "Save Config" for after editing. Debounced
+  // auto-save keeps models_vault.json in sync without requiring an extra
+  // click, while the bulk "Save Config" button continues to handle the
+  // rest of the configuration as before.
+  //
+  // Only fires when a metadataEndpoint value is *present* and *differs*
+  // from what's already on disk. This avoids spurious POSTs on initial
+  // mount or on unrelated state changes.
+  const autoSaveTimerRef = useRef<number | null>(null);
+  const persistedMetaRef = useRef<string>("");
+  useEffect(() => {
+    if (initialLoadedRef.current === "") return; // not loaded yet
+
+    const metadataSnapshot = JSON.stringify({
+      lm: lmStudioSettings.metadataEndpoint || "",
+      ol: ollamaSettings.metadataEndpoint || "",
+      cloud: cloudProviders.map((c) => [c.id, c.metadataEndpoint || ""]),
+      custom: customEndpoints.map((c) => [c.id, c.metadataEndpoint || ""]),
+    });
+
+    if (persistedMetaRef.current === "") {
+      // First snapshot after load — remember it, don't trigger a save.
+      persistedMetaRef.current = metadataSnapshot;
+      return;
+    }
+    if (persistedMetaRef.current === metadataSnapshot) return;
+
+    if (autoSaveTimerRef.current !== null) {
+      window.clearTimeout(autoSaveTimerRef.current);
+    }
+    autoSaveTimerRef.current = window.setTimeout(async () => {
+      persistedMetaRef.current = metadataSnapshot;
+      try {
+        const enriched = enrichVaultDefaults({
+          lmStudioSettings,
+          ollamaSettings,
+          cloudProviders,
+          customEndpoints,
+        });
+        await saveVaultToBackend({
+          lmstudio_vault: enriched.lm,
+          ollama_vault: enriched.ol,
+          cloud_vault: enriched.clouds,
+          custom_endpoints: enriched.customs,
+        });
+      } catch (err) {
+        console.warn("[auto-save metadata] failed:", err);
+      }
+    }, 800);
+
+    return () => {
+      if (autoSaveTimerRef.current !== null) {
+        window.clearTimeout(autoSaveTimerRef.current);
+      }
+    };
+  }, [lmStudioSettings, ollamaSettings, cloudProviders, customEndpoints]);
 
   const handleReset = () => {
     if (initialLoadedRef.current) {
@@ -557,7 +726,10 @@ export default function SettingsPage() {
       if (res.ok) {
         const updatedLM: LMStudioSettings = {
           ...lmStudioSettings,
-          savedModels: availableModels.length > 0 ? availableModels : lmStudioSettings.savedModels || [],
+          savedModels:
+            availableModels.length > 0
+              ? availableModels
+              : lmStudioSettings.savedModels || [],
         };
 
         const safeOllamaVault: OllamaSettings = {
@@ -565,11 +737,20 @@ export default function SettingsPage() {
           savedModels: ollamaSettings.savedModels || [],
         };
 
+        // Resolve empty metadata endpoints to computed defaults before
+        // persisting, so models_vault.json always stores the real URL.
+        const enriched = enrichVaultDefaults({
+          lmStudioSettings: updatedLM,
+          ollamaSettings: safeOllamaVault,
+          cloudProviders,
+          customEndpoints,
+        });
+
         await saveVaultToBackend({
-          cloud_vault: cloudProviders,
-          custom_endpoints: customEndpoints,
-          lmstudio_vault: updatedLM,
-          ollama_vault: safeOllamaVault,
+          cloud_vault: enriched.clouds,
+          custom_endpoints: enriched.customs,
+          lmstudio_vault: enriched.lm,
+          ollama_vault: enriched.ol,
           scanned_models: availableModels,
         });
 
@@ -578,20 +759,23 @@ export default function SettingsPage() {
           llm: activeLlm,
           browser: {
             ...config.browser,
-            max_content_length: parseInt(String(config.browser.max_content_length), 10) || 2000,
+            max_content_length:
+              parseInt(String(config.browser.max_content_length), 10) || 2000,
           },
         };
 
         setConfig(finalConfig);
-        setLmStudioSettings(updatedLM);
-        setOllamaSettings(safeOllamaVault);
+        setLmStudioSettings(enriched.lm);
+        setOllamaSettings(enriched.ol);
+        setCloudProviders(enriched.clouds);
+        setCustomEndpoints(enriched.customs);
 
         initialLoadedRef.current = JSON.stringify({
           config: finalConfig,
-          lmStudioSettings: updatedLM,
-          ollamaSettings: safeOllamaVault,
-          cloudProviders,
-          customEndpoints,
+          lmStudioSettings: enriched.lm,
+          ollamaSettings: enriched.ol,
+          cloudProviders: enriched.clouds,
+          customEndpoints: enriched.customs,
         });
 
         setSaveStatus({ ok: true, message: "Configuration & Vault permanently saved!" });

@@ -184,29 +184,103 @@ export function LLMTab(props: LLMTabProps) {
 
   /* -------------------------- Context auto-detect ----------------------- */
 
-  const autoDetectActiveModelLimit = useCallback(() => {
-    const meta = metadataVault[config.llm.model];
-    if (meta && meta.max_context_length) {
-      const detected = sanitizeTokenInput(meta.max_context_length, 8192);
+  const autoDetectActiveModelLimit = useCallback(async () => {
+    const modelId = config.llm.model;
+    if (!modelId) {
+      showToast.warning("No active model", "Select a model first.");
+      return;
+    }
+
+    // Resolve the metadata endpoint for the CURRENTLY active provider by
+    // looking it up across the four provider stores. The user configured
+    // it in the UI, so we honor it here.
+    const activeProvider = (config.llm.provider || "").toLowerCase();
+    let metadataEndpoint = "";
+    if (activeProvider === "lmstudio") {
+      metadataEndpoint = lmStudioSettings.metadataEndpoint || "";
+    } else if (activeProvider === "ollama") {
+      metadataEndpoint = ollamaSettings.metadataEndpoint || "";
+    } else {
+      const cloud = cloudProviders.find((p) => p.id === config.llm.provider);
+      if (cloud) {
+        metadataEndpoint = cloud.metadataEndpoint || "";
+      } else {
+        const custom = customEndpoints.find(
+          (p) =>
+            p.providerId === config.llm.provider || p.id === config.llm.provider
+        );
+        if (custom) metadataEndpoint = custom.metadataEndpoint || "";
+      }
+    }
+
+    try {
+      const res = await fetch("/api/config/fetch-models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          base_url: config.llm.base_url,
+          api_key: config.llm.api_key || "",
+          provider_id: config.llm.provider || "",
+          provider_type: config.llm.api_type || "",
+          metadata_endpoint: metadataEndpoint,
+        }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        if (data.ok && data.models_metadata) {
+          setMetadataVault((prev) => ({ ...prev, ...data.models_metadata }));
+          const meta = data.models_metadata[modelId];
+          if (meta && typeof meta.max_context_length === "number") {
+            const detected = sanitizeTokenInput(meta.max_context_length, 8192);
+            setConfig({
+              ...config,
+              llm: {
+                ...config.llm,
+                context_window: detected,
+                max_tokens: detected,
+              },
+            });
+            showToast.success(
+              "Detected from provider API",
+              `${modelId}: ${detected.toLocaleString()} tokens`
+            );
+            return;
+          }
+        }
+      }
+    } catch {
+      /* fall through to cache */
+    }
+
+    // Fallback: check cached metadata
+    const cached = metadataVault[modelId];
+    if (cached && cached.max_context_length) {
+      const detected = sanitizeTokenInput(cached.max_context_length, 8192);
       setConfig({
         ...config,
-        llm: {
-          ...config.llm,
-          context_window: detected,
-          max_tokens: detected,
-        },
+        llm: { ...config.llm, context_window: detected, max_tokens: detected },
       });
       showToast.success(
-        "Auto-Detected Context Window",
-        `${config.llm.model}: ${detected.toLocaleString()} tokens`
+        "From cached metadata",
+        `${modelId}: ${detected.toLocaleString()} tokens`
       );
-    } else {
-      showToast.info(
-        "No Metadata Found",
-        "Using fallback default limit for active model."
-      );
+      return;
     }
-  }, [config, metadataVault, setConfig]);
+
+    showToast.warning(
+      "Provider did not return context",
+      `${modelId}: set context manually in Model Budgets.`
+    );
+  }, [
+    config,
+    metadataVault,
+    setConfig,
+    lmStudioSettings.metadataEndpoint,
+    ollamaSettings.metadataEndpoint,
+    cloudProviders,
+    customEndpoints,
+  ]);
 
   /* -------------------------- LM Studio probe --------------------------- */
 

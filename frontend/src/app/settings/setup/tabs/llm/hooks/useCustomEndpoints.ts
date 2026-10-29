@@ -130,6 +130,7 @@ export function useCustomEndpoints({
         endpointForm.providerId.trim() ||
         slugifyProviderName(endpointForm.name),
       endpointUrl: endpointForm.endpointUrl.trim(),
+      metadataEndpoint: endpointForm.metadataEndpoint?.trim() || undefined,
       apiMode: endpointForm.apiMode,
       defaultModel: endpointForm.defaultModel.trim() || "default",
       contextWindow: endpointForm.contextWindow || "Auto",

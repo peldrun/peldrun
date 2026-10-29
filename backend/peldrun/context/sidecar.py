@@ -86,21 +86,71 @@ def resolve_model_budget_profile(
             except Exception as err:
                 logger.debug("Failed reading model budget from %s: %s", path, err)
 
-    # Tier 2: consult the models vault, which stores the max context
-    # reported by the model server itself (LM Studio, Ollama, and
-    # cloud endpoints all populate this field).
+    # ------------------------------------------------------------------
+    # Tier 2a: models_metadata.json — the canonical cache populated by
+    # POST /api/config/fetch-models. This file holds the *real* context
+    # window reported by each provider's API (LM Studio max_context_length,
+    # DeepSeek context_window, Google inputTokenLimit, Anthropic
+    # max_input_tokens, etc.).
     #
-    # This is the authoritative source for models that were
-    # discovered but not yet configured in Model Budgets. Without
-    # this lookup, a freshly added local model (e.g. qwen3:32b with
-    # a 262K window) would silently fall through to the 8192
-    # default and be truncated to 3% of its capacity.
+    # Previously we looked inside models_vault.json, but that file stores
+    # only savedModels (IDs) and endpoint info — never the raw metadata.
+    # That mismatch caused every model to fall through to the heuristic
+    # tier and display incorrect numbers.
+    # ------------------------------------------------------------------
+    metadata_paths: List[Path] = []
+    if storage_root:
+        metadata_paths.append(storage_root / "models_metadata.json")
+    _backend_root = Path(__file__).resolve().parent.parent.parent
+    metadata_paths.append(_backend_root / "storage" / "models_metadata.json")
+    metadata_paths.append(_backend_root / "data" / "models_metadata.json")
+
+    for mpath in metadata_paths:
+        if not mpath.exists():
+            continue
+        try:
+            with open(mpath, "r", encoding="utf-8") as f:
+                meta_cache = json.load(f)
+        except Exception as err:
+            logger.debug("Failed reading models_metadata from %s: %s", mpath, err)
+            continue
+
+        if not isinstance(meta_cache, dict):
+            continue
+
+        # Try the exact id, then the short form (models/xxx → xxx), and
+        # then the long form for providers that store prefixed keys.
+        candidates_keys = [model_id]
+        if "/" in model_id:
+            candidates_keys.append(model_id.rsplit("/", 1)[-1])
+        else:
+            candidates_keys.append(f"models/{model_id}")
+
+        for key in candidates_keys:
+            entry = meta_cache.get(key)
+            if not isinstance(entry, dict):
+                continue
+            ctx = entry.get("max_context_length") or entry.get("context_length")
+            out = entry.get("max_output_tokens") or entry.get("max_completion_tokens")
+            if isinstance(ctx, (int, float)) and ctx > 0:
+                c_win = int(ctx)
+                m_out = (
+                    int(out)
+                    if isinstance(out, (int, float)) and out > 0
+                    else max(1500, min(8192, c_win // 4))
+                )
+                return c_win, m_out, default_ratios
+
+    # ------------------------------------------------------------------
+    # Tier 2b: models_vault.json — kept only as a secondary source for
+    # vaults that carry their own metadata (older schema). Most current
+    # vaults store metadata in models_metadata.json instead.
+    # ------------------------------------------------------------------
     vault_paths: List[Path] = []
     if storage_root:
         vault_paths.append(storage_root / "models_vault.json")
-    backend_root = Path(__file__).resolve().parent.parent.parent
-    vault_paths.append(backend_root / "data" / "models_vault.json")
-    vault_paths.append(backend_root / "storage" / "models_vault.json")
+    vault_paths.append(_backend_root / "data" / "models_vault.json")
+    vault_paths.append(_backend_root / "storage" / "models_vault.json")
 
     for vpath in vault_paths:
         if not vpath.exists():
@@ -114,89 +164,36 @@ def resolve_model_budget_profile(
 
         max_ctx = _lookup_context_in_vault(vault, model_id)
         if max_ctx is not None and max_ctx > 0:
-            # Preserve the model's true context window; reserve a
-            # conservative output budget (25% of the window, capped
-            # to 8192, floored at 1500) so large models still get a
-            # usable input budget.
             reserve = max(1500, min(8192, max_ctx // 4))
             return max_ctx, reserve, default_ratios
 
-    # Tier 3: extended model-family heuristic fallbacks.
-    # These cover the common families shipped by major providers and
-    # the open-weight ecosystem. They run only when the model is
-    # missing from both models_budget.json (user explicit) and
-    # models_vault.json (server-reported). See audit report item 3.2.
-    mid = model_id.lower()
-
-    # Google
-    if "gemini-2" in mid or "gemini-1.5" in mid or "gemini-exp" in mid:
-        return 1048576, 8192, default_ratios
-    if "gemini" in mid:
-        return 32768, 4096, default_ratios
-
-    # Anthropic
-    if "claude-3-7" in mid or "claude-3.7" in mid or "claude-3-5" in mid or "claude-3.5" in mid:
-        return 200000, 8192, default_ratios
-    if "claude" in mid:
-        return 200000, 4096, default_ratios
-
-    # OpenAI
-    if "gpt-4o" in mid or "gpt-4-turbo" in mid or "o1" in mid or "o3" in mid or "o4" in mid:
-        return 128000, 4096, default_ratios
-    if "gpt-4" in mid:
-        return 8192, 4096, default_ratios
-    if "gpt-3.5" in mid:
-        return 16384, 4096, default_ratios
-
-    # DeepSeek
-    if "deepseek-r1" in mid or "deepseek-v3" in mid or "deepseek-v2" in mid:
-        return 131072, 8192, default_ratios
-    if "deepseek" in mid:
-        return 64000, 8192, default_ratios
-
-    # Meta Llama
-    if "llama-3.1" in mid or "llama-3.2" in mid or "llama-3.3" in mid:
-        return 131072, 4096, default_ratios
-    if "llama-3" in mid:
-        return 8192, 4096, default_ratios
-
-    # Alibaba Qwen (very common in local-first setups)
-    if "qwen3" in mid:
-        return 262144, 8192, default_ratios
-    if "qwen2.5" in mid or "qwen2-5" in mid:
-        return 131072, 8192, default_ratios
-    if "qwen2" in mid:
-        return 32768, 4096, default_ratios
-
-    # Mistral
-    if "mistral-large" in mid or "codestral" in mid:
-        return 131072, 8192, default_ratios
-    if "mistral" in mid:
-        return 32768, 4096, default_ratios
-
-    # Google Gemma
-    if "gemma-3" in mid or "gemma-4" in mid:
-        return 131072, 4096, default_ratios
-    if "gemma" in mid:
-        return 8192, 2048, default_ratios
-
-    # Microsoft Phi
-    if "phi-4" in mid:
-        return 16384, 4096, default_ratios
-    if "phi-3" in mid:
-        return 131072, 4096, default_ratios
-
-    # NVIDIA Nemotron
-    if "nemotron" in mid:
-        return 1048576, 8192, default_ratios
-
-    # Tier 4: safe fallback for genuinely unknown models.
-    # We deliberately keep this conservative (8192/1500) rather than
-    # guessing a larger window. A too-small window degrades quality;
-    # a too-large window triggers a hard error from the provider.
-    # Users who need more can configure the model in Model Budgets.
+    # ------------------------------------------------------------------
+    # Tier 3: unknown model.
+    #
+    # We deliberately do NOT guess. Previously this function contained
+    # hardcoded per-family heuristics (deepseek → 64000, gemini → 1048576,
+    # etc.) that were often wrong because:
+    #   - Providers upgrade models without renaming the family.
+    #   - Different sizes within a family have different limits.
+    #   - OpenAI never exposes the values via API, and the values shown
+    #     on their website change per model.
+    #
+    # Guessing produces plausible-but-wrong numbers that silently break
+    # prompt budgeting. A conservative default (8192 / 1500) plus a clear
+    # log line is safer: the user is expected to open "Model Budgets &
+    # Context" and fill in the authoritative values (or use Auto-Detect
+    # which fetches from the provider's API).
+    # ------------------------------------------------------------------
+    logger.warning(
+        "No context-window metadata found for model %r in models_budget.json "
+        "or models_metadata.json. Falling back to conservative default "
+        "(%s / %s). Configure it in Model Budgets & Context, or run "
+        "Auto-Detect from the provider's API.",
+        model_id,
+        default_context,
+        default_output,
+    )
     return default_context, default_output, default_ratios
-
 
 def calculate_budget_slices(
     context_window: int,

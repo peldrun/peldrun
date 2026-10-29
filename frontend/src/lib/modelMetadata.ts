@@ -223,7 +223,7 @@ export function inferModelCapabilities(
     else if (lowerKey.includes("qwen3")) maxContext = 262144;
     else if (lowerKey.includes("qwen2.5")) maxContext = 131072;
     else if (lowerKey.includes("gemma-4")) maxContext = 262144;
-    else if (lowerKey.includes("nemotron")) maxContext = 1048576;
+    else if (lowerKey.includes("nemotron")) maxContext = 20000;
   }
 
   let contextDisplay: string | null = null;

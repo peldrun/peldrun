@@ -280,6 +280,29 @@ export function CustomEndpointsTab({
             />
           </div>
 
+          {/* Metadata Endpoint (optional) */}
+          <div>
+            <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-1">
+              Metadata Endpoint (optional)
+            </label>
+            <input
+              type="text"
+              value={endpointForm.metadataEndpoint || ""}
+              onChange={(e) =>
+                setEndpointForm({
+                  ...endpointForm,
+                  metadataEndpoint: e.target.value,
+                })
+              }
+              placeholder="Leave empty to use <endpointUrl>/models"
+              className="w-full bg-background border border-border rounded-sm px-3 py-1.5 text-xs text-foreground shadow-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow"
+            />
+            <span className="text-[10px] text-muted-foreground block mt-0.5">
+              Used by Auto-Detect to read the context window from a path
+              different from <code>&lt;endpointUrl&gt;/models</code>.
+            </span>
+          </div>
+
           {/* API Mode */}
           <div>
             <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-1.5">

@@ -73,6 +73,7 @@ export interface EndpointFormState {
   name: string;
   providerId: string;
   endpointUrl: string;
+  metadataEndpoint?: string;
   apiMode: ApiModeType;
   defaultModel: string;
   contextWindow: string;

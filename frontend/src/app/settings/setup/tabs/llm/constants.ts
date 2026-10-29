@@ -15,6 +15,7 @@ export const EMPTY_ENDPOINT_FORM: EndpointFormState = {
   name: "",
   providerId: "",
   endpointUrl: "",
+  metadataEndpoint: "",
   apiMode: "Auto-detect",
   defaultModel: "",
   contextWindow: "Auto",

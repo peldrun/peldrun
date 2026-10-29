@@ -78,6 +78,12 @@ interface GranularProviderGroup {
   baseUrl: string;
   /** API key for this provider — needed by Auto-Detect to query the API. */
   apiKey: string;
+  /**
+   * Optional explicit metadata endpoint from the vault/config. Passed
+   * verbatim to `/api/config/fetch-models` so the backend hits the right
+   * URL (e.g. LM Studio /api/v0/models, Google /v1beta/models).
+   */
+  metadataEndpoint?: string;
   badge: string;
   icon: React.ReactNode;
   models: Array<{
@@ -339,12 +345,40 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
     const groups: GranularProviderGroup[] = [];
 
     /* Resolve data from vault, with props as fallback */
+    // Merge vault + props per-field, so metadataEndpoint set via the UI
+    // (which persists to localStorage) is visible even when the vault
+    // was populated before the field existed.
+    const mergeProvider = (v: any, p: any) => ({
+      ...(v || {}),
+      ...(p || {}),
+      // Explicitly prefer vault values for identity fields, but prefer
+      // props for metadataEndpoint when props has a value.
+      metadataEndpoint:
+        (p && p.metadataEndpoint) || (v && v.metadataEndpoint) || "",
+    });
+
     const clouds: CloudProviderVaultItem[] =
-      vault?.cloud_vault ?? props.cloudProviders ?? [];
+      (vault?.cloud_vault ?? []).map((v) => {
+        const p = props.cloudProviders?.find((c) => c.id === v.id);
+        return mergeProvider(v, p) as CloudProviderVaultItem;
+      }).concat(
+        (props.cloudProviders ?? []).filter(
+          (p) => !(vault?.cloud_vault ?? []).some((v) => v.id === p.id)
+        )
+      );
+
     const customs: CustomEndpoint[] =
-      vault?.custom_endpoints ?? props.customEndpoints ?? [];
-    const lm = vault?.lmstudio_vault ?? (props.lmStudioSettings as any);
-    const ol = vault?.ollama_vault ?? (props.ollamaSettings as any);
+      (vault?.custom_endpoints ?? []).map((v) => {
+        const p = props.customEndpoints?.find((c) => c.id === v.id);
+        return mergeProvider(v, p) as CustomEndpoint;
+      }).concat(
+        (props.customEndpoints ?? []).filter(
+          (p) => !(vault?.custom_endpoints ?? []).some((v) => v.id === p.id)
+        )
+      );
+
+    const lm = mergeProvider(vault?.lmstudio_vault, props.lmStudioSettings);
+    const ol = mergeProvider(vault?.ollama_vault, props.ollamaSettings);
 
     const scanned: string[] = vault?.scanned_models ?? [];
     const avail: string[] =
@@ -367,6 +401,7 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
         providerKey: cp.id,
         baseUrl: cp.baseUrl || "",
         apiKey: cp.apiKey || "",
+        metadataEndpoint: (cp as any).metadataEndpoint || "",
         badge: cp.badge || "",
         icon: <ProviderIcon badge={cp.badge} />,
         models: uniqueModels.map((m) => {
@@ -395,6 +430,7 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
           providerKey: "lmstudio",
           baseUrl: lm.baseUrl || "http://127.0.0.1:1234/v1",
           apiKey: lm.apiKey || "",
+          metadataEndpoint: (lm as any).metadataEndpoint || "",
           badge: lm.badge || "",
           icon: <ProviderIcon badge={lm.badge} />,
           models: lmModels.map((m) => {
@@ -426,6 +462,7 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
           // never a hardcoded URL.
           baseUrl: ol.baseUrl || "http://127.0.0.1:11434",
           apiKey: "",
+          metadataEndpoint: (ol as any).metadataEndpoint || "",
           badge: ol.badge || "",
           icon: <ProviderIcon badge={ol.badge} />,
           models: olModels.map((m) => {
@@ -459,6 +496,7 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
         // a hardcoded value. Auto-Detect needs these to reach the API.
         baseUrl: ce.endpointUrl || "",
         apiKey: ce.apiKey || "",
+        metadataEndpoint: (ce as any).metadataEndpoint || "",
         badge,
         icon: <ProviderIcon badge={badge} />,
         models: ceModels.map((m) => {
@@ -579,7 +617,8 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
     providerName: string,
     baseUrl: string,
     apiKey: string,
-    _providerKey: string,
+    providerKey: string,
+    metadataEndpoint: string = "",
   ) => {
     if (!baseUrl) {
       showToast.warning(
@@ -591,84 +630,53 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
 
     setAutoDetectingId(modelId);
     try {
-      const cleanBase = baseUrl.replace(/\/+$/, "");
-      const modelsUrl = cleanBase.endsWith("/models")
-        ? cleanBase
-        : `${cleanBase}/models`;
-
-      const headers: Record<string, string> = {
-        Accept: "application/json",
-      };
-      if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
-
-      const res = await fetch(modelsUrl, { headers });
+      // Query via backend — same path "Scan Models" uses. The backend
+      // handles provider-specific endpoints (LM Studio /api/v0/models,
+      // Google /v1beta/models), CORS, and context-field extraction.
+      const res = await fetch("/api/config/fetch-models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          base_url: baseUrl,
+          api_key: apiKey || "",
+          provider_id: providerKey,
+          provider_type: "",
+          metadata_endpoint: metadataEndpoint || "",
+        }),
+      });
 
       if (!res.ok) {
-        showToast.error(
-          `HTTP ${res.status}`,
-          `${modelsUrl}`
-        );
+        showToast.error(`HTTP ${res.status}`, `${providerName} query failed`);
         return;
       }
 
       const data = await res.json();
-      const list: any[] =
-        (Array.isArray(data?.data) && data.data) ||
-        (Array.isArray(data?.models) && data.models) ||
-        [];
-
-      if (list.length === 0) {
+      if (!data.ok) {
         showToast.warning(
-          "Empty response",
-          `${modelsUrl} returned no models.`
+          "Provider unreachable",
+          data.error || "Check endpoint URL in Models tab"
         );
         return;
       }
 
-      const model = list.find((m) => {
-        if (!m || typeof m !== "object") return false;
-        const rawId = String(m.id || m.name || "");
-        const shortId = rawId.includes("/")
-          ? rawId.split("/").pop() || rawId
-          : rawId;
-        return (
-          rawId === modelId ||
-          shortId === modelId ||
-          rawId.endsWith(`/${modelId}`) ||
-          modelId.endsWith(`/${rawId}`)
-        );
-      });
+      // Merge fresh metadata into local state so other UI stays in sync
+      if (data.models_metadata) {
+        setMetadataVault((prev) => ({ ...prev, ...data.models_metadata }));
+      }
 
-      if (!model) {
+      const meta = data.models_metadata?.[modelId];
+      if (!meta || typeof meta.max_context_length !== "number") {
         showToast.warning(
-          "Model not in API response",
-          `${modelId} is not listed at ${modelsUrl}`
+          "Provider did not return context",
+          `${modelId} appears in ${providerName}'s list, but the API has no context field. Enter manually.`
         );
         return;
       }
 
-      const ctx =
-        model.max_context_length ??
-        model.context_length ??
-        model.context_window ??
-        model.inputTokenLimit ??
-        model.max_tokens;
-
-      if (typeof ctx !== "number" || ctx <= 0) {
-        showToast.warning(
-          "API does not return context window",
-          `${providerName} /models response has no context field. Enter manually.`
-        );
-        return;
-      }
-
+      const ctx = meta.max_context_length;
       const out =
-        model.max_output_tokens ??
-        model.max_completion_tokens ??
-        model.outputTokenLimit;
-      const finalOut =
-        typeof out === "number" && out > 0
-          ? out
+        typeof meta.max_output_tokens === "number"
+          ? meta.max_output_tokens
           : ctx >= 32768
           ? 4096
           : 1500;
@@ -678,7 +686,7 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
         [modelId]: {
           ...(prev[modelId] || { provider_name: providerName }),
           context_window: ctx,
-          max_output_tokens: finalOut,
+          max_output_tokens: out,
           provider_name: providerName,
         },
       }));
@@ -688,10 +696,7 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
         `${modelId} → ${ctx.toLocaleString()} tokens`
       );
     } catch (err: any) {
-      showToast.error(
-        "Auto-Detect failed",
-        err?.message || "Network error"
-      );
+      showToast.error("Auto-Detect failed", err?.message || "Network error");
     } finally {
       setAutoDetectingId(null);
     }
@@ -802,9 +807,9 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
    * Render
    * ------------------------------- */
   return (
-    <div className="w-full max-w-7xl space-y-6 pt-6 m-auto">
+    <div className="w-full max-w-7xl space-y-6 pt-6 m-auto relative">
       {/* Header banner & global control actions */}
-      <div className="p-4 rounded-sm border border-border bg-gigbg flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 shadow-xs">
+      <div className=" top-0 p-4 rounded-sm border border-border bg-gigbg flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 shadow-xs">
         <div>
           <div className="flex items-center gap-2">
             <Gauge size={16} className="text-primary" />
@@ -837,7 +842,7 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
           <Button
             onClick={handleSaveAll}
             disabled={saving || loading}
-            className="h-8 text-xs bg-primary text-primary-foreground font-medium flex items-center gap-1.5 cursor-pointer shadow-xs"
+            className="h-8 text-xs hover:text-[#fff] font-medium flex items-center gap-1.5 cursor-pointer shadow-xs"
           >
             <Save size={13} className={saving ? "animate-spin" : ""} />
             <span>{saving ? "Saving Changes…" : "Save All Budgets"}</span>
@@ -907,7 +912,7 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
 
               {/* Models list */}
               {isOpen && (
-                <div className="divide-y bg-muted divide-border/50 p-2 sm:p-3 space-y-2">
+                <div className="divide-y bg-black/10 divide-border/50 p-2 sm:p-3 space-y-2">
                   {group.models.map((item) => {
                     const modelConfig = budgets[item.modelId] || {
                       context_window: item.defaultContextWindow,
@@ -945,7 +950,7 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
                         className="rounded-md border border-border/60 bg-background/50 overflow-hidden transition hover:border-border"
                       >
                         {/* Model row summary */}
-                        <div className="p-3 bg-custom flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                        <div className="p-3 bg-card flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
                           <div className="flex items-center gap-2.5 truncate">
                             <button
                               type="button"
@@ -996,6 +1001,7 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
                                   group.baseUrl,
                                   group.apiKey,
                                   group.providerKey,
+                                  group.metadataEndpoint || "",
                                 )
                               }
                               disabled={autoDetectingId === item.modelId}
@@ -1029,7 +1035,7 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
 
                         {/* Interactive configuration panel */}
                         {isExpanded && (
-                          <div className="p-3.5 bg-card/60 border-t border-border/50 space-y-4">
+                          <div className="p-3.5 bg-gigbg border-t border-border/50 space-y-4">
                             {/* Numeric inputs */}
                             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
                               <div>
@@ -1085,13 +1091,13 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
                                 explicitTemp !== defaultTemperature;
 
                               return (
-                                <div className="p-3 rounded-lg bg-background/80 border border-border/70 space-y-2">
+                                <div className="p-3 rounded-sm bg-muted border border-border/70 space-y-2 shadow-sm">
                                   <div className="flex items-center justify-between gap-2">
                                     <div className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
-                                      <span className="h-2 w-2 rounded-full bg-fuchsia-500" />
+                                      <span className="h-2 w-2 rounded-full bg-green-800" />
                                       <span>Temperature (Sampling)</span>
                                       {isOverridden && (
-                                        <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-fuchsia-500/10 text-fuchsia-500 border border-fuchsia-500/30">
+                                        <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-green-500/10 text-green-500 border border-green-500/30">
                                           Override
                                         </span>
                                       )}
@@ -1146,7 +1152,7 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
                                         };
                                       });
                                     }}
-                                    className="w-full accent-fuchsia-500 h-1.5 cursor-pointer"
+                                    className="w-full accent-green-500 h-1.5 cursor-pointer"
                                   />
                                   <div className="flex items-center justify-between text-[10px] text-muted-foreground font-mono">
                                     <span>Deterministic (0.00)</span>

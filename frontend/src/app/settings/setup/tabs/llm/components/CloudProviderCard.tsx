@@ -199,6 +199,25 @@ export function CloudProviderCard({
           />
         </div>
 
+        {/* Metadata Endpoint (optional) */}
+        <div className="md:col-span-3">
+          <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-1">
+            Metadata Endpoint (optional)
+          </label>
+          <input
+            type="text"
+            value={provider.metadataEndpoint || ""}
+            onChange={(e) => onChange({ metadataEndpoint: e.target.value })}
+            placeholder="Leave empty to use <baseUrl>/models"
+            className="w-full bg-card border border-border rounded-sm px-2.5 py-1.5
+            text-xs text-foreground font-mono shadow-sm focus:outline-none focus:ring-1 focus:ring-rb transition-shadow"
+          />
+          <span className="text-[9px] text-muted-foreground block mt-1 font-mono">
+            Used by Auto-Detect. Google requires the native{" "}
+            <code>v1beta/models</code> endpoint.
+          </span>
+        </div>
+
         {/* API Key */}
         <div>
           <div className="flex items-center justify-between mb-1">

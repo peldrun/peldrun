@@ -24,6 +24,12 @@ export interface CustomEndpoint {
   name: string;
   providerId: string;
   endpointUrl: string;
+  /**
+   * Optional explicit URL for fetching model metadata (context window,
+   * max output). If empty, the backend uses `<endpointUrl>/models`.
+   * Useful for servers whose `/models` returns IDs only.
+   */
+  metadataEndpoint?: string;
   apiMode: ApiModeType;
   defaultModel: string;
   contextWindow: number | string;
@@ -41,6 +47,13 @@ export interface CloudProviderVaultItem {
   name: string;
   type: string;
   baseUrl: string;
+  /**
+   * Optional metadata endpoint. If empty, the backend derives it from
+   * `baseUrl + "/models"`. Set this when the provider exposes context
+   * info at a different path (e.g. Google's
+   * `https://generativelanguage.googleapis.com/v1beta/models`).
+   */
+  metadataEndpoint?: string;
   apiKey: string;
   model: string;
   popularModels: string[];
@@ -58,6 +71,13 @@ export interface LMStudioSettings {
   savedModels?: string[];
   provider: string;
   baseUrl: string;
+  /**
+   * Optional metadata endpoint. LM Studio's `/v1/models` returns IDs
+   * only. Context window is exposed at `/api/v0/models` (or
+   * `/api/v1/models` on newer builds). Set this to enable Auto-Detect
+   * to read real limits.
+   */
+  metadataEndpoint?: string;
   apiKey: string;
   badge?: string;
   model: string;
@@ -68,6 +88,11 @@ export interface LMStudioSettings {
 
 export interface OllamaSettings {
   baseUrl: string;
+  /**
+   * Optional metadata endpoint. Ollama's `/v1/models` is minimal; the
+   * native `/api/tags` or `/api/show` returns richer info.
+   */
+  metadataEndpoint?: string;
   model: string;
   status: ProviderConnectionStatus;
   latency?: number;

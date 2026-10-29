@@ -124,6 +124,14 @@ export function LocalEnginesTab({
     }
   };
 
+  const handleLMMetadataEndpointChange = (value: string) => {
+    setLmStudioSettings({ ...lmStudioSettings, metadataEndpoint: value });
+  };
+
+  const handleOllamaMetadataEndpointChange = (value: string) => {
+    setOllamaSettings({ ...ollamaSettings, metadataEndpoint: value });
+  };
+
   /* ---------------------- Ollama derived helpers ------------------------ */
 
   const handleOllamaBaseUrlChange = (value: string) => {
@@ -210,6 +218,24 @@ export function LocalEnginesTab({
               onChange={(e) => handleLMModelChange(e.target.value)}
               className="w-full bg-background border border-border rounded-sm px-3 py-1.5 text-xs text-foreground font-mono shadow-sm focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow"
             />
+          </div>
+
+          <div>
+            <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-1">
+              Metadata Endpoint (optional)
+            </label>
+            <input
+              type="text"
+              value={lmStudioSettings.metadataEndpoint || ""}
+              onChange={(e) => handleLMMetadataEndpointChange(e.target.value)}
+              placeholder="e.g. http://127.0.0.1:1234/api/v0/models"
+              className="w-full bg-background border border-border rounded-sm px-3 py-1.5 text-xs text-foreground font-mono shadow-sm focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow"
+            />
+            <span className="text-[10px] text-muted-foreground block mt-0.5">
+              Used by Auto-Detect to read the real context window. Leave
+              empty to use <code>&lt;baseUrl&gt;/models</code>. Recommended:{" "}
+              <code>/api/v0/models</code>.
+            </span>
           </div>
 
           <div className="flex items-center justify-between pt-2 flex-wrap gap-2">
@@ -422,6 +448,23 @@ export function LocalEnginesTab({
                 className="w-full bg-background border border-border rounded-sm px-3 py-1.5 text-xs text-foreground font-mono shadow-sm focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow"
               />
             </div>
+          </div>
+
+          <div>
+            <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-1">
+              Metadata Endpoint (optional)
+            </label>
+            <input
+              type="text"
+              value={ollamaSettings.metadataEndpoint || ""}
+              onChange={(e) => handleOllamaMetadataEndpointChange(e.target.value)}
+              placeholder="e.g. http://127.0.0.1:11434/api/tags"
+              className="w-full bg-background border border-border rounded-sm px-3 py-1.5 text-xs text-foreground font-mono shadow-sm focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow"
+            />
+            <span className="text-[10px] text-muted-foreground block mt-0.5">
+              Used by Auto-Detect to read the real context window. Leave
+              empty to use <code>&lt;baseUrl&gt;/models</code>.
+            </span>
           </div>
 
           <div className="flex items-center justify-between pt-1 flex-wrap gap-2">
