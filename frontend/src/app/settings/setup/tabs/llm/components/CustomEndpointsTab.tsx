@@ -4,11 +4,13 @@
 import React from "react";
 import { motion } from "framer-motion";
 import {
+  CheckCircle2,
   ChevronRight,
   Plus,
   RefreshCw,
   Terminal,
   Trash2,
+  XCircle,
   Zap,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -61,6 +63,7 @@ export function CustomEndpointsTab({
   setEndpointForm,
   testingId,
   handleTestCustomForm,
+  handleTestCustomEndpoint,
   handleSaveCustomEndpoint,
   handleDeleteCustomEndpoint,
   onOpenDiscovery,
@@ -136,6 +139,17 @@ export function CustomEndpointsTab({
                       <span className="text-[10px] px-1.5 py-0.5 rounded-sm bg-muted text-muted-foreground font-mono">
                         {ce.defaultModel}
                       </span>
+                      {ce.status === "online" && (
+                        <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-sm border border-emerald-500/20">
+                          <CheckCircle2 size={11} /> Connected
+                          {typeof ce.latency === "number" ? ` (${ce.latency} ms)` : ""}
+                        </span>
+                      )}
+                      {ce.status === "offline" && (
+                        <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-rose-600 dark:text-rose-400 bg-rose-500/10 px-2 py-0.5 rounded-sm border border-rose-500/20">
+                          <XCircle size={11} /> Failed
+                        </span>
+                      )}
                     </div>
                     <span
                       className="text-xs text-muted-foreground font-mono block truncate"
@@ -143,10 +157,36 @@ export function CustomEndpointsTab({
                     >
                       {ce.endpointUrl}
                     </span>
+                    {ce.status === "offline" && ce.lastError && (
+                      <span className="text-[10px] text-rose-500 font-mono block truncate">
+                        {ce.lastError}
+                      </span>
+                    )}
                   </div>
                 </div>
 
                 <div className="flex items-center gap-2 shrink-0">
+                  {/* [FIX-TEST-ALL] Per-endpoint health probe. Updates the
+                      endpoint's status/latency/lastError and reflects the
+                      result in the ConnectivityMatrix. */}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => handleTestCustomEndpoint(ce.id)}
+                    disabled={testingId === ce.id}
+                    className="h-8 px-2.5 text-xs border-border bg-background hover:bg-muted text-foreground cursor-pointer hover:scale-105 transition-transform disabled:hover:scale-100 flex items-center gap-1"
+                    title="Test connection to this endpoint"
+                  >
+                    <Zap
+                      size={11}
+                      className={`text-amber-500 ${
+                        testingId === ce.id ? "animate-spin" : ""
+                      }`}
+                    />
+                    <span>{testingId === ce.id ? "Testing…" : "Test"}</span>
+                  </Button>
+
                   <Button
                     type="button"
                     variant="outline"

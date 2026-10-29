@@ -368,6 +368,13 @@ export function LLMTab(props: LLMTabProps) {
         }
       }
 
+      // [FIX-TEST-ALL] Custom endpoints were previously skipped by the
+      // bulk health check. Iterate them here so the ConnectivityMatrix
+      // reflects real status for every configured provider.
+      for (const ce of customEndpoints) {
+        await custom.handleTestCustomEndpoint(ce.id);
+      }
+
       showToast.success(
         "Health Check Completed",
         "All provider responses updated."
@@ -375,7 +382,14 @@ export function LLMTab(props: LLMTabProps) {
     } finally {
       setTestingAll(false);
     }
-  }, [cloudProviders, cloud, handleTestLMStudio, handleTestOllama]);
+  }, [
+    cloudProviders,
+    cloud,
+    customEndpoints,
+    custom,
+    handleTestLMStudio,
+    handleTestOllama,
+  ]);
 
   /* -------------------------- Model list wrappers ----------------------- */
 
@@ -536,6 +550,7 @@ export function LLMTab(props: LLMTabProps) {
             setEndpointForm={custom.setEndpointForm}
             testingId={custom.testingId}
             handleTestCustomForm={custom.handleTestCustomForm}
+            handleTestCustomEndpoint={custom.handleTestCustomEndpoint}
             handleSaveCustomEndpoint={custom.handleSaveCustomEndpoint}
             handleDeleteCustomEndpoint={custom.handleDeleteCustomEndpoint}
             onOpenDiscovery={handleOpenDiscovery}

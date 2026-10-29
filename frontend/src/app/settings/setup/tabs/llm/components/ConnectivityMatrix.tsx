@@ -320,7 +320,11 @@ export function ConnectivityMatrix({
               iconName={iconName}
               label={ce.name}
               subLabel={ce.defaultModel}
-              state="untested"
+              // [FIX-MATRIX-CUSTOM] Read the actual persisted health fields
+              // instead of hardcoding "untested". `handleTestCustomEndpoint`
+              // updates these values, so the matrix now reflects reality.
+              state={(ce.status as HealthState) || "untested"}
+              latency={ce.latency}
               isPrimary={isPrimary}
               onActivate={
                 isPrimary

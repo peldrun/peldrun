@@ -37,14 +37,18 @@ export interface UseCustomEndpointsResult {
   testingId: string | null;
   /** Runs a connectivity probe against the current form values. */
   handleTestCustomForm: () => Promise<void>;
+  /**
+   * Runs a connectivity probe against a SAVED custom endpoint.
+   * Updates the endpoint's `status`, `latency`, and `lastError` in place.
+   * Used by:
+   *   - the per-endpoint "Test" button in CustomEndpointsTab;
+   *   - `handleTestAll` in LLMTab (bulk health check).
+   */
+  handleTestCustomEndpoint: (endpointId: string) => Promise<void>;
   /** Persists the current form as a new custom endpoint. */
   handleSaveCustomEndpoint: () => void;
   /** Removes a custom endpoint by id. */
   handleDeleteCustomEndpoint: (id: string) => void;
-  /**
-   * Merges discovered models into an existing custom endpoint and persists
-   * the result to localStorage.
-   */
   applyDiscoveredModels: (
     endpointId: string,
     selectedModels: string[],
@@ -114,6 +118,57 @@ export function useCustomEndpoints({
       setTestingId(null);
     }
   }, [endpointForm, testEndpoint]);
+
+  /* -------------------------- Test SAVED endpoint ----------------------- */
+
+  /**
+   * Probe a saved custom endpoint and update its runtime health fields.
+   * Mirrors `useCloudProviders.handleTestCloud` — same shape, same toasts,
+   * same side effects — so the ConnectivityMatrix reflects the result
+   * uniformly across providers.
+   */
+  const handleTestCustomEndpoint = useCallback(
+    async (endpointId: string) => {
+      const ce = customEndpoints.find((c) => c.id === endpointId);
+      if (!ce) return;
+
+      setTestingId(endpointId);
+      try {
+        const res = await testEndpoint(
+          ce.endpointUrl,
+          ce.apiKey,
+          ce.defaultModel,
+          ""
+        );
+
+        setCustomEndpoints((prev) =>
+          prev.map((item) =>
+            item.id === endpointId
+              ? {
+                  ...item,
+                  status: res.ok ? "online" : "offline",
+                  latency: res.latency,
+                  lastError: res.ok ? undefined : res.message,
+                }
+              : item
+          )
+        );
+
+        if (res.ok) {
+          showToast.success(
+            `${ce.name} Verified`,
+            `Active and responsive (${res.latency} ms)`,
+            res.latency
+          );
+        } else {
+          showToast.error(`${ce.name} Connection Failed`, res.message);
+        }
+      } finally {
+        setTestingId(null);
+      }
+    },
+    [customEndpoints, setCustomEndpoints, testEndpoint]
+  );
 
   /* -------------------------- Create new endpoint ----------------------- */
 
@@ -192,6 +247,7 @@ export function useCustomEndpoints({
     setEndpointForm,
     testingId,
     handleTestCustomForm,
+    handleTestCustomEndpoint,
     handleSaveCustomEndpoint,
     handleDeleteCustomEndpoint,
     applyDiscoveredModels,

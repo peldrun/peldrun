@@ -227,6 +227,7 @@ export interface CustomEndpointsTabProps extends LLMTabProps {
   setEndpointForm: Dispatch<SetStateAction<EndpointFormState>>;
   testingId: string | null;
   handleTestCustomForm: () => Promise<void>;
+  handleTestCustomEndpoint: (endpointId: string) => Promise<void>;
   handleSaveCustomEndpoint: () => void;
   handleDeleteCustomEndpoint: (id: string) => void;
   onOpenDiscovery: (target: DiscoveryTarget) => void;
