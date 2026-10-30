@@ -34,9 +34,17 @@ def manifest_needs_auth(manifest: Dict[str, Any]) -> bool:
     """
     Decide whether an MCP server requires user-provided credentials.
 
-    Two independent signals are OR'd:
-      * An explicit ``auth_strategy`` declaring a recognized auth kind.
-      * A required secret field inside ``env_schema``.
+    Auth trigger rules:
+      1. ``auth_strategy == "oauth"`` → ALWAYS requires an interactive
+         OAuth flow, regardless of any env_schema.
+      2. ``auth_strategy`` in ("env", "apikey", "api_key", "bearer",
+         "token") → Requires auth ONLY IF at least one field in
+         ``env_schema.required`` is marked as ``secret: true``.
+         This allows "optional key" servers (e.g. Context7) to be
+         used without prompting the user, while still protecting
+         servers with mandatory secrets (e.g. GitHub, WordPress).
+      3. ``auth_strategy`` absent → Same as rule 2 (checks env_schema).
+      4. No env_schema or no required secret fields → No auth needed.
 
     A server with neither signal (filesystem, fetch, ...) is treated
     as auth-free and never prompts the user.
@@ -45,20 +53,36 @@ def manifest_needs_auth(manifest: Dict[str, Any]) -> bool:
         return False
 
     strategy = str(manifest.get("auth_strategy") or "").lower().strip()
-    if strategy in ("oauth", "env", "apikey", "api_key", "bearer", "token"):
+
+    # OAuth strictly requires user interaction, regardless of env_schema.
+    if strategy == "oauth":
         return True
 
+    # For "env" (or aliases), fall through to schema inspection.
+    # A strategy declaration alone is not enough — we must verify
+    # that at least one field is BOTH required AND secret.
     env_schema = manifest.get("env_schema")
     if not isinstance(env_schema, dict):
+        # If strategy is an env kind but no schema exists, treat as
+        # "no credentials needed" rather than blocking the user with
+        # an impossible-to-satisfy modal.
         return False
+
     required = env_schema.get("required") or []
     properties = env_schema.get("properties") or {}
+
     if not isinstance(required, list) or not isinstance(properties, dict):
         return False
+
+    # No required fields → credentials are optional. Do not prompt.
+    if not required:
+        return False
+
     for field in required:
         prop = properties.get(field)
         if isinstance(prop, dict) and prop.get("secret"):
             return True
+
     return False
 
 

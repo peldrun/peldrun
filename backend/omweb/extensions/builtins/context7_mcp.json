@@ -1,0 +1,92 @@
+{
+  "id": "context7_mcp",
+  "registry_id": "io.peldrun/context7_mcp",
+  "name": "Context7",
+  "type": "mcp_server",
+  "status": "ready",
+
+  "icon_svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" data-name=\"Layer 1\" viewBox=\"0 0 128 128\"><title>Context7 MCP Server</title><path fill=\"currentColor\" d=\"M26 6a2 2 0 0 1 2-2h72a2 2 0 0 1 2 2v4H26Zm98 86h-9v-9a2.006 2.006 0 0 0-2-2H95v-7h5a6.005 6.005 0 0 0 6-6V6a6.005 6.005 0 0 0-6-6H28a6.005 6.005 0 0 0-6 6v62a6.005 6.005 0 0 0 6 6h5v7H15a2.006 2.006 0 0 0-2 2v9H4a4 4 0 0 0-4 4v28a4 4 0 0 0 4 4h18a4 4 0 0 0 2.83-1.17l4-4A4 4 0 0 0 30 120V96a4 4 0 0 0-4-4h-9v-7h18a2.006 2.006 0 0 0 2-2v-9h25v18h-9a4 4 0 0 0-4 4v28a4 4 0 0 0 4 4h18a4 4 0 0 0 2.83-1.17l4-4A4 4 0 0 0 79 120V96a4 4 0 0 0-4-4h-9V74h25v9a2.006 2.006 0 0 0 2 2h18v7h-9a4 4 0 0 0-4 4v28a4 4 0 0 0 4 4h18a4 4 0 0 0 2.83-1.17l4-4A4 4 0 0 0 128 120V96a4 4 0 0 0-4-4M34 20h60a2 2 0 0 1 0 4H34a2 2 0 0 1 0-4m0 10h60a2 2 0 0 1 0 4H34a2 2 0 0 1 0-4m0 10h60a2 2 0 0 1 0 4H34a2 2 0 0 1 0-4m0 10h60a2 2 0 0 1 0 4H34a2 2 0 0 1 0-4m0 14a2 2 0 0 1 0-4h60a2 2 0 0 1 0 4Z\"/></svg>",
+  "icon_url": "https://static.peldrun.ai/icons/context7_mcp.svg",
+
+  "short_description": "Fetch up-to-date, version-specific documentation for libraries and frameworks directly into your agent's context.",
+  "store_description": "Context7 is a documentation MCP server that provides up-to-date, version-specific documentation and code snippets for any popular library or framework. LLMs often hallucinate outdated APIs because their training data has a cutoff. Context7 fixes this by fetching the latest official documentation for a specific library version and injecting it into the prompt. Supports thousands of libraries (React, Next.js, FastAPI, etc.). You can optionally use a free API key for higher rate limits.",
+
+  "description": "Fetches up-to-date, version-specific documentation for libraries.",
+  "category": "development",
+  "tags": ["documentation", "code", "libraries", "frameworks", "context", "reference", "developer-tools"],
+
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+
+  "repository": {
+    "url": "https://github.com/upstash/context7",
+    "source": "github"
+  },
+  "upstream": {
+    "name": "@upstash/context7-mcp",
+    "registry": "npm",
+    "registry_url": "https://www.npmjs.com/package/@upstash/context7-mcp",
+    "version": "1.0.12",
+    "license": "MIT"
+  },
+
+  "homepage": "https://context7.com",
+  "docs_url": "https://github.com/upstash/context7",
+  "changelog_url": "https://github.com/upstash/context7/releases",
+  "support_url": "https://github.com/upstash/context7/issues",
+  "license": "MIT",
+  "license_url": "https://github.com/upstash/context7/blob/master/LICENSE",
+
+  "version": "1.0.0",
+  "release_date": "2026-10-30",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "lifecycle_status": "active",
+
+  "is_builtin": true,
+  "read_only": false,
+  "command": "npx -y @upstash/context7-mcp",
+  "transport": "stdio",
+  "runtime": "node",
+  "auth_strategy": "none",
+  "hosting_type": "local",
+
+  "capabilities": {
+    "tools": true,
+    "resources": false,
+    "prompts": false
+  },
+  "tool_count": 2,
+
+  "badges": ["official", "verified", "documentation", "read-only"],
+
+  "env_schema": {
+    "type": "object",
+    "required": [],
+    "properties": {
+      "CONTEXT7_API_KEY": {
+        "type": "string",
+        "title": "Context7 API Key (Optional)",
+        "description": "Provides higher rate limits. Get a free key at https://context7.com",
+        "secret": true
+      }
+    }
+  },
+
+  "usage_hint": "This MCP server provides up-to-date documentation for libraries. WORKFLOW: (1) First, use the 'resolve-library-id' tool to find the Context7 ID for the library you are using (e.g., 'react', 'nextjs'). (2) Then, use the 'get-library-docs' tool with that ID and an optional topic to fetch the official documentation directly into your context. Use this whenever you need to write code using a specific framework to avoid using outdated APIs.",
+
+  "hints": {
+    "setup_time": "10 seconds",
+    "requires_account": false,
+    "requires_token": false,
+    "cost": "free",
+    "data_access": "read-only",
+    "network_access": true,
+    "rate_limit": "Higher limits with free API key"
+  }
+}

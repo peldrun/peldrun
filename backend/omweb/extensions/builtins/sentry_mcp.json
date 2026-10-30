@@ -1,0 +1,78 @@
+{
+  "id": "sentry_mcp",
+  "registry_id": "io.peldrun/sentry_mcp",
+  "name": "Sentry",
+  "type": "mcp_server",
+  "status": "ready",
+
+  "icon_svg": "<svg role=\"img\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\"><title>Sentry</title><path fill=\"currentColor\" d=\"M13.91 2.505c-.873-1.448-2.972-1.448-3.844 0L6.904 7.92a15.478 15.478 0 0 1 8.53 12.811h-2.221A13.301 13.301 0 0 0 5.784 9.814l-2.926 5.06a7.65 7.65 0 0 1 4.435 5.848H2.194a.365.365 0 0 1-.298-.534l1.413-2.402a5.16 5.16 0 0 0-1.614-.913L.296 19.275a2.182 2.182 0 0 0 .812 2.999 2.24 2.24 0 0 0 1.086.288h6.983a9.322 9.322 0 0 0-3.845-8.318l1.11-1.922a11.47 11.47 0 0 1 4.95 10.24h5.915a17.242 17.242 0 0 0-7.885-15.28l2.244-3.845a.37.37 0 0 1 .504-.13c.255.14 9.75 16.708 9.928 16.9a.365.365 0 0 1-.327.543h-2.287c.029.612.029 1.223 0 1.831h2.297a2.206 2.206 0 0 0 1.922-3.31z\"/></svg>",
+  "icon_url": "https://static.peldrun.ai/icons/sentry_mcp.svg",
+
+  "short_description": "Inspect production errors, search issues, and trigger Seer AI root-cause analysis directly from your agent.",
+  "store_description": "Sentry's official hosted MCP server. Connects your agent to Sentry's issue stream, event data, and Seer AI analysis — purpose-built for coding assistants that need to debug production failures. Ask questions about any Sentry organization, team, or project in natural language: search errors across recent deploys, fetch full stacktraces and breadcrumbs for a specific issue, count occurrences by release or environment, and let Seer pinpoint the root cause with suggested code fixes. Authentication uses OAuth 2.1 with PKCE (S256) and Dynamic Client Registration, so no manual API key or OAuth app registration is required — one consent screen grants the agent access to your entire Sentry workspace. Tools run with the authorizing user's Sentry permissions.",
+
+  "description": "Sentry's official MCP server for error monitoring, issue search, and Seer AI debugging.",
+  "category": "development",
+  "tags": ["sentry", "errors", "monitoring", "observability", "debugging", "issues", "stacktraces", "seer", "performance"],
+
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+
+  "repository": {
+    "url": "https://github.com/getsentry/sentry-mcp",
+    "source": "github"
+  },
+  "upstream": {
+    "name": "sentry-mcp",
+    "registry": "hosted",
+    "registry_url": "https://mcp.sentry.dev",
+    "version": "hosted",
+    "license": "proprietary"
+  },
+
+  "homepage": "https://mcp.sentry.dev",
+  "docs_url": "https://docs.sentry.dev/mcp/",
+  "changelog_url": "https://github.com/getsentry/sentry-mcp/releases",
+  "support_url": "https://github.com/getsentry/sentry-mcp/issues",
+  "license": "proprietary",
+  "license_url": "https://sentry.io/terms/",
+  "privacy_url": "https://sentry.io/privacy/",
+
+  "version": "1.0.0",
+  "release_date": "2026-10-30",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "lifecycle_status": "active",
+
+  "is_builtin": true,
+  "read_only": false,
+  "transport": "http",
+  "url": "https://mcp.sentry.dev/mcp",
+  "auth_strategy": "oauth",
+  "hosting_type": "remote",
+
+  "capabilities": {
+    "tools": true,
+    "resources": true,
+    "prompts": false
+  },
+
+  "badges": ["official", "verified", "remote", "requires-oauth", "read-only-data"],
+
+  "usage_hint": "This server is hosted by Sentry and authenticated via OAuth 2.1 (PKCE S256 + Dynamic Client Registration). Scopes are driven by Sentry's authorization-server metadata (org:read, project:write, team:write, event:write, alerts:write). Tools follow Sentry's own naming. CORE WORKFLOW: (1) If the user pastes a Sentry issue URL or gives an issue ID, call get_issue_details directly — it accepts both a URL and a short ID. (2) If the user describes a symptom in natural language ('checkout errors spiking', 'TypeError in Checkout.tsx'), call search_issues first with the appropriate org/project/query, then get_issue_details on the top hit. (3) To count or group events (not issues), use search_events. (4) For root-cause analysis with suggested fixes, call analyze_issue_with_seer — it returns AI-generated hypotheses grounded in the stacktrace and code context. (5) Use find_organizations / find_projects to discover valid org and project slugs before building queries. PATH CONSTRAINTS: appending '/:organization' or '/:organization/:project' to the URL restricts every tool call to that scope and automatically hides find_organizations (org scope) or find_projects (project scope). RESOURCES: the server exposes read-only sentry:// resources listing your organizations, projects, tag keys, and tag values — call resources/list if the user asks what orgs/projects are reachable. Read-only tool calls are safe to run freely; create_* tools modify the workspace and should only run on explicit user request.",
+
+  "hints": {
+    "setup_time": "30 seconds",
+    "requires_account": true,
+    "requires_token": false,
+    "cost": "free",
+    "data_access": "read-write",
+    "network_access": true,
+    "rate_limit": "Managed by Sentry per-user"
+  }
+}

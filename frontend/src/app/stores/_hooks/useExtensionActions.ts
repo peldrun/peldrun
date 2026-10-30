@@ -131,10 +131,18 @@ export function useExtensionActions({
       const isOAuthServer = authStrategy === "oauth";
 
       if (isOAuthServer) {
+        // Classify as "deferred" rather than "success". The badge
+        // for a deferred result is amber ("OAuth server"), which
+        // correctly signals "not verified from here" instead of
+        // lying with a green "Connected" badge. `ok: true` is kept
+        // for backward compatibility with any consumer that only
+        // reads the boolean — it means "no blocking problem to
+        // report", which is accurate for a deferred check.
         setTestResults((prev) => ({
           ...prev,
           [extId]: {
             ok: true,
+            kind: "deferred",
             message:
               "OAuth server — connect from Chat to authenticate and verify.",
           },
@@ -167,6 +175,7 @@ export function useExtensionActions({
           ...prev,
           [extId]: {
             ok: isOk,
+            kind: isOk ? "success" : "failure",
             message: isAuthMissing
               ? "Requires credentials — set them in Settings first."
               : data.message || (isOk ? "Connection OK" : "Test failed"),
@@ -188,6 +197,7 @@ export function useExtensionActions({
           ...prev,
           [extId]: {
             ok: false,
+            kind: "failure",
             message: err.message || "Failed to reach backend.",
           },
         }));

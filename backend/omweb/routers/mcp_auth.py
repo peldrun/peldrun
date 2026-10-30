@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Request
@@ -853,6 +854,179 @@ async def delete_global_oauth(server_id: str):
     return {
         "status": "ok",
         "server_id": server_id,
+        "removed": removed,
+    }
+
+
+
+
+# ─────────────────────────────────────────────────────────────────
+# OAuth Provider Credentials (UI-managed client_id/secret)
+# ─────────────────────────────────────────────────────────────────
+#
+# Google, GitHub, and other pre-registered providers do not support
+# Dynamic Client Registration — the operator must create an OAuth
+# app manually. Historically this meant exporting env vars before
+# `start-backend`. These endpoints let the UI store the credentials
+# instead, so every Google Workspace MCP server (Gmail, Drive,
+# Calendar) shares a single configuration entry.
+# ─────────────────────────────────────────────────────────────────
+
+
+class SaveOAuthProviderPayload(BaseModel):
+    """Body for PUT /api/mcp/oauth-providers/{provider_key}."""
+    client_id: str
+    client_secret: str
+
+
+def _require_pre_registered(provider_key: str) -> Dict[str, Any]:
+    """
+    Validate that ``provider_key`` matches a known pre-registered
+    provider AND that it is actually used by MCP servers.
+
+    Providers with ``mcp_oauth=False`` (e.g. GitHub) are registered
+    for SOURCE CONTROL OAuth flows only — their credentials must
+    NOT be settable through this endpoint, because no MCP server
+    would consume them. Rejecting explicitly is better than silently
+    accepting and leaving the user wondering why nothing changed.
+    """
+    from omweb.extensions.auth_manager import PRE_REGISTERED_CLIENTS
+
+    for match_host, cfg in PRE_REGISTERED_CLIENTS.items():
+        if match_host == provider_key:
+            if not cfg.get("mcp_oauth", False):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Provider '{provider_key}' is registered for "
+                        f"OAuth flows outside MCP (e.g. source control). "
+                        f"Its credentials cannot be set through the MCP "
+                        f"OAuth Providers endpoint."
+                    ),
+                )
+            return cfg
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            f"Provider '{provider_key}' is not a pre-registered OAuth "
+            f"provider. Known providers: "
+            f"{', '.join(PRE_REGISTERED_CLIENTS.keys())}"
+        ),
+    )
+
+
+@router.get("/api/mcp/oauth-providers")
+async def list_oauth_providers():
+    """
+    List every pre-registered OAuth provider and its configuration
+    status.
+
+    Used by the UI to decide whether to show a "Setup required"
+    warning on servers that depend on a pre-registered provider.
+    """
+    from omweb.extensions.auth_manager import PRE_REGISTERED_CLIENTS
+    from omweb.extensions.oauth_provider_store import (
+        get_oauth_provider_store,
+    )
+
+    store = get_oauth_provider_store()
+    out = []
+    for provider_key, cfg in PRE_REGISTERED_CLIENTS.items():
+        # Only providers that are actually used by MCP servers with
+        # auth_strategy="oauth" belong here. GitHub's entry in
+        # PRE_REGISTERED_CLIENTS is for source control (PAT-backed
+        # GitHub MCP never uses OAuth), so it must not appear in
+        # this list — showing it would mislead the user into
+        # configuring credentials that no MCP server consumes.
+        if not cfg.get("mcp_oauth", False):
+            continue
+
+        configured_ui = store.is_configured(provider_key)
+        # Also check env fallback so the UI reports "ready" when the
+        # operator pre-configured via env.
+        env_id = (os.environ.get(cfg["client_id_env"]) or "").strip()
+        out.append({
+            "provider_key": provider_key,
+            # display_name lives inside PRE_REGISTERED_CLIENTS now,
+            # so adding a new provider requires editing exactly ONE
+            # place in auth_manager.py — no more duplicate dicts.
+            "display_name": cfg.get("display_name", provider_key),
+            "configured_via_ui": configured_ui,
+            "configured_via_env": bool(env_id),
+            "ready": configured_ui or bool(env_id),
+            "client_id_env": cfg["client_id_env"],
+            "client_secret_env": cfg["client_secret_env"],
+        })
+    return {"status": "ok", "providers": out}
+
+
+@router.put("/api/mcp/oauth-providers/{provider_key}")
+async def save_oauth_provider(
+    provider_key: str,
+    payload: SaveOAuthProviderPayload = Body(...),
+):
+    """
+    Save (or overwrite) the client_id / client_secret for a
+    pre-registered OAuth provider.
+
+    The values are encrypted with AES-256-GCM using AAD bound to
+    the provider key, so a leaked file cannot be replayed as a
+    different provider's credentials.
+    """
+    _require_pre_registered(provider_key)
+
+    cid = (payload.client_id or "").strip()
+    csec = (payload.client_secret or "").strip()
+    if not cid or not csec:
+        raise HTTPException(
+            status_code=400,
+            detail="Both client_id and client_secret are required.",
+        )
+
+    from omweb.extensions.oauth_provider_store import (
+        get_oauth_provider_store,
+    )
+
+    try:
+        get_oauth_provider_store().save(provider_key, cid, csec)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "Failed to save OAuth provider credentials for '%s': %s",
+            provider_key,
+            exc,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to save credentials: {exc}",
+        )
+
+    return {
+        "status": "ok",
+        "provider_key": provider_key,
+        "ready": True,
+    }
+
+
+@router.delete("/api/mcp/oauth-providers/{provider_key}")
+async def delete_oauth_provider(provider_key: str):
+    """
+    Remove the UI-stored credentials for a provider.
+
+    Does NOT revoke anything at the provider — it only deletes the
+    local ciphertext. Any OAuth tokens previously issued via this
+    client remain valid until they expire (or are revoked in the
+    provider's own dashboard).
+    """
+    _require_pre_registered(provider_key)
+
+    from omweb.extensions.oauth_provider_store import (
+        get_oauth_provider_store,
+    )
+
+    removed = get_oauth_provider_store().delete(provider_key)
+    return {
+        "status": "ok",
+        "provider_key": provider_key,
         "removed": removed,
     }
 

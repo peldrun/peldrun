@@ -3,15 +3,25 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
-import { BrainCircuit, Terminal, ChevronDown, ChevronRight } from "lucide-react";
+import {
+  BrainCircuit,
+  Terminal,
+  ChevronDown,
+  ChevronRight,
+  Server,
+} from "lucide-react";
 import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
 import { ToolIcon } from "@/app/stores/_components/ToolIcon";
 import {
   resolveToolLabel,
   fetchToolManifest,
   formatToolArgs,
-  ToolManifest
+  ToolManifest,
 } from "@/lib/tool-icon-registry";
+import {
+  parseMcpToolName,
+  fetchMcpServerIcon,
+} from "@/components/chat/tool-call-card";
 
 export interface StepEvent {
   id: string;
@@ -34,20 +44,53 @@ interface ChatTimelineProps {
 
 function TimelineToolCall({ evt }: { evt: StepEvent }) {
   const [manifest, setManifest] = useState<ToolManifest | null>(null);
+  // MCP server icon — same caching contract as ToolCallCard.
+  // Populated async; falls back to <Server> icon when the manifest
+  // declares neither icon_svg nor icon_url.
+  const [mcpIcon, setMcpIcon] = useState<{
+    icon_svg?: string;
+    icon_url?: string;
+  } | null>(null);
+
+  // Detect MCP tool ids (mcp__server__tool) so we can route the
+  // icon lookup to the correct endpoint:
+  //   - MCP tool        → /api/mcp/servers/{server_id} (manifest)
+  //   - Built-in tool   → /api/store/tools/{tool_id}  (tool manifest)
+  // Without this routing, MCP tools generate spurious 404s on
+  // /api/store/tools/mcp__*/icon.svg and the card shows no icon.
+  const mcpInfo = evt.toolName
+    ? parseMcpToolName(evt.toolName)
+    : { isMcp: false };
 
   useEffect(() => {
+    if (!evt.toolName) return;
     let cancelled = false;
-    if (evt.toolName) {
+
+    if (mcpInfo.isMcp && mcpInfo.serverId) {
+      // MCP path: fetch the server manifest, extract its icon.
+      fetchMcpServerIcon(mcpInfo.serverId).then((info) => {
+        if (!cancelled) setMcpIcon(info);
+      });
+    } else {
+      // Built-in path: fetch the tool manifest as before.
       fetchToolManifest(evt.toolName).then((m) => {
         if (!cancelled && m) setManifest(m);
       });
     }
+
     return () => { cancelled = true; };
-  }, [evt.toolName]);
+  }, [evt.toolName, mcpInfo.isMcp, mcpInfo.serverId]);
 
   if (!evt.toolName) return null;
 
-  const label = manifest ? (manifest.display_name || manifest.name) : resolveToolLabel(evt.toolName);
+  // For MCP tools, prefer the remote name (portion after the final
+  // `__`) — this matches the label shown in ToolCallCard and
+  // reflects what the server actually calls the tool.
+  const label = mcpInfo.isMcp
+    ? mcpInfo.remoteName || evt.toolName
+    : manifest
+    ? manifest.display_name || manifest.name
+    : resolveToolLabel(evt.toolName);
 
   // Format the raw JSON string into a clean readable string
   const displayContent = formatToolArgs(evt.toolName, evt.content);
@@ -55,16 +98,44 @@ function TimelineToolCall({ evt }: { evt: StepEvent }) {
   return (
     <div className="flex items-start gap-2 p-2.5 rounded-sm bg-custom border border-border text-foreground font-mono text-xs">
       <div className="mt-0.5 flex-shrink-0 text-foreground">
-        <ToolIcon
-          tool={{
-            id: evt.toolName,
-            name: label,
-            description: "",
-            category: manifest?.category || "",
-            icon: manifest?.icon
-          }}
-          size={14}
-        />
+        {mcpInfo.isMcp ? (
+          mcpIcon?.icon_svg ? (
+            // Inline SVG from the server manifest — preferred.
+            // currentColor makes it inherit the primary accent,
+            // matching the MCP visual language elsewhere.
+            <div
+              className="bg-transparent text-black inline-flex
+              items-center justify-center w-5 h-5 overflow-hidden [&>svg]:w-full [&>svg]:h-full [&>svg]:block"
+              dangerouslySetInnerHTML={{ __html: mcpIcon.icon_svg }}
+            />
+          ) : mcpIcon?.icon_url ? (
+            // External icon URL — fallback if no inline SVG.
+            <div className="p-0.5 rounded bg-primary/10 border border-primary/20 inline-flex items-center justify-center w-4 h-4 overflow-hidden">
+              <img
+                src={mcpIcon.icon_url}
+                alt=""
+                className="w-full h-full object-contain"
+                loading="lazy"
+              />
+            </div>
+          ) : (
+            // Last resort — generic server icon.
+            <div className="p-0.5 rounded bg-primary/10 text-primary border border-primary/20">
+              <Server size={12} />
+            </div>
+          )
+        ) : (
+          <ToolIcon
+            tool={{
+              id: evt.toolName,
+              name: label,
+              description: "",
+              category: manifest?.category || "",
+              icon: manifest?.icon
+            }}
+            size={14}
+          />
+        )}
       </div>
       <div className="truncate">
         <span className="font-extrabold text-black mr-1">{label}: </span>

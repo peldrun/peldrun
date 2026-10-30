@@ -1196,6 +1196,158 @@ class McpSessionPool:
 
             return list(merged)
 
+    # ─────────────────────────────────────────────────────────────
+    # Resources & Prompts (MCP 2025-11-25 §5, §6)
+    # ─────────────────────────────────────────────────────────────
+
+    async def get_resources(
+        self,
+        server_id: str,
+        manifest: Dict[str, Any],
+        workspace_root: Optional[str] = None,
+        *,
+        force_refresh: bool = False,
+        env_override: Optional[Dict[str, str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return the resources exposed by a server.
+
+        Resources (MCP 2025-11-25 §5) are addressable read-only
+        data the agent can fetch by URI. Unlike tools they are not
+        invoked — you read a specific URI.
+
+        Caching mirrors ``get_tools``: persistent cache file first,
+        then live discovery. Failed discovery is NEVER cached.
+
+        Returns an empty list when the server does not support
+        resources (the common case for tool-only servers) so the
+        caller does not need to special-case the "no resources"
+        path.
+        """
+        from omweb.extensions.mcp_subsystem_settings import (
+            is_enabled as _subsystem_enabled,
+            get_tool_cache_ttl_seconds,
+        )
+        from omweb.extensions.mcp_tool_cache import (
+            compute_config_hash,
+            load_cache as _load_persistent_cache,
+            is_cache_fresh,
+            get_resources as _get_cached_resources,
+            store_discovered_resources,
+        )
+
+        if not _subsystem_enabled():
+            logger.debug(
+                "MCP subsystem is disabled; returning [] for resources "
+                "of '%s'.",
+                server_id,
+            )
+            return []
+
+        config_hash = compute_config_hash(manifest)
+
+        # Persistent cache fast path.
+        if not force_refresh:
+            persistent = _load_persistent_cache(server_id)
+            if is_cache_fresh(
+                persistent,
+                config_hash,
+                get_tool_cache_ttl_seconds(),
+            ):
+                logger.debug(
+                    "Persistent cache HIT for resources of '%s'.",
+                    server_id,
+                )
+                return _get_cached_resources(server_id)
+
+        # Live discovery.
+        client = await self.get_or_create_client(
+            server_id=server_id,
+            manifest=manifest,
+            workspace_root=workspace_root,
+            env_override=env_override,
+        )
+        resources = await client.list_resources()
+        store_discovered_resources(server_id, config_hash, resources)
+        logger.info(
+            "Discovered %d resource(s) for '%s'.",
+            len(resources),
+            server_id,
+        )
+        return resources
+
+    async def get_prompts(
+        self,
+        server_id: str,
+        manifest: Dict[str, Any],
+        workspace_root: Optional[str] = None,
+        *,
+        force_refresh: bool = False,
+        env_override: Optional[Dict[str, str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return the prompts exposed by a server.
+
+        Prompts (MCP 2025-11-25 §6) are parameterized templates
+        that produce a sequence of messages. They are not invoked
+        by the LLM directly — they appear in the UI as
+        starting-point choices for the user.
+
+        Caching, fail-soft semantics, and the empty-list-on-
+        unsupported contract all mirror ``get_resources``
+        deliberately: the two primitives are always read together
+        by the Store UI and must not diverge in behaviour.
+        """
+        from omweb.extensions.mcp_subsystem_settings import (
+            is_enabled as _subsystem_enabled,
+            get_tool_cache_ttl_seconds,
+        )
+        from omweb.extensions.mcp_tool_cache import (
+            compute_config_hash,
+            load_cache as _load_persistent_cache,
+            is_cache_fresh,
+            get_prompts as _get_cached_prompts,
+            store_discovered_prompts,
+        )
+
+        if not _subsystem_enabled():
+            logger.debug(
+                "MCP subsystem is disabled; returning [] for prompts "
+                "of '%s'.",
+                server_id,
+            )
+            return []
+
+        config_hash = compute_config_hash(manifest)
+
+        if not force_refresh:
+            persistent = _load_persistent_cache(server_id)
+            if is_cache_fresh(
+                persistent,
+                config_hash,
+                get_tool_cache_ttl_seconds(),
+            ):
+                logger.debug(
+                    "Persistent cache HIT for prompts of '%s'.",
+                    server_id,
+                )
+                return _get_cached_prompts(server_id)
+
+        client = await self.get_or_create_client(
+            server_id=server_id,
+            manifest=manifest,
+            workspace_root=workspace_root,
+            env_override=env_override,
+        )
+        prompts = await client.list_prompts()
+        store_discovered_prompts(server_id, config_hash, prompts)
+        logger.info(
+            "Discovered %d prompt(s) for '%s'.",
+            len(prompts),
+            server_id,
+        )
+        return prompts
+
     async def invalidate_cache(self, server_id: str) -> None:
         """
         Drop every cached tool list for the given server, in BOTH the
@@ -1487,6 +1639,13 @@ class McpSessionPool:
         Marks the key as closing BEFORE popping the client so that any
         concurrent get_or_create_client bails out instead of creating a
         second client for the same key.
+
+        Hardened with a timeout: a stuck transport (e.g. a subprocess
+        that ignores SIGTERM, or an HTTP connection that hangs during
+        close) must not hold `session_key` in `_closing` forever —
+        that would make every subsequent get_or_create_client for the
+        same key raise "closed concurrently", effectively bricking the
+        server until restart.
         """
         async with self._global_lock:
             self._closing.add(session_key)
@@ -1494,8 +1653,27 @@ class McpSessionPool:
 
         try:
             if client is not None:
-                await self._safe_close_client(client)
-                logger.info("Closed active MCP session for key '%s'", session_key)
+                # Cap the close duration. 5s is more than enough for
+                # any well-behaved transport to finish; beyond that,
+                # assume the transport is wedged and move on. The
+                # underlying socket/file descriptor will be closed by
+                # the OS when the process exits — but in the meantime
+                # the session pool stays usable for new requests.
+                try:
+                    await asyncio.wait_for(
+                        self._safe_close_client(client),
+                        timeout=5.0,
+                    )
+                    logger.info(
+                        "Closed active MCP session for key '%s'",
+                        session_key,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "MCP session close timed out after 5s for "
+                        "key '%s'. Forcing detachment.",
+                        session_key,
+                    )
         finally:
             async with self._global_lock:
                 self._closing.discard(session_key)
@@ -1557,8 +1735,26 @@ class McpSessionPool:
             self._locks.clear()
             self._tool_cache.clear()
 
-        for client in clients_to_close:
-            await self._safe_close_client(client)
+        if clients_to_close:
+            async def _bounded_close(c: MCPClient) -> None:
+                try:
+                    await asyncio.wait_for(
+                        self._safe_close_client(c),
+                        timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "MCP session close timed out after 5s during "
+                        "close_all(); forcing detachment."
+                    )
+
+            # Fire all closes in parallel. Even if every session hangs
+            # at the 5s cap, the total wall time is still 5s (not
+            # N × 5s), because they are concurrent.
+            await asyncio.gather(
+                *(_bounded_close(c) for c in clients_to_close),
+                return_exceptions=True,
+            )
 
         async with self._global_lock:
             self._closing.clear()

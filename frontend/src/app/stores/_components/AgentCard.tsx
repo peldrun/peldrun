@@ -15,6 +15,7 @@ import {
 import { Button } from "@/components/ui/button";
 import type { AgentManifest } from "@/lib/types";
 import { AgentIcon } from "./AgentIcon";
+import { color } from "motion/react";
 
 /* ────────────────────────────────────────────────────────────────
  * Props
@@ -140,17 +141,19 @@ export function AgentCard({
   return (
     <div
       className={`group relative text-black hover:text-[#fff] flex flex-col justify-between p-5 rounded-sm
-        border transition-all duration-200 shadow-md hover:shadow-sm overflow-hidden ${
+        border border-t-[2px] transition-all duration-200 shadow-md hover:shadow-sm overflow-hidden ${
         isDisabled
-          ? "bg-muted/30 border-border/60 opacity-80"
-          : "bg-card border-card hover:border-card/50"
+          ? "bg-muted/30 border-border/60 opacity-80 hover:bg-black/25 !border-t-black"
+          : "bg-card hover:border-card/50"
       }`}
+
+      style={{ borderTopColor: coreColor }}
     >
       {/* ── core_color wash (decorative background) ────────────── */}
       {!isDisabled && coreColor && (
         <div
-          className="absolute inset-0 pointer-events-none opacity-[0.08] group-hover:opacity-[1.0] transition-opacity"
-          style={{ backgroundColor: coreColor}}
+          className="absolute border-t-[5px] inset-0 pointer-events-none opacity-[0.08] group-hover:opacity-[0.8] transition-opacity"
+          style={{ backgroundColor: coreColor, borderColor: coreColor }}
           aria-hidden="true"
         />
       )}

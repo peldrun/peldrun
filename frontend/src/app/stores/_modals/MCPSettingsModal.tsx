@@ -128,6 +128,16 @@ export function MCPSettingsModal({
   const [oauthNeedsRefresh, setOauthNeedsRefresh] = useState(false);
   const [oauthLoading, setOauthLoading] = useState(false);
   const [oauthConnecting, setOauthConnecting] = useState(false);
+
+  // ── OAuth Provider Credentials (pre-registered providers) ────
+  // Some providers (Google, GitHub) do not support Dynamic Client
+  // Registration — the operator must create an OAuth app manually
+  // and paste its credentials. The card below stores these at the
+  // PROVIDER level (not per-server), so configuring Google once
+  // covers Gmail, Drive, and Calendar simultaneously.
+  const [oauthProviderKey, setOauthProviderKey] = useState<string | null>(null);
+  const [oauthProviderDisplayName, setOauthProviderDisplayName] = useState("");
+  const [oauthProviderReady, setOauthProviderReady] = useState(false);
   const popupRef = useRef<Window | null>(null);
   const popupPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const messageHandlerRef = useRef<((e: MessageEvent) => void) | null>(null);
@@ -322,6 +332,13 @@ export function MCPSettingsModal({
     }
   }, [serverId, fetchOAuthStatus]);
 
+  // The actual credential form lives in the Integrations page
+  // (frontend/src/features/mcp-oauth/). This modal only shows a
+  // banner pointing the user there when the provider is not yet
+  // configured. Removing the duplicate form fixes the misleading
+  // UX where users saw the same fields in every Google server's
+  // Settings tab.
+
   useEffect(() => {
     if (!open || !serverId) return;
     let cancelled = false;
@@ -340,6 +357,11 @@ export function MCPSettingsModal({
     setOauthNeedsRefresh(false);
     setOauthLoading(false);
     setOauthConnecting(false);
+    // Reset provider credentials state too — the provider key is
+    // server-specific and must not persist across modal opens.
+    setOauthProviderKey(null);
+    setOauthProviderDisplayName("");
+    setOauthProviderReady(false);
     cleanupOAuthPopup();
 
     (async () => {
@@ -400,6 +422,39 @@ export function MCPSettingsModal({
             }
           } catch {
             /* best-effort */
+          }
+
+          // Map this server to a pre-registered OAuth provider by
+          // matching the provider key against the server URL host.
+          // Google Workspace MCP servers share gmailmcp.googleapis.com,
+          // drivemcp.googleapis.com, etc. — all of which contain
+          // "googleapis.com", the registered provider key.
+          try {
+            const providersRes = await fetch(
+              getApiUrl("/api/mcp/oauth-providers")
+            );
+            if (providersRes.ok && !cancelled) {
+              const providersData = await providersRes.json();
+              const providerList = Array.isArray(providersData.providers)
+                ? providersData.providers
+                : [];
+              const serverUrl = String(data.url || "").toLowerCase();
+              const matched = providerList.find(
+                (p: any) =>
+                  p &&
+                  typeof p.provider_key === "string" &&
+                  serverUrl.includes(p.provider_key.toLowerCase())
+              );
+              if (matched && !cancelled) {
+                setOauthProviderKey(matched.provider_key);
+                setOauthProviderDisplayName(
+                  matched.display_name || matched.provider_key
+                );
+                setOauthProviderReady(Boolean(matched.ready));
+              }
+            }
+          } catch {
+            /* best-effort — provider setup stays hidden */
           }
         }
 
@@ -583,6 +638,29 @@ export function MCPSettingsModal({
             </div>
           )}
 
+          {/* ── OAuth Provider Banner (pre-registered, not configured) ── */}
+          {/* The full setup form lives in the Integrations page. When
+              the provider is not configured, this banner redirects the
+              user there instead of showing a duplicate form here. */}
+          {!loading && oauthCapable && oauthProviderKey && !oauthProviderReady && (
+            <div className="p-3 rounded-md border border-amber-500/40 bg-amber-500/5 flex items-start gap-2">
+              <AlertTriangle size={14} className="text-amber-600 shrink-0 mt-0.5" />
+              <div className="flex-1 text-[11px] text-foreground leading-relaxed">
+                <strong>{oauthProviderDisplayName} OAuth client</strong>{" "}
+                is not configured yet. Configure it once in the{" "}
+                <a
+                  href="/integrations#mcp-oauth-providers"
+                  className="text-primary underline font-medium hover:opacity-80"
+                >
+                  Integrations page
+                </a>
+                . The credentials will be shared by Gmail, Drive,
+                Calendar, and every other {oauthProviderDisplayName}
+                -based server automatically.
+              </div>
+            </div>
+          )}
+
           {/* ── OAuth Connection (OAuth-capable servers only) ──── */}
           {!loading && oauthCapable && (
             <OAuthConnectionCard
@@ -592,6 +670,9 @@ export function MCPSettingsModal({
               disconnecting={oauthLoading}
               onConnect={handleConnectOAuth}
               onDisconnect={handleDisconnectOAuth}
+              requiresProviderSetup={
+                !!oauthProviderKey && !oauthProviderReady
+              }
             />
           )}
 
@@ -721,6 +802,7 @@ function OAuthConnectionCard({
   disconnecting,
   onConnect,
   onDisconnect,
+  requiresProviderSetup = false,
 }: {
   authenticated: boolean;
   needsRefresh: boolean;
@@ -728,6 +810,7 @@ function OAuthConnectionCard({
   disconnecting: boolean;
   onConnect: () => void;
   onDisconnect: () => void;
+  requiresProviderSetup?: boolean;
 }) {
   return (
     <div className="p-4 rounded-md border border-border bg-muted/20 space-y-3">
@@ -777,15 +860,22 @@ function OAuthConnectionCard({
           <button
             type="button"
             onClick={onConnect}
-            disabled={connecting}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-medium hover:opacity-90 transition disabled:opacity-50"
+            disabled={connecting || requiresProviderSetup}
+            title={
+              requiresProviderSetup
+                ? "Configure OAuth client credentials above first"
+                : undefined
+            }
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-medium hover:opacity-90 transition disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {connecting ? (
               <Loader2 size={13} className="animate-spin" />
             ) : (
               <ExternalLink size={13} />
             )}
-            {connecting
+            {requiresProviderSetup
+              ? "Configure credentials first"
+              : connecting
               ? "Waiting for browser…"
               : authenticated
               ? "Reconnect"
@@ -796,6 +886,8 @@ function OAuthConnectionCard({
     </div>
   );
 }
+
+
 
 function McpFieldRow({
   fieldKey,

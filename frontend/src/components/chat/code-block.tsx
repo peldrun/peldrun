@@ -29,6 +29,7 @@ import {
   PanelRightOpen,
 } from "lucide-react";
 
+import { Icon } from '@/components/Icon/Icon';
 // ---------------------------------------------------------------------------
 // Public props
 // ---------------------------------------------------------------------------
@@ -197,14 +198,18 @@ export function CodeBlock({
           {normalizedLang === "bash" ? (
             <Terminal size={13} className="text-primary flex-shrink-0" />
           ) : (
-            <FileCode size={13} className="text-card flex-shrink-0" />
+
+             <span className="text-[10px] font-mono uppercase">
+               <Icon name={displayLang} size={20} />
+             </span>
+
           )}
+
+
           <span className="font-mono text-xs font-semibold text-muted-foreground/90 truncate max-w-[180px] sm:max-w-none">
             {defaultFilename}
           </span>
-          <span className="px-1.5 py-0.5 rounded text-[10px] font-mono uppercase bg-muted/10 text-card">
-            {displayLang}
-          </span>
+
           <span className="hidden sm:inline-block text-[11px] font-mono text-muted-foreground">
             ({lines.length} lines)
           </span>

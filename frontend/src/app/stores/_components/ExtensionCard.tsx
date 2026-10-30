@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   Cpu,
   Loader2,
+  MessageSquare,
   Play,
   Settings,
   Trash2,
@@ -113,21 +114,56 @@ export function ExtensionCard({
       {/* ─── Right: Actions ───────────────────────────────────── */}
       <div className="flex items-center gap-2 shrink-0 sm:justify-end">
         {/* Test Result Badge */}
-        {testResult && (
-          <div
-            className={`mr-2 px-2 py-1 rounded text-[10px] flex items-center gap-1 border font-medium ${
-              testResult.ok
-                ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-600"
-                : "bg-destructive/10 border-destructive/20 text-destructive"
-            }`}
-            title={testResult.message}
-          >
-            {testResult.ok ? <CheckCircle2 size={12} /> : <XCircle size={12} />}
-            <span className="hidden md:inline truncate max-w-[100px]">
-              {testResult.ok ? "Connected" : "Failed"}
-            </span>
-          </div>
-        )}
+        {testResult && (() => {
+          // Three-state badge driven by `kind` when present, with
+          // `ok` as a fallback for older payloads that predate the
+          // `kind` field.
+          //
+          //   success   → green  "Connected"
+          //   failure   → red    "Failed"
+          //   deferred  → amber  "OAuth server"
+          //
+          // "deferred" is what the OAuth-server path in
+          // useExtensionActions emits: the server is intentionally
+          // NOT tested from the Store UI because verification
+          // requires a Bearer token that only exists inside a chat
+          // session. Amber communicates "not verified here" without
+          // claiming either a success or a failure.
+          const kind =
+            testResult.kind ?? (testResult.ok ? "success" : "failure");
+
+          const palette =
+            kind === "success"
+              ? {
+                  cls: "bg-emerald-500/10 border-emerald-500/20 text-emerald-600",
+                  label: "Connected",
+                  Icon: CheckCircle2,
+                }
+              : kind === "deferred"
+              ? {
+                  cls: "bg-amber-500/10 border-amber-500/30 text-amber-600 dark:text-amber-400",
+                  label: "OAuth server",
+                  Icon: MessageSquare,
+                }
+              : {
+                  cls: "bg-destructive/10 border-destructive/20 text-destructive",
+                  label: "Failed",
+                  Icon: XCircle,
+                };
+
+          const { cls, label, Icon } = palette;
+          return (
+            <div
+              className={`mr-2 px-2 py-1 rounded text-[10px] flex items-center gap-1 border font-medium ${cls}`}
+              title={testResult.message}
+            >
+              <Icon size={12} />
+              <span className="hidden md:inline truncate max-w-[100px]">
+                {label}
+              </span>
+            </div>
+          );
+        })()}
 
         {/* Details Button (Google Drive Style) */}
         <button

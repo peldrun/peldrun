@@ -229,6 +229,11 @@ async def get_mcp_server_settings(server_id: str):
         "auth_strategy": _auth_strategy or None,
         "transport": _transport or "stdio",
         "oauth_capable": _oauth_capable,
+        # Exposed so the frontend can map the server to a
+        # pre-registered OAuth provider (googleapis.com, github.com)
+        # and render the "OAuth Client Credentials" setup card.
+        # stdio servers have no url — the field is null for them.
+        "url": _url if isinstance(_url, str) and _url else None,
     }
 
 

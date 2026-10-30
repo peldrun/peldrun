@@ -172,7 +172,7 @@ function MarkdownRendererInner({
 
   return (
     <div
-      className={`prose prose-sm dark:prose-invert max-w-none break-words leading-relaxed text-foreground ${className}`}
+      className={`prose prose-sm dark:prose-invert max-w-none break-words leading-relaxed text-black ${className}`}
     >
       <ReactMarkdown
         remarkPlugins={remarkPlugins}
@@ -191,7 +191,7 @@ function MarkdownRendererInner({
             if (!isBlock) {
               return (
                 <code
-                  className="px-1.5 py-0.5 rounded-md bg-muted text-foreground font-mono text-[11px] border border-border/40 font-normal"
+                  className="px-1.5 py-0.5 rounded-md bg-muted text-black font-mono text-[11px] border border-border/40 font-normal"
                   {...props}
                 >
                   {children}
@@ -239,7 +239,7 @@ function MarkdownRendererInner({
 
           thead({ children }: any) {
             return (
-              <thead className="bg-muted/70 text-foreground font-semibold border-b border-border">
+              <thead className="bg-muted/70 text-black font-semibold border-b border-border">
                 {children}
               </thead>
             );
@@ -253,7 +253,7 @@ function MarkdownRendererInner({
 
           td({ children }: any) {
             return (
-              <td className="px-3.5 py-2 border-t border-border/50 text-foreground/90 text-sm">
+              <td className="px-3.5 py-2 border-t border-border/50 text-black/90 text-sm">
                 {children}
               </td>
             );
@@ -261,7 +261,7 @@ function MarkdownRendererInner({
 
           h1({ children }: any) {
             return (
-              <h1 className="text-2xl font-semibold font-heading text-foreground mt-4 mb-2">
+              <h1 className="text-2xl font-semibold font-heading text-black mt-4 mb-2">
                 {children}
               </h1>
             );
@@ -269,7 +269,7 @@ function MarkdownRendererInner({
 
           h2({ children }: any) {
             return (
-              <h2 className="text-xl font-semibold font-heading text-foreground mt-3 mb-1.5">
+              <h2 className="text-xl font-semibold font-heading text-black mt-3 mb-1.5">
                 {children}
               </h2>
             );
@@ -277,7 +277,7 @@ function MarkdownRendererInner({
 
           h3({ children }: any) {
             return (
-              <h3 className="text-lg font-semibold font-heading text-foreground mt-2.5 mb-1">
+              <h3 className="text-lg font-semibold font-heading text-black mt-2.5 mb-1">
                 {children}
               </h3>
             );

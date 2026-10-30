@@ -59,12 +59,45 @@ logger = logging.getLogger("omweb.extensions.auth_manager")
 #
 PRE_REGISTERED_CLIENTS: Dict[str, Dict[str, Any]] = {
     "github.com": {
+        "display_name": "GitHub",
         "client_id_env": "PELDRUN_GITHUB_CLIENT_ID",
         "client_secret_env": "PELDRUN_GITHUB_CLIENT_SECRET",
         "authorization_endpoint": "https://github.com/login/oauth/authorize",
         "token_endpoint": "https://github.com/login/oauth/access_token",
         "scopes": ["repo", "read:user"],
         "pkce": True,
+        # GitHub is registered here for SOURCE CONTROL OAuth flows,
+        # not for MCP. The mcp_github server uses auth_strategy="env"
+        # (Personal Access Token), so it never invokes resolve_client
+        # against this entry. Setting mcp_oauth=False keeps it out of
+        # the MCP OAuth Providers UI.
+        "mcp_oauth": False,
+    },
+    # Google Workspace MCP servers (Gmail, Drive, Calendar, Docs,
+    # Sheets, Slides, Chat, People). Google does NOT support dynamic
+    # client registration — an OAuth 2.0 Web client must be created
+    # in Google Cloud Console and its id/secret supplied via the two
+    # env vars below. The user must also join the Workspace Developer
+    # Preview program and enable the MCP service for each product.
+    #
+    # The match key is ``googleapis.com`` because every Workspace MCP
+    # host ends with it (gmailmcp.googleapis.com, drivemcp.googleapis.com,
+    # calendarmcp.googleapis.com, ...). The issuer is overridden
+    # because Google's OAuth 2.0 issuer (accounts.google.com) differs
+    # from the MCP host.
+    "googleapis.com": {
+        "display_name": "Google",
+        "client_id_env": "PELDRUN_GOOGLE_CLIENT_ID",
+        "client_secret_env": "PELDRUN_GOOGLE_CLIENT_SECRET",
+        "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+        "token_endpoint": "https://oauth2.googleapis.com/token",
+        "issuer": "https://accounts.google.com",
+        "scopes": [],  # per-manifest; Google requires explicit scopes
+        "pkce": True,
+        # Google IS used by MCP (Gmail, Drive, Calendar Workspace
+        # servers). Its credentials must appear in the MCP OAuth
+        # Providers UI.
+        "mcp_oauth": True,
     },
     # WordPress.com is handled via DCR — no pre-registration entry needed.
 }
@@ -510,8 +543,12 @@ class OAuthManager:
                 logger.info(
                     "Using pre-registered metadata for host '%s'.", match_host
                 )
+                # ``issuer`` may be overridden because the OAuth 2.0
+                # issuer is not always the MCP host. Google is the
+                # canonical example: MCP host is *.googleapis.com,
+                # but the issuer is accounts.google.com.
                 return AuthServerMetadata(
-                    issuer=f"https://{match_host}",
+                    issuer=cfg.get("issuer") or f"https://{match_host}",
                     authorization_endpoint=cfg["authorization_endpoint"],
                     token_endpoint=cfg["token_endpoint"],
                     registration_endpoint=None,
@@ -555,16 +592,66 @@ class OAuthManager:
         host = urlparse(metadata.issuer).hostname or urlparse(mcp_server_url).hostname or ""
         for match_host, cfg in PRE_REGISTERED_CLIENTS.items():
             if match_host in metadata.issuer or match_host == host or match_host in mcp_server_url:
-                client_id = (os.environ.get(cfg["client_id_env"]) or "").strip()
+                # Resolution order for client credentials:
+                #   1. UI-stored credentials (oauth_provider_store)
+                #   2. Environment variables (legacy / CI fallback)
+                #   3. Raise with an actionable error.
+                #
+                # The UI path is preferred because PELDRUN runs
+                # locally — forcing every user to export env vars
+                # before `start-backend` is hostile UX. The env-var
+                # path remains for containerized deployments and CI.
+                client_id: Optional[str] = None
+                client_secret: Optional[str] = None
+
+                try:
+                    from omweb.extensions.oauth_provider_store import (
+                        get_oauth_provider_store,
+                    )
+
+                    stored = get_oauth_provider_store().get(match_host)
+                    if stored:
+                        client_id = (stored.get("client_id") or "").strip() or None
+                        client_secret = (
+                            stored.get("client_secret") or ""
+                        ).strip() or None
+                        if client_id:
+                            logger.debug(
+                                "Using UI-stored OAuth client for '%s' "
+                                "(server_id=%s).",
+                                match_host,
+                                server_id,
+                            )
+                except Exception as store_err:  # noqa: BLE001
+                    # A broken store must not block the flow — fall
+                    # through to env vars.
+                    logger.debug(
+                        "OAuth provider store lookup failed for '%s': %s",
+                        match_host,
+                        store_err,
+                    )
+
+                # Env var fallback.
+                if not client_id:
+                    client_id = (
+                        os.environ.get(cfg["client_id_env"]) or ""
+                    ).strip() or None
+                if not client_secret:
+                    client_secret = (
+                        os.environ.get(cfg["client_secret_env"]) or ""
+                    ).strip() or None
+
                 if not client_id:
                     raise ValueError(
                         f"Pre-registered MCP client for '{match_host}' is "
-                        f"missing environment variable {cfg['client_id_env']}. "
-                        f"Register an OAuth app and export the client_id."
+                        f"not configured. Either:\n"
+                        f"  (a) Open the Integrations page → 'MCP OAuth "
+                        f"Providers' → '{cfg.get('display_name', match_host)}' "
+                        f"and paste your client_id + client_secret, or\n"
+                        f"  (b) Export {cfg['client_id_env']} and "
+                        f"{cfg['client_secret_env']} before starting "
+                        f"the backend."
                     )
-                client_secret = (
-                    os.environ.get(cfg["client_secret_env"]) or ""
-                ).strip() or None
 
                 auth_method = "client_secret_post" if client_secret else "none"
                 logger.info(
@@ -724,6 +811,22 @@ class OAuthManager:
         if scopes:
             params["scope"] = " ".join(scopes)
 
+        # Google-specific OAuth parameters. Google only issues a
+        # refresh token when ``access_type=offline`` is present, and
+        # only re-displays the consent screen (required to obtain a
+        # fresh refresh token after a scope change) when
+        # ``prompt=consent`` is set. Both are harmless elsewhere, but
+        # ``prompt=consent`` forces re-consent on every flow, which
+        # is friction we avoid for GitHub. Hence the host-gated
+        # inclusion.
+        _is_google = (
+            "google.com" in (metadata.issuer or "")
+            or "google" in (metadata.authorization_endpoint or "")
+        )
+        if _is_google:
+            params["access_type"] = "offline"
+            params["prompt"] = "consent"
+
         sep = "&" if "?" in metadata.authorization_endpoint else "?"
         return f"{metadata.authorization_endpoint}{sep}{urlencode(params)}"
 
@@ -759,11 +862,14 @@ class OAuthManager:
         # GitHub is not RFC 8707 compliant and will reject unknown
         # parameters in some configurations — but it also silently
         # ignores them. We send resource only to well-behaved servers.
-        host = urlparse(metadata.issuer).hostname or ""
-        if host not in PRE_REGISTERED_CLIENTS:
+        # RFC 8707 ``resource`` is ignored by GitHub and rejected by
+        # Google's token endpoint, which is strict about unknown
+        # parameters. Send it only to providers that actually consume
+        # it (Notion, Linear, and other RFC 8707-aware servers).
+        _host = (metadata.issuer or "").lower()
+        _is_google = "google.com" in _host or "googleapis.com" in _host
+        if not _is_google:
             body["resource"] = resource
-        else:
-            body["resource"] = resource  # RFC 8707 — include unconditionally
 
         if client_secret:
             body["client_secret"] = client_secret
@@ -830,8 +936,17 @@ class OAuthManager:
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
             "client_id": client_id,
-            "resource": resource,
         }
+        # See ``exchange_code`` for the rationale — Google rejects
+        # unknown parameters, so ``resource`` is omitted there. The
+        # refresh grant hits the same token endpoint and would be
+        # rejected for the same reason; the gating must be identical
+        # to avoid breaking refresh_token rotation for Google.
+        _host = (metadata.issuer or "").lower()
+        _is_google = "google.com" in _host or "googleapis.com" in _host
+        if not _is_google:
+            body["resource"] = resource
+
         if client_secret:
             body["client_secret"] = client_secret
 

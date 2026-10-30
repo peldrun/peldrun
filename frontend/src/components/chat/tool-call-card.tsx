@@ -237,6 +237,58 @@ async function fetchDisabledMcpServers(agentId: string): Promise<Set<string>> {
   }
 }
 
+/**
+ * Cache of MCP server icon data, keyed by server_id.
+ *
+ * Fetches the server's manifest once (5-minute TTL) to extract its
+ * `icon_svg` (preferred) or `icon_url` (fallback). A chat turn can
+ * render several tool cards from the same server, so caching is
+ * essential to avoid N identical network requests.
+ *
+ * On any failure, the cache stores an empty object so subsequent
+ * calls within the TTL window short-circuit without retrying. The
+ * caller falls back to the generic <Server> icon in that case.
+ */
+const mcpServerIconCache = new Map<
+  string,
+  { at: number; data: { icon_svg?: string; icon_url?: string } }
+>();
+const MCP_ICON_CACHE_TTL_MS = 5 * 60_000;
+
+export async function fetchMcpServerIcon(
+  serverId: string,
+): Promise<{ icon_svg?: string; icon_url?: string }> {
+  const now = Date.now();
+  const cached = mcpServerIconCache.get(serverId);
+  if (cached && now - cached.at < MCP_ICON_CACHE_TTL_MS) {
+    return cached.data;
+  }
+
+  try {
+    const res = await fetch(
+      `/api/mcp/servers/${encodeURIComponent(serverId)}`,
+      { cache: "no-store" },
+    );
+    if (!res.ok) {
+      mcpServerIconCache.set(serverId, { at: now, data: {} });
+      return {};
+    }
+    const json = await res.json();
+    const server = json?.server || {};
+    const data = {
+      icon_svg:
+        typeof server.icon_svg === "string" ? server.icon_svg : undefined,
+      icon_url:
+        typeof server.icon_url === "string" ? server.icon_url : undefined,
+    };
+    mcpServerIconCache.set(serverId, { at: now, data });
+    return data;
+  } catch {
+    mcpServerIconCache.set(serverId, { at: now, data: {} });
+    return {};
+  }
+}
+
 export interface ToolCallCardProps {
   tool: ToolPair;
   agentId?: string;
@@ -247,6 +299,12 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
   const [disabled, setDisabled] = useState(false);
   const [copied, setCopied] = useState(false);
   const [manifest, setManifest] = useState<ToolManifest | null>(null);
+  // MCP server icon — populated async; falls back to <Server> icon
+  // when the manifest declares neither `icon_svg` nor `icon_url`.
+  const [mcpIcon, setMcpIcon] = useState<{
+    icon_svg?: string;
+    icon_url?: string;
+  } | null>(null);
 
   const mcpInfo = parseMcpToolName(tool.tool);
 
@@ -259,6 +317,19 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
     });
     return () => { cancelled = true; };
   }, [tool.tool, mcpInfo.isMcp]);
+
+  // Fetch the MCP server's icon (svg preferred, url fallback).
+  // Independent of `agentId` — we want the icon visible even when
+  // no agent context is provided (e.g. standalone tool cards in
+  // exports or previews).
+  useEffect(() => {
+    if (!mcpInfo.isMcp || !mcpInfo.serverId) return;
+    let cancelled = false;
+    fetchMcpServerIcon(mcpInfo.serverId).then((info) => {
+      if (!cancelled) setMcpIcon(info);
+    });
+    return () => { cancelled = true; };
+  }, [mcpInfo.isMcp, mcpInfo.serverId]);
 
   const label = mcpInfo.isMcp
     ? (mcpInfo.remoteName || tool.tool)
@@ -358,9 +429,33 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
         <div className="flex items-center gap-2 truncate min-w-0 flex-1">
           <div className="flex-shrink-0 text-foreground">
             {mcpInfo.isMcp ? (
-              <div className="p-0.5 rounded bg-primary/10 text-primary border border-primary/20">
-                <Server size={12} />
-              </div>
+              mcpIcon?.icon_svg ? (
+                // Preferred: inline SVG from the manifest. `currentColor`
+                // is primary so the icon matches the MCP visual language
+                // used elsewhere (ExtensionCard, MCPDetailDrawer). The
+                // SVG is scaled to fill a 16×16 box via arbitrary child
+                // selectors, keeping the card layout stable regardless
+                // of the source SVG's own dimensions.
+                <div
+                  className="p-0.5 rounded bg-primary/10 text-primary border border-primary/20 inline-flex items-center justify-center w-5 h-5 overflow-hidden [&>svg]:w-full [&>svg]:h-full [&>svg]:block"
+                  dangerouslySetInnerHTML={{ __html: mcpIcon.icon_svg }}
+                />
+              ) : mcpIcon?.icon_url ? (
+                // Fallback: external icon URL, same box dimensions.
+                <div className="p-0.5 rounded bg-primary/10 border border-primary/20 inline-flex items-center justify-center w-5 h-5 overflow-hidden">
+                  <img
+                    src={mcpIcon.icon_url}
+                    alt=""
+                    className="w-full h-full object-contain"
+                    loading="lazy"
+                  />
+                </div>
+              ) : (
+                // Last resort: generic server icon (current behaviour).
+                <div className="p-0.5 rounded bg-primary/10 text-primary border border-primary/20">
+                  <Server size={12} />
+                </div>
+              )
             ) : (
               <ToolIcon
                 tool={{

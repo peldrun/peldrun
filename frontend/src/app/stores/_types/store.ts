@@ -18,6 +18,24 @@ export type ToolFilter = "all" | "builtin" | "custom";
 export interface McpTestResult {
   ok: boolean;
   message: string;
+  // Optional three-state classification used by the UI to pick the
+  // badge color and label.
+  //
+  //   "success"  → green  "Connected"
+  //   "failure"  → red    "Failed"
+  //   "deferred" → amber  "OAuth server"
+  //
+  // "deferred" is set by the OAuth-server path in
+  // useExtensionActions: verification requires a Bearer token that
+  // only exists inside a chat session, so the Store UI cannot test
+  // the connection. A green "Connected" badge would claim a success
+  // that never happened; a red "Failed" badge would claim a failure
+  // that also never happened. Amber honestly communicates "not
+  // verified here — verify in chat".
+  //
+  // When omitted, the UI falls back to `ok` for backward
+  // compatibility with any existing payloads.
+  kind?: "success" | "failure" | "deferred";
 }
 
 /**
