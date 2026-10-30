@@ -1,10 +1,11 @@
 // frontend/src/app/stores/_modals/MCPSettingsModal.tsx
 "use client";
 
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
+  ExternalLink,
   Eye,
   EyeOff,
   KeyRound,
@@ -116,6 +117,211 @@ export function MCPSettingsModal({
   const [envValues, setEnvValues] = useState<FormValues>({});
   const [activeTab, setActiveTab] = useState<"settings" | "env">("settings");
 
+  // ── OAuth state (for OAuth-capable servers only) ──────────────
+  // These are populated when /settings reports oauth_capable=true.
+  // OAuth servers (Notion, Linear, etc.) have NO env_schema — their
+  // credentials are tokens, not env vars. The flow lives entirely
+  // in this modal so the user can authorize once from the Store
+  // without ever visiting a chat.
+  const [oauthCapable, setOauthCapable] = useState(false);
+  const [oauthAuthenticated, setOauthAuthenticated] = useState(false);
+  const [oauthNeedsRefresh, setOauthNeedsRefresh] = useState(false);
+  const [oauthLoading, setOauthLoading] = useState(false);
+  const [oauthConnecting, setOauthConnecting] = useState(false);
+  const popupRef = useRef<Window | null>(null);
+  const popupPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const messageHandlerRef = useRef<((e: MessageEvent) => void) | null>(null);
+  const oauthResolvedRef = useRef(false);
+
+  const cleanupOAuthPopup = useCallback(() => {
+    if (popupPollRef.current) {
+      clearInterval(popupPollRef.current);
+      popupPollRef.current = null;
+    }
+    if (messageHandlerRef.current) {
+      window.removeEventListener("message", messageHandlerRef.current);
+      messageHandlerRef.current = null;
+    }
+    if (popupRef.current && !popupRef.current.closed) {
+      try {
+        popupRef.current.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    popupRef.current = null;
+  }, []);
+
+  const fetchOAuthStatus = useCallback(async () => {
+    if (!serverId) return;
+    try {
+      const res = await fetch(
+        getApiUrl(`/api/mcp/servers/${serverId}/oauth/status`)
+      );
+      if (!res.ok) return;
+      const data = await res.json();
+      setOauthAuthenticated(Boolean(data.authenticated));
+      setOauthNeedsRefresh(Boolean(data.needs_refresh));
+    } catch {
+      /* best-effort */
+    }
+  }, [serverId]);
+
+  const handleConnectOAuth = useCallback(async () => {
+    if (!serverId) return;
+    setOauthConnecting(true);
+    oauthResolvedRef.current = false;
+    cleanupOAuthPopup();
+
+    try {
+      const res = await fetch(
+        getApiUrl(`/api/mcp/servers/${serverId}/oauth/start`),
+        { method: "POST" }
+      );
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      const authUrl: string = data?.auth_url;
+      if (!authUrl) throw new Error("Backend returned no auth_url.");
+
+      const popup = window.open(
+        authUrl,
+        "peldrun-mcp-oauth-global",
+        "width=600,height=700,menubar=no,toolbar=no,location=yes,status=yes"
+      );
+      if (!popup) {
+        throw new Error(
+          "Popup blocked. Allow popups for PELDRUN and try again."
+        );
+      }
+      popupRef.current = popup;
+
+      // postMessage listener for the callback page.
+      const onMessage = (event: MessageEvent) => {
+        if (event.origin !== window.location.origin) return;
+        const payload = event.data;
+        if (!payload || typeof payload !== "object") return;
+        if (payload.source !== "peldrun-mcp-oauth") return;
+        if (payload.server_id !== serverId) return;
+        // chat_id is null for global-scope flows — do NOT check it.
+
+        oauthResolvedRef.current = true;
+        cleanupOAuthPopup();
+        setOauthConnecting(false);
+
+        if (payload.status === "success") {
+          showToast.success(
+            "OAuth Connected",
+            "You can now use this server from any chat."
+          );
+          fetchOAuthStatus();
+        } else {
+          showToast.error(
+            "OAuth Failed",
+            payload.error_message ||
+              payload.error_code ||
+              "Authentication was not completed."
+          );
+        }
+      };
+      window.addEventListener("message", onMessage);
+      messageHandlerRef.current = onMessage;
+
+      // Detect popup close (either via callback or user cancellation).
+      popupPollRef.current = setInterval(() => {
+        if (popupRef.current && popupRef.current.closed) {
+          if (popupPollRef.current) {
+            clearInterval(popupPollRef.current);
+            popupPollRef.current = null;
+          }
+
+          // Do not immediately stop the loader. Give the postMessage
+          // 800ms to arrive. If it doesn't, start polling the backend
+          // to verify if the tokens were saved successfully.
+          setTimeout(async () => {
+            if (oauthResolvedRef.current) return; // Handled by onMessage
+
+            let isAuth = false;
+            for (let i = 0; i < 4; i++) {
+              try {
+                const statusRes = await fetch(
+                  getApiUrl(`/api/mcp/servers/${serverId}/oauth/status`)
+                );
+                if (statusRes.ok) {
+                  const statusData = await statusRes.json();
+                  if (statusData.authenticated) {
+                    isAuth = true;
+                    setOauthAuthenticated(true);
+                    setOauthNeedsRefresh(Boolean(statusData.needs_refresh));
+                    break;
+                  }
+                }
+              } catch {
+                /* ignore */
+              }
+              await new Promise((r) => setTimeout(r, 1000));
+            }
+
+            if (oauthResolvedRef.current) return; // Handled during polling
+
+            oauthResolvedRef.current = true;
+            cleanupOAuthPopup();
+            setOauthConnecting(false);
+
+            if (isAuth) {
+              showToast.success(
+                "OAuth Connected",
+                "You can now use this server from any chat."
+              );
+            } else {
+              showToast.error(
+                "OAuth Failed",
+                "Authentication was not completed or the window was closed."
+              );
+            }
+          }, 800);
+        }
+      }, 500);
+    } catch (err: any) {
+      setOauthConnecting(false);
+      cleanupOAuthPopup();
+      showToast.error(
+        "OAuth Failed",
+        err?.message || "Could not start OAuth flow."
+      );
+    }
+  }, [serverId, cleanupOAuthPopup, fetchOAuthStatus]);
+
+  const handleDisconnectOAuth = useCallback(async () => {
+    if (!serverId) return;
+    setOauthLoading(true);
+    try {
+      const res = await fetch(
+        getApiUrl(`/api/mcp/servers/${serverId}/oauth`),
+        { method: "DELETE" }
+      );
+      if (res.ok) {
+        showToast.success(
+          "Disconnected",
+          "OAuth tokens removed from this server."
+        );
+        fetchOAuthStatus();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+    } catch (err: any) {
+      showToast.error(
+        "Disconnect Failed",
+        err?.message || "Could not remove OAuth tokens."
+      );
+    } finally {
+      setOauthLoading(false);
+    }
+  }, [serverId, fetchOAuthStatus]);
+
   useEffect(() => {
     if (!open || !serverId) return;
     let cancelled = false;
@@ -127,6 +333,14 @@ export function MCPSettingsModal({
     setSettingsValues({});
     setEnvValues({});
     setTestResult(null);
+    // Reset OAuth state on every open so switching between servers
+    // does not leak the previous server's connection status.
+    setOauthCapable(false);
+    setOauthAuthenticated(false);
+    setOauthNeedsRefresh(false);
+    setOauthLoading(false);
+    setOauthConnecting(false);
+    cleanupOAuthPopup();
 
     (async () => {
       try {
@@ -168,6 +382,27 @@ export function MCPSettingsModal({
         setSettingsValues(sValues);
         setEnvValues(eValues);
 
+        // Detect OAuth capability and fetch current connection status
+        // (best-effort — a failed status check just leaves the UI in
+        // "not connected" state, so the Connect button still shows).
+        const isOauthCapable = Boolean(data.oauth_capable);
+        setOauthCapable(isOauthCapable);
+
+        if (isOauthCapable && !cancelled) {
+          try {
+            const statusRes = await fetch(
+              getApiUrl(`/api/mcp/servers/${serverId}/oauth/status`)
+            );
+            if (statusRes.ok && !cancelled) {
+              const status = await statusRes.json();
+              setOauthAuthenticated(Boolean(status.authenticated));
+              setOauthNeedsRefresh(Boolean(status.needs_refresh));
+            }
+          } catch {
+            /* best-effort */
+          }
+        }
+
         if (!sSchema?.properties && eSchema?.properties) {
           setActiveTab("env");
         } else {
@@ -184,16 +419,13 @@ export function MCPSettingsModal({
     return () => {
       cancelled = true;
     };
-  }, [open, serverId]);
+  }, [open, serverId, cleanupOAuthPopup]);
 
+  // Cleanup OAuth popup when the modal closes or unmounts.
   useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !saving) onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open, saving, onClose]);
+    if (!open) cleanupOAuthPopup();
+    return () => cleanupOAuthPopup();
+  }, [open, cleanupOAuthPopup]);
 
   const handleTestConnection = useCallback(async () => {
     if (!serverId) return;
@@ -351,7 +583,19 @@ export function MCPSettingsModal({
             </div>
           )}
 
-          {!loading && !hasAnyFields && (
+          {/* ── OAuth Connection (OAuth-capable servers only) ──── */}
+          {!loading && oauthCapable && (
+            <OAuthConnectionCard
+              authenticated={oauthAuthenticated}
+              needsRefresh={oauthNeedsRefresh}
+              connecting={oauthConnecting}
+              disconnecting={oauthLoading}
+              onConnect={handleConnectOAuth}
+              onDisconnect={handleDisconnectOAuth}
+            />
+          )}
+
+          {!loading && !hasAnyFields && !oauthCapable && (
             <div className="p-8 text-center text-xs text-muted-foreground border border-dashed border-border rounded-md">
               This MCP server declares no additional configurable settings or environment variables.
             </div>
@@ -465,6 +709,89 @@ export function MCPSettingsModal({
             </button>
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function OAuthConnectionCard({
+  authenticated,
+  needsRefresh,
+  connecting,
+  disconnecting,
+  onConnect,
+  onDisconnect,
+}: {
+  authenticated: boolean;
+  needsRefresh: boolean;
+  connecting: boolean;
+  disconnecting: boolean;
+  onConnect: () => void;
+  onDisconnect: () => void;
+}) {
+  return (
+    <div className="p-4 rounded-md border border-border bg-muted/20 space-y-3">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <KeyRound size={15} className="text-primary" />
+          <span className="text-xs font-semibold text-foreground">
+            OAuth Connection
+          </span>
+        </div>
+        {authenticated ? (
+          <span className="flex items-center gap-1 text-[11px] text-emerald-600 dark:text-emerald-400 font-medium">
+            <CheckCircle2 size={12} />
+            Connected
+          </span>
+        ) : (
+          <span className="text-[11px] text-muted-foreground font-mono">
+            Not connected
+          </span>
+        )}
+      </div>
+
+      <p className="text-[11px] text-muted-foreground leading-relaxed">
+        {authenticated && !needsRefresh
+          ? "This server is authorized. Tokens are encrypted at rest and used automatically by every chat without re-prompting."
+          : authenticated && needsRefresh
+          ? "The access token is close to expiry. Click Reconnect to refresh it. Tools may fail if the token has already expired."
+          : "Authorize this server with the provider once. After connecting, tools are available in every chat without re-prompting."}
+      </p>
+
+      <div className="flex items-center gap-2">
+        {authenticated && !needsRefresh ? (
+          <button
+            type="button"
+            onClick={onDisconnect}
+            disabled={disconnecting}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-destructive/30 bg-destructive/5 text-destructive text-xs font-medium hover:bg-destructive/10 transition disabled:opacity-50"
+          >
+            {disconnecting ? (
+              <Loader2 size={13} className="animate-spin" />
+            ) : (
+              <XCircle size={13} />
+            )}
+            Disconnect
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={onConnect}
+            disabled={connecting}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-medium hover:opacity-90 transition disabled:opacity-50"
+          >
+            {connecting ? (
+              <Loader2 size={13} className="animate-spin" />
+            ) : (
+              <ExternalLink size={13} />
+            )}
+            {connecting
+              ? "Waiting for browser…"
+              : authenticated
+              ? "Reconnect"
+              : "Connect with OAuth"}
+          </button>
+        )}
       </div>
     </div>
   );

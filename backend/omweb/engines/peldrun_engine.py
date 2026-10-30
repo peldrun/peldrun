@@ -603,7 +603,15 @@ class PeldrunEngine(ExecutionEngine):
         # MCP tools if they see a past "Authentication Required" error
         # in the conversation history. This block explicitly informs
         # the model that it has active, working access to these servers.
+        #
+        # Additionally, if a server declares a ``usage_hint`` field in
+        # its manifest, that hint is appended verbatim — it typically
+        # describes a multi-step workflow that the raw tool descriptions
+        # do not convey (e.g. WordPress meta-tools: discover → get-info
+        # → execute). Without this hint, LLMs either guess wrong tool
+        # names or skip the discovery step entirely.
         _authenticated_mcp_servers = []
+        _usage_hints: list[str] = []
         if target_mcp_servers:
             from omweb.extensions.chat_mcp_auth import get_chat_mcp_auth_store
             from omweb.extensions.mcp_auth_state import manifest_needs_auth
@@ -618,9 +626,15 @@ class PeldrunEngine(ExecutionEngine):
                 # if the server doesn't actually need auth.
                 if mode in ("custom", "use_global", "ephemeral") or not manifest_needs_auth(srv):
                     _authenticated_mcp_servers.append(srv.get("name") or s_id)
+                    # Collect the per-server usage hint (if any).
+                    hint = srv.get("usage_hint")
+                    if isinstance(hint, str) and hint.strip():
+                        _usage_hints.append(
+                            f"[{srv.get('name') or s_id}]\n{hint.strip()}"
+                        )
 
         if _authenticated_mcp_servers:
-            system_prompt = system_prompt.rstrip() + (
+            _access_block = (
                 "\n\n[MCP SERVER ACCESS]\n"
                 "You have active, authenticated access to the following MCP servers: "
                 + ", ".join(_authenticated_mcp_servers)
@@ -628,6 +642,14 @@ class PeldrunEngine(ExecutionEngine):
                 "Use their tools freely to accomplish the user's task. "
                 "Do NOT refuse to use them or claim you lack access."
             )
+            if _usage_hints:
+                _access_block += (
+                    "\n\n[MCP USAGE HINTS]\n"
+                    "Follow these workflows when calling tools from the "
+                    "servers below. Do NOT skip the discovery step.\n\n"
+                    + "\n\n".join(_usage_hints)
+                )
+            system_prompt = system_prompt.rstrip() + _access_block
 
         # ── Inject MCP access hint into system prompt ─────────────
         # Some models (e.g. GigaChat) hallucinate and refuse to use

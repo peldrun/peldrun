@@ -47,6 +47,10 @@ interface CachedTool {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
+  // MCP 2025-11-25 §7.2: tools may declare an output schema describing
+  // the shape of their `structuredContent` result. Optional — most
+  // servers (GitHub, Filesystem, WordPress) do not emit one.
+  output_schema?: Record<string, unknown>;
   user_enabled: boolean;
   first_seen_at: number;
   last_seen_at: number;
@@ -553,37 +557,73 @@ export function MCPToolsModal({
                               {tool.description}
                             </p>
                           )}
-                          {tool.parameters &&
+                          {/* The "Show schema" toggle appears when EITHER
+                              an input schema OR an output schema is
+                              present. Previously it appeared only for
+                              input, which hid the new output schema on
+                              tools that declare one but no input
+                              parameters — a rare but real MCP 2025+
+                              pattern. */}
+                          {((tool.parameters &&
                             typeof tool.parameters === "object" &&
                             Object.keys(tool.parameters as object).length >
-                              0 && (
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setCollapsed((prev) => ({
-                                    ...prev,
-                                    [tool.name]: !isCollapsed,
-                                  }))
-                                }
-                                className="mt-1 text-[10px] text-muted-foreground hover:text-foreground inline-flex items-center gap-0.5"
-                              >
-                                {isCollapsed ? (
-                                  <>
-                                    <ChevronDown size={10} />
-                                    Show schema
-                                  </>
-                                ) : (
-                                  <>
-                                    <ChevronUp size={10} />
-                                    Hide schema
-                                  </>
+                              0) ||
+                            (tool.output_schema &&
+                              typeof tool.output_schema === "object" &&
+                              Object.keys(tool.output_schema as object)
+                                .length > 0)) && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setCollapsed((prev) => ({
+                                  ...prev,
+                                  [tool.name]: !isCollapsed,
+                                }))
+                              }
+                              className="mt-1 text-[10px] text-muted-foreground hover:text-foreground inline-flex items-center gap-0.5"
+                            >
+                              {isCollapsed ? (
+                                <>
+                                  <ChevronDown size={10} />
+                                  Show schema
+                                </>
+                              ) : (
+                                <>
+                                  <ChevronUp size={10} />
+                                  Hide schema
+                                </>
+                              )}
+                            </button>
+                          )}
+                          {!isCollapsed && (
+                            <div className="mt-1.5 space-y-2">
+                              {tool.parameters &&
+                                typeof tool.parameters === "object" &&
+                                Object.keys(tool.parameters as object)
+                                  .length > 0 && (
+                                  <div>
+                                    <div className="text-[9px] uppercase tracking-wider font-bold text-muted-foreground mb-1">
+                                      Input Schema
+                                    </div>
+                                    <pre className="p-2 rounded bg-background border border-border text-[10px] font-mono text-foreground overflow-x-auto max-h-40">
+                                      {JSON.stringify(tool.parameters, null, 2)}
+                                    </pre>
+                                  </div>
                                 )}
-                              </button>
-                            )}
-                          {!isCollapsed && tool.parameters && (
-                            <pre className="mt-1.5 p-2 rounded bg-background border border-border text-[10px] font-mono text-foreground overflow-x-auto max-h-40">
-                              {JSON.stringify(tool.parameters, null, 2)}
-                            </pre>
+                              {tool.output_schema &&
+                                typeof tool.output_schema === "object" &&
+                                Object.keys(tool.output_schema as object)
+                                  .length > 0 && (
+                                  <div>
+                                    <div className="text-[9px] uppercase tracking-wider font-bold text-muted-foreground mb-1">
+                                      Output Schema
+                                    </div>
+                                    <pre className="p-2 rounded bg-background border border-border text-[10px] font-mono text-foreground overflow-x-auto max-h-40">
+                                      {JSON.stringify(tool.output_schema, null, 2)}
+                                    </pre>
+                                  </div>
+                                )}
+                            </div>
                           )}
                         </div>
                       </div>

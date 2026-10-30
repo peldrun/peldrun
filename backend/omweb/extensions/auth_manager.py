@@ -116,6 +116,56 @@ def _b64url_no_pad(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
+def _is_publicly_reachable_url(url: str) -> bool:
+    """
+    Return True if a CIMD (Client ID Metadata Document) URL could
+    plausibly be fetched by a remote authorization server.
+
+    CIMD's client_id is a URL that the authorization server must
+    fetch over the network. When PELDRUN is running on localhost or
+    a private network, that URL is unreachable — the server will
+    reject it with "Invalid client_id". In that case the correct
+    fallback is DCR (Dynamic Client Registration), which returns a
+    real client_id string that the AS can trust without fetching
+    anything.
+
+    CIMD also requires HTTPS (draft §4.1). Plain HTTP is never
+    considered publicly reachable.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+
+    if parsed.scheme != "https":
+        return False
+
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+
+    # Loopback / localhost
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return False
+
+    # IPv4 private ranges (RFC 1918) and link-local.
+    if host.startswith("127.") or host.startswith("10."):
+        return False
+    if host.startswith("192.168."):
+        return False
+    if host.startswith("169.254."):
+        return False
+    if host.startswith("172."):
+        try:
+            second = int(host.split(".")[1])
+            if 16 <= second <= 31:
+                return False
+        except (ValueError, IndexError):
+            pass
+
+    return True
+
+
 # ─────────────────────────────────────────────────────────────────
 # PKCE (S256)
 # ─────────────────────────────────────────────────────────────────
@@ -290,46 +340,133 @@ class OAuthManager:
         """
         RFC 9728 discovery from an MCP server URL.
 
-        Fetches /.well-known/oauth-protected-resource to learn which
-        Authorization Server protects this resource, then fetches the
-        AS's /.well-known/oauth-authorization-server metadata.
+        The well-known URL is constructed by INSERTING
+        ``.well-known/oauth-protected-resource`` between the host and
+        the resource path — NOT by appending it to the path. For
+        example:
+
+            Resource:   https://mcp.notion.com/sse
+            Candidate 1: https://mcp.notion.com/.well-known/oauth-protected-resource/sse
+            Candidate 2: https://mcp.notion.com/.well-known/oauth-protected-resource
+
+        We try candidate 1 first (per RFC 9728 §3.1's path-scoped form),
+        then candidate 2 (host-scoped fallback). Only when BOTH fail do
+        we raise — a single 404 should not be treated as "no discovery
+        support" when the other form might work.
+
+        Common MCP servers and their discovery support:
+
+          * Notion (https://mcp.notion.com/sse)        → host-scoped
+          * Linear, Atlassian Rovo                     → host-scoped
+          * Most DCR/CIMD servers                      → path-scoped or host
+
+        The subsequent authorization-server metadata fetch tries BOTH
+        the RFC 8414 form (``/.well-known/oauth-authorization-server``)
+        and the OpenID Connect discovery form
+        (``/.well-known/openid-configuration``), since some providers
+        only publish one.
         """
-        base = mcp_server_url.rstrip("/")
-        prm_url = f"{base}/.well-known/oauth-protected-resource"
+        from urllib.parse import urlparse as _urlparse
 
-        try:
-            r = await self._http.get(prm_url)
-            r.raise_for_status()
-        except httpx.HTTPError as exc:
+        parsed = _urlparse(mcp_server_url)
+        scheme = parsed.scheme or "https"
+        host = parsed.netloc
+        path = (parsed.path or "").strip("/")
+
+        if not host:
             raise ValueError(
-                f"Protected resource metadata discovery failed at {prm_url}: {exc}"
-            ) from exc
+                f"Cannot parse host from mcp_server_url: {mcp_server_url!r}"
+            )
 
-        try:
-            prm = r.json()
-        except ValueError as exc:
-            raise ValueError(f"Invalid JSON from {prm_url}: {exc}") from exc
+        # Candidate list, ordered by specificity (RFC 9728 §3.1).
+        prm_candidates: list[str] = []
+        if path:
+            prm_candidates.append(
+                f"{scheme}://{host}/.well-known/oauth-protected-resource/{path}"
+            )
+        prm_candidates.append(
+            f"{scheme}://{host}/.well-known/oauth-protected-resource"
+        )
+
+        prm: Optional[dict] = None
+        prm_url_used: Optional[str] = None
+        last_error: Optional[Exception] = None
+
+        for cand in prm_candidates:
+            try:
+                r = await self._http.get(cand)
+                if r.status_code != 200:
+                    last_error = ValueError(
+                        f"HTTP {r.status_code} from {cand}"
+                    )
+                    continue
+                prm = r.json()
+                prm_url_used = cand
+                logger.info(
+                    "RFC 9728 discovery succeeded at %s (resource=%s)",
+                    cand,
+                    mcp_server_url,
+                )
+                break
+            except (httpx.HTTPError, ValueError) as exc:
+                last_error = exc
+                logger.debug(
+                    "RFC 9728 discovery attempt failed at %s: %s",
+                    cand,
+                    exc,
+                )
+                continue
+
+        if prm is None or prm_url_used is None:
+            raise ValueError(
+                f"Protected resource metadata discovery failed for "
+                f"{mcp_server_url!r}. Tried {prm_candidates}. "
+                f"Last error: {last_error}"
+            )
 
         auth_servers = prm.get("authorization_servers") or []
         if not isinstance(auth_servers, list) or not auth_servers:
-            raise ValueError(f"No authorization_servers advertised at {prm_url}")
+            raise ValueError(
+                f"No authorization_servers advertised at {prm_url_used}: "
+                f"{prm}"
+            )
 
         issuer = str(auth_servers[0]).rstrip("/")
-        as_url = f"{issuer}/.well-known/oauth-authorization-server"
 
-        try:
-            r = await self._http.get(as_url)
-            r.raise_for_status()
-            as_meta = r.json()
-        except httpx.HTTPError as exc:
+        # Try both RFC 8414 and OIDC discovery metadata URLs. Providers
+        # usually support one of the two; we do not know which in
+        # advance, so try both in sequence.
+        as_meta: Optional[dict] = None
+        as_url_used: Optional[str] = None
+        as_candidates = [
+            f"{issuer}/.well-known/oauth-authorization-server",
+            f"{issuer}/.well-known/openid-configuration",
+        ]
+        last_as_error: Optional[Exception] = None
+
+        for cand in as_candidates:
+            try:
+                r = await self._http.get(cand)
+                if r.status_code != 200:
+                    last_as_error = ValueError(
+                        f"HTTP {r.status_code} from {cand}"
+                    )
+                    continue
+                meta = r.json()
+                if isinstance(meta, dict):
+                    as_meta = meta
+                    as_url_used = cand
+                    break
+            except (httpx.HTTPError, ValueError) as exc:
+                last_as_error = exc
+                continue
+
+        if as_meta is None or as_url_used is None:
             raise ValueError(
-                f"Authorization server metadata discovery failed at {as_url}: {exc}"
-            ) from exc
-        except ValueError as exc:
-            raise ValueError(f"Invalid JSON from {as_url}: {exc}") from exc
-
-        if not isinstance(as_meta, dict):
-            raise ValueError(f"Unexpected metadata shape from {as_url}")
+                f"Authorization server metadata discovery failed for "
+                f"issuer {issuer!r}. Tried {as_candidates}. "
+                f"Last error: {last_as_error}"
+            )
 
         try:
             return AuthServerMetadata(
@@ -344,7 +481,8 @@ class OAuthManager:
             )
         except KeyError as exc:
             raise ValueError(
-                f"Authorization server metadata at {as_url} is missing required field {exc}"
+                f"Authorization server metadata at {as_url_used} is "
+                f"missing required field {exc}"
             ) from exc
 
     async def get_metadata(self, mcp_server_url: str) -> AuthServerMetadata:
@@ -442,40 +580,79 @@ class OAuthManager:
                     raw=dict(cfg),
                 )
 
-        # 2. CIMD
+        # 2. CIMD — only when the metadata URL is publicly reachable.
+        #
+        # CIMD's client_id is a URL that the authorization server
+        # must fetch over the network to verify the client. On
+        # localhost / private networks that URL is unreachable, so
+        # servers like Notion reject it with "Invalid client_id".
+        # Falling through to DCR (which returns a real client_id
+        # string) is the correct behavior — the AS does not need to
+        # fetch anything.
         if metadata.client_id_metadata_document_supported:
             chosen_url = (manifest_metadata_url or "").strip() or (
                 pelrdun_metadata_url or ""
             ).strip()
-            if not chosen_url:
-                raise ValueError(
-                    f"Server '{server_id}' supports CIMD but no client metadata "
-                    "URL is available (neither manifest-supplied nor PELDRUN-hosted)."
+            if chosen_url and _is_publicly_reachable_url(chosen_url):
+                logger.info(
+                    "Resolved CIMD client for server '%s' using %s",
+                    server_id,
+                    chosen_url,
                 )
+                return RegistrationResult(
+                    client_id=chosen_url,
+                    token_endpoint_auth_method="none",
+                    raw={"source": "cimd", "url": chosen_url},
+                )
+            # Fall through to DCR below.
             logger.info(
-                "Resolved CIMD client for server '%s' using %s",
+                "CIMD skipped for '%s': client metadata URL %r is not "
+                "publicly reachable (localhost, private IP, or HTTP). "
+                "Falling back to DCR.",
                 server_id,
                 chosen_url,
             )
-            return RegistrationResult(
-                client_id=chosen_url,
-                token_endpoint_auth_method="none",
-                raw={"source": "cimd", "url": chosen_url},
-            )
 
-        # 3. DCR
+        # 3. DCR — works with localhost because the AS returns a real
+        #    client_id string (no fetch required).
         if metadata.registration_endpoint:
-            body = {
+            # RFC 7591 §2: "web" is the default application_type.
+            # RFC 8252 §7.3: native apps with loopback redirect URIs
+            # should declare "native". PELDRUN is a web app but during
+            # local development the redirect_uri is loopback, so we
+            # declare "native" for that case — most servers (including
+            # Notion) accept it and skip the HTTPS requirement.
+            rd = urlparse(redirect_uri)
+            is_loopback = (rd.hostname or "").lower() in (
+                "localhost",
+                "127.0.0.1",
+                "::1",
+            )
+            body: Dict[str, Any] = {
                 "client_name": "PELDRUN MCP Client",
                 "redirect_uris": [redirect_uri],
                 "grant_types": ["authorization_code", "refresh_token"],
                 "response_types": ["code"],
                 "token_endpoint_auth_method": "none",
+                "application_type": "native" if is_loopback else "web",
             }
             try:
-                r = await self._http.post(metadata.registration_endpoint, json=body)
+                r = await self._http.post(
+                    metadata.registration_endpoint, json=body
+                )
                 r.raise_for_status()
                 reg = r.json()
+            except httpx.HTTPStatusError as dc_exc:
+                detail = ""
+                try:
+                    detail = dc_exc.response.text[:500]
+                except Exception:  # noqa: BLE001
+                    pass
+                raise ValueError(
+                    f"Dynamic client registration failed at "
+                    f"{metadata.registration_endpoint} "
+                    f"(HTTP {dc_exc.response.status_code}): {detail}"
+                ) from dc_exc
             except httpx.HTTPError as exc:
                 raise ValueError(
                     f"Dynamic client registration failed at "
@@ -491,9 +668,11 @@ class OAuthManager:
                     "Registration endpoint returned no client_id."
                 )
             logger.info(
-                "Resolved DCR client for server '%s' (client_id=%s...)",
+                "Resolved DCR client for server '%s' "
+                "(client_id=%s..., application_type=%s)",
                 server_id,
                 str(reg["client_id"])[:8],
+                body["application_type"],
             )
             return RegistrationResult(
                 client_id=reg["client_id"],

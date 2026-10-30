@@ -207,6 +207,18 @@ async def get_mcp_server_settings(server_id: str):
     current_settings = extension_registry.get_server_settings(server_id)
     current_env = extension_registry.get_server_env(server_id)
 
+    # ── OAuth capability (mirrors routers/mcp_auth._is_oauth_capable) ──
+    # OAuth is only meaningful for HTTP-transport servers that expose
+    # a URL and declare auth_strategy="oauth". The frontend uses this
+    # to conditionally render the "Connect with OAuth" section — a
+    # stdio server cannot participate in an OAuth flow.
+    _transport = str(ext.get("transport") or "").lower()
+    _url = ext.get("url")
+    _auth_strategy = str(ext.get("auth_strategy") or "").lower()
+    _is_http = _transport in ("sse", "http", "streamable-http", "")
+    _has_url = isinstance(_url, str) and bool(_url)
+    _oauth_capable = _auth_strategy == "oauth" and _is_http and _has_url
+
     return {
         "status": "ok",
         "server_id": server_id,
@@ -214,6 +226,9 @@ async def get_mcp_server_settings(server_id: str):
         "env_schema": env_schema,
         "settings": current_settings,
         "env": current_env,
+        "auth_strategy": _auth_strategy or None,
+        "transport": _transport or "stdio",
+        "oauth_capable": _oauth_capable,
     }
 
 
@@ -596,11 +611,33 @@ async def refresh_tools_endpoint(server_id: str):
     # produces a 30-120s timeout because most MCP servers hang
     # waiting for their token on stdin. Fail fast with an
     # actionable 412 instead.
+    #
+    # OAuth servers (Notion, Linear, etc.) have auth_strategy="oauth"
+    # and NO env_schema. Their credential is a global OAuth token
+    # bundle managed via mcp_settings_manager.save_oauth (populated
+    # by POST /api/mcp/servers/{id}/oauth/start).
     try:
         from omweb.extensions.mcp_auth_state import manifest_needs_auth
         from omweb.extensions.settings_manager import mcp_settings_manager
 
-        if manifest_needs_auth(manifest):
+        auth_strategy = str(
+            manifest.get("auth_strategy") or ""
+        ).lower().strip()
+
+        if auth_strategy == "oauth":
+            bundle = mcp_settings_manager.get_oauth(server_id)
+            if not (bundle and bundle.get("access_token")):
+                raise HTTPException(
+                    status_code=412,
+                    detail=(
+                        f"Server '{server_id}' requires OAuth authorization. "
+                        f"Open Store → Extensions → "
+                        f"{manifest.get('name', server_id)} → Settings and "
+                        f"click 'Connect with OAuth' to authorize before "
+                        f"refreshing tools."
+                    ),
+                )
+        elif manifest_needs_auth(manifest):
             global_env = mcp_settings_manager.get_env(
                 server_id, manifest.get("env_schema")
             )
@@ -679,6 +716,230 @@ async def refresh_tools_endpoint(server_id: str):
         ),
         "tools": final_tools,
     }
+
+
+# ─────────────────────────────────────────────────────────────────
+# MCP Resources & Prompts (MCP 2025-11-25 §5, §6)
+# ─────────────────────────────────────────────────────────────────
+#
+# Three read-only endpoints that surface the non-tool primitives
+# exposed by an MCP server. Historically only tools were discoverable
+# in the Store UI, so a "documentation server" (3 resources, 0 tools)
+# appeared as "0 tools — empty" — indistinguishable from a broken
+# server.
+#
+# Cache strategy: identical to ``/tools/cached``. The endpoints
+# serve the cache when it is fresh; otherwise they fall back to a
+# live discovery that re-populates the cache. This keeps the
+# `MCPDetailDrawer` responsive on every visit after the first.
+# ─────────────────────────────────────────────────────────────────
+
+@router.get("/servers/{server_id}/resources")
+async def get_mcp_server_resources(server_id: str):
+    """
+    Return the resources exposed by a server.
+
+    Cache-first: the response is served from the persistent cache
+    when fresh, and discovered live otherwise. A live discovery
+    updates the cache as a side effect, so a second call hits the
+    cache.
+
+    Empty list is a valid result: most MCP servers today expose
+    tools only and do not declare any resources. The frontend
+    treats an empty list as "no resources tab" and does not show
+    an error.
+    """
+    if not extension_registry.get_extension(server_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"MCP server '{server_id}' not found.",
+        )
+
+    manifest = extension_registry.get_effective_server(server_id)
+    if not manifest:
+        raise HTTPException(
+            status_code=404,
+            detail=f"MCP server '{server_id}' has no effective manifest.",
+        )
+
+    # ── Fast path: cached resources ──────────────────────────────
+    try:
+        from omweb.extensions.mcp_tool_cache import (
+            get_resources as _get_cached_resources,
+        )
+
+        cached = _get_cached_resources(server_id)
+        if cached:
+            return {
+                "status": "ok",
+                "server_id": server_id,
+                "resources": cached,
+                "total": len(cached),
+                "source": "cache",
+            }
+    except Exception as cache_err:  # noqa: BLE001
+        # A broken cache read must not block live discovery.
+        logger.debug(
+            "Cached resources read failed for '%s': %s",
+            server_id,
+            cache_err,
+        )
+
+    # ── Slow path: live discovery ────────────────────────────────
+    try:
+        resources = await mcp_session_pool.get_resources(
+            server_id=server_id,
+            manifest=manifest,
+        )
+        return {
+            "status": "ok",
+            "server_id": server_id,
+            "resources": resources,
+            "total": len(resources),
+            "source": "live",
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "Failed to list resources for '%s': %s", server_id, exc
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Resource discovery failed: {exc}",
+        )
+
+
+@router.get("/servers/{server_id}/prompts")
+async def get_mcp_server_prompts(server_id: str):
+    """
+    Return the prompts exposed by a server.
+
+    Mirrors ``/resources`` in every respect — cache-first, live
+    fallback, empty list is a valid response.
+    """
+    if not extension_registry.get_extension(server_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"MCP server '{server_id}' not found.",
+        )
+
+    manifest = extension_registry.get_effective_server(server_id)
+    if not manifest:
+        raise HTTPException(
+            status_code=404,
+            detail=f"MCP server '{server_id}' has no effective manifest.",
+        )
+
+    try:
+        from omweb.extensions.mcp_tool_cache import (
+            get_prompts as _get_cached_prompts,
+        )
+
+        cached = _get_cached_prompts(server_id)
+        if cached:
+            return {
+                "status": "ok",
+                "server_id": server_id,
+                "prompts": cached,
+                "total": len(cached),
+                "source": "cache",
+            }
+    except Exception as cache_err:  # noqa: BLE001
+        logger.debug(
+            "Cached prompts read failed for '%s': %s",
+            server_id,
+            cache_err,
+        )
+
+    try:
+        prompts = await mcp_session_pool.get_prompts(
+            server_id=server_id,
+            manifest=manifest,
+        )
+        return {
+            "status": "ok",
+            "server_id": server_id,
+            "prompts": prompts,
+            "total": len(prompts),
+            "source": "live",
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "Failed to list prompts for '%s': %s", server_id, exc
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Prompt discovery failed: {exc}",
+        )
+
+
+class ReadResourcePayload(BaseModel):
+    """Body for POST /servers/{sid}/resources/read."""
+    uri: str
+
+
+@router.post("/servers/{server_id}/resources/read")
+async def read_mcp_resource(
+    server_id: str,
+    payload: ReadResourcePayload = Body(...),
+):
+    """
+    Read the contents of a single resource by URI.
+
+    Returns ``{contents: [{uri, mimeType, text|blob}]}`` on
+    success. The response shape mirrors MCP's ``resources/read``
+    verbatim so clients can rely on the standard schema.
+
+    A 404 is returned when the resource is unavailable (URI is
+    valid but returns no contents). This is distinct from 502
+    (transport / RPC failure) and lets the UI distinguish "this
+    URI is gone" from "the server is unreachable".
+    """
+    if not extension_registry.get_extension(server_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"MCP server '{server_id}' not found.",
+        )
+
+    manifest = extension_registry.get_effective_server(server_id)
+    if not manifest:
+        raise HTTPException(
+            status_code=404,
+            detail=f"MCP server '{server_id}' has no effective manifest.",
+        )
+
+    try:
+        client = await mcp_session_pool.get_or_create_client(
+            server_id=server_id,
+            manifest=manifest,
+        )
+        result = await client.read_resource(payload.uri)
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Resource '{payload.uri}' is not available on "
+                    f"server '{server_id}'."
+                ),
+            )
+        return {
+            "status": "ok",
+            "server_id": server_id,
+            "uri": payload.uri,
+            **result,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "Failed to read resource '%s' from '%s': %s",
+            payload.uri,
+            server_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Resource read failed: {exc}",
+        )
 
 
 # ─────────────────────────────────────────────────────────────────

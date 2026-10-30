@@ -115,41 +115,92 @@ export function useExtensionActions({
   /**
    * Run an MCP connectivity test against the backend.
    */
-  const handleTestExtension = useCallback(async (extId: string) => {
-    setTestingExtId(extId);
-    try {
-      const res = await fetch(getApiUrl("/api/mcp/test"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ server_id: extId }),
-      });
-      const data = await res.json().catch(() => ({}));
-      const isOk = data.status === "ok";
-      setTestResults((prev) => ({
-        ...prev,
-        [extId]: {
-          ok: isOk,
-          message: data.message || (isOk ? "Connection OK" : "Test failed"),
-        },
-      }));
-      if (isOk) {
-        showToast.success("MCP Test Succeeded", data.message);
-      } else {
-        showToast.warning("MCP Test Warning", data.message);
+  const handleTestExtension = useCallback(
+    async (extId: string) => {
+      setTestingExtId(extId);
+
+      // Pre-flight: OAuth servers NEVER pass "Test Connection"
+      // because the endpoint requires a Bearer token that only
+      // exists after the OAuth flow completes. Sending a naked
+      // request produces a scary 401 in the logs and a red
+      // warning in the UI — both of which look like bugs to the
+      // user. Short-circuit with a friendly info toast that
+      // points to the correct flow (test from within a chat).
+      const ext = extensions.find((e) => e.id === extId) as any;
+      const authStrategy = String(ext?.auth_strategy || "").toLowerCase();
+      const isOAuthServer = authStrategy === "oauth";
+
+      if (isOAuthServer) {
+        setTestResults((prev) => ({
+          ...prev,
+          [extId]: {
+            ok: true,
+            message:
+              "OAuth server — connect from Chat to authenticate and verify.",
+          },
+        }));
+        showToast.info(
+          "OAuth Server",
+          "This server authenticates through OAuth. Open a chat and use its tools — the connection is verified there, not here."
+        );
+        setTestingExtId(null);
+        return;
       }
-    } catch (err: any) {
-      setTestResults((prev) => ({
-        ...prev,
-        [extId]: {
-          ok: false,
-          message: err.message || "Failed to reach backend.",
-        },
-      }));
-      showToast.error("Test Error", err.message || "Failed to reach backend.");
-    } finally {
-      setTestingExtId(null);
-    }
-  }, []);
+
+      try {
+        const res = await fetch(getApiUrl("/api/mcp/test"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ server_id: extId }),
+        });
+        const data = await res.json().catch(() => ({}));
+        const isOk = data.status === "ok";
+
+        // Even non-OAuth servers can return 401 if credentials
+        // are missing globally. Surface that as a hint instead of
+        // a raw error, so the user knows the path forward.
+        const isAuthMissing =
+          typeof data.message === "string" &&
+          /401|unauthori[sz]ed/i.test(data.message);
+
+        setTestResults((prev) => ({
+          ...prev,
+          [extId]: {
+            ok: isOk,
+            message: isAuthMissing
+              ? "Requires credentials — set them in Settings first."
+              : data.message || (isOk ? "Connection OK" : "Test failed"),
+          },
+        }));
+
+        if (isOk) {
+          showToast.success("MCP Test Succeeded", data.message);
+        } else if (isAuthMissing) {
+          showToast.info(
+            "Credentials Required",
+            "This server needs credentials before it can be tested. Open Settings and save them, then retry."
+          );
+        } else {
+          showToast.warning("MCP Test Warning", data.message);
+        }
+      } catch (err: any) {
+        setTestResults((prev) => ({
+          ...prev,
+          [extId]: {
+            ok: false,
+            message: err.message || "Failed to reach backend.",
+          },
+        }));
+        showToast.error(
+          "Test Error",
+          err.message || "Failed to reach backend."
+        );
+      } finally {
+        setTestingExtId(null);
+      }
+    },
+    [extensions]
+  );
 
   /**
    * Delete or purge an MCP server / bundle.

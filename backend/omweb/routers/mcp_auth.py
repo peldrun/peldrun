@@ -314,8 +314,140 @@ async def get_client_metadata(request: Request):
 
 
 # ─────────────────────────────────────────────────────────────────
-# OAuth: start flow
+# OAuth: start flow (GLOBAL scope — from Store UI)
 # ─────────────────────────────────────────────────────────────────
+#
+# The Store UI needs to authorize OAuth servers WITHOUT being inside
+# a chat. The chat-scoped endpoint below requires a chat_id because
+# its tokens are stored per-chat. This global endpoint uses the same
+# OAuth state machine but saves tokens to the server-level config
+# (mcp_settings_manager.save_oauth) so a single authorization covers
+# every future chat.
+#
+# Flow:
+#   1. Store → Notion → Settings → "Connect with OAuth"
+#   2. POST /api/mcp/servers/notion_mcp/oauth/start
+#   3. Popup opens → Notion OAuth → user approves
+#   4. Callback saves to mcp_settings_manager
+#   5. Store receives postMessage "success" → refreshes UI
+#   6. Test Connection → uses global token → works
+#   7. Tools → Refresh → tools cached
+#   8. Chat → agent sees tools immediately (no modal)
+#
+# ─────────────────────────────────────────────────────────────────
+
+@router.post("/api/mcp/servers/{server_id}/oauth/start")
+async def start_global_oauth(server_id: str, request: Request):
+    """
+    Begin an OAuth 2.1 flow for a server, saving tokens globally.
+
+    Unlike the chat-scoped endpoint, this does NOT require a chat_id.
+    Tokens are written to the server-level config (encrypted with AAD
+    "global:{server_id}:oauth") and are reused by every chat that does
+    not override them with a per-chat credential decision.
+
+    Returns the authorization URL the frontend must open in a popup.
+    """
+    manifest = _load_manifest_or_404(server_id)
+
+    if not _is_oauth_capable(manifest):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"MCP server '{server_id}' does not support OAuth: it has "
+                "no URL or uses a non-HTTP transport."
+            ),
+        )
+
+    mcp_server_url = str(manifest["url"]).rstrip("/")
+
+    try:
+        metadata = await oauth_manager.get_metadata(mcp_server_url)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Global OAuth metadata discovery failed for '%s': %s",
+            server_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Failed to discover authorization server for '{server_id}': "
+                f"{exc}"
+            ),
+        )
+
+    redirect_uri = f"{resolve_public_base_url(request)}/api/mcp/oauth/callback"
+    manifest_metadata_url = manifest.get("client_metadata_url")
+    pelrdun_metadata_url = resolve_client_metadata_url(request)
+
+    try:
+        registration = await oauth_manager.resolve_client(
+            server_id=server_id,
+            mcp_server_url=mcp_server_url,
+            metadata=metadata,
+            redirect_uri=redirect_uri,
+            manifest_metadata_url=manifest_metadata_url,
+            pelrdun_metadata_url=pelrdun_metadata_url,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Global OAuth client registration failed for '%s': %s",
+            server_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to register OAuth client for '{server_id}': {exc}",
+        )
+
+    pkce = generate_pkce()
+    import secrets as _secrets
+
+    state = _secrets.token_urlsafe(32)
+    scopes: List[str] = list(
+        manifest.get("scopes") or metadata.scopes_supported
+    )
+
+    # Key difference from chat-scoped: no chat_id, scope = "global".
+    oauth_state_store.put(
+        state,
+        {
+            "scope": "global",
+            "chat_id": None,
+            "server_id": server_id,
+            "verifier": pkce.verifier,
+            "metadata": metadata,
+            "client_id": registration.client_id,
+            "client_secret": registration.client_secret,
+            "redirect_uri": redirect_uri,
+            "resource": mcp_server_url,
+        },
+    )
+
+    auth_url = oauth_manager.build_authorization_url(
+        metadata=metadata,
+        client_id=registration.client_id,
+        redirect_uri=redirect_uri,
+        pkce=pkce,
+        scopes=scopes,
+        state=state,
+        resource=mcp_server_url,
+    )
+
+    logger.info(
+        "Global OAuth flow started (server=%s issuer=%s).",
+        server_id,
+        metadata.issuer,
+    )
+
+    return {
+        "auth_url": auth_url,
+        "state": state,
+        "server_id": server_id,
+        "scope": "global",
+    }
+
 
 @router.post(
     "/api/chats/{chat_id}/mcp-auth/{server_id}/start",
@@ -554,28 +686,68 @@ async def oauth_callback(
             status_code=200,
         )
 
-    # 4. Persist the tokens for this (chat, server) pair.
+    # 4. Persist tokens. Two scopes exist:
+    #    * "global" — triggered from Store UI. Tokens go to
+    #      mcp_settings_manager.save_oauth() and are reused by every
+    #      chat that does not override them.
+    #    * chat-scoped (default) — triggered from Chat modal. Tokens
+    #      go to chat_mcp_auth.save_oauth_tokens() with AAD bound to
+    #      the specific chat_id.
     try:
-        store = get_chat_mcp_auth_store()
-        await store.save_oauth_tokens(
-            chat_id=ctx["chat_id"],
-            server_id=ctx["server_id"],
-            access_token=tokens["access_token"],
-            refresh_token=tokens.get("refresh_token"),
-            expires_in=tokens.get("expires_in"),
-            token_type=tokens.get("token_type", "Bearer"),
-            resource=ctx["resource"],
-        )
+        if ctx.get("scope") == "global":
+            from omweb.extensions.settings_manager import (
+                mcp_settings_manager,
+            )
+
+            bundle: Dict[str, Any] = {
+                "access_token": tokens["access_token"],
+                "token_type": tokens.get("token_type", "Bearer"),
+            }
+            if tokens.get("refresh_token"):
+                bundle["refresh_token"] = tokens["refresh_token"]
+            if tokens.get("expires_in") is not None:
+                import time as _time
+
+                try:
+                    expires_in_int = int(tokens["expires_in"])
+                    bundle["expires_in"] = expires_in_int
+                    bundle["expires_at"] = int(
+                        _time.time() + expires_in_int
+                    )
+                except (TypeError, ValueError):
+                    pass
+            if ctx.get("resource"):
+                bundle["resource"] = ctx["resource"]
+
+            mcp_settings_manager.save_oauth(
+                ctx["server_id"], bundle
+            )
+            logger.info(
+                "Global OAuth tokens saved for server '%s'.",
+                ctx["server_id"],
+            )
+        else:
+            store = get_chat_mcp_auth_store()
+            await store.save_oauth_tokens(
+                chat_id=ctx["chat_id"],
+                server_id=ctx["server_id"],
+                access_token=tokens["access_token"],
+                refresh_token=tokens.get("refresh_token"),
+                expires_in=tokens.get("expires_in"),
+                token_type=tokens.get("token_type", "Bearer"),
+                resource=ctx["resource"],
+            )
     except Exception as exc:  # noqa: BLE001
         logger.exception(
-            "Failed to persist OAuth tokens (chat=%s server=%s)",
+            "Failed to persist OAuth tokens (scope=%s chat=%s server=%s)",
+            ctx.get("scope") or "chat",
             ctx.get("chat_id"),
             ctx.get("server_id"),
         )
         return HTMLResponse(
             _close_window_html(
                 request=request,
-                chat_id=ctx["chat_id"],
+                chat_id=ctx.get("chat_id"),
                 server_id=ctx["server_id"],
                 success=False,
                 error_code="persist_failed",
@@ -585,20 +757,104 @@ async def oauth_callback(
         )
 
     logger.info(
-        "OAuth flow completed (chat=%s server=%s)",
-        ctx["chat_id"],
+        "OAuth flow completed (scope=%s chat=%s server=%s)",
+        ctx.get("scope") or "chat",
+        ctx.get("chat_id"),
         ctx["server_id"],
     )
 
     return HTMLResponse(
         _close_window_html(
             request=request,
-            chat_id=ctx["chat_id"],
+            chat_id=ctx.get("chat_id"),
             server_id=ctx["server_id"],
             success=True,
         ),
         status_code=200,
     )
+
+
+# ─────────────────────────────────────────────────────────────────
+# Global OAuth status & disconnect
+# ─────────────────────────────────────────────────────────────────
+
+@router.get("/api/mcp/servers/{server_id}/oauth/status")
+async def get_global_oauth_status(server_id: str):
+    """
+    Report whether global OAuth tokens exist for a server.
+
+    The Store UI uses this to render the correct button label
+    ("Connect with OAuth" vs "Disconnect") and to show the
+    authenticated state without leaking the tokens themselves.
+    """
+    manifest = _load_manifest_or_404(server_id)
+
+    if not _is_oauth_capable(manifest):
+        return {
+            "status": "ok",
+            "server_id": server_id,
+            "oauth_capable": False,
+            "authenticated": False,
+        }
+
+    from omweb.extensions.settings_manager import mcp_settings_manager
+
+    bundle = mcp_settings_manager.get_oauth(server_id)
+    authenticated = bool(
+        bundle and bundle.get("access_token")
+    )
+
+    # Best-effort expiry check — surfaces "needs_refresh" without
+    # actually refreshing (the caller can trigger a new OAuth flow
+    # if it cares).
+    needs_refresh = False
+    if authenticated:
+        try:
+            expires_at = int(bundle.get("expires_at") or 0)
+            if expires_at > 0:
+                import time as _time
+
+                needs_refresh = expires_at <= int(_time.time()) + 60
+        except (TypeError, ValueError):
+            pass
+
+    return {
+        "status": "ok",
+        "server_id": server_id,
+        "oauth_capable": True,
+        "authenticated": authenticated,
+        "needs_refresh": needs_refresh,
+        "has_refresh_token": bool(
+            authenticated and bundle and bundle.get("refresh_token")
+        ),
+    }
+
+
+@router.delete("/api/mcp/servers/{server_id}/oauth")
+async def delete_global_oauth(server_id: str):
+    """
+    Remove global OAuth tokens for a server.
+
+    Does NOT revoke them at the provider — the user should also remove
+    the integration from their provider's settings (e.g. Notion's
+    "Manage workspace clients"). This endpoint only clears PELDRUN's
+    local copy, which is sufficient to force a re-authorization.
+    """
+    _load_manifest_or_404(server_id)
+
+    from omweb.extensions.settings_manager import mcp_settings_manager
+
+    removed = mcp_settings_manager.delete_oauth(server_id)
+    logger.info(
+        "Global OAuth tokens %s for server '%s'.",
+        "removed" if removed else "not present",
+        server_id,
+    )
+    return {
+        "status": "ok",
+        "server_id": server_id,
+        "removed": removed,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────

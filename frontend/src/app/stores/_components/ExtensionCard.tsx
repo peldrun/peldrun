@@ -95,6 +95,14 @@ export function ExtensionCard({
                 custom
               </span>
             )}
+            {(extension as any).auth_strategy === "oauth" && (
+              <span
+                className="text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary border border-primary/20 font-mono"
+                title="OAuth server — authenticate from Chat"
+              >
+                OAuth
+              </span>
+            )}
           </div>
           <p className="text-xs text-muted-foreground line-clamp-2 leading-relaxed">
             {shortDesc}
@@ -131,20 +139,33 @@ export function ExtensionCard({
           <ExternalLink size={12} className="text-muted-foreground" />
         </button>
 
-        {/* Test Connection */}
-        <button
-          type="button"
-          onClick={() => onTest(extension.id)}
-          disabled={isTesting || isGloballyDisabled}
-          className="flex items-center justify-center w-8 h-8 rounded-md bg-secondary hover:bg-secondary/80 text-secondary-foreground transition-colors disabled:opacity-50"
-          title="Test Connection"
-        >
-          {isTesting ? (
-            <Loader2 size={14} className="animate-spin text-primary" />
-          ) : (
-            <Play size={12} className="text-primary fill-primary" />
-          )}
-        </button>
+        {/* Test Connection — OAuth servers get a friendlier tooltip */}
+        {(() => {
+          const authStrategy = String(
+            (extension as any).auth_strategy || ""
+          ).toLowerCase();
+          const isOAuth = authStrategy === "oauth";
+          return (
+            <button
+              type="button"
+              onClick={() => onTest(extension.id)}
+              disabled={isTesting || isGloballyDisabled}
+              className="flex items-center justify-center w-8 h-8 rounded-md bg-secondary hover:bg-secondary/80 text-secondary-foreground transition-colors disabled:opacity-50"
+              title={
+                isOAuth
+                  ? "OAuth server — verify from Chat (Test Connection requires a token)"
+                  : "Test Connection"
+              }
+              aria-label="Test Connection"
+            >
+              {isTesting ? (
+                <Loader2 size={14} className="animate-spin text-primary" />
+              ) : (
+                <Play size={12} className="text-primary fill-primary" />
+              )}
+            </button>
+          );
+        })()}
 
         {/* Settings (If not built-in, or if it has env vars) */}
         {onConfigure && (

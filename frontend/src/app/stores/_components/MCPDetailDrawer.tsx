@@ -12,6 +12,8 @@ import {
   Wrench,
   Loader2,
   Globe,
+  FileText,
+  MessageSquare,
 } from "lucide-react";
 import type { ExtensionDefinition } from "@/lib/types";
 
@@ -26,26 +28,71 @@ interface CachedTool {
   description: string;
 }
 
+interface CachedResource {
+  uri: string;
+  name: string;
+  description: string;
+  mimeType: string;
+}
+
+interface CachedPrompt {
+  name: string;
+  description: string;
+  arguments: Array<{
+    name: string;
+    description: string;
+    required: boolean;
+  }>;
+}
+
 export function MCPDetailDrawer({ open, extension, onClose }: MCPDetailDrawerProps) {
+  const [activeTab, setActiveTab] = useState<"tools" | "resources" | "prompts">("tools");
   const [tools, setTools] = useState<CachedTool[]>([]);
-  const [loadingTools, setLoadingTools] = useState(false);
+  const [resources, setResources] = useState<CachedResource[]>([]);
+  const [prompts, setPrompts] = useState<CachedPrompt[]>([]);
+  const [loadingData, setLoadingData] = useState(false);
 
   useEffect(() => {
     if (!open || !extension) return;
 
     let cancelled = false;
-    setLoadingTools(true);
+    setLoadingData(true);
+    setActiveTab("tools"); // Reset to default tab on open
 
-    fetch(`/api/mcp/servers/${extension.id}/tools/cached`)
-      .then((res) => res.json())
-      .then((data) => {
-        if (!cancelled && data.cached) {
-          setTools(data.tools || []);
+    // Fetch all three primitives in parallel to minimize latency.
+    // The backend caches all three in the same file, so this is
+    // effectively one disk read behind the scenes.
+    Promise.all([
+      fetch(`/api/mcp/servers/${extension.id}/tools/cached`).then((r) => r.json()),
+      fetch(`/api/mcp/servers/${extension.id}/resources`).then((r) => r.json()).catch(() => ({})),
+      fetch(`/api/mcp/servers/${extension.id}/prompts`).then((r) => r.json()).catch(() => ({})),
+    ])
+      .then(([toolsData, resourcesData, promptsData]) => {
+        if (cancelled) return;
+
+        if (toolsData && toolsData.cached) {
+          setTools(toolsData.tools || []);
+        } else {
+          setTools([]);
+        }
+
+        if (resourcesData && resourcesData.status === "ok") {
+          setResources(resourcesData.resources || []);
+        } else {
+          setResources([]);
+        }
+
+        if (promptsData && promptsData.status === "ok") {
+          setPrompts(promptsData.prompts || []);
+        } else {
+          setPrompts([]);
         }
       })
-      .catch(() => {})
+      .catch(() => {
+        // Fail-soft: leave lists empty if the parallel fetch fails
+      })
       .finally(() => {
-        if (!cancelled) setLoadingTools(false);
+        if (!cancelled) setLoadingData(false);
       });
 
     return () => {
@@ -96,11 +143,11 @@ export function MCPDetailDrawer({ open, extension, onClose }: MCPDetailDrawerPro
           <div className="px-8 py-6 max-w-2xl mx-auto">
 
             {/* Title Area */}
-            <div className="flex items-start gap-4 mb-6">
+            <div className="flex items-center gap-4 mb-6">
               <div className="p-0 shrink-0">
                 {iconSvg ? (
                   <div
-                    className="w-10 h-10 text-primary"
+                    className="w-10 h-full text-primary flex items-center justify-center "
                     dangerouslySetInnerHTML={{ __html: iconSvg }}
                   />
                 ) : (
@@ -116,7 +163,7 @@ export function MCPDetailDrawer({ open, extension, onClose }: MCPDetailDrawerPro
                     </span>
                   )}
                 </h1>
-                <p className="text-sm text-muted-foreground mt-1">
+                <p className="text-[13px] font-mono  text-muted-foreground mt-1 max-w-md">
                   {shortDesc}
                 </p>
               </div>
@@ -149,39 +196,145 @@ export function MCPDetailDrawer({ open, extension, onClose }: MCPDetailDrawerPro
               <div className="md:col-span-2 space-y-8">
                 {/* About */}
                 <section>
-                  <h2 className="text-sm font-bold text-foreground mb-3 uppercase tracking-wider text-muted-foreground">
+                  <h2 className="text-sm font-bold text-black mb-3 uppercase tracking-wider ">
                     About
                   </h2>
-                  <p className="text-sm text-foreground leading-relaxed whitespace-pre-wrap">
+                  <p className="text-[14px] text-black/60 leading-relaxed whitespace-pre-wrap">
                     {longDesc}
                   </p>
                 </section>
 
-                {/* Tools List */}
+                {/* Primitives Section (Tools / Resources / Prompts) */}
                 <section>
-                  <h2 className="text-sm font-bold text-foreground mb-3 uppercase tracking-wider text-muted-foreground flex items-center gap-2">
-                    <Wrench size={16} /> Tools
-                  </h2>
-                  {loadingTools ? (
+                  {/* Tab Bar */}
+                  <div className="flex border-b border-border mb-4">
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab("tools")}
+                      className={`px-4 py-2 text-xs font-semibold border-b-2 transition-colors flex items-center gap-1.5 ${
+                        activeTab === "tools"
+                          ? "border-primary text-primary"
+                          : "border-transparent text-muted-foreground hover:text-foreground"
+                      }`}
+                    >
+                      <Wrench size={14} /> Tools ({tools.length})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab("resources")}
+                      className={`px-4 py-2 text-xs font-semibold border-b-2 transition-colors flex items-center gap-1.5 ${
+                        activeTab === "resources"
+                          ? "border-primary text-primary"
+                          : "border-transparent text-muted-foreground hover:text-foreground"
+                      }`}
+                    >
+                      <FileText size={14} /> Resources ({resources.length})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab("prompts")}
+                      className={`px-4 py-2 text-xs font-semibold border-b-2 transition-colors flex items-center gap-1.5 ${
+                        activeTab === "prompts"
+                          ? "border-primary text-primary"
+                          : "border-transparent text-muted-foreground hover:text-foreground"
+                      }`}
+                    >
+                      <MessageSquare size={14} /> Prompts ({prompts.length})
+                    </button>
+                  </div>
+
+                  {loadingData ? (
                     <div className="flex items-center gap-2 text-xs text-muted-foreground py-4">
-                      <Loader2 size={14} className="animate-spin" /> Loading tools...
-                    </div>
-                  ) : tools.length > 0 ? (
-                    <div className="flex flex-wrap gap-2">
-                      {tools.map((t) => (
-                        <span
-                          key={t.name}
-                          className="px-2.5 py-1 rounded-md border border-border bg-muted text-[11px] font-mono text-foreground"
-                          title={t.description}
-                        >
-                          {t.name}
-                        </span>
-                      ))}
+                      <Loader2 size={14} className="animate-spin" /> Loading data...
                     </div>
                   ) : (
-                    <p className="text-xs text-muted-foreground italic">
-                      No tools cached yet. Open "Manage Tools" to fetch them.
-                    </p>
+                    <>
+                      {/* ── Tools Tab ── */}
+                      {activeTab === "tools" &&
+                        (tools.length > 0 ? (
+                          <div className="flex flex-wrap gap-2">
+                            {tools.map((t) => (
+                              <span
+                                key={t.name}
+                                className="px-2.5 py-1 rounded-md border border-border bg-muted text-[11px] font-mono text-foreground"
+                                title={t.description}
+                              >
+                                {t.name}
+                              </span>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-xs text-muted-foreground italic">
+                            No tools cached yet. Open "Manage Tools" to fetch them.
+                          </p>
+                        ))}
+
+                      {/* ── Resources Tab ── */}
+                      {activeTab === "resources" &&
+                        (resources.length > 0 ? (
+                          <div className="flex flex-col gap-3">
+                            {resources.map((r) => (
+                              <div key={r.uri} className="p-3 rounded-md border border-border bg-card">
+                                <div className="flex items-center justify-between mb-1">
+                                  <span className="text-sm font-bold text-foreground">{r.name}</span>
+                                  <span className="text-[10px] font-mono text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
+                                    {r.mimeType}
+                                  </span>
+                                </div>
+                                <p className="text-xs text-muted-foreground mb-2">{r.description}</p>
+                                <div className="text-[10px] font-mono text-primary/70 break-all bg-primary/5 p-1.5 rounded">
+                                  {r.uri}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-xs text-muted-foreground italic">
+                            This server does not expose any resources.
+                          </p>
+                        ))}
+
+                      {/* ── Prompts Tab ── */}
+                      {activeTab === "prompts" &&
+                        (prompts.length > 0 ? (
+                          <div className="flex flex-col gap-3">
+                            {prompts.map((p) => (
+                              <div key={p.name} className="p-3 rounded-md border border-border bg-card">
+                                <div className="text-sm font-bold text-foreground mb-1">{p.name}</div>
+                                <p className="text-xs text-muted-foreground mb-2">{p.description}</p>
+                                {p.arguments && p.arguments.length > 0 && (
+                                  <div className="mt-2">
+                                    <span className="text-[10px] uppercase font-bold text-muted-foreground">
+                                      Arguments:
+                                    </span>
+                                    <ul className="mt-1 space-y-1">
+                                      {p.arguments.map((arg) => (
+                                        <li key={arg.name} className="text-xs text-foreground flex items-center gap-1.5">
+                                          <code className="font-mono text-[11px] bg-muted px-1 rounded">
+                                            {arg.name}
+                                          </code>
+                                          <span className="text-muted-foreground text-[11px]">
+                                            {arg.description}
+                                          </span>
+                                          {arg.required && (
+                                            <span className="text-[9px] text-destructive font-bold uppercase">
+                                              required
+                                            </span>
+                                          )}
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-xs text-muted-foreground italic">
+                            This server does not expose any prompts.
+                          </p>
+                        ))}
+                    </>
                   )}
                 </section>
               </div>
@@ -252,7 +405,7 @@ export function MCPDetailDrawer({ open, extension, onClose }: MCPDetailDrawerPro
         </div>
 
         {/* Footer Warning */}
-        <div className="p-6 border-t border-border bg-muted/10 shrink-0">
+        <div className="p-6 border-t border-border bg-custom shrink-0">
           <p className="text-[11px] text-muted-foreground leading-relaxed text-center">
             Only use connectors from developers you trust. PELDRUN does not control which tools developers make available and cannot verify that they will work as intended or that they won't change.
           </p>

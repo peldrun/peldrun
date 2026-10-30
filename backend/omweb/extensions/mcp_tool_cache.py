@@ -96,6 +96,19 @@ def _cache_path(server_id: str) -> Path:
 
 _lock = threading.RLock()
 
+# Cache container schema version. Bump this whenever the shape of the
+# data inside the cache changes — ``is_cache_fresh`` checks it, so any
+# cache written under an older version is treated as stale and gets
+# re-discovered on the next call. This is how we automatically roll out
+# the $ref sanitizer to every user: old caches carry ``version: 1`` and
+# are rejected; new caches written after this patch carry ``version: 2``.
+# v4: cache carries `resources` and `prompts` alongside `tools`
+# (MCP 2025-11-25 §5, §6). Bumping this version is what makes the
+# rollout automatic for existing installs: every cache file written
+# under v3 fails the ``is_cache_fresh`` version check on the next
+# read, forcing a re-discovery that populates the new fields.
+CACHE_SCHEMA_VERSION = 4
+
 
 # ─────────────────────────────────────────────────────────────────
 # Config hash
@@ -213,13 +226,18 @@ def is_cache_fresh(
 
     A cache is fresh iff:
       * it exists and is structurally valid,
+      * its ``version`` matches ``CACHE_SCHEMA_VERSION``,
       * its stored ``server_config_hash`` matches the current manifest,
       * its ``fetched_at`` is within ``ttl_seconds`` of now.
 
-    The hash check prevents serving stale tools when the user has
-    edited the manifest (e.g. swapped to a newer package version).
+    The version check is what makes schema-affecting patches
+    (e.g. the $ref sanitizer that changed the shape of cached
+    ``parameters``) apply automatically without asking the user to
+    clear caches by hand.
     """
     if not cache:
+        return False
+    if int(cache.get("version", 0)) != CACHE_SCHEMA_VERSION:
         return False
     if cache.get("server_config_hash") != config_hash:
         return False
@@ -249,11 +267,16 @@ def merge_tools(
     Rules (per design decisions D3/D8):
       * Existing tool + same name → preserve ``user_enabled`` and
         ``first_seen_at``; refresh ``description``, ``parameters``,
-        and ``last_seen_at``.
+        ``output_schema``, and ``last_seen_at``.
       * New tool not in existing cache → create with
         ``user_enabled = default_enabled``.
       * Old tool not in new discovery → dropped (server no longer
         exposes it).
+
+    ``output_schema`` (MCP 2025-11-25 §7.2) is treated like
+    ``parameters`` — the fresh value from the server is always the
+    authoritative one. If the server drops the field, the cache
+    drops it too (no stale carry-over).
 
     Input tools are the raw dicts produced by ``mcp_pool.get_tools``
     (they carry ``name``, ``description``, ``parameters``).
@@ -293,6 +316,16 @@ def merge_tools(
                 else {"type": "object", "properties": {}, "required": []}
             ),
         }
+
+        # Preserve output_schema when present (MCP 2025-11-25 §7.2).
+        # Accept both snake_case (our normal form) and the raw MCP
+        # camelCase spelling so a direct probe result can be fed here
+        # without an intermediate translation step.
+        raw_out_schema = (
+            tool.get("output_schema") or tool.get("outputSchema")
+        )
+        if isinstance(raw_out_schema, dict) and raw_out_schema:
+            entry["output_schema"] = raw_out_schema
 
         if prev is not None:
             # Preserve the user's previous decision.
@@ -335,7 +368,7 @@ def save_cache(
     not re-merge — it trusts the caller to have done so.
     """
     container = {
-        "version": 1,
+        "version": CACHE_SCHEMA_VERSION,
         "server_id": server_id,
         "server_config_hash": config_hash,
         "fetched_at": time.time(),
@@ -511,6 +544,132 @@ def list_cached_servers() -> List[Dict[str, Any]]:
     return out
 
 
+# ─────────────────────────────────────────────────────────────────
+# Resources & Prompts (MCP 2025-11-25 §5, §6)
+# ─────────────────────────────────────────────────────────────────
+#
+# Resources and prompts share the per-server cache container with
+# tools, but live in their own top-level keys (``resources`` and
+# ``prompts``). They are never mixed with tools because the tool
+# toggle UI operates on tools only — resources/prompts are
+# read-only metadata.
+#
+# Rationale for a single file:
+#   * A single read serves ``/tools/cached``, ``/resources/cached``,
+#     and ``/prompts/cached`` — three endpoints, one disk touch.
+#   * Cache freshness (TTL + config hash + schema version) is
+#     evaluated once for all three primitives. There is no way for
+#     tools to be fresh while resources are stale.
+#   * Deleting a server invalidates one file, not three.
+# ─────────────────────────────────────────────────────────────────
+
+def get_resources(server_id: str) -> List[Dict[str, Any]]:
+    """
+    Return cached resources for a server, or an empty list.
+
+    Never raises: a missing or malformed cache yields an empty list
+    so the caller can fall back to live discovery or show "none".
+    """
+    cache = load_cache(server_id)
+    if not cache:
+        return []
+    items = cache.get("resources")
+    if not isinstance(items, list):
+        return []
+    return [r for r in items if isinstance(r, dict)]
+
+
+def get_prompts(server_id: str) -> List[Dict[str, Any]]:
+    """
+    Return cached prompts for a server, or an empty list.
+
+    Mirrors ``get_resources``: fail-soft, never raises.
+    """
+    cache = load_cache(server_id)
+    if not cache:
+        return []
+    items = cache.get("prompts")
+    if not isinstance(items, list):
+        return []
+    return [p for p in items if isinstance(p, dict)]
+
+
+def store_discovered_resources(
+    server_id: str,
+    config_hash: str,
+    resources: List[Dict[str, Any]],
+) -> None:
+    """
+    Persist resources for a server.
+
+    Merges into the existing cache container so tools/prompts
+    written under the same version are preserved. The
+    ``fetched_at`` field is NOT updated here — the caller controls
+    that (typically ``store_discovered_tools`` runs first and sets
+    it, then resources/prompts are attached to the same snapshot).
+
+    A missing container is created fresh — this happens when the
+    very first discovery is a resources-only server with zero
+    tools, an edge case that would otherwise leave no file on disk.
+    """
+    container = load_cache(server_id) or {
+        "version": CACHE_SCHEMA_VERSION,
+        "server_id": server_id,
+        "server_config_hash": config_hash,
+        "fetched_at": time.time(),
+        "tools": [],
+        "resources": [],
+        "prompts": [],
+    }
+    container["resources"] = [
+        r for r in resources if isinstance(r, dict)
+    ]
+    container["version"] = CACHE_SCHEMA_VERSION
+    container["server_config_hash"] = config_hash
+    path = _cache_path(server_id)
+    with _lock:
+        _atomic_write_json(path, container)
+    logger.info(
+        "Stored %d resource(s) for '%s'.",
+        len(container["resources"]),
+        server_id,
+    )
+
+
+def store_discovered_prompts(
+    server_id: str,
+    config_hash: str,
+    prompts: List[Dict[str, Any]],
+) -> None:
+    """
+    Persist prompts for a server (mirrors
+    ``store_discovered_resources`` — same merge semantics, same
+    fail-soft on malformed input).
+    """
+    container = load_cache(server_id) or {
+        "version": CACHE_SCHEMA_VERSION,
+        "server_id": server_id,
+        "server_config_hash": config_hash,
+        "fetched_at": time.time(),
+        "tools": [],
+        "resources": [],
+        "prompts": [],
+    }
+    container["prompts"] = [
+        p for p in prompts if isinstance(p, dict)
+    ]
+    container["version"] = CACHE_SCHEMA_VERSION
+    container["server_config_hash"] = config_hash
+    path = _cache_path(server_id)
+    with _lock:
+        _atomic_write_json(path, container)
+    logger.info(
+        "Stored %d prompt(s) for '%s'.",
+        len(container["prompts"]),
+        server_id,
+    )
+
+
 __all__ = [
     "compute_config_hash",
     "load_cache",
@@ -523,4 +682,9 @@ __all__ = [
     "set_all_tools_enabled",
     "get_enabled_tools",
     "list_cached_servers",
+    # ── MCP 2025-11-25 §5/§6: resources + prompts ──
+    "get_resources",
+    "get_prompts",
+    "store_discovered_resources",
+    "store_discovered_prompts",
 ]

@@ -1,0 +1,115 @@
+{
+  "$schema": "https://peldrun.ai/schemas/mcp-server/v1.json",
+
+  "id": "wordpress_mcp",
+  "registry_id": "io.peldrun/wordpress_mcp",
+  "name": "WordPress MCP Adapter",
+  "type": "mcp_server",
+  "status": "ready",
+
+  "icon_svg": "<svg role=\"img\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\"><title>WordPress</title><path fill=\"currentColor\" d=\"M21.469 6.825c.84 1.537 1.318 3.3 1.318 5.175 0 3.979-2.156 7.456-5.363 9.325l3.295-9.527c.615-1.54.82-2.771.82-3.864 0-.405-.026-.78-.07-1.11m-7.981.105c.647-.03 1.232-.105 1.232-.105.582-.075.514-.93-.067-.899 0 0-1.755.135-2.88.135-1.064 0-2.85-.15-2.85-.15-.585-.03-.661.855-.075.885 0 0 .54.061 1.125.09l1.68 4.605-2.37 7.08L5.354 6.9c.649-.03 1.234-.1 1.234-.1.585-.075.516-.93-.065-.896 0 0-1.746.138-2.874.138-.2 0-.438-.008-.69-.015C4.911 3.15 8.235 1.215 12 1.215c2.809 0 5.365 1.072 7.286 2.833-.046-.003-.091-.009-.141-.009-1.06 0-1.812.923-1.812 1.914 0 .89.513 1.643 1.06 2.531.411.72.89 1.643.89 2.977 0 .915-.354 1.994-.821 3.479l-1.075 3.585-3.9-11.61.001.014zM12 22.784c-1.059 0-2.081-.153-3.048-.437l3.237-9.406 3.315 9.087c.024.053.05.101.078.149-1.12.393-2.325.609-3.582.609M1.211 12c0-1.564.336-3.05.935-4.39L7.29 21.709C3.694 19.96 1.212 16.271 1.211 12M12 0C5.385 0 0 5.385 0 12s5.385 12 12 12 12-5.385 12-12S18.615 0 12 0\"/></svg>",
+  "icon_url": "https://static.peldrun.ai/icons/wordpress_mcp.svg",
+
+  "short_description": "Connect to WordPress 6.9+ and expose its Abilities API (posts, pages, media, users) as MCP tools.",
+  "store_description": "Bridges WordPress 6.9+ Abilities API with the Model Context Protocol via the official WordPress MCP Adapter plugin (v0.7.1+, available directly from WordPress.org plugin directory or GitHub). No Composer needed since v0.6.1 — the vendor/ folder is bundled. Authentication uses WordPress core Application Passwords via HTTP Basic Auth. The default server exposes three meta-tools: mcp-adapter/discover-abilities (lists public abilities), mcp-adapter/get-ability-info (returns schema), and mcp-adapter/execute-ability (runs the ability). Any plugin or theme ability marked with meta.mcp.public = true becomes automatically discoverable. HTTPS is required on production sites — Application Passwords are disabled over plain HTTP.",
+
+  "description": "Connect to a WordPress site running the official MCP Adapter plugin (Abilities API).",
+  "category": "cms",
+  "tags": ["wordpress", "cms", "blog", "content", "abilities", "posts", "pages", "media"],
+
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "community",
+
+  "repository": {
+    "url": "https://github.com/WordPress/mcp-adapter",
+    "source": "github"
+  },
+  "upstream": {
+    "name": "wordpress/mcp-adapter",
+    "registry": "packagist",
+    "registry_url": "https://packagist.org/packages/wordpress/mcp-adapter",
+    "version": "0.7.1",
+    "license": "GPL-2.0-or-later"
+  },
+
+  "homepage": "https://github.com/WordPress/mcp-adapter",
+  "docs_url": "https://github.com/WordPress/mcp-adapter/blob/trunk/docs/getting-started/README.md",
+  "changelog_url": "https://github.com/WordPress/mcp-adapter/releases",
+  "support_url": "https://github.com/WordPress/mcp-adapter/issues",
+  "license": "proprietary",
+  "license_url": "https://peldrun.ai/license",
+  "privacy_url": "https://peldrun.ai/privacy",
+
+  "version": "1.0.0",
+  "release_date": "2026-10-30",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "lifecycle_status": "active",
+
+  "is_builtin": true,
+  "read_only": false,
+  "transport": "http",
+  "url": "{WORDPRESS_URL}/wp-json/mcp/mcp-adapter-default-server",
+  "auth_strategy": "env",
+  "hosting_type": "remote",
+
+  "http_basic_auth": {
+    "user_env": "WORDPRESS_USERNAME",
+    "pass_env": "WORDPRESS_APP_PASSWORD"
+  },
+
+  "capabilities": {
+    "tools": true,
+    "resources": true,
+    "prompts": true
+  },
+  "tool_count": 3,
+
+  "badges": ["official-upstream", "requires-token", "remote", "writes-data", "requires-https"],
+
+  "env_schema": {
+    "type": "object",
+    "required": [
+      "WORDPRESS_URL",
+      "WORDPRESS_USERNAME",
+      "WORDPRESS_APP_PASSWORD"
+    ],
+    "properties": {
+      "WORDPRESS_URL": {
+        "type": "string",
+        "title": "WordPress Site URL",
+        "description": "Base URL of your WordPress site without trailing slash. Example: https://mysite.com. HTTPS is required on production.",
+        "secret": false
+      },
+      "WORDPRESS_USERNAME": {
+        "type": "string",
+        "title": "WordPress Username",
+        "description": "Your WordPress account username. Use a dedicated account with limited permissions, not the admin account.",
+        "secret": false
+      },
+      "WORDPRESS_APP_PASSWORD": {
+        "type": "string",
+        "title": "Application Password",
+        "description": "Generate in WP Admin → Users → Profile → Application Passwords. The spaces in the generated password are OK — WordPress accepts them verbatim.",
+        "secret": true
+      }
+    }
+  },
+
+  "usage_hint": "This MCP server exposes three meta-tools, not direct capabilities. WORKFLOW: (1) ALWAYS start by calling 'mcp-adapter/discover-abilities' with no arguments to list what WordPress plugins/themes have exposed. (2) For each ability you want to use, call 'mcp-adapter/get-ability-info' with {ability_name} to get its input schema. (3) Finally call 'mcp-adapter/execute-ability' with {ability_name, parameters} to run it. Never skip step 1 — abilities are installed dynamically and guessing their names will fail. If discover-abilities returns an empty list, the user has not registered any abilities yet (plugins must call wp_register_ability with meta.mcp.public=true).",
+
+  "hints": {
+    "setup_time": "5 minutes",
+    "requires_account": true,
+    "requires_token": true,
+    "cost": "free",
+    "data_access": "read-write",
+    "network_access": true,
+    "rate_limit": "Depends on WordPress host"
+  }
+}

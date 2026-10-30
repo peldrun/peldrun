@@ -138,6 +138,171 @@ def _compute_creds_hash(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
+# ---------------------------------------------------------------------------
+# JSON Schema sanitizer for LLM providers
+# ---------------------------------------------------------------------------
+#
+# Many MCP servers (Notion, Linear, Atlassian) publish tool schemas that
+# use JSON Schema draft 2019-09 features: ``$defs`` at the root, ``$ref``
+# pointers into ``$defs`` from deep inside ``anyOf``/``oneOf``/nested
+# objects, and combinatorial composition keywords.
+#
+# Generic OpenAI-compatible providers — LM Studio (llama.cpp engine),
+# llama.cpp servers, some vLLM configurations — do NOT implement $ref
+# resolution. When they receive such a schema they reject the ENTIRE
+# request with "cannot resolve $ref #/$defs/...". One broken tool
+# schema disables ALL tools from the server.
+#
+# ``_sanitize_json_schema_for_llm`` converts any schema into a fully
+# inlined, $ref-free form every provider can process. If a reference
+# cannot be resolved (missing $defs entry, cyclic ref, unsupported
+# pointer), the field is replaced with a permissive ``{type: object}``
+# so the tool remains callable — the LLM can still pass any structure
+# the underlying server accepts.
+
+_ALLOWED_SCHEMA_KEYS = frozenset({
+    "type", "description", "title", "format", "enum",
+    "default", "minimum", "maximum", "exclusiveMinimum",
+    "exclusiveMaximum", "minLength", "maxLength", "minItems",
+    "maxItems", "pattern", "required", "properties", "items",
+    "additionalProperties", "nullable",
+})
+
+
+def _sanitize_json_schema_for_llm(
+    node: Any,
+    root: Optional[Dict[str, Any]] = None,
+    depth: int = 0,
+    seen_refs: Optional[Set[str]] = None,
+) -> Any:
+    """Convert an MCP tool JSON schema to a $ref-free form."""
+    if depth > 10 or not isinstance(node, dict):
+        return {} if depth > 10 else node
+
+    if seen_refs is None:
+        seen_refs = set()
+
+    # ── Resolve $ref ────────────────────────────────────────────
+    ref = node.get("$ref")
+    if isinstance(ref, str):
+        if ref in seen_refs:
+            return {"type": "object", "additionalProperties": True}
+        if not ref.startswith("#/"):
+            return {"type": "object", "additionalProperties": True}
+
+        parts = ref.split("/")
+        target: Optional[Dict[str, Any]] = None
+        if (
+            len(parts) >= 3
+            and parts[1] in ("$defs", "definitions")
+            and isinstance(root, dict)
+        ):
+            defs = root.get(parts[1])
+            if isinstance(defs, dict):
+                cand = defs.get(parts[2])
+                if isinstance(cand, dict):
+                    target = cand
+
+        if target is None:
+            return {"type": "object", "additionalProperties": True}
+
+        seen_refs.add(ref)
+        resolved = _sanitize_json_schema_for_llm(
+            target, root, depth + 1, seen_refs
+        )
+        seen_refs.discard(ref)
+
+        extra = {k: v for k, v in node.items() if k != "$ref"}
+        if isinstance(resolved, dict) and extra:
+            merged = dict(resolved)
+            for k, v in extra.items():
+                if k in _ALLOWED_SCHEMA_KEYS:
+                    merged[k] = _sanitize_json_schema_for_llm(
+                        v, root, depth + 1, seen_refs
+                    )
+            return merged
+        return resolved
+
+    # ── Handle composition ──────────────────────────────────────
+    for comb in ("anyOf", "oneOf"):
+        variants = node.get(comb)
+        if isinstance(variants, list) and variants:
+            first = variants[0]
+            sanitized = _sanitize_json_schema_for_llm(
+                first, root, depth + 1, seen_refs
+            )
+            if isinstance(sanitized, dict) and sanitized.get("type"):
+                return sanitized
+            return {"type": "object"}
+
+    all_of = node.get("allOf")
+    if isinstance(all_of, list) and all_of:
+        merged_props: Dict[str, Any] = {}
+        merged_required: list = []
+        for opt in all_of:
+            sanitized = _sanitize_json_schema_for_llm(
+                opt, root, depth + 1, seen_refs
+            )
+            if isinstance(sanitized, dict):
+                props = sanitized.get("properties")
+                if isinstance(props, dict):
+                    merged_props.update(props)
+                req = sanitized.get("required")
+                if isinstance(req, list):
+                    merged_required.extend(req)
+        return {
+            "type": "object",
+            "properties": merged_props,
+            "required": list(dict.fromkeys(merged_required)),
+        }
+
+    # ── Recurse into children ───────────────────────────────────
+    result: Dict[str, Any] = {}
+    for key, value in node.items():
+        if key not in _ALLOWED_SCHEMA_KEYS:
+            continue
+        if key == "properties" and isinstance(value, dict):
+            result["properties"] = {
+                k: _sanitize_json_schema_for_llm(
+                    v, root, depth + 1, seen_refs
+                )
+                for k, v in value.items()
+            }
+        elif key == "items":
+            result["items"] = _sanitize_json_schema_for_llm(
+                value, root, depth + 1, seen_refs
+            )
+        elif key == "additionalProperties" and isinstance(value, dict):
+            result["additionalProperties"] = _sanitize_json_schema_for_llm(
+                value, root, depth + 1, seen_refs
+            )
+        elif key == "required" and isinstance(value, list):
+            result["required"] = list(value)
+        else:
+            result[key] = value
+
+    return result
+
+
+def _sanitize_tool_input_schema(input_schema: Any) -> Dict[str, Any]:
+    """
+    Wrap ``_sanitize_json_schema_for_llm`` for the top-level tool input
+    schema. Ensures the result is always a valid ``{type: object, ...}``
+    schema so OpenAI/llama.cpp validators accept it.
+    """
+    root = input_schema if isinstance(input_schema, dict) else {}
+    sanitized = _sanitize_json_schema_for_llm(root, root)
+    if not isinstance(sanitized, dict):
+        return {"type": "object", "properties": {}, "required": []}
+    if sanitized.get("type") != "object":
+        sanitized["type"] = "object"
+    if not isinstance(sanitized.get("properties"), dict):
+        sanitized["properties"] = {}
+    if not isinstance(sanitized.get("required"), list):
+        sanitized["required"] = []
+    return sanitized
+
+
 class McpSessionPool:
     """Manages persistent active connections and dynamic sessions for MCP servers."""
 
@@ -414,22 +579,102 @@ class McpSessionPool:
             return transport, None, None
 
         elif transport_type in ("sse", "http"):
+            # ── Placeholder substitution from env ──────────────────
+            # Allows manifests to declare a dynamic URL such as
+            #   "{WORDPRESS_URL}/wp-json/mcp/mcp-adapter-default-server"
+            # where WORDPRESS_URL is supplied per-chat (or globally)
+            # via env_schema. Substitution is limited to {KEY} tokens
+            # found in env_vars; unreplaced tokens are left as-is so a
+            # missing variable produces a clear error at request time
+            # rather than silently sending a malformed URL.
+            if isinstance(target_url, str) and env_vars:
+                for k, v in env_vars.items():
+                    if v is None:
+                        continue
+                    target_url = target_url.replace("{" + str(k) + "}", str(v))
+
             if not target_url:
                 raise ValueError(
                     f"MCP server '{server_id}' specifies '{transport_type}' transport but lacks 'url'."
                 )
 
+            # ── Global OAuth tokens as fallback ────────────────────
+            # OAuth-only servers (Notion, Linear, etc.) have no
+            # env_schema. Their credentials live in the server-level
+            # config as `oauth_enc`. When NO per-chat override exists
+            # (env_override is None), we pull the global token bundle
+            # and use it as a Bearer credential.
+            #
+            # Precedence:
+            #   1. env_override with _oauth_access_token (per-chat)
+            #   2. global mcp_settings_manager OAuth bundle
+            #   3. HTTP Basic Auth (WordPress)
+            #   4. Nothing → unauthenticated (Store Test will 401)
+            if env_override is None:
+                try:
+                    from omweb.extensions.settings_manager import (
+                        mcp_settings_manager as _settings,
+                    )
+
+                    global_bundle = _settings.get_oauth(server_id)
+                    if (
+                        isinstance(global_bundle, dict)
+                        and global_bundle.get("access_token")
+                    ):
+                        oauth_token = str(global_bundle["access_token"])
+                        token_type = str(
+                            global_bundle.get("token_type") or "Bearer"
+                        )
+                        logger.debug(
+                            "Using global OAuth token for '%s' (expires_at=%s).",
+                            server_id,
+                            global_bundle.get("expires_at"),
+                        )
+                except Exception as g_err:  # noqa: BLE001
+                    logger.debug(
+                        "Failed to load global OAuth tokens for '%s': %s",
+                        server_id,
+                        g_err,
+                    )
+
             # Compose the outbound headers: static manifest headers
-            # first, then the Authorization header from OAuth. The
-            # merge order means a manifest-declared Authorization
-            # header is overridden by a per-chat OAuth token — that
-            # is deliberate: the per-chat decision is user-driven
-            # and supersedes a static placeholder.
+            # first, then an Authorization header from either OAuth
+            # (Bearer) or HTTP Basic credentials declared via the
+            # optional `http_basic_auth` manifest block.
             headers: Dict[str, str] = {"Content-Type": "application/json"}
             manifest_headers = manifest.get("headers")
             if isinstance(manifest_headers, dict):
                 for hk, hv in manifest_headers.items():
                     headers[str(hk)] = str(hv)
+
+            # ── HTTP Basic Auth (WordPress, GitLab, etc.) ──────────
+            # Only applied when no Bearer token is available. If both
+            # are somehow present, Bearer wins (an OAuth flow is a
+            # more specific user decision than static env creds).
+            basic_cfg = manifest.get("http_basic_auth")
+            if (
+                not oauth_token
+                and isinstance(basic_cfg, dict)
+                and env_vars
+            ):
+                u_key = str(basic_cfg.get("user_env") or "")
+                p_key = str(basic_cfg.get("pass_env") or "")
+                u_val = env_vars.get(u_key) if u_key else None
+                p_val = env_vars.get(p_key) if p_key else None
+                if u_val and p_val:
+                    import base64 as _b64
+                    token = _b64.b64encode(
+                        f"{u_val}:{p_val}".encode("utf-8")
+                    ).decode("ascii")
+                    headers["Authorization"] = f"Basic {token}"
+                    logger.debug(
+                        "Applied HTTP Basic Auth for '%s' (user=%r).",
+                        server_id,
+                        u_val,
+                    )
+
+            # OAuth Bearer takes precedence over Basic if both are
+            # somehow present.
             if oauth_token:
                 headers["Authorization"] = f"{token_type} {oauth_token}"
 
@@ -437,19 +682,117 @@ class McpSessionPool:
                 from omweb.extensions.mcp_subsystem_settings import (
                     get_startup_timeout_seconds as _startup_timeout,
                 )
-                transport = SSETransport(
-                    url=target_url,
-                    headers=headers,
-                    timeout=float(
-                        manifest.get("timeout") or _startup_timeout()
-                    ),
+                # Defensive construction: SSETransport's signature has
+                # varied across PELDRUN core versions and MCP SDK
+                # releases. Two auth mechanisms exist:
+                #
+                #   * ``headers`` kwarg — newer builds that accept a
+                #     full header dict (rare; not the case today).
+                #   * ``auth_token`` kwarg — the current PELDRUN core
+                #     signature (endpoint_url, auth_token, timeout,
+                #     transport). The transport prepends ``Bearer ``
+                #     internally, so we must pass the RAW token here.
+                #
+                # We detect the actual parameters at runtime so this
+                # code works regardless of the installed version.
+                import inspect as _inspect
+
+                _timeout = float(
+                    manifest.get("timeout") or _startup_timeout()
                 )
+                try:
+                    _params = _inspect.signature(SSETransport).parameters
+                except (TypeError, ValueError):
+                    _params = {}
+
+                _url_key = next(
+                    (
+                        k
+                        for k in (
+                            "endpoint_url",
+                            "url",
+                            "base_url",
+                            "server_url",
+                            "endpoint",
+                            "server_endpoint",
+                        )
+                        if k in _params
+                    ),
+                    None,
+                )
+
+                _kwargs: Dict[str, Any] = {}
+                if "timeout" in _params:
+                    _kwargs["timeout"] = _timeout
+
+                # ── Auth wiring ────────────────────────────────────
+                # Prefer the newer ``headers`` kwarg when available;
+                # otherwise fall back to the current core's
+                # ``auth_token`` parameter. For Bearer tokens we pass
+                # the raw token (the transport prepends "Bearer ").
+                #
+                # HTTP Basic auth over SSE is NOT expressible via
+                # ``auth_token`` (the transport hard-codes "Bearer ").
+                # WordPress is the only server we ship that uses Basic,
+                # and it is HTTP-only, so this limitation does not
+                # affect any first-party integration today.
+                if "headers" in _params:
+                    _kwargs["headers"] = headers
+                    logger.debug(
+                        "SSETransport auth via headers kwarg for '%s'.",
+                        server_id,
+                    )
+                elif "auth_token" in _params and oauth_token:
+                    _kwargs["auth_token"] = oauth_token
+                    logger.debug(
+                        "SSETransport auth via auth_token kwarg for "
+                        "'%s' (token_type=%s).",
+                        server_id,
+                        token_type,
+                    )
+
+                try:
+                    if _url_key:
+                        transport = SSETransport(
+                            **{_url_key: target_url, **_kwargs}
+                        )
+                    else:
+                        # Positional URL — assume it's the first arg.
+                        transport = SSETransport(target_url, **_kwargs)
+                    logger.debug(
+                        "SSETransport built for '%s' (url_param=%r, "
+                        "auth_kw=%r).",
+                        server_id,
+                        _url_key or "<positional>",
+                        "headers" if "headers" in _kwargs else (
+                            "auth_token" if "auth_token" in _kwargs else "none"
+                        ),
+                    )
+                except TypeError as sse_err:
+                    # Last-ditch: pass the URL positionally and drop
+                    # everything else. This drops auth too — but a
+                    # transport with no auth at least surfaces a
+                    # clean 401 instead of a TypeError.
+                    logger.warning(
+                        "SSETransport failed with detected signature "
+                        "(%s); retrying with positional URL only.",
+                        sse_err,
+                    )
+                    transport = SSETransport(target_url)
+
                 return transport, None, None
 
             # Fallback to direct HTTP JSON-RPC client. The auth token
             # is surfaced so get_or_create_client can pass it to
             # MCPClient, which builds its own Authorization header.
-            return None, target_url, oauth_token
+            #
+            # Strip a trailing slash from the URL: Notion (and other
+            # Streamable HTTP servers) reject "/mcp/" with 404 while
+            # accepting "/mcp". The MCPClient appends a slash
+            # internally in some versions, so passing the clean URL
+            # is the only reliable way to hit the right endpoint.
+            _clean_url = target_url.rstrip("/") if isinstance(target_url, str) else target_url
+            return None, _clean_url, oauth_token
 
         raise ValueError(
             f"Unsupported transport type '{transport_type}' for MCP server '{server_id}'."
@@ -528,11 +871,74 @@ class McpSessionPool:
             # pre-configured with a baked-in token.
             auth_token = effective_auth_token or manifest.get("auth_token")
 
+            # ── mTLS config resolution ─────────────────────────────
+            # Only relevant for HTTP/SSE transports (fallback_url is
+            # non-empty). stdio servers have no TLS layer, so any
+            # ``mtls`` block is silently ignored for them.
+            #
+            # Credentials come from env vars: the manifest declares
+            # which env var holds each path, and the env var itself
+            # carries the filesystem path. This lets an operator
+            # rotate a cert by updating an env var without editing
+            # the manifest.
+            #
+            # When ``env_override`` is provided, it FULLY replaces
+            # the global env (per-chat isolation contract), so we do
+            # NOT merge — a chat that chose "custom" must not
+            # silently inherit the global cert path.
+            mtls_cert: Optional[Any] = None
+            mtls_ca: Optional[str] = None
+            mtls_block = manifest.get("mtls")
+            if (
+                isinstance(mtls_block, dict)
+                and isinstance(fallback_url, str)
+                and fallback_url
+            ):
+                try:
+                    if env_override is not None:
+                        mtls_env = {
+                            str(k): str(v) for k, v in env_override.items()
+                        }
+                    else:
+                        mtls_env = {
+                            str(k): str(v)
+                            for k, v in (
+                                mcp_settings_manager.get_effective_runtime_config(
+                                    server_id, manifest
+                                ).get("env", {})
+                            ).items()
+                        }
+
+                    cert_path = mtls_env.get(
+                        str(mtls_block.get("cert_env") or ""), ""
+                    )
+                    key_path = mtls_env.get(
+                        str(mtls_block.get("key_env") or ""), ""
+                    )
+                    ca_path = mtls_env.get(
+                        str(mtls_block.get("ca_env") or ""), ""
+                    )
+
+                    if cert_path:
+                        mtls_cert = (
+                            (cert_path, key_path) if key_path else cert_path
+                        )
+                    if ca_path:
+                        mtls_ca = ca_path
+                except Exception as _mtls_err:  # noqa: BLE001
+                    logger.warning(
+                        "mTLS config resolution failed for '%s': %s",
+                        server_id,
+                        _mtls_err,
+                    )
+
             client = MCPClient(
                 server_url=fallback_url,
                 auth_token=auth_token,
                 timeout=float(manifest.get("timeout", 30.0)),
                 transport=transport,
+                client_cert=mtls_cert,
+                ca_bundle=mtls_ca,
             )
 
             # Eagerly connect transport if applicable.
@@ -686,15 +1092,52 @@ class McpSessionPool:
                 name = td.get("name")
                 if not name:
                     continue
-                discovered.append({
+                raw_input_schema = td.get("inputSchema") or {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                }
+
+                # MCP 2025-11-25 §7.2: tools may declare an
+                # outputSchema describing the shape of their
+                # structuredContent result. Capture it verbatim
+                # (sanitized) so the UI and the agent can reason
+                # about structured outputs. `_sanitize_tool_input_schema`
+                # is safe to run on output schemas as well — it only
+                # strips $ref/combinatorics that break LLM providers,
+                # which applies equally to any schema we display.
+                raw_output_schema = td.get("outputSchema")
+                output_schema: Optional[Dict[str, Any]] = None
+                if isinstance(raw_output_schema, dict):
+                    try:
+                        output_schema = _sanitize_tool_input_schema(
+                            raw_output_schema
+                        )
+                    except Exception as _os_err:  # noqa: BLE001
+                        logger.debug(
+                            "outputSchema sanitization failed for "
+                            "'%s::%s': %s",
+                            server_id,
+                            name,
+                            _os_err,
+                        )
+                        output_schema = None
+
+                entry: Dict[str, Any] = {
                     "name": str(name),
                     "description": str(td.get("description") or ""),
-                    "parameters": td.get("inputSchema") or {
-                        "type": "object",
-                        "properties": {},
-                        "required": [],
-                    },
-                })
+                    # Sanitize the JSON schema so generic LLM providers
+                    # (LM Studio, llama.cpp) can process it. Without
+                    # this, one $ref-using tool (e.g. Notion's
+                    # query_database) rejects the ENTIRE tool list at
+                    # the provider level.
+                    "parameters": _sanitize_tool_input_schema(
+                        raw_input_schema
+                    ),
+                }
+                if output_schema is not None:
+                    entry["output_schema"] = output_schema
+                discovered.append(entry)
                 if len(discovered) >= max_tools:
                     logger.warning(
                         "Server '%s' returned more tools than max_tools_per_server=%d; capping.",
@@ -895,11 +1338,65 @@ class McpSessionPool:
             transport, fallback_url, effective_auth_token = self.build_transport(
                 manifest, workspace_root, env_override
             )
+
+            # ── mTLS config resolution (mirrors get_or_create_client) ──
+            # Differs from get_or_create_client in one respect: for
+            # probe_connection, ``env_override`` is a "test override"
+            # (typically from the Test Connection button with custom
+            # credentials), so we MERGE it on top of the global env
+            # rather than replacing. This matches the mental model
+            # "try with these credentials; fall back to global for
+            # anything I didn't supply" — which is exactly what a
+            # user testing a freshly-pasted cert expects.
+            _mtls_cert: Optional[Any] = None
+            _mtls_ca: Optional[str] = None
+            _mtls_block = manifest.get("mtls")
+            if (
+                isinstance(_mtls_block, dict)
+                and isinstance(fallback_url, str)
+                and fallback_url
+            ):
+                try:
+                    _mtls_env = {
+                        str(k): str(v)
+                        for k, v in (
+                            mcp_settings_manager.get_effective_runtime_config(
+                                server_id, manifest
+                            ).get("env", {})
+                        ).items()
+                    }
+                    if env_override:
+                        _mtls_env.update(
+                            {str(k): str(v) for k, v in env_override.items()}
+                        )
+
+                    _cp = _mtls_env.get(
+                        str(_mtls_block.get("cert_env") or ""), ""
+                    )
+                    _kp = _mtls_env.get(
+                        str(_mtls_block.get("key_env") or ""), ""
+                    )
+                    _cap = _mtls_env.get(
+                        str(_mtls_block.get("ca_env") or ""), ""
+                    )
+                    if _cp:
+                        _mtls_cert = (_cp, _kp) if _kp else _cp
+                    if _cap:
+                        _mtls_ca = _cap
+                except Exception as _mtls_err:  # noqa: BLE001
+                    logger.warning(
+                        "mTLS config resolution failed for probe '%s': %s",
+                        server_id,
+                        _mtls_err,
+                    )
+
             client = MCPClient(
                 server_url=fallback_url,
                 auth_token=effective_auth_token or manifest.get("auth_token"),
                 timeout=float(manifest.get("timeout", 15.0)),
                 transport=transport,
+                client_cert=_mtls_cert,
+                ca_bundle=_mtls_ca,
             )
 
             if transport is not None:
@@ -915,15 +1412,42 @@ class McpSessionPool:
                 name = td.get("name")
                 if not name:
                     continue
-                tool_summaries.append({
+                raw_input_schema = td.get("inputSchema") or {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                }
+
+                # Capture outputSchema (MCP 2025-11-25 §7.2) so the
+                # probe result carries the same shape as the cached
+                # tool list. Without this, "Test Connection" would
+                # show the input schema but hide the output schema,
+                # and the user would have no way to know a tool
+                # returns structured data — a mismatch with the
+                # Manage Tools view that reads from the cache.
+                raw_output_schema = td.get("outputSchema")
+                output_schema: Optional[Dict[str, Any]] = None
+                if isinstance(raw_output_schema, dict):
+                    try:
+                        output_schema = _sanitize_tool_input_schema(
+                            raw_output_schema
+                        )
+                    except Exception:  # noqa: BLE001
+                        # Sanitization is best-effort; a broken output
+                        # schema must not abort the probe. We simply
+                        # omit the field so the tool remains callable.
+                        output_schema = None
+
+                summary: Dict[str, Any] = {
                     "name": str(name),
                     "description": str(td.get("description") or ""),
-                    "parameters": td.get("inputSchema") or {
-                        "type": "object",
-                        "properties": {},
-                        "required": [],
-                    },
-                })
+                    "parameters": _sanitize_tool_input_schema(
+                        raw_input_schema
+                    ),
+                }
+                if output_schema is not None:
+                    summary["output_schema"] = output_schema
+                tool_summaries.append(summary)
 
             return {
                 "status": "ok",

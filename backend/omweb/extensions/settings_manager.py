@@ -125,7 +125,30 @@ class McpSettingsManager:
             if isinstance(legacy, dict):
                 env = legacy
 
-        return {"settings": settings, "env": env}
+        # ── Global OAuth tokens (for OAuth-only servers) ──────────
+        # OAuth servers (Notion, Linear, etc.) do NOT have env_schema
+        # because their credentials are tokens, not env vars. The
+        # token bundle is stored here so the Store UI can trigger
+        # OAuth once and the agent gets tools on the next run
+        # without opening a modal.
+        oauth: Optional[Dict[str, Any]] = None
+        oauth_enc = data.get("oauth_enc")
+        if isinstance(oauth_enc, str) and oauth_enc:
+            try:
+                plaintext = self._secrets.decrypt(
+                    oauth_enc, aad=f"global:{server_id}:oauth"
+                )
+                parsed = json.loads(plaintext)
+                if isinstance(parsed, dict):
+                    oauth = parsed
+            except Exception as exc:
+                logger.warning(
+                    "Failed to decrypt oauth for MCP server '%s': %s",
+                    server_id,
+                    exc,
+                )
+
+        return {"settings": settings, "env": env, "oauth": oauth}
 
     def _write_server_payload(self, server_id: str, payload: Dict[str, Any]) -> None:
         """
@@ -146,6 +169,7 @@ class McpSettingsManager:
 
         settings = payload.get("settings", {}) or {}
         env = payload.get("env", {}) or {}
+        oauth = payload.get("oauth")
 
         disk_payload: Dict[str, Any] = {
             "settings": settings if isinstance(settings, dict) else {},
@@ -156,6 +180,16 @@ class McpSettingsManager:
             env_json = json.dumps(env, ensure_ascii=False)
             disk_payload["env_enc"] = self._secrets.encrypt(
                 env_json, aad=f"global:{server_id}"
+            )
+
+        # ── Global OAuth tokens (only when present) ────────────────
+        # Encrypted with a distinct AAD ("...:oauth") so a ciphertext
+        # swap between env and oauth is rejected — the two cannot be
+        # confused at rest.
+        if isinstance(oauth, dict) and oauth:
+            oauth_json = json.dumps(oauth, ensure_ascii=False)
+            disk_payload["oauth_enc"] = self._secrets.encrypt(
+                oauth_json, aad=f"global:{server_id}:oauth"
             )
 
         try:
@@ -308,6 +342,70 @@ class McpSettingsManager:
         self._write_server_payload(server_id, container)
         logger.info("Successfully updated environment variables for MCP server '%s'", server_id)
         return values
+
+    # ─────────────────────────────────────────────────────────────
+    # Global OAuth token storage (for OAuth-only servers)
+    # ─────────────────────────────────────────────────────────────
+
+    def save_oauth(
+        self,
+        server_id: str,
+        tokens: Dict[str, Any],
+    ) -> None:
+        """
+        Persist an OAuth token bundle for a server (global scope).
+
+        Used by OAuth-only servers (Notion, Linear, etc.) after the
+        Store UI completes the authorization flow. The bundle is
+        encrypted with AAD "global:{server_id}:oauth" so it cannot
+        be confused with env credentials even if extracted from disk.
+
+        Tokens may be refreshed later; the caller is expected to
+        overwrite the whole bundle (refresh token rotation).
+        """
+        if not isinstance(tokens, dict):
+            raise TypeError("tokens must be a dict")
+        container = self._read_server_payload(server_id)
+        container["oauth"] = tokens
+        self._write_server_payload(server_id, container)
+        logger.info(
+            "Saved global OAuth token bundle for MCP server '%s'.",
+            server_id,
+        )
+
+    def get_oauth(self, server_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Return the decrypted global OAuth token bundle, or None.
+
+        Never raises: a corrupt or tampered ciphertext yields None so
+        the caller treats it as "no credentials" and re-prompts the
+        user rather than serving garbage.
+        """
+        container = self._read_server_payload(server_id)
+        oauth = container.get("oauth")
+        if isinstance(oauth, dict) and oauth:
+            return oauth
+        return None
+
+    def delete_oauth(self, server_id: str) -> bool:
+        """
+        Remove the global OAuth token bundle for a server.
+
+        Returns True when a bundle was present and removed.
+        """
+        container = self._read_server_payload(server_id)
+        had = isinstance(container.get("oauth"), dict) and bool(
+            container.get("oauth")
+        )
+        if not had:
+            return False
+        container["oauth"] = {}
+        self._write_server_payload(server_id, container)
+        logger.info(
+            "Removed global OAuth token bundle for MCP server '%s'.",
+            server_id,
+        )
+        return True
 
     def get_effective_runtime_config(
         self,
