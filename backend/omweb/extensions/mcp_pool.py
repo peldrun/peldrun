@@ -181,6 +181,79 @@ class McpSessionPool:
         return f"{server_id}:"
 
     # ─────────────────────────────────────────────────────────────
+    # Probe workspace resolution (filesystem-specific)
+    # ─────────────────────────────────────────────────────────────
+
+    def _resolve_workspace_for_transport(
+        self,
+        manifest: Dict[str, Any],
+        workspace_root: Optional[str],
+    ) -> Optional[str]:
+        """
+        Ensure filesystem servers always receive at least one directory.
+
+        Priority (highest → lowest):
+          1. Explicit ``workspace_root`` passed by the caller
+             (chat context during a run or explicit Chat Tools call).
+          2. The most recently active chat's files directory — used
+             when testing / refreshing from the Store UI, which does
+             not know the chat context. Matches user expectation: the
+             last chat you were in is the one you're testing for.
+          3. ``~/.peldrun/probe_workspace`` — final fallback when no
+             chats exist yet.
+
+        Non-filesystem servers pass through unchanged.
+        """
+        if workspace_root is not None:
+            return workspace_root
+
+        command = str(manifest.get("command") or "")
+        is_filesystem = (
+            "server-filesystem" in command
+            or "mcp-server-filesystem" in command
+        )
+        if not is_filesystem:
+            return None
+
+        # ── 2. Most recently active chat's workspace ──────────────
+        try:
+            from omweb.project_manager import project_manager
+
+            chats = project_manager.list_chats()
+            if chats:
+                latest = chats[0]
+                chat_id = latest.get("id")
+                project_id = latest.get("project_id") or "default_project"
+                if chat_id:
+                    fdir = project_manager.get_chat_files_dir(
+                        chat_id, project_id
+                    )
+                    if fdir.exists():
+                        logger.debug(
+                            "Probe workspace resolved from latest chat "
+                            "'%s': %s",
+                            chat_id,
+                            fdir,
+                        )
+                        return str(fdir)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Latest-chat workspace resolution failed: %s", exc
+            )
+
+        # ── 3. Fallback: probe workspace ──────────────────────────
+        probe_dir = Path.home() / ".peldrun" / "probe_workspace"
+        try:
+            probe_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning(
+                "Could not create probe workspace at %s: %s", probe_dir, exc
+            )
+            return None
+        logger.debug("Using probe_workspace fallback: %s", probe_dir)
+        return str(probe_dir)
+
+    # ─────────────────────────────────────────────────────────────
     # Command preparation
     # ─────────────────────────────────────────────────────────────
 
@@ -226,17 +299,31 @@ class McpSessionPool:
 
         args = cmd_parts[1:]
 
-        # Handle filesystem server allowed directories binding
+        is_filesystem = (
+            "@modelcontextprotocol/server-filesystem" in command_str
+            or "mcp-server-filesystem" in command_str
+        )
+
+        # ── Priority order for filesystem servers ─────────────────
+        # 1. workspace_root (chat's actual files directory) — highest
+        #    priority, always appended when available.
+        # 2. allowed_directories (from Settings) — appended after, as
+        #    additional accessible paths, deduped against #1.
+        #
+        # For non-filesystem servers, allowed_directories is passed
+        # through as-is (most servers ignore it, but some plugins use
+        # it for scoping).
+        if is_filesystem and workspace_root:
+            ws_str = str(workspace_root)
+            if ws_str not in args:
+                args.append(ws_str)
+
         allowed_dirs = settings.get("allowed_directories", [])
         if isinstance(allowed_dirs, list):
             for directory in allowed_dirs:
-                if str(directory) not in args:
-                    args.append(str(directory))
-
-        # Fallback to workspace root if no directories specified for filesystem server
-        if "@modelcontextprotocol/server-filesystem" in command_str and not allowed_dirs and workspace_root:
-            if str(workspace_root) not in args:
-                args.append(str(workspace_root))
+                d_str = str(directory) if directory else ""
+                if d_str and d_str not in args:
+                    args.append(d_str)
 
         return resolved_exe, args
 
@@ -298,7 +385,18 @@ class McpSessionPool:
                     f"MCP server '{server_id}' specifies 'stdio' transport but lacks 'command'."
                 )
 
-            executable, args = self._build_command_args(command, settings, workspace_root)
+            # Filesystem servers require at least one directory argument.
+            # When workspace_root is None (e.g. from the Store UI's
+            # probe / refresh paths), this resolves a safe default so
+            # the server can start. Non-filesystem servers pass through
+            # unchanged — see _resolve_workspace_for_transport.
+            effective_ws = self._resolve_workspace_for_transport(
+                manifest, workspace_root
+            )
+
+            executable, args = self._build_command_args(
+                command, settings, effective_ws
+            )
             from omweb.extensions.mcp_subsystem_settings import (
                 get_startup_timeout_seconds as _startup_timeout,
             )
@@ -306,7 +404,7 @@ class McpSessionPool:
                 command=executable,
                 args=args,
                 env=env_vars if env_vars else None,
-                cwd=workspace_root,
+                cwd=effective_ws,
                 timeout=float(
                     manifest.get("timeout") or _startup_timeout()
                 ),

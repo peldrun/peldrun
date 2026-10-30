@@ -679,3 +679,135 @@ async def refresh_tools_endpoint(server_id: str):
         ),
         "tools": final_tools,
     }
+
+
+# ─────────────────────────────────────────────────────────────────
+# MCP Subsystem Maintenance Endpoints
+# ─────────────────────────────────────────────────────────────────
+
+@router.post("/maintenance/warm-npm-cache")
+async def maintenance_warm_npm_cache():
+    """
+    Re-download every npx package used by a registered MCP server.
+
+    Safe to run at any time. Runs packages in parallel (bounded at
+    two concurrent installs) so a five-server setup completes in
+    ~30-60s instead of 5 × 30-60s.
+
+    Use after: ``npm cache clean --force``, network outages, or when
+    ``Test Connection`` times out because ``npx -y`` is re-downloading
+    a package.
+    """
+    from omweb.extensions.mcp_maintenance import warm_npm_cache
+
+    try:
+        report = await warm_npm_cache()
+        return {"status": "ok", **report}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Warm npm cache failed: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Warm npm cache failed: {exc}",
+        )
+
+
+@router.post("/maintenance/cleanup-sessions")
+async def maintenance_cleanup_sessions():
+    """
+    Close every active MCP session and invalidate all tool caches.
+
+    Use when: Test Connection or Tools Refresh hangs, sessions appear
+    stuck, or after editing an MCP manifest that is not being picked up.
+    """
+    from omweb.extensions.mcp_maintenance import cleanup_orphans
+
+    try:
+        report = await cleanup_orphans()
+        return {"status": "ok", **report}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Session cleanup failed: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Session cleanup failed: {exc}",
+        )
+
+
+@router.get("/maintenance/diagnose-restart")
+async def maintenance_diagnose_restart():
+    """
+    Diagnose the restart command without actually restarting.
+
+    Returns the reconstructed argv, whether the executable path is
+    valid, and the raw sys.argv/psutil values for debugging. Useful
+    when "Restart Backend" fails because of Windows path issues.
+    """
+    import sys as _sys
+    from omweb.extensions.mcp_maintenance import (
+        _get_restart_argv,
+        _validate_restart_argv,
+    )
+
+    argv = _get_restart_argv()
+    validation_error = _validate_restart_argv(argv)
+
+    psutil_raw: Optional[list] = None
+    try:
+        import psutil
+        psutil_raw = psutil.Process().cmdline()
+    except Exception:
+        pass
+
+    return {
+        "status": "ok" if validation_error is None else "error",
+        "restart_argv": argv,
+        "validation_error": validation_error,
+        "sys_executable": _sys.executable,
+        "sys_argv": list(_sys.argv),
+        "psutil_raw_cmdline": psutil_raw,
+    }
+
+
+@router.post("/maintenance/restart")
+async def maintenance_restart_backend():
+    """
+    Restart the backend process in-place.
+
+    Uses ``os.execv`` so the same PID is preserved (PowerShell and any
+    supervisor keep waiting on the process). The response is sent
+    first, then a 1.5s delay elapses, then the process re-executes
+    itself with the original command line.
+
+    Returns **500 with a descriptive message** when the restart argv
+    cannot be reconstructed safely. In that case the server is NOT
+    stopped — the user must restart manually. This is strictly better
+    than stopping without a replacement, which is what caused the
+    "server went down and didn't come back" failure mode reported
+    after a Windows path-with-spaces bug in ``psutil.cmdline()``.
+    """
+    from omweb.extensions.mcp_maintenance import schedule_restart
+
+    try:
+        argv = schedule_restart(delay_seconds=1.5)
+        return {
+            "status": "ok",
+            "message": "Backend is restarting in 1.5s…",
+            "command": " ".join(argv),
+            "delay_seconds": 1.5,
+        }
+    except RuntimeError as exc:
+        # Refused to restart because argv was invalid. Server stays up.
+        logger.warning("Restart refused (invalid argv): %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Restart refused: {exc}\n\n"
+                f"The server is still running. Please restart manually: "
+                f"Ctrl+C in the terminal, then run '.\\start-backend' again."
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Restart scheduling failed: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Restart failed: {exc}",
+        )

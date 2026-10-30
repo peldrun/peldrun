@@ -16,6 +16,10 @@ import {
   Info,
   Settings2,
   RotateCcw,
+  PackagePlus,
+  Trash,
+  ShieldAlert,
+  X,
 } from "lucide-react";
 import { showToast } from "@/components/ui/ToastNotification";
 
@@ -52,6 +56,20 @@ export function MCPTab({ config, setConfig }: MCPTabProps) {
   const [settings, setSettings] = useState<MCPSettings>(DEFAULT_SETTINGS);
   const [defaults, setDefaults] = useState<MCPSettings>(DEFAULT_SETTINGS);
   const initialRef = useRef<MCPSettings>(DEFAULT_SETTINGS);
+
+  // ── Maintenance state ──────────────────────────────────────
+  const [warmingCache, setWarmingCache] = useState(false);
+  const [cleaningSessions, setCleaningSessions] = useState(false);
+  const [restarting, setRestarting] = useState(false);
+
+  // ── Custom Confirm Dialog State ─────────────────────────────
+  const [confirmAction, setConfirmAction] = useState<{
+    title: string;
+    message: React.ReactNode;
+    confirmLabel: string;
+    variant: "primary" | "destructive";
+    onConfirm: () => void | Promise<void>;
+  } | null>(null);
 
   const fetchSettings = useCallback(async () => {
     setLoading(true);
@@ -123,6 +141,142 @@ export function MCPTab({ config, setConfig }: MCPTabProps) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [isDirty, saving, handleSave]);
+
+  // ── Maintenance handlers ───────────────────────────────────
+
+  const handleWarmCache = useCallback(async () => {
+    setWarmingCache(true);
+    try {
+      showToast.info(
+        "Warming npm Cache",
+        "Downloading packages for all npx-based MCP servers. This may take 30-120 seconds."
+      );
+      const res = await fetch("/api/mcp/maintenance/warm-npm-cache", {
+        method: "POST",
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      if (data.failed > 0) {
+        showToast.warning(
+          `Cache Warmed (${data.succeeded}/${data.total})`,
+          `${data.failed} package(s) failed. Check server logs for details.`
+        );
+      } else {
+        showToast.success(
+          "Cache Warmed Successfully",
+          `${data.succeeded} package(s) downloaded and cached.`
+        );
+      }
+    } catch (err: any) {
+      showToast.error("Cache Warm Failed", err?.message || "Unknown error");
+    } finally {
+      setWarmingCache(false);
+    }
+  }, []);
+
+  const handleCleanupSessions = useCallback(() => {
+    setConfirmAction({
+      title: "Cleanup MCP Sessions",
+      message: (
+        <div className="space-y-3">
+          <p className="text-sm text-foreground">
+            Close all active MCP sessions and invalidate caches?
+          </p>
+          <p className="text-xs text-muted-foreground leading-relaxed">
+            Active chats will re-discover tools on the next tool call. This
+            operation is safe and idempotent.
+          </p>
+        </div>
+      ),
+      confirmLabel: "Cleanup Now",
+      variant: "primary",
+      onConfirm: async () => {
+        setCleaningSessions(true);
+        try {
+          const res = await fetch("/api/mcp/maintenance/cleanup-sessions", {
+            method: "POST",
+          });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || `HTTP ${res.status}`);
+          }
+          const data = await res.json();
+          showToast.success(
+            "Sessions Cleaned",
+            `${data.sessions_closed} session(s) closed, ${data.caches_invalidated} cache(s) invalidated.`
+          );
+        } catch (err: any) {
+          showToast.error("Cleanup Failed", err?.message || "Unknown error");
+        } finally {
+          setCleaningSessions(false);
+          setConfirmAction(null);
+        }
+      },
+    });
+  }, []);
+
+  const handleRestartBackend = useCallback(() => {
+    setConfirmAction({
+      title: "Restart Backend",
+      message: (
+        <div className="space-y-3">
+          <p className="text-sm text-foreground">
+            Are you sure you want to restart the backend?
+          </p>
+          <ul className="list-disc pl-5 text-xs text-muted-foreground space-y-1 leading-relaxed">
+            <li>All active chats will reconnect.</li>
+            <li>The page will reload automatically once the backend is back up.</li>
+            <li>This takes approximately 5–10 seconds.</li>
+          </ul>
+        </div>
+      ),
+      confirmLabel: "Restart Now",
+      variant: "destructive",
+      onConfirm: async () => {
+        setRestarting(true);
+        try {
+          await fetch("/api/mcp/maintenance/restart", { method: "POST" });
+          showToast.info(
+            "Restarting Backend",
+            "The backend is shutting down. Waiting for it to come back online…"
+          );
+
+          await new Promise((r) => setTimeout(r, 3000));
+
+          const start = Date.now();
+          while (Date.now() - start < 30_000) {
+            try {
+              const res = await fetch("/api/health", { cache: "no-store" });
+              if (res.ok) {
+                showToast.success(
+                  "Backend Restarted",
+                  "Reloading the page now…"
+                );
+                setTimeout(() => window.location.reload(), 500);
+                return;
+              }
+            } catch {
+              // Expected while backend is down.
+            }
+            await new Promise((r) => setTimeout(r, 800));
+          }
+
+          showToast.error(
+            "Restart Timeout",
+            "Backend did not respond within 30s. Check the terminal."
+          );
+        } catch (err) {
+          console.debug("Restart fetch error (expected during shutdown):", err);
+        } finally {
+          setRestarting(false);
+          setConfirmAction(null);
+        }
+      },
+    });
+  }, []);
 
   if (loading) {
     return (
@@ -223,6 +377,24 @@ export function MCPTab({ config, setConfig }: MCPTabProps) {
             </button>
           </div>
         </section>
+
+              {/* ── Custom Confirm Dialog ─────────────────────────────── */}
+      {confirmAction && (
+        <ConfirmDialog
+          open={!!confirmAction}
+          title={confirmAction.title}
+          message={confirmAction.message}
+          confirmLabel={confirmAction.confirmLabel}
+          variant={confirmAction.variant}
+          loading={restarting || cleaningSessions}
+          onConfirm={confirmAction.onConfirm}
+          onCancel={() => {
+            if (!restarting && !cleaningSessions) {
+              setConfirmAction(null);
+            }
+          }}
+        />
+      )}
 
         {/* ── Cache & Performance ─────────────────────────────── */}
         <section className="p-5 rounded-md border border-border bg-gigbg shadow-sm space-y-4">
@@ -328,6 +500,51 @@ export function MCPTab({ config, setConfig }: MCPTabProps) {
             Individual tool enable/disable lives in the server card in the Store.
           </p>
         </section>
+
+        {/* ── Maintenance ─────────────────────────────────────── */}
+        <section className="p-5 rounded-md border border-border bg-gigbg shadow-sm space-y-4">
+          <header className="flex items-center gap-2 pb-2 border-b border-border/60">
+            <Settings2 size={15} className="text-primary" />
+            <h3 className="text-xs font-semibold text-foreground uppercase tracking-wider">
+              Maintenance
+            </h3>
+          </header>
+          <p className="text-xs text-muted-foreground leading-relaxed">
+            Recovery actions for common operational issues. Safe to run
+            at any time — none of them touch existing chat history or
+            saved credentials.
+          </p>
+
+          <div className="space-y-2.5">
+            <MaintenanceRow
+              icon={<PackagePlus size={15} />}
+              label="Warm npm Cache"
+              description="Re-download packages for all npx-based MCP servers. Fixes Test Connection timeouts after `npm cache clean` or network outages."
+              actionLabel={warmingCache ? "Downloading…" : "Warm Cache"}
+              loading={warmingCache}
+              onClick={handleWarmCache}
+              variant="primary"
+            />
+            <MaintenanceRow
+              icon={<Trash size={15} />}
+              label="Cleanup Sessions"
+              description="Close all active MCP subprocesses and invalidate caches. Use when Test Connection hangs or Tools Refresh stalls."
+              actionLabel={cleaningSessions ? "Cleaning…" : "Cleanup"}
+              loading={cleaningSessions}
+              onClick={handleCleanupSessions}
+              variant="secondary"
+            />
+            <MaintenanceRow
+              icon={<ShieldAlert size={15} />}
+              label="Restart Backend"
+              description="Re-execute the backend process to load newly-edited Python modules. Active chats will reconnect automatically."
+              actionLabel={restarting ? "Restarting…" : "Restart"}
+              loading={restarting}
+              onClick={handleRestartBackend}
+              variant="destructive"
+            />
+          </div>
+        </section>
       </div>
 
       {/* ── Sticky save bar ────────────────────────────────────── */}
@@ -376,6 +593,128 @@ export function MCPTab({ config, setConfig }: MCPTabProps) {
 // ─────────────────────────────────────────────────────────────────
 // Helper components
 // ─────────────────────────────────────────────────────────────────
+function ConfirmDialog({
+  open,
+  title,
+  message,
+  confirmLabel,
+  variant = "primary",
+  loading = false,
+  onConfirm,
+  onCancel,
+}: {
+  open: boolean;
+  title: string;
+  message: React.ReactNode;
+  confirmLabel: string;
+  variant?: "primary" | "destructive";
+  loading?: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  if (!open) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-background/70 backdrop-blur-sm p-4"
+      onClick={(e) => {
+        if (e.target === e.currentTarget && !loading) onCancel();
+      }}
+    >
+      <div className="bg-card rounded-lg shadow-2xl w-full max-w-md border border-border overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+        {/* Header */}
+        <div className="px-5 py-3.5 border-b border-border bg-muted/30 flex items-center justify-between">
+          <h3 className="text-sm font-bold text-foreground">{title}</h3>
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={loading}
+            className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted/50 transition disabled:opacity-40"
+            aria-label="Close"
+          >
+            <X size={16} />
+          </button>
+        </div>
+
+        {/* Body */}
+        <div className="px-5 py-4">{message}</div>
+
+        {/* Footer */}
+        <div className="px-5 py-3 border-t border-border bg-muted/20 flex items-center justify-end gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={loading}
+            className="px-4 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground transition disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={loading}
+            className={`inline-flex items-center gap-1.5 px-4 py-1.5 rounded-md text-xs font-medium transition disabled:opacity-50 ${
+              variant === "destructive"
+                ? "bg-destructive text-destructive-foreground hover:opacity-90"
+                : "bg-primary text-primary-foreground hover:opacity-90"
+            }`}
+          >
+            {loading && <Loader2 size={13} className="animate-spin" />}
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MaintenanceRow({
+  icon,
+  label,
+  description,
+  actionLabel,
+  loading,
+  onClick,
+  variant,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  description: string;
+  actionLabel: string;
+  loading: boolean;
+  onClick: () => void;
+  variant: "primary" | "secondary" | "destructive";
+}) {
+  const buttonClass =
+    variant === "destructive"
+      ? "bg-destructive text-destructive-foreground hover:opacity-90"
+      : variant === "primary"
+      ? "bg-primary text-primary-foreground hover:opacity-90"
+      : "border border-border bg-card hover:bg-muted text-foreground";
+
+  return (
+    <div className="flex items-start justify-between gap-4 p-3 rounded-md border border-border/60 bg-background/50">
+      <div className="flex items-start gap-2.5 min-w-0 flex-1">
+        <span className="text-muted-foreground mt-0.5 shrink-0">{icon}</span>
+        <div className="min-w-0">
+          <div className="text-xs font-semibold text-foreground">{label}</div>
+          <p className="text-[10px] text-muted-foreground mt-0.5 leading-tight">
+            {description}
+          </p>
+        </div>
+      </div>
+      <button
+        type="button"
+        onClick={onClick}
+        disabled={loading}
+        className={`shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition disabled:opacity-50 disabled:cursor-not-allowed ${buttonClass}`}
+      >
+        {loading && <Loader2 size={12} className="animate-spin" />}
+        {actionLabel}
+      </button>
+    </div>
+  );
+}
 
 function NumberField({
   icon,
