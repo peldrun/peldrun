@@ -1,437 +1,468 @@
-﻿// frontend\src\app\settings\setup\tabs\MCPTab.tsx
+﻿// frontend/src/app/settings/setup/tabs/MCPTab.tsx
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
-  Share2,
-  Bot,
-  Server,
-  CheckCircle2,
-  XCircle,
-  RefreshCw,
-  Terminal,
-  Play,
+  Save,
   Loader2,
-  Settings,
-  Trash2,
-  Wrench,
+  RefreshCw,
+  Power,
+  Clock,
+  Timer,
+  Database,
+  Gauge,
+  Zap,
+  AlertTriangle,
+  Info,
+  Settings2,
+  RotateCcw,
 } from "lucide-react";
 import { showToast } from "@/components/ui/ToastNotification";
-import { MCPSettingsModal } from "@/app/stores/_modals/MCPSettingsModal";
+
+interface MCPSettings {
+  enabled: boolean;
+  tool_cache_ttl_hours: number;
+  startup_timeout_seconds: number;
+  call_timeout_seconds: number;
+  max_tools_per_server: number;
+  auto_cleanup_idle_minutes: number;
+  lazy_start_on_demand: boolean;
+  send_all_tools_by_default: boolean;
+}
 
 interface MCPTabProps {
   config: any;
   setConfig: React.Dispatch<React.SetStateAction<any>>;
 }
 
-interface MCPServerInfo {
-  id: string;
-  name: string;
-  type: string;
-  status: "active" | "ready" | string;
-  command?: string;
-  url?: string;
-  transport?: string;
-  description?: string;
-  is_builtin?: boolean;
-  is_bundle?: boolean;
-}
+const DEFAULT_SETTINGS: MCPSettings = {
+  enabled: true,
+  tool_cache_ttl_hours: 24,
+  startup_timeout_seconds: 30,
+  call_timeout_seconds: 120,
+  max_tools_per_server: 100,
+  auto_cleanup_idle_minutes: 30,
+  lazy_start_on_demand: false,
+  send_all_tools_by_default: true,
+};
 
 export function MCPTab({ config, setConfig }: MCPTabProps) {
-  const [servers, setServers] = useState<MCPServerInfo[]>([]);
-  const [activeTools, setActiveTools] = useState<string[]>([]);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [togglingId, setTogglingId] = useState<string | null>(null);
-  const [testingId, setTestingId] = useState<string | null>(null);
-  const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [configuringServer, setConfiguringServer] = useState<MCPServerInfo | null>(null);
-  const [testResults, setTestResults] = useState<Record<string, { ok: boolean; message: string }>>({});
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [settings, setSettings] = useState<MCPSettings>(DEFAULT_SETTINGS);
+  const [defaults, setDefaults] = useState<MCPSettings>(DEFAULT_SETTINGS);
+  const initialRef = useRef<MCPSettings>(DEFAULT_SETTINGS);
 
-  const handleDeleteServer = async (serverId: string) => {
-    if (!confirm(`Are you sure you want to delete MCP server '${serverId}' and purge all its bundle files?`)) {
-      return;
-    }
-    setDeletingId(serverId);
-    try {
-      const res = await fetch(getApiUrl(`/api/mcp/servers/${serverId}`), {
-        method: "DELETE",
-      });
-      if (res.ok) {
-        showToast.success("MCP Server Removed", `${serverId} purged successfully.`);
-        fetchMCPServers();
-      } else {
-        const err = await res.json().catch(() => ({}));
-        showToast.error("Delete Failed", err.detail || "Failed to delete server.");
-      }
-    } catch (err: any) {
-      showToast.error("Network Error", err.message || "Failed to reach backend.");
-    } finally {
-      setDeletingId(null);
-    }
-  };
-
-  // Relative path only - SSR/CSR parity. See next.config.mjs.
-  const getApiUrl = (endpoint: string) => {
-    return endpoint;
-  };
-
-  const fetchMCPServers = async () => {
+  const fetchSettings = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await fetch(getApiUrl("/api/mcp"));
-      if (res.ok) {
-        const data = await res.json();
-        setServers(data.servers || []);
-        setActiveTools(data.active_tools || []);
-      } else {
-        showToast.error("MCP Fetch Error", "Failed to retrieve registered MCP servers.");
-      }
+      const res = await fetch("/api/mcp/settings");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const s = data.settings || DEFAULT_SETTINGS;
+      const d = data.defaults || DEFAULT_SETTINGS;
+      setSettings(s);
+      setDefaults(d);
+      initialRef.current = s;
     } catch (err: any) {
-      console.error("Failed to fetch MCP servers:", err);
-      showToast.error("Connection Error", err.message || "Could not connect to backend MCP registry.");
+      console.error("Failed to load MCP settings:", err);
+      showToast.error("Load Failed", err.message || "Could not load MCP settings.");
     } finally {
       setLoading(false);
     }
-  };
-
-  useEffect(() => {
-    fetchMCPServers();
   }, []);
 
-  const handleToggle = async (serverId: string) => {
-    setTogglingId(serverId);
-    try {
-      const res = await fetch(getApiUrl(`/api/mcp/servers/${serverId}/toggle`), {
-        method: "POST"
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const newStatus = data.server?.status;
-        setServers((prev) =>
-          prev.map((s) => (s.id === serverId ? { ...s, status: newStatus } : s))
-        );
-        showToast.success("MCP Server Updated", `${serverId} is now ${newStatus}`);
-        fetchMCPServers();
-      } else {
-        const err = await res.json();
-        showToast.error("Toggle Failed", err.detail || "Could not toggle server status.");
-      }
-    } catch (err: any) {
-      showToast.error("Network Error", err.message);
-    } finally {
-      setTogglingId(null);
-    }
+  useEffect(() => {
+    fetchSettings();
+  }, [fetchSettings]);
+
+  const isDirty = JSON.stringify(settings) !== JSON.stringify(initialRef.current);
+
+  const setField = <K extends keyof MCPSettings>(key: K, value: MCPSettings[K]) => {
+    setSettings((prev) => ({ ...prev, [key]: value }));
   };
 
-  const handleTestConnection = async (serverId: string) => {
-    setTestingId(serverId);
+  const handleSave = useCallback(async () => {
+    setSaving(true);
     try {
-      const res = await fetch(getApiUrl("/api/mcp/test"), {
-        method: "POST",
+      const res = await fetch("/api/mcp/settings", {
+        method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ server_id: serverId })
+        body: JSON.stringify(settings),
       });
-      const data = await res.json();
-      const isOk = data.status === "ok";
-      setTestResults((prev) => ({
-        ...prev,
-        [serverId]: { ok: isOk, message: data.message }
-      }));
-      if (isOk) {
-        showToast.success("MCP Test Succeeded", data.message);
-      } else {
-        showToast.warning("MCP Test Warning", data.message);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
       }
+      const data = await res.json();
+      const saved = data.settings || settings;
+      setSettings(saved);
+      initialRef.current = saved;
+      showToast.success("MCP Settings Saved", "Subsystem configuration updated.");
     } catch (err: any) {
-      setTestResults((prev) => ({
-        ...prev,
-        [serverId]: { ok: false, message: err.message || "Failed to reach backend." }
-      }));
-      showToast.error("Test Error", err.message);
+      console.error("Failed to save MCP settings:", err);
+      showToast.error("Save Failed", err.message || "Could not save MCP settings.");
     } finally {
-      setTestingId(null);
+      setSaving(false);
     }
-  };
+  }, [settings]);
+
+  const handleReset = useCallback(() => {
+    setSettings(defaults);
+    showToast.info("Reset to Defaults", "Click Save to apply the default values.");
+  }, [defaults]);
+
+  // Ctrl/Cmd+S shortcut
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === "s") {
+        e.preventDefault();
+        if (isDirty && !saving) handleSave();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [isDirty, saving, handleSave]);
+
+  if (loading) {
+    return (
+      <div className="llm-tab w-full space-y-6 font-sans pb-6">
+        <div className="flex items-center justify-center py-16 text-muted-foreground gap-2 text-sm">
+          <Loader2 size={18} className="animate-spin text-primary" />
+          Loading MCP subsystem settings…
+        </div>
+      </div>
+    );
+  }
+
+  const isDisabled = !settings.enabled;
 
   return (
-    <div className="llm-tab w-full space-y-6 max-auto font-sans pb-6">
-      {/* Header */}
+    <div className="llm-tab w-full space-y-6 font-sans pb-24">
+      {/* ── Header ─────────────────────────────────────────────── */}
       <div className="border-b border-border w-full pb-4 pt-4 bg-custom">
         <div className="flex items-center justify-between pr-4 pl-4">
           <div className="flex items-center gap-2">
-            <Share2 size={16} className="text-primary" />
+            <Settings2 size={16} className="text-primary" />
             <h2 className="text-sm font-semibold font-heading text-foreground uppercase tracking-wide">
-              Model Context Protocol (MCP) & Multi-Agent Workflows
+              Model Context Protocol — Subsystem Settings
             </h2>
           </div>
-          <button
-            type="button"
-            onClick={fetchMCPServers}
-            disabled={loading}
-            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md border border-border bg-card hover:bg-rby text-black transition-colors"
-          >
-            <RefreshCw size={12} className={loading ? "animate-spin text-primary" : ""} />
-            Refresh
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={fetchSettings}
+              disabled={loading || saving}
+              className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md border border-border bg-card hover:bg-muted text-foreground transition-colors disabled:opacity-50"
+            >
+              <RefreshCw size={12} className={loading ? "animate-spin text-primary" : ""} />
+              Reload
+            </button>
+            <button
+              type="button"
+              onClick={handleReset}
+              disabled={loading || saving}
+              className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md border border-border bg-card hover:bg-muted text-foreground transition-colors disabled:opacity-50"
+              title="Reset all fields to defaults (must Save to apply)"
+            >
+              <RotateCcw size={12} />
+              Reset
+            </button>
+          </div>
         </div>
         <p className="text-xs text-muted-foreground mt-0.5 pr-4 pl-4">
-          Seamlessly manage external tool servers, standard stdio execution bridges, and automated multi-agent delegations.
+          Global configuration for the MCP subsystem. Server-level settings live in the Store; per-chat credentials are managed via the authentication modal inside each chat.
         </p>
       </div>
 
-      <div className="w-full max-w-7xl space-y-8 pt-6 m-auto px-4">
-        {/* Section 1: Registered MCP Servers */}
-        <div className="p-5 rounded-md border border-border bg-gigbg space-y-5 shadow-sm">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Server size={15} className="text-primary" />
-              <span className="text-xs font-semibold text-foreground uppercase tracking-wider block">
-                Registered MCP Tool Servers
-              </span>
+      <div className="w-full max-w-5xl space-y-6 m-auto px-4">
+        {/* ── Disabled banner ─────────────────────────────────── */}
+        {isDisabled && (
+          <div className="p-4 rounded-md border border-amber-500/30 bg-amber-500/10 flex items-start gap-3">
+            <AlertTriangle size={18} className="text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+            <div className="text-xs">
+              <p className="font-semibold text-amber-700 dark:text-amber-300">
+                MCP Subsystem is Disabled
+              </p>
+              <p className="text-amber-700/80 dark:text-amber-400/80 mt-1 leading-relaxed">
+                No MCP server will be contacted. All active sessions have been closed. Agents cannot see or invoke any MCP tool until the subsystem is re-enabled and saved.
+              </p>
             </div>
-            <span className="text-[11px] text-muted-foreground font-mono">
-              {servers.filter((s) => s.status === "active").length} of {servers.length} active
-            </span>
           </div>
+        )}
 
-          {loading ? (
-            <div className="flex items-center justify-center py-8 text-muted-foreground gap-2 text-xs">
-              <Loader2 size={16} className="animate-spin text-primary" />
-              Loading registered MCP servers...
-            </div>
-          ) : servers.length === 0 ? (
-            <div className="text-center py-8 text-xs text-muted-foreground border border-dashed border-border rounded-md">
-              No MCP servers registered in the extensions manifest directory.
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {servers.map((server) => {
-                const isActive = server.status === "active";
-                const isToggling = togglingId === server.id;
-                const isTesting = testingId === server.id;
-                const testResult = testResults[server.id];
-
-                return (
-                  <div
-                    key={server.id}
-                    className={`rounded-lg border p-4 space-y-3 transition-all ${
-                      isActive
-                        ? "border-rb/20 bg-rb/5 text-black shadow-sm"
-                        : "border-border bg-background"
-                    }`}
-                  >
-                    {/* Card Header */}
-                    <div className="flex items-start justify-between gap-2">
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <span className="text-xs font-semibold text-foreground">
-                            {server.name}
-                          </span>
-                          {server.is_builtin && (
-                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-muted text-inherit font-mono">
-                              builtin
-                            </span>
-                          )}
-                          {server.is_bundle && (
-                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary border border-primary/20 font-mono">
-                              bundle
-                            </span>
-                          )}
-                        </div>
-                        <p className="text-[11px] text-inherit mt-0.5 line-clamp-2">
-                          {server.description || "No description provided."}
-                        </p>
-                      </div>
-
-                      {/* Status Toggle Switch */}
-                      <button
-                        type="button"
-                        onClick={() => handleToggle(server.id)}
-                        disabled={isToggling}
-                        className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                          isActive ? "bg-green-300" : "bg-black/50"
-                        }`}
-                        title={isActive ? "Click to disable" : "Click to activate"}
-                      >
-                        <span
-                          className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-background shadow-lg ring-0 transition duration-200 ease-in-out ${
-                            isActive ? "translate-x-4" : "translate-x-0"
-                          }`}
-                        />
-                      </button>
-                    </div>
-
-                    {/* Command / Target Display */}
-                    <div className="p-2 rounded bg-muted border border-border/50 text-[11px] font-mono text-black flex items-center gap-2 overflow-x-auto">
-                      <Terminal size={12} className="shrink-0 text-primary" />
-                      <span className="truncate select-all">
-                        {server.command || server.url || "No execution target defined"}
-                      </span>
-                    </div>
-
-                    {/* Test Result Notice */}
-                    {testResult && (
-                      <div
-                        className={`p-2 rounded text-[11px] flex items-start gap-1.5 ${
-                          testResult.ok
-                            ? "bg-green-500/10 text-green-600 dark:text-green-400 border border-green-500/20"
-                            : "bg-destructive/10 text-destructive border border-destructive/20"
-                        }`}
-                      >
-                        {testResult.ok ? (
-                          <CheckCircle2 size={13} className="shrink-0 mt-0.5" />
-                        ) : (
-                          <XCircle size={13} className="shrink-0 mt-0.5" />
-                        )}
-                        <span className="leading-tight">{testResult.message}</span>
-                      </div>
-                    )}
-
-                    {/* Card Actions Footer */}
-                    <div className="flex items-center justify-between pt-1 border-t border-border/40">
-                      <div className="flex items-center gap-1.5 text-[10px] text-card">
-                        <span
-                          className={`h-1.5 w-1.5 rounded-full ${
-                            isActive ? "bg-green-500 animate-pulse" : "bg-muted-foreground"
-                          }`}
-                        />
-                        <span className="capitalize text-rby">{server.status}</span>
-                      </div>
-
-                      <div className="flex items-center gap-1.5">
-                        <button
-                          type="button"
-                          onClick={() => setConfiguringServer(server)}
-                          className="flex items-center gap-1 text-[11px] px-2.5 py-1 rounded border border-border bg-card hover:bg-muted text-foreground transition font-medium cursor-pointer"
-                          title="Configure Server Settings & Environment"
-                        >
-                          <Settings size={11} className="text-muted-foreground" />
-                          <span>Settings</span>
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() => handleTestConnection(server.id)}
-                          disabled={isTesting}
-                          className="flex items-center gap-1 text-[11px] px-2.5 py-1 rounded bg-secondary hover:bg-secondary/80 text-secondary-foreground font-medium transition-colors cursor-pointer"
-                        >
-                          {isTesting ? (
-                            <Loader2 size={11} className="animate-spin text-primary" />
-                          ) : (
-                            <Play size={10} className="text-primary fill-primary" />
-                          )}
-                          Test Connection
-                        </button>
-
-                        {!server.is_builtin && (
-                          <button
-                            type="button"
-                            onClick={() => handleDeleteServer(server.id)}
-                            disabled={deletingId === server.id}
-                            className="p-1 rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition cursor-pointer disabled:opacity-50"
-                            title="Delete Server / Purge Bundle"
-                            aria-label="Delete Server"
-                          >
-                            {deletingId === server.id ? (
-                              <Loader2 size={12} className="animate-spin text-destructive" />
-                            ) : (
-                              <Trash2 size={12} />
-                            )}
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-
-          {/* Active Tools Summary */}
-          {activeTools.length > 0 && (
-            <div className="pt-3 border-t border-border">
-              <span className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider block mb-2">
-                Active Protocol Tools Available to Agents:
-              </span>
-              <div className="flex flex-wrap gap-1.5">
-                {activeTools.map((tool) => (
-                  <span
-                    key={tool}
-                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-mono bg-rby/20 text-black border border-rby"
-                  >
-                    <Wrench size={10} className="text-primary" />
-                    {tool}
-                  </span>
-                ))}
+        {/* ── Master toggle ──────────────────────────────────── */}
+        <section className="p-5 rounded-md border border-border bg-gigbg shadow-sm">
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex items-start gap-3">
+              <div className={`p-2 rounded-lg ${settings.enabled ? "bg-primary/10 text-primary" : "bg-muted text-muted-foreground"}`}>
+                <Power size={18} />
+              </div>
+              <div>
+                <h3 className="text-sm font-semibold text-foreground">
+                  Master Enable
+                </h3>
+                <p className="text-xs text-muted-foreground mt-0.5 leading-relaxed max-w-lg">
+                  When disabled, the entire MCP subsystem is stopped — no subprocesses, no discovery, no tool injection. Existing chat sessions are unaffected after the next save.
+                </p>
               </div>
             </div>
-          )}
-        </div>
-
-        {/* Section 2: Agent Delegation [runflow] */}
-        <div className="p-5 rounded-md border border-border bg-card space-y-4 shadow-sm text-black">
-          <span className="text-xs font-semibold text-inherit uppercase tracking-wider block">
-            Agent Delegation [runflow]
-          </span>
-
-          <label className="flex items-center gap-2.5 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={Boolean(config?.runflow?.use_data_analysis_agent)}
-              onChange={(e) =>
-                setConfig((prev: any) => ({
-                  ...prev,
-                  runflow: { ...(prev?.runflow || {}), use_data_analysis_agent: e.target.checked }
-                }))
-              }
-              className="rounded border-border text-primary focus:ring-primary h-4 w-4"
-            />
-            <div className="flex items-center gap-1.5">
-              <Bot size={14} className="text-primary" />
-              <span className="text-xs text-foreground font-medium">
-                Use Data Analysis Specialist Agent
-              </span>
-            </div>
-          </label>
-        </div>
-
-        {/* Section 3: Model Context Protocol [mcp] */}
-        <div className="p-5 rounded-md border border-border bg-card space-y-4 shadow-sm">
-          <span className="text-xs font-semibold uppercase tracking-wider block text-inherit">
-            Core Reference Module [mcp]
-          </span>
-
-          <div>
-            <label className="text-[11px] font-medium text-muted-foreground block mb-1">
-              MCP Server Reference Module
-            </label>
-            <input
-              type="text"
-              value={config?.mcp?.server_reference || ""}
-              onChange={(e) =>
-                setConfig((prev: any) => ({
-                  ...prev,
-                  mcp: { ...(prev?.mcp || {}), server_reference: e.target.value }
-                }))
-              }
-              placeholder="app.mcp.server"
-              className="w-full bg-background border border-border rounded-md px-3 py-1.5 text-xs text-foreground shadow-peldrun-xs font-mono"
-            />
-            <span className="text-[10px] text-muted-foreground mt-1.5 block">
-              Points to the backend Python module implementing native MCP server tools for external integrations.
-            </span>
+            <button
+              type="button"
+              onClick={() => setField("enabled", !settings.enabled)}
+              className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-primary/30 ${
+                settings.enabled ? "bg-green-500" : "bg-muted-foreground/40"
+              }`}
+              aria-label={settings.enabled ? "Disable MCP subsystem" : "Enable MCP subsystem"}
+            >
+              <span
+                className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-lg ring-0 transition duration-200 ease-in-out ${
+                  settings.enabled ? "translate-x-5" : "translate-x-0"
+                }`}
+              />
+            </button>
           </div>
-        </div>
+        </section>
+
+        {/* ── Cache & Performance ─────────────────────────────── */}
+        <section className="p-5 rounded-md border border-border bg-gigbg shadow-sm space-y-4">
+          <header className="flex items-center gap-2 pb-2 border-b border-border/60">
+            <Database size={15} className="text-primary" />
+            <h3 className="text-xs font-semibold text-foreground uppercase tracking-wider">
+              Tool Cache & Discovery
+            </h3>
+          </header>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <NumberField
+              icon={<Clock size={14} />}
+              label="Tool Cache TTL (hours)"
+              hint="How long a cached tool list is considered authoritative before re-discovery. Range: 1–168."
+              value={settings.tool_cache_ttl_hours}
+              min={1}
+              max={168}
+              onChange={(v) => setField("tool_cache_ttl_hours", v)}
+              disabled={isDisabled}
+            />
+            <NumberField
+              icon={<Gauge size={14} />}
+              label="Max Tools per Server"
+              hint="Hard cap on tools accepted from one server. Protects against malformed servers. Range: 10–1000."
+              value={settings.max_tools_per_server}
+              min={10}
+              max={1000}
+              onChange={(v) => setField("max_tools_per_server", v)}
+              disabled={isDisabled}
+            />
+          </div>
+
+          <ToggleRow
+            icon={<Zap size={14} />}
+            label="Lazy Start on Demand"
+            hint="Spawn subprocess only when a tool is invoked, not during discovery. Recommended for costly-to-start servers with sporadic usage."
+            checked={settings.lazy_start_on_demand}
+            onChange={(v) => setField("lazy_start_on_demand", v)}
+            disabled={isDisabled}
+          />
+
+          <ToggleRow
+            icon={<Info size={14} />}
+            label="Send All Tools by Default"
+            hint="When enabled, newly discovered tools are auto-enabled. When disabled, new tools start disabled and must be opted in via the Manage Tools modal."
+            checked={settings.send_all_tools_by_default}
+            onChange={(v) => setField("send_all_tools_by_default", v)}
+            disabled={isDisabled}
+          />
+        </section>
+
+        {/* ── Timeouts ────────────────────────────────────────── */}
+        <section className="p-5 rounded-md border border-border bg-gigbg shadow-sm space-y-4">
+          <header className="flex items-center gap-2 pb-2 border-b border-border/60">
+            <Timer size={15} className="text-primary" />
+            <h3 className="text-xs font-semibold text-foreground uppercase tracking-wider">
+              Timeouts
+            </h3>
+          </header>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <NumberField
+              icon={<Timer size={14} />}
+              label="Startup Timeout (s)"
+              hint="Maximum time to spawn a stdio subprocess or establish HTTP/SSE. Range: 5–300."
+              value={settings.startup_timeout_seconds}
+              min={5}
+              max={300}
+              onChange={(v) => setField("startup_timeout_seconds", v)}
+              disabled={isDisabled}
+            />
+            <NumberField
+              icon={<Timer size={14} />}
+              label="Call Timeout (s)"
+              hint="Maximum duration of a single tool invocation. Range: 10–1800."
+              value={settings.call_timeout_seconds}
+              min={10}
+              max={1800}
+              onChange={(v) => setField("call_timeout_seconds", v)}
+              disabled={isDisabled}
+            />
+            <NumberField
+              icon={<Clock size={14} />}
+              label="Idle Cleanup (min)"
+              hint="Close idle stdio subprocesses after this many minutes of inactivity. Range: 1–1440."
+              value={settings.auto_cleanup_idle_minutes}
+              min={1}
+              max={1440}
+              onChange={(v) => setField("auto_cleanup_idle_minutes", v)}
+              disabled={isDisabled}
+            />
+          </div>
+        </section>
+
+        {/* ── Where to do what ────────────────────────────────── */}
+        <section className="p-4 rounded-md border border-border/60 bg-card/50">
+          <p className="text-[11px] text-muted-foreground leading-relaxed">
+            <strong className="text-foreground">Looking for something else?</strong>{" "}
+            Server registration and per-server credentials are managed in the{" "}
+            <a href="/stores" className="text-primary hover:underline">Store → Extensions &amp; MCP</a>{" "}
+            section. Per-chat credentials are managed inside each chat via the authentication modal.
+            Individual tool enable/disable lives in the server card in the Store.
+          </p>
+        </section>
       </div>
 
-      {/* Standalone MCP Server Settings Modal */}
-      <MCPSettingsModal
-        open={configuringServer !== null}
-        serverId={configuringServer?.id ?? null}
-        serverName={configuringServer?.name ?? ""}
-        onClose={() => setConfiguringServer(null)}
-        onSaved={fetchMCPServers}
-      />
+      {/* ── Sticky save bar ────────────────────────────────────── */}
+      {isDirty && (
+        <div className="fixed bottom-0 left-0 right-0 z-40 border-t border-border bg-background/95 backdrop-blur-sm shadow-lg">
+          <div className="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between gap-4">
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <div className="h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse" />
+              <span>You have unsaved changes.</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setSettings(initialRef.current)}
+                disabled={saving}
+                className="px-3 py-1.5 text-xs text-muted-foreground hover:text-foreground transition disabled:opacity-50"
+              >
+                Discard
+              </button>
+              <button
+                type="button"
+                onClick={handleSave}
+                disabled={saving}
+                className="inline-flex items-center gap-1.5 px-4 py-1.5 bg-primary text-primary-foreground rounded-md text-xs font-medium hover:opacity-90 disabled:opacity-50 transition"
+              >
+                {saving ? (
+                  <>
+                    <Loader2 size={13} className="animate-spin" />
+                    Saving…
+                  </>
+                ) : (
+                  <>
+                    <Save size={13} />
+                    Save Changes
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
+
+// ─────────────────────────────────────────────────────────────────
+// Helper components
+// ─────────────────────────────────────────────────────────────────
+
+function NumberField({
+  icon,
+  label,
+  hint,
+  value,
+  min,
+  max,
+  onChange,
+  disabled,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  hint: string;
+  value: number;
+  min: number;
+  max: number;
+  onChange: (v: number) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <div className={disabled ? "opacity-50 pointer-events-none" : ""}>
+      <label className="flex items-center gap-1.5 text-xs font-semibold text-foreground mb-1.5">
+        <span className="text-muted-foreground">{icon}</span>
+        {label}
+      </label>
+      <input
+        type="number"
+        value={value}
+        min={min}
+        max={max}
+        onChange={(e) => {
+          const n = Number(e.target.value);
+          if (Number.isFinite(n)) onChange(n);
+        }}
+        disabled={disabled}
+        className="w-full px-3 py-1.5 bg-background border border-border rounded-md text-xs text-foreground font-mono focus:outline-none focus:border-primary transition"
+      />
+      <p className="text-[10px] text-muted-foreground mt-1 leading-tight">{hint}</p>
+    </div>
+  );
+}
+
+function ToggleRow({
+  icon,
+  label,
+  hint,
+  checked,
+  onChange,
+  disabled,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  hint: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <div
+      className={`flex items-start justify-between gap-4 p-3 rounded-md border border-border/60 bg-background/50 ${
+        disabled ? "opacity-50 pointer-events-none" : ""
+      }`}
+    >
+      <div className="flex items-start gap-2.5 min-w-0">
+        <span className="text-muted-foreground mt-0.5 shrink-0">{icon}</span>
+        <div className="min-w-0">
+          <div className="text-xs font-semibold text-foreground">{label}</div>
+          <p className="text-[10px] text-muted-foreground mt-0.5 leading-tight">{hint}</p>
+        </div>
+      </div>
+      <button
+        type="button"
+        onClick={() => onChange(!checked)}
+        disabled={disabled}
+        className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none disabled:cursor-not-allowed ${
+          checked ? "bg-green-500" : "bg-muted-foreground/40"
+        }`}
+      >
+        <span
+          className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-md ring-0 transition duration-200 ease-in-out ${
+            checked ? "translate-x-4" : "translate-x-0"
+          }`}
+        />
+      </button>
+    </div>
+  );
+}
+
+export default MCPTab;

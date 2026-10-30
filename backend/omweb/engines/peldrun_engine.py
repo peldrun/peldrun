@@ -571,6 +571,33 @@ class PeldrunEngine(ExecutionEngine):
                 server_id=pre_sid,
             )
 
+        # ── MCP subsystem kill-switch ──────────────────────────────
+        # When the operator has disabled the entire MCP subsystem in
+        # Setup → MCP, skip discovery altogether. `target_mcp_servers`
+        # remains non-empty (the registry still knows about the
+        # servers), but we treat it as empty for this run so no
+        # subprocess is spawned and no MCP tool is advertised to the
+        # LLM. Existing chat sessions are unaffected because they
+        # already have their credentials resolved.
+        try:
+            from omweb.extensions.mcp_subsystem_settings import (
+                is_enabled as _mcp_subsystem_enabled,
+            )
+
+            if not _mcp_subsystem_enabled():
+                logger.info(
+                    "[MCP DISABLED] Subsystem disabled in settings; "
+                    "skipping discovery for job %s.",
+                    job_id,
+                )
+                target_mcp_servers = []
+        except Exception as kill_switch_err:  # noqa: BLE001
+            logger.debug(
+                "Could not read MCP kill-switch state for job %s: %s",
+                job_id,
+                kill_switch_err,
+            )
+
         # ── Inject MCP access hint into system prompt ─────────────
         # Some models (e.g. GigaChat) hallucinate and refuse to use
         # MCP tools if they see a past "Authentication Required" error
@@ -694,6 +721,27 @@ class PeldrunEngine(ExecutionEngine):
                 remote_name = tool_info.get("name")
                 if not remote_name:
                     continue
+
+                # ── Per-tool enable filter ────────────────────────
+                # Tools the user has explicitly disabled in the
+                # "Manage Tools" UI are NOT injected into AgentSpec.
+                # This cuts tool-definition tokens substantially on
+                # large servers (GitHub: 50+ tools) while keeping the
+                # ones the user actually needs.
+                #
+                # `user_enabled` is always present because tools come
+                # from the merged cache (see mcp_tool_cache.merge_tools).
+                # The .get(..., True) fallback is defensive only for
+                # legacy caches written before this feature shipped.
+                if not bool(tool_info.get("user_enabled", True)):
+                    logger.debug(
+                        "Skipping disabled MCP tool '%s::%s' for job %s",
+                        srv_id,
+                        remote_name,
+                        job_id,
+                    )
+                    continue
+
                 mcp_tool_id = f"mcp__{srv_id}__{remote_name}"
                 if mcp_tool_id in resolved_tool_ids:
                     continue

@@ -40,6 +40,12 @@ export interface UseExtensionActionsResult {
   isConfigModalOpen: boolean;
   handleOpenConfigure: (ext: ExtensionDefinition) => void;
   handleCloseConfigure: () => void;
+
+  // Tools management modal
+  managingToolsExtension: ExtensionDefinition | null;
+  isToolsModalOpen: boolean;
+  handleOpenManageTools: (ext: ExtensionDefinition) => void;
+  handleCloseManageTools: () => void;
 }
 
 /**
@@ -58,6 +64,7 @@ export function useExtensionActions({
   const [deletingExtId, setDeletingExtId] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<McpTestResultMap>({});
   const [configuringExtension, setConfiguringExtension] = useState<ExtensionDefinition | null>(null);
+  const [managingToolsExtension, setManagingToolsExtension] = useState<ExtensionDefinition | null>(null);
 
   /**
    * Toggle the status of an MCP server.
@@ -165,6 +172,14 @@ export function useExtensionActions({
     setConfiguringExtension(null);
   }, []);
 
+  const handleOpenManageTools = useCallback((ext: ExtensionDefinition) => {
+    setManagingToolsExtension(ext);
+  }, []);
+
+  const handleCloseManageTools = useCallback(() => {
+    setManagingToolsExtension(null);
+  }, []);
+
   return {
     togglingExtId,
     handleToggleExtension,
@@ -177,5 +192,10 @@ export function useExtensionActions({
     isConfigModalOpen: Boolean(configuringExtension),
     handleOpenConfigure,
     handleCloseConfigure,
+    // Tools management modal
+    managingToolsExtension: managingToolsExtension,
+    isToolsModalOpen: Boolean(managingToolsExtension),
+    handleOpenManageTools,
+    handleCloseManageTools,
   };
 }

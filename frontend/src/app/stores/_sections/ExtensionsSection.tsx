@@ -28,6 +28,7 @@ export interface ExtensionsSectionProps {
   onToggleExtension: (extId: string) => void;
   onTestExtension: (extId: string) => void;
   onConfigureExtension?: (extension: ExtensionDefinition) => void;
+  onManageToolsExtension?: (extension: ExtensionDefinition) => void;
   onDeleteExtension?: (extId: string) => void;
 }
 
@@ -78,6 +79,7 @@ export function ExtensionsSection({
   onToggleExtension,
   onTestExtension,
   onConfigureExtension,
+  onManageToolsExtension,
   onDeleteExtension,
 }: ExtensionsSectionProps) {
   const filteredExtensions = useMemo(() => {
@@ -118,6 +120,7 @@ export function ExtensionsSection({
           onToggle={onToggleExtension}
           onTest={onTestExtension}
           onConfigure={onConfigureExtension}
+          onManageTools={onManageToolsExtension}
           onDelete={onDeleteExtension}
         />
       ))}

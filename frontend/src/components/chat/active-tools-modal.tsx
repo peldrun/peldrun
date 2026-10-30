@@ -68,6 +68,19 @@ interface DisplayTool {
   is_builtin: boolean;
   safety_level?: string | null;
   serverName?: string;
+  user_enabled?: boolean;
+  /**
+   * `true` only when ALL FOUR conditions hold:
+   *   1. global MCP subsystem enabled
+   *   2. MCP server status == "active"
+   *   3. tool user_enabled == true
+   *   4. tool is actually from the cache
+   *
+   * `false` means the tool will NOT be sent to the LLM. `undefined`
+   * is treated as `true` only for built-in tools (which bypass MCP
+   * gating entirely).
+   */
+  isEffective?: boolean;
 }
 
 interface McpGroup {
@@ -75,10 +88,20 @@ interface McpGroup {
   serverName: string;
   serverStatus: string;
   tools: DisplayTool[];
-  /** True once the per-server tool probe has finished (success or error). */
+  /** Tools actually sent to the LLM (respects all 4 gates). */
+  enabledCount: number;
+  /** Tools that are NOT sent (global off OR server inactive OR user disabled). */
+  disabledCount: number;
+  /** Tools the user explicitly disabled (subset of disabledCount). */
+  userDisabledCount: number;
+  /** True once the per-server tool probe has finished. */
   loaded: boolean;
-  /** Non-null when the probe failed. */
+  /** Non-null when the probe failed or the cache is empty. */
   error: string | null;
+  /** Whether the MCP server is toggled ON in the Store. */
+  isServerActive: boolean;
+  /** Whether the MCP subsystem is enabled globally. */
+  isGlobalEnabled: boolean;
 }
 
 /* ────────────────────────────────────────────────────────────────
@@ -92,12 +115,16 @@ export function ActiveToolsModal() {
   const [toolsState, setToolsState] = useState<AgentToolsState | null>(null);
   const [effectiveMcpServers, setEffectiveMcpServers] = useState<string[]>([]);
   const [mcpToolsByServer, setMcpToolsByServer] = useState<
-    Record<string, Array<{ name: string; description: string }>>
+    Record<
+      string,
+      Array<{ name: string; description: string; user_enabled: boolean }>
+    >
   >({});
   const [mcpServerErrors, setMcpServerErrors] = useState<
     Record<string, string>
   >({});
   const [mcpServers, setMcpServers] = useState<MCPServerInfo[]>([]);
+  const [globalMcpEnabled, setGlobalMcpEnabled] = useState<boolean>(true);
   const [mcpToolsLoading, setMcpToolsLoading] = useState(false);
   // Expanded state per server. Missing entry = collapsed (accordion default).
   const [expandedServers, setExpandedServers] = useState<Set<string>>(
@@ -158,10 +185,11 @@ export function ActiveToolsModal() {
     if (!selectedAgentId) {
       setEffectiveMcpServers([]);
       setMcpServers([]);
+      setGlobalMcpEnabled(true);
       return;
     }
     try {
-      const [agentMcpRes, allMcpRes] = await Promise.all([
+      const [agentMcpRes, allMcpRes, settingsRes] = await Promise.all([
         fetch(
           getApiUrl(
             `/api/store/agents/${encodeURIComponent(selectedAgentId)}/mcp`,
@@ -169,6 +197,12 @@ export function ActiveToolsModal() {
           { cache: "no-store" },
         ),
         fetch(getApiUrl("/api/mcp"), { cache: "no-store" }),
+        // Fetch global MCP subsystem settings so we can correctly
+        // gate "effective" tool counts when the operator has
+        // disabled the subsystem entirely.
+        fetch(getApiUrl("/api/mcp/settings"), {
+          cache: "no-store",
+        }).catch(() => null),
       ]);
 
       if (agentMcpRes.ok) {
@@ -185,6 +219,11 @@ export function ActiveToolsModal() {
       if (allMcpRes.ok) {
         const data = await allMcpRes.json();
         setMcpServers(Array.isArray(data.servers) ? data.servers : []);
+      }
+
+      if (settingsRes && settingsRes.ok) {
+        const sData = await settingsRes.json();
+        setGlobalMcpEnabled(sData?.settings?.enabled !== false);
       }
     } catch (err) {
       console.error("Failed to load MCP metadata:", err);
@@ -243,9 +282,12 @@ export function ActiveToolsModal() {
     await Promise.all(
       toLoad.map(async (serverId) => {
         try {
+          // Read from the persistent tool cache — do NOT spawn a
+          // subprocess. The cache is populated the first time the
+          // user opens "Manage Tools" and clicks Refresh in the Store.
           const res = await fetch(
             getApiUrl(
-              `/api/mcp/servers/${encodeURIComponent(serverId)}/tools`,
+              `/api/mcp/servers/${encodeURIComponent(serverId)}/tools/cached`,
             ),
             { cache: "no-store" },
           );
@@ -260,10 +302,15 @@ export function ActiveToolsModal() {
             return;
           }
           const data = await res.json();
-          if (data?.status === "error") {
+          // The cached endpoint returns `cached: false` when the
+          // server has never been discovered. Surface this as a
+          // hint (not a hard error) so the user knows to run the
+          // Refresh action from Store → Extensions → Manage Tools.
+          if (data?.cached === false) {
             setMcpServerErrors((prev) => ({
               ...prev,
-              [serverId]: String(data.message || "Probe failed"),
+              [serverId]:
+                "No cached tools yet. Open Store → Extensions → Manage Tools to run Refresh.",
             }));
             setMcpToolsByServer((prev) => ({ ...prev, [serverId]: [] }));
             return;
@@ -274,6 +321,10 @@ export function ActiveToolsModal() {
             [serverId]: tools.map((t: any) => ({
               name: String(t?.name || ""),
               description: String(t?.description || ""),
+              // Default to enabled if the field is missing — the
+              // backend always includes it, but defensive for any
+              // legacy cache written before this feature shipped.
+              user_enabled: t?.user_enabled !== false,
             })),
           }));
         } catch (err: any) {
@@ -400,6 +451,13 @@ export function ActiveToolsModal() {
 
     return effectiveMcpServers.map((serverId) => {
       const srvInfo = serverById.get(serverId);
+      const isServerActive = srvInfo?.status === "active";
+
+      // Four-level gate: global enabled AND server active AND
+      // per-tool user_enabled. If ANY layer is off, the tool will
+      // NOT be sent to the LLM.
+      const effectivelyEnabled = globalMcpEnabled && isServerActive;
+
       const tools = (mcpToolsByServer[serverId] || []).map<DisplayTool>((t) => ({
         id: `mcp__${serverId}__${t.name}`,
         name: t.name,
@@ -408,15 +466,28 @@ export function ActiveToolsModal() {
         source: "mcp",
         is_builtin: false,
         serverName: srvInfo?.name || serverId,
+        user_enabled: t.user_enabled,
+        isEffective: effectivelyEnabled && t.user_enabled !== false,
       }));
+
+      const enabledCount = tools.filter((t) => t.isEffective).length;
+      const disabledCount = tools.length - enabledCount;
+      const userDisabledCount = tools.filter(
+        (t) => t.user_enabled === false,
+      ).length;
 
       return {
         serverId,
         serverName: srvInfo?.name || serverId,
         serverStatus: srvInfo?.status || "unknown",
         tools,
+        enabledCount,
+        disabledCount,
+        userDisabledCount,
         loaded: serverId in mcpToolsByServer,
         error: mcpServerErrors[serverId] || null,
+        isServerActive,
+        isGlobalEnabled: globalMcpEnabled,
       };
     });
   }, [
@@ -425,15 +496,31 @@ export function ActiveToolsModal() {
     mcpToolsByServer,
     mcpServers,
     mcpServerErrors,
+    globalMcpEnabled,
   ]);
 
-  const totalToolCount = useMemo(
-    () =>
-      builtinTools.length + mcpGroups.reduce((acc, g) => acc + g.tools.length, 0),
-    [builtinTools, mcpGroups],
+  // Enabled MCP tools — the ones the agent can actually invoke right
+  // now. Disabled tools are still listed below (with a "Disabled"
+  // badge) so the user can see them, but they are NOT sent to the
+  // LLM and are excluded from `totalToolCount` so the header badge
+  // reflects the effective tool surface.
+  const enabledMcpCount = useMemo(
+    () => mcpGroups.reduce((acc, g) => acc + g.enabledCount, 0),
+    [mcpGroups],
   );
-
-  const mcpToolCount = totalToolCount - builtinTools.length;
+  const disabledMcpCount = useMemo(
+    () => mcpGroups.reduce((acc, g) => acc + g.disabledCount, 0),
+    [mcpGroups],
+  );
+  const userDisabledMcpCount = useMemo(
+    () => mcpGroups.reduce((acc, g) => acc + g.userDisabledCount, 0),
+    [mcpGroups],
+  );
+  const totalToolCount = useMemo(
+    () => builtinTools.length + enabledMcpCount,
+    [builtinTools, enabledMcpCount],
+  );
+  const mcpToolCount = enabledMcpCount;
   const disabledCount = toolsState?.disabled_tools.length ?? 0;
   const displayName = activeAgent?.name || "Unknown Agent";
 
@@ -470,10 +557,19 @@ export function ActiveToolsModal() {
     />
   );
 
-  const renderToolCard = (tool: DisplayTool) => (
+  const renderToolCard = (tool: DisplayTool) => {
+    // Built-in tools have no `isEffective`; treat them as always on.
+    const isEffective = tool.isEffective !== false;
+    const isUserDisabled = tool.user_enabled === false;
+
+    return (
     <div
       key={`${tool.source}:${tool.id}`}
-      className="p-3 rounded-md border border-border/80 bg-muted hover:border-primary/40 transition-colors flex items-start justify-between gap-3 shadow-xs"
+      className={`p-3 rounded-md border transition-colors flex items-start justify-between gap-3 shadow-xs ${
+        isEffective
+          ? "border-border/80 bg-muted hover:border-primary/40"
+          : "border-border/50 bg-muted/40 opacity-70 hover:opacity-100"
+      }`}
     >
       <div className="flex items-center gap-2.5 min-w-0">
         <div className="toolcallcrdIcon shrink-0 mt-0.5 flex items-center justify-center">
@@ -507,12 +603,25 @@ export function ActiveToolsModal() {
           )}
         </div>
       </div>
-      <div className="flex items-center gap-1 text-[10px] text-emerald-500 font-medium shrink-0 pt-0.5">
-        <CheckCircle2 size={12} />
-        <span>Active</span>
-      </div>
+      {isEffective ? (
+        <div className="flex items-center gap-1 text-[10px] text-emerald-500 font-medium shrink-0 pt-0.5">
+          <CheckCircle2 size={12} />
+          <span>Active</span>
+        </div>
+      ) : isUserDisabled ? (
+        <div className="flex items-center gap-1 text-[10px] text-muted-foreground font-medium shrink-0 pt-0.5">
+          <EyeOff size={12} />
+          <span>Disabled</span>
+        </div>
+      ) : (
+        <div className="flex items-center gap-1 text-[10px] text-amber-600 dark:text-amber-400 font-medium shrink-0 pt-0.5">
+          <EyeOff size={12} />
+          <span>Inactive</span>
+        </div>
+      )}
     </div>
-  );
+    );
+  };
 
   const renderMcpGroup = (group: McpGroup) => {
     const isExpanded = expandedServers.has(group.serverId);
@@ -558,13 +667,24 @@ export function ActiveToolsModal() {
                 loading
               </span>
             ) : hasError ? (
-              <span className="flex items-center gap-1 text-[10px] font-mono text-red-500 shrink-0">
+              <span
+                className={`flex items-center gap-1 text-[10px] font-mono shrink-0 ${
+                  (group.error || "").toLowerCase().includes("no cached")
+                    ? "text-amber-600 dark:text-amber-400"
+                    : "text-red-500"
+                }`}
+              >
                 <AlertCircle size={10} />
-                error
+                {(group.error || "").toLowerCase().includes("no cached")
+                  ? "setup"
+                  : "error"}
               </span>
             ) : (
               <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-primary/10 text-primary border border-primary/20 shrink-0">
-                {group.tools.length}{" "}
+                {group.enabledCount}
+                {group.disabledCount > 0 && (
+                  <span className="opacity-70">/{group.tools.length}</span>
+                )}{" "}
                 {group.tools.length === 1 ? "tool" : "tools"}
               </span>
             )}
@@ -573,6 +693,38 @@ export function ActiveToolsModal() {
 
         {isExpanded && (
           <div className="p-2 space-y-2 border-t border-border/60">
+            {!group.isGlobalEnabled && (
+              <div className="p-2.5 rounded bg-destructive/10 border border-destructive/20 text-[11px] text-destructive flex items-start gap-2">
+                <AlertCircle size={13} className="shrink-0 mt-0.5" />
+                <div>
+                  <strong>MCP Subsystem is disabled.</strong> Enable it in{" "}
+                  <a
+                    href="/settings"
+                    className="underline font-medium hover:opacity-80"
+                  >
+                    Settings → MCP
+                  </a>{" "}
+                  to use these tools.
+                </div>
+              </div>
+            )}
+
+            {group.isGlobalEnabled && !group.isServerActive && (
+              <div className="p-2.5 rounded bg-amber-500/10 border border-amber-500/20 text-[11px] text-amber-700 dark:text-amber-400 flex items-start gap-2">
+                <AlertCircle size={13} className="shrink-0 mt-0.5" />
+                <div>
+                  <strong>Server is inactive.</strong> Toggle it ON in the{" "}
+                  <a
+                    href="/stores"
+                    className="underline font-medium hover:opacity-80"
+                  >
+                    Store
+                  </a>{" "}
+                  to use these tools.
+                </div>
+              </div>
+            )}
+
             {isLoading && (
               <div className="flex items-center justify-center gap-2 py-4 text-xs text-muted-foreground">
                 <Loader2 size={12} className="animate-spin text-primary" />
@@ -581,10 +733,18 @@ export function ActiveToolsModal() {
             )}
 
             {!isLoading && hasError && (
-              <div className="p-3 rounded bg-red-500/5 border border-red-500/20 text-[11px] text-red-600 dark:text-red-400">
+              <div
+                className={`p-3 rounded text-[11px] ${
+                  (group.error || "").toLowerCase().includes("no cached")
+                    ? "bg-amber-500/5 border border-amber-500/20 text-amber-700 dark:text-amber-400"
+                    : "bg-red-500/5 border border-red-500/20 text-red-600 dark:text-red-400"
+                }`}
+              >
                 <div className="font-semibold mb-1 flex items-center gap-1">
                   <AlertCircle size={11} />
-                  Failed to load tools
+                  {(group.error || "").toLowerCase().includes("no cached")
+                    ? "Setup required"
+                    : "Failed to load tools"}
                 </div>
                 <div className="font-mono text-[10px] opacity-90 break-all">
                   {group.error}
@@ -631,9 +791,9 @@ export function ActiveToolsModal() {
         title={`View [ ${totalToolCount} ] active tools for ${displayName} `}
       >
         <Wrench size={13} className="text-primary" />
-        {disabledCount > 0 && (
+        {(disabledCount + disabledMcpCount) > 0 && (
           <span className="px-1.5 py-0.2 rounded-full text-[10px] font-mono bg-muted text-muted-foreground border border-border">
-            {disabledCount} off
+            {disabledCount + disabledMcpCount} off
           </span>
         )}
       </button>
@@ -663,7 +823,21 @@ export function ActiveToolsModal() {
                     </span>
                     {disabledCount > 0 && (
                       <span className="px-2 py-0.5 rounded text-[10px] bg-muted text-muted-foreground border border-border font-mono shrink-0">
-                        {disabledCount} disabled
+                        {disabledCount} agent-disabled
+                      </span>
+                    )}
+                    {disabledMcpCount > 0 && (
+                      <span
+                        className="px-2 py-0.5 rounded text-[10px] bg-amber-500/10 text-amber-700 dark:text-amber-300 border border-amber-500/20 font-mono shrink-0"
+                        title={
+                          !globalMcpEnabled
+                            ? "MCP subsystem is disabled in Settings → MCP"
+                            : disabledMcpCount === userDisabledMcpCount
+                            ? "All these tools are disabled in Manage Tools"
+                            : "Some servers are inactive in the Store"
+                        }
+                      >
+                        {disabledMcpCount} mcp-inactive
                       </span>
                     )}
                     {mcpToolsLoading && (

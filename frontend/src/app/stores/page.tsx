@@ -38,6 +38,7 @@ import {
 import { AgentBuilderModal } from "./_modals/AgentBuilderModal";
 import { UploadModal } from "./_modals/UploadModal";
 import { MCPSettingsModal } from "./_modals/MCPSettingsModal";
+import { MCPToolsModal } from "@/app/stores/_modals/MCPToolsModal";
 
 /**
  * Store page orchestrator.
@@ -201,6 +202,7 @@ export default function StoresPage() {
                   onToggleExtension={extensionActions.handleToggleExtension}
                   onTestExtension={extensionActions.handleTestExtension}
                   onConfigureExtension={extensionActions.handleOpenConfigure}
+                  onManageToolsExtension={extensionActions.handleOpenManageTools}
                   onDeleteExtension={extensionActions.handleDeleteExtension}
                 />
               )}
@@ -292,6 +294,15 @@ export default function StoresPage() {
         onClose={extensionActions.handleCloseConfigure}
         onSaved={reload}
       />
+
+            {/* MCP Tools management modal */}
+      <MCPToolsModal
+        open={extensionActions.isToolsModalOpen}
+        serverId={extensionActions.managingToolsExtension?.id ?? null}
+        serverName={extensionActions.managingToolsExtension?.name ?? ""}
+        onClose={extensionActions.handleCloseManageTools}
+      />
+
     </div>
   );
 }

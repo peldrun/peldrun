@@ -299,12 +299,17 @@ class McpSessionPool:
                 )
 
             executable, args = self._build_command_args(command, settings, workspace_root)
+            from omweb.extensions.mcp_subsystem_settings import (
+                get_startup_timeout_seconds as _startup_timeout,
+            )
             transport = StdioTransport(
                 command=executable,
                 args=args,
                 env=env_vars if env_vars else None,
                 cwd=workspace_root,
-                timeout=float(manifest.get("timeout", 30.0)),
+                timeout=float(
+                    manifest.get("timeout") or _startup_timeout()
+                ),
             )
             # Note: oauth_token is intentionally NOT forwarded to a
             # stdio subprocess — it is an HTTP-layer credential.
@@ -331,10 +336,15 @@ class McpSessionPool:
                 headers["Authorization"] = f"{token_type} {oauth_token}"
 
             if transport_type == "sse" and SSETransport is not None:
+                from omweb.extensions.mcp_subsystem_settings import (
+                    get_startup_timeout_seconds as _startup_timeout,
+                )
                 transport = SSETransport(
                     url=target_url,
                     headers=headers,
-                    timeout=float(manifest.get("timeout", 30.0)),
+                    timeout=float(
+                        manifest.get("timeout") or _startup_timeout()
+                    ),
                 )
                 return transport, None, None
 
@@ -464,26 +474,72 @@ class McpSessionPool:
         env_override: Optional[Dict[str, str]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Return the discovered tool list for a server, using a per-server cache.
+        Return the discovered tool list for a server.
 
-        Unlike probe_connection (which is a one-shot diagnostic), this
-        method is intended for the hot path: it does NOT spawn a fresh
-        subprocess on every call and it does NOT silently swallow errors.
-        A failed tools/list raises — callers may then surface the error
-        or fall back to a degraded toolset. Failed probes are never cached.
+        Layered cache strategy:
 
-        Cache invalidation channels:
-          * Explicit: invalidate_cache(server_id) — invoked by
-            ExtensionRegistry.save_extension / toggle_status when the
-            transport configuration changes.
-          * TTL fallback: after `cache_ttl_seconds` a fresh tools/list
-            is issued on the next call.
+          1. Subsystem kill-switch check — returns [] immediately when
+             `enabled=False` in MCP subsystem settings.
+          2. Persistent cache (survives backend restarts) — fast path,
+             no disk I/O beyond reading one small JSON file.
+          3. In-memory per-credential cache — fast path within a single
+             process lifecycle (short TTL, ~5 minutes).
+          4. Live discovery — spawns the subprocess, calls tools/list,
+             merges result into the persistent cache (preserving
+             per-tool `user_enabled` decisions), and mirrors the merged
+             list into the in-memory cache.
+
+        The returned list includes a `user_enabled` boolean per tool.
+        The caller (peldrun_engine) uses it to decide whether to
+        advertise the tool to the LLM. Disabled tools are still
+        returned so the "Manage Tools" UI can display the full set.
+
+        Set ``force_refresh=True`` to bypass both caches and re-probe
+        the server (used by the "Refresh Tools" button in the UI).
+
+        A failed ``tools/list`` raises. Failed probes are never cached;
+        only successful discoveries update the persistent cache.
         """
-        # Cache key includes the creds hash so two users of the same
-        # server do not cross-pollute tool lists. Some MCP servers
-        # expose a different tool surface based on the authenticated
-        # scope; treating the cache as per-credential is the safe
-        # default.
+        # Lazy imports keep mcp_pool importable without dragging the
+        # whole settings/cache stack at module load time.
+        from omweb.extensions.mcp_subsystem_settings import (
+            is_enabled as _subsystem_enabled,
+            get_tool_cache_ttl_seconds,
+            get_max_tools_per_server,
+            is_send_all_by_default,
+        )
+        from omweb.extensions.mcp_tool_cache import (
+            compute_config_hash,
+            load_cache as _load_persistent_cache,
+            is_cache_fresh,
+            store_discovered_tools,
+        )
+
+        # ── 1. Subsystem kill switch ─────────────────────────────
+        if not _subsystem_enabled():
+            logger.debug(
+                "MCP subsystem is disabled; returning [] for '%s'.",
+                server_id,
+            )
+            return []
+
+        config_hash = compute_config_hash(manifest)
+        ttl_seconds = get_tool_cache_ttl_seconds()
+
+        # ── 2. Persistent cache fast path ────────────────────────
+        if not force_refresh:
+            persistent = _load_persistent_cache(server_id)
+            if is_cache_fresh(persistent, config_hash, ttl_seconds):
+                age = time.time() - float(persistent.get("fetched_at", 0))
+                logger.debug(
+                    "Persistent cache HIT for '%s' (age: %.1fs, tools: %d).",
+                    server_id,
+                    age,
+                    len(persistent.get("tools", [])),
+                )
+                return list(persistent["tools"])
+
+        # ── 3. In-memory cache fast path ─────────────────────────
         creds_hash = _compute_creds_hash(env_override)
         cache_key = f"{server_id}:{creds_hash}" if creds_hash else server_id
 
@@ -492,8 +548,7 @@ class McpSessionPool:
             if cached and (time.monotonic() - cached["fetched_at"]) < self._cache_ttl:
                 return list(cached["tools"])
 
-        # Serialise concurrent probes for the same server so N callers
-        # produce 1 network round-trip instead of N.
+        # ── 4. Live discovery ────────────────────────────────────
         probe_key = f"tool_probe:{server_id}"
         async with self._global_lock:
             if probe_key not in self._locks:
@@ -501,8 +556,13 @@ class McpSessionPool:
             probe_lock = self._locks[probe_key]
 
         async with probe_lock:
-            # Double-check under lock (another caller may have just populated it).
+            # Double-check both caches under the lock so concurrent
+            # callers collapse into a single discovery.
             if not force_refresh:
+                persistent = _load_persistent_cache(server_id)
+                if is_cache_fresh(persistent, config_hash, ttl_seconds):
+                    return list(persistent["tools"])
+
                 cached = self._tool_cache.get(cache_key)
                 if cached and (time.monotonic() - cached["fetched_at"]) < self._cache_ttl:
                     return list(cached["tools"])
@@ -514,19 +574,21 @@ class McpSessionPool:
                 env_override=env_override,
             )
 
-            # Direct JSON-RPC call so that failures are surfaced to the
-            # caller — MCPClient.discover_tools would silently return [].
+            # Direct JSON-RPC call so failures surface to the caller.
             result = await client._send_jsonrpc_request("tools/list")
             raw_tools = result.get("tools", []) if isinstance(result, dict) else []
 
-            tools: List[Dict[str, Any]] = []
+            # Cap at max_tools_per_server to protect against a
+            # malformed server that returns thousands of entries.
+            max_tools = get_max_tools_per_server()
+            discovered: List[Dict[str, Any]] = []
             for td in raw_tools:
                 if not isinstance(td, dict):
                     continue
                 name = td.get("name")
                 if not name:
                     continue
-                tools.append({
+                discovered.append({
                     "name": str(name),
                     "description": str(td.get("description") or ""),
                     "parameters": td.get("inputSchema") or {
@@ -535,27 +597,88 @@ class McpSessionPool:
                         "required": [],
                     },
                 })
+                if len(discovered) >= max_tools:
+                    logger.warning(
+                        "Server '%s' returned more tools than max_tools_per_server=%d; capping.",
+                        server_id,
+                        max_tools,
+                    )
+                    break
 
+            # Merge into persistent cache (preserves per-tool
+            # user_enabled decisions; new tools default per
+            # send_all_tools_by_default).
+            default_enabled = is_send_all_by_default()
+            merged = store_discovered_tools(
+                server_id,
+                config_hash,
+                discovered,
+                default_enabled,
+            )
+
+            # Mirror into in-memory cache so subsequent calls in the
+            # same process avoid touching the disk.
             self._tool_cache[cache_key] = {
-                "tools": tools,
+                "tools": merged,
                 "fetched_at": time.monotonic(),
             }
+
             logger.info(
-                "Cached %d tool(s) for server '%s' (workspace: %s)",
-                len(tools),
+                "Discovered %d tool(s) for '%s' (enabled: %d, disabled: %d).",
+                len(merged),
                 server_id,
-                workspace_root or "default",
+                sum(1 for t in merged if t.get("user_enabled")),
+                sum(1 for t in merged if not t.get("user_enabled")),
             )
-            return list(tools)
+
+            # Lazy-start behavior: when enabled, close the discovery
+            # subprocess so it does not sit idle. The next tool call
+            # will spawn fresh. Best-effort — a failure to close does
+            # not affect the returned tool list.
+            try:
+                from omweb.extensions.mcp_subsystem_settings import (
+                    is_lazy_start_enabled as _is_lazy,
+                )
+
+                if _is_lazy():
+                    await self.close_session(server_id, workspace_root)
+                    logger.debug(
+                        "Lazy start: closed discovery session for '%s'.",
+                        server_id,
+                    )
+            except Exception as lazy_err:  # noqa: BLE001
+                logger.debug(
+                    "Lazy-start cleanup notice for '%s': %s",
+                    server_id,
+                    lazy_err,
+                )
+
+            return list(merged)
 
     async def invalidate_cache(self, server_id: str) -> None:
         """
-        Drop every cached tool list for the given server, regardless
-        of credential variant. Used when the server's configuration
-        changes in a way that could invalidate every cred-scoped
-        cache entry at once (bundle reinstall, settings update,
-        status toggle).
+        Drop every cached tool list for the given server, in BOTH the
+        in-memory cache and the persistent on-disk cache.
+
+        Used when the server's configuration changes in a way that
+        could invalidate every cred-scoped entry at once (bundle
+        reinstall, settings update, status toggle).
         """
+        # 1. Drop the persistent cache file (best-effort).
+        try:
+            from omweb.extensions.mcp_tool_cache import (
+                invalidate as _invalidate_persistent,
+            )
+
+            _invalidate_persistent(server_id)
+        except Exception as persist_err:  # noqa: BLE001
+            logger.debug(
+                "Failed to invalidate persistent cache for '%s': %s",
+                server_id,
+                persist_err,
+            )
+
+        # 2. Drop every in-memory cred-scoped variant.
         prefix = f"{server_id}:"
         async with self._global_lock:
             keys_to_drop = [
@@ -572,10 +695,27 @@ class McpSessionPool:
         Used by ``McpBundleManager.install_bundle`` (synchronous by
         contract) to evict every cred-scoped variant of a stale tool
         list when a bundle is being re-uploaded under the same id.
-        The underlying dict mutations are atomic under the GIL, so no
-        lock is required here — and acquiring the async lock from a
-        sync context is impossible without an event loop.
+
+        Invalidates BOTH the persistent on-disk cache and the
+        in-memory cache. The underlying dict mutations are atomic under
+        the GIL, so no lock is required here — and acquiring the async
+        lock from a sync context is impossible without an event loop.
         """
+        # 1. Persistent cache (best-effort).
+        try:
+            from omweb.extensions.mcp_tool_cache import (
+                invalidate as _invalidate_persistent,
+            )
+
+            _invalidate_persistent(server_id)
+        except Exception as persist_err:  # noqa: BLE001
+            logger.debug(
+                "Failed to invalidate persistent cache for '%s': %s",
+                server_id,
+                persist_err,
+            )
+
+        # 2. In-memory cred-scoped variants.
         prefix = f"{server_id}:"
         keys_to_drop = [
             k for k in list(self._tool_cache.keys())
@@ -588,25 +728,47 @@ class McpSessionPool:
         self, server_id: str
     ) -> Optional[List[Dict[str, Any]]]:
         """
-        Return the cached tool list for a server without any I/O.
+        Return the cached tool list for a server without spawning a
+        subprocess.
 
-        Used by the delegation resolver (which is synchronous by design
-        and does not know the caller's credential context) to expand
-        bare server IDs into concrete MCP tool IDs. Any fresh
-        cred-scoped entry is returned; if only stale entries exist,
-        ``None`` is returned so the caller falls back gracefully.
+        Layered lookup:
+          1. In-memory entry for the bare server id.
+          2. Any fresh cred-scoped in-memory variant.
+          3. Persistent on-disk cache (used by the delegation resolver,
+             which is synchronous and cannot `await` a live probe).
+
+        Returns ``None`` when no cache (memory or disk) is available,
+        so the caller can fall back gracefully.
         """
+        # 1. In-memory (default key).
         cached = self._tool_cache.get(server_id)
         if cached and (time.monotonic() - cached["fetched_at"]) < self._cache_ttl:
             return list(cached["tools"])
 
-        # Try any cred-scoped variant.
+        # 2. Any fresh cred-scoped in-memory variant.
         prefix = f"{server_id}:"
         for key, entry in self._tool_cache.items():
             if key.startswith(prefix) and (
                 time.monotonic() - entry["fetched_at"]
             ) < self._cache_ttl:
                 return list(entry["tools"])
+
+        # 3. Persistent on-disk fallback (survives restarts).
+        try:
+            from omweb.extensions.mcp_tool_cache import (
+                load_cache as _load_persistent_cache,
+            )
+
+            persistent = _load_persistent_cache(server_id)
+            if persistent and isinstance(persistent.get("tools"), list):
+                return list(persistent["tools"])
+        except Exception as persist_err:  # noqa: BLE001
+            logger.debug(
+                "Persistent cache read failed for '%s': %s",
+                server_id,
+                persist_err,
+            )
+
         return None
 
     # ─────────────────────────────────────────────────────────────

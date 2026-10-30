@@ -10,6 +10,7 @@ import {
   Play,
   Settings,
   Trash2,
+  Wrench,
   XCircle,
 } from "lucide-react";
 import type { ExtensionDefinition } from "@/lib/types";
@@ -33,6 +34,7 @@ export interface ExtensionCardProps {
   onToggle: (extId: string) => void;
   onTest: (extId: string) => void;
   onConfigure?: (extension: ExtensionDefinition) => void;
+  onManageTools?: (extension: ExtensionDefinition) => void;
   onDelete?: (extId: string) => void;
 }
 
@@ -54,6 +56,7 @@ export function ExtensionCard({
   onToggle,
   onTest,
   onConfigure,
+  onManageTools,
   onDelete,
 }: ExtensionCardProps) {
   const isActive = extension.status === "active";
@@ -163,6 +166,18 @@ export function ExtensionCard({
             >
               <Settings size={11} className="text-muted-foreground" />
               <span>Settings</span>
+            </button>
+          )}
+
+          {onManageTools && (
+            <button
+              type="button"
+              onClick={() => onManageTools(extension)}
+              className="flex items-center gap-1 text-[11px] px-2.5 py-1 rounded border border-border bg-card hover:bg-muted text-foreground transition cursor-pointer font-medium"
+              title="Manage tools for this MCP server"
+            >
+              <Wrench size={11} className="text-muted-foreground" />
+              <span>Tools</span>
             </button>
           )}
 
