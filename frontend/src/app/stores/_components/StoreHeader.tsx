@@ -34,11 +34,11 @@ function ActionButton({ action }: { action: HeaderAction }) {
     string
   > = {
     primary:
-      "bg-primary hover:bg-primary/90 text-primary-foreground border border-transparent shadow-xs",
+      "!bg-black !text-[#fff] hover:!bg-rb/80 hover:shadow-md",
     outline:
-      "border border-border bg-muted/50 hover:bg-muted text-foreground shadow-xs",
+      "",
     ghost:
-      "border border-transparent hover:bg-muted text-foreground",
+      "",
   };
 
   const variant = action.variant ?? "primary";

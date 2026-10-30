@@ -2,7 +2,7 @@
 
 "use client";
 
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import type { BundleEntry } from "@/lib/bundleApi";
 import { ToastContainer } from "@/components/ui/ToastNotification";
 import { BundleUploadModal } from "@/components/store/BundleUploadModal";
@@ -39,6 +39,7 @@ import { AgentBuilderModal } from "./_modals/AgentBuilderModal";
 import { UploadModal } from "./_modals/UploadModal";
 import { MCPSettingsModal } from "./_modals/MCPSettingsModal";
 import { MCPToolsModal } from "@/app/stores/_modals/MCPToolsModal";
+import { MCPDetailDrawer } from "./_components/MCPDetailDrawer";
 
 /**
  * Store page orchestrator.
@@ -64,6 +65,7 @@ export default function StoresPage() {
   // Bundle-specific UI state (drawer + upload modal).
   const [detailsBundle, setDetailsBundle] = useState<BundleEntry | null>(null);
   const [isBundleUploadOpen, setIsBundleUploadOpen] = useState(false);
+  const [isMcpGloballyDisabled, setIsMcpGloballyDisabled] = useState(false);
 
   // ── Data layer ──────────────────────────────────────────────────
   const {
@@ -87,6 +89,16 @@ export default function StoresPage() {
     detailsBundle,
     setDetailsBundle,
   });
+
+  // ── Effects ─────────────────────────────────────────────────────
+  useEffect(() => {
+    fetch("/api/mcp/settings")
+      .then((res) => res.json())
+      .then((data) => {
+        setIsMcpGloballyDisabled(data?.settings?.enabled === false);
+      })
+      .catch(() => {});
+  }, [reload]);
 
   // ── Derived layout data ─────────────────────────────────────────
   const counts: Record<SectionId, number> = {
@@ -203,7 +215,9 @@ export default function StoresPage() {
                   onTestExtension={extensionActions.handleTestExtension}
                   onConfigureExtension={extensionActions.handleOpenConfigure}
                   onManageToolsExtension={extensionActions.handleOpenManageTools}
+                  onOpenDetailsExtension={extensionActions.handleOpenDetails}
                   onDeleteExtension={extensionActions.handleDeleteExtension}
+                  isMcpGloballyDisabled={isMcpGloballyDisabled}
                 />
               )}
             </div>
@@ -301,6 +315,13 @@ export default function StoresPage() {
         serverId={extensionActions.managingToolsExtension?.id ?? null}
         serverName={extensionActions.managingToolsExtension?.name ?? ""}
         onClose={extensionActions.handleCloseManageTools}
+      />
+
+      {/* MCP Details Drawer */}
+      <MCPDetailDrawer
+        open={extensionActions.isDetailsDrawerOpen}
+        extension={extensionActions.detailsExtension}
+        onClose={extensionActions.handleCloseDetails}
       />
 
     </div>

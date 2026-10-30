@@ -64,13 +64,28 @@ class ExtensionRegistry:
             raise
 
     def _load_ext_from_file(self, file_path: Path, is_builtin: bool) -> Optional[Dict[str, Any]]:
-        """Load and sanitize extension manifest from disk."""
+        """
+        Load and sanitize extension manifest from disk.
+
+        Identity rule: an extension is considered *builtin* if a
+        matching manifest exists under ``builtins/``. The custom-dir
+        copy (created by ``toggle_status``) is a state store only —
+        it must not degrade a builtin to "custom". This keeps the UI
+        badge, the delete-gate, and the code paths that guard builtin
+        manifests consistent across toggles.
+        """
         try:
             data = json.loads(file_path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 return None
             data.setdefault("id", file_path.stem)
-            data["is_builtin"] = is_builtin
+
+            ext_id = str(data["id"])
+            has_builtin = (self.builtin_dir / f"{ext_id}.json").exists()
+            # The presence of a builtin manifest is authoritative;
+            # the caller-provided flag is only a fallback when no
+            # builtin exists (i.e. for genuinely custom servers).
+            data["is_builtin"] = True if has_builtin else bool(is_builtin)
             return data
         except Exception as exc:
             logger.debug("Could not parse extension manifest from '%s': %s", file_path, exc)
@@ -127,14 +142,21 @@ class ExtensionRegistry:
         return effective
 
     def toggle_status(self, ext_id: str) -> Dict[str, Any]:
-        """Toggle an extension or server status between active and ready."""
+        """
+        Toggle an extension or server status between active and ready.
+
+        Identity (``is_builtin``) is intentionally NOT mutated here.
+        The custom-dir copy is just a state store — ``_load_ext_from_file``
+        determines builtin-ness from the presence of ``builtins/{id}.json``,
+        so a toggled builtin remains a builtin in the UI.
+        """
         ext = self.get_extension(ext_id)
         if not ext:
             return {"error": f"Extension '{ext_id}' not found"}
 
         new_status = "ready" if ext.get("status") == "active" else "active"
         ext["status"] = new_status
-        ext["is_builtin"] = False
+        # Do NOT touch is_builtin — see the docstring above.
 
         target_file = self.custom_dir / f"{ext_id}.json"
         self._atomic_write_json(target_file, ext)

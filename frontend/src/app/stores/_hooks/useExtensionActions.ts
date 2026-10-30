@@ -18,6 +18,8 @@ export interface UseExtensionActionsArgs {
   setExtensions: React.Dispatch<React.SetStateAction<ExtensionDefinition[]>>;
 }
 
+
+
 /**
  * Return type of {@link useExtensionActions}.
  */
@@ -46,7 +48,17 @@ export interface UseExtensionActionsResult {
   isToolsModalOpen: boolean;
   handleOpenManageTools: (ext: ExtensionDefinition) => void;
   handleCloseManageTools: () => void;
+
+    // Details Drawer
+  detailsExtension: ExtensionDefinition | null;
+  isDetailsDrawerOpen: boolean;
+  handleOpenDetails: (ext: ExtensionDefinition) => void;
+  handleCloseDetails: () => void;
+
 }
+
+
+
 
 /**
  * Encapsulates actions related to the Extensions & MCP section:
@@ -65,6 +77,7 @@ export function useExtensionActions({
   const [testResults, setTestResults] = useState<McpTestResultMap>({});
   const [configuringExtension, setConfiguringExtension] = useState<ExtensionDefinition | null>(null);
   const [managingToolsExtension, setManagingToolsExtension] = useState<ExtensionDefinition | null>(null);
+  const [detailsExtension, setDetailsExtension] = useState<ExtensionDefinition | null>(null);
 
   /**
    * Toggle the status of an MCP server.
@@ -180,6 +193,14 @@ export function useExtensionActions({
     setManagingToolsExtension(null);
   }, []);
 
+  const handleOpenDetails = useCallback((ext: ExtensionDefinition) => {
+    setDetailsExtension(ext);
+  }, []);
+
+  const handleCloseDetails = useCallback(() => {
+    setDetailsExtension(null);
+  }, []);
+
   return {
     togglingExtId,
     handleToggleExtension,
@@ -197,5 +218,10 @@ export function useExtensionActions({
     isToolsModalOpen: Boolean(managingToolsExtension),
     handleOpenManageTools,
     handleCloseManageTools,
+    // Details Drawer
+    detailsExtension,
+    isDetailsDrawerOpen: Boolean(detailsExtension),
+    handleOpenDetails,
+    handleCloseDetails,
   };
 }

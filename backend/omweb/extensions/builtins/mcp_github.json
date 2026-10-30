@@ -1,13 +1,79 @@
 {
+  "$schema": "https://peldrun.ai/schemas/mcp-server/v1.json",
+
   "id": "mcp_github",
+  "registry_id": "io.peldrun/mcp_github",
   "name": "MCP GitHub Integration",
   "type": "mcp_server",
   "status": "ready",
-  "command": "npx -y @modelcontextprotocol/server-github",
+
+  "icon_svg": "<svg role=\"img\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\"><title>GitHub</title><path fill=\"currentColor\" d=\"M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12\"/></svg>",
+  "icon_url": "https://static.peldrun.ai/icons/mcp_github.svg",
+
+  "short_description": "Inspect repos, fetch issues, open PRs, and automate commits directly from your agent.",
+  "store_description": "Connects the agent to the GitHub REST API through the official MCP server. Supports repository inspection, file CRUD, branch management, issue and pull-request lifecycles, code search, and commit automation. Requires a Personal Access Token (classic: `repo` scope, or fine-grained: `Contents: Read and Write`). Read-only usage only needs `public_repo` / `Contents: Read`. Tokens are encrypted at rest per-chat and never written to logs.",
+
   "description": "Enables repository inspection, issues retrieval, and commit automation.",
+  "category": "development",
+  "tags": ["git", "github", "repositories", "issues", "pull-requests", "code-search", "ci-cd"],
+
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+  "signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+
+  "repository": {
+    "url": "https://github.com/modelcontextprotocol/servers/tree/main/src/github",
+    "source": "github"
+  },
+  "upstream": {
+    "name": "@modelcontextprotocol/server-github",
+    "registry": "npm",
+    "registry_url": "https://www.npmjs.com/package/@modelcontextprotocol/server-github",
+    "version": "0.6.2",
+    "license": "MIT"
+  },
+
+  "homepage": "https://peldrun.ai/mcp/github",
+  "docs_url": "https://docs.peldrun.ai/mcp/github",
+  "demo_url": null,
+  "changelog_url": "https://peldrun.ai/mcp/github/changelog",
+  "support_url": "https://peldrun.ai/support",
+  "screenshots": [],
+  "banner_url": null,
+
+  "license": "proprietary",
+  "license_url": "https://peldrun.ai/license",
+  "terms_url": "https://peldrun.ai/terms",
+  "privacy_url": "https://peldrun.ai/privacy",
+
+  "version": "1.0.0",
+  "release_date": "2025-01-15",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "lifecycle_status": "active",
+
   "is_builtin": true,
-  "read_only": true,
+  "read_only": false,
+  "command": "npx -y @modelcontextprotocol/server-github",
+  "transport": "stdio",
+  "runtime": "node",
   "auth_strategy": "env",
+  "hosting_type": "local",
+
+  "capabilities": {
+    "tools": true,
+    "resources": false,
+    "prompts": false
+  },
+  "tool_count": 26,
+
+  "badges": ["official", "verified", "requires-token", "writes-data"],
+
   "env_schema": {
     "type": "object",
     "required": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
@@ -15,9 +81,19 @@
       "GITHUB_PERSONAL_ACCESS_TOKEN": {
         "type": "string",
         "title": "GitHub Personal Access Token",
-        "description": "Classic or fine-grained PAT with 'repo' scope. Create one at https://github.com/settings/tokens",
+        "description": "Classic PAT needs 'repo' for write ops, 'public_repo' for read-only. Fine-grained: 'Contents: Read and write'. Create at https://github.com/settings/tokens",
         "secret": true
       }
     }
+  },
+
+  "hints": {
+    "setup_time": "1 minute",
+    "requires_account": true,
+    "requires_token": true,
+    "cost": "free",
+    "data_access": "read-write",
+    "network_access": true,
+    "rate_limit": "5,000 req/hour authenticated"
   }
 }

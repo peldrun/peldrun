@@ -1,10 +1,98 @@
 {
+  "$schema": "https://peldrun.ai/schemas/mcp-server/v1.json",
+
   "id": "mcp_filesystem",
+  "registry_id": "io.peldrun/mcp_filesystem",
   "name": "MCP Local Filesystem",
   "type": "mcp_server",
   "status": "active",
-  "command": "npx -y @modelcontextprotocol/server-filesystem",
+
+  "icon_svg": "<svg role=\"img\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\"><title>Filesystem</title><path fill=\"currentColor\" d=\"M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z\"/></svg>",
+  "icon_url": "https://static.peldrun.ai/icons/mcp_filesystem.svg",
+
+  "short_description": "Give agents safe, sandboxed access to specific local directories for reading and writing files.",
+  "store_description": "Exposes a strict allowlist of local directories to the agent through the official filesystem MCP server. Every operation is bound to the configured paths — symlink escapes and directory traversal are rejected. Supports reading, writing, editing, moving, and searching files. Requires at least one absolute directory path; without it, the server refuses to start.",
+
   "description": "Exposes local filesystem directories safely to agents.",
+  "category": "system",
+  "tags": ["files", "filesystem", "local", "filesystem-access", "sandbox"],
+
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+  "signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+
+  "repository": {
+    "url": "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem",
+    "source": "github"
+  },
+  "upstream": {
+    "name": "@modelcontextprotocol/server-filesystem",
+    "registry": "npm",
+    "registry_url": "https://www.npmjs.com/package/@modelcontextprotocol/server-filesystem",
+    "version": "0.6.2",
+    "license": "MIT"
+  },
+
+  "homepage": "https://peldrun.ai/mcp/filesystem",
+  "docs_url": "https://docs.peldrun.ai/mcp/filesystem",
+  "demo_url": null,
+  "changelog_url": "https://peldrun.ai/mcp/filesystem/changelog",
+  "support_url": "https://peldrun.ai/support",
+  "screenshots": [],
+  "banner_url": null,
+
+  "license": "proprietary",
+  "license_url": "https://peldrun.ai/license",
+  "terms_url": "https://peldrun.ai/terms",
+  "privacy_url": "https://peldrun.ai/privacy",
+
+  "version": "1.0.0",
+  "release_date": "2025-01-15",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "lifecycle_status": "active",
+
   "is_builtin": true,
-  "read_only": true
+  "read_only": false,
+  "command": "npx -y @modelcontextprotocol/server-filesystem",
+  "transport": "stdio",
+  "runtime": "node",
+  "auth_strategy": "none",
+  "hosting_type": "local",
+
+  "capabilities": {
+    "tools": true,
+    "resources": true,
+    "prompts": false
+  },
+  "tool_count": 11,
+
+  "badges": ["official", "verified", "local-only", "writes-data"],
+
+  "settings_schema": {
+    "type": "object",
+    "properties": {
+      "allowed_directories": {
+        "type": "array",
+        "items": { "type": "string" },
+        "title": "Allowed Directories",
+        "description": "Absolute paths the server may access. Required — refuses to start without at least one directory.",
+        "default": []
+      }
+    }
+  },
+
+  "hints": {
+    "setup_time": "30 seconds",
+    "requires_account": false,
+    "requires_token": false,
+    "cost": "free",
+    "data_access": "read-write",
+    "network_access": false
+  }
 }
