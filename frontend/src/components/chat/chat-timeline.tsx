@@ -145,7 +145,7 @@ function TimelineToolCall({ evt }: { evt: StepEvent }) {
   );
 }
 
-export function ChatTimeline({
+function ChatTimelineInner({
   prefix,
   groupedSteps,
   isCurrentActive = false,
@@ -254,4 +254,112 @@ export function ChatTimeline({
   );
 }
 
+// ---------------------------------------------------------------------------
+// Memoization — custom comparison
+// ---------------------------------------------------------------------------
+//
+// Why a custom comparison instead of React.memo's default shallow compare?
+//
+//   `ChatThread` rebuilds `filteredGroupedSteps` on EVERY render (see the
+//   `Object.fromEntries(...)` call there), so the `groupedSteps` prop is a
+//   fresh object each time the parent re-renders — even when the underlying
+//   content is byte-identical. This happens at least once per second due to
+//   `elapsedSeconds` updates, and on every unrelated state change (hover,
+//   tooltip, selection, etc.).
+//
+//   Default shallow comparison would therefore never skip a render, defeating
+//   the purpose of memoization. The custom comparator below walks the step
+//   array and compares per-event identity + content: O(events) with tiny
+//   constants (string identity checks), versus the full render cost of
+//   re-running MarkdownRenderer over every historical event.
+//
+// What this fixes:
+//   * Timer ticks (elapsedSeconds updates) no longer trigger a full timeline
+//     re-render.
+//   * Hover / tooltip / selection state in `ChatThread` no longer cascades
+//     into `ChatTimeline`.
+//
+// What this does NOT fix:
+//   * Intra-step streaming (20-40 tokens/second). Each token arrives as a new
+//     `StepEvent`, so `groupedSteps` content genuinely changes and the memo
+//     correctly re-renders. Per-step memoization is the next optimization.
+// ---------------------------------------------------------------------------
+
+function areExpandedStepsEqual(
+  a: Record<string, boolean>,
+  b: Record<string, boolean>
+): boolean {
+  if (a === b) return true;
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  for (const k of aKeys) {
+    if (a[k] !== b[k]) return false;
+  }
+  return true;
+}
+
+function areGroupedStepsEqual(
+  a: Record<number, StepEvent[]>,
+  b: Record<number, StepEvent[]>
+): boolean {
+  if (a === b) return true;
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+
+  for (const rawKey of aKeys) {
+    const key = Number(rawKey);
+    const arrA = a[key];
+    const arrB = b[key];
+
+    if (!arrB) return false;
+    // Fast path: same array reference means the parent did not rebuild this
+    // step's event list. This is common for historical steps when only the
+    // active step is growing.
+    if (arrA === arrB) continue;
+    if (arrA.length !== arrB.length) return false;
+
+    for (let i = 0; i < arrA.length; i++) {
+      const ea = arrA[i];
+      const eb = arrB[i];
+      if (
+        ea.id !== eb.id ||
+        ea.type !== eb.type ||
+        ea.content !== eb.content ||
+        ea.toolName !== eb.toolName ||
+        ea.step !== eb.step
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function areChatTimelinePropsEqual(
+  prev: ChatTimelineProps,
+  next: ChatTimelineProps
+): boolean {
+  if (prev.prefix !== next.prefix) return false;
+  if (prev.isCurrentActive !== next.isCurrentActive) return false;
+  if (prev.currentStepNum !== next.currentStepNum) return false;
+  if (prev.isRunning !== next.isRunning) return false;
+  // `toggleStep` must be stable (useCallback with empty deps in ChatThread).
+  // If a future refactor breaks that contract, we fall back to re-rendering
+  // rather than risk rendering with a stale closure.
+  if (prev.toggleStep !== next.toggleStep) return false;
+  if (!areExpandedStepsEqual(prev.expandedSteps, next.expandedSteps)) return false;
+  if (!areGroupedStepsEqual(prev.groupedSteps, next.groupedSteps)) return false;
+  return true;
+}
+
+const ChatTimeline = React.memo(
+  ChatTimelineInner,
+  areChatTimelinePropsEqual
+);
+
+ChatTimeline.displayName = "ChatTimeline";
+
+export { ChatTimeline };
 export default ChatTimeline;

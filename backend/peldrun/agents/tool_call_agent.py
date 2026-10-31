@@ -36,6 +36,97 @@ from peldrun.tools.contract import ToolExecutionPolicy
 logger = logging.getLogger("peldrun.agents.tool_call_agent")
 
 
+# ---------------------------------------------------------------------------
+# Loop detection thresholds
+# ---------------------------------------------------------------------------
+# Detects when the LLM calls the same tool with identical arguments for
+# N consecutive steps. Three is the safe minimum: a legitimate agent
+# rarely calls the same tool identically twice in a row, and three
+# consecutive identical calls are essentially always a loop.
+_LOOP_DETECTION_WINDOW: int = 3
+
+
+# ---------------------------------------------------------------------------
+# OOM detection helper
+# ---------------------------------------------------------------------------
+def _is_oom_error(exc: BaseException) -> bool:
+    """
+    Detect provider out-of-memory errors.
+
+    Kept in sync with the helper in ``peldrun.llm.client``. Duplicated
+    here rather than imported to keep the coupling between the agent
+    loop and the LLM transport minimal — a change in either module
+    should not silently break the other.
+    """
+    if exc is None:
+        return False
+    err_str = str(exc).lower()
+    if not err_str:
+        return False
+    patterns = (
+        "bad allocation",
+        "out of memory",
+        "cuda out of memory",
+        "insufficient memory",
+        "memory exhausted",
+        "cannot allocate",
+        "oom error",
+    )
+    return any(p in err_str for p in patterns)
+
+
+# ---------------------------------------------------------------------------
+# Observation truncation for tool outputs
+# ---------------------------------------------------------------------------
+# Tool observations are appended verbatim to ``self.messages`` and to
+# ``state.messages`` — both of which are re-sent to the LLM on every
+# subsequent step. A single 20 KB observation therefore costs ~5 KB of
+# context per step, multiplied by every remaining step in the run.
+#
+# The per-tool limits below keep the LLM's working context bounded while
+# preserving the top results that matter most. The full observation is
+# still recorded in ``state.tool_history`` (for audit) and in the SSE
+# event stream (for UI) — only the conversation-history copy is capped.
+_OBSERVATION_TRUNCATION_LIMITS: Dict[str, int] = {
+    "web_search": 3000,        # ~750 tokens — enough for top 3-5 results
+    "web_fetch": 5000,
+    "http_fetch": 5000,
+    "browser_interactive": 4000,
+    "bash": 4000,
+    "python_execute": 4000,
+}
+_DEFAULT_OBSERVATION_LIMIT: int = 8000
+
+
+def _truncate_observation(tool_name: str, output: str) -> str:
+    """
+    Truncate a tool observation for inclusion in the conversation history.
+
+    Preserves the beginning (first ~70% of the limit) and the tail (last
+    ~20%) so that both results lists and trailing error messages survive.
+    The middle section — typically redundant results 6..N of a search
+    query, or the bulk of a large file listing — is dropped with a clear
+    marker so the LLM knows to refine the call if more detail is needed.
+    """
+    if not output:
+        return output
+    limit = _OBSERVATION_TRUNCATION_LIMITS.get(
+        (tool_name or "").lower(), _DEFAULT_OBSERVATION_LIMIT
+    )
+    if len(output) <= limit:
+        return output
+    head_len = int(limit * 0.7)
+    tail_len = int(limit * 0.2)
+    head = output[:head_len]
+    tail = output[-tail_len:] if tail_len > 0 else ""
+    return (
+        f"{head}\n\n"
+        f"... [observation truncated: {len(output)} chars → ~{limit} chars, "
+        f"mid-section omitted. If more detail is needed, refine the call.] ...\n\n"
+        f"{tail}"
+    )
+
+
 class ToolCallAgent(BaseAgent):
     """
     Autonomous ReAct agent executing real tool invocations on concrete tool instances.
@@ -94,6 +185,11 @@ class ToolCallAgent(BaseAgent):
         self.current_step = 1
         self._final_answer: str = ""
         self.state: Optional[ExecutionState] = None
+        # Rolling window of recent single-tool-call signatures used to
+        # detect when the LLM is stuck calling the same tool with the
+        # same arguments repeatedly. Cleared whenever a step contains
+        # multiple tool calls (which breaks the "consecutive" pattern).
+        self._recent_call_signatures: List[str] = []
 
     @property
     def name(self) -> str:
@@ -281,35 +377,58 @@ class ToolCallAgent(BaseAgent):
         # ──────────────────────────────────────────────────────────────
         # Streaming buffer state (local to this think() invocation)
         #
-        # Tuning knobs (env vars, no code changes needed at runtime):
-        #   PELDRUN_STREAM_FLUSH_INTERVAL — seconds between forced flushes
-        #     Default 0.05 (50 ms). Raise to 0.10 on fast models (>100 tok/s)
-        #     to halve SQLite/SSE write volume while remaining visually
-        #     indistinguishable to the user.
-        #   PELDRUN_STREAM_FLUSH_CHARS — minimum buffered chars before flush
-        #     Default 20. Raise to 40 to reduce event count proportionally.
+        # [FIX-STREAMING-RUNTIME] Read tuning values from the runtime
+        # settings store, NOT from os.environ directly. Otherwise values
+        # edited from the Settings UI (`/settings/runtime`) would be
+        # silently ignored — the UI persists to runtime_settings.json,
+        # but the agent would only honor env vars.
         #
-        # Both values are read fresh on every think() call so the operator
-        # can adjust them without restarting the process (e.g. via a
-        # supervisor that updates os.environ).
+        # Resolution tier (handled inside runtime_settings.resolve):
+        #     runtime_settings.json  >  os.environ  >  hardcoded default
+        #
+        # Read fresh on every think() call, so UI changes apply on the
+        # very next LLM step without a server restart.
+        #
+        # A broken settings service (e.g. during unit tests where omweb
+        # is not importable) falls back to os.environ, then to hardcoded
+        # defaults, so the agent never loses the streaming optimization.
         # ──────────────────────────────────────────────────────────────
-        import os as _os_env
-        try:
-            _STREAM_FLUSH_INTERVAL = float(
-                _os_env.environ.get("PELDRUN_STREAM_FLUSH_INTERVAL", "0.05")
-            )
-        except (TypeError, ValueError):
-            _STREAM_FLUSH_INTERVAL = 0.05
-        try:
-            _STREAM_FLUSH_CHARS = int(
-                _os_env.environ.get("PELDRUN_STREAM_FLUSH_CHARS", "20")
-            )
-        except (TypeError, ValueError):
-            _STREAM_FLUSH_CHARS = 20
+        _STREAM_FLUSH_INTERVAL: float
+        _STREAM_FLUSH_CHARS: int
 
-        # Clamp to sane bounds — protects against pathological env values
-        # (e.g. PELDRUN_STREAM_FLUSH_CHARS=0 would break batching; =10000
-        # would make the stream feel choppy).
+        try:
+            # Prefer the runtime settings store (respects UI edits).
+            from omweb.services.runtime_settings import (
+                resolve as _rt_resolve,
+            )
+
+            _rt_interval = _rt_resolve("streaming", "flush_interval_seconds")
+            _rt_chars = _rt_resolve("streaming", "flush_chars")
+            _STREAM_FLUSH_INTERVAL = float(_rt_interval or 0.05)
+            _STREAM_FLUSH_CHARS = int(_rt_chars or 20)
+        except Exception:
+            # Fallback path — omweb not importable, or settings service
+            # is broken. Preserve the historical behavior so no run is
+            # ever blocked by a settings-layer issue.
+            import os as _os_env
+
+            try:
+                _STREAM_FLUSH_INTERVAL = float(
+                    _os_env.environ.get(
+                        "PELDRUN_STREAM_FLUSH_INTERVAL", "0.05"
+                    )
+                )
+            except (TypeError, ValueError):
+                _STREAM_FLUSH_INTERVAL = 0.05
+            try:
+                _STREAM_FLUSH_CHARS = int(
+                    _os_env.environ.get("PELDRUN_STREAM_FLUSH_CHARS", "20")
+                )
+            except (TypeError, ValueError):
+                _STREAM_FLUSH_CHARS = 20
+
+        # Clamp to sane bounds — protects against pathological values
+        # (0 would break batching; 10000 would make the stream choppy).
         _STREAM_FLUSH_INTERVAL = max(0.01, min(1.0, _STREAM_FLUSH_INTERVAL))
         _STREAM_FLUSH_CHARS = max(5, min(200, _STREAM_FLUSH_CHARS))
 
@@ -409,11 +528,41 @@ class ToolCallAgent(BaseAgent):
                 last_llm_exc = exc
                 err_str = str(exc).lower()
 
+                # [FIX-OOM-FAST-FAIL] Out-of-memory is never retryable.
+                # A second attempt consumes additional memory before the
+                # original allocation is freed, making OOM strictly
+                # worse. Propagate immediately with a clear message.
+                if _is_oom_error(exc):
+                    logger.error(
+                        "LLM OOM detected on attempt %d (%s). Raising "
+                        "immediately without retry.",
+                        llm_attempt,
+                        exc,
+                    )
+                    raise
+
                 if "terminated" in err_str or "context" in err_str or "400" in err_str or "maximum context" in err_str:
-                    logger.warning("Provider rejected full context (%s). Compacting context on attempt %d.", exc, llm_attempt)
-                    compact_msgs = list(self.messages[:2]) + list(self.messages[-6:])
+                    # [FIX-AGGRESSIVE-COMPACTION] Previous compaction kept
+                    # 6 trailing messages (up to 3 tool observations). For
+                    # a web_search loop that means 3 × 4 KB = 12 KB of
+                    # observations survive — often still too much to fit.
+                    # Keep only 3 trailing messages and truncate any tool
+                    # observation inside the window to 800 chars.
+                    logger.warning(
+                        "Provider rejected full context (%s). "
+                        "Aggressively compacting on attempt %d.",
+                        exc,
+                        llm_attempt,
+                    )
+                    compact_msgs = list(self.messages[:2]) + list(self.messages[-3:])
                     while compact_msgs and len(compact_msgs) > 2 and compact_msgs[2].get("role") == "tool":
                         compact_msgs.pop(2)
+
+                    for cmsg in compact_msgs:
+                        if cmsg.get("role") == "tool":
+                            c = cmsg.get("content", "")
+                            if isinstance(c, str) and len(c) > 800:
+                                cmsg["content"] = c[:640] + "... [truncated on compaction]"
 
                     if not compact_msgs or not any(m.get("role") == "user" for m in compact_msgs):
                         compact_msgs = [
@@ -425,6 +574,14 @@ class ToolCallAgent(BaseAgent):
                         break
                     except Exception as compact_exc:
                         last_llm_exc = compact_exc
+                        if _is_oom_error(compact_exc):
+                            logger.error(
+                                "LLM OOM detected during compaction on "
+                                "attempt %d (%s). Raising immediately.",
+                                llm_attempt,
+                                compact_exc,
+                            )
+                            raise
 
                 is_transient = (
                     "429" in err_str
@@ -650,17 +807,26 @@ class ToolCallAgent(BaseAgent):
                 },
             )
 
+            # [FIX-OBSERVATION-TRUNCATION] Truncate large observations
+            # before storing in the conversation history. The full output
+            # is already in ``state.tool_history`` (via record_tool_execution
+            # above) and in the SSE event above, so nothing is lost from
+            # the audit / UI view. Only what the LLM re-sends each step is
+            # capped, preventing a single web_search from consuming 5+ KB
+            # of context per subsequent step.
+            _truncated_observation = _truncate_observation(tool_name, final_output_str)
+
             self.messages.append({
                 "role": "tool",
                 "tool_call_id": call_id,
                 "name": tool_name,
-                "content": final_output_str,
+                "content": _truncated_observation,
             })
 
             if self.state is not None:
                 self.state.add_message(
                     role=MessageRole.TOOL,
-                    content=final_output_str,
+                    content=_truncated_observation,
                     name=tool_name,
                     tool_call_id=call_id,
                 )
@@ -677,6 +843,47 @@ class ToolCallAgent(BaseAgent):
         self._sync_messages_from_state(state)
 
         response = await self.think(step=self.current_step)
+
+        # [FIX-LOOP-DETECTION] Detect when the LLM is stuck calling the
+        # same tool with identical arguments across consecutive steps.
+        # A single-tool step allows an unambiguous comparison. Multi-tool
+        # steps reset the tracker because their ordering may legitimately
+        # vary without indicating a loop.
+        if response.tool_calls:
+            if len(response.tool_calls) == 1:
+                tc = response.tool_calls[0]
+                try:
+                    if isinstance(tc.arguments, dict):
+                        args_canon = json.dumps(
+                            tc.arguments, sort_keys=True, ensure_ascii=False
+                        )
+                    else:
+                        args_canon = str(tc.arguments)
+                except Exception:
+                    args_canon = str(tc.arguments)
+                signature = f"{tc.name}::{args_canon}"
+
+                self._recent_call_signatures.append(signature)
+                if len(self._recent_call_signatures) > _LOOP_DETECTION_WINDOW:
+                    self._recent_call_signatures = self._recent_call_signatures[
+                        -_LOOP_DETECTION_WINDOW:
+                    ]
+
+                if (
+                    len(self._recent_call_signatures) >= _LOOP_DETECTION_WINDOW
+                    and len(set(self._recent_call_signatures)) == 1
+                ):
+                    loop_msg = (
+                        f"Loop detected: tool '{tc.name}' was invoked "
+                        f"{_LOOP_DETECTION_WINDOW} times in a row with "
+                        f"identical arguments. The agent appears stuck. "
+                        f"Forcing termination."
+                    )
+                    logger.error(loop_msg)
+                    raise RuntimeError(loop_msg)
+            else:
+                # Multi-tool step — break the consecutive-signature chain.
+                self._recent_call_signatures.clear()
 
         if not response.tool_calls:
             self._final_answer = response.content or response.thought or response.reasoning or "Task completed."

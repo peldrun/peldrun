@@ -61,30 +61,66 @@ class TempArtifactsCleaner:
 
     @staticmethod
     def _is_enabled() -> bool:
-        raw = os.environ.get("PELDRUN_TEMP_CLEANUP_ENABLED", "1").strip().lower()
-        return raw not in ("0", "false", "no", "off", "disabled")
+        """
+        Return True when the cleaner should run.
+
+        Resolution tier: runtime_settings.json > env var > default.
+        Called fresh on every loop iteration so a settings change made
+        from the UI takes effect within the current cycle.
+        """
+        try:
+            from omweb.services.runtime_settings import resolve
+
+            return bool(resolve("cleanup", "enabled"))
+        except Exception:
+            # Fallback to raw env when the settings service is broken —
+            # a broken file must not silently stop the cleaner.
+            raw = os.environ.get("PELDRUN_TEMP_CLEANUP_ENABLED", "1").strip().lower()
+            return raw not in ("0", "false", "no", "off", "disabled")
 
     @staticmethod
     def _interval_seconds() -> float:
+        """
+        Return the current sweep interval in seconds.
+
+        Resolution tier: runtime_settings.json > env var > default.
+        Read fresh on every loop iteration, so UI changes are applied on
+        the next wake-up without a server restart.
+        """
         try:
-            hours = float(
-                os.environ.get("PELDRUN_TEMP_CLEANUP_INTERVAL_HOURS", "6")
-            )
-        except (TypeError, ValueError):
-            hours = 6.0
-        # Clamp to a sane range: 1 minute → 7 days.
+            from omweb.services.runtime_settings import resolve
+
+            hours = float(resolve("cleanup", "interval_hours") or 6.0)
+        except Exception:
+            try:
+                hours = float(
+                    os.environ.get("PELDRUN_TEMP_CLEANUP_INTERVAL_HOURS", "6")
+                )
+            except (TypeError, ValueError):
+                hours = 6.0
         hours = max(1.0 / 60.0, min(7.0 * 24.0, hours))
         return hours * 3600.0
 
     @staticmethod
     def _max_age_hours() -> float:
+        """
+        Return the current max-age threshold in hours.
+
+        Resolution tier: runtime_settings.json > env var > default.
+        Read fresh on every sweep so the UI's ``max_age_hours`` field
+        applies immediately to the next cleanup.
+        """
         try:
-            hours = float(
-                os.environ.get("PELDRUN_TEMP_CLEANUP_MAX_AGE_HOURS", "24")
-            )
-        except (TypeError, ValueError):
-            hours = 24.0
-        # Clamp: 6 minutes → 30 days.
+            from omweb.services.runtime_settings import resolve
+
+            hours = float(resolve("cleanup", "max_age_hours") or 24.0)
+        except Exception:
+            try:
+                hours = float(
+                    os.environ.get("PELDRUN_TEMP_CLEANUP_MAX_AGE_HOURS", "24")
+                )
+            except (TypeError, ValueError):
+                hours = 24.0
         return max(0.1, min(30.0 * 24.0, hours))
 
     # ------------------------------------------------------------------
@@ -164,16 +200,46 @@ class TempArtifactsCleaner:
         return report
 
     async def _loop(self) -> None:
-        interval = self._interval_seconds()
+        """
+        Periodic sweep loop with live re-read of settings each iteration.
+
+        Interval and enablement are read fresh every cycle, so a value
+        saved from the UI takes effect on the *next* wake-up. This is the
+        behavior users expect: they don't need to restart the server for
+        the new schedule to apply.
+        """
         try:
             # Startup sweep: reclaim yesterday's leftovers immediately.
             await self._run_once()
 
             while True:
+                # Fast-check: if disabled via settings, poll every 60s
+                # so re-enabling from the UI is picked up promptly
+                # without a full restart.
+                if not self._is_enabled():
+                    try:
+                        await asyncio.sleep(60.0)
+                    except asyncio.CancelledError:
+                        raise
+                    continue
+
+                # Re-read the interval each cycle so UI changes apply.
+                try:
+                    interval = self._interval_seconds()
+                except Exception as exc:
+                    logger.warning(
+                        "Could not compute cleanup interval, defaulting to 6h: %s",
+                        exc,
+                    )
+                    interval = 6.0 * 3600.0
+
                 try:
                     await asyncio.sleep(interval)
                 except asyncio.CancelledError:
                     raise
+
+                if not self._is_enabled():
+                    continue
 
                 await self._run_once()
         except asyncio.CancelledError:

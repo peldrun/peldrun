@@ -53,6 +53,7 @@ from omweb.routers import (
     mcp_auth,
     resource_monitor,
     run,
+    runtime_settings_rtr,
     search_rtr,
     setup,
     source_control,
@@ -240,6 +241,10 @@ app.include_router(
     prefix="/api/config",
     tags=["config", "generative-ui"],
 )
+# Runtime settings router — the router already declares
+# ``prefix="/api/config/runtime-settings"`` internally, so no prefix=
+# argument here (matches source_control / resource_monitor convention).
+app.include_router(runtime_settings_rtr.router)
 app.include_router(search_rtr.router, prefix="/api/search", tags=["search"])
 app.include_router(files.router, prefix="/api/files", tags=["files"])
 app.include_router(mcp.router, prefix="/api/mcp", tags=["mcp"])

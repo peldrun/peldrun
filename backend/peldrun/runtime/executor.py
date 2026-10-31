@@ -248,6 +248,37 @@ class CoreRuntimeExecutor:
         model_name = llm_cfg_dict.get("model", "default")
         provider_name = llm_cfg_dict.get("provider", "openai")
 
+        # [FIX-LLM-REQUEST-TIMEOUT] Distinguish between the per-step
+        # ceiling (``step_timeout``, enforced by AgentRunner) and the
+        # per-request HTTP timeout (``llm_request_timeout``, enforced
+        # by AsyncLLMClient here). Previously this function hardwired
+        # ``LLMConfig.timeout = step_timeout``, which made the user's
+        # dedicated ``llm_request_timeout_seconds`` setting from
+        # /settings/runtime have zero effect in agent mode.
+        #
+        # Resolution:
+        #   1. ``llm_cfg_dict["timeout"]`` — set by dispatcher from
+        #      runtime_settings.json (or by an explicit per-request
+        #      override, which wins at the dispatcher level).
+        #   2. Fall back to ``step_timeout`` when no separate LLM
+        #      timeout is configured — preserves the historical
+        #      behavior for deployments that never set one.
+        #
+        # The outer step_timeout will still cap this value in practice
+        # (a request that exceeds the step ceiling is cancelled by the
+        # runner regardless of what the client's HTTP timeout says).
+        # Users who want llm_request_timeout to actually bite must set
+        # it <= step_timeout — otherwise the step ceiling fires first.
+        _configured_llm_timeout = llm_cfg_dict.get("timeout")
+        try:
+            llm_request_timeout = float(
+                _configured_llm_timeout
+                if _configured_llm_timeout is not None
+                else step_timeout
+            )
+        except (TypeError, ValueError):
+            llm_request_timeout = step_timeout
+
         raw_effort = llm_cfg_dict.get("reasoning_effort")
         resolved_effort: Optional[str] = None
         if raw_effort:
@@ -263,7 +294,7 @@ class CoreRuntimeExecutor:
             api_key=api_key,
             temperature=float(spec.temperature),
             max_tokens=max_tokens,
-            timeout=step_timeout,
+            timeout=llm_request_timeout,
             reasoning_effort=resolved_effort,
         )
         llm_provider = OpenAICompatProvider(config=llm_cfg)
@@ -510,6 +541,36 @@ class CoreRuntimeExecutor:
                 }
                 _temp_dir = _get_root() / "artifacts" / "temp"
 
+                # [FIX-WORKSPACE-FIRST] Resolve attachments from the
+                # workspace copy first, temp as fallback.
+                #
+                # Why this ordering matters:
+                #   * ``start_run.py`` copies every attachment to
+                #     ``<chat_files>/.peldrun/user_uploads/<fileId>`` and
+                #     (after the companion change in ``start_run.py``)
+                #     deletes the temp original as soon as the copy
+                #     succeeds. Reading temp first would therefore fail
+                #     for any attachment that has already been persisted
+                #     once — including regeneration runs, follow-up turns
+                #     that reuse the same fileId, and any page reload
+                #     past 24h when the periodic sweeper has run.
+                #   * Reading workspace first is also faster (no need to
+                #     fall back), and more resilient (temp may be
+                #     cleaned up mid-run by the background cleaner).
+                #
+                # Both directories are content-scoped, and fileIds are
+                # opaque UUIDs, so the same fileId in a different chat's
+                # workspace is either the same image (safe) or a hash
+                # collision (astronomically improbable).
+                _workspace_upload_dir: Optional[Path] = None
+                try:
+                    # ws_root already points at <chat_files>.
+                    _workspace_upload_dir = (
+                        Path(ws_root) / ".peldrun" / "user_uploads"
+                    )
+                except Exception:
+                    _workspace_upload_dir = None
+
                 _image_parts: List[Dict[str, Any]] = []
                 for _att in _attachments_raw:
                     if not isinstance(_att, dict):
@@ -525,10 +586,22 @@ class CoreRuntimeExecutor:
                             "Skipping attachment with unsafe fileId %r", _fid
                         )
                         continue
-                    _path = _temp_dir / _fid
-                    if not _path.is_file():
+
+                    # Resolve: workspace first, temp fallback.
+                    _path: Optional[Path] = None
+                    if _workspace_upload_dir is not None:
+                        _ws_candidate = _workspace_upload_dir / _fid
+                        if _ws_candidate.is_file():
+                            _path = _ws_candidate
+                    if _path is None:
+                        _temp_candidate = _temp_dir / _fid
+                        if _temp_candidate.is_file():
+                            _path = _temp_candidate
+
+                    if _path is None:
                         logger.warning(
-                            "Attachment fileId %r resolved to a missing file",
+                            "Attachment fileId %r not found in workspace "
+                            "or temp store",
                             _fid,
                         )
                         continue

@@ -412,7 +412,37 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
                                     "attachment %s to workspace",
                                     _fid,
                                 )
+                                # [TEMP-CLEANUP-AFTER-PERSIST] The
+                                # workspace copy is now authoritative.
+                                # Remove the temp original so the temp
+                                # store does not accumulate duplicates
+                                # of every image ever pasted. All
+                                # consumers (executor, dispatcher,
+                                # frontend) resolve workspace first —
+                                # see the companion changes in
+                                # ``peldrun/runtime/executor.py``,
+                                # ``omweb/agent_bridge_parts/dispatcher.py``
+                                # and ``frontend/.../utils.ts``.
+                                try:
+                                    _src.unlink(missing_ok=True)
+                                    logger.debug(
+                                        "[TEMP-CLEANUP-AFTER-PERSIST] "
+                                        "Removed temp original for %s",
+                                        _fid,
+                                    )
+                                except Exception as _unlink_err:
+                                    logger.debug(
+                                        "[TEMP-CLEANUP-AFTER-PERSIST] "
+                                        "Failed to remove temp original "
+                                        "for %s: %s",
+                                        _fid,
+                                        _unlink_err,
+                                    )
                             except Exception as _copy_err:
+                                # Copy failed — temp original stays as
+                                # the authoritative fallback. Do NOT
+                                # attempt to delete it (the unlink is
+                                # inside the success branch only).
                                 logger.debug(
                                     "[WORKSPACE-PERSIST] Copy failed "
                                     "for %s: %s",

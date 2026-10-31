@@ -17,8 +17,8 @@ cdp_url = "http://localhost:9222"
 max_content_length = 2000
 
 [search]
-engine = "Google"
-fallback_engines = [ "DuckDuckGo", "Baidu", "Bing",]
+engine = "DuckDuckGo"
+fallback_engines = [ "Jina",]
 enabled = true
 lang = "en"
 country = "us"

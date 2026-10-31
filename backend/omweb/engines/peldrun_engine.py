@@ -858,6 +858,23 @@ class PeldrunEngine(ExecutionEngine):
             "attachments": context.attachments or [],
         }
 
+        # [FIX-TOTAL-TIMEOUT] Enforce an overall ceiling on top of the
+        # per-step timeout. Without this, an agent stuck in a slow tool
+        # loop (or an LLM that streams for hours) can consume unlimited
+        # time and memory. The user can override via config.toml:
+        #   [llm]
+        #   total_timeout = 900.0   # seconds; 0 disables the ceiling
+        raw_total_timeout = active_llm.get("total_timeout")
+        if raw_total_timeout is None:
+            total_timeout_val: Optional[float] = 600.0
+        else:
+            try:
+                parsed = float(raw_total_timeout)
+                # Treat 0 or negative as "no ceiling" (operator override).
+                total_timeout_val = parsed if parsed > 0 else None
+            except (TypeError, ValueError):
+                total_timeout_val = 600.0
+
         run_request = RunRequest(
             run_id=run_id_str,
             job_id=job_id,
@@ -868,7 +885,19 @@ class PeldrunEngine(ExecutionEngine):
             metadata=run_metadata,
             context_sidecar=sidecar,
             project_rules=project_rules,
-            step_timeout_seconds=float(active_llm.get("timeout") or 120.0),
+            # [FIX-RUNTIME-TIMEOUTS] Prefer the dedicated ``step_timeout``
+            # key (populated by dispatcher from /settings/runtime), then
+            # fall back to ``timeout`` (legacy behavior: same key drives
+            # both HTTP and step boundaries), then to the historical 120s
+            # default. ``total_timeout`` is resolved above from
+            # ``active_llm["total_timeout"]``, which dispatcher also
+            # populates from runtime_settings when the user configured it.
+            step_timeout_seconds=float(
+                active_llm.get("step_timeout")
+                or active_llm.get("timeout")
+                or 120.0
+            ),
+            total_timeout_seconds=total_timeout_val,
         )
 
         # 5. Setup Async Event Processing Bridge

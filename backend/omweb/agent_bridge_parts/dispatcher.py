@@ -556,6 +556,39 @@ async def run_instrumented(
         if raw_eff in ("none", "off", "0"):
             active_llm["reasoning_effort"] = "none"
 
+    # [FIX-RUNTIME-TIMEOUTS] Apply user-configurable timeout overrides
+    # from /settings/runtime. Precedence for each field:
+    #   1. Per-request llm_override (highest — explicit caller intent)
+    #   2. runtime_settings.json (user's persistent UI choice)
+    #   3. config.toml / active_llm default (deployment default)
+    #
+    # Each of the three timeout keys (timeout, step_timeout,
+    # total_timeout) is resolved independently — a caller can override
+    # just one without disturbing the other two. All lookups are
+    # best-effort: a broken runtime_settings.json must never block a run.
+    try:
+        from omweb.services.runtime_settings import resolve as _rt_resolve
+
+        def _apply_rt_timeout(active_key: str, rt_key: str) -> None:
+            if (
+                isinstance(llm_override, dict)
+                and llm_override.get(active_key) is not None
+            ):
+                return  # explicit per-request override wins
+            rt_val = _rt_resolve("timeouts", rt_key)
+            if rt_val is not None:
+                active_llm[active_key] = float(rt_val)
+
+        _apply_rt_timeout("timeout", "llm_request_timeout_seconds")
+        _apply_rt_timeout("step_timeout", "step_timeout_seconds")
+        _apply_rt_timeout("total_timeout", "total_timeout_seconds")
+    except Exception as _rt_err:
+        logger.debug(
+            "Runtime timeout overrides skipped for job %s: %s",
+            job_id,
+            _rt_err,
+        )
+
     p_cand = active_llm.get("provider_name") or active_llm.get("provider") or ""
     b_cand = str(active_llm.get("base_url") or "")
     if "1234" not in b_cand and "lmstudio" not in str(active_llm.get("provider") or "").lower():
@@ -820,6 +853,34 @@ async def run_direct_chat(
                 _genui_err,
             )
 
+    # [FIX-RUNTIME-TIMEOUTS] Same override logic as `run_instrumented`.
+    # In chat mode, only `llm_request_timeout_seconds` matters (there is
+    # no step/total boundary — a chat request is a single LLM call), but
+    # we apply all three for consistency so that a future chat-mode
+    # loop implementation inherits the same values automatically.
+    try:
+        from omweb.services.runtime_settings import resolve as _rt_resolve
+
+        def _apply_rt_timeout_chat(active_key: str, rt_key: str) -> None:
+            if (
+                isinstance(llm_override, dict)
+                and llm_override.get(active_key) is not None
+            ):
+                return
+            rt_val = _rt_resolve("timeouts", rt_key)
+            if rt_val is not None:
+                active_llm[active_key] = float(rt_val)
+
+        _apply_rt_timeout_chat("timeout", "llm_request_timeout_seconds")
+        _apply_rt_timeout_chat("step_timeout", "step_timeout_seconds")
+        _apply_rt_timeout_chat("total_timeout", "total_timeout_seconds")
+    except Exception as _rt_err:
+        logger.debug(
+            "Runtime timeout overrides skipped for chat job %s: %s",
+            job_id,
+            _rt_err,
+        )
+
     p_cand = active_llm.get("provider_name") or active_llm.get("provider") or ""
     b_cand = str(active_llm.get("base_url") or "")
     if "1234" not in b_cand and "lmstudio" not in str(active_llm.get("provider") or "").lower():
@@ -1040,14 +1101,24 @@ async def run_direct_chat(
                     if "/" in _fid or "\\" in _fid or ".." in _fid:
                         continue
 
+                    # [FIX-WORKSPACE-FIRST] Resolve workspace first, temp
+                    # fallback. Mirror of the ordering in
+                    # ``peldrun.runtime.executor`` — see the detailed
+                    # rationale there. In short: ``start_run.py`` copies
+                    # attachments to the workspace and (after the
+                    # companion change) removes the temp original as
+                    # soon as the copy succeeds. Chat mode must therefore
+                    # read the workspace copy first, or attachments
+                    # become unreadable after the very first turn.
                     _path = None
-                    _temp_path = _temp_dir / _fid
-                    if _temp_path.is_file():
-                        _path = _temp_path
-                    elif _workspace_uploads_dir is not None:
+                    if _workspace_uploads_dir is not None:
                         _ws_path = _workspace_uploads_dir / _fid
                         if _ws_path.is_file():
                             _path = _ws_path
+                    if _path is None:
+                        _temp_path = _temp_dir / _fid
+                        if _temp_path.is_file():
+                            _path = _temp_path
 
                     if _path is None:
                         logger.warning(

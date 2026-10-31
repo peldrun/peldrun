@@ -113,7 +113,20 @@ export function resolveFileCategory(
   if (customUrl) {
     previewUrl = customUrl;
   } else if (isImage && fileId) {
-    previewUrl = `/api/files/temp/${fileId}`;
+    // [WORKSPACE-FIRST] Prefer the workspace copy over the temp store.
+    //
+    // ``start_run.py`` copies every attachment to
+    // ``<chat_files>/.peldrun/user_uploads/<fileId>`` and removes the
+    // temp original as soon as the copy succeeds. The temp URL would
+    // therefore 404 for every image after the first turn. The workspace
+    // path resolves through ``/api/files/raw`` → ``find_file_in_storage``
+    // → recursive lookup across all chat workspaces, which succeeds
+    // because fileIds are opaque UUIDs.
+    //
+    // The ``<img onError>`` handler in AttachedFileCard hides the
+    // element when even this URL fails (extremely rare — only if the
+    // workspace copy was also deleted manually).
+    previewUrl = `/api/files/raw/.peldrun/user_uploads/${fileId}`;
   } else if (isImage) {
     previewUrl = `/api/files/raw/${fileName}`;
   } else {

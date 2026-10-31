@@ -27,6 +27,90 @@ import {
   type FullAppConfig,
 } from "./setup/types";
 
+/**
+ * Authoritative list of search providers supported by the backend
+ * SearchProviderFactory (see backend/peldrun/tools/builtins/
+ * search_providers/factory.py and backend/omweb/routers/search_rtr.py).
+ *
+ * Any provider identifier not present in this list MUST be filtered out
+ * before persistence. Otherwise POST /api/config reaches
+ * _validate_and_normalize_search_config, which calls
+ * SearchProviderFactory.normalize_provider_key(...) and raises
+ * "Unsupported search provider '<name>'" — rejecting the whole save.
+ */
+const SUPPORTED_SEARCH_PROVIDERS: readonly string[] = [
+  "DuckDuckGo",
+  "SearXNG",
+  "Tavily",
+  "Brave",
+  "Google",
+  "Jina",
+  "Yandex",
+];
+
+const SUPPORTED_SEARCH_PROVIDER_LOOKUP: Map<string, string> = new Map(
+  SUPPORTED_SEARCH_PROVIDERS.map((name) => [name.toLowerCase(), name])
+);
+
+const DEFAULT_SEARCH_ENGINE = "Google";
+const DEFAULT_FALLBACK_ENGINES: readonly string[] = ["DuckDuckGo"];
+
+/**
+ * Resolve a raw engine identifier to its canonical supported display name.
+ * Falls back to DEFAULT_SEARCH_ENGINE when the input is unknown.
+ */
+function resolveSupportedEngine(raw: unknown): string {
+  if (typeof raw !== "string") return DEFAULT_SEARCH_ENGINE;
+  const canonical = SUPPORTED_SEARCH_PROVIDER_LOOKUP.get(raw.trim().toLowerCase());
+  return canonical ?? DEFAULT_SEARCH_ENGINE;
+}
+
+/**
+ * Filter a raw fallback_engines array down to supported, deduplicated
+ * providers that are NOT the primary engine. Preserves the input order.
+ */
+function sanitizeFallbackEngines(raw: unknown, primaryEngine: string): string[] {
+  if (!Array.isArray(raw)) return [...DEFAULT_FALLBACK_ENGINES];
+
+  const seen = new Set<string>();
+  const cleaned: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== "string") continue;
+    const trimmed = item.trim();
+    if (!trimmed) continue;
+    const canonical = SUPPORTED_SEARCH_PROVIDER_LOOKUP.get(trimmed.toLowerCase());
+    if (!canonical) continue;
+    if (canonical === primaryEngine) continue;
+    if (seen.has(canonical)) continue;
+    seen.add(canonical);
+    cleaned.push(canonical);
+  }
+  return cleaned;
+}
+
+/**
+ * Sanitize the entire `search` config block so that:
+ *   - `engine` always points to a backend-supported provider
+ *   - `fallback_engines` never contains unsupported entries (e.g. Baidu/Bing)
+ *   - the primary engine is never duplicated in the fallback list
+ *
+ * Safe to call on any arbitrary shape; unknown fields are passed through
+ * untouched so new backend keys (duckduckgo, tavily, privacy_mode, ...)
+ * survive the round-trip.
+ */
+function sanitizeSearchConfigForPersistence(rawSearch: unknown): any {
+  if (!rawSearch || typeof rawSearch !== "object") {
+    return {
+      engine: DEFAULT_SEARCH_ENGINE,
+      fallback_engines: [...DEFAULT_FALLBACK_ENGINES],
+    };
+  }
+  const search = rawSearch as Record<string, any>;
+  const engine = resolveSupportedEngine(search.engine);
+  const fallback_engines = sanitizeFallbackEngines(search.fallback_engines, engine);
+  return { ...search, engine, fallback_engines };
+}
+
 export default function SettingsPage() {
   const [activeTab, setActiveTab] = useState<SettingsTab>("llm");
   const [saving, setSaving] = useState(false);
@@ -75,8 +159,8 @@ export default function SettingsPage() {
       proxy: { server: "", username: "", password: "" },
     },
     search: {
-      engine: "Google",
-      fallback_engines: ["DuckDuckGo", "Baidu", "Bing"],
+      engine: DEFAULT_SEARCH_ENGINE,
+      fallback_engines: [...DEFAULT_FALLBACK_ENGINES],
       retry_delay: 60,
       max_retries: 3,
       lang: "en",
@@ -320,7 +404,7 @@ export default function SettingsPage() {
             password: cfg["browser.proxy"]?.password || cfg.browser?.proxy?.password || "",
           },
         },
-        search: {
+        search: sanitizeSearchConfigForPersistence({
           // Preserve the entire search section from the backend
           // (including duckduckgo, searxng, tavily, default_max_results,
           // privacy_mode, etc.). Without `...(cfg.search)`, fetchConfig
@@ -328,16 +412,18 @@ export default function SettingsPage() {
           // a partial object of just the six basic fields. That made
           // the global Save button send an incomplete payload and made
           // the UI appear to lose the settings after a page reload.
+          //
+          // sanitizeSearchConfigForPersistence is applied AFTER the spread
+          // so that any legacy on-disk entries (e.g. Baidu, Bing) are
+          // stripped before the state is committed to React — otherwise
+          // the next "Save Config" click would forward them verbatim to
+          // POST /api/config and the backend would reject the entire save.
           ...(cfg.search || {}),
-          engine: cfg.search?.engine || "Google",
-          fallback_engines: Array.isArray(cfg.search?.fallback_engines)
-            ? cfg.search.fallback_engines
-            : ["DuckDuckGo", "Baidu", "Bing"],
           retry_delay: cfg.search?.retry_delay ?? 60,
           max_retries: cfg.search?.max_retries ?? 3,
           lang: cfg.search?.lang || "en",
           country: cfg.search?.country || "us",
-        },
+        }),
         sandbox: {
           use_sandbox: cfg.sandbox?.use_sandbox ?? false,
           image: cfg.sandbox?.image || "python:3.12-slim",
@@ -699,6 +785,14 @@ export default function SettingsPage() {
       llmDict["vision"] = config.llm_vision;
       llmDict.max_tokens = activeLlm.max_tokens;
 
+      // Final defensive sanitization immediately before the network call.
+      // Even if a legacy provider identifier (e.g. Baidu, Bing) somehow
+      // still lives in React state — e.g. injected by a hot-reload edge
+      // case or an intermediate setState from SearchTab.tsx — it is
+      // stripped here so POST /api/config never receives an unsupported
+      // provider and never fails with "Unsupported search provider".
+      const sanitizedSearch = sanitizeSearchConfigForPersistence(config.search);
+
       const payload = {
         llm: llmDict,
         browser: {
@@ -710,7 +804,7 @@ export default function SettingsPage() {
           max_content_length: parseInt(String(config.browser.max_content_length), 10) || 2000,
           proxy: config.browser.proxy,
         },
-        search: config.search,
+        search: sanitizedSearch,
         sandbox: config.sandbox,
         daytona: config.daytona,
         mcp: config.mcp,
@@ -757,6 +851,7 @@ export default function SettingsPage() {
         const finalConfig: FullAppConfig = {
           ...config,
           llm: activeLlm,
+          search: sanitizedSearch,
           browser: {
             ...config.browser,
             max_content_length:

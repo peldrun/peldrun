@@ -19,6 +19,7 @@ import {
   Coins,
   GitBranch,
   Blocks,
+  Gauge,
   Sparkles,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -121,9 +122,11 @@ export function Sidebar({
 
               {/* Dedicated Live Monitoring Link */}
         <div className="pt-2.5 mt-2.5 border-t border-border/60">
+
           <span className="text-[10px] font-semibold text-muted-foreground/70 uppercase tracking-wider px-3 mb-1.5 block">
             Live Monitoring & Telemetry
           </span>
+
           <Link
             href="/settings/search"
             title="Open dedicated search orchestrator, analytics, and provider telemetry"
@@ -135,6 +138,7 @@ export function Sidebar({
             </div>
             <ExternalLink size={12} className="text-muted-foreground/50 group-hover:text-foreground transition-colors" />
           </Link>
+
           <Link
             href="/status"
             title="Open real-time system health and runtime diagnostics"
@@ -146,6 +150,33 @@ export function Sidebar({
             </div>
             <ExternalLink size={12} className="text-muted-foreground/50 group-hover:text-foreground transition-colors" />
           </Link>
+
+
+        </div>
+
+
+
+                      {/* Other Setings Control */}
+        <div className="pt-2.5 mt-2.5 border-t border-border/60">
+
+          <span className="text-[10px] font-semibold text-muted-foreground/70 uppercase tracking-wider px-3 mb-1.5 block">
+             Setings Control
+          </span>
+
+          <Link
+            href="/settings/runtime"
+            title="Cleanup schedule, streaming cadence, live-editable"
+            className="w-full flex items-center justify-between px-3 py-2 rounded-0 text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-all cursor-pointer group"
+          >
+            <div className="flex items-center gap-2.5">
+              <Gauge  size={14} className="text-peldrun-accent group-hover:scale-110 transition-transform" />
+
+              <span className="group-hover:text-foreground transition-colors">Runtime Settings</span>
+
+            </div>
+            <ExternalLink size={12} className="text-muted-foreground/50 group-hover:text-foreground transition-colors" />
+          </Link>
+
         </div>
 
 

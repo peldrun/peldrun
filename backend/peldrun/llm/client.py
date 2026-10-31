@@ -38,6 +38,38 @@ _RECENT_TOOL_SIGNATURES: _deque = _deque(maxlen=12)
 from collections import defaultdict as _defaultdict
 _TOOL_CALL_COUNTER: Dict[str, int] = _defaultdict(int)
 
+
+def _is_oom_error(exc: BaseException) -> bool:
+    """
+    Detect provider out-of-memory errors (GPU or CPU).
+
+    LM Studio emits ``"bad allocation"`` when the model cannot allocate
+    enough VRAM/RAM for the current request. Other providers emit
+    variations of ``"out of memory"`` / ``"CUDA out of memory"``.
+
+    Retrying these errors is counterproductive — the retry consumes
+    additional memory before the original allocation is freed, which is
+    exactly the failure mode observed when a model OOMs during streaming
+    and the client falls back to non-streaming, consuming MORE memory
+    only to fail again with a worse error.
+    """
+    if exc is None:
+        return False
+    err_str = str(exc).lower()
+    if not err_str:
+        return False
+    patterns = (
+        "bad allocation",
+        "out of memory",
+        "cuda out of memory",
+        "insufficient memory",
+        "memory exhausted",
+        "cannot allocate",
+        "oom error",
+    )
+    return any(p in err_str for p in patterns)
+
+
 class UsageSource(str, Enum):
     """Authoritative origin of invocation token metrics."""
 
@@ -742,13 +774,37 @@ class AsyncLLMClient:
             try:
                 response = await self.client.chat.completions.create(**call_kwargs)
             except Exception as stream_init_err:
+                # [FIX-OOM-FAST-FAIL] OOM must never trigger a retry.
+                if _is_oom_error(stream_init_err):
+                    logger.error(
+                        "[LLM CLIENT] OOM detected for model '%s' during "
+                        "streaming init: %s. Raising immediately (no retry).",
+                        chosen_model,
+                        stream_init_err,
+                    )
+                    raise RuntimeError(
+                        f"The model '{chosen_model}' ran out of memory (OOM). "
+                        f"Restart LM Studio to free GPU/CPU memory, or switch "
+                        f"to a smaller/quantized model. "
+                        f"Original error: {stream_init_err}"
+                    ) from stream_init_err
                 logger.warning(
                     "[LLM CLIENT] Streaming init failed for model '%s' (%s). Retrying with stream=False fallback...",
                     chosen_model,
                     stream_init_err,
                 )
                 call_kwargs["stream"] = False
-                fallback_resp = await self.client.chat.completions.create(**call_kwargs)
+                try:
+                    fallback_resp = await self.client.chat.completions.create(**call_kwargs)
+                except Exception as fallback_err:
+                    if _is_oom_error(fallback_err):
+                        raise RuntimeError(
+                            f"The model '{chosen_model}' ran out of memory (OOM) "
+                            f"during non-streaming fallback. "
+                            f"Restart LM Studio or switch to a smaller model. "
+                            f"Original error: {fallback_err}"
+                        ) from fallback_err
+                    raise
                 return self._process_non_streaming_choice(
                     response=fallback_resp,
                     effective_messages=effective_messages,
@@ -845,6 +901,20 @@ class AsyncLLMClient:
                                     accumulated_tool_calls[idx]["arguments"] += fn.arguments
 
             except Exception as stream_read_err:
+                # [FIX-OOM-FAST-FAIL] Same rationale as streaming init.
+                if _is_oom_error(stream_read_err):
+                    logger.error(
+                        "[LLM CLIENT] OOM detected during active stream for "
+                        "model '%s': %s. Raising immediately (no fallback).",
+                        chosen_model,
+                        stream_read_err,
+                    )
+                    raise RuntimeError(
+                        f"The model '{chosen_model}' ran out of memory (OOM) "
+                        f"during generation. Restart LM Studio to free memory, "
+                        f"or switch to a smaller/quantized model. "
+                        f"Original error: {stream_read_err}"
+                    ) from stream_read_err
                 logger.warning(
                     "[LLM CLIENT] Active stream interrupted for model '%s': %s",
                     chosen_model,
@@ -858,7 +928,17 @@ class AsyncLLMClient:
                     flush=True,
                 )
                 call_kwargs["stream"] = False
-                non_stream_resp = await self.client.chat.completions.create(**call_kwargs)
+                try:
+                    non_stream_resp = await self.client.chat.completions.create(**call_kwargs)
+                except Exception as fallback_err:
+                    if _is_oom_error(fallback_err):
+                        raise RuntimeError(
+                            f"The model '{chosen_model}' ran out of memory (OOM) "
+                            f"during non-streaming fallback. "
+                            f"Restart LM Studio or switch to a smaller model. "
+                            f"Original error: {fallback_err}"
+                        ) from fallback_err
+                    raise
                 return self._process_non_streaming_choice(
                     response=non_stream_resp,
                     effective_messages=effective_messages,
