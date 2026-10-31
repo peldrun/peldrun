@@ -29,10 +29,13 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 from peldrun.tools.builtins.search_providers import base as base_mod
 from peldrun.tools.builtins.search_providers.base import (
     BaseSearchProvider,
+    ImageSearchResponse,
+    ImageSearchResult,
     ProviderCapability,
     ProviderStatus,
     SearchProviderError,
     SearchResponse,
+    UpstreamError,
 )
 
 logger = logging.getLogger("peldrun.tools.search_providers.factory")
@@ -180,6 +183,14 @@ _RETRYABLE_FAILURE_STATUSES: frozenset = frozenset(
         ProviderStatus.UPSTREAM_ERROR.value,
         ProviderStatus.INVALID_RESPONSE.value,
     }
+)
+
+# Canonical provider keys whose concrete provider class implements
+# ``image_search()``. All others inherit the base "unsupported" default
+# from ``BaseSearchProvider.image_search`` and are filtered out of any
+# image failover chain by ``build_image_execution_chain``.
+_IMAGE_CAPABLE_PROVIDERS: frozenset = frozenset(
+    {"duckduckgo", "searxng", "brave", "google"}
 )
 
 
@@ -337,6 +348,7 @@ class SearchProviderFactory:
         canonical_limit: int,
     ) -> ProviderCapability:
         """Construct a ProviderCapability compatible with base.ProviderCapability fields."""
+        image_supported = key in _IMAGE_CAPABLE_PROVIDERS
         return ProviderCapability(
             id=key,
             config_key=key,
@@ -347,6 +359,12 @@ class SearchProviderFactory:
             supports_language=bool(spec.get("supports_language", True)),
             supports_country=bool(spec.get("supports_region", False)),
             supports_safesearch=bool(spec.get("supports_safe_search", False)),
+            supports_image_search=image_supported,
+            image_max_results_limit=(
+                min(canonical_limit, MAX_RESULTS_HARD_CAP)
+                if image_supported
+                else 0
+            ),
             max_results_limit=canonical_limit,
         )
 
@@ -574,6 +592,7 @@ class SearchProviderFactory:
                     "default_max_results": global_default,
                     "limit_type": cap_dict.get("limit_type") or spec["limit_type"],
                     "notes": cap_dict.get("notes") or spec["notes"],
+                    "supports_image_search": key in _IMAGE_CAPABLE_PROVIDERS,
                 }
             )
             capabilities[key] = cap_dict
@@ -762,6 +781,352 @@ class SearchProviderFactory:
         return (_OUTCOME_FAILURE_RETRYABLE, True)
 
     # ------------------------------------------------------------------
+    # Image search helpers & orchestrator
+    # ------------------------------------------------------------------
+    @classmethod
+    def provider_supports_images(cls, provider_name: str) -> bool:
+        """Return True if the canonical provider implements image search."""
+        try:
+            key = cls.normalize_provider_key(provider_name)
+        except ValueError:
+            return False
+        return key in _IMAGE_CAPABLE_PROVIDERS
+
+    @classmethod
+    def build_image_execution_chain(
+        cls,
+        search_config: Optional[Dict[str, Any]] = None,
+        override_provider: Optional[str] = None,
+    ) -> List[str]:
+        """
+        Build the ordered list of image-capable provider keys to attempt.
+
+        Precedence:
+          1. Explicit ``override_provider`` (diagnostic/test intent).
+          2. ``search.image_search.engine`` + ``fallback_engines`` when provided.
+          3. Base chain from ``search.engine`` + ``fallback_engines``.
+
+        Non-image-capable providers (Tavily, Jina, Yandex) are filtered out,
+        so text-only primaries automatically fail over to the first
+        image-capable provider in the chain.
+        """
+        cfg = cls._unwrap_search_section(search_config)
+        img_cfg = (
+            cfg.get("image_search")
+            if isinstance(cfg.get("image_search"), dict)
+            else {}
+        )
+
+        if override_provider:
+            chain = [cls.normalize_provider_key(override_provider)]
+        elif img_cfg.get("engine") or img_cfg.get("fallback_engines"):
+            merged = dict(cfg)
+            if img_cfg.get("engine"):
+                merged["engine"] = img_cfg.get("engine")
+            if img_cfg.get("fallback_engines") is not None:
+                merged["fallback_engines"] = img_cfg.get("fallback_engines")
+            chain = cls.build_execution_chain(merged)
+        else:
+            chain = cls.build_execution_chain(cfg)
+
+        return [k for k in chain if k in _IMAGE_CAPABLE_PROVIDERS]
+
+    @classmethod
+    def resolve_image_max_results(
+        cls,
+        provider_name: str,
+        requested: Optional[int] = None,
+        search_config: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """
+        Compute the effective image result count for a specific provider.
+
+        Honors:
+          - ``search.image_search.default_max_results`` (falls back to
+            ``search.default_max_results`` then to DEFAULT_MAX_RESULTS).
+          - ``search.image_search.max_results_cap`` (falls back to
+            MAX_RESULTS_HARD_CAP).
+          - Provider technical limit via ``ProviderCapability.max_results_limit``.
+          - Application hard cap via MAX_RESULTS_HARD_CAP.
+        """
+        key = cls.normalize_provider_key(provider_name)
+        cfg = cls._unwrap_search_section(search_config)
+        img_cfg = (
+            cfg.get("image_search")
+            if isinstance(cfg.get("image_search"), dict)
+            else {}
+        )
+
+        cap = cls.get_provider_capability(key, cfg)
+        provider_limit = min(
+            int(getattr(cap, "max_results_limit", MAX_RESULTS_HARD_CAP)),
+            MAX_RESULTS_HARD_CAP,
+        )
+
+        default_raw = img_cfg.get("default_max_results")
+        if default_raw is None:
+            default_raw = cfg.get("default_max_results", DEFAULT_MAX_RESULTS)
+        try:
+            global_default = max(
+                MIN_RESULTS_LIMIT,
+                min(int(default_raw), MAX_RESULTS_HARD_CAP),
+            )
+        except (TypeError, ValueError):
+            global_default = DEFAULT_MAX_RESULTS
+
+        cap_raw = img_cfg.get("max_results_cap")
+        try:
+            image_cap = (
+                max(MIN_RESULTS_LIMIT, min(int(cap_raw), MAX_RESULTS_HARD_CAP))
+                if cap_raw is not None
+                else MAX_RESULTS_HARD_CAP
+            )
+        except (TypeError, ValueError):
+            image_cap = MAX_RESULTS_HARD_CAP
+
+        if requested is not None:
+            requested_count = _parse_strict_positive_int(
+                requested, "max_results", min_value=MIN_RESULTS_LIMIT,
+            )
+        else:
+            requested_count = global_default
+
+        return max(
+            MIN_RESULTS_LIMIT,
+            min(requested_count, global_default, image_cap, provider_limit),
+        )
+
+    @classmethod
+    async def search_images(
+        cls,
+        query: str,
+        max_results: Optional[int] = None,
+        search_config: Optional[Dict[str, Any]] = None,
+        *,
+        override_provider: Optional[str] = None,
+        lang: Optional[str] = None,
+        country: Optional[str] = None,
+        timeout: Optional[float] = None,
+        **kwargs: Any,
+    ) -> ImageSearchResponse:
+        """
+        Execute an image search across the configured image-capable provider
+        chain with retries, budget enforcement, and EMPTY-tolerant failover.
+
+        Mirrors ``search()`` semantics but operates on ``ImageSearchResponse``
+        and filters the chain to image-capable providers only.
+        """
+        clean_query = (query or "").strip()
+        if not clean_query:
+            raise SearchProviderError("Image search query cannot be empty.")
+
+        cfg = cls._unwrap_search_section(search_config)
+        if cfg.get("enabled") is False:
+            raise SearchProviderError(
+                "External web search is disabled by PELDRUN Search Settings."
+            )
+
+        img_cfg = (
+            cfg.get("image_search")
+            if isinstance(cfg.get("image_search"), dict)
+            else {}
+        )
+        if img_cfg.get("enabled") is False:
+            raise SearchProviderError(
+                "Image search is disabled by PELDRUN Search Settings."
+            )
+
+        chain = cls.build_image_execution_chain(
+            cfg, override_provider=override_provider
+        )
+        if not chain:
+            raise SearchProviderError(
+                "No image-capable search providers are configured. "
+                "Supported image providers: DuckDuckGo, SearXNG, Brave, Google."
+            )
+
+        resolved_lang = (
+            lang
+            if lang is not None
+            else str(img_cfg.get("lang") or cfg.get("lang") or "en")
+        )
+        resolved_country = (
+            country
+            if country is not None
+            else str(img_cfg.get("country") or cfg.get("country") or "us")
+        )
+
+        total_budget = float(
+            timeout
+            if timeout is not None
+            else (
+                img_cfg.get("total_budget_seconds")
+                or cfg.get("total_budget_seconds")
+                or 20.0
+            )
+        )
+        max_retries = max(
+            0,
+            int(img_cfg.get("max_retries") or cfg.get("max_retries") or 0),
+        )
+        retry_delay = max(
+            0.0,
+            float(img_cfg.get("retry_delay") or cfg.get("retry_delay") or 1.0),
+        )
+
+        deadline = time.monotonic() + total_budget
+        errors: List[Tuple[str, str]] = []
+        last_empty_response: Optional[ImageSearchResponse] = None
+
+        for provider_index, provider_key in enumerate(chain):
+            display_name = cls.get_canonical_display_name(provider_key)
+            prov_section = cls._extract_provider_section(provider_key, cfg)
+
+            if prov_section.get("enabled") is False and override_provider is None:
+                errors.append(
+                    (
+                        display_name,
+                        f"Provider '{display_name}' is disabled in search settings.",
+                    )
+                )
+                logger.info(
+                    "Skipping explicitly disabled image search provider: %s",
+                    display_name,
+                )
+                continue
+
+            effective_count = cls.resolve_image_max_results(
+                provider_key, requested=max_results, search_config=cfg,
+            )
+            cap = cls.get_provider_capability(provider_key, cfg)
+            provider_limit = min(
+                int(getattr(cap, "max_results_limit", MAX_RESULTS_HARD_CAP)),
+                MAX_RESULTS_HARD_CAP,
+            )
+
+            provider = cls.create_provider(provider_key, cfg)
+
+            for attempt in range(max_retries + 1):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    errors.append(
+                        (
+                            display_name,
+                            "Total image search time budget exhausted.",
+                        )
+                    )
+                    break
+
+                prov_timeout = float(
+                    prov_section.get("timeout") or remaining
+                )
+                attempt_timeout = max(0.5, min(remaining, prov_timeout))
+
+                try:
+                    response = await asyncio.wait_for(
+                        provider.image_search(
+                            query=clean_query,
+                            max_results=effective_count,
+                            lang=resolved_lang,
+                            country=resolved_country,
+                            **kwargs,
+                        ),
+                        timeout=attempt_timeout + 1.0,
+                    )
+                except Exception as exc:
+                    err_text = str(exc) or exc.__class__.__name__
+                    logger.warning(
+                        "Image provider %s raised (attempt %d/%d): %s",
+                        display_name,
+                        attempt + 1,
+                        max_retries + 1,
+                        err_text,
+                    )
+                    if (
+                        attempt < max_retries
+                        and (deadline - time.monotonic()) > retry_delay
+                    ):
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    errors.append((display_name, err_text))
+                    break
+
+                # Defensive result-count truncation
+                if (
+                    hasattr(response, "results")
+                    and isinstance(response.results, list)
+                    and len(response.results) > effective_count
+                ):
+                    response.results = list(response.results[:effective_count])
+
+                cls._attach_count_metadata(
+                    response=response,
+                    provider_name=display_name,
+                    provider_key=provider_key,
+                    requested_max_results=max_results,
+                    effective_max_results=effective_count,
+                    configured_max_results=None,
+                    max_results_limit=provider_limit,
+                    fallback_used=(provider_index > 0),
+                    attempt_number=(attempt + 1),
+                )
+
+                outcome, _should_failover = cls._classify_response_outcome(response)
+
+                if outcome == _OUTCOME_SUCCESS:
+                    return response
+
+                status_obj = getattr(response, "status", None)
+                status_val = (
+                    status_obj.value
+                    if hasattr(status_obj, "value")
+                    else str(status_obj or "unknown")
+                )
+                err_msg = getattr(response, "error_message", None) or (
+                    f"Provider '{display_name}' returned status "
+                    f"'{status_val}' with no usable images."
+                )
+
+                logger.warning(
+                    "Image provider %s non-success outcome=%s status=%s "
+                    "(attempt %d/%d, effective_max_results=%d): %s",
+                    display_name,
+                    outcome,
+                    status_val,
+                    attempt + 1,
+                    max_retries + 1,
+                    effective_count,
+                    err_msg,
+                )
+
+                if outcome == _OUTCOME_EMPTY:
+                    last_empty_response = response
+
+                errors.append((display_name, err_msg))
+
+                if outcome in (_OUTCOME_EMPTY, _OUTCOME_FAILURE_TERMINAL):
+                    break
+
+                if (
+                    attempt < max_retries
+                    and (deadline - time.monotonic()) > retry_delay
+                ):
+                    await asyncio.sleep(retry_delay)
+                    continue
+                break
+
+        if last_empty_response is not None:
+            return last_empty_response
+
+        summary = (
+            "; ".join(f"{prov}: {msg}" for prov, msg in errors)
+            or "Unknown provider failure."
+        )
+        raise SearchProviderError(
+            f"All image search providers failed. Details: {summary}"
+        )
+
+    # ------------------------------------------------------------------
     # Primary failover-aware execution loop
     # ------------------------------------------------------------------
     @classmethod
@@ -821,7 +1186,7 @@ class SearchProviderFactory:
 
         print(
             f"\n[SEARCH-FACTORY] Query: {clean_query!r}\n"
-            f"[SEARCH-FACTORY] Chain: {' → '.join(chain)}\n"
+            f"[SEARCH-FACTORY] Chain: {' -> '.join(chain)}\n"
             f"[SEARCH-FACTORY] Requested: {max_results} | Budget: {total_budget}s | Retries: {max_retries}",
             flush=True,
         )
@@ -865,9 +1230,9 @@ class SearchProviderFactory:
                 attempt_timeout = max(0.5, min(remaining_budget, prov_timeout))
 
                 print(
-                    f"[SEARCH-FACTORY] → Attempt #{provider_index + 1}.{attempt + 1}: "
+                    f"[SEARCH-FACTORY] -> Attempt #{provider_index + 1}.{attempt + 1}: "
                     f"provider={display_name} | effective_max={effective_count} | "
-                    f"limit={provider_limit} | timeout≈{attempt_timeout:.1f}s",
+                    f"limit={provider_limit} | timeout~{attempt_timeout:.1f}s",
                     flush=True,
                 )
 
@@ -886,7 +1251,7 @@ class SearchProviderFactory:
                 except Exception as exc:
                     err_text = str(exc) or exc.__class__.__name__
                     print(
-                        f"[SEARCH-FACTORY] ✗ {display_name} raised exception "
+                        f"[SEARCH-FACTORY] X {display_name} raised exception "
                         f"(attempt {attempt + 1}/{max_retries + 1}): {err_text[:200]}",
                         flush=True,
                     )
@@ -927,7 +1292,7 @@ class SearchProviderFactory:
 
                 if outcome == _OUTCOME_SUCCESS:
                     print(
-                        f"[SEARCH-FACTORY] ✓ {display_name} returned "
+                        f"[SEARCH-FACTORY] OK {display_name} returned "
                         f"{len(response.results)} results in "
                         f"{getattr(response, 'latency_ms', 0):.0f}ms "
                         f"| status={getattr(response.status, 'value', response.status)}",
@@ -945,8 +1310,8 @@ class SearchProviderFactory:
                 )
 
                 print(
-                    f"[SEARCH-FACTORY] ⚠ {display_name} non-success outcome: "
-                    f"{outcome} (status={status_val}) — "
+                    f"[SEARCH-FACTORY] WARN {display_name} non-success outcome: "
+                    f"{outcome} (status={status_val}) - "
                     f"{'failing over' if should_failover else 'accepting'}",
                     flush=True,
                 )
@@ -982,7 +1347,7 @@ class SearchProviderFactory:
         # ---- All providers exhausted -------------------------------------------
         if last_empty_response is not None:
             print(
-                "[SEARCH-FACTORY] ⚠ All providers exhausted; returning valid EMPTY result "
+                "[SEARCH-FACTORY] WARN All providers exhausted; returning valid EMPTY result "
                 f"from {last_empty_response.provider}.",
                 flush=True,
             )
@@ -990,7 +1355,7 @@ class SearchProviderFactory:
 
         summary = "; ".join(f"{prov}: {msg}" for prov, msg in errors) or "Unknown provider failure."
         print(
-            f"[SEARCH-FACTORY] ✗✗ ALL PROVIDERS FAILED\n"
+            f"[SEARCH-FACTORY] XX ALL PROVIDERS FAILED\n"
             f"[SEARCH-FACTORY] {summary}",
             flush=True,
         )
@@ -1041,10 +1406,27 @@ class SearchProviderFactory:
                     continue
                 call_kwargs[k] = v
 
-        if "query" not in call_kwargs:
-            return await asyncio.wait_for(search_fn(query, max_results=effective_count), timeout=timeout + 1.0)
-
-        return await asyncio.wait_for(search_fn(**call_kwargs), timeout=timeout + 1.0)
+        try:
+            if "query" not in call_kwargs:
+                return await asyncio.wait_for(
+                    search_fn(query, max_results=effective_count),
+                    timeout=timeout + 1.0,
+                )
+            return await asyncio.wait_for(
+                search_fn(**call_kwargs),
+                timeout=timeout + 1.0,
+            )
+        except UnicodeEncodeError as exc:
+            # Defense-in-depth: some providers or their HTTP transport
+            # layers can raise UnicodeEncodeError on Windows consoles or
+            # under non-UTF-8 locales. Convert to a classified provider
+            # failure so the orchestrator can fail over to the next
+            # provider instead of treating this as a crash.
+            raise UpstreamError(
+                f"Provider '{provider.provider_name}' failed to encode "
+                f"HTTP data: {exc}",
+                provider=provider.provider_name,
+            ) from exc
 
     # ------------------------------------------------------------------
     # Count metadata attachment

@@ -120,6 +120,22 @@ _DEFAULT_PROVIDER_CONFIGS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# Defaults for the [search.image_search] sub-table. This is a settings
+# block, not a provider, so it is handled separately from
+# _DEFAULT_PROVIDER_CONFIGS.
+_DEFAULT_IMAGE_SEARCH_CONFIG: Dict[str, Any] = {
+    "enabled": True,
+    "default_max_results": DEFAULT_MAX_RESULTS,
+    "max_results_cap": MAX_RESULTS_HARD_CAP,
+    "engine": "",
+    "fallback_engines": [],
+    "lang": "",
+    "country": "",
+    "total_budget_seconds": 20.0,
+    "max_retries": 0,
+    "retry_delay": 1.0,
+}
+
 # Fields that must never be written back by the client payload.
 _READONLY_CAPABILITY_KEYS = {
     "maxResultsLimit",
@@ -546,6 +562,78 @@ def _enrich_search_config_with_defaults(search_cfg: Optional[Dict[str, Any]] = N
 
         enriched[prov_key] = merged
 
+    # ----- [search.image_search] sub-table -----
+    raw_image = (
+        raw.get("image_search")
+        if isinstance(raw.get("image_search"), dict)
+        else {}
+    )
+    image_cfg: Dict[str, Any] = copy.deepcopy(_DEFAULT_IMAGE_SEARCH_CONFIG)
+
+    if isinstance(raw_image.get("enabled"), bool):
+        image_cfg["enabled"] = raw_image["enabled"]
+
+    for numeric_key in ("default_max_results", "max_results_cap"):
+        if numeric_key in raw_image and raw_image[numeric_key] is not None:
+            try:
+                image_cfg[numeric_key] = _parse_strict_int(
+                    raw_image[numeric_key],
+                    f"image_search.{numeric_key}",
+                    MIN_RESULTS_LIMIT,
+                    MAX_RESULTS_HARD_CAP,
+                )
+            except SearchConfigValidationError:
+                pass
+
+    if isinstance(raw_image.get("engine"), str) and raw_image["engine"].strip():
+        try:
+            image_cfg["engine"] = SearchProviderFactory.get_canonical_display_name(
+                raw_image["engine"]
+            )
+        except ValueError:
+            image_cfg["engine"] = ""
+
+    raw_image_fb = raw_image.get("fallback_engines")
+    if isinstance(raw_image_fb, list):
+        image_fbs: List[str] = []
+        for item in raw_image_fb:
+            if not item:
+                continue
+            try:
+                disp = SearchProviderFactory.get_canonical_display_name(str(item))
+                if disp not in image_fbs:
+                    image_fbs.append(disp)
+            except ValueError:
+                continue
+        image_cfg["fallback_engines"] = image_fbs
+
+    if isinstance(raw_image.get("lang"), str):
+        image_cfg["lang"] = raw_image["lang"].strip().lower()
+    if isinstance(raw_image.get("country"), str):
+        image_cfg["country"] = raw_image["country"].strip().lower()
+
+    for fkey in ("total_budget_seconds", "retry_delay"):
+        if fkey in raw_image and raw_image[fkey] is not None:
+            try:
+                image_cfg[fkey] = _parse_strict_float(
+                    raw_image[fkey],
+                    f"image_search.{fkey}",
+                    0.0 if fkey == "retry_delay" else 1.0,
+                    300.0,
+                )
+            except SearchConfigValidationError:
+                pass
+
+    if "max_retries" in raw_image and raw_image["max_retries"] is not None:
+        try:
+            image_cfg["max_retries"] = _parse_strict_int(
+                raw_image["max_retries"], "image_search.max_retries", 0, 10
+            )
+        except SearchConfigValidationError:
+            pass
+
+    enriched["image_search"] = image_cfg
+
     return enriched
 
 
@@ -742,6 +830,138 @@ def _validate_and_normalize_search_config(
             merged[field_key] = field_val
 
         normalized[prov_key] = merged
+
+    # ----- [search.image_search] sub-table (validate + persist) -----
+    raw_image_in = incoming.get("image_search")
+
+    image_cfg: Dict[str, Any] = copy.deepcopy(_DEFAULT_IMAGE_SEARCH_CONFIG)
+
+    # Start from existing validated state so omitted fields are preserved
+    existing_image = base_existing.get("image_search")
+    if isinstance(existing_image, dict):
+        for k, v in existing_image.items():
+            if k in image_cfg:
+                image_cfg[k] = v
+
+    if isinstance(raw_image_in, dict):
+        if "enabled" in raw_image_in:
+            if not isinstance(raw_image_in["enabled"], bool):
+                raise SearchConfigValidationError(
+                    "image_search.enabled must be a boolean."
+                )
+            image_cfg["enabled"] = raw_image_in["enabled"]
+
+        for numeric_key in ("default_max_results", "max_results_cap"):
+            if (
+                numeric_key in raw_image_in
+                and raw_image_in[numeric_key] not in (None, "")
+            ):
+                image_cfg[numeric_key] = _parse_strict_int(
+                    raw_image_in[numeric_key],
+                    f"image_search.{numeric_key}",
+                    MIN_RESULTS_LIMIT,
+                    MAX_RESULTS_HARD_CAP,
+                )
+
+        if "engine" in raw_image_in:
+            raw_eng = raw_image_in["engine"]
+            if raw_eng is None or raw_eng == "":
+                image_cfg["engine"] = ""
+            elif isinstance(raw_eng, str):
+                try:
+                    eng_key = SearchProviderFactory.normalize_provider_key(raw_eng)
+                    if not SearchProviderFactory.provider_supports_images(eng_key):
+                        raise SearchConfigValidationError(
+                            f"image_search.engine '{raw_eng}' does not support "
+                            f"image search. Supported: DuckDuckGo, SearXNG, "
+                            f"Brave, Google."
+                        )
+                    image_cfg["engine"] = (
+                        SearchProviderFactory.get_canonical_display_name(eng_key)
+                    )
+                except ValueError as exc:
+                    raise SearchConfigValidationError(str(exc)) from exc
+            else:
+                raise SearchConfigValidationError(
+                    "image_search.engine must be a string."
+                )
+
+        if "fallback_engines" in raw_image_in:
+            raw_fb = raw_image_in["fallback_engines"]
+            if raw_fb is None:
+                image_cfg["fallback_engines"] = []
+            else:
+                if isinstance(raw_fb, str):
+                    raw_fb_list = [
+                        p.strip() for p in raw_fb.split(",") if p.strip()
+                    ]
+                elif isinstance(raw_fb, list):
+                    raw_fb_list = raw_fb
+                else:
+                    raise SearchConfigValidationError(
+                        "image_search.fallback_engines must be a list."
+                    )
+                parsed_fbs: List[str] = []
+                for fb in raw_fb_list:
+                    if not isinstance(fb, str) or not fb.strip():
+                        continue
+                    try:
+                        fb_key = SearchProviderFactory.normalize_provider_key(fb)
+                        if not SearchProviderFactory.provider_supports_images(fb_key):
+                            raise SearchConfigValidationError(
+                                f"image_search.fallback_engines '{fb}' does "
+                                f"not support image search."
+                            )
+                        disp = SearchProviderFactory.get_canonical_display_name(fb_key)
+                        if disp not in parsed_fbs:
+                            parsed_fbs.append(disp)
+                    except ValueError as exc:
+                        raise SearchConfigValidationError(str(exc)) from exc
+                image_cfg["fallback_engines"] = parsed_fbs
+
+        if "lang" in raw_image_in:
+            val = raw_image_in["lang"]
+            if val is None:
+                image_cfg["lang"] = ""
+            elif isinstance(val, str):
+                image_cfg["lang"] = val.strip().lower()
+            else:
+                raise SearchConfigValidationError(
+                    "image_search.lang must be a string."
+                )
+
+        if "country" in raw_image_in:
+            val = raw_image_in["country"]
+            if val is None:
+                image_cfg["country"] = ""
+            elif isinstance(val, str):
+                image_cfg["country"] = val.strip().lower()
+            else:
+                raise SearchConfigValidationError(
+                    "image_search.country must be a string."
+                )
+
+        if (
+            "total_budget_seconds" in raw_image_in
+            and raw_image_in["total_budget_seconds"] is not None
+        ):
+            image_cfg["total_budget_seconds"] = _parse_strict_float(
+                raw_image_in["total_budget_seconds"],
+                "image_search.total_budget_seconds",
+                1.0, 300.0,
+            )
+
+        if "max_retries" in raw_image_in and raw_image_in["max_retries"] is not None:
+            image_cfg["max_retries"] = _parse_strict_int(
+                raw_image_in["max_retries"], "image_search.max_retries", 0, 10
+            )
+
+        if "retry_delay" in raw_image_in and raw_image_in["retry_delay"] is not None:
+            image_cfg["retry_delay"] = _parse_strict_float(
+                raw_image_in["retry_delay"], "image_search.retry_delay", 0.0, 60.0
+            )
+
+    normalized["image_search"] = image_cfg
 
     return normalized
 

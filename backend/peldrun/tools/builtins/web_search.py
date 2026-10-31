@@ -58,6 +58,211 @@ _CB_COOLDOWN_SECONDS: float = 60.0
 _EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 _BEARER_KEY_RE = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{16,}|tvly-[A-Za-z0-9_-]{12,}|AIza[0-9A-Za-z_-]{20,})\b")
 
+# Detects image search intent when search_type='auto' (default).
+# Matches realistic user prompts including verbose direct-chat prompts
+# such as "Search the web for images of the Eiffel Tower at sunset and
+# show me the image URLs". Technical contexts (image processing, image
+# compression, image recognition, ...) are excluded by requiring the
+# image noun to appear in a search/request frame rather than simply
+# being present anywhere in the query.
+_IMAGE_QUERY_KEYWORDS_RE = re.compile(
+    r"(?:"
+    # "images of X" / "photos of X" / "pictures of X" / etc.
+    r"\b(?:images?|pictures?|photos?|pics?|photographs?)"
+    r"\s+(?:of|for|about|on|showing|related\s+to)\b"
+    r"|"
+    # "... for images" / "... for some photos" / "... for the pictures"
+    r"\bfor\s+(?:some\s+|the\s+)?"
+    r"(?:images?|pictures?|photos?|pics?|photographs?)\b"
+    r"|"
+    # "image search" / "photo search" / "picture search"
+    r"\b(?:image|photo|picture)\s+search\b"
+    r"|"
+    # "show me images" / "find photos" / "get pictures" / "download images"
+    r"\b(?:show|find|get|fetch|grab|download|pull|locate|search\s+for)"
+    r"\s+(?:me\s+)?(?:some\s+|the\s+)?"
+    r"(?:images?|pictures?|photos?|pics?|photographs?)\b"
+    r"|"
+    # "image URLs" / "photo links" / "picture files"
+    r"\b(?:images?|pictures?|photos?)\s+(?:URLs?|links?|files?|sources?)\b"
+    r"|"
+    # Ends with an image noun (e.g. "Eiffel Tower sunset images")
+    r"\b(?:images?|pictures?|photos?|pics?|photographs?)\s*[?.!]*\s*$"
+    r")",
+    re.IGNORECASE,
+)
+
+_IMAGE_SEARCH_TYPE_VALUES = frozenset(
+    {"images", "image", "photo", "photos", "picture", "pictures", "pic", "pics"}
+)
+
+
+def _detect_image_intent_from_query(query: str) -> bool:
+    """
+    Return True when the query expresses an image-search request.
+
+    Used only when search_type='auto' so web_search can serve image
+    requests even when the dedicated image_search tool is not
+    registered on the agent. Explicit search_type='text' always wins.
+    """
+    if not query or not isinstance(query, str):
+        return False
+    return bool(_IMAGE_QUERY_KEYWORDS_RE.search(query.strip()))
+
+
+def _extract_image_search_topic(prompt: str) -> str:
+    """
+    Extract a clean image search topic from a verbose user prompt.
+
+    Strategy (in order):
+      1. Locate an explicit "images of X" / "photos of X" / "pictures of X"
+         / "image search for X" pattern in the ORIGINAL prompt and capture
+         X directly. This is resilient to verbose requests such as
+         "Search the internet and show me images of Saint Petersburg" —
+         where a naive strip-based approach would lose the subject after
+         "and show me images of".
+      2. If no explicit pattern exists, fall back to stripping leading
+         search verbs and trailing filler words (image nouns, "from the
+         internet", "online", ...) one at a time.
+      3. Reject meta-only results ("the internet", "the web", "online")
+         and fall back to the original prompt so we never send the image
+         API an empty or meaningless topic.
+
+    Examples
+    --------
+    "Search the internet and show me images of Saint Petersburg"
+        -> "Saint Petersburg"
+    "Search the web for images of the Eiffel Tower at sunset and show me the image URLs."
+        -> "the Eiffel Tower at sunset"
+    "Find pictures of cats"                 -> "cats"
+    "Get image URLs for Mount Fuji"         -> "Mount Fuji"
+    "image search for sunsets"              -> "sunsets"
+    "Eiffel Tower sunset images"            -> "Eiffel Tower sunset"
+    """
+    text = (prompt or "").strip()
+    if not text:
+        return text
+
+    # ------------------------------------------------------------------
+    # 1. Primary strategy: extract "images of X" / "image search for X"
+    #    from the ORIGINAL prompt. This avoids losing the subject when
+    #    trailing instructions such as "and show me images of X" contain
+    #    the actual topic.
+    # ------------------------------------------------------------------
+    primary = re.search(
+        r"(?:"
+        r"\b(?:images?|pictures?|photos?|pics?|photographs?)"
+        r"(?:\s+(?:URLs?|links?|sources?|files?))?"
+        r"\s+(?:of|for|about|on|showing|related\s+to|from)\s+"
+        r"|"
+        r"\b(?:image|photo|picture)\s+search\s+(?:for\s+)?"
+        r")"
+        r"(.+?)"
+        r"(?:\s+(?:and|,)\s+"
+        r"(?:show|give|send|return|display|provide|list|include|fetch)\b.*)?"
+        r"(?:\s+from\s+(?:the\s+)?(?:internet|web|online|net)\b.*)?"
+        r"\s*[?.!]*\s*$",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if primary:
+        topic = primary.group(1).strip(" .,!?;:")
+        # Strip any residual "from/on/at the internet/web/online" that
+        # survived the capture group.
+        topic = re.sub(
+            r"\s+(?:from|on|via|in|at)\s+(?:the\s+)?"
+            r"(?:internet|web|net|online)\s*[?.!]*\s*$",
+            "",
+            topic,
+            flags=re.IGNORECASE,
+        )
+        # Strip any residual "and ..." clause that leaked into the capture.
+        topic = re.sub(
+            r"\s+(?:and|,)\s+.*$",
+            "",
+            topic,
+            flags=re.IGNORECASE,
+        )
+        # Strip bare trailing "internet/web/net/online" that survived
+        # the capture group without a preposition (e.g. "cats online",
+        # "puppies online").
+        topic = re.sub(
+            r"\s+(?:the\s+)?(?:internet|web|net|online)\s*[?.!]*\s*$",
+            "",
+            topic,
+            flags=re.IGNORECASE,
+        )
+        topic = topic.strip(" .,!?;:")
+        if topic and topic.lower() not in {
+            "", "the internet", "internet", "the web", "web",
+            "online", "the net", "net",
+        }:
+            return topic
+
+    # ------------------------------------------------------------------
+    # 2. Secondary strategy: strip leading verbs + trailing fillers.
+    # ------------------------------------------------------------------
+    text = re.sub(
+        r"^(?:please\s+|could\s+you\s+|can\s+you\s+|would\s+you\s+|"
+        r"i\s+want\s+to\s+)?"
+        r"(?:search|find|get|show|fetch|grab|download|pull|locate|"
+        r"look\s+up|look\s+for|see)\b"
+        r"(?:\s+(?:the\s+web|the\s+internet|the\s+net|online|web|internet))?"
+        r"(?:\s+for)?"
+        r"(?:\s+me)?"
+        r"\s+",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Strip "some/the images of ..." header if not already consumed.
+    text = re.sub(
+        r"^(?:some\s+|the\s+)?"
+        r"(?:images?|pictures?|photos?|pics?|photographs?)"
+        r"(?:\s+(?:of|for|about|on|from|showing|related\s+to))?\s+",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Strip trailing "from the internet" / "online" / "web" etc.
+    text = re.sub(
+        r"\s+(?:(?:from|on|via|in|at)\s+)?(?:the\s+)?"
+        r"(?:internet|web|net|online)\s*[?.!]*\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Strip trailing "images"/"pictures"/"photos" nouns.
+    text = re.sub(
+        r"\s+(?:images?|pictures?|photos?|pics?|photographs?)\s*[?.!]*\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Strip trailing filler particles.
+    text = re.sub(
+        r"\s+(?:for|of|about|on|from)\s*$", "", text, flags=re.IGNORECASE,
+    )
+
+    text = text.strip(" .,!?;:")
+
+    # ------------------------------------------------------------------
+    # 3. Validate: never return a meta-only topic.
+    # ------------------------------------------------------------------
+    meta_only = {
+        "", "the internet", "internet", "the web", "web",
+        "online", "the net", "net", "the world wide web",
+    }
+    if text.lower() in meta_only:
+        return prompt.strip()
+
+    return text or prompt.strip()
+
+
 # Provider statuses that represent a genuine non-success failure (as opposed to a
 # valid empty search result).
 _FAILURE_STATUS_VALUES: frozenset = frozenset(
@@ -99,6 +304,14 @@ class WebSearchArgs(BaseModel):
             "Optional desired maximum number of results. Omit this argument to use "
             "PELDRUN Search Settings. The configured provider ceiling and provider "
             "capability maximum are always enforced."
+        ),
+    )
+    search_type: Optional[str] = Field(
+        default="auto",
+        description=(
+            "Type of search. 'auto' (default) detects image intent from the "
+            "query. 'images' forces image search and returns direct image URLs. "
+            "'text' forces web-page search."
         ),
     )
 
@@ -634,6 +847,7 @@ class WebSearchTool(BaseTool):
         self,
         query: str,
         max_results: Optional[int] = None,
+        search_type: str = "auto",
         *,
         search_config: Optional[Dict[str, Any]] = None,
         override_provider: Optional[str] = None,
@@ -650,6 +864,70 @@ class WebSearchTool(BaseTool):
         consulting the authoritative search configuration in SearchProviderFactory.
         """
         start_ts = time.perf_counter()
+
+        # ------------------------------------------------------------------
+        # Resolve effective search mode.
+        #
+        #   "images"          -> explicit image search
+        #   "text"            -> explicit web-page search (respects caller)
+        #   "auto" (default)  -> detect image intent from the query keyword
+        #
+        # This routing runs inside web_search itself and imports
+        # ImageSearchTool directly, so it works even when the dedicated
+        # image_search tool is not registered on the agent.
+        # ------------------------------------------------------------------
+        effective_search_type = str(search_type or "auto").strip().lower()
+
+        if effective_search_type in _IMAGE_SEARCH_TYPE_VALUES:
+            use_image_search = True
+            routing_reason = f"explicit search_type='{effective_search_type}'"
+        elif effective_search_type == "text":
+            use_image_search = False
+            routing_reason = "explicit search_type='text'"
+        elif effective_search_type == "auto":
+            use_image_search = _detect_image_intent_from_query(query or "")
+            routing_reason = (
+                "auto-detected image keyword in query"
+                if use_image_search
+                else "no image keyword detected in query"
+            )
+        else:
+            # Unknown value: default to text search (safe).
+            use_image_search = False
+            routing_reason = f"unknown search_type='{effective_search_type}', defaulting to text"
+
+        if use_image_search:
+            # Strip search verbs, image nouns, and trailing instructions
+            # from the verbose user prompt so the image API receives a
+            # clean topic instead of a full sentence.
+            image_topic = _extract_image_search_topic(query or "")
+            logger.info(
+                "web_search routing to image search (%s) "
+                "topic=%r (original_query=%r)",
+                routing_reason,
+                image_topic,
+                query,
+            )
+            print(
+                f"[WEB_SEARCH] Routing to image_search ({routing_reason}) "
+                f"topic={image_topic!r}",
+                flush=True,
+            )
+            from peldrun.tools.builtins.image_search import ImageSearchTool
+            img_tool = ImageSearchTool(
+                workspace_root=self.workspace_root,
+                search_config=search_config,
+            )
+            return await img_tool._arun(
+                query=image_topic,
+                max_results=max_results,
+            )
+        elif effective_search_type == "auto":
+            logger.debug(
+                "web_search staying on text search (%s) for query %r",
+                routing_reason,
+                query,
+            )
 
         # 1. Validate query
         if not isinstance(query, str) or not query.strip():
@@ -747,18 +1025,18 @@ class WebSearchTool(BaseTool):
 
         print(
             "\n"
-            "╔══════════════════════════════════════════════════════════════════\n"
-            "║ [WEB_SEARCH] Invocation\n"
-            "╠══════════════════════════════════════════════════════════════════\n"
-            f"║ Query          : {sanitized_query!r}\n"
-            f"║ Requested max  : {explicit_requested_count if explicit_requested_count is not None else '(from settings)'}\n"
-            f"║ Default max    : {cfg.get('default_max_results')}\n"
-            f"║ Primary engine : {cfg.get('engine')}\n"
-            f"║ Fallback chain : {cfg.get('fallback_engines') or []}\n"
-            f"║ Exec chain     : {' → '.join(enabled_chain)}\n"
-            f"║ Privacy mode   : {cfg.get('privacy_mode', False)}\n"
-            f"║ Override prov  : {override_provider or '(none)'}\n"
-            "╚══════════════════════════════════════════════════════════════════",
+            "+==================================================================\n"
+            "| [WEB_SEARCH] Invocation\n"
+            "+==================================================================\n"
+            f"| Query          : {sanitized_query!r}\n"
+            f"| Requested max  : {explicit_requested_count if explicit_requested_count is not None else '(from settings)'}\n"
+            f"| Default max    : {cfg.get('default_max_results')}\n"
+            f"| Primary engine : {cfg.get('engine')}\n"
+            f"| Fallback chain : {cfg.get('fallback_engines') or []}\n"
+            f"| Exec chain     : {' -> '.join(enabled_chain)}\n"
+            f"| Privacy mode   : {cfg.get('privacy_mode', False)}\n"
+            f"| Override prov  : {override_provider or '(none)'}\n"
+            "+==================================================================",
             flush=True,
         )
 
@@ -775,13 +1053,13 @@ class WebSearchTool(BaseTool):
             latency_ms = (time.perf_counter() - start_ts) * 1000.0
             err_str = str(exc) or exc.__class__.__name__
             print(
-                "╔══════════════════════════════════════════════════════════════════\n"
-                "║ [WEB_SEARCH] ✗ FAILED\n"
-                "╠══════════════════════════════════════════════════════════════════\n"
-                f"║ Query          : {sanitized_query!r}\n"
-                f"║ Error          : {err_str}\n"
-                f"║ Latency (ms)   : {round(latency_ms, 2)}\n"
-                "╚══════════════════════════════════════════════════════════════════\n",
+                "+==================================================================\n"
+                "| [WEB_SEARCH] FAILED\n"
+                "+==================================================================\n"
+                f"| Query          : {sanitized_query!r}\n"
+                f"| Error          : {err_str}\n"
+                f"| Latency (ms)   : {round(latency_ms, 2)}\n"
+                "+==================================================================\n",
                 flush=True,
             )
             self._record_breaker_outcome(
@@ -853,15 +1131,15 @@ class WebSearchTool(BaseTool):
             )
 
             print(
-                "╔══════════════════════════════════════════════════════════════════\n"
-                "║ [WEB_SEARCH] ✗ FAILED (provider returned failure status)\n"
-                "╠══════════════════════════════════════════════════════════════════\n"
-                f"║ Query           : {sanitized_query!r}\n"
-                f"║ Provider        : {resolved_provider}\n"
-                f"║ Provider status : {provider_status_value or 'unknown'}\n"
-                f"║ Error           : {err_msg}\n"
-                f"║ Latency (ms)    : {round(latency_ms, 2)}\n"
-                "╚══════════════════════════════════════════════════════════════════\n",
+                "+==================================================================\n"
+                "| [WEB_SEARCH] FAILED (provider returned failure status)\n"
+                "+==================================================================\n"
+                f"| Query           : {sanitized_query!r}\n"
+                f"| Provider        : {resolved_provider}\n"
+                f"| Provider status : {provider_status_value or 'unknown'}\n"
+                f"| Error           : {err_msg}\n"
+                f"| Latency (ms)    : {round(latency_ms, 2)}\n"
+                "+==================================================================\n",
                 flush=True,
             )
 
@@ -955,24 +1233,24 @@ class WebSearchTool(BaseTool):
 
         # --- Diagnostic console output: search outcome (real, not assumed) ---
         if outcome_class == "success":
-            outcome_label = "✓ SUCCESS"
+            outcome_label = "SUCCESS"
             telemetry_status = "completed"
         else:
-            outcome_label = "○ EMPTY (search completed, no matching results)"
+            outcome_label = "EMPTY (search completed, no matching results)"
             telemetry_status = "empty"
 
         print(
-            "╔══════════════════════════════════════════════════════════════════\n"
-            f"║ [WEB_SEARCH] {outcome_label}\n"
-            "╠══════════════════════════════════════════════════════════════════\n"
-            f"║ Query           : {sanitized_query!r}\n"
-            f"║ Provider used   : {resolved_provider}\n"
-            f"║ Provider status : {provider_status_value or 'unknown'}\n"
-            f"║ Results count   : {len(capped_items)} / {effective_max} (limit {provider_limit})\n"
-            f"║ Latency (ms)    : {round(latency_ms, 2)}\n"
-            f"║ Cost (USD)      : {cost_usd:.4f}\n"
-            f"║ Cost basis      : {cost_basis}\n"
-            "╚══════════════════════════════════════════════════════════════════\n",
+            "+==================================================================\n"
+            f"| [WEB_SEARCH] {outcome_label}\n"
+            "+==================================================================\n"
+            f"| Query           : {sanitized_query!r}\n"
+            f"| Provider used   : {resolved_provider}\n"
+            f"| Provider status : {provider_status_value or 'unknown'}\n"
+            f"| Results count   : {len(capped_items)} / {effective_max} (limit {provider_limit})\n"
+            f"| Latency (ms)    : {round(latency_ms, 2)}\n"
+            f"| Cost (USD)      : {cost_usd:.4f}\n"
+            f"| Cost basis      : {cost_basis}\n"
+            "+==================================================================\n",
             flush=True,
         )
 

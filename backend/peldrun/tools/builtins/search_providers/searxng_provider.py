@@ -31,6 +31,8 @@ from peldrun.tools.builtins.search_providers.base import (
     ConfigurationError,
     CostBasis,
     DiagnosticCheckType,
+    ImageSearchResponse,
+    ImageSearchResult,
     InvalidResponseError,
     PermissionError,
     ProviderDiagnosticResult,
@@ -517,6 +519,245 @@ class SearXNGSearchProvider(BaseSearchProvider):
                 "SearXNG completed the request (HTTP 200) but returned zero results. "
                 "Verify that upstream engines are enabled and responsive on the instance."
             ),
+        )
+
+    # ------------------------------------------------------------------
+    # Image Search
+    # ------------------------------------------------------------------
+    async def image_search(
+        self,
+        query: str,
+        max_results: int = 3,
+        lang: str = "en",
+        country: str = "us",
+        **kwargs: Any,
+    ) -> ImageSearchResponse:
+        """
+        Execute a SearXNG image search through the 'images' category.
+        Requires 'json' format and the images category to be enabled on the
+        instance. Returns rich image results (image_url, thumbnail, source page,
+        dimensions) and records request_count independently of result count.
+        """
+        start_time = time.perf_counter()
+        clean_q = (query or "").strip()
+
+        if not clean_q:
+            return ImageSearchResponse(
+                query=query or "",
+                provider=self.provider_name,
+                results=[],
+                status=ProviderStatus.CONFIGURATION_ERROR,
+                request_count=0,
+                estimated_cost_usd=0.0,
+                cost_basis=CostBasis.NOT_BILLABLE_LOCAL,
+                is_success=False,
+                error_code="empty_query",
+                error_message="Image search query cannot be empty.",
+            )
+
+        try:
+            self._validate_base_url()
+        except ConfigurationError as exc:
+            return ImageSearchResponse(
+                query=clean_q,
+                provider=self.provider_name,
+                results=[],
+                status=ProviderStatus.CONFIGURATION_ERROR,
+                request_count=0,
+                estimated_cost_usd=0.0,
+                cost_basis=CostBasis.ASSUMED_ZERO_LOCAL,
+                is_success=False,
+                error_code=exc.error_code,
+                error_message=exc.message,
+            )
+
+        limit = max(1, min(int(max_results), self.max_results_cap, 20))
+        cost_val, cost_basis = self._resolve_cost_and_basis()
+
+        params: Dict[str, Any] = {
+            "q": clean_q,
+            "format": "json",
+            "categories": "images",
+            "language": (lang or "en").strip(),
+            "safesearch": self.safesearch,
+        }
+        if self.time_format:
+            params["time_range"] = self.time_format
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.timeout_seconds,
+                follow_redirects=True,
+                headers={"Accept": "application/json"},
+            ) as client:
+                resp = await client.get(f"{self.base_url}/search", params=params)
+        except httpx.TimeoutException as exc:
+            elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+            return ImageSearchResponse(
+                query=clean_q,
+                provider=self.provider_name,
+                results=[],
+                status=ProviderStatus.TIMEOUT,
+                latency_ms=elapsed_ms,
+                request_count=1,
+                estimated_cost_usd=0.0,
+                cost_basis=cost_basis,
+                is_success=False,
+                error_code="timeout",
+                error_message=(
+                    f"SearXNG image search timed out after "
+                    f"{self.timeout_seconds:.1f}s."
+                ),
+            )
+        except httpx.HTTPError as exc:
+            elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+            return ImageSearchResponse(
+                query=clean_q,
+                provider=self.provider_name,
+                results=[],
+                status=ProviderStatus.UPSTREAM_ERROR,
+                latency_ms=elapsed_ms,
+                request_count=1,
+                estimated_cost_usd=0.0,
+                cost_basis=cost_basis,
+                is_success=False,
+                error_code="upstream_error",
+                error_message=(
+                    f"Failed to connect to SearXNG instance at "
+                    f"{self.base_url}: {exc}"
+                ),
+            )
+
+        if resp.status_code != 200:
+            elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+            if resp.status_code == 401:
+                status = ProviderStatus.AUTHENTICATION_ERROR
+                err_msg = "SearXNG instance requires authentication (HTTP 401)."
+            elif resp.status_code == 403:
+                status = ProviderStatus.PERMISSION_ERROR
+                err_msg = (
+                    "SearXNG rejected the JSON image search request (HTTP 403). "
+                    "Ensure 'json' is enabled under 'search.formats' in "
+                    "settings.yml and that the 'images' category is enabled."
+                )
+            elif resp.status_code == 404:
+                status = ProviderStatus.CONFIGURATION_ERROR
+                err_msg = (
+                    f"SearXNG search endpoint not found at "
+                    f"{self.base_url}/search (HTTP 404)."
+                )
+            elif resp.status_code == 429:
+                status = ProviderStatus.RATE_LIMITED
+                err_msg = (
+                    "SearXNG instance rate limit or limiter threshold exceeded "
+                    "(HTTP 429)."
+                )
+            elif resp.status_code >= 500:
+                status = ProviderStatus.UPSTREAM_ERROR
+                err_msg = (
+                    f"SearXNG instance returned server error HTTP "
+                    f"{resp.status_code}: {resp.text[:200]}"
+                )
+            else:
+                status = ProviderStatus.UPSTREAM_ERROR
+                err_msg = (
+                    f"SearXNG returned unexpected HTTP {resp.status_code}: "
+                    f"{resp.text[:200]}"
+                )
+            return ImageSearchResponse(
+                query=clean_q,
+                provider=self.provider_name,
+                results=[],
+                status=status,
+                latency_ms=elapsed_ms,
+                request_count=1,
+                estimated_cost_usd=0.0,
+                cost_basis=cost_basis,
+                is_success=False,
+                error_code=status.value,
+                error_message=err_msg,
+            )
+
+        try:
+            data = resp.json()
+        except Exception as exc:
+            elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+            return ImageSearchResponse(
+                query=clean_q,
+                provider=self.provider_name,
+                results=[],
+                status=ProviderStatus.INVALID_RESPONSE,
+                latency_ms=elapsed_ms,
+                request_count=1,
+                estimated_cost_usd=0.0,
+                cost_basis=cost_basis,
+                is_success=False,
+                error_code="invalid_response",
+                error_message=(
+                    "SearXNG returned a non-JSON image response. Verify that "
+                    f"'json' format is enabled. Details: {exc}"
+                ),
+            )
+
+        raw_results = data.get("results") if isinstance(data, dict) else None
+        if not isinstance(raw_results, list):
+            raw_results = []
+
+        results: List[ImageSearchResult] = []
+        for item in raw_results:
+            if not isinstance(item, dict):
+                continue
+
+            img_url = (
+                item.get("img_src")
+                or item.get("image")
+                or item.get("image_url")
+                or ""
+            )
+            if not img_url:
+                continue
+
+            parsed = self.make_image_result(
+                title=item.get("title") or item.get("source") or "",
+                image_url=img_url,
+                thumbnail_url=(
+                    item.get("thumbnail_src")
+                    or item.get("thumbnail")
+                    or item.get("thumbnail_url")
+                    or ""
+                ),
+                source_url=item.get("url") or "",
+                width=item.get("width"),
+                height=item.get("height"),
+            )
+            if parsed is not None:
+                results.append(parsed)
+            if len(results) >= limit:
+                break
+
+        elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+        has_results = bool(results)
+
+        return ImageSearchResponse(
+            query=clean_q,
+            provider=self.provider_name,
+            results=results,
+            status=ProviderStatus.SUCCESS if has_results else ProviderStatus.EMPTY,
+            latency_ms=elapsed_ms,
+            request_count=1,
+            usage_units=1.0,
+            estimated_cost_usd=cost_val,
+            cost_basis=cost_basis,
+            is_success=has_results,
+            error_code=None if has_results else "empty_results",
+            error_message=None
+            if has_results
+            else (
+                "SearXNG image search completed the request (HTTP 200) but "
+                "returned zero images. Verify that the 'images' category is "
+                "enabled and upstream image engines are responsive."
+            ),
+            effective_max_results=limit,
         )
 
 

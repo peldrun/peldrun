@@ -12,6 +12,7 @@ from peldrun.tools.builtins.file_ops import FileOpsArgs, FileOpsTool
 from peldrun.tools.builtins.human_input import HumanInputArgs, HumanInputTool
 from peldrun.tools.builtins.shell_exec import ShellExecArgs, ShellExecTool
 from peldrun.tools.builtins.web_search import WebSearchArgs, WebSearchTool
+from peldrun.tools.builtins.image_search import ImageSearchArgs, ImageSearchTool
 
 
 def get_builtin_tools(
@@ -26,6 +27,7 @@ def get_builtin_tools(
         FileOpsTool(workspace_root=workspace_root),
         ShellExecTool(workspace_root=workspace_root),
         WebSearchTool(workspace_root=workspace_root),
+        ImageSearchTool(workspace_root=workspace_root),
         HumanInputTool(workspace_root=workspace_root, emitter=emitter),
     ]
 
@@ -35,11 +37,13 @@ __all__ = [
     "FileOpsArgs",
     "ShellExecArgs",
     "WebSearchArgs",
+    "ImageSearchArgs",
     "HumanInputArgs",
     # Tools
     "FileOpsTool",
     "ShellExecTool",
     "WebSearchTool",
+    "ImageSearchTool",
     "HumanInputTool",
     # Factory
     "get_builtin_tools",

@@ -231,7 +231,18 @@ def sanitize_untrusted_text(
 
 
 def sanitize_error_text(raw_error: Optional[str]) -> str:
-    """Bound and clean diagnostic error strings so raw HTML/secrets are not leaked."""
+    """
+    Bound and clean diagnostic error strings so raw HTML/secrets are not
+    leaked.
+
+    Also forces ASCII-safe output so error messages can be written to
+    encoding-constrained log streams without raising UnicodeEncodeError.
+    Combined with ``omweb._unicode_setup.install_utf8_console`` at app
+    startup, this provides defense-in-depth: even if UTF-8 reconfiguration
+    is unavailable (embedded environments, exotic CI runners), non-ASCII
+    content in error text is safely down-converted to '?' before any
+    logging call.
+    """
     if not raw_error:
         return ""
     cleaned = _CONTROL_CHARS_RE.sub(" ", str(raw_error))
@@ -241,6 +252,13 @@ def sanitize_error_text(raw_error: Optional[str]) -> str:
         r"\1[REDACTED]",
         cleaned,
     )
+    # Force ASCII-safe output. Windows consoles using cp1252 or ascii
+    # encoding raise UnicodeEncodeError on any non-ASCII codepoint; this
+    # guard prevents that failure mode.
+    try:
+        cleaned = cleaned.encode("ascii", errors="replace").decode("ascii")
+    except Exception:
+        cleaned = "".join(c if ord(c) < 128 else "?" for c in cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if len(cleaned) > MAX_ERROR_MESSAGE_CHARS:
         return cleaned[:MAX_ERROR_MESSAGE_CHARS].rstrip() + "..."
@@ -515,6 +533,144 @@ class SearchResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Canonical Image Result & Response Models
+# ---------------------------------------------------------------------------
+class ImageSearchResult(BaseModel):
+    """
+    Standardized atomic image result parsed from an external search provider.
+    Treated as untrusted external source material.
+    """
+    title: str = Field(..., description="Sanitized image title or alt-text.")
+    image_url: str = Field(..., description="Direct URL to the image file.")
+    thumbnail_url: Optional[str] = Field(
+        default=None,
+        description="Optional thumbnail URL supplied by the provider.",
+    )
+    source_url: Optional[str] = Field(
+        default=None,
+        description="Page URL where the image was originally found.",
+    )
+    width: Optional[int] = Field(default=None, ge=0)
+    height: Optional[int] = Field(default=None, ge=0)
+    source: Optional[str] = Field(
+        default=None,
+        description="Normalized hostname of the image URL.",
+    )
+    provider: Optional[str] = Field(
+        default=None,
+        description="Provider identifier that produced this result.",
+    )
+
+    @field_validator("image_url", mode="before")
+    @classmethod
+    def _validate_image_url(cls, value: Any) -> str:
+        return validate_search_url(str(value or ""))
+
+    @field_validator("thumbnail_url", mode="before")
+    @classmethod
+    def _validate_thumbnail_url(cls, value: Any) -> Optional[str]:
+        if value is None or value == "":
+            return None
+        try:
+            return validate_search_url(str(value))
+        except ValueError:
+            return None
+
+    @field_validator("source_url", mode="before")
+    @classmethod
+    def _validate_source_url(cls, value: Any) -> Optional[str]:
+        if value is None or value == "":
+            return None
+        try:
+            return validate_search_url(str(value))
+        except ValueError:
+            return None
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def _validate_title(cls, value: Any) -> str:
+        cleaned = sanitize_untrusted_text(
+            str(value or ""), max_chars=MAX_TITLE_CHARS
+        )
+        return cleaned or "Untitled Image"
+
+    @field_validator("width", "height", mode="before")
+    @classmethod
+    def _validate_dimension(cls, value: Any) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        try:
+            parsed = int(value)
+            return parsed if parsed > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    @model_validator(mode="after")
+    def _populate_source(self) -> "ImageSearchResult":
+        if not self.source and self.image_url:
+            self.source = extract_url_source(self.image_url)
+        return self
+
+
+class ImageSearchResponse(BaseModel):
+    """
+    Structured outcome model for image search provider invocations.
+    Mirrors SearchResponse semantics: status classification, request/usage
+    accounting, latency metrics, and cost basis tracking.
+    """
+    query: str = Field(..., description="Evaluated image search query.")
+    provider: str = Field(..., description="Provider identifier.")
+    results: List[ImageSearchResult] = Field(
+        default_factory=list,
+        description="Parsed image results (bounded to effective_max_results).",
+    )
+    status: ProviderStatus = Field(
+        default=ProviderStatus.SUCCESS,
+        description="Explicit classification of the image search outcome.",
+    )
+    latency_ms: float = Field(default=0.0, ge=0.0)
+    request_count: int = Field(default=1, ge=0)
+    usage_units: Optional[float] = Field(default=None, ge=0.0)
+    estimated_cost_usd: Optional[float] = Field(default=0.0)
+    cost_basis: CostBasis = Field(default=CostBasis.UNKNOWN)
+    is_success: bool = Field(default=True)
+    error_code: Optional[str] = Field(default=None)
+    error_message: Optional[str] = Field(default=None)
+    requested_max_results: Optional[int] = Field(default=None)
+    effective_max_results: Optional[int] = Field(default=None)
+    max_results_limit: Optional[int] = Field(default=None)
+
+    @model_validator(mode="after")
+    def _normalize_contract_fields(self) -> "ImageSearchResponse":
+        cap = MAX_RESULTS_HARD_CAP
+        if self.effective_max_results is not None and self.effective_max_results >= 1:
+            cap = min(cap, int(self.effective_max_results))
+        if self.max_results_limit is not None and self.max_results_limit >= 1:
+            cap = min(cap, int(self.max_results_limit))
+        if len(self.results) > cap:
+            self.results = self.results[:cap]
+
+        for item in self.results:
+            if not item.provider:
+                item.provider = self.provider
+
+        if self.error_message:
+            self.error_message = sanitize_error_text(self.error_message)
+
+        if self.estimated_cost_usd is not None and self.estimated_cost_usd < 0.0:
+            self.estimated_cost_usd = 0.0
+
+        if self.results and self.is_success:
+            self.status = ProviderStatus.SUCCESS
+        elif not self.results and self.status == ProviderStatus.SUCCESS:
+            if self.is_success:
+                self.status = ProviderStatus.EMPTY
+                self.is_success = False
+
+        return self
+
+
+# ---------------------------------------------------------------------------
 # Provider Capability & Diagnostic Models (Phase 1.8, 5.1, 5.2)
 # ---------------------------------------------------------------------------
 class ProviderFieldSpec(BaseModel):
@@ -543,6 +699,8 @@ class ProviderCapability(BaseModel):
     supports_country: bool = True
     supports_safesearch: bool = False
     supports_raw_content: bool = False
+    supports_image_search: bool = False
+    image_max_results_limit: int = 20
     max_results_limit: int = 10
     default_max_results: int = DEFAULT_MAX_RESULTS
     configured_max_results: Optional[int] = None
@@ -618,6 +776,37 @@ class BaseSearchProvider(ABC):
         Returns True only when the provider check succeeds without auth/quota errors.
         """
         raise NotImplementedError("Search provider must implement 'ping' method.")
+
+    async def image_search(
+        self,
+        query: str,
+        max_results: int = 3,
+        lang: str = "en",
+        country: str = "us",
+        **kwargs: Any,
+    ) -> ImageSearchResponse:
+        """
+        Default image search implementation.
+        Providers that support image search must override this method.
+        The base implementation returns a classified 'unsupported' response
+        so that orchestrators can filter image-capable providers without
+        catching exceptions.
+        """
+        clean_q = (query or "").strip()
+        return ImageSearchResponse(
+            query=clean_q,
+            provider=self.provider_name,
+            results=[],
+            status=ProviderStatus.CONFIGURATION_ERROR,
+            request_count=0,
+            estimated_cost_usd=0.0,
+            cost_basis=CostBasis.NOT_BILLABLE_LOCAL,
+            is_success=False,
+            error_code="image_search_unsupported",
+            error_message=(
+                f"{self.provider_name} does not support image search."
+            ),
+        )
 
     async def diagnose(
         self,
@@ -739,6 +928,39 @@ class BaseSearchProvider(ABC):
             )
             return None
 
+    def make_image_result(
+        self,
+        *,
+        title: Any,
+        image_url: Any,
+        thumbnail_url: Any = None,
+        source_url: Any = None,
+        width: Any = None,
+        height: Any = None,
+    ) -> Optional[ImageSearchResult]:
+        """
+        Safely build and validate an ImageSearchResult item.
+        Returns None (and logs at debug level) if an individual item has a
+        malformed/unsafe URL, preventing a single bad item from aborting an
+        entire image search batch.
+        """
+        try:
+            return ImageSearchResult(
+                title=title,
+                image_url=image_url,
+                thumbnail_url=thumbnail_url,
+                source_url=source_url,
+                width=width,
+                height=height,
+                provider=self.provider_name,
+            )
+        except Exception as exc:
+            logger.debug(
+                f"[{self.provider_name}] Skipping invalid image result item "
+                f"(image_url={image_url!r}): {exc}"
+            )
+            return None
+
     def sanitize_snippet(self, raw_text: str) -> str:
         """Backward-compatible wrapper around sanitize_untrusted_text."""
         return sanitize_untrusted_text(raw_text, max_chars=MAX_SNIPPET_CHARS)
@@ -777,6 +999,8 @@ __all__ = [
     "extract_url_source",
     "SearchResult",
     "SearchResponse",
+    "ImageSearchResult",
+    "ImageSearchResponse",
     "ProviderFieldSpec",
     "ProviderCapability",
     "ProviderDiagnosticResult",

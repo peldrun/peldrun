@@ -97,6 +97,12 @@
         "minLength": 1,
         "description": "Search query string to look up on the web."
       },
+      "search_type": {
+        "type": "string",
+        "enum": ["auto", "text", "images"],
+        "default": "auto",
+        "description": "Type of search. 'auto' (default) detects image intent from the query and routes to image search automatically. 'images' forces image search and returns direct image URLs (thumbnail, source page, dimensions). 'text' forces web-page search."
+      },
       "max_results": {
         "type": "integer",
         "minimum": 1,

@@ -31,6 +31,8 @@ from peldrun.tools.builtins.search_providers.base import (
     ConfigurationError,
     CostBasis,
     DiagnosticCheckType,
+    ImageSearchResponse,
+    ImageSearchResult,
     InvalidResponseError,
     PermissionError,
     ProviderDiagnosticResult,
@@ -501,6 +503,233 @@ class GoogleSearchProvider(BaseSearchProvider):
                 "Google CSE completed the request (HTTP 200) but returned zero "
                 "results for this query."
             ),
+        )
+
+    # ------------------------------------------------------------------
+    # Image Search
+    # ------------------------------------------------------------------
+    async def image_search(
+        self,
+        query: str,
+        max_results: int = 3,
+        lang: str = "en",
+        country: str = "us",
+        **kwargs: Any,
+    ) -> ImageSearchResponse:
+        """
+        Execute a Google CSE image search via the same customsearch endpoint
+        with searchType=image. Google's JSON API caps 'num' at 10 for image
+        requests just like web search; that limit is hard-enforced here.
+        """
+        start_time = time.perf_counter()
+        clean_q = (query or "").strip()
+
+        if not clean_q:
+            return ImageSearchResponse(
+                query=query or "",
+                provider=self.provider_name,
+                results=[],
+                status=ProviderStatus.CONFIGURATION_ERROR,
+                request_count=0,
+                estimated_cost_usd=0.0,
+                cost_basis=CostBasis.NOT_BILLABLE_LOCAL,
+                is_success=False,
+                error_code="empty_query",
+                error_message="Image search query cannot be empty.",
+            )
+
+        if not self.api_key or not self.cx:
+            return ImageSearchResponse(
+                query=clean_q,
+                provider=self.provider_name,
+                results=[],
+                status=ProviderStatus.CONFIGURATION_ERROR,
+                request_count=0,
+                estimated_cost_usd=0.0,
+                cost_basis=CostBasis.NOT_BILLABLE_LOCAL,
+                is_success=False,
+                error_code="missing_credentials",
+                error_message=(
+                    "Google Custom Search requires both 'api_key' and "
+                    "Search Engine ID ('cx'). One or both are missing."
+                ),
+            )
+
+        bounded_num = max(
+            1, min(int(max_results), self.max_results_cap, self._GOOGLE_HARD_CAP)
+        )
+
+        params = {
+            "key": self.api_key,
+            "cx": self.cx,
+            "q": clean_q,
+            "num": bounded_num,
+            "searchType": "image",
+            "hl": (lang or "en").strip(),
+            "gl": (country or "us").strip(),
+            "safe": "active",
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                resp = await client.get(self.endpoint, params=params)
+        except httpx.TimeoutException as exc:
+            elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+            return ImageSearchResponse(
+                query=clean_q,
+                provider=self.provider_name,
+                results=[],
+                status=ProviderStatus.TIMEOUT,
+                latency_ms=elapsed_ms,
+                request_count=1,
+                estimated_cost_usd=0.0,
+                cost_basis=self.default_cost_basis,
+                is_success=False,
+                error_code="timeout",
+                error_message=(
+                    f"Google image search timed out after "
+                    f"{self.timeout_seconds:.1f}s."
+                ),
+            )
+        except httpx.HTTPError as exc:
+            elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+            return ImageSearchResponse(
+                query=clean_q,
+                provider=self.provider_name,
+                results=[],
+                status=ProviderStatus.UPSTREAM_ERROR,
+                latency_ms=elapsed_ms,
+                request_count=1,
+                estimated_cost_usd=0.0,
+                cost_basis=self.default_cost_basis,
+                is_success=False,
+                error_code="upstream_error",
+                error_message=f"Google image search network error: {exc}",
+            )
+
+        if resp.status_code != 200:
+            elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+            try:
+                self._raise_classified_google_error(resp)
+            except SearchProviderError as exc:
+                logger.warning(
+                    f"Google image search error [{exc.error_code}]: {exc.message}"
+                )
+                return ImageSearchResponse(
+                    query=clean_q,
+                    provider=self.provider_name,
+                    results=[],
+                    status=exc.status,
+                    latency_ms=elapsed_ms,
+                    request_count=1,
+                    estimated_cost_usd=0.0,
+                    cost_basis=self.default_cost_basis,
+                    is_success=False,
+                    error_code=exc.error_code,
+                    error_message=exc.message,
+                )
+            return ImageSearchResponse(
+                query=clean_q,
+                provider=self.provider_name,
+                results=[],
+                status=ProviderStatus.UPSTREAM_ERROR,
+                latency_ms=elapsed_ms,
+                request_count=1,
+                estimated_cost_usd=0.0,
+                cost_basis=self.default_cost_basis,
+                is_success=False,
+                error_code="upstream_error",
+                error_message=(
+                    f"Google image search returned unexpected HTTP "
+                    f"{resp.status_code}: {resp.text[:200]}"
+                ),
+            )
+
+        try:
+            data = resp.json()
+        except Exception as exc:
+            elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+            return ImageSearchResponse(
+                query=clean_q,
+                provider=self.provider_name,
+                results=[],
+                status=ProviderStatus.INVALID_RESPONSE,
+                latency_ms=elapsed_ms,
+                request_count=1,
+                estimated_cost_usd=0.0,
+                cost_basis=self.default_cost_basis,
+                is_success=False,
+                error_code="invalid_response",
+                error_message=f"Google returned non-JSON image response: {exc}",
+            )
+
+        if not isinstance(data, dict):
+            elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+            return ImageSearchResponse(
+                query=clean_q,
+                provider=self.provider_name,
+                results=[],
+                status=ProviderStatus.INVALID_RESPONSE,
+                latency_ms=elapsed_ms,
+                request_count=1,
+                estimated_cost_usd=0.0,
+                cost_basis=self.default_cost_basis,
+                is_success=False,
+                error_code="invalid_response",
+                error_message=(
+                    "Google image search JSON response root must be an object."
+                ),
+            )
+
+        items = data.get("items")
+        if not isinstance(items, list):
+            items = []
+
+        results: List[ImageSearchResult] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            image_obj = item.get("image") if isinstance(item.get("image"), dict) else {}
+            img_url = item.get("link") or image_obj.get("thumbnailLink") or ""
+            if not img_url:
+                continue
+
+            parsed = self.make_image_result(
+                title=item.get("title") or item.get("snippet") or "",
+                image_url=img_url,
+                thumbnail_url=image_obj.get("thumbnailLink") or "",
+                source_url=image_obj.get("contextLink") or "",
+                width=image_obj.get("width"),
+                height=image_obj.get("height"),
+            )
+            if parsed is not None:
+                results.append(parsed)
+            if len(results) >= bounded_num:
+                break
+
+        elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+        has_results = bool(results)
+
+        return ImageSearchResponse(
+            query=clean_q,
+            provider=self.provider_name,
+            results=results,
+            status=ProviderStatus.SUCCESS if has_results else ProviderStatus.EMPTY,
+            latency_ms=elapsed_ms,
+            request_count=1,
+            usage_units=1.0,
+            estimated_cost_usd=self.cost_per_query,
+            cost_basis=self.default_cost_basis,
+            is_success=has_results,
+            error_code=None if has_results else "empty_results",
+            error_message=None
+            if has_results
+            else (
+                "Google CSE image search completed the request (HTTP 200) but "
+                "returned zero matching images for this query."
+            ),
+            effective_max_results=bounded_num,
         )
 
 

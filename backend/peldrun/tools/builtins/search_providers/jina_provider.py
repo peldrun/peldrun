@@ -185,6 +185,18 @@ class JinaSearchProvider(BaseSearchProvider):
                 f"Jina Search network error: {exc}",
                 provider=self.provider_name,
             ) from exc
+        except UnicodeEncodeError as exc:
+            # httpx/httpcore/h11 can raise UnicodeEncodeError when the
+            # query, api_key, or any header value contains non-ASCII
+            # characters that HTTP/1.1 transport tries to encode as
+            # ASCII, or when a response body contains non-ASCII and an
+            # internal stream write fails. Convert to a classified
+            # UpstreamError so factory-level failover can handle it
+            # instead of crashing the search.
+            raise UpstreamError(
+                f"Jina Search failed to encode HTTP data: {exc}",
+                provider=self.provider_name,
+            ) from exc
 
         if resp.status_code == 400:
             raise ConfigurationError(

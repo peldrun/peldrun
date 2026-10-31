@@ -8,6 +8,7 @@ import {
   Search, ExternalLink, Activity, Eye, EyeOff, CheckCircle2, XCircle,
   RefreshCw, Shield, ShieldOff, Gauge, Network, Sliders,
   ChevronDown, Save, Loader2, AlertCircle, Lock, Info, Hash,
+  Image as ImageIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/Icon/Icon";
@@ -48,10 +49,23 @@ export interface ProviderCapabilityMeta {
   limit_type?: string;
   notes?: string;
   requires_api_key?: boolean;
+  supports_image_search?: boolean;
+  image_max_results_limit?: number;
 }
 
 const DEFAULT_GLOBAL_MAX_RESULTS = 5;
+const DEFAULT_IMAGE_MAX_RESULTS = 5;
 const FALLBACK_HARD_CAP = 20;
+
+// Fallback set of providers known to be image-capable, used only when the
+// backend capability registry is unavailable. The authoritative source is
+// `capability.supports_image_search` returned by /api/search/providers.
+const DEFAULT_IMAGE_CAPABLE_PROVIDERS = new Set<string>([
+  "DuckDuckGo",
+  "SearXNG",
+  "Brave",
+  "Google",
+]);
 
 const PROVIDERS: readonly ProviderDef[] = [
   {
@@ -653,6 +667,97 @@ export function SearchTab({
     : [];
 
   // ----------------------------------------------------------
+  // Image Search Configuration (independent provider chain)
+  // ----------------------------------------------------------
+  const imageSearchConfig: Record<string, any> = useMemo(() => {
+    return searchConfig.image_search && typeof searchConfig.image_search === "object"
+      ? searchConfig.image_search
+      : {};
+  }, [searchConfig.image_search]);
+
+  const isImageSearchEnabled = imageSearchConfig.enabled !== false;
+
+  const imageGlobalDefaultMaxResults: number = useMemo(() => {
+    const raw = imageSearchConfig.default_max_results;
+    if (
+      typeof raw === "number" &&
+      Number.isInteger(raw) &&
+      raw >= 1 &&
+      raw <= hardCap
+    ) {
+      return raw;
+    }
+    return globalDefaultMaxResults > 0
+      ? globalDefaultMaxResults
+      : DEFAULT_IMAGE_MAX_RESULTS;
+  }, [imageSearchConfig.default_max_results, globalDefaultMaxResults, hardCap]);
+
+  const imageMaxResultsCap: number = useMemo(() => {
+    const raw = imageSearchConfig.max_results_cap;
+    if (
+      typeof raw === "number" &&
+      Number.isInteger(raw) &&
+      raw >= 1 &&
+      raw <= hardCap
+    ) {
+      return raw;
+    }
+    return hardCap;
+  }, [imageSearchConfig.max_results_cap, hardCap]);
+
+  const imagePrimaryEngine: string = useMemo(() => {
+    const raw = imageSearchConfig.engine;
+    if (typeof raw === "string" && raw.trim()) {
+      return raw.trim();
+    }
+    return ""; // empty = inherit from text chain
+  }, [imageSearchConfig.engine]);
+
+  const imageFallbackList: string[] = useMemo(() => {
+    const raw = imageSearchConfig.fallback_engines;
+    if (Array.isArray(raw)) {
+      return raw.filter((x): x is string => typeof x === "string");
+    }
+    return [];
+  }, [imageSearchConfig.fallback_engines]);
+
+  const providerSupportsImages = useCallback(
+    (providerId: string): boolean => {
+      const cap = providerCapabilities[providerId.toLowerCase()];
+      if (cap && typeof cap.supports_image_search === "boolean") {
+        return cap.supports_image_search;
+      }
+      return DEFAULT_IMAGE_CAPABLE_PROVIDERS.has(providerId);
+    },
+    [providerCapabilities]
+  );
+
+  const imageCapableProviderDefs = useMemo(
+    () => PROVIDERS.filter((p) => providerSupportsImages(p.id)),
+    [providerSupportsImages]
+  );
+
+  const effectiveImagePrimaryEngine = imagePrimaryEngine || primaryEngine;
+  const imagePrimarySupportsImages = providerSupportsImages(
+    effectiveImagePrimaryEngine
+  );
+
+  const updateImageSearch = (partial: Record<string, any>) => {
+    updateSearch({
+      image_search: { ...imageSearchConfig, ...partial },
+    });
+  };
+
+  const toggleImageFallback = (eng: string) => {
+    if (!providerSupportsImages(eng)) return;
+    const list = [...imageFallbackList];
+    const idx = list.indexOf(eng);
+    if (idx > -1) list.splice(idx, 1);
+    else list.push(eng);
+    updateImageSearch({ fallback_engines: list });
+  };
+
+  // ----------------------------------------------------------
   // Render
   // ----------------------------------------------------------
   return (
@@ -1138,6 +1243,254 @@ export function SearchTab({
           </div>
         </motion.div>
 
+        {/* Image Search Configuration */}
+        <motion.div
+          {...FADE_UP}
+          transition={{ ...FADE_UP.transition, delay: 0.25 }}
+          className="relative p-5 rounded-md bg-gigbg shadow-sm space-y-5"
+        >
+          <div className="pointer-events-none absolute top-0 left-0 right-0 h-[2px] rounded-t-md from-transparent via-emerald-500/60 to-transparent shadow-sm" />
+
+          <div className="flex items-center justify-between flex-wrap gap-3">
+            <div className="flex items-center gap-3">
+              <div className="p-2 icon">
+                <ImageIcon size={16} className="text-emerald-500" />
+              </div>
+              <div>
+                <h3 className="text-md text-black font-semibold font-heading uppercase tracking-wider">
+                  Image Search Configuration
+                </h3>
+                <p className="text-[11px] text-muted-foreground">
+                  Independent provider chain for image_search &middot; only
+                  image-capable providers are used
+                </p>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={() =>
+                updateImageSearch({ enabled: !isImageSearchEnabled })
+              }
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-sm text-[11px] font-semibold transition-all cursor-pointer border ${
+                isImageSearchEnabled
+                  ? "bg-emerald-500/10 border-emerald-500/40 text-emerald-600 dark:text-emerald-400"
+                  : "bg-rose-500/10 border-rose-500/40 text-rose-600 dark:text-rose-400"
+              }`}
+            >
+              <span className="relative flex h-2 w-2">
+                {isImageSearchEnabled && (
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                )}
+                <span
+                  className={`relative inline-flex rounded-full h-2 w-2 ${
+                    isImageSearchEnabled ? "bg-emerald-500" : "bg-rose-500"
+                  }`}
+                />
+              </span>
+              {isImageSearchEnabled ? "Enabled" : "Disabled"}
+            </button>
+          </div>
+
+          <div className="text-[11px] text-muted-foreground">
+            <strong className="text-foreground">Image-capable providers:</strong>{" "}
+            {imageCapableProviderDefs.length > 0 ? (
+              <span className="font-mono">
+                {imageCapableProviderDefs.map((p) => p.name).join(" · ")}
+              </span>
+            ) : (
+              <span className="text-rose-500 font-semibold">
+                None configured — image_search will fail until at least one
+                image-capable provider is enabled
+              </span>
+            )}
+          </div>
+
+          {!imagePrimarySupportsImages && (
+            <div
+              role="alert"
+              className="flex items-start gap-2 p-2.5 rounded-sm border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-[11px]"
+            >
+              <AlertCircle size={14} className="shrink-0 mt-0.5" />
+              <span>
+                Primary text engine{" "}
+                <strong>{effectiveImagePrimaryEngine}</strong> does not support
+                images. The factory will automatically skip it and use the
+                first image-capable provider in the chain.
+              </span>
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            <div className="p-3 rounded-sm border border-border/60 bg-card hover:border-muted/30 hover:shadow-sm transition-colors">
+              <label
+                htmlFor="image-default-max-results"
+                className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-1.5"
+              >
+                Default Images per Search (1-{hardCap})
+              </label>
+              <input
+                id="image-default-max-results"
+                type="number"
+                min={1}
+                max={hardCap}
+                step={1}
+                value={imageGlobalDefaultMaxResults}
+                onChange={(e) => {
+                  const rawVal = e.target.value;
+                  if (rawVal === "") {
+                    updateImageSearch({ default_max_results: "" });
+                    return;
+                  }
+                  const parsed = Number(rawVal);
+                  updateImageSearch({
+                    default_max_results: Number.isNaN(parsed) ? rawVal : parsed,
+                  });
+                }}
+                className="w-full border-0 outline-none text-xs text-foreground font-mono focus:ring-0 bg-transparent hover:bg-muted p-1"
+              />
+            </div>
+
+            <div className="p-3 rounded-sm border border-border/60 bg-card hover:border-muted/30 hover:shadow-sm transition-colors">
+              <label
+                htmlFor="image-max-results-cap"
+                className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-1.5"
+              >
+                Max Results Cap (1-{hardCap})
+              </label>
+              <input
+                id="image-max-results-cap"
+                type="number"
+                min={1}
+                max={hardCap}
+                step={1}
+                value={imageMaxResultsCap}
+                onChange={(e) => {
+                  const rawVal = e.target.value;
+                  if (rawVal === "") {
+                    updateImageSearch({ max_results_cap: "" });
+                    return;
+                  }
+                  const parsed = Number(rawVal);
+                  updateImageSearch({
+                    max_results_cap: Number.isNaN(parsed) ? rawVal : parsed,
+                  });
+                }}
+                className="w-full border-0 outline-none text-xs text-foreground font-mono focus:ring-0 bg-transparent hover:bg-muted p-1"
+              />
+            </div>
+
+            <div className="p-3 rounded-sm border border-border/60 bg-card hover:border-muted/30 hover:shadow-sm transition-colors">
+              <label
+                htmlFor="image-primary-engine"
+                className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-1.5"
+              >
+                Primary Image Engine (optional override)
+              </label>
+              <select
+                id="image-primary-engine"
+                value={imagePrimaryEngine}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  if (val) {
+                    updateImageSearch({ engine: val });
+                  } else {
+                    const next = { ...imageSearchConfig };
+                    delete next.engine;
+                    updateSearch({ image_search: next });
+                  }
+                }}
+                className="w-full bg-transparent border-0 outline-none text-xs text-foreground font-mono focus:ring-0 p-1 hover:bg-muted cursor-pointer"
+              >
+                <option value="">
+                  Inherit from text chain (auto-filter)
+                </option>
+                {imageCapableProviderDefs.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div>
+            <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block mb-2">
+              Image Failover Chain (image-capable only)
+            </label>
+            {imageCapableProviderDefs.length === 0 ? (
+              <p className="text-[11px] text-rose-500">
+                No image-capable providers detected. Enable at least one of:
+                DuckDuckGo, SearXNG, Brave, Google.
+              </p>
+            ) : (
+              <div className="flex flex-wrap gap-1.5">
+                {imageCapableProviderDefs.map((p) => {
+                  const isSelected = imageFallbackList.includes(p.id);
+                  return (
+                    <motion.button
+                      key={p.id}
+                      type="button"
+                      whileHover={{ y: -2 }}
+                      onClick={() => toggleImageFallback(p.id)}
+                      className={`flex items-center gap-1.5 px-2.5 py-1 rounded-sm text-[11px] font-medium cursor-pointer transition-all border ${
+                        isSelected
+                          ? "bg-emerald-500 text-white border-emerald-500 shadow-md"
+                          : "bg-background text-muted-foreground border-border hover:border-emerald-500/40 hover:text-foreground"
+                      }`}
+                    >
+                      <Icon
+                        name={providerIconName(p.id)}
+                        size={13}
+                        title={`${p.name} logo`}
+                      />
+                      <span>{p.name}</span>
+                    </motion.button>
+                  );
+                })}
+              </div>
+            )}
+            {imagePrimaryEngine && imageFallbackList.length === 0 && (
+              <p className="text-[10px] text-amber-600 dark:text-amber-400 mt-2">
+                When overriding the primary image engine, the text-level
+                fallback_engines list is ignored. Add image fallbacks above to
+                enable failover.
+              </p>
+            )}
+          </div>
+
+          <details className="pt-2 border-t border-border/60">
+            <summary className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground cursor-pointer select-none">
+              Advanced (budget, retries, delay)
+            </summary>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-3">
+              <CompactField
+                label="Image Budget (s)"
+                value={imageSearchConfig.total_budget_seconds ?? 20}
+                min={2}
+                max={120}
+                onChange={(v) =>
+                  updateImageSearch({ total_budget_seconds: v })
+                }
+              />
+              <CompactField
+                label="Image Retries (0-2)"
+                value={imageSearchConfig.max_retries ?? 0}
+                min={0}
+                max={2}
+                onChange={(v) => updateImageSearch({ max_retries: v })}
+              />
+              <CompactField
+                label="Image Retry Delay (s)"
+                value={imageSearchConfig.retry_delay ?? 1}
+                min={0}
+                max={10}
+                onChange={(v) => updateImageSearch({ retry_delay: v })}
+              />
+            </div>
+          </details>
+        </motion.div>
+
         {/* Provider section header */}
         <motion.div
           {...FADE_UP}
@@ -1429,6 +1782,9 @@ function ProviderListRow({
 }: ProviderListRowProps) {
   const subConfig = config[provider.configKey] || {};
   const effectiveCapLimit = providerLimit ?? hardCap;
+  const supportsImages =
+    capability?.supports_image_search ??
+    DEFAULT_IMAGE_CAPABLE_PROVIDERS.has(provider.id);
 
   const hasExplicitOverride =
     subConfig.max_results !== undefined && subConfig.max_results !== null;
@@ -1500,6 +1856,21 @@ function ProviderListRow({
             {provider.lifecycle === "legacy" && (
               <span className="text-[9px] font-mono font-semibold px-1.5 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400">
                 Legacy · Retires 2027-01-01
+              </span>
+            )}
+            {supportsImages ? (
+              <span
+                className="text-[9px] font-mono font-semibold px-1.5 py-0.5 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                title="This provider can be used by the image_search tool"
+              >
+                Images ✓
+              </span>
+            ) : (
+              <span
+                className="text-[9px] font-mono px-1.5 py-0.5 rounded border border-border bg-muted/40 text-muted-foreground"
+                title="This provider is text-search only and is automatically skipped by the image_search chain"
+              >
+                Text only
               </span>
             )}
             <span

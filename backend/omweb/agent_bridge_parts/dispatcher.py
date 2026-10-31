@@ -987,7 +987,16 @@ async def run_direct_chat(
 
             meta = search_result.metadata or {}
             status = str(meta.get("status") or "").strip().lower()
-            returned_count = int(meta.get("returned_results_count") or 0)
+            # `returned_results_count` is the canonical field, but we
+            # defensively fall back to the shape-specific lists so that
+            # image_search (image_urls) and any future provider with a
+            # different results key are still counted correctly.
+            returned_count = int(
+                meta.get("returned_results_count")
+                or len(meta.get("image_urls", []))
+                or len(meta.get("results", []))
+                or 0
+            )
 
             if status == "success" and returned_count > 0:
                 search_used_successfully = True

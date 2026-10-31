@@ -28,6 +28,8 @@ from peldrun.tools.builtins.search_providers.base import (
     BaseSearchProvider,
     CostBasis,
     DiagnosticCheckType,
+    ImageSearchResponse,
+    ImageSearchResult,
     ProviderDiagnosticResult,
     ProviderStatus,
     RateLimitError,
@@ -262,7 +264,11 @@ class DuckDuckGoSearchProvider(BaseSearchProvider):
                 provider=self.provider_name,
             )
 
-        socket_timeout = max(1, int(round(self.timeout_seconds)))
+        # Use a shorter library-side timeout so that when the `ddgs`
+        # library stalls (common under Windows + rate limits), the
+        # HTML fallback fires sooner. The outer ``self.timeout_seconds``
+        # still bounds the total provider call.
+        socket_timeout = max(1, min(int(round(self.timeout_seconds)), 6))
 
         def _fetch() -> List[Dict[str, Any]]:
             call_kwargs: Dict[str, Any] = {
@@ -622,6 +628,195 @@ class DuckDuckGoSearchProvider(BaseSearchProvider):
             is_success=has_results if "has_results" in locals() else False,
             error_code="empty_results",
             error_message="DuckDuckGo completed the search but returned zero matching results.",
+        )
+
+    # ------------------------------------------------------------------
+    # Image Search
+    # ------------------------------------------------------------------
+    async def image_search(
+        self,
+        query: str,
+        max_results: int = 3,
+        lang: str = "en",
+        country: str = "us",
+        **kwargs: Any,
+    ) -> ImageSearchResponse:
+        """
+        Execute a DuckDuckGo image search via the ddgs library.
+        Applies the same throttling and safe-search configuration used by
+        text search, and records request_count/cost independently of the
+        number of images returned.
+        """
+        start_time = time.perf_counter()
+        clean_q = (query or "").strip()
+
+        if not clean_q:
+            return ImageSearchResponse(
+                query=query or "",
+                provider=self.provider_name,
+                results=[],
+                status=ProviderStatus.CONFIGURATION_ERROR,
+                request_count=0,
+                estimated_cost_usd=0.0,
+                cost_basis=CostBasis.NOT_BILLABLE_LOCAL,
+                is_success=False,
+                error_code="empty_query",
+                error_message="Image search query cannot be empty.",
+            )
+
+        if DDGS is None:
+            return ImageSearchResponse(
+                query=clean_q,
+                provider=self.provider_name,
+                results=[],
+                status=ProviderStatus.CONFIGURATION_ERROR,
+                request_count=0,
+                estimated_cost_usd=0.0,
+                cost_basis=CostBasis.NOT_BILLABLE_LOCAL,
+                is_success=False,
+                error_code="missing_dependency",
+                error_message=(
+                    "No DDGS client library is installed. Run: pip install -U ddgs"
+                ),
+            )
+
+        limit = max(1, min(int(max_results), self.max_results_cap, 20))
+        region = self._build_region(country, lang)
+
+        try:
+            await self._throttle()
+        except Exception:
+            pass
+
+        def _fetch() -> List[Dict[str, Any]]:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                warnings.simplefilter("ignore", ResourceWarning)
+                try:
+                    with DDGS(timeout=max(1, int(self.timeout_seconds))) as ddgs:  # type: ignore[misc]
+                        return list(
+                            ddgs.images(
+                                clean_q,
+                                region=region,
+                                safesearch=self.safesearch,
+                                max_results=limit,
+                            )
+                        )
+                except TypeError:
+                    ddgs_instance = DDGS()  # type: ignore[misc]
+                    try:
+                        return list(
+                            ddgs_instance.images(clean_q, max_results=limit)
+                        )
+                    finally:
+                        close_fn = getattr(ddgs_instance, "__exit__", None)
+                        if callable(close_fn):
+                            try:
+                                close_fn(None, None, None)
+                            except Exception:
+                                pass
+                finally:
+                    gc.collect()
+
+        try:
+            raw = await asyncio.wait_for(
+                asyncio.to_thread(_fetch),
+                timeout=self.timeout_seconds + 2.0,
+            )
+        except asyncio.TimeoutError as exc:
+            elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+            return ImageSearchResponse(
+                query=clean_q,
+                provider=self.provider_name,
+                results=[],
+                status=ProviderStatus.TIMEOUT,
+                latency_ms=elapsed_ms,
+                request_count=1,
+                estimated_cost_usd=0.0,
+                cost_basis=CostBasis.ASSUMED_ZERO_LOCAL,
+                is_success=False,
+                error_code="timeout",
+                error_message=(
+                    f"DDGS image search timed out after "
+                    f"{self.timeout_seconds:.1f}s."
+                ),
+            )
+        except Exception as exc:
+            elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+            msg_lower = str(exc).lower()
+            is_rate_limited = (
+                "ratelimit" in msg_lower
+                or "202" in msg_lower
+                or "429" in msg_lower
+            )
+            status = (
+                ProviderStatus.RATE_LIMITED
+                if is_rate_limited
+                else ProviderStatus.UPSTREAM_ERROR
+            )
+            logger.warning(
+                f"DDGS image search failed ({_DDGS_BACKEND}): {exc}"
+            )
+            return ImageSearchResponse(
+                query=clean_q,
+                provider=self.provider_name,
+                results=[],
+                status=status,
+                latency_ms=elapsed_ms,
+                request_count=1,
+                estimated_cost_usd=0.0,
+                cost_basis=CostBasis.ASSUMED_ZERO_LOCAL,
+                is_success=False,
+                error_code=status.value,
+                error_message=(
+                    f"DDGS image search failed ({_DDGS_BACKEND}): {exc}"
+                ),
+            )
+
+        results: List[ImageSearchResult] = []
+        for item in raw or []:
+            if not isinstance(item, dict):
+                continue
+            parsed = self.make_image_result(
+                title=item.get("title") or "",
+                image_url=item.get("image") or "",
+                thumbnail_url=item.get("thumbnail") or "",
+                source_url=item.get("url") or "",
+                width=item.get("width"),
+                height=item.get("height"),
+            )
+            if parsed is not None:
+                results.append(parsed)
+            if len(results) >= limit:
+                break
+
+        elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+        has_results = bool(results)
+        effective_cost = self.cost_per_query if self.cost_overridden else 0.0
+        cost_basis = (
+            CostBasis.CONFIGURED_ESTIMATE
+            if self.cost_overridden
+            else CostBasis.ASSUMED_ZERO_LOCAL
+        )
+
+        return ImageSearchResponse(
+            query=clean_q,
+            provider=self.provider_name,
+            results=results,
+            status=ProviderStatus.SUCCESS if has_results else ProviderStatus.EMPTY,
+            latency_ms=elapsed_ms,
+            request_count=1,
+            estimated_cost_usd=effective_cost,
+            cost_basis=cost_basis,
+            is_success=has_results,
+            error_code=None if has_results else "empty_results",
+            error_message=None
+            if has_results
+            else (
+                "DuckDuckGo image search completed the request but returned "
+                "zero matching images."
+            ),
+            effective_max_results=limit,
         )
 
 

@@ -29,6 +29,8 @@ from peldrun.tools.builtins.search_providers.base import (
     ConfigurationError,
     CostBasis,
     DiagnosticCheckType,
+    ImageSearchResponse,
+    ImageSearchResult,
     InvalidResponseError,
     PermissionError,
     ProviderDiagnosticResult,
@@ -465,6 +467,225 @@ class BraveSearchProvider(BaseSearchProvider):
                 "Brave Search completed the request (HTTP 200) but returned zero "
                 "matching results for this query."
             ),
+        )
+
+    # ------------------------------------------------------------------
+    # Image Search
+    # ------------------------------------------------------------------
+    @property
+    def _image_endpoint(self) -> str:
+        """
+        Derive the Brave Images endpoint from the configured web endpoint.
+        Falls back to the documented official Images URL when the configured
+        endpoint does not contain '/web/search'.
+        """
+        if "/web/search" in self.endpoint:
+            return self.endpoint.replace("/web/search", "/images/search")
+        return "https://api.search.brave.com/res/v1/images/search"
+
+    async def image_search(
+        self,
+        query: str,
+        max_results: int = 3,
+        lang: str = "en",
+        country: str = "us",
+        **kwargs: Any,
+    ) -> ImageSearchResponse:
+        """
+        Execute a Brave Images search via /res/v1/images/search.
+        Applies the same subscription token header, country/lang normalization,
+        and HTTP error classification used by text search. Returns rich image
+        results (image_url, thumbnail, source page, dimensions).
+        """
+        start_time = time.perf_counter()
+        clean_q = (query or "").strip()
+
+        if not clean_q:
+            return ImageSearchResponse(
+                query=query or "",
+                provider=self.provider_name,
+                results=[],
+                status=ProviderStatus.CONFIGURATION_ERROR,
+                request_count=0,
+                estimated_cost_usd=0.0,
+                cost_basis=CostBasis.NOT_BILLABLE_LOCAL,
+                is_success=False,
+                error_code="empty_query",
+                error_message="Image search query cannot be empty.",
+            )
+
+        if not self.api_key:
+            return ImageSearchResponse(
+                query=clean_q,
+                provider=self.provider_name,
+                results=[],
+                status=ProviderStatus.CONFIGURATION_ERROR,
+                request_count=0,
+                estimated_cost_usd=0.0,
+                cost_basis=CostBasis.NOT_BILLABLE_LOCAL,
+                is_success=False,
+                error_code="missing_api_key",
+                error_message=(
+                    "Brave API key (X-Subscription-Token) is not configured."
+                ),
+            )
+
+        limit = max(1, min(int(max_results), self.max_results_cap, 20))
+
+        headers = {
+            "Accept": "application/json",
+            "X-Subscription-Token": self.api_key,
+        }
+        params = {
+            "q": clean_q,
+            "count": limit,
+            "search_lang": self._normalize_lang(lang),
+            "country": self._normalize_country(country),
+            "safesearch": "moderate",
+        }
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.timeout_seconds,
+                headers=headers,
+            ) as client:
+                resp = await client.get(self._image_endpoint, params=params)
+        except httpx.TimeoutException as exc:
+            elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+            return ImageSearchResponse(
+                query=clean_q,
+                provider=self.provider_name,
+                results=[],
+                status=ProviderStatus.TIMEOUT,
+                latency_ms=elapsed_ms,
+                request_count=1,
+                estimated_cost_usd=0.0,
+                cost_basis=self.default_cost_basis,
+                is_success=False,
+                error_code="timeout",
+                error_message=(
+                    f"Brave image search timed out after "
+                    f"{self.timeout_seconds:.1f}s."
+                ),
+            )
+        except httpx.HTTPError as exc:
+            elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+            return ImageSearchResponse(
+                query=clean_q,
+                provider=self.provider_name,
+                results=[],
+                status=ProviderStatus.UPSTREAM_ERROR,
+                latency_ms=elapsed_ms,
+                request_count=1,
+                estimated_cost_usd=0.0,
+                cost_basis=self.default_cost_basis,
+                is_success=False,
+                error_code="upstream_error",
+                error_message=f"Brave image search network error: {exc}",
+            )
+
+        if resp.status_code != 200:
+            elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+            if resp.status_code in (400, 422):
+                status = ProviderStatus.CONFIGURATION_ERROR
+            elif resp.status_code == 401:
+                status = ProviderStatus.AUTHENTICATION_ERROR
+            elif resp.status_code == 402:
+                status = ProviderStatus.QUOTA_EXHAUSTED
+            elif resp.status_code == 403:
+                status = ProviderStatus.PERMISSION_ERROR
+            elif resp.status_code == 429:
+                status = ProviderStatus.RATE_LIMITED
+            elif resp.status_code >= 500:
+                status = ProviderStatus.UPSTREAM_ERROR
+            else:
+                status = ProviderStatus.UPSTREAM_ERROR
+            return ImageSearchResponse(
+                query=clean_q,
+                provider=self.provider_name,
+                results=[],
+                status=status,
+                latency_ms=elapsed_ms,
+                request_count=1,
+                estimated_cost_usd=0.0,
+                cost_basis=self.default_cost_basis,
+                is_success=False,
+                error_code=status.value,
+                error_message=(
+                    f"Brave image search returned HTTP {resp.status_code}: "
+                    f"{resp.text[:200]}"
+                ),
+            )
+
+        try:
+            data = resp.json()
+        except Exception as exc:
+            elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+            return ImageSearchResponse(
+                query=clean_q,
+                provider=self.provider_name,
+                results=[],
+                status=ProviderStatus.INVALID_RESPONSE,
+                latency_ms=elapsed_ms,
+                request_count=1,
+                estimated_cost_usd=0.0,
+                cost_basis=self.default_cost_basis,
+                is_success=False,
+                error_code="invalid_response",
+                error_message=f"Brave returned non-JSON image response: {exc}",
+            )
+
+        raw_results = data.get("results") if isinstance(data, dict) else None
+        if not isinstance(raw_results, list):
+            raw_results = []
+
+        results: List[ImageSearchResult] = []
+        for item in raw_results:
+            if not isinstance(item, dict):
+                continue
+
+            props = item.get("properties") if isinstance(item.get("properties"), dict) else {}
+            thumb = item.get("thumbnail") if isinstance(item.get("thumbnail"), dict) else {}
+
+            img_url = props.get("url") or thumb.get("src") or ""
+            if not img_url:
+                continue
+
+            parsed = self.make_image_result(
+                title=item.get("title") or "",
+                image_url=img_url,
+                thumbnail_url=thumb.get("src") or "",
+                source_url=item.get("url") or "",
+                width=props.get("width"),
+                height=props.get("height"),
+            )
+            if parsed is not None:
+                results.append(parsed)
+            if len(results) >= limit:
+                break
+
+        elapsed_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+        has_results = bool(results)
+
+        return ImageSearchResponse(
+            query=clean_q,
+            provider=self.provider_name,
+            results=results,
+            status=ProviderStatus.SUCCESS if has_results else ProviderStatus.EMPTY,
+            latency_ms=elapsed_ms,
+            request_count=1,
+            usage_units=1.0,
+            estimated_cost_usd=self.cost_per_query,
+            cost_basis=self.default_cost_basis,
+            is_success=has_results,
+            error_code=None if has_results else "empty_results",
+            error_message=None
+            if has_results
+            else (
+                "Brave Images completed the request (HTTP 200) but returned "
+                "zero matching images for this query."
+            ),
+            effective_max_results=limit,
         )
 
 

@@ -30,6 +30,16 @@ Lifespan management:
 
 from __future__ import annotations
 
+# =====================================================================
+# MUST be the very first executable statement in this module.
+# Forces UTF-8 encoding on stdout/stderr and all logging handlers so
+# that non-ASCII content returned by providers (Jina, SearXNG, Google,
+# Yandex, Brave) never raises UnicodeEncodeError on Windows consoles.
+# See omweb/_unicode_setup.py for the full rationale.
+# =====================================================================
+from omweb._unicode_setup import install_utf8_console
+install_utf8_console()
+
 import asyncio
 import logging
 from contextlib import asynccontextmanager

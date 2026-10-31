@@ -1,0 +1,111 @@
+{
+  "id": "image_search",
+  "name": "image_search",
+  "display_name": "Image Search",
+  "description": "Search the web for images and return direct image URLs. Automatically fails over across image-capable providers (DuckDuckGo, SearXNG, Brave, Google CSE). Use this when the user asks to find, download, or see pictures of a specific topic.",
+  "category": "search",
+  "subcategory": "images",
+  "tags": ["web", "images", "pictures", "photos"],
+  "capabilities": ["external_network", "stateless", "read_only"],
+  "builtin": true,
+  "enabled": true,
+
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+  "signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+
+  "license": "proprietary",
+  "license_url": "https://peldrun.ai/license",
+
+  "version": "1.0.0",
+  "release_date": "2025-01-15",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "changelog_url": "https://peldrun.ai/tools/image_search/changelog",
+
+  "short_description": "Multi-provider image search with automatic failover returning direct image URLs.",
+  "store_description": "Built-in image search tool that dispatches through SearchProviderFactory to automatically select an image-capable provider (DuckDuckGo, SearXNG, Brave, or Google CSE) with first-success failover. Returns direct image URLs plus thumbnails, source pages, and dimensions for each result.",
+  "homepage": "https://peldrun.ai/tools/image_search",
+  "docs_url": "https://docs.peldrun.ai/tools/image_search",
+  "demo_url": null,
+  "screenshots": [],
+  "icon": "icons/image_search.svg",
+
+  "pricing": "free",
+  "supported_languages": ["en", "ar"],
+  "i18n": {
+    "ar": {
+      "display_name": "Image Search",
+      "short_description": "Real-time image search returning direct image URLs."
+    }
+  },
+
+  "settings": {
+    "enabled": true,
+    "schema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "defaults": {},
+    "required": []
+  },
+
+  "permissions": ["network:outbound"],
+  "network_access": true,
+  "requires_api_key": false,
+  "required_env_vars": [],
+  "sandbox": true,
+  "rate_limit": {
+    "requests": 60,
+    "window_seconds": 60
+  },
+
+  "timeout_seconds": 30,
+  "concurrency": 4,
+  "runtime": "builtin",
+  "entry_point": "image_search.handler",
+  "dependencies": [],
+
+  "examples": [
+    {
+      "input": { "query": "Saint Petersburg", "max_results": 3 },
+      "output_preview": "Top 3 direct image URLs for Saint Petersburg with thumbnails and source pages."
+    },
+    {
+      "input": { "query": "northern lights" },
+      "output_preview": "Default result count resolved from search.image_search.default_max_results; provider selected automatically with failover."
+    }
+  ],
+  "usage_notes": "Prefer passing only `query`. Omit `max_results` to inherit PELDRUN Search Settings (search.image_search.default_max_results). Non-image-capable providers (Tavily, Jina, Yandex) are automatically skipped in the image provider chain. The configured provider ceiling and provider capability maximum are always enforced.",
+
+  "deprecated": false,
+  "deprecation_message": null,
+  "replaces": [],
+  "replaced_by": null,
+
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Search query string to look up images on the web."
+      },
+      "max_results": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 20,
+        "description": "Optional desired maximum number of image results. Omit this argument to inherit PELDRUN Search Settings (search.image_search.default_max_results). The configured provider ceiling and provider capability maximum are always enforced."
+      }
+    },
+    "required": [
+      "query"
+    ]
+  }
+}
