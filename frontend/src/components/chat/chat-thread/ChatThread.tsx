@@ -151,6 +151,11 @@ export function ChatThread({
     Object.entries(activeGroupedSteps || {})
       .map(([stepNum, steps]) => {
         const cleaned = (steps as StepEvent[]).filter((s) => {
+          // image_results steps are rendered separately by ChatThread
+          // above the timeline, so exclude them from the accordion
+          // content to prevent visual duplication.
+          if (s.type === "image_results") return false;
+
           if (!finalResultTrimmed) return true;
           if (s.type !== "observation") return true;
           const content =
@@ -205,7 +210,8 @@ export function ChatThread({
           </div>
         )}
 
-        {/* Active Stepper (Agent Mode) */}
+        {/* Active Stepper (Agent Mode) — rendered FIRST so the user
+            sees the search work that produced the images. */}
         {execMode === "agent" &&
           Object.keys(filteredGroupedSteps).length > 0 && (
             <ChatTimeline
@@ -218,6 +224,14 @@ export function ChatThread({
               toggleStep={toggleStep}
             />
           )}
+
+        {/* Image galleries are injected into the final answer's
+            `result_text` as an ``image_gallery`` markdown block by
+            the backend (peldrun_engine.py for agent mode,
+            dispatcher.py for chat mode). They render inside
+            <ChatDeliverable> via MarkdownRenderer, not as a
+            standalone block here. This keeps the gallery visually
+            part of the model's answer, matching chat mode. */}
 
         {activeOperation && onOpenReview && (
           <ChatOperationCard

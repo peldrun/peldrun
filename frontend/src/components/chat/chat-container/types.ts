@@ -66,3 +66,50 @@ export interface ProducedFile {
   name: string;
   path: string;
 }
+
+// ===========================================================================
+// Image Search Results (Gallery)
+// ===========================================================================
+//
+// Structured image records emitted by the backend via the "image_results"
+// SSE event. Populated by:
+//   - omweb/agent_bridge_parts/dispatcher.py  (chat mode)
+//   - omweb/engines/peldrun_engine.py          (agent mode)
+//
+// URLs are already pre-processed by the backend to route through
+// /api/search/image-proxy, so the frontend can render them directly
+// without additional transformation.
+
+/** A single image result from the backend. */
+export interface ImageResultItem {
+  /** Human-readable title or alt-text. */
+  title: string;
+  /** Proxied URL to the actual image (via /api/search/image-proxy). */
+  image_url: string;
+  /** Proxied URL to a thumbnail, when provided by the upstream. */
+  thumbnail_url?: string | null;
+  /** Original page where the image was found (external link). */
+  source_url?: string | null;
+  /** Image width in pixels, when known. */
+  width?: number | null;
+  /** Image height in pixels, when known. */
+  height?: number | null;
+  /** Normalized hostname of the original image source. */
+  source?: string | null;
+}
+
+/** Payload carried by the "image_results" SSE event. */
+export interface ImageResultsPayload {
+  /** Search query that produced these images. */
+  query: string;
+  /** Provider that handled the search (DuckDuckGo, Brave, SearXNG, Google). */
+  provider: string;
+  /** Ordered list of image results. */
+  images: ImageResultItem[];
+  /** Count of items in `images`. */
+  count: number;
+  /** End-to-end search latency in milliseconds. */
+  latency_ms: number;
+  /** Estimated USD cost of the search. */
+  estimated_cost_usd: number;
+}

@@ -134,6 +134,14 @@ _DEFAULT_IMAGE_SEARCH_CONFIG: Dict[str, Any] = {
     "total_budget_seconds": 20.0,
     "max_retries": 0,
     "retry_delay": 1.0,
+    # Download policy for image_search. Three modes:
+    #   "always"  -> download every image into <workspace>/images/
+    #   "never"   -> never download; only return proxy URLs
+    #   "smart"   -> the LLM decides per call via the auto_download
+    #                tool argument (recommended default)
+    # Legacy boolean values in existing config.toml files are still
+    # accepted: True -> "always", False -> "never".
+    "auto_download": "smart",
 }
 
 # Fields that must never be written back by the client payload.
@@ -573,6 +581,17 @@ def _enrich_search_config_with_defaults(search_cfg: Optional[Dict[str, Any]] = N
     if isinstance(raw_image.get("enabled"), bool):
         image_cfg["enabled"] = raw_image["enabled"]
 
+    # auto_download accepts "always" | "smart" | "never" as a string,
+    # or a legacy boolean (True -> "always", False -> "never").
+    _raw_ad = raw_image.get("auto_download")
+    if isinstance(_raw_ad, bool):
+        image_cfg["auto_download"] = "always" if _raw_ad else "never"
+    elif isinstance(_raw_ad, str):
+        _norm = _raw_ad.strip().lower()
+        if _norm in ("always", "smart", "never"):
+            image_cfg["auto_download"] = _norm
+        # else: keep default ("smart")
+
     for numeric_key in ("default_max_results", "max_results_cap"):
         if numeric_key in raw_image and raw_image[numeric_key] is not None:
             try:
@@ -850,6 +869,26 @@ def _validate_and_normalize_search_config(
                     "image_search.enabled must be a boolean."
                 )
             image_cfg["enabled"] = raw_image_in["enabled"]
+
+        if "auto_download" in raw_image_in:
+            _raw_ad = raw_image_in["auto_download"]
+            if isinstance(_raw_ad, bool):
+                # Backward compatibility: legacy boolean values.
+                image_cfg["auto_download"] = "always" if _raw_ad else "never"
+            elif isinstance(_raw_ad, str):
+                _norm = _raw_ad.strip().lower()
+                if _norm not in ("always", "smart", "never"):
+                    raise SearchConfigValidationError(
+                        "image_search.auto_download must be one of "
+                        "'always', 'smart', or 'never' (or a legacy "
+                        "boolean)."
+                    )
+                image_cfg["auto_download"] = _norm
+            else:
+                raise SearchConfigValidationError(
+                    "image_search.auto_download must be one of "
+                    "'always', 'smart', or 'never'."
+                )
 
         for numeric_key in ("default_max_results", "max_results_cap"):
             if (

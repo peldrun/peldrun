@@ -289,6 +289,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   const { connectStream, closeStream, eventSourceRef } = useSseStream({
     currentStepNumRef,
     activeChatIdRef,
+    execMode,
     setSteps,
     setCurrentStepNum,
     setActiveModelName,

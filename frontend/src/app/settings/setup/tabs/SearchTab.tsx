@@ -677,6 +677,16 @@ export function SearchTab({
 
   const isImageSearchEnabled = imageSearchConfig.enabled !== false;
 
+  // auto_download policy: "always" | "smart" | "never".
+  // Legacy boolean values in config.toml are mapped for backward compat.
+  const imageAutoDownloadMode: "always" | "smart" | "never" = useMemo(() => {
+    const raw = imageSearchConfig.auto_download;
+    if (raw === true) return "always";
+    if (raw === false) return "never";
+    if (raw === "always" || raw === "smart" || raw === "never") return raw;
+    return "smart"; // default
+  }, [imageSearchConfig.auto_download]);
+
   const imageGlobalDefaultMaxResults: number = useMemo(() => {
     const raw = imageSearchConfig.default_max_results;
     if (
@@ -1320,6 +1330,70 @@ export function SearchTab({
               </span>
             </div>
           )}
+
+          {/* Auto-download policy — 3-way selector */}
+          <div className="p-3 rounded-sm border border-border/60 bg-card space-y-2">
+            <div>
+              <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground block">
+                Auto-download images
+              </label>
+              <p className="text-[10px] text-muted-foreground mt-0.5">
+                Control whether image_search downloads images to the{" "}
+                <code className="font-mono">images/</code> folder. Pick{" "}
+                <strong>Smart</strong> to let the AI decide per call.
+              </p>
+            </div>
+            <div className="inline-flex items-center gap-0.5 rounded-md border border-border bg-background p-0.5">
+              {(
+                [
+                  { id: "always", label: "Always", hint: "Download every image (legacy behavior)" },
+                  { id: "smart", label: "Smart", hint: "AI decides — download only when a file will be created" },
+                  { id: "never", label: "Never", hint: "Never download; return proxy URLs only" },
+                ] as const
+              ).map((opt) => {
+                const isSelected = imageAutoDownloadMode === opt.id;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => updateImageSearch({ auto_download: opt.id })}
+                    title={opt.hint}
+                    className={`px-3 py-1 rounded text-[11px] font-medium transition-all cursor-pointer ${
+                      isSelected
+                        ? "bg-emerald-500 text-white shadow-sm"
+                        : "text-muted-foreground hover:text-foreground hover:bg-muted/60"
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+            <p className="text-[10px] text-muted-foreground">
+              {imageAutoDownloadMode === "always" && (
+                <>
+                  <strong>Always:</strong> every image is saved to{" "}
+                  <code className="font-mono">images/</code> and returned as a
+                  local path. Use when bandwidth/disk is not a concern.
+                </>
+              )}
+              {imageAutoDownloadMode === "smart" && (
+                <>
+                  <strong>Smart (recommended):</strong> the AI sets{" "}
+                  <code className="font-mono">auto_download=true</code> only
+                  when it plans to embed the images in a file it creates
+                  (HTML, Markdown, report). Otherwise only the gallery is
+                  rendered.
+                </>
+              )}
+              {imageAutoDownloadMode === "never" && (
+                <>
+                  <strong>Never:</strong> images are never downloaded; the
+                  tool returns proxy URLs only. Use for pure image browsing.
+                </>
+              )}
+            </p>
+          </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
             <div className="p-3 rounded-sm border border-border/60 bg-card hover:border-muted/30 hover:shadow-sm transition-colors">

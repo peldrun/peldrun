@@ -59,6 +59,7 @@ from omweb.routers import (
     config_rtr,
     files,
     generative_ui_rtr,
+    image_proxy_rtr,
     mcp,
     mcp_auth,
     resource_monitor,
@@ -256,6 +257,12 @@ app.include_router(
 # argument here (matches source_control / resource_monitor convention).
 app.include_router(runtime_settings_rtr.router)
 app.include_router(search_rtr.router, prefix="/api/search", tags=["search"])
+# Image proxy router — serves images for the image_search gallery
+# (/api/search/image-proxy). Mounted under /api/search so it shares
+# the same CORS + auth surface as the search endpoints.
+app.include_router(
+    image_proxy_rtr.router, prefix="/api/search", tags=["search", "image-proxy"]
+)
 app.include_router(files.router, prefix="/api/files", tags=["files"])
 app.include_router(mcp.router, prefix="/api/mcp", tags=["mcp"])
 app.include_router(setup.router, prefix="/api/setup", tags=["setup"])

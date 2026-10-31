@@ -112,7 +112,7 @@ estimated_cost_per_query = 0.005
 
 [search.jina]
 enabled = true
-api_key = "jina_330c240e759743cdb99eb438bcf7f336o5v3iba1AQy2dOd7MDAFIjCcTIZj"
+api_key = "jina••••••••TIZj"
 timeout = 20
 cost_per_query = 0.002
 estimated_cost_per_query = 0.002
@@ -139,3 +139,4 @@ country = ""
 total_budget_seconds = 20
 max_retries = 0
 retry_delay = 1
+auto_download = "smart"

@@ -15,6 +15,7 @@ export type ServerEventName =
   | "artifact_updated"
   | "artifact_deleted"
   | "artifact_moved"
+  | "image_results"
   | "delegation_requested"
   | "approval_required"
   | "approval_resolved"
@@ -52,6 +53,33 @@ export interface Step {
   tool_args?: Record<string, any>;
   attempt?: number;
   status?: string;
+}
+
+// ===========================================================================
+// Image Search Results
+// ===========================================================================
+//
+// Mirrors the payload emitted by the "image_results" SSE event. All
+// image_url and thumbnail_url values are already proxied through
+// /api/search/image-proxy, so they can be used directly in <img src>.
+
+export interface ImageResultItem {
+  title: string;
+  image_url: string;
+  thumbnail_url?: string | null;
+  source_url?: string | null;
+  width?: number | null;
+  height?: number | null;
+  source?: string | null;
+}
+
+export interface ImageResultsPayload {
+  query: string;
+  provider: string;
+  images: ImageResultItem[];
+  count: number;
+  latency_ms: number;
+  estimated_cost_usd: number;
 }
 
 export interface ToolPair {

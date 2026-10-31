@@ -32,6 +32,7 @@ import rehypeKatex from "rehype-katex";
 import "katex/dist/katex.min.css";
 
 import { CodeBlock } from "@/components/chat/code-block";
+import { ImageGallery } from "@/components/chat/ImageGallery";
 import { useGenerativeUIStore } from "@/components/generative-ui/store";
 import { PeldrunDiagram } from "@/components/generative-ui/catalog/PeldrunDiagram";
 import { PeldrunChartBlock } from "@/components/generative-ui/catalog/PeldrunChartBlock";
@@ -211,6 +212,42 @@ function MarkdownRendererInner({
                 return <PeldrunChartBlock source={rawCode} />;
               }
               return <CodeBlock code={rawCode} language="json" />;
+            }
+
+            // Special block emitted by use-sse-stream in chat mode.
+            // The backend's structured image_results payload is
+            // embedded as JSON inside this fenced block, and we
+            // render it as an inline gallery. Parse failures fall
+            // back to plain code (never crash the renderer).
+            if (language === "image_gallery") {
+              try {
+                const parsed = JSON.parse(rawCode);
+                const images = Array.isArray(parsed?.images)
+                  ? parsed.images
+                  : [];
+                if (images.length > 0) {
+                  return (
+                    <ImageGallery
+                      images={images}
+                      query={
+                        typeof parsed?.query === "string"
+                          ? parsed.query
+                          : undefined
+                      }
+                      provider={
+                        typeof parsed?.provider === "string"
+                          ? parsed.provider
+                          : undefined
+                      }
+                    />
+                  );
+                }
+                return null;
+              } catch {
+                // Malformed payload — render as plain JSON so the
+                // user can still see what went wrong.
+                return <CodeBlock code={rawCode} language="json" />;
+              }
             }
 
             if (language === "text" || !language) {

@@ -55,6 +55,13 @@ export interface McpAuthRequiredPayload {
 interface UseSseStreamParams {
   currentStepNumRef: React.MutableRefObject<number>;
   activeChatIdRef: React.MutableRefObject<string | null>;
+  /**
+   * Current run mode. Used to decide whether image_results should be
+   * appended as a timeline step (agent mode) or injected into
+   * finalResult as a special markdown block (chat mode, which does
+   * not render the timeline).
+   */
+  execMode?: "agent" | "chat";
   setSteps: React.Dispatch<React.SetStateAction<StepEvent[]>>;
   setCurrentStepNum: (n: number) => void;
   setActiveModelName: (m: string) => void;
@@ -107,6 +114,27 @@ export function useSseStream(params: UseSseStreamParams) {
   const eventSourceRef = useRef<EventSource | null>(null);
 
   /**
+   * Image results accumulated during the current run. Reset on every
+   * `connectStream()` call. In chat mode, these are injected as a
+   * markdown code block into finalResult on the `final` event, which
+   * MarkdownRenderer converts into an inline gallery. In agent mode,
+   * each image_results event is appended as its own timeline step.
+   */
+  const collectedImagesRef = useRef<
+    Array<{
+      title: string;
+      image_url: string;
+      thumbnail_url?: string | null;
+      source_url?: string | null;
+      width?: number | null;
+      height?: number | null;
+      source?: string | null;
+    }>
+  >([]);
+  const collectedImagesQueryRef = useRef<string>("");
+  const collectedImagesProviderRef = useRef<string>("");
+
+  /**
    * Mirror of the latest `params` object. Handlers read from this ref so they
    * always observe the freshest state setters without forcing the callback
    * itself to change identity.
@@ -127,6 +155,11 @@ export function useSseStream(params: UseSseStreamParams) {
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
     }
+    // Reset accumulated image state on every fresh connection.
+    collectedImagesRef.current = [];
+    collectedImagesQueryRef.current = "";
+    collectedImagesProviderRef.current = "";
+
     const es = new EventSource(`/api/run/jobs/${jobId}/stream`);
     eventSourceRef.current = es;
 
@@ -426,7 +459,55 @@ export function useSseStream(params: UseSseStreamParams) {
           payload.data?.result ??
           payload.data?.content ??
           "Task completed successfully.";
-        if (eventType === "final") ctx.setFinalResult(safeRender(resText));
+        if (eventType === "final") {
+          let finalContent = safeRender(resText);
+
+          // In chat mode, ChatThread does not render the timeline.
+          // To surface the images, append a special markdown code
+          // block that MarkdownRenderer converts into an inline
+          // gallery. The block is invisible to the user; only the
+          // rendered gallery appears.
+          // Skip client-side injection when the backend already
+          // embedded the gallery block in the persisted result text
+          // (the new dispatcher behavior). The guard prevents double
+          // rendering when both the backend and the frontend try to
+          // add the same block.
+          // Fallback: inject the image_gallery block when the backend
+          // did not already embed it. The backend now handles this in
+          // BOTH modes (dispatcher.py for chat, peldrun_engine.py for
+          // agent), but the frontend keeps this path as a defensive
+          // fallback for older backend versions or partial failures.
+          // The ``!finalContent.includes`` guard prevents double
+          // rendering when the backend already injected the block.
+          if (
+            collectedImagesRef.current.length > 0 &&
+            !finalContent.includes("```image_gallery")
+          ) {
+            try {
+              const payloadJson = JSON.stringify({
+                images: collectedImagesRef.current,
+                query: collectedImagesQueryRef.current,
+                provider: collectedImagesProviderRef.current,
+              });
+              finalContent += `\n\n\`\`\`image_gallery\n${payloadJson}\n\`\`\`\n`;
+            } catch (jsonErr) {
+              if (DEBUG_SSE) {
+                console.warn(
+                  "[SSE] Failed to serialize image gallery payload",
+                  jsonErr
+                );
+              }
+            }
+          }
+
+          ctx.setFinalResult(finalContent);
+
+          // Clear accumulated image state now that the turn is
+          // complete. This prevents leakage into the next turn.
+          collectedImagesRef.current = [];
+          collectedImagesQueryRef.current = "";
+          collectedImagesProviderRef.current = "";
+        }
 
         if (typeof window !== "undefined") {
           logEntry(`[${logTimestamp}] [FINAL] ${safeRender(resText)}`);
@@ -575,11 +656,65 @@ export function useSseStream(params: UseSseStreamParams) {
           );
           window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
         }
+      } else if (eventType === "image_results") {
+        // Structured image payload from the backend. Two consumers:
+        //   * Agent mode: append a step (rendered by ChatTimeline
+        //     via <ImageGallery>).
+        //   * Chat mode: collect for injection into finalResult on
+        //     the `final` event (ChatDeliverable -> MarkdownRenderer).
+        const rawImages = payload.data?.images;
+        const imagesArray = Array.isArray(rawImages) ? rawImages : [];
+        const provider = String(payload.data?.provider || "search");
+        const query = String(payload.data?.query || "");
+
+        if (imagesArray.length > 0) {
+          // Accumulate for chat-mode finalResult injection.
+          collectedImagesRef.current.push(...imagesArray);
+          if (query) collectedImagesQueryRef.current = query;
+          collectedImagesProviderRef.current = provider;
+
+          // Agent mode: emit a dedicated timeline step so the gallery
+          // renders inside ChatTimeline (which ChatThread already
+          // forwards `activeGroupedSteps` to).
+          if (ctx.execMode === "agent") {
+            ctx.setSteps((prev) => [
+              ...prev,
+              {
+                id: `img-${step}-${Date.now()}-${Math.random()
+                  .toString(36)
+                  .slice(2, 6)}`,
+                step,
+                type: "image_results",
+                content: `${imagesArray.length} image${
+                  imagesArray.length === 1 ? "" : "s"
+                } via ${provider}`,
+                images: imagesArray,
+                imageProvider: provider,
+                imageQuery: query,
+                timestamp: new Date().toLocaleTimeString(),
+              },
+            ]);
+            ctx.setExpandedSteps((prev) => ({
+              ...prev,
+              [`active-${step}`]: true,
+            }));
+          }
+
+          logEntry(
+            `[${logTimestamp}] [IMAGE_RESULTS] ${imagesArray.length} image${
+              imagesArray.length === 1 ? "" : "s"
+            } via ${provider}`
+          );
+        }
       } else if (eventType === "error") {
         ctx.setHumanQuery(null);
         const errText = payload.data?.message ?? "Execution error encountered.";
         ctx.setFinalResult(safeRender(errText));
         ctx.setStatus("failed");
+        // Discard any accumulated images so the next turn starts clean.
+        collectedImagesRef.current = [];
+        collectedImagesQueryRef.current = "";
+        collectedImagesProviderRef.current = "";
         if (typeof window !== "undefined") {
           logEntry(`[${logTimestamp}] [ERROR] ${safeRender(errText)}`);
           window.dispatchEvent(new CustomEvent("peldrun:run-completed"));

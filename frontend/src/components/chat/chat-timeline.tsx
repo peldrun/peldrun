@@ -22,14 +22,29 @@ import {
   parseMcpToolName,
   fetchMcpServerIcon,
 } from "@/components/chat/tool-call-card";
+import type { ImageResultItem } from "@/lib/types";
 
 export interface StepEvent {
   id: string;
   step: number;
-  type: "thought" | "tool_call" | "observation" | "error" | "final" | "ask_human";
+  type:
+    | "thought"
+    | "tool_call"
+    | "observation"
+    | "error"
+    | "final"
+    | "ask_human"
+    | "image_results";
   content: string;
   toolName?: string;
   timestamp?: string;
+
+  /** Structured image data — only set when type === "image_results". */
+  images?: ImageResultItem[];
+  /** Provider name for the image search — only for image_results. */
+  imageProvider?: string;
+  /** Original query for the image search — only for image_results. */
+  imageQuery?: string;
 }
 
 interface ChatTimelineProps {
@@ -212,9 +227,15 @@ function ChatTimelineInner({
               </button>
             </div>
 
+            {/* Image galleries are rendered by ChatThread above the
+                timeline, not here. This module deliberately does NOT
+                render them, to guarantee they cannot be hidden by any
+                accordion state. */}
             {isExpanded && (
               <div className="mt-2.5 space-y-2 pl-1.5 pr-1 animate-in fade-in">
-                {stepEvents.map((evt) => (
+                {stepEvents
+                  .filter((e) => e.type !== "image_results")
+                  .map((evt) => (
                   <div key={evt.id} className="text-xs space-y-1">
                     {evt.type === "thought" && (
                       <div className="flex items-start gap-2.5 p-3 rounded-lg bg-card border border-border/80 text-foreground shadow-peldrun-xs">

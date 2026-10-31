@@ -102,6 +102,10 @@
         "minimum": 1,
         "maximum": 20,
         "description": "Optional desired maximum number of image results. Omit this argument to inherit PELDRUN Search Settings (search.image_search.default_max_results). The configured provider ceiling and provider capability maximum are always enforced."
+      },
+      "auto_download": {
+        "type": "boolean",
+        "description": "Whether to download images to <workspace>/images/ and return local file paths. Set TRUE when you plan to reference these images in files you will create (HTML, Markdown, reports, PDFs, etc.) — otherwise the file will have broken image references. Set FALSE for purely informational image searches where the user only wants to see the images on screen. Omit to inherit the operator's configured default. IGNORED when PELDRUN's search.image_search.auto_download setting is 'always' or 'never'."
       }
     },
     "required": [

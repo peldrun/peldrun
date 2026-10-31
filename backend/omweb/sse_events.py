@@ -45,6 +45,48 @@ class SSEEventType(str, Enum):
     ARTIFACT_DELETED = "artifact_deleted"
     ARTIFACT_MOVED = "artifact_moved"
 
+    # Image Search Results Event
+    #
+    # Emitted after a successful image_search invocation so the frontend
+    # can render a rich visual gallery independently of any Generative UI
+    # rendering. The event is orthogonal to OBSERVATION: it carries
+    # structured image metadata (image_url, thumbnail_url, source_url,
+    # width, height, host) that is not otherwise surfaced in the text
+    # observation payload.
+    #
+    # Two emission sites:
+    #   * omweb/agent_bridge_parts/dispatcher.py  (direct chat mode)
+    #   * omweb/engines/peldrun_engine.py          (agent mode, parsed
+    #                                                from image_search
+    #                                                observation output)
+    #
+    # Payload shape (data):
+    #   {
+    #     "query": str,
+    #     "provider": str,
+    #     "images": [
+    #       {
+    #         "title": str,
+    #         "image_url": str,        # /api/search/image-proxy?... URL
+    #         "thumbnail_url": str|null,
+    #         "source_url": str|null,
+    #         "width": int|null,
+    #         "height": int|null,
+    #         "source": str|null
+    #       },
+    #       ...
+    #     ],
+    #     "count": int,
+    #     "latency_ms": float,
+    #     "estimated_cost_usd": float
+    #   }
+    #
+    # The frontend renders this as a responsive image grid with lazy
+    # loading, lightbox, and download actions. Text in the same turn is
+    # shown side-by-side; the LLM is instructed NOT to duplicate image
+    # URLs in its response.
+    IMAGE_RESULTS = "image_results"
+
     # Multi-Agent Lineage & Approval Events (Phase M3)
     DELEGATION_REQUESTED = "delegation_requested"
     APPROVAL_REQUIRED = "approval_required"

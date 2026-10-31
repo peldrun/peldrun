@@ -8,6 +8,12 @@
 export const HUMAN_TOOL_NAMES = new Set(["ask_human", "human_input"]);
 
 /**
+ * Tool names that trigger visual gallery rendering when their observation
+ * contains structured image metadata.
+ */
+export const IMAGE_TOOL_NAMES = new Set(["image_search"]);
+
+/**
  * Diagnostic flag: enable verbose SSE event logging in browser console.
  * Set to false once the ask_human rendering issue is confirmed resolved.
  */
@@ -40,6 +46,11 @@ export const SSE_EVENT_TYPES = [
   "artifact_deleted",
   "artifact_moved",
   "artifact",
+
+  // Image search results — emitted after a successful image_search
+  // invocation. Carries structured image metadata for the visual
+  // gallery. Rendered orthogonally to the text observation.
+  "image_results",
 
   // MCP authentication — terminal for the current stream.
   //

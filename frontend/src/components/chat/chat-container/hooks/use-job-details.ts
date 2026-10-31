@@ -191,14 +191,41 @@ export function useJobDetails(params: UseJobDetailsParams) {
           const rendered = safeRender(evContent);
           const tool = ev.data?.tool_name || ev.data?.name || ev.data?.tool;
           if (rendered.trim() !== "" || Boolean(tool)) {
-            replayed.push({
+            const replayedStep: StepEvent = {
               id: `replay-${idx}-${Math.random()}`,
               step: ev.step || 1,
               type: evType,
               content: rendered,
               toolName: tool,
               timestamp: ev.timestamp || new Date().toLocaleTimeString(),
-            });
+            };
+
+            // image_results events carry structured image metadata
+            // (proxied URLs, dimensions, source pages) that is NOT
+            // recoverable from the rendered markdown string. Without
+            // this preservation, the ChatTimeline receives an
+            // image_results step with an empty `images` array after
+            // a page refresh, so the gallery never renders again.
+            if (
+              evType === "image_results" &&
+              ev.data &&
+              typeof ev.data === "object"
+            ) {
+              const evImages = (ev.data as any).images;
+              if (Array.isArray(evImages) && evImages.length > 0) {
+                replayedStep.images = evImages;
+                replayedStep.imageProvider =
+                  typeof (ev.data as any).provider === "string"
+                    ? (ev.data as any).provider
+                    : undefined;
+                replayedStep.imageQuery =
+                  typeof (ev.data as any).query === "string"
+                    ? (ev.data as any).query
+                    : undefined;
+              }
+            }
+
+            replayed.push(replayedStep);
           }
         });
         p.setSteps(replayed);
