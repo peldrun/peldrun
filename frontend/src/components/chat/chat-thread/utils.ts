@@ -77,7 +77,11 @@ export function parsePromptAndAttachments(
  * The `isCode` flag is treated as the fallback category when the file does
  * not match any of the recognized media groups.
  */
-export function resolveFileCategory(fileName: string, customUrl?: string) {
+export function resolveFileCategory(
+  fileName: string,
+  customUrl?: string,
+  fileId?: string
+) {
   const extension = fileName.includes(".")
     ? fileName.slice(fileName.lastIndexOf(".")).toLowerCase()
     : "";
@@ -96,7 +100,25 @@ export function resolveFileCategory(fileName: string, customUrl?: string) {
     !isAudioVideo &&
     !isArchive;
 
-  const previewUrl = customUrl || (isImage ? `/api/files/raw/${fileName}` : undefined);
+  // Preview URL resolution order (images only):
+  //   1. Explicit custom URL passed by the caller.
+  //   2. Temporary artifact store — used by images uploaded via
+  //      POST /api/files/upload-temp. This is the only path that
+  //      survives a page reload, since data is served by the backend
+  //      rather than held in a browser-only blob URL.
+  //   3. Legacy workspace raw endpoint — covers attachments uploaded
+  //      via POST /api/files/upload (workspace / chat files).
+  // Non-images never have a preview URL (they render as icon tiles).
+  let previewUrl: string | undefined;
+  if (customUrl) {
+    previewUrl = customUrl;
+  } else if (isImage && fileId) {
+    previewUrl = `/api/files/temp/${fileId}`;
+  } else if (isImage) {
+    previewUrl = `/api/files/raw/${fileName}`;
+  } else {
+    previewUrl = undefined;
+  }
 
   return {
     isImage,

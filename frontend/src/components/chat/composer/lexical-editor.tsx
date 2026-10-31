@@ -37,6 +37,7 @@ import { SubmitCommandPlugin } from './submit-command-plugin';
 import { TypeaheadMenuPlugin } from './plugins/typeahead-menu-plugin';
 import { MarkdownClipboardPlugin } from './plugins/markdown-clipboard-plugin';
 import { FloatingToolbarPlugin } from './plugins/floating-toolbar-plugin';
+import { ImagePastePlugin } from './plugins/image-paste-plugin';
 import { COMPOSER_TRANSFORMERS, extractCleanText } from './serialization';
 import { LexicalEditorHandle, LexicalEditorProps } from './types';
 import {
@@ -105,6 +106,7 @@ export const LexicalEditorComponent = forwardRef<
     autoFocus = false,
     onClearEditor,
     chatId,
+    onImagePasted,
   },
   ref
 ) {
@@ -294,6 +296,19 @@ export const LexicalEditorComponent = forwardRef<
         <LinkPlugin />
         <AutoLinkPlugin matchers={MATCHERS} />
         <MarkdownClipboardPlugin />
+        {/*
+          ImagePastePlugin is mounted only when the host supplies an
+          onImagePasted callback. Without it, the plugin would have no
+          target and image pastes should fall through to the browser's
+          default behavior. Placed adjacent to MarkdownClipboardPlugin
+          to keep clipboard concerns grouped together; the actual
+          precedence is determined by command priority (CRITICAL vs
+          HIGH), with MarkdownClipboardPlugin already deferring to
+          image pastes via its explicit early-return guard.
+        */}
+        {onImagePasted && (
+          <ImagePastePlugin onImagePasted={onImagePasted} />
+        )}
         <FloatingToolbarPlugin />
         {/* Typeahead is registered before Submit to ensure menu capture on Enter */}
         <TypeaheadMenuPlugin onClearEditor={onClearEditor} chatId={chatId} />

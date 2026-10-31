@@ -843,6 +843,19 @@ class PeldrunEngine(ExecutionEngine):
             "authorized_tools": list(requested_tools),
             "resolved_custom_tools": list(resolved_tool_ids),
             "specialist_tools": specialist_tools_map,
+            # [FIX-MULTIMODAL-PROPAGATE] Forward the multimodal attachment
+            # references received from dispatcher.py so that
+            # executor.py's [FIX-MULTIMODAL] block can resolve them to
+            # image_url content parts before the LLM call. Without this
+            # field, attachments are silently dropped between
+            # peldrun_engine and executor — the model receives only the
+            # text prompt and reports that it cannot see any image.
+            #
+            # This field is consumed exclusively by
+            # CoreRuntimeExecutor.execute via
+            # ``request.metadata.get("attachments")``. It is NOT read by
+            # any other layer, so adding it cannot cause side effects.
+            "attachments": context.attachments or [],
         }
 
         run_request = RunRequest(

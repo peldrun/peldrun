@@ -2,7 +2,13 @@
 
 "use client";
 
-import React, { useRef, useState, useEffect, useMemo } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import NeuralLoaderV3 from "@/components/NeuralLoaderV3";
 import {
   Bot,
@@ -11,12 +17,16 @@ import {
   Sparkles,
   ArrowUp,
   FileText,
+  Image as ImageIcon,
   X,
   Maximize2,
   Minimize2,
   Globe,
   GitFork,
   Info,
+  AlertCircle,
+  CheckCircle2,
+  Loader2,
 } from "lucide-react";
 import { AgentSelector } from "./agent-selector";
 import { ActiveToolsModal } from "./active-tools-modal";
@@ -27,6 +37,78 @@ import { LexicalEditorComponent } from "./composer/lexical-editor";
 import { LexicalEditorHandle } from "./composer/types";
 import { commandRegistry } from "./composer/registry/command-registry";
 import { useChatStore } from "@/stores/chat-store";
+
+// ---------------------------------------------------------------------------
+// Multimodal attachment model
+// ---------------------------------------------------------------------------
+
+/**
+ * A single image attachment tracked by the landing composer.
+ *
+ * Only images use this structure. Non-image files continue to live in
+ * the parent's ``landingAttachedFiles`` list untouched, preserving the
+ * existing ``onStartTask`` contract. Images are uploaded to the
+ * temporary artifact store immediately so the user sees live progress,
+ * and only their ``fileId`` references travel to the backend once the
+ * user dispatches the task.
+ *
+ * Note: this type intentionally duplicates ``PendingAttachment`` from
+ * ``composer.tsx``. The two composers are independent components with
+ * different lifecycle contracts; sharing a type between them would
+ * couple their evolution. If a third consumer appears, extract this
+ * to a shared module then.
+ */
+interface PendingImageAttachment {
+  id: string;
+  file: File;
+  fileName: string;
+  fileSize: number;
+  mimeType: string;
+  status: "uploading" | "ready" | "error";
+  fileId?: string;
+  width?: number;
+  height?: number;
+  errorMessage?: string;
+  previewUrl: string;
+}
+
+interface UploadTempResponse {
+  file_id: string;
+  mime_type: string;
+  size_bytes: number;
+  width?: number | null;
+  height?: number | null;
+  filename?: string;
+  url?: string;
+}
+
+async function uploadImageToTemp(file: File): Promise<UploadTempResponse> {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const res = await fetch("/api/files/upload-temp", {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!res.ok) {
+    let detail = "";
+    try {
+      detail = await res.text();
+    } catch {
+      /* ignore */
+    }
+    throw new Error(
+      `Upload failed (${res.status}${detail ? `: ${detail.slice(0, 120)}` : ""})`
+    );
+  }
+
+  return (await res.json()) as UploadTempResponse;
+}
+
+function generateImageAttachmentId(): string {
+  return `img_att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
 
 interface ChatLandingProps {
   inputValue: string;
@@ -51,6 +133,9 @@ export function ChatLanding({
 }: ChatLandingProps) {
   const [isLandingDragging, setIsLandingDragging] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
+  const [pendingImageAttachments, setPendingImageAttachments] = useState<
+    PendingImageAttachment[]
+  >([]);
 
   // Web Search: temporary per-message toggle, chat mode only.
   const [webSearchEnabled, setWebSearchEnabled] = useState(false);
@@ -108,6 +193,27 @@ export function ChatLanding({
     }
   }, [setActiveModel, setActiveProvider]);
 
+  // Revoke any outstanding preview URLs on unmount. A ref keeps the
+  // latest list accessible from the cleanup closure without re-running
+  // the cleanup on every state change.
+  const pendingImageAttachmentsRef = useRef<PendingImageAttachment[]>([]);
+  useEffect(() => {
+    pendingImageAttachmentsRef.current = pendingImageAttachments;
+  }, [pendingImageAttachments]);
+  useEffect(() => {
+    return () => {
+      pendingImageAttachmentsRef.current.forEach((att) => {
+        if (att.previewUrl) {
+          try {
+            URL.revokeObjectURL(att.previewUrl);
+          } catch {
+            /* ignore */
+          }
+        }
+      });
+    };
+  }, []);
+
   // Dynamically resolve whether the currently active model supports reasoning
   const modelCaps = useMemo(() => {
     return inferModelCapabilities(
@@ -118,21 +224,161 @@ export function ChatLanding({
 
   const isReasoningSupported = Boolean(modelCaps?.isReasoning);
 
+  /**
+   * Route a batch of incoming files through the correct pipeline:
+   *
+   *   * Images  -> internal ``pendingImageAttachments`` list, uploaded
+   *                to the temporary artifact store immediately.
+   *   * Others  -> parent's ``landingAttachedFiles`` list, unchanged
+   *                from the pre-multimodal behavior.
+   *
+   * This split preserves the parent's contract (``onStartTask`` keeps
+   * receiving the same ``File[]`` it always has) while giving images a
+   * dedicated upload lifecycle so the vision pipeline can resolve them
+   * later via their server-assigned ``fileId``.
+   */
+  const ingestLandingFiles = useCallback(
+    (incoming: File[]) => {
+      if (incoming.length === 0) return;
+
+      const imageFiles: File[] = [];
+      const nonImageFiles: File[] = [];
+
+      for (const file of incoming) {
+        if (file.type.startsWith("image/")) {
+          imageFiles.push(file);
+        } else {
+          nonImageFiles.push(file);
+        }
+      }
+
+      // Non-images keep going through the parent's existing flow.
+      if (nonImageFiles.length > 0) {
+        setLandingAttachedFiles((prev) => [...prev, ...nonImageFiles]);
+      }
+
+      if (imageFiles.length === 0) return;
+
+      const newAttachments: PendingImageAttachment[] = imageFiles.map(
+        (file) => ({
+          id: generateImageAttachmentId(),
+          file,
+          fileName: file.name || "pasted-image",
+          fileSize: file.size,
+          mimeType: file.type || "image/png",
+          status: "uploading" as const,
+          previewUrl: URL.createObjectURL(file),
+        })
+      );
+
+      setPendingImageAttachments((prev) => [...prev, ...newAttachments]);
+
+      // Kick off uploads in parallel. Each completion mutates only its
+      // own attachment, so concurrent pastes never clobber each other.
+      newAttachments.forEach((att) => {
+        const attId = att.id;
+        void (async () => {
+          try {
+            const response = await uploadImageToTemp(att.file);
+            setPendingImageAttachments((prev) =>
+              prev.map((current) =>
+                current.id === attId
+                  ? {
+                      ...current,
+                      status: "ready",
+                      fileId: response.file_id,
+                      mimeType: response.mime_type || current.mimeType,
+                      width: response.width ?? undefined,
+                      height: response.height ?? undefined,
+                    }
+                  : current
+              )
+            );
+          } catch (error) {
+            console.error(
+              "[ChatLanding] Image upload failed for",
+              att.fileName,
+              error
+            );
+            setPendingImageAttachments((prev) =>
+              prev.map((current) =>
+                current.id === attId
+                  ? {
+                      ...current,
+                      status: "error",
+                      errorMessage:
+                        error instanceof Error
+                          ? error.message
+                          : String(error),
+                    }
+                  : current
+              )
+            );
+          }
+        })();
+      });
+    },
+    [setLandingAttachedFiles]
+  );
+
   const handleLandingFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
-      setLandingAttachedFiles((prev) => [...prev, ...Array.from(e.target.files!)]);
+      ingestLandingFiles(Array.from(e.target.files));
     }
     if (landingFileInputRef.current) {
       landingFileInputRef.current.value = "";
     }
   };
 
+  /**
+   * ImagePastePlugin callback. Uniform with picker and drop: images
+   * always flow through the same immediate-upload path.
+   */
+  const handleImagePasted = useCallback(
+    (file: File) => {
+      ingestLandingFiles([file]);
+    },
+    [ingestLandingFiles]
+  );
+
+  const handleRemoveImageAttachment = useCallback((id: string) => {
+    setPendingImageAttachments((prev) => {
+      const target = prev.find((att) => att.id === id);
+      if (target?.previewUrl) {
+        try {
+          URL.revokeObjectURL(target.previewUrl);
+        } catch {
+          /* ignore */
+        }
+      }
+      return prev.filter((att) => att.id !== id);
+    });
+  }, []);
+
   const handleDispatch = (customPrompt?: string) => {
     const rawText = landingEditorRef.current
       ? landingEditorRef.current.getText()
       : inputValue;
     const textToRun = (customPrompt !== undefined ? customPrompt : rawText).trim();
-    if (!textToRun && landingAttachedFiles.length === 0) return;
+
+    const hasImages = pendingImageAttachments.length > 0;
+    if (!textToRun && landingAttachedFiles.length === 0 && !hasImages) {
+      return;
+    }
+
+    // Only fully-uploaded images travel to the backend. Still-uploading
+    // or errored entries are excluded: the backend would otherwise
+    // receive null file IDs and the engine would treat each reference
+    // as broken. The user can retry dispatch once uploads settle.
+    const readyImageRefs = pendingImageAttachments
+      .filter((att) => att.status === "ready" && att.fileId)
+      .map((att) => ({
+        fileId: att.fileId as string,
+        mimeType: att.mimeType,
+        fileName: att.fileName,
+        width: att.width,
+        height: att.height,
+      }));
 
     const payloadOverride = {
       is_reasoning_model: isReasoningSupported,
@@ -141,12 +387,30 @@ export function ChatLanding({
       ...(execMode === "chat" && { web_search_enabled: webSearchEnabled }),
       // Attach delegation flag (agent mode only)
       ...(execMode === "agent" && { delegation_allowed: delegationAllowed }),
+      // Multimodal image references. Consumed by start_run.py and
+      // forwarded to the engine as llm_override["attachments"].
+      // Omitted entirely when no image finished uploading successfully.
+      ...(readyImageRefs.length > 0 ? { attachments: readyImageRefs } : {}),
     };
 
     onStartTask(textToRun, payloadOverride, landingAttachedFiles);
+
+    // Success path: revoke preview URLs before clearing state so the
+    // Blob references release immediately rather than waiting for GC.
+    pendingImageAttachments.forEach((att) => {
+      if (att.previewUrl) {
+        try {
+          URL.revokeObjectURL(att.previewUrl);
+        } catch {
+          /* ignore */
+        }
+      }
+    });
+
     landingEditorRef.current?.clear();
     setInputValue("");
     setLandingAttachedFiles([]);
+    setPendingImageAttachments([]);
     setWebSearchEnabled(false); // Reset after dispatch
   };
 
@@ -227,24 +491,29 @@ export function ChatLanding({
           e.preventDefault();
           setIsLandingDragging(false);
           if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-            setLandingAttachedFiles((prev) => [...prev, ...Array.from(e.dataTransfer.files)]);
+            ingestLandingFiles(Array.from(e.dataTransfer.files));
           }
         }}
         className={`w-full bg-card rounded-3xl transition-all p-3.5 peldrun-input-bar text-start ${
           isLandingDragging ? "ring-2 ring-primary/40 bg-card" : "bg-card"
         }`}
       >
-        {/* Attached Files Badges Container */}
-        {landingAttachedFiles.length > 0 && (
+        {/* Attached Files & Image Badges Container */}
+        {(landingAttachedFiles.length > 0 ||
+          pendingImageAttachments.length > 0) && (
           <div className="flex flex-col border-b border-border/40 bg-muted/20 mb-2 pb-1">
             <div className="flex flex-wrap gap-2 p-2.5 pb-1">
+              {/* Non-image files: legacy pipeline, held in parent state. */}
               {landingAttachedFiles.map((file, idx) => (
                 <div
-                  key={`${file.name}-${idx}`}
+                  key={`legacy-${file.name}-${idx}`}
                   className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs bg-muted/60 border border-border shadow-xs text-foreground animate-in fade-in"
                 >
                   <FileText size={13} className="text-primary shrink-0" />
-                  <span className="font-medium truncate max-w-[160px]" title={file.name}>
+                  <span
+                    className="font-medium truncate max-w-[160px]"
+                    title={file.name}
+                  >
                     {file.name}
                   </span>
                   <span className="text-[10px] text-muted-foreground font-mono">
@@ -253,7 +522,9 @@ export function ChatLanding({
                   <button
                     type="button"
                     onClick={() =>
-                      setLandingAttachedFiles((prev) => prev.filter((_, i) => i !== idx))
+                      setLandingAttachedFiles((prev) =>
+                        prev.filter((_, i) => i !== idx)
+                      )
                     }
                     className="p-0.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer ml-1"
                     title="Remove file"
@@ -262,10 +533,67 @@ export function ChatLanding({
                   </button>
                 </div>
               ))}
+
+              {/* Images: live upload pipeline, held in internal state. */}
+              {pendingImageAttachments.map((att) => (
+                <div
+                  key={att.id}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs bg-muted/60 border border-border shadow-xs text-foreground animate-in fade-in"
+                >
+                  {att.previewUrl ? (
+                    <img
+                      src={att.previewUrl}
+                      alt={att.fileName}
+                      className="w-5 h-5 rounded object-cover shrink-0 border border-border/40"
+                    />
+                  ) : (
+                    <ImageIcon size={13} className="text-primary shrink-0" />
+                  )}
+                  <span
+                    className="font-medium truncate max-w-[160px]"
+                    title={att.fileName}
+                  >
+                    {att.fileName}
+                  </span>
+                  <span className="text-[10px] text-muted-foreground font-mono">
+                    ({formatFileSize(att.fileSize)})
+                  </span>
+                  {att.status === "uploading" && (
+                    <Loader2
+                      size={12}
+                      className="text-primary animate-spin shrink-0"
+                    />
+                  )}
+                  {att.status === "ready" && (
+                    <CheckCircle2
+                      size={12}
+                      className="text-emerald-500 shrink-0"
+                    />
+                  )}
+                  {att.status === "error" && (
+                    <AlertCircle
+                      size={12}
+                      className="text-rose-500 shrink-0"
+                      aria-label={att.errorMessage || "Upload failed"}
+                    />
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveImageAttachment(att.id)}
+                    className="p-0.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer ml-1"
+                    title="Remove image"
+                  >
+                    <X size={12} />
+                  </button>
+                </div>
+              ))}
             </div>
             <div className="px-2.5 pb-1.5 text-[10px] text-muted-foreground/70 flex items-center gap-1">
               <Info size={10} className="shrink-0" />
-              <span>Unsent attachments are held in memory and upload upon confirmed task submission.</span>
+              <span>
+                Images upload immediately. Non-image files are held in
+                memory and upload upon confirmed task submission.
+              </span>
             </div>
           </div>
         )}
@@ -275,12 +603,14 @@ export function ChatLanding({
           <LexicalEditorComponent
             ref={landingEditorRef}
             placeholder={
-              landingAttachedFiles.length > 0
+              landingAttachedFiles.length > 0 ||
+              pendingImageAttachments.length > 0
                 ? "Add instructions for attached files..."
                 : dynamicPlaceholder
             }
             onSubmit={() => handleDispatch()}
             onChange={(val) => setInputValue(val)}
+            onImagePasted={handleImagePasted}
             contentClassName={
               isExpanded
                 ? "min-h-[520px] max-h-[680px] px-2 py-2 leading-relaxed"
@@ -305,7 +635,8 @@ export function ChatLanding({
               title="Attach files or images"
             >
               <Paperclip size={15} />
-              {landingAttachedFiles.length > 0 && (
+              {(landingAttachedFiles.length > 0 ||
+                pendingImageAttachments.length > 0) && (
                 <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-primary" />
               )}
             </button>
@@ -390,7 +721,11 @@ export function ChatLanding({
             <button
               type="button"
               onClick={() => handleDispatch()}
-              disabled={!inputValue.trim() && landingAttachedFiles.length === 0}
+              disabled={
+                !inputValue.trim() &&
+                landingAttachedFiles.length === 0 &&
+                pendingImageAttachments.length === 0
+              }
               className="h-8 w-8 rounded-full bg-black dark:bg-white text-white dark:text-black flex items-center justify-center transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-peldrun-xs cursor-pointer hover:opacity-90"
               title="Dispatch Task (Enter)"
             >

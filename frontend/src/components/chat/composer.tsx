@@ -10,11 +10,14 @@ import {
   Bot,
   MessageSquare,
   FileText,
+  Image as ImageIcon,
   X,
   Maximize2,
   Minimize2,
   RotateCcw,
   AlertCircle,
+  CheckCircle2,
+  Loader2,
   Info,
   GitFork,
   Globe,
@@ -97,6 +100,76 @@ export function clearDraft(key: string): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Multimodal attachment model
+// ---------------------------------------------------------------------------
+
+/**
+ * A single attachment tracked by the composer.
+ *
+ * Images are uploaded to the temporary artifact store on add, so they
+ * carry a server-assigned ``fileId`` once the upload succeeds. Non-image
+ * files are kept in memory and forwarded to the parent's ``onSend``
+ * handler as raw ``File`` objects (the legacy upload path).
+ *
+ * ``previewUrl`` holds a ``URL.createObjectURL`` handle for images so the
+ * chip row can render a thumbnail. It MUST be revoked when the attachment
+ * is removed or the component unmounts; otherwise the underlying Blob is
+ * leaked for the lifetime of the tab.
+ */
+export interface PendingAttachment {
+  id: string;
+  file: File;
+  fileName: string;
+  fileSize: number;
+  mimeType: string;
+  isImage: boolean;
+  status: "uploading" | "ready" | "error";
+  fileId?: string;
+  width?: number;
+  height?: number;
+  errorMessage?: string;
+  previewUrl?: string;
+}
+
+interface UploadTempResponse {
+  file_id: string;
+  mime_type: string;
+  size_bytes: number;
+  width?: number | null;
+  height?: number | null;
+  filename?: string;
+  url?: string;
+}
+
+async function uploadImageToTemp(file: File): Promise<UploadTempResponse> {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const res = await fetch("/api/files/upload-temp", {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!res.ok) {
+    let detail = "";
+    try {
+      detail = await res.text();
+    } catch {
+      /* ignore */
+    }
+    throw new Error(
+      `Upload failed (${res.status}${detail ? `: ${detail.slice(0, 120)}` : ""})`
+    );
+  }
+
+  return (await res.json()) as UploadTempResponse;
+}
+
+function generateAttachmentId(): string {
+  return `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
 interface ComposerProps {
   onSend: (
     text: string,
@@ -123,7 +196,9 @@ export function Composer({
   const activeSessionId = chatId || urlChatId;
 
   const [text, setText] = useState("");
-  const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
+  const [pendingAttachments, setPendingAttachments] = useState<
+    PendingAttachment[]
+  >([]);
   const [selectedMentions, setSelectedMentions] = useState<MentionItem[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [metadataVault, setMetadataVault] = useState<Record<string, any>>({});
@@ -140,11 +215,9 @@ export function Composer({
 
   const [failedDraft, setFailedDraft] = useState<{
     text: string;
-    files: File[];
   } | null>(null);
   const backupDraftRef = useRef<{
     text: string;
-    files: File[];
   } | null>(null);
 
   const draftStorageKey = useMemo(
@@ -251,6 +324,29 @@ export function Composer({
     }
   }, [setActiveModel, setActiveProvider]);
 
+  // Revoke any outstanding preview URLs when the composer unmounts.
+  // Without this, every thumbnail created via URL.createObjectURL leaks
+  // its Blob for the lifetime of the tab. A ref holds the latest state
+  // so the cleanup runs against the correct list even after the initial
+  // render (the empty-array capture would otherwise be a no-op).
+  const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
+  useEffect(() => {
+    pendingAttachmentsRef.current = pendingAttachments;
+  }, [pendingAttachments]);
+  useEffect(() => {
+    return () => {
+      pendingAttachmentsRef.current.forEach((att) => {
+        if (att.previewUrl) {
+          try {
+            URL.revokeObjectURL(att.previewUrl);
+          } catch {
+            /* ignore */
+          }
+        }
+      });
+    };
+  }, []);
+
   const modelCaps = useMemo(() => {
     return inferModelCapabilities(
       activeModel,
@@ -340,26 +436,123 @@ export function Composer({
     return base;
   };
 
+  /**
+   * Route a batch of user-supplied files through the correct pipeline:
+   * images are uploaded to the temporary artifact store immediately
+   * (so the user sees progress), while non-images stay in memory and
+   * are forwarded to the parent's ``onSend`` handler as raw ``File``
+   * objects via the legacy upload path.
+   */
+  const ingestFiles = useCallback((incoming: File[]) => {
+    if (incoming.length === 0) return;
+
+    const newAttachments: PendingAttachment[] = [];
+    const imagesToUpload: Array<{ id: string; file: File }> = [];
+
+    for (const file of incoming) {
+      const isImage = file.type.startsWith("image/");
+      const id = generateAttachmentId();
+
+      if (isImage) {
+        newAttachments.push({
+          id,
+          file,
+          fileName: file.name || "pasted-image",
+          fileSize: file.size,
+          mimeType: file.type || "image/png",
+          isImage: true,
+          status: "uploading",
+          previewUrl: URL.createObjectURL(file),
+        });
+        imagesToUpload.push({ id, file });
+      } else {
+        newAttachments.push({
+          id,
+          file,
+          fileName: file.name,
+          fileSize: file.size,
+          mimeType: file.type || "application/octet-stream",
+          isImage: false,
+          status: "ready",
+        });
+      }
+    }
+
+    setPendingAttachments((prev) => [...prev, ...newAttachments]);
+
+    // Kick off image uploads in parallel. Each upload only mutates its
+    // own attachment, so concurrent pastes never clobber each other.
+    imagesToUpload.forEach(({ id, file }) => {
+      void (async () => {
+        try {
+          const response = await uploadImageToTemp(file);
+          setPendingAttachments((prev) =>
+            prev.map((att) =>
+              att.id === id
+                ? {
+                    ...att,
+                    status: "ready",
+                    fileId: response.file_id,
+                    mimeType: response.mime_type || att.mimeType,
+                    width: response.width ?? undefined,
+                    height: response.height ?? undefined,
+                  }
+                : att
+            )
+          );
+        } catch (error) {
+          console.error(
+            "[Composer] Image upload failed for",
+            file.name,
+            error
+          );
+          setPendingAttachments((prev) =>
+            prev.map((att) =>
+              att.id === id
+                ? {
+                    ...att,
+                    status: "error",
+                    errorMessage:
+                      error instanceof Error
+                        ? error.message
+                        : String(error),
+                  }
+                : att
+            )
+          );
+        }
+      })();
+    });
+  }, []);
+
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
-      const newFiles = Array.from(e.target.files);
-      setAttachedFiles((prev) => [...prev, ...newFiles]);
+      ingestFiles(Array.from(e.target.files));
     }
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
   };
 
-  const handleRemoveFile = (index: number) => {
-    setAttachedFiles((prev) => prev.filter((_, idx) => idx !== index));
+  const handleRemoveAttachment = (id: string) => {
+    setPendingAttachments((prev) => {
+      const target = prev.find((att) => att.id === id);
+      if (target?.previewUrl) {
+        try {
+          URL.revokeObjectURL(target.previewUrl);
+        } catch {
+          /* ignore */
+        }
+      }
+      return prev.filter((att) => att.id !== id);
+    });
   };
 
   const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setIsDragging(false);
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      const droppedFiles = Array.from(e.dataTransfer.files);
-      setAttachedFiles((prev) => [...prev, ...droppedFiles]);
+      ingestFiles(Array.from(e.dataTransfer.files));
     }
   };
 
@@ -367,6 +560,19 @@ export function Composer({
     e.preventDefault();
     setIsDragging(true);
   };
+
+  /**
+   * ImagePastePlugin callback. Delegates to the shared ingestion path so
+   * a paste behaves exactly like a drag-drop or file-picker selection:
+   * the image is uploaded immediately and the chip row reflects live
+   * upload progress.
+   */
+  const handleImagePasted = useCallback(
+    (file: File) => {
+      ingestFiles([file]);
+    },
+    [ingestFiles]
+  );
 
   const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -387,9 +593,11 @@ export function Composer({
       editorRef.current.setText(failedDraft.text);
     }
     setText(failedDraft.text);
-    setAttachedFiles(failedDraft.files);
     saveDraft(draftStorageKey, failedDraft.text);
     setFailedDraft(null);
+    // Attachments are intentionally NOT restored here: they were never
+    // cleared on the failure path (see handleSend), so the current
+    // pendingAttachments state already holds the correct set.
   };
 
   const handleSend = async () => {
@@ -397,7 +605,7 @@ export function Composer({
     const trimmedText = rawText.trim();
 
     if (
-      (!trimmedText && attachedFiles.length === 0) ||
+      (!trimmedText && pendingAttachments.length === 0) ||
       isRunning ||
       disabled ||
       isSubmitting
@@ -405,22 +613,44 @@ export function Composer({
       return;
     }
 
-    const currentFiles = [...attachedFiles];
+    // Partition attachments by kind:
+    //   * Non-images keep their raw File objects and are forwarded as the
+    //     legacy ``files`` argument so the parent's existing upload path
+    //     (POST /api/files/upload) keeps working unchanged.
+    //   * Ready images become AttachmentRef objects traveling inside
+    //     ``llmOverride.attachments``. The parent forwards them to the
+    //     backend, which stores only the lightweight ``file_id`` references.
+    //   * Still-uploading or errored images are excluded: sending them
+    //     would land on the backend with a null fileId and the engine
+    //     would treat the reference as broken.
+    const currentFiles = pendingAttachments
+      .filter((att) => !att.isImage)
+      .map((att) => att.file);
+
+    const readyImageRefs = pendingAttachments
+      .filter(
+        (att) => att.isImage && att.status === "ready" && att.fileId
+      )
+      .map((att) => ({
+        fileId: att.fileId as string,
+        mimeType: att.mimeType,
+        fileName: att.fileName,
+        width: att.width,
+        height: att.height,
+      }));
+
     const currentPayload = getActivePayload(trimmedText);
 
     // Read file mentions directly from the editor node tree. This is the
     // authoritative source: it preserves the canonical workspace-relative
     // path of each referenced file, avoiding the lossy basename extraction
     // that regex-on-text would produce for files in subdirectories.
-    // Read file mentions directly from the editor node tree.
     const editorMentions: Array<{ display: string; path: string }> =
       editorRef.current?.getFileMentions?.() ?? [];
 
     // Deduplicate by canonical path. The user may legitimately reference
     // the same file at multiple points in the message, but the payload
     // (and the resulting chip row) must contain each file only once.
-    // This mirrors the deduplication the backend already performs before
-    // injecting file contents into the prompt.
     const seenPaths = new Set<string>();
     const contextRefs: Array<{ relPath: string; fileName: string }> = [];
     for (const m of editorMentions) {
@@ -446,8 +676,15 @@ export function Composer({
         currentFiles.length > 0 ? currentFiles : undefined,
         {
           ...currentPayload,
-          // [FIX-2.3] Attach structured file references for backend resolution.
+          // [FIX-2.3] Structured workspace file references (from @-menu).
           context_refs: contextRefs.length > 0 ? contextRefs : undefined,
+          // Multimodal image references (from /api/files/upload-temp).
+          // Consumed by ``start_run.py`` and forwarded to the engine as
+          // ``llm_override["attachments"]``. Omitted entirely when no
+          // image finished uploading successfully.
+          ...(readyImageRefs.length > 0
+            ? { attachments: readyImageRefs }
+            : {}),
         }
       );
 
@@ -466,10 +703,23 @@ export function Composer({
         }
       }
 
+      // Success path: revoke every preview URL before clearing state so
+      // the Blob references are released immediately rather than waiting
+      // for GC to reclaim them.
+      pendingAttachments.forEach((att) => {
+        if (att.previewUrl) {
+          try {
+            URL.revokeObjectURL(att.previewUrl);
+          } catch {
+            /* ignore */
+          }
+        }
+      });
+
       setWebSearchEnabled(false);
       editorRef.current?.clear();
       setText("");
-      setAttachedFiles([]);
+      setPendingAttachments([]);
       setSelectedMentions([]);
       setFailedDraft(null);
       backupDraftRef.current = null;
@@ -477,16 +727,14 @@ export function Composer({
     } catch (error) {
       console.error("[Composer] Message dispatch failed:", error);
 
-      setFailedDraft({
-        text: trimmedText,
-        files: currentFiles,
-      });
+      // Failure path: attachments stay intact so the user can retry
+      // without re-uploading images that already reached the server.
+      setFailedDraft({ text: trimmedText });
 
       if (editorRef.current) {
         editorRef.current.setText(trimmedText);
       }
       setText(trimmedText);
-      setAttachedFiles(currentFiles);
     } finally {
       setIsSubmitting(false);
     }
@@ -506,7 +754,8 @@ export function Composer({
       ? `Ask ${displayProvider} (${displayModel}) to execute autonomous tasks...`
       : `Chat directly with ${displayProvider} (${displayModel})...`);
 
-  const isInputEmpty = !text.trim() && attachedFiles.length === 0;
+  const isInputEmpty =
+    !text.trim() && pendingAttachments.length === 0;
 
   return (
     <div className="relative w-full max-w-[1000px] mx-auto font-sans">
@@ -562,26 +811,58 @@ export function Composer({
             : "border-border focus-within:ring-1 focus-within:ring-muted focus-within:border-muted "
         }`}
       >
-        {attachedFiles.length > 0 && (
+        {pendingAttachments.length > 0 && (
           <div className="flex flex-col border-b border-border/40 bg-muted/20">
             <div className="flex flex-wrap gap-2 p-2.5 pb-1">
-              {attachedFiles.map((file, idx) => (
+              {pendingAttachments.map((att) => (
                 <div
-                  key={`${file.name}-${idx}`}
+                  key={att.id}
                   className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs bg-card border border-border shadow-xs text-foreground animate-in fade-in"
                 >
-                  <FileText size={13} className="text-primary shrink-0" />
-                  <span className="font-medium truncate max-w-[160px]" title={file.name}>
-                    {file.name}
+                  {att.isImage && att.previewUrl ? (
+                    <img
+                      src={att.previewUrl}
+                      alt={att.fileName}
+                      className="w-5 h-5 rounded object-cover shrink-0 border border-border/40"
+                    />
+                  ) : att.isImage ? (
+                    <ImageIcon size={13} className="text-primary shrink-0" />
+                  ) : (
+                    <FileText size={13} className="text-primary shrink-0" />
+                  )}
+                  <span
+                    className="font-medium truncate max-w-[160px]"
+                    title={att.fileName}
+                  >
+                    {att.fileName}
                   </span>
                   <span className="text-[10px] text-muted-foreground font-mono">
-                    ({formatFileSize(file.size)})
+                    ({formatFileSize(att.fileSize)})
                   </span>
+                  {att.status === "uploading" && (
+                    <Loader2
+                      size={12}
+                      className="text-primary animate-spin shrink-0"
+                    />
+                  )}
+                  {att.status === "ready" && att.isImage && (
+                    <CheckCircle2
+                      size={12}
+                      className="text-emerald-500 shrink-0"
+                    />
+                  )}
+                  {att.status === "error" && (
+                    <AlertCircle
+                      size={12}
+                      className="text-rose-500 shrink-0"
+                      aria-label={att.errorMessage || "Upload failed"}
+                    />
+                  )}
                   <button
                     type="button"
-                    onClick={() => handleRemoveFile(idx)}
+                    onClick={() => handleRemoveAttachment(att.id)}
                     className="p-0.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer ml-1"
-                    title="Remove file"
+                    title="Remove attachment"
                   >
                     <X size={12} />
                   </button>
@@ -590,7 +871,11 @@ export function Composer({
             </div>
             <div className="px-2.5 pb-1.5 text-[10px] text-muted-foreground/70 flex items-center gap-1">
               <Info size={10} className="shrink-0" />
-              <span>Unsent attachments are held in memory and upload upon confirmed task submission.</span>
+              <span>
+                Images upload to the temporary artifact store immediately.
+                Non-image files are held in memory and upload upon confirmed
+                task submission.
+              </span>
             </div>
           </div>
         )}
@@ -599,13 +884,14 @@ export function Composer({
           ref={editorRef}
           chatId={activeSessionId}
           placeholder={
-            attachedFiles.length > 0
+            pendingAttachments.length > 0
               ? "Add instructions for attached files..."
               : dynamicPlaceholder
           }
           disabled={disabled || isRunning || isSubmitting}
           onSubmit={handleSend}
           onChange={handleEditorChange}
+          onImagePasted={handleImagePasted}
           contentClassName={
             isExpanded
               ? "min-h-[220px] max-h-[460px] px-4 py-3"
@@ -631,7 +917,7 @@ export function Composer({
               title="Attach files or images"
             >
               <Paperclip size={15} />
-              {attachedFiles.length > 0 && (
+              {pendingAttachments.length > 0 && (
                 <span className="absolute top-1 right-1 w-2 h-2 rounded-full bg-primary" />
               )}
             </Button>

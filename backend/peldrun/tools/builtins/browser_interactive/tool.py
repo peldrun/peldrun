@@ -13,6 +13,13 @@ screenshots. Implements 9 actions:
   * fill          — type into an input by ref or CSS selector.
   * scroll        — scroll the viewport.
   * screenshot    — save a PNG to the workspace (never sent to the model).
+  * screenshot_for_model
+                  — capture a PNG artifact and return its ``file_id``
+                    plus metadata so the engine can route it to a vision
+                    model. The image bytes are NOT inlined in the
+                    observation: the engine decides whether to embed
+                    them (vision-capable active model) or route them
+                    through the vision worker (text-only active model).
   * back          — navigate back in history.
   * forward       — navigate forward in history.
 
@@ -26,7 +33,7 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
@@ -55,7 +62,7 @@ class BrowserInteractiveArgs(BaseModel):
         ...,
         description=(
             "Operation to perform: navigate, snapshot, get_content, click, "
-            "fill, scroll, screenshot, back, forward."
+            "fill, scroll, screenshot, screenshot_for_model, back, forward."
         ),
     )
     url: Optional[str] = Field(
@@ -106,7 +113,11 @@ class BrowserInteractiveTool(BaseTool):
         "accessibility tree with element references (refs), 'click' or 'fill' "
         "using those refs, 'get_content' for visible text, 'scroll' to reveal "
         "more, and 'screenshot' to save a PNG image to the workspace. "
-        "Screenshots are saved as artifacts and are NOT returned to the model."
+        "Use 'screenshot_for_model' when the task requires visually "
+        "inspecting the page: it captures a PNG artifact and returns a "
+        "file_id that the engine routes to a vision model. Screenshots "
+        "taken via 'screenshot' are saved as user-facing artifacts and "
+        "are NOT returned to the model."
     )
     args_schema: type[BaseModel] = BrowserInteractiveArgs
 
@@ -194,6 +205,46 @@ class BrowserInteractiveTool(BaseTool):
             str(sd).strip() if isinstance(sd, str) and sd.strip() else None
         )
 
+        # Dedicated directory for model-facing screenshot artifacts.
+        # Kept separate from ``_settings_screenshot_dir`` (user-facing
+        # screenshots) so the two flows never collide. Resolved lazily
+        # via ``_resolve_artifacts_dir`` when not explicitly bound.
+        self._run_artifacts_dir: Optional[str] = None
+
+    def set_run_artifacts_dir(self, artifacts_dir: Optional[str]) -> None:
+        """
+        Bind a per-run artifacts directory for model-facing screenshots.
+
+        The engine calls this once per run, typically with the path
+        ``<chat_files>/.peldrun/artifacts/<run_id>/``. When never called,
+        ``_screenshot_for_model`` falls back to
+        ``<workspace_root>/.peldrun/artifacts``.
+        """
+        self._run_artifacts_dir = (
+            str(artifacts_dir).strip() if artifacts_dir else None
+        )
+
+    def _resolve_artifacts_dir(self) -> Path:
+        """
+        Resolve the effective artifacts directory for
+        ``screenshot_for_model``.
+
+        Precedence:
+          1. ``_run_artifacts_dir`` when explicitly bound.
+          2. ``<workspace_root>/.peldrun/artifacts`` when a workspace
+             root is available.
+          3. ``<cwd>/.peldrun/artifacts`` as a last resort so the tool
+             still works in ad-hoc contexts.
+        """
+        if self._run_artifacts_dir:
+            return Path(self._run_artifacts_dir).expanduser()
+        base = (
+            Path(self.workspace_root).expanduser()
+            if self.workspace_root
+            else Path.cwd()
+        )
+        return base / ".peldrun" / "artifacts"
+
     def set_run_id(self, run_id: str) -> None:
         """Bind this tool instance to a specific run_id for session isolation."""
         self._run_id = run_id
@@ -258,6 +309,8 @@ class BrowserInteractiveTool(BaseTool):
                 return await self._scroll(direction)
             if action == "screenshot":
                 return await self._screenshot(full_page)
+            if action == "screenshot_for_model":
+                return await self._screenshot_for_model(full_page)
             if action == "back":
                 return await self._back()
             if action == "forward":
@@ -889,6 +942,97 @@ class BrowserInteractiveTool(BaseTool):
                 "path": str(filepath),
                 "size_bytes": size_bytes,
                 "full_page": full_page,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Action: screenshot_for_model
+    # ------------------------------------------------------------------
+
+    async def _screenshot_for_model(self, full_page: bool) -> ToolResult:
+        """
+        Capture a PNG artifact intended for a vision model to analyze.
+
+        Unlike ``_screenshot`` (which saves a user-facing PNG in the
+        workspace and returns only its filename), this action writes
+        the capture into the per-run artifacts directory managed by
+        the session layer and returns a ``file_id`` plus rich metadata
+        in the tool result.
+
+        The observation text is deliberately short and does NOT inline
+        the base64 payload. The engine layer is responsible for
+        routing the artifact — either by embedding it as an
+        ``image_url`` part (vision-capable active model) or by invoking
+        the vision worker to produce a textual description (text-only
+        active model). This keeps the tool layer decoupled from model
+        capability and prevents multi-megabyte payloads from being
+        embedded into tool observations.
+        """
+        page, state = await self._get_page_and_state()
+        state.touch()
+
+        if page.url in ("about:blank", ""):
+            return ToolResult(
+                output="Browser Error: no page loaded. Call 'navigate' first.",
+                exit_code=1,
+                is_error=True,
+                metadata={"error_code": "NO_PAGE_LOADED"},
+            )
+
+        artifacts_dir = self._resolve_artifacts_dir()
+
+        manager = get_session_manager()
+        capture = await manager.capture_screen_artifact(
+            page=page,
+            artifacts_dir=artifacts_dir,
+            prefix="snap",
+            full_page=full_page,
+        )
+
+        if capture is None:
+            return ToolResult(
+                output=(
+                    "Browser Error: failed to capture a screenshot "
+                    "artifact for the model."
+                ),
+                exit_code=1,
+                is_error=True,
+                metadata={
+                    "error_code": "SCREENSHOT_FOR_MODEL_FAILED",
+                    "url": page.url,
+                    "artifacts_dir": str(artifacts_dir),
+                },
+            )
+
+        file_id = str(capture.get("file_id") or "")
+        size_bytes = int(capture.get("size_bytes") or 0)
+        width = capture.get("width")
+        height = capture.get("height")
+
+        dims_fragment = (
+            f"{width}x{height}" if width and height else "unknown dimensions"
+        )
+
+        return ToolResult(
+            output=(
+                f"Captured screen artifact {file_id} "
+                f"({dims_fragment}, {size_bytes} bytes, "
+                f"full_page={full_page}). "
+                f"Use this file_id to route the capture to a vision model."
+            ),
+            exit_code=0,
+            is_error=False,
+            artifacts=[file_id],
+            metadata={
+                "file_id": file_id,
+                "file_path": capture.get("file_path"),
+                "mime_type": capture.get("mime_type", "image/png"),
+                "size_bytes": size_bytes,
+                "width": width,
+                "height": height,
+                "full_page": full_page,
+                "url": page.url,
+                "artifact_kind": "vision_input",
             },
         )
 

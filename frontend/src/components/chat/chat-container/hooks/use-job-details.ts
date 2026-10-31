@@ -2,7 +2,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef } from "react";
-import type { ChatTurn } from "@/components/chat/chat-thread";
+import type { AttachedUserFile, ChatTurn } from "@/components/chat/chat-thread";
 import type { StepEvent } from "@/components/chat/chat-timeline";
 import { safeRender } from "../utils";
 import type { ChatStatus, TokenUsage, UsageMetrics } from "../types";
@@ -10,6 +10,7 @@ import type { ChatStatus, TokenUsage, UsageMetrics } from "../types";
 interface UseJobDetailsParams {
   setActiveChatId: (id: string | null) => void;
   setSubmittedPrompt: (p: string) => void;
+  setSubmittedFiles: (files: AttachedUserFile[]) => void;
   setSelectedAgentId: (id: string) => void;
   setExecMode: (m: any) => void;
   setActiveModelName: (m: string) => void;
@@ -24,6 +25,47 @@ interface UseJobDetailsParams {
   currentStepNumRef: React.MutableRefObject<number>;
   fetchJobFiles: (jobId: string) => void;
   connectStream: (jobId: string) => void;
+}
+
+/**
+ * Project the top-level ``attachments`` array returned by
+ * ``GET /api/run/jobs/{id}`` into the ``AttachedUserFile`` shape consumed
+ * by ``UserMessageBubble`` / ``AttachedFileCard``.
+ *
+ * Mirrors ``_project_attachments_for_turn`` on the backend: entries
+ * without a valid string ``fileId`` are dropped, duplicates are
+ * collapsed, and optional fields are only included when well-typed.
+ * Non-array inputs yield ``[]`` so a schema drift on the backend never
+ * crashes the container during hydration.
+ */
+function projectAttachmentsForCurrentTurn(
+  attachments: unknown
+): AttachedUserFile[] {
+  if (!Array.isArray(attachments)) return [];
+  const result: AttachedUserFile[] = [];
+  const seen = new Set<string>();
+  for (const a of attachments) {
+    if (!a || typeof a !== "object") continue;
+    const entry = a as Record<string, unknown>;
+    const fileId = entry.fileId;
+    if (typeof fileId !== "string" || !fileId) continue;
+    if (seen.has(fileId)) continue;
+    seen.add(fileId);
+    const fileNameRaw = entry.fileName;
+    const name =
+      typeof fileNameRaw === "string" && fileNameRaw ? fileNameRaw : fileId;
+    const item: AttachedUserFile = { name, fileId };
+    const mimeType = entry.mimeType;
+    if (typeof mimeType === "string" && mimeType) {
+      item.mimeType = mimeType;
+    }
+    const width = entry.width;
+    if (typeof width === "number") item.width = width;
+    const height = entry.height;
+    if (typeof height === "number") item.height = height;
+    result.push(item);
+  }
+  return result;
 }
 
 /**
@@ -53,6 +95,15 @@ export function useJobDetails(params: UseJobDetailsParams) {
       const data = await res.json();
       if (data.chat_id) p.setActiveChatId(data.chat_id);
       if (data.prompt) p.setSubmittedPrompt(data.prompt);
+      // Project the current turn's multimodal attachments. Populated
+      // whenever the session carries image references at the top level
+      // (i.e. before the turn has been flushed into turns[] by the next
+      // run). This is the ONLY path that lets a page reload surface the
+      // active turn's images; historical turns get theirs from
+      // ``t.attached_files`` during the turns[] loop below.
+      p.setSubmittedFiles(
+        projectAttachmentsForCurrentTurn(data.attachments)
+      );
       if (data.agent_id) p.setSelectedAgentId(data.agent_id);
       if (data.mode) p.setExecMode(data.mode);
       if (data.model) p.setActiveModelName(data.model);
@@ -96,7 +147,7 @@ export function useJobDetails(params: UseJobDetailsParams) {
               status: t.status || "completed",
               model: t.model,
               producedFiles: t.produced_files,
-              attachedFiles: t.attached_files || undefined,
+              attachedFiles: t.attachedFiles || undefined,
               usage: t.usage || undefined,
               tokensUsed: t.usage
                 ? {

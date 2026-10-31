@@ -20,7 +20,10 @@ export interface AttachedCardProps {
 }
 
 export function AttachedFileCard({ file, onSelectFile }: AttachedCardProps) {
-  const info = resolveFileCategory(file.name, file.url);
+  // Pass fileId so images that were uploaded to the temporary artifact
+  // store render from /api/files/temp/{fileId} instead of the legacy
+  // workspace /raw path. Non-image cards ignore it.
+  const info = resolveFileCategory(file.name, file.url, file.fileId);
 
   if (info.isImage && info.previewUrl) {
     return (

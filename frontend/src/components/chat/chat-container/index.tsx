@@ -312,6 +312,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   const fetchJobDetails = useJobDetails({
     setActiveChatId,
     setSubmittedPrompt,
+    setSubmittedFiles,
     setSelectedAgentId,
     setExecMode,
     setActiveModelName,
@@ -745,7 +746,65 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         refAttachments.push({ name: fileName, path: relPath });
       }
 
-      attachedMetadata = [...attachedMetadata, ...refAttachments];
+      // [FIX-MULTIMODAL] Attach image references selected via the
+      // composer's multimodal pipeline. Each entry carries a server-side
+      // ``fileId`` assigned by ``POST /api/files/upload-temp``; the
+      // binary content never travels through this path. The backend
+      // (``start_run.py``) forwards them to the engine as
+      // ``llm_override["attachments"]``, where the context builder either
+      // embeds them inline (vision-capable model) or routes them through
+      // the vision worker (text-only model).
+      //
+      // The same list is projected into ``AttachedUserFile[]`` here so
+      // ``AttachedFileCard`` can render thumbnails from
+      // ``/api/files/temp/{fileId}`` — which survives a page reload,
+      // unlike a browser-only ``URL.createObjectURL`` handle.
+      const attachmentsFromOverride: Array<{
+        fileId?: string;
+        mimeType?: string;
+        fileName?: string;
+        width?: number;
+        height?: number;
+      }> = Array.isArray(customOverride?.attachments)
+        ? customOverride.attachments
+        : [];
+
+      // Defensive filtering:
+      //   * Entries without a string ``fileId`` are dropped — sending
+      //     them would land on the backend as null references and the
+      //     engine would treat each one as broken.
+      //   * Duplicate ``fileId`` values are collapsed so the chip row
+      //     (and the backend's own deduplication) never has to handle
+      //     the same image twice.
+      // The ``fileId`` is used as the fallback display name only when
+      // the composer did not supply a filename; the backend still
+      // resolves the artifact by ID, never by name.
+      const seenAttachmentIds = new Set<string>();
+      const imageAttachments: AttachedUserFile[] = [];
+      for (const a of attachmentsFromOverride) {
+        if (!a || typeof a.fileId !== "string" || !a.fileId) continue;
+        if (seenAttachmentIds.has(a.fileId)) continue;
+        seenAttachmentIds.add(a.fileId);
+        imageAttachments.push({
+          name:
+            typeof a.fileName === "string" && a.fileName
+              ? a.fileName
+              : a.fileId,
+          fileId: a.fileId,
+          mimeType:
+            typeof a.mimeType === "string" && a.mimeType
+              ? a.mimeType
+              : undefined,
+          width: typeof a.width === "number" ? a.width : undefined,
+          height: typeof a.height === "number" ? a.height : undefined,
+        });
+      }
+
+      attachedMetadata = [
+        ...attachedMetadata,
+        ...refAttachments,
+        ...imageAttachments,
+      ];
 
       // Archive the current turn before starting a new one.
       if (submittedPrompt && (finalResult || steps.length > 0)) {

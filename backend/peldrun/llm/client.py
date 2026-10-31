@@ -327,6 +327,39 @@ def sanitize_tools_for_openai(tools: Optional[List[Dict[str, Any]]]) -> Optional
     return cleaned_tools
 
 
+def _content_to_plain_text(content: Any) -> str:
+    """
+    Flatten a message ``content`` field into a plain string.
+
+    Handles three shapes:
+      * ``str``          — returned as-is.
+      * ``list`` of parts — concatenates ``text`` fields of every
+        ``type == "text"`` part; ignores image parts since they cannot
+        be folded into a text prompt.
+      * anything else   — coerced with ``str()``.
+
+    This helper exists so that the Gemma-folding path never calls
+    ``str(content)`` on a multimodal parts list (which would produce a
+    corrupt representation of the payload).
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_fragments: List[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                if part.get("type") == "text":
+                    val = part.get("text", "")
+                    if isinstance(val, str) and val:
+                        text_fragments.append(val)
+            elif hasattr(part, "type") and getattr(part, "type", None) == "text":
+                val = getattr(part, "text", "")
+                if isinstance(val, str) and val:
+                    text_fragments.append(val)
+        return "\n".join(text_fragments)
+    return str(content)
+
+
 def normalize_messages_for_target_model(
     messages: List[Dict[str, Any]],
     model_name: str,
@@ -335,6 +368,18 @@ def normalize_messages_for_target_model(
     Normalizes message sequences based on target model template restrictions.
     For models that reject 'system' roles in their Jinja templates (such as Google Gemma),
     system directives are seamlessly folded into the initial 'user' turn.
+
+    Multimodal safety
+    -----------------
+    When the first user message carries a multimodal ``content`` list
+    (text parts + image_url parts), the folded system directive is
+    prepended as an additional ``{"type": "text"}`` part rather than
+    being stringified. This preserves the multimodal payload exactly as
+    the provider expects it, and never replaces a parts list with its
+    string repr.
+
+    Plain-text ``content`` keeps the original string-concatenation
+    behaviour unchanged.
     """
     if not messages:
         return []
@@ -350,10 +395,13 @@ def normalize_messages_for_target_model(
 
     for msg in messages:
         role = str(msg.get("role", "user")).lower()
-        content = str(msg.get("content", ""))
+        raw_content = msg.get("content", "")
         if role == "system":
-            if content.strip():
-                system_parts.append(content.strip())
+            # System directives are semantically plain text; use the
+            # flattening helper in case the caller ever passes parts.
+            flat = _content_to_plain_text(raw_content).strip()
+            if flat:
+                system_parts.append(flat)
         else:
             dialogue.append(dict(msg))
 
@@ -363,8 +411,18 @@ def normalize_messages_for_target_model(
     combined_system_text = "\n\n".join(system_parts)
 
     if dialogue and str(dialogue[0].get("role", "")).lower() == "user":
-        first_user_content = str(dialogue[0].get("content", ""))
-        dialogue[0]["content"] = f"{combined_system_text}\n\n{first_user_content}"
+        first_user_content = dialogue[0].get("content", "")
+        if isinstance(first_user_content, list):
+            # Multimodal first user turn: prepend the system text as a
+            # leading text part so the parts list survives intact.
+            dialogue[0]["content"] = [
+                {"type": "text", "text": combined_system_text}
+            ] + list(first_user_content)
+        else:
+            flat_first = _content_to_plain_text(first_user_content)
+            dialogue[0]["content"] = (
+                f"{combined_system_text}\n\n{flat_first}"
+            )
     else:
         dialogue.insert(0, {"role": "user", "content": combined_system_text})
 

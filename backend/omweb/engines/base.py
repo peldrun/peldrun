@@ -40,6 +40,19 @@ class EngineRunContext:
     # backward compatible without any call-site changes.
     context_refs: Optional[List[Dict[str, Any]]] = None
 
+    # [FIX-MULTIMODAL] Structured multimodal attachment references for
+    # the current turn. Each entry is a dict produced by the composer /
+    # chat-landing pipeline with the canonical shape::
+    #
+    #   {"fileId": str, "mimeType": str | None, "fileName": str | None,
+    #    "width": int | None, "height": int | None}
+    #
+    # The referenced artifacts live in ``storage/artifacts/temp/`` and are
+    # resolved to base64 data URIs by the engine immediately before
+    # constructing the ``RunRequest``. Non-consumers ignore this field,
+    # keeping all existing engine implementations backwards compatible.
+    attachments: Optional[List[Dict[str, Any]]] = None
+
 
 @runtime_checkable
 class ExecutionEngine(Protocol):

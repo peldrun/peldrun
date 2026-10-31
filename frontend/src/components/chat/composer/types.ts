@@ -31,4 +31,17 @@ export interface LexicalEditorProps {
   autoFocus?: boolean;
   onClearEditor?: () => void;
   chatId?: string;
+  /**
+   * Invoked once per image file pasted into the editor.
+   *
+   * When omitted, the ImagePastePlugin is not mounted and image pastes
+   * fall through to the browser's default handling (inline base64 in
+   * the editor state — generally undesirable). Composer hosts should
+   * always supply this callback to route images through the temporary
+   * artifact upload pipeline.
+   *
+   * The plugin does not await the returned promise; the host owns the
+   * upload lifecycle and any per-file progress or error UI.
+   */
+  onImagePasted?: (file: File) => void | Promise<void>;
 }

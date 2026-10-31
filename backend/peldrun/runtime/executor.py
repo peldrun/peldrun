@@ -465,6 +465,138 @@ class CoreRuntimeExecutor:
             budget_usage.get("effective_limit", 0),
         )
 
+        # ─────────────────────────────────────────────────────────────
+        # [FIX-MULTIMODAL] Inject multimodal attachment references into
+        # the last user message before the agent sees the payload.
+        #
+        # The context manager builds messages from a plain-text prompt
+        # only. Multimodal attachments (uploaded via /api/files/upload-temp)
+        # are carried as lightweight ``fileId`` references and must be
+        # resolved to inline ``image_url`` parts HERE, at the last
+        # responsible boundary, so that every provider path (streaming,
+        # non-streaming, tool loops, retries) sees the same multimodal
+        # content without duplicating the resolution logic.
+        #
+        # Source precedence for the attachments list:
+        #   1. request.llm_config["attachments"]  — set by dispatcher
+        #      when the caller supplied attachments in llm_override.
+        #      This is the historical path; retained for compatibility.
+        #   2. request.metadata["attachments"]    — forwarded by
+        #      peldrun_engine from context.attachments after File 26.
+        #   3. Nothing.
+        #
+        # Filesystem resolution targets the canonical temp artifact
+        # store under <storage_root>/artifacts/temp/<fileId>.
+        # Rejections (bad id, missing file, unreadable bytes) are logged
+        # and skipped — never fatal.
+        # ─────────────────────────────────────────────────────────────
+        _attachments_raw = None
+        if isinstance(request.llm_config, dict):
+            _attachments_raw = request.llm_config.get("attachments")
+        if not _attachments_raw and isinstance(request.metadata, dict):
+            _attachments_raw = request.metadata.get("attachments")
+
+        if _attachments_raw and isinstance(assembled_messages, list) and assembled_messages:
+            try:
+                import base64 as _b64
+                from peldrun.storage_paths import get_storage_root as _get_root
+
+                _MIME_BY_EXT = {
+                    "png": "image/png",
+                    "jpg": "image/jpeg",
+                    "jpeg": "image/jpeg",
+                    "webp": "image/webp",
+                    "gif": "image/gif",
+                }
+                _temp_dir = _get_root() / "artifacts" / "temp"
+
+                _image_parts: List[Dict[str, Any]] = []
+                for _att in _attachments_raw:
+                    if not isinstance(_att, dict):
+                        continue
+                    _fid = _att.get("fileId") or _att.get("file_id")
+                    if not isinstance(_fid, str) or not _fid:
+                        continue
+                    # Reject traversal attempts. fileId is an opaque token
+                    # like ``img_<hex>.<ext>``; anything else is a caller
+                    # bug or attack.
+                    if "/" in _fid or "\\" in _fid or ".." in _fid:
+                        logger.warning(
+                            "Skipping attachment with unsafe fileId %r", _fid
+                        )
+                        continue
+                    _path = _temp_dir / _fid
+                    if not _path.is_file():
+                        logger.warning(
+                            "Attachment fileId %r resolved to a missing file",
+                            _fid,
+                        )
+                        continue
+                    try:
+                        _raw = _path.read_bytes()
+                    except Exception as _read_exc:
+                        logger.warning(
+                            "Failed to read attachment %r: %s", _fid, _read_exc
+                        )
+                        continue
+                    _ext = _path.suffix.lower().lstrip(".")
+                    _mime = _MIME_BY_EXT.get(_ext, "image/png")
+                    _encoded = _b64.b64encode(_raw).decode("ascii")
+                    _image_parts.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{_mime};base64,{_encoded}",
+                            "detail": "auto",
+                        },
+                    })
+
+                if _image_parts:
+                    # The last user message is the current turn's prompt
+                    # (assembled_messages ends with the current user turn).
+                    # Convert its content from a plain string into a
+                    # multimodal parts list.
+                    for _i in range(len(assembled_messages) - 1, -1, -1):
+                        _msg = assembled_messages[_i]
+                        if (
+                            isinstance(_msg, dict)
+                            and _msg.get("role") == "user"
+                            and isinstance(_msg.get("content"), str)
+                        ):
+                            _text = _msg["content"]
+                            _msg["content"] = (
+                                [{"type": "text", "text": _text}]
+                                + _image_parts
+                            )
+                            logger.info(
+                                "Injected %d multimodal image(s) into "
+                                "context for job %s (fileIds: %s)",
+                                len(_image_parts),
+                                job_id,
+                                ", ".join(
+                                    str(_att.get("fileId"))
+                                    for _att in _attachments_raw
+                                    if isinstance(_att, dict)
+                                ),
+                            )
+                            break
+                else:
+                    logger.info(
+                        "Multimodal attachments present for job %s but "
+                        "none resolved to readable files. Continuing with "
+                        "text-only context.",
+                        job_id,
+                    )
+            except Exception as _mm_exc:
+                # Multimodal injection is best-effort: if it fails for any
+                # reason, fall back to the text-only context so the run
+                # still proceeds. The user sees no image analysis but the
+                # agent works normally.
+                logger.warning(
+                    "Multimodal attachment injection failed for job %s: %s",
+                    job_id,
+                    _mm_exc,
+                )
+
         initial_state = ExecutionState(
             run_id=run_id_str,
             task_prompt=request.prompt,
@@ -491,7 +623,70 @@ class CoreRuntimeExecutor:
                 role_enum = MessageRole.ASSISTANT
             else:
                 role_enum = MessageRole.USER
-            initial_state.add_message(role=role_enum, content=str(msg.get("content", "")))
+
+            _raw_content = msg.get("content", "")
+
+            # [FIX-MULTIMODAL-STATE] Preserve the full multimodal payload
+            # in ``ExecutionState.messages`` too — NOT just in
+            # ``agent.messages``. The AgentRunner uses
+            # ``initial_state.messages`` as the source of truth for each
+            # LLM call: it rehydrates ``agent.messages`` from
+            # ``state.messages`` at the start of every step. If we
+            # flatten here, the model loses the ``image_url`` parts
+            # entirely and reports that it cannot see any image, while
+            # chat mode (which bypasses ExecutionState) works correctly.
+            #
+            # Trade-off:
+            #   * Checkpoints for image turns become larger (base64 image
+            #     data is serialized into the checkpoint JSON). This is
+            #     bounded — checkpoints are overwritten each step, and
+            #     turns with images are typically single-LLM-call runs.
+            #   * If ``add_message`` type-checks content as ``str`` and
+            #     rejects the multimodal list, we fall back to the
+            #     flattened summary so the run still proceeds. A warning
+            #     is logged so the failure is diagnosable.
+            if isinstance(_raw_content, list):
+                try:
+                    initial_state.add_message(
+                        role=role_enum, content=_raw_content
+                    )
+                    logger.info(
+                        "[FIX-MULTIMODAL-STATE] Preserved %d multimodal "
+                        "part(s) in ExecutionState for role=%s (job=%s)",
+                        len(_raw_content),
+                        role_enum.value,
+                        job_id,
+                    )
+                    continue
+                except (TypeError, ValueError, AttributeError) as state_add_err:
+                    logger.warning(
+                        "[FIX-MULTIMODAL-STATE] ExecutionState rejected "
+                        "multimodal content for job %s: %s — falling "
+                        "back to flattened summary (model will NOT "
+                        "receive image parts this turn).",
+                        job_id,
+                        state_add_err,
+                    )
+
+                # Fallback: flatten with a clear marker.
+                _text_fragments = [
+                    str(_p.get("text", ""))
+                    for _p in _raw_content
+                    if isinstance(_p, dict)
+                    and _p.get("type") == "text"
+                    and _p.get("text")
+                ]
+                _img_count = sum(
+                    1
+                    for _p in _raw_content
+                    if isinstance(_p, dict) and _p.get("type") == "image_url"
+                )
+                _flattened = " ".join(_text_fragments)
+                if _img_count > 0:
+                    _flattened += f" [{_img_count} image(s) attached]"
+                initial_state.add_message(role=role_enum, content=_flattened)
+            else:
+                initial_state.add_message(role=role_enum, content=str(_raw_content))
 
         agent.messages = [dict(m) for m in assembled_messages]
 

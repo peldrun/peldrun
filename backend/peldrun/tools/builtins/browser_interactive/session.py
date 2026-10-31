@@ -26,8 +26,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, Union
 
 from .security import make_route_handler
 
@@ -313,6 +315,132 @@ class BrowserSessionManager:
                 IDLE_TIMEOUT_SECONDS,
             )
             await self.close_context(run_id)
+
+    # ------------------------------------------------------------------
+    # Artifact capture
+    # ------------------------------------------------------------------
+
+    async def capture_screen_artifact(
+        self,
+        page: Any,
+        artifacts_dir: Union[str, Path],
+        prefix: str = "snap",
+        full_page: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Capture the current page as a PNG artifact and persist it under
+        ``artifacts_dir``.
+
+        Returns a metadata dict on success, or ``None`` on any failure.
+        The caller (typically ``BrowserInteractiveTool``) is responsible
+        for wiring this metadata into the run's artifact registry. The
+        session manager only owns the disk write.
+
+        The returned dict shape::
+
+            {
+                "file_id":    "snap_ab12cd34ef56.png",
+                "file_path":  "/absolute/path/to/snap_ab12cd34ef56.png",
+                "mime_type":  "image/png",
+                "size_bytes": 123456,
+                "width":      1280,   # None if Pillow is unavailable
+                "height":     720,    # None if Pillow is unavailable
+                "full_page":  False,
+            }
+
+        This method never raises. Failures are logged and surfaced as
+        ``None`` so that a broken screenshot step cannot crash the
+        browser tool's action loop.
+        """
+        # Guard against a missing or already-closed page. ``is_closed``
+        # may be a coroutine on some Playwright versions; handle both.
+        if page is None:
+            return None
+        try:
+            if hasattr(page, "is_closed"):
+                closed = page.is_closed()
+                if asyncio.iscoroutine(closed):
+                    closed = await closed
+                if closed:
+                    logger.debug(
+                        "capture_screen_artifact: page is closed; skipping."
+                    )
+                    return None
+        except Exception:
+            # Best-effort; proceed to the screenshot attempt and let it
+            # fail naturally if the page is truly unusable.
+            pass
+
+        # Ensure the target directory exists before writing.
+        try:
+            target_dir = Path(artifacts_dir).expanduser()
+            target_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            logger.warning(
+                "capture_screen_artifact: cannot prepare artifacts dir "
+                "%r: %s",
+                artifacts_dir,
+                exc,
+            )
+            return None
+
+        file_id = f"{prefix}_{uuid.uuid4().hex[:12]}.png"
+        target_path = target_dir / file_id
+
+        try:
+            await page.screenshot(
+                path=str(target_path), full_page=full_page
+            )
+        except Exception as exc:
+            logger.warning(
+                "capture_screen_artifact: page.screenshot failed: %s", exc
+            )
+            return None
+
+        if not target_path.is_file():
+            logger.warning(
+                "capture_screen_artifact: screenshot file missing at %s",
+                target_path,
+            )
+            return None
+
+        size_bytes = 0
+        try:
+            size_bytes = target_path.stat().st_size
+        except Exception:
+            pass
+
+        width, height = self._probe_image_dimensions(target_path)
+
+        return {
+            "file_id": file_id,
+            "file_path": str(target_path),
+            "mime_type": "image/png",
+            "size_bytes": size_bytes,
+            "width": width,
+            "height": height,
+            "full_page": full_page,
+        }
+
+    @staticmethod
+    def _probe_image_dimensions(
+        path: Path,
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """
+        Return ``(width, height)`` for the image at ``path``.
+
+        Best-effort only: returns ``(None, None)`` when Pillow is
+        unavailable or the file cannot be parsed. Callers must treat
+        the tuple as advisory metadata, never as a hard requirement.
+        """
+        try:
+            from PIL import Image  # noqa: PLC0415 — optional dependency
+
+            with Image.open(path) as img:
+                width, height = img.size
+                return int(width), int(height)
+        except Exception:
+            return None, None
 
     # ------------------------------------------------------------------
     # Introspection (for tests and diagnostics)

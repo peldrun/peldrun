@@ -41,10 +41,90 @@ def estimate_tokens_from_string(text: Optional[str], model: str = "gpt-4") -> in
     return max(1, len(text) // 4)
 
 
+# ---------------------------------------------------------------------------
+# Image token estimation
+# ---------------------------------------------------------------------------
+
+# Conservative token estimates per ``detail`` hint, calibrated against
+# OpenAI's published vision pricing. These numbers represent the fixed
+# baseline cost per image that providers bill even before variable
+# tiling kicks in for high-resolution inputs.
+#
+#   - "low":  providers downscale to 512x512 and bill a flat 85 tokens.
+#   - "auto": treated as "high" by most providers; a mid-point estimate
+#             is used here to keep the accounting conservative.
+#   - "high": 85 base tokens + tiling; a 1024x1024 image bills roughly
+#             765 tokens, which we use as a safe upper-bound average.
+IMAGE_TOKEN_ESTIMATES: Dict[str, int] = {
+    "low": 85,
+    "auto": 500,
+    "high": 765,
+}
+DEFAULT_IMAGE_TOKEN_ESTIMATE: int = 500
+
+
+def estimate_image_tokens(detail: Optional[str] = None) -> int:
+    """
+    Return a conservative token estimate for a single image part.
+
+    The ``detail`` hint follows the OpenAI vision API contract
+    (``"low"``, ``"auto"``, ``"high"``). Unknown values fall back to
+    the ``"auto"`` estimate so that unrecognised providers never cause
+    the count to collapse to zero.
+    """
+    key = (detail or "auto").lower()
+    return IMAGE_TOKEN_ESTIMATES.get(key, DEFAULT_IMAGE_TOKEN_ESTIMATE)
+
+
+def count_content_parts_tokens(
+    content: List[Any],
+    model: str = "gpt-4",
+) -> int:
+    """
+    Count tokens across a multimodal ``content`` list.
+
+    Each part is expected to be either a dict or a typed ``ContentPart``
+    instance (see ``peldrun.llm.schema``). Unknown part kinds contribute
+    zero tokens by design, so that future content types never break
+    accounting.
+    """
+    total = 0
+    for part in content:
+        if isinstance(part, dict):
+            ptype = part.get("type")
+            if ptype == "text":
+                text_val = part.get("text")
+                if isinstance(text_val, str) and text_val:
+                    total += estimate_tokens_from_string(text_val, model=model)
+            elif ptype == "image_url":
+                detail_val: Optional[str] = None
+                img_payload = part.get("image_url")
+                if isinstance(img_payload, dict):
+                    detail_val = img_payload.get("detail")
+                total += estimate_image_tokens(detail_val)
+        else:
+            # Accept typed ContentPart instances transparently.
+            part_type = getattr(part, "type", None)
+            if part_type == "text":
+                text_val = getattr(part, "text", None)
+                if isinstance(text_val, str) and text_val:
+                    total += estimate_tokens_from_string(text_val, model=model)
+            elif part_type == "image_url":
+                img_payload = getattr(part, "image_url", None)
+                detail_val = (
+                    getattr(img_payload, "detail", None) if img_payload else None
+                )
+                if hasattr(detail_val, "value"):
+                    detail_val = detail_val.value
+                total += estimate_image_tokens(detail_val)
+    return total
+
+
 def count_message_tokens(messages: List[Dict[str, Any]], model: str = "gpt-4") -> int:
     """
     Calculate token usage across a list of structured chat messages,
-    accounting for role identifiers, name wrappers, and tool call serialization.
+    accounting for role identifiers, name wrappers, tool call
+    serialization, and multimodal content parts.
     """
     total_tokens = 3  # Baseline overhead per conversation reply prefix
 
@@ -53,6 +133,10 @@ def count_message_tokens(messages: List[Dict[str, Any]], model: str = "gpt-4") -
         for key, value in msg.items():
             if isinstance(value, str):
                 total_tokens += estimate_tokens_from_string(value, model=model)
+            elif isinstance(value, list) and key == "content":
+                # Multimodal content: dispatch to the parts-aware counter
+                # so that images contribute their estimated baseline.
+                total_tokens += count_content_parts_tokens(value, model=model)
             elif isinstance(value, list) and key == "tool_calls":
                 for tc in value:
                     total_tokens += 10  # Function call structure baseline

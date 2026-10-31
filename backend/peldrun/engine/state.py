@@ -117,11 +117,43 @@ class MessageRole(str, Enum):
 
 
 class ChatMessage(BaseModel):
-    """Represents an atomic message within the agent reasoning context."""
+    """Represents an atomic message within the agent reasoning context.
+
+    Multimodal support
+    ------------------
+    ``content`` accepts either:
+
+      * a plain text string (the historical behavior — unchanged);
+      * a list of OpenAI-style multimodal parts, e.g.::
+
+            [
+                {"type": "text", "text": "What's in this image?"},
+                {"type": "image_url",
+                 "image_url": {"url": "data:image/png;base64,...",
+                               "detail": "auto"}},
+            ]
+
+    The list is preserved verbatim by ``to_llm_dict`` so that the LLM
+    provider receives the exact multimodal payload assembled by
+    ``CoreRuntimeExecutor`` — the agent loop no longer needs to
+    serialise or flatten image parts when persisting state.
+
+    ``ExecutionState.add_message`` transparently accepts both shapes;
+    any caller that previously passed a string continues to work
+    without modification.
+    """
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 
     role: MessageRole = Field(..., description="Role of the message sender")
-    content: Optional[str] = Field(default=None, description="Textual content or thought trace")
+    content: Optional[Union[str, List[Dict[str, Any]]]] = Field(
+        default=None,
+        description=(
+            "Textual content (``str``) for text-only turns, or a list of "
+            "OpenAI-style multimodal content parts (``list`` of dicts) "
+            "for turns that carry images. Both shapes are forwarded "
+            "verbatim to the provider."
+        ),
+    )
     name: Optional[str] = Field(default=None, description="Optional name identifier for tool or participant")
     tool_calls: Optional[List[Dict[str, Any]]] = Field(
         default=None,
@@ -137,9 +169,15 @@ class ChatMessage(BaseModel):
     )
 
     def to_llm_dict(self) -> Dict[str, Any]:
-        """Export clean payload suitable for LLM provider APIs."""
+        """Export clean payload suitable for LLM provider APIs.
+
+        Multimodal content lists are forwarded unchanged — no
+        serialisation, no flattening. Text content is forwarded as-is.
+        Missing/empty content is omitted, matching the OpenAI contract.
+        """
         payload: Dict[str, Any] = {"role": self.role.value}
         if self.content is not None:
+            # Both ``str`` and ``List[Dict]`` pass through verbatim.
             payload["content"] = self.content
         if self.name:
             payload["name"] = self.name

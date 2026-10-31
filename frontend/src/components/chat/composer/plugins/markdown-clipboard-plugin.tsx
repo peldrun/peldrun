@@ -183,6 +183,21 @@ export function MarkdownClipboardPlugin() {
           return false;
         }
 
+        // Defer to ImagePastePlugin when the clipboard carries image
+        // files. This guard is essential for mixed pastes (styled text +
+        // image, e.g. a copy from a webpage or Word document): without
+        // it, this handler would consume the entire paste as markdown
+        // text and the image would be silently lost before the dedicated
+        // image handler gets a chance to run.
+        const clipboardItems = event.clipboardData.items;
+        if (clipboardItems) {
+          for (const item of Array.from(clipboardItems)) {
+            if (item.kind === 'file' && item.type.startsWith('image/')) {
+              return false;
+            }
+          }
+        }
+
         const text = event.clipboardData.getData('text/plain');
         if (!text) return false;
 

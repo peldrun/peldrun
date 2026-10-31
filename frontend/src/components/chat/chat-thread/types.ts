@@ -10,6 +10,26 @@ export interface AttachedUserFile {
   path?: string;
   url?: string;
   type?: string;
+  /**
+   * Multimodal image reference.
+   *
+   * Populated for images that were uploaded to the temporary artifact
+   * store (``POST /api/files/upload-temp``). When present, the card
+   * renders a preview from ``/api/files/temp/{fileId}`` instead of the
+   * legacy ``/api/files/raw/{name}`` fallback, so the thumbnail works
+   * even after a page reload (unlike ``URL.createObjectURL`` handles,
+   * which die with the tab).
+   *
+   * Always ``undefined`` for non-image attachments and for files that
+   * arrived via the legacy ``POST /api/files/upload`` pipeline.
+   */
+  fileId?: string;
+  /** MIME type of the file, when known (e.g. ``"image/png"``). */
+  mimeType?: string;
+  /** Image width in pixels, when known. Advisory only. */
+  width?: number;
+  /** Image height in pixels, when known. Advisory only. */
+  height?: number;
 }
 
 export type ChatStatus = "idle" | "running" | "paused" | "completed" | "failed";

@@ -133,4 +133,14 @@ async def get_job_detail(job_id: str):
         "mode": chat.get("mode", "agent"),
         "produced_files": resolved_files,
         "generative_ui": chat.get("generative_ui"),
+        # Multimodal attachment references for the CURRENT turn (not yet
+        # archived into turns[]). Consumed by use-job-details.ts to
+        # repopulate submittedFiles after a page reload, so image
+        # thumbnails survive a browser refresh even before the turn is
+        # flushed into history by the next run.
+        #
+        # Each entry carries {fileId, mimeType, fileName, width, height}.
+        # An empty list is returned when the turn has no images; the
+        # frontend treats it identically to a missing key.
+        "attachments": chat.get("attachments", []),
     }

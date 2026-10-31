@@ -272,6 +272,27 @@ async def stream_job_events(job_id: str, after_sequence: int = Query(0, ge=0)):
                 JOB_DELTA_ARTIFACTS[job_id] = calculated_delta
                 job_scoped_artifacts[job_id] = calculated_delta
 
+                # [FIX-ATTACHMENTS-PERSIST] Capture the previous turn's
+                # multimodal attachments BEFORE save_chat_session overwrites
+                # the file. save_chat_session performs a full-file overwrite
+                # without an attachments parameter, so without this capture
+                # the multimodal references are silently lost on every
+                # terminal event.
+                _prev_attachments_for_persist = None
+                try:
+                    _prev_session_path = (
+                        project_manager.get_chat_dir(chat_id, p_id) / "session.json"
+                    )
+                    if _prev_session_path.exists():
+                        _prev_data = json.loads(
+                            _prev_session_path.read_text(encoding="utf-8")
+                        )
+                        _prev_attachments_for_persist = _prev_data.get(
+                            "attachments"
+                        )
+                except Exception:
+                    _prev_attachments_for_persist = None
+
                 project_manager.save_chat_session(
                     chat_id=chat_id,
                     project_id=p_id,
@@ -287,8 +308,9 @@ async def stream_job_events(job_id: str, after_sequence: int = Query(0, ge=0)):
                     turns=chat.get("turns", []),
                 )
 
-                # Patch the session with the latest usage data and the
-                # per-turn token usage attached to the last turn.
+                # Patch the session with the latest usage data, restore
+                # the multimodal attachments captured above, and attach
+                # per-turn usage to the last turn.
                 try:
                     s_file = project_manager.get_chat_dir(chat_id, p_id) / "session.json"
                     if s_file.exists():
@@ -301,6 +323,9 @@ async def stream_job_events(job_id: str, after_sequence: int = Query(0, ge=0)):
                             if turns_list:
                                 turns_list[-1]["usage"] = turn_usage
                             s_data["turns"] = turns_list
+                        # [FIX-ATTACHMENTS-PERSIST] Restore.
+                        if _prev_attachments_for_persist is not None:
+                            s_data["attachments"] = _prev_attachments_for_persist
                         s_file.write_text(
                             json.dumps(s_data, indent=2, ensure_ascii=False),
                             encoding="utf-8",

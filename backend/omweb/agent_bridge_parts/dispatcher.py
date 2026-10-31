@@ -497,12 +497,25 @@ async def run_instrumented(
     # into active_llm, so they never leak into the LLM client configuration.
     # We shallow-copy llm_override to avoid mutating the caller's dict.
     context_refs: Optional[List[Dict[str, Any]]] = None
+    # [FIX-MULTIMODAL] Pop multimodal attachment references for the same
+    # reason: they must NOT leak into active_llm, because active_llm is
+    # forwarded verbatim to the LLM provider config and any unrecognised
+    # field would either be ignored (best case) or trigger a provider-
+    # specific error (worst case). They are re-attached to the engine
+    # context as a dedicated field below.
+    attachments: Optional[List[Dict[str, Any]]] = None
     if isinstance(llm_override, dict):
         llm_override = dict(llm_override)
         context_refs = llm_override.pop("context_refs", None)
+        attachments = llm_override.pop("attachments", None)
         if context_refs:
             print(
                 f"[BRIDGE] Resolved {len(context_refs)} context reference(s) "
+                f"for job {job_id}"
+            )
+        if attachments:
+            print(
+                f"[BRIDGE] Resolved {len(attachments)} multimodal attachment(s) "
                 f"for job {job_id}"
             )
 
@@ -707,6 +720,7 @@ async def run_instrumented(
         chat_id=chat_id,
         manifest=manifest,
         context_refs=merged_refs,
+        attachments=attachments,
     )
 
     try:
@@ -758,9 +772,23 @@ async def run_direct_chat(
     # Direct chat currently ignores file references (it doesn't build tool
     # messages), but we pop them here for symmetry and to keep the LLM client
     # configuration clean across all dispatch paths.
+    #
+    # [FIX-MULTIMODAL-CHAT] Also pop multimodal attachments from llm_override
+    # into a local variable. They are injected as ``image_url`` content parts
+    # into the last user message later, right before the LLM call. Keeping
+    # them out of active_llm prevents accidental leaks into provider
+    # configuration payloads.
+    _chat_attachments: Optional[List[Dict[str, Any]]] = None
     if isinstance(llm_override, dict):
         llm_override = dict(llm_override)
         llm_override.pop("context_refs", None)
+        _chat_attachments = llm_override.pop("attachments", None)
+        if _chat_attachments:
+            print(
+                f"[BRIDGE DIRECT CHAT] Resolved "
+                f"{len(_chat_attachments)} multimodal attachment(s) for "
+                f"job {job_id}"
+            )
 
     toml_cfg = read_active_toml_config()
     active_llm = dict(toml_cfg.get("llm", {}))
@@ -965,6 +993,118 @@ async def run_direct_chat(
             f"[CONTEXT BUDGET] Enforced limits for {model_name} | "
             f"Active: {budget_usage.get('total_tokens', 0)} / {budget_usage.get('effective_limit', 0)} tokens"
         )
+
+        # ─────────────────────────────────────────────────────────────
+        # [FIX-MULTIMODAL-CHAT] Inject multimodal attachments into the
+        # last user message as ``image_url`` content parts. Without this
+        # block, chat mode ignores attachments entirely — the model
+        # receives only the text prompt and reports that it cannot see
+        # any image.
+        #
+        # Resolution order:
+        #   1. <storage>/artifacts/temp/<fileId>            — canonical
+        #   2. <chat_files>/.peldrun/user_uploads/<fileId>  — workspace
+        #      fallback (populated by start_run.py for persistence)
+        # ─────────────────────────────────────────────────────────────
+        if _chat_attachments and isinstance(messages, list) and messages:
+            try:
+                import base64 as _b64
+                from peldrun.storage_paths import get_storage_root as _get_root
+
+                _MIME_BY_EXT = {
+                    "png": "image/png",
+                    "jpg": "image/jpeg",
+                    "jpeg": "image/jpeg",
+                    "webp": "image/webp",
+                    "gif": "image/gif",
+                }
+                _temp_dir = _get_root() / "artifacts" / "temp"
+                _workspace_uploads_dir = None
+                try:
+                    _ws_files_dir = project_manager.get_chat_files_dir(
+                        chat_id, project_id
+                    )
+                    _workspace_uploads_dir = (
+                        _ws_files_dir / ".peldrun" / "user_uploads"
+                    )
+                except Exception:
+                    _workspace_uploads_dir = None
+
+                _image_parts: List[Dict[str, Any]] = []
+                for _att in _chat_attachments:
+                    if not isinstance(_att, dict):
+                        continue
+                    _fid = _att.get("fileId") or _att.get("file_id")
+                    if not isinstance(_fid, str) or not _fid:
+                        continue
+                    if "/" in _fid or "\\" in _fid or ".." in _fid:
+                        continue
+
+                    _path = None
+                    _temp_path = _temp_dir / _fid
+                    if _temp_path.is_file():
+                        _path = _temp_path
+                    elif _workspace_uploads_dir is not None:
+                        _ws_path = _workspace_uploads_dir / _fid
+                        if _ws_path.is_file():
+                            _path = _ws_path
+
+                    if _path is None:
+                        logger.warning(
+                            "[CHAT MULTIMODAL] fileId %r not found in "
+                            "temp or workspace", _fid,
+                        )
+                        continue
+                    try:
+                        _raw = _path.read_bytes()
+                    except Exception as _read_exc:
+                        logger.warning(
+                            "[CHAT MULTIMODAL] Failed to read %r: %s",
+                            _fid, _read_exc,
+                        )
+                        continue
+                    _ext = _path.suffix.lower().lstrip(".")
+                    _mime = _MIME_BY_EXT.get(_ext, "image/png")
+                    _encoded = _b64.b64encode(_raw).decode("ascii")
+                    _image_parts.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{_mime};base64,{_encoded}",
+                            "detail": "auto",
+                        },
+                    })
+
+                if _image_parts:
+                    for _i in range(len(messages) - 1, -1, -1):
+                        _msg = messages[_i]
+                        if (
+                            isinstance(_msg, dict)
+                            and _msg.get("role") == "user"
+                            and isinstance(_msg.get("content"), str)
+                        ):
+                            _text = _msg["content"]
+                            _msg["content"] = (
+                                [{"type": "text", "text": _text}]
+                                + _image_parts
+                            )
+                            print(
+                                f"[BRIDGE DIRECT CHAT] Injected "
+                                f"{len(_image_parts)} multimodal image(s) "
+                                f"for job {job_id}"
+                            )
+                            break
+                else:
+                    print(
+                        f"[BRIDGE DIRECT CHAT] Multimodal attachments "
+                        f"present for job {job_id} but none resolved to "
+                        f"readable files."
+                    )
+            except Exception as _mm_exc:
+                logger.warning(
+                    "[BRIDGE DIRECT CHAT] Multimodal injection failed "
+                    "for job %s: %s",
+                    job_id, _mm_exc,
+                )
 
         max_tokens = _resolve_model_max_output_tokens(model_name, active_llm)
         active_llm["max_tokens"] = max_tokens

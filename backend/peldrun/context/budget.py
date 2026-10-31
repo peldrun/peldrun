@@ -24,12 +24,75 @@ def count_tokens_heuristic(text: str) -> int:
     return max(1, len(clean) // 4)
 
 
+def _count_content_parts_tokens(content: List[Any]) -> int:
+    """
+    Count tokens across a multimodal ``content`` list.
+
+    Tries to delegate to the canonical parts-aware counter in
+    ``peldrun.llm.tokenizer`` so that both subsystems produce identical
+    numbers for the same message. Falls back to an inline heuristic when
+    the tokenizer module is unavailable (e.g. text-only deployments
+    where the ``openai`` package is not installed and
+    ``peldrun.llm.__init__`` cannot be imported).
+
+    Fallback constants mirror the tokenizer module so drift is
+    bounded: 500 tokens per image (the ``auto`` estimate) plus the
+    local text heuristic for text parts.
+    """
+    try:
+        from peldrun.llm.tokenizer import count_content_parts_tokens
+
+        return count_content_parts_tokens(content)
+    except Exception:
+        # Inline fallback — never let a tokenizer import failure break
+        # budgeting. Numbers stay within the same order of magnitude as
+        # the tokenizer module's output.
+        total = 0
+        for part in content:
+            if isinstance(part, dict):
+                ptype = part.get("type")
+                if ptype == "text":
+                    total += count_tokens_heuristic(
+                        part.get("text") or ""
+                    )
+                elif ptype == "image_url":
+                    total += 500
+            else:
+                ptype = getattr(part, "type", None)
+                if ptype == "text":
+                    total += count_tokens_heuristic(
+                        getattr(part, "text", "") or ""
+                    )
+                elif ptype == "image_url":
+                    total += 500
+        return total
+
+
 def count_message_tokens(message: Dict[str, Any]) -> int:
-    """Calculate token weight of a single chat message payload."""
-    content = message.get("content") or ""
+    """
+    Calculate the token weight of a single chat message payload.
+
+    Plain text messages use the fast character heuristic unchanged.
+    Multimodal messages (``content`` is a list of parts) are dispatched
+    to ``_count_content_parts_tokens`` so that image parts contribute
+    their estimated baseline instead of being stringified into their
+    Python repr — which would otherwise inflate the count by orders of
+    magnitude and cause aggressive over-eviction in the sliding window.
+
+    ``tool_calls`` are not counted by this function; when a message
+    carries them, its ``content`` is typically empty, so the returned
+    baseline is the correct minimum.
+    """
+    content = message.get("content")
     role = message.get("role") or ""
+
+    if isinstance(content, list):
+        content_tokens = _count_content_parts_tokens(content)
+    else:
+        content_tokens = count_tokens_heuristic(str(content or ""))
+
     # Standard overhead: 4 tokens for metadata framing + content tokens
-    return 4 + count_tokens_heuristic(str(content)) + count_tokens_heuristic(str(role))
+    return 4 + content_tokens + count_tokens_heuristic(str(role))
 
 
 def count_messages_total(messages: List[Dict[str, Any]]) -> int:

@@ -49,6 +49,60 @@ logger = logging.getLogger("omweb.routers.run_routes.start_run")
 router = APIRouter()
 
 
+def _project_attachments_for_turn(attachments: Any) -> list:
+    """
+    Project ``session.json``'s top-level ``attachments`` list into the
+    ``AttachedUserFile`` shape consumed by the frontend's ``ChatTurn``
+    renderer.
+
+    The top-level ``attachments`` field stores the *latest* turn's image
+    references (see ``AttachmentRef`` in ``schemas.py``). When a turn is
+    archived into ``turns[]``, this helper converts those references
+    into the historical shape so that ``AttachedFileCard`` can render
+    thumbnails from ``/api/files/temp/{fileId}`` after a page reload.
+
+    Entries without a valid string ``fileId`` are dropped: they cannot
+    be resolved to a physical artifact, so including them would surface
+    broken thumbnails. The ``name`` field falls back to the ``fileId``
+    when the original filename was not recorded.
+
+    Non-dict entries and non-list inputs are silently ignored so that a
+    schema drift in one historical turn never crashes turn archival.
+
+    Every returned item carries ``name`` and ``fileId``. Optional fields
+    (``mimeType``, ``width``, ``height``) are included only when they
+    hold a well-typed value, keeping the persisted JSON compact.
+    """
+    if not isinstance(attachments, list):
+        return []
+
+    result: list = []
+    for a in attachments:
+        if not isinstance(a, dict):
+            continue
+        file_id = a.get("fileId")
+        if not isinstance(file_id, str) or not file_id:
+            continue
+        name = a.get("fileName")
+        if not isinstance(name, str) or not name:
+            name = file_id
+        projected: dict = {
+            "name": name,
+            "fileId": file_id,
+        }
+        mime_type = a.get("mimeType")
+        if isinstance(mime_type, str) and mime_type:
+            projected["mimeType"] = mime_type
+        width = a.get("width")
+        if isinstance(width, int):
+            projected["width"] = width
+        height = a.get("height")
+        if isinstance(height, int):
+            projected["height"] = height
+        result.append(projected)
+    return result
+
+
 @router.post("")
 @router.post("/")
 async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
@@ -128,6 +182,22 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
             ref.model_dump(by_alias=True, exclude_none=True)
             for ref in req.context_refs
         ]
+    # Forward multimodal attachments (images uploaded via /api/files/upload-temp).
+    #
+    # These are lightweight references (``file_id`` + optional metadata),
+    # NOT inline image bytes. The actual image content is resolved on
+    # demand by the context builder using
+    # ``omweb.routers.files.resolve_temp_artifact_to_data_uri``. This keeps
+    # the run request under a few KB regardless of image size.
+    #
+    # ``attachments`` travels independently of ``context_refs``: a single
+    # turn can carry both (text from an @-mentioned file AND one or more
+    # images), and the two flows never overlap in the builder.
+    if req.attachments:
+        llm_override["attachments"] = [
+            att.model_dump(by_alias=True, exclude_none=True)
+            for att in req.attachments
+        ]
 
     # Resolve session turns and context
     if existing_chat:
@@ -136,6 +206,14 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
         title = existing_chat.get("title") or prompt[:40]
         turns = list(existing_chat.get("turns", []))
         prev_jid = existing_chat.get("job_id", "")
+
+        # Project the current turn's multimodal attachments into the
+        # historical ``attachedFiles`` shape so they survive archival
+        # into ``turns[]``. Applied identically in both branches below
+        # (regenerate fallback + standard sequential run).
+        prev_attached_files = _project_attachments_for_turn(
+            existing_chat.get("attachments")
+        )
 
         if req.regenerate_turn_id:
             # Handle regeneration branching
@@ -172,6 +250,7 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
                                 "status": existing_chat.get("status", "completed"),
                                 "created_at": existing_chat.get("updated_at") or existing_chat.get("created_at"),
                                 "produced_files": job_scoped_artifacts.get(prev_jid, []),
+                                "attachedFiles": prev_attached_files,
                                 "model": existing_chat.get("model"),
                                 "usage": existing_chat.get("usage"),
                             })
@@ -190,6 +269,7 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
                         "status": existing_chat.get("status", "completed"),
                         "created_at": existing_chat.get("updated_at") or existing_chat.get("created_at"),
                         "produced_files": job_scoped_artifacts.get(prev_jid, []),
+                        "attachedFiles": prev_attached_files,
                         "model": existing_chat.get("model"),
                         "usage": existing_chat.get("usage"),
                     })
@@ -280,6 +360,71 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
                 s_data["agent_id"] = effective_agent
                 if "reasoning_effort" in llm_override:
                     s_data["reasoning_effort"] = llm_override["reasoning_effort"]
+                # Persist multimodal attachments so the engine can re-resolve
+                # them when a run is regenerated or resumed from a checkpoint.
+                # The stored shape matches ``AttachmentRef.model_dump`` (camel-
+                # cased keys, ``None`` fields omitted) so it survives a JSON
+                # round-trip without loss.
+                if "attachments" in llm_override:
+                    s_data["attachments"] = llm_override["attachments"]
+                    # [FIX-WORKSPACE-PERSIST] Copy each temp file to
+                    # permanent workspace storage under
+                    # ``.peldrun/user_uploads/``. This ensures the image
+                    # survives even if the temp artifact store is cleaned
+                    # up later. The copy is best-effort: a failure here
+                    # must NOT break the run (the temp file still exists
+                    # for immediate use).
+                    try:
+                        import shutil as _shutil
+                        from peldrun.storage_paths import (
+                            get_storage_root as _get_storage_root,
+                        )
+
+                        _temp_root = (
+                            _get_storage_root() / "artifacts" / "temp"
+                        )
+                        _user_uploads_dir = (
+                            files_dir / ".peldrun" / "user_uploads"
+                        )
+                        _user_uploads_dir.mkdir(
+                            parents=True, exist_ok=True
+                        )
+                        for _att in llm_override["attachments"]:
+                            _fid = _att.get("fileId")
+                            if not isinstance(_fid, str) or not _fid:
+                                continue
+                            if (
+                                "/" in _fid
+                                or "\\" in _fid
+                                or ".." in _fid
+                            ):
+                                continue
+                            _src = _temp_root / _fid
+                            if not _src.is_file():
+                                continue
+                            _dst = _user_uploads_dir / _fid
+                            if _dst.exists():
+                                continue
+                            try:
+                                _shutil.copy2(_src, _dst)
+                                logger.info(
+                                    "[WORKSPACE-PERSIST] Copied "
+                                    "attachment %s to workspace",
+                                    _fid,
+                                )
+                            except Exception as _copy_err:
+                                logger.debug(
+                                    "[WORKSPACE-PERSIST] Copy failed "
+                                    "for %s: %s",
+                                    _fid,
+                                    _copy_err,
+                                )
+                    except Exception as _persist_err:
+                        logger.debug(
+                            "[WORKSPACE-PERSIST] Attachment persist "
+                            "pipeline failed: %s",
+                            _persist_err,
+                        )
             session_file.write_text(
                 json.dumps(s_data, indent=2, ensure_ascii=False),
                 encoding="utf-8",
@@ -345,4 +490,10 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
         "agent_id": effective_agent,
         "reasoning_effort": llm_override.get("reasoning_effort"),
         "generative_ui_enabled": bool(req.generative_ui and req.generative_ui.get("enabled")),
+        # Diagnostic: confirms the backend received and forwarded the
+        # multimodal attachment references. The frontend uses this to
+        # distinguish "attachment rejected upstream" from "attachment
+        # accepted but resolved to zero images by the engine" when
+        # debugging. Never part of any downstream contract.
+        "attachments_count": len(llm_override.get("attachments") or []),
     }
