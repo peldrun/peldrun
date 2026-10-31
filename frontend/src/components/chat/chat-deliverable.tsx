@@ -1,12 +1,14 @@
 ﻿"use client";
 
 import React from "react";
-import { FileText, ExternalLink, Activity, Check, Copy, Bot, AlertCircle, RotateCcw } from "lucide-react";
+import { FileText, ExternalLink, Activity, Check, Copy, Bot, AlertCircle, RotateCcw, PlayCircle } from "lucide-react";
+import { resolveFileCategory } from "./chat-thread/utils";
 import { UsageBadgeGroup } from "@/components/chat/UsageBadges";
 import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
 
 interface ChatDeliverableProps {
   finalResult: string;
+  chatId?: string;
   status?: "completed" | "failed" | "stopped" | "paused";
   turnIndex?: number;
   isTurnRawTrace?: boolean;
@@ -29,6 +31,7 @@ interface ChatDeliverableProps {
 
 export function ChatDeliverable({
   finalResult,
+  chatId,
   status = "completed",
   turnIndex,
   isTurnRawTrace = false,
@@ -154,6 +157,81 @@ export function ChatDeliverable({
             {visibleProducedFiles.map((f, idx) => {
               const isModified = f.action === "modified" || f.status === "modified";
               const targetPath = f.path || f.name;
+
+              // Determine preview capability
+              const info = resolveFileCategory(targetPath);
+              const fileUrl = chatId
+                ? `/api/chats/${chatId}/raw/${targetPath
+                    .split("/")
+                    .map(encodeURIComponent)
+                    .join("/")}`
+                : null;
+
+              // 1. Image Preview
+              if (info.isImage && fileUrl) {
+                return (
+                  <button
+                    key={`${targetPath}-${idx}`}
+                    type="button"
+                    onClick={() => onSelectFile(targetPath)}
+                    className="relative w-24 h-24 sm:w-28 sm:h-28 rounded-md overflow-hidden bg-muted/40 border border-border shadow-sm hover:border-primary/50 hover:shadow-md transition-all group cursor-pointer flex-shrink-0"
+                    title={`Preview ${targetPath} in Workspace`}
+                  >
+                    <img
+                      src={fileUrl}
+                      alt={targetPath}
+                      className="w-full h-full object-cover"
+                      loading="lazy"
+                    />
+                    <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-end p-1.5">
+                      <span className="text-[10px] text-white truncate max-w-full font-mono">
+                        {targetPath.split("/").pop()}
+                      </span>
+                    </div>
+                    {isModified && (
+                      <span className="absolute top-1 right-1 text-[9px] px-1 py-0.5 rounded bg-amber-500 text-white font-mono font-semibold shadow-sm">
+                        Mod
+                      </span>
+                    )}
+                    {!isModified && (
+                      <span className="absolute top-1 right-1 text-[9px] px-1 py-0.5 rounded bg-emerald-500 text-white font-mono font-semibold shadow-sm">
+                        New
+                      </span>
+                    )}
+                  </button>
+                );
+              }
+
+              // 2. Video/Audio Preview
+              if (info.isAudioVideo && fileUrl) {
+                return (
+                  <button
+                    key={`${targetPath}-${idx}`}
+                    type="button"
+                    onClick={() => onSelectFile(targetPath)}
+                    className="relative w-24 h-24 sm:w-28 sm:h-28 rounded-md overflow-hidden bg-black flex items-center justify-center border border-border shadow-sm hover:border-primary/50 hover:shadow-md transition-all group cursor-pointer flex-shrink-0"
+                    title={`Preview ${targetPath} in Workspace`}
+                  >
+                    <video
+                      src={fileUrl}
+                      className="w-full h-full object-cover opacity-80"
+                      muted
+                      playsInline
+                      preload="metadata"
+                    />
+                    <div className="absolute inset-0 flex items-center justify-center bg-black/20 group-hover:bg-black/40 transition-colors">
+                      <PlayCircle className="text-white w-8 h-8 opacity-80 drop-shadow-md" />
+                    </div>
+                    <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent p-1.5 pointer-events-none">
+                      <span className="text-[10px] text-white truncate max-w-full font-mono">
+                        {targetPath.split("/").pop()}
+                      </span>
+                    </div>
+                  </button>
+                );
+              }
+
+              // 3. Fallback: Generic File Icon (PDFs, code, data, etc.)
               return (
                 <button
                   key={`${targetPath}-${idx}`}

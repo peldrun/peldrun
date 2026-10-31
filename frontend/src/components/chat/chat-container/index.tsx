@@ -1293,6 +1293,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         ) : (
           <ChatThread
             historyTurns={historyTurns}
+            chatId={activeChatId || undefined}
             submittedPrompt={submittedPrompt}
             submittedFiles={submittedFiles}
             sessionTimestamp={sessionTimestamp}

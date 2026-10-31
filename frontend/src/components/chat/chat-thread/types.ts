@@ -60,6 +60,7 @@ export interface ChatTurn {
 
 export interface ChatThreadProps {
   historyTurns: ChatTurn[];
+  chatId?: string;
   submittedPrompt: string;
   submittedFiles?: AttachedUserFile[];
   sessionTimestamp: string;

@@ -56,6 +56,7 @@ function groupStepEvents(evts: StepEvent[]): Record<number, StepEvent[]> {
 
 export function ChatThread({
   historyTurns,
+  chatId,
   submittedPrompt,
   submittedFiles = [],
   sessionTimestamp,
@@ -175,6 +176,7 @@ export function ChatThread({
             <HistoricalTurn
               turn={turn}
               tIdx={tIdx}
+              chatId={chatId}
               copiedSection={copiedSection}
               copyText={copyText}
               expandedSteps={expandedSteps}
@@ -274,6 +276,7 @@ export function ChatThread({
         {/* Deliverable for Completed / Current Turn */}
         {finalResult && (
           <ChatDeliverable
+            chatId={chatId}
             finalResult={finalResult}
             status={status === "failed" ? "failed" : "completed"}
             isTurnRawTrace={isCurrentRawTrace}

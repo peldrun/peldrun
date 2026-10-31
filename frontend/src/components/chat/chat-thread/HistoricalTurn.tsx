@@ -25,6 +25,7 @@ import type { ChatTurn } from "./types";
 export interface HistoricalTurnProps {
   turn: ChatTurn;
   tIdx: number;
+  chatId?: string;
   copiedSection: string | null;
   copyText: (text: string, id: string) => void;
   expandedSteps: Record<string, boolean>;
@@ -55,6 +56,7 @@ function groupStepEvents(evts: StepEvent[]): Record<number, StepEvent[]> {
 export function HistoricalTurn({
   turn,
   tIdx,
+  chatId,
   copiedSection,
   copyText,
   expandedSteps,
@@ -116,6 +118,7 @@ export function HistoricalTurn({
 
       {turn.finalResult && (
         <ChatDeliverable
+          chatId={chatId}
           finalResult={turn.finalResult}
           status={turn.status}
           turnIndex={tIdx}
