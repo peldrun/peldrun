@@ -27,7 +27,6 @@ from omweb.engines.base import EngineRunContext
 from omweb.engines.registry import EngineNotFoundError
 from omweb.job_manager import job_manager
 from omweb.project_manager import project_manager
-from omweb.routers.image_proxy_rtr import build_proxy_url as _build_proxy_url
 from omweb.sse_events import SSEEvent, SSEEventType, dispatch_event
 
 from peldrun.llm.client import AsyncLLMClient
@@ -416,6 +415,14 @@ async def _emit_image_results_event_if_present(
     gallery survives a page refresh (the frontend cannot reconstruct
     proxy URLs on its own, and chat mode does not render the timeline).
     """
+    # Lazy import to break a pre-existing module-load cycle:
+    #   dispatcher → omweb.routers.__init__ → run → run_routes/files
+    #     → omweb.agent_bridge → agent_bridge_parts → dispatcher
+    # Moving this import inside the function keeps dispatcher.py
+    # importable in isolation (unit tests) while preserving identical
+    # runtime behavior.
+    from omweb.routers.image_proxy_rtr import build_proxy_url as _build_proxy_url
+
     images_data = meta.get("images")
     if not isinstance(images_data, list) or not images_data:
         return None
@@ -589,10 +596,22 @@ async def run_instrumented(
     # specific error (worst case). They are re-attached to the engine
     # context as a dedicated field below.
     attachments: Optional[List[Dict[str, Any]]] = None
+    # [SKILLS] Pop explicitly invoked skill IDs (from ``/<skill-id>``
+    # in the chat composer). Like context_refs and attachments, these
+    # must NOT leak into active_llm — they are consumed exclusively by
+    # the engine's skill injection resolver.
+    invoked_skills: Optional[List[str]] = None
     if isinstance(llm_override, dict):
         llm_override = dict(llm_override)
         context_refs = llm_override.pop("context_refs", None)
         attachments = llm_override.pop("attachments", None)
+        invoked_skills_raw = llm_override.pop("invoked_skills", None)
+        if isinstance(invoked_skills_raw, list):
+            invoked_skills = [
+                str(s).strip()
+                for s in invoked_skills_raw
+                if isinstance(s, str) and s.strip()
+            ] or None
         if context_refs:
             print(
                 f"[BRIDGE] Resolved {len(context_refs)} context reference(s) "
@@ -602,6 +621,11 @@ async def run_instrumented(
             print(
                 f"[BRIDGE] Resolved {len(attachments)} multimodal attachment(s) "
                 f"for job {job_id}"
+            )
+        if invoked_skills:
+            print(
+                f"[BRIDGE] Resolved {len(invoked_skills)} invoked skill(s) "
+                f"for job {job_id}: {invoked_skills}"
             )
 
     toml_cfg = read_active_toml_config()
@@ -839,6 +863,7 @@ async def run_instrumented(
         manifest=manifest,
         context_refs=merged_refs,
         attachments=attachments,
+        invoked_skills=invoked_skills,
     )
 
     try:

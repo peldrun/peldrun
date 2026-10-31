@@ -173,6 +173,40 @@ class AgentRegistry:
         if isinstance(raw_tools, list):
             manifest["tools"] = [t for t in raw_tools if t != "mcp"]
 
+    @staticmethod
+    def _merge_skills_state_for_agent(
+        manifest: Dict[str, Any],
+        saved_settings: Optional[Dict[str, Any]],
+    ) -> None:
+        """Compute and attach ``effective_skills`` for one agent.
+
+        Mirrors ``_merge_mcp_state_for_agent``. Mutates the passed
+        dict in place and normalizes the ``skills`` field to a list
+        (defaulting to ``[]`` when the manifest omits it).
+        """
+        manifest_skills = [str(s) for s in (manifest.get("skills") or [])]
+        manifest["skills"] = list(manifest_skills)
+
+        disabled: List[str] = []
+        extra: List[str] = []
+        if isinstance(saved_settings, dict):
+            disabled = [
+                str(s) for s in (saved_settings.get("disabled_skills") or [])
+            ]
+            extra = [
+                str(s) for s in (saved_settings.get("extra_skills") or [])
+            ]
+
+        disabled_set = set(disabled)
+        effective: List[str] = [
+            s for s in manifest_skills if s not in disabled_set
+        ]
+        for s in extra:
+            if s not in disabled_set and s not in effective:
+                effective.append(s)
+
+        manifest["effective_skills"] = effective
+
     def list_agents(self) -> List[Dict[str, Any]]:
         """List all registered agents merging built-ins with custom definitions."""
         states = self._load_states()
@@ -257,10 +291,14 @@ class AgentRegistry:
 
         for aid, ameta in results.items():
             try:
-                self._merge_mcp_state_for_agent(ameta, all_settings.get(aid))
+                saved = all_settings.get(aid)
+                self._merge_mcp_state_for_agent(ameta, saved)
+                self._merge_skills_state_for_agent(ameta, saved)
             except Exception as exc:
                 logger.debug(
-                    "MCP state merge failed for agent '%s': %s", aid, exc
+                    "MCP/skills state merge failed for agent '%s': %s",
+                    aid,
+                    exc,
                 )
 
         return list(results.values())
@@ -510,6 +548,36 @@ class AgentRegistry:
             effective["effective_mcp_servers"] = list(manifest_mcp)
             effective["mcp_servers"] = list(manifest_mcp)
 
+        # ── Channel 4: skill assignments ────────────────────────────
+        # Same disabled/extra pattern as tools and MCP servers. The
+        # `skills` field in the manifest is the baseline; the override
+        # file can exclude baseline entries (`disabled_skills`) or add
+        # new ones (`extra_skills`).
+        #
+        # Unlike tools, skill editing is enabled by default for all
+        # agents because skills are instructional-only and cannot cause
+        # execution damage. An agent that wants to lock its skill list
+        # sets `settings.skills_editable: false` explicitly.
+        manifest_skills = [str(s) for s in (manifest.get("skills") or [])]
+        skills_saved = (
+            saved_settings if isinstance(saved_settings, dict) else {}
+        )
+        disabled_skills = list(skills_saved.get("disabled_skills") or [])
+        extra_skills = list(skills_saved.get("extra_skills") or [])
+
+        dis_set = set(disabled_skills)
+        eff_skills: List[str] = [
+            s for s in manifest_skills if s not in dis_set
+        ]
+        for s in extra_skills:
+            if s not in dis_set and s not in eff_skills:
+                eff_skills.append(s)
+
+        effective["skills"] = list(manifest_skills)
+        effective["disabled_skills"] = disabled_skills
+        effective["extra_skills"] = extra_skills
+        effective["effective_skills"] = eff_skills
+
         return effective
 
     # ─────────────────────────────────────────────────────────────
@@ -619,6 +687,117 @@ class AgentRegistry:
         self._save_settings(data)
 
         return self.get_agent_tools_state(agent_id)
+
+    # ─────────────────────────────────────────────────────────────
+    # Skill assignments — per-agent skill selection & activation
+    # ─────────────────────────────────────────────────────────────
+    #
+    # Skills use the same disabled/extra override pattern as tools and
+    # MCP servers, persisted in ``agent_settings.json``:
+    #
+    #   "<agent_id>": {
+    #       "disabled_skills": ["test_planning"],
+    #       "extra_skills":    ["code_review"]
+    #   }
+    #
+    # Effective skills = (manifest.skills − disabled) ∪ extra
+    #
+    # Unlike ``tools_editable``, which defaults to False to protect
+    # built-in agents from accidental tool removal, ``skills_editable``
+    # defaults to True for ALL agents — including built-ins. Rationale:
+    # skills are instructional-only (they cannot cause execution
+    # damage), and enabling per-agent skill assignment is the primary
+    # UX goal of the Skills subsystem. An agent that wants to lock its
+    # skill list sets ``settings.skills_editable: false`` explicitly.
+
+    def get_agent_skills_state(self, agent_id: str) -> Dict[str, Any]:
+        """Return the current skill selection for an agent.
+
+        Return shape::
+
+            {
+              "manifest_skills":  [...],   # baseline declared in manifest
+              "disabled_skills":  [...],   # subset of manifest_skills to exclude
+              "extra_skills":     [...],   # additions from the store
+              "effective_skills": [...],   # manifest − disabled ∪ extra (deduped)
+              "skills_editable":  bool,    # whether overrides are honoured
+            }
+
+        ``skills_editable`` defaults to True. Only agents that
+        explicitly set ``settings.skills_editable: false`` return
+        ``False`` here, and only they are protected from having their
+        skill list mutated via the API.
+        """
+        manifest = self.get_agent(agent_id)
+        manifest_skills = [str(s) for s in (manifest.get("skills") or [])]
+
+        settings_block = manifest.get("settings")
+        editable = True  # default: skills always editable
+        if isinstance(settings_block, dict):
+            editable = bool(settings_block.get("skills_editable", True))
+
+        if not editable:
+            return {
+                "manifest_skills": manifest_skills,
+                "disabled_skills": [],
+                "extra_skills": [],
+                "effective_skills": list(manifest_skills),
+                "skills_editable": False,
+            }
+
+        saved = self._load_settings().get(agent_id, {})
+        disabled_raw = [str(s) for s in (saved.get("disabled_skills") or [])]
+        extra_raw = [str(s) for s in (saved.get("extra_skills") or [])]
+
+        manifest_set = set(manifest_skills)
+        disabled_set = set(disabled_raw) & manifest_set
+        extra_set = set(extra_raw) - manifest_set
+
+        effective: List[str] = [
+            s for s in manifest_skills if s not in disabled_set
+        ]
+        for s in extra_set:
+            if s not in effective:
+                effective.append(s)
+
+        return {
+            "manifest_skills": manifest_skills,
+            "disabled_skills": sorted(disabled_set),
+            "extra_skills": sorted(extra_set),
+            "effective_skills": effective,
+            "skills_editable": True,
+        }
+
+    def save_agent_skills_state(
+        self,
+        agent_id: str,
+        disabled: List[str],
+        extra: List[str],
+    ) -> Dict[str, Any]:
+        """Persist skill overrides for an agent and return the new state.
+
+        Preserves any existing tool / MCP / settings entries stored
+        alongside the skill state in ``agent_settings.json``.
+        """
+        manifest = self.get_agent(agent_id)
+        settings_block = manifest.get("settings")
+        editable = True
+        if isinstance(settings_block, dict):
+            editable = bool(settings_block.get("skills_editable", True))
+
+        if not editable:
+            raise ValueError(
+                f"Agent '{agent_id}' does not allow skill editing."
+            )
+
+        data = self._load_settings()
+        existing = dict(data.get(agent_id, {}))
+        existing["disabled_skills"] = list(disabled)
+        existing["extra_skills"] = list(extra)
+        data[agent_id] = existing
+        self._save_settings(data)
+
+        return self.get_agent_skills_state(agent_id)
 
     # ─────────────────────────────────────────────────────────────
     # MCP server overrides — per-agent protocol server selection

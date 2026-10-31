@@ -14,6 +14,7 @@ import type {
   ExtensionDefinition,
 } from "@/lib/types";
 import { listBundles, type BundleEntry } from "@/lib/bundleApi";
+import type { SkillSummary } from "../_types/store";
 import { showToast } from "@/components/ui/ToastNotification";
 
 /**
@@ -51,6 +52,8 @@ export interface StoreDataState {
   setAgents: React.Dispatch<React.SetStateAction<AgentManifest[]>>;
   tools: ToolDefinition[];
   setTools: React.Dispatch<React.SetStateAction<ToolDefinition[]>>;
+  skills: SkillSummary[];
+  setSkills: React.Dispatch<React.SetStateAction<SkillSummary[]>>;
   extensions: ExtensionDefinition[];
   setExtensions: React.Dispatch<React.SetStateAction<ExtensionDefinition[]>>;
   bundles: BundleEntry[];
@@ -60,10 +63,31 @@ export interface StoreDataState {
 }
 
 /**
+ * Fetch the installed skills catalog.
+ *
+ * Uses ``include_disabled=true`` so the store page shows disabled
+ * skills too (the operator needs to see them to re-enable them).
+ * Chat-invocation filtering happens elsewhere — this is the
+ * management surface.
+ */
+async function fetchSkills(): Promise<SkillSummary[]> {
+  try {
+    const res = await fetch("/api/skills?include_disabled=true");
+    if (!res.ok) return [];
+    const data = await res.json();
+    const list = Array.isArray(data?.skills) ? data.skills : [];
+    return list as SkillSummary[];
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Central data hook for the store page.
  *
  * Responsibilities:
- *  - Owns the four catalog collections (agents, tools, extensions, bundles).
+ *  - Owns the five catalog collections (agents, tools, skills,
+ *    extensions, bundles).
  *  - Exposes their setters so action hooks can apply optimistic updates
  *    without needing to re-fetch the whole catalog.
  *  - Provides a single `reload()` used after destructive or stateful
@@ -73,6 +97,7 @@ export interface StoreDataState {
 export function useStoreData(): StoreDataState {
   const [agents, setAgents] = useState<AgentManifest[]>([]);
   const [tools, setTools] = useState<ToolDefinition[]>([]);
+  const [skills, setSkills] = useState<SkillSummary[]>([]);
   const [extensions, setExtensions] = useState<ExtensionDefinition[]>([]);
   const [bundles, setBundles] = useState<BundleEntry[]>([]);
   const [loading, setLoading] = useState(false);
@@ -80,15 +105,17 @@ export function useStoreData(): StoreDataState {
   const reload = useCallback(async () => {
     setLoading(true);
     try {
-      const [ag, tl, ex, bd] = await Promise.all([
+      const [ag, tl, sk, ex, bd] = await Promise.all([
         fetchStoreAgents(),
         fetchStoreTools(),
+        fetchSkills(),
         fetchStoreExtensions(),
         // Bundles are non-critical: a failure must not break the page.
         listBundles().catch(() => [] as BundleEntry[]),
       ]);
       setAgents(ag || []);
       setTools(tl || []);
+      setSkills(sk || []);
       setExtensions(ex || []);
       setBundles(bd || []);
     } catch (err: any) {
@@ -111,6 +138,8 @@ export function useStoreData(): StoreDataState {
     setAgents,
     tools,
     setTools,
+    skills,
+    setSkills,
     extensions,
     setExtensions,
     bundles,

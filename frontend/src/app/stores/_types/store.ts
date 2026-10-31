@@ -109,3 +109,119 @@ export interface AgentToolsState {
   tools_editable: boolean;
   available_tools: AgentToolInfo[];
 }
+
+
+// ─────────────────────────────────────────────────────────────────
+// Skills
+// ─────────────────────────────────────────────────────────────────
+//
+// Types mirror the HTTP responses from ``omweb.routers.skills``:
+//
+//   GET  /api/skills                      → SkillSummary[]  (list)
+//   GET  /api/skills/{id}                 → SkillDetail     (single)
+//   POST /api/skills/install              → SkillInstallResponse
+//   POST /api/skills/{id}/toggle          → SkillToggleResponse
+//   DELETE /api/skills/{id}               → { deleted: true }
+//   GET  /api/skills/{id}/preview         → SkillPreview
+//
+// These are duplicated locally rather than fetched from a shared
+// module because the store page is the only consumer. If a second
+// consumer appears (e.g. a mobile client), extract to ``@/lib/types``.
+
+/**
+ * Filter modes for the Skills section.
+ *
+ *   "all"      → every installed skill
+ *   "builtin"  → shipped skills (``is_builtin: true``)
+ *   "custom"   → user-installed skills (``is_builtin: false``)
+ */
+export type SkillFilter = "all" | "builtin" | "custom";
+
+/**
+ * Author block as it appears in a skill manifest. All fields
+ * optional — a skill may be installed by a user who never filled
+ * them in.
+ */
+export interface SkillAuthor {
+  name?: string;
+  url?: string;
+  email?: string;
+}
+
+/**
+ * Summary of one skill as returned by the list endpoint.
+ *
+ * Deliberately excludes the full ``manifest`` and ``frontmatter``
+ * (which can each be several KB) and the sanitized ``icon_svg``
+ * (up to 32 KB). Those are fetched on demand via the detail
+ * endpoint and the icon endpoint respectively.
+ */
+export interface SkillSummary {
+  id: string;
+  version: string;
+  name: string;
+  display_name: string;
+  description: string;
+  short_description: string;
+  status: string;
+  enabled: boolean;
+  is_builtin: boolean;
+  is_deprecated: boolean;
+  chat_invocable: boolean;
+  agent_assignable: boolean;
+  workflow_node: boolean;
+  has_icon_svg: boolean;
+  has_icon_path: boolean;
+  icon_path: string | null;
+  tags: string[];
+  author: SkillAuthor;
+  publisher_id: string | null;
+  trust: string;
+  license: string | null;
+  homepage: string | null;
+  docs_url: string | null;
+  release_date: string | null;
+  stability: string;
+  capabilities: Record<string, unknown>;
+  execution: Record<string, unknown>;
+  package_dir: string;
+}
+
+/**
+ * Full skill detail — includes the raw manifest and SKILL.md frontmatter.
+ */
+export interface SkillDetail extends SkillSummary {
+  manifest: Record<string, unknown>;
+  frontmatter: Record<string, unknown>;
+}
+
+/**
+ * Response from ``POST /api/skills/install``.
+ */
+export interface SkillInstallResponse {
+  status: string;
+  skill: SkillSummary;
+  was_upgrade: boolean;
+  warnings: string[];
+}
+
+/**
+ * Response from ``POST /api/skills/{id}/toggle``.
+ */
+export interface SkillToggleResponse {
+  status: string;
+  skill: SkillSummary;
+}
+
+/**
+ * Response from ``GET /api/skills/{id}/preview`` — the full
+ * instructions text for the details drawer.
+ */
+export interface SkillPreview {
+  status: string;
+  skill_id: string;
+  version: string;
+  instructions: string;
+  instructions_length: number;
+  frontmatter: Record<string, unknown>;
+}

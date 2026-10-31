@@ -463,6 +463,8 @@ export function TypeaheadMenuPlugin({
                       <Bot size={13} />
                     ) : item.category === 'tool' ? (
                       <Wrench size={13} />
+                    ) : item.category === 'skill' ? (
+                      <Sparkles size={13} />
                     ) : (
                       <Terminal size={13} />
                     )}

@@ -15,6 +15,18 @@ export interface SlashCommandItem {
   description: string;
   category: CommandCategory;
   icon?: string;
+  /**
+   * Optional extra strings matched by the slash-menu search in addition
+   * to ``label``, ``trigger``, and ``description``.
+   *
+   * Used by skills to expose their display name and tags so typing
+   * ``/review`` matches a skill whose id is ``code_review`` but whose
+   * name is ``Code Review`` and whose tags include ``review``.
+   *
+   * The slash menu matches case-insensitively against the whole list.
+   * Order is irrelevant — inclusion is what matters.
+   */
+  searchTerms?: string[];
   execute: (context: SlashCommandExecutionContext) => void | Promise<void>;
 }
 
@@ -480,9 +492,60 @@ class CommandRegistryStore {
     const list = Array.from(this.slashCommands.values());
     if (!query) return list;
     const lower = query.toLowerCase();
-    return list.filter(
-      (c) => c.trigger.toLowerCase().includes(lower) || c.label.toLowerCase().includes(lower)
-    );
+
+    // Rank results so the most specific match wins:
+    //   1. Label starts with the query (e.g. "/code" matches "/code_review").
+    //   2. Any searchTerm starts with the query.
+    //   3. Trigger / label / description / searchTerm contains the query.
+    //
+    // The sort is stable within each tier, preserving registration
+    // order (system commands first, then skills, then any custom
+    // additions). This keeps /clear, /agent, /chat pinned at the top
+    // when the query is empty but lets skills bubble up when the user
+    // types a prefix that only they match.
+    // [P7.1b] Hyphen/underscore normalization. Users frequently type
+    // the repository form (`/code-review`) even though the skill ID is
+    // canonicalized to `code_review`. Normalizing both sides of the
+    // match keeps every spelling working without touching the
+    // registered ID.
+    const normalized = lower.replace(/-/g, '_');
+
+    const scored: Array<{ item: SlashCommandItem; score: number }> = [];
+
+    for (const c of list) {
+      const labelLower = c.label.toLowerCase().replace(/-/g, '_');
+      const triggerLower = c.trigger.toLowerCase().replace(/-/g, '_');
+      const descriptionLower = (c.description || '').toLowerCase();
+      const searchTermsLower = (c.searchTerms || []).map((t) =>
+        t.toLowerCase().replace(/-/g, '_')
+      );
+
+      let score = 0;
+
+      if (
+        labelLower.startsWith(normalized) ||
+        triggerLower.startsWith(normalized)
+      ) {
+        score += 100;
+      } else if (searchTermsLower.some((t) => t.startsWith(normalized))) {
+        score += 50;
+      }
+
+      if (score === 0) {
+        const matchesAnywhere =
+          labelLower.includes(normalized) ||
+          triggerLower.includes(normalized) ||
+          descriptionLower.includes(lower) ||
+          searchTermsLower.some((t) => t.includes(normalized));
+        if (!matchesAnywhere) continue;
+        score = 10;
+      }
+
+      scored.push({ item: c, score });
+    }
+
+    scored.sort((a, b) => b.score - a.score);
+    return scored.map((s) => s.item);
   }
 
   public async getMentionItems(

@@ -42,6 +42,12 @@ except ImportError:  # pragma: no cover - defensive fallback
 from omweb.agents.registry import AgentNotFoundError, agent_registry
 from omweb.extensions.bundle_manager import McpBundleError, mcp_bundle_manager
 from omweb.extensions.registry import extension_registry
+from omweb.skills.assignments import (
+    get_agent_skills_state as _get_agent_skills_state,
+    save_agent_skills_state as _save_agent_skills_state,
+)
+from omweb.skills.errors import SkillAssignmentError
+from omweb.skills.manager import skill_manager
 from omweb.tools.bundles.errors import BundleError
 from omweb.tools.registry import tool_registry
 
@@ -253,6 +259,158 @@ async def update_agent_tools_endpoint(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    return {"status": "ok", **state}
+
+
+# ─────────────────────────────────────────────────────────────────
+# Agent Skills — per-agent skill selection & activation
+# ─────────────────────────────────────────────────────────────────
+#
+# Skills use the same disabled/extra override pattern as tools and
+# MCP servers, but with one important difference: skill editing is
+# enabled by default for ALL agents (including built-ins), because
+# skills are instructional-only and cannot cause execution damage.
+# An agent that wants to lock its skill list sets
+# ``settings.skills_editable: false`` explicitly.
+#
+# Persistence is delegated to ``agent_registry.save_agent_skills_state``
+# (via ``omweb.skills.assignments``), which writes into the same
+# ``agent_settings.json`` file used by tools and MCP overrides. This
+# guarantees a single source of truth per agent — no parallel state
+# files, no drift between subsystems.
+
+
+class _AgentSkillsPayload(BaseModel):
+    """Request body for PUT /agents/{id}/skills."""
+
+    disabled_skills: List[str] = Field(default_factory=list)
+    extra_skills: List[str] = Field(default_factory=list)
+
+
+@router.get("/agents/{agent_id}/skills")
+async def get_agent_skills_endpoint(agent_id: str) -> Dict[str, Any]:
+    """Return the current skill selection for an agent.
+
+    Combines:
+      - the manifest baseline (``manifest_skills``),
+      - the user's exclusions (``disabled_skills``),
+      - the user's additions (``extra_skills``),
+      - the computed ``effective_skills`` list the runtime will use,
+      - resolved metadata for each effective skill (``resolved_skills``),
+      - the full Store catalog of assignable skills
+        (``available_skills``) so the UI can render every skill with
+        ``in_manifest`` and compatibility metadata.
+    """
+    try:
+        state = _get_agent_skills_state(agent_id)
+    except AgentNotFoundError:
+        raise HTTPException(
+            status_code=404, detail=f"Agent '{agent_id}' not found"
+        )
+    except Exception as exc:
+        logger.exception(
+            "Failed to read skill state for agent %r: %s", agent_id, exc
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": f"Failed to read skill state: {exc}",
+                "code": "SKILL_STATE_READ_FAILED",
+                "details": {"agent_id": agent_id},
+            },
+        )
+
+    # Enumerate every assignable skill so the UI can render a picker
+    # without a second request. Deprecated skills are included but
+    # flagged — the UI is expected to gray them out and block
+    # selection (the backend also rejects them on PUT via
+    # save_agent_skills_state).
+    try:
+        all_skills = skill_manager.list_skills(
+            include_disabled=True,
+            include_deprecated=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning(
+            "Failed to list skills while loading agent %r state: %s",
+            agent_id,
+            exc,
+        )
+        all_skills = []
+
+    manifest_set = set(state.get("manifest_skills", []))
+    available_skills: List[Dict[str, Any]] = []
+    for record in all_skills:
+        available_skills.append(
+            {
+                "id": record.id,
+                "name": record.name,
+                "version": record.version,
+                "description": record.description,
+                "short_description": (
+                    record.manifest.get("short_description")
+                    or record.description
+                ),
+                "status": record.status,
+                "enabled": record.enabled,
+                "is_deprecated": record.is_deprecated,
+                "agent_assignable": record.agent_assignable,
+                "chat_invocable": record.chat_invocable,
+                "in_manifest": record.id in manifest_set,
+                "tags": list(record.manifest.get("tags") or []),
+                "has_icon_svg": bool(record.icon_svg),
+                "has_icon_path": bool(record.icon_path),
+            }
+        )
+
+    return {
+        "status": "ok",
+        **state,
+        "available_skills": available_skills,
+    }
+
+
+@router.put("/agents/{agent_id}/skills")
+async def update_agent_skills_endpoint(
+    agent_id: str, req: _AgentSkillsPayload
+) -> Dict[str, Any]:
+    """Persist skill overrides for an agent.
+
+    Validation (performed by ``omweb.skills.assignments``):
+      - every ``disabled`` and ``extra`` ID must resolve to an
+        installed skill;
+      - every ``extra`` ID must additionally be ``active`` and
+        declare ``agent_assignable`` (i.e. not deprecated, not
+        chat-only);
+      - ``disabled`` IDs are NOT required to be active — excluding a
+        skill is valid regardless of its current status;
+      - the agent must not set ``settings.skills_editable: false``.
+    """
+    try:
+        state = _save_agent_skills_state(
+            agent_id, req.disabled_skills, req.extra_skills
+        )
+    except AgentNotFoundError:
+        raise HTTPException(
+            status_code=404, detail=f"Agent '{agent_id}' not found"
+        )
+    except SkillAssignmentError as exc:
+        # Structured 400 with {error, code, details} — mirrors the
+        # tool bundles error shape.
+        raise HTTPException(status_code=400, detail=exc.to_dict())
+    except Exception as exc:
+        logger.exception(
+            "Skill assignment save failed for agent %r: %s", agent_id, exc
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": str(exc),
+                "code": "SKILL_ASSIGNMENT_FAILED",
+                "details": {"agent_id": agent_id},
+            },
+        )
 
     return {"status": "ok", **state}
 

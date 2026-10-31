@@ -1,11 +1,11 @@
 // frontend/src/app/stores/_config/sections.tsx
 
-import { Bot, LucideIcon, Puzzle, Wrench } from "lucide-react";
+import { Bot, LucideIcon, Puzzle, Sparkles, Wrench } from "lucide-react";
 
 /**
  * Unique identifier for each store section.
  */
-export type SectionId = "agents" | "tools" | "extensions";
+export type SectionId = "agents" | "tools" | "skills" | "extensions";
 
 /**
  * Sidebar / navigation metadata for a store section.
@@ -51,6 +51,13 @@ export interface SectionHeaderConfig {
 /**
  * Ordered list of all store sections.
  * The first item is the default landing section.
+ *
+ * Section order rationale:
+ *   - Agents first: it is the primary entry point for the product.
+ *   - Tools second: fundamental capability layer.
+ *   - Skills third: instructional packs assigned to agents or invoked
+ *     from chat — sits naturally between Tools and MCP.
+ *   - Extensions (MCP) last: most advanced / least frequently used.
  */
 export const SECTIONS: SectionMeta[] = [
   {
@@ -66,6 +73,13 @@ export const SECTIONS: SectionMeta[] = [
     shortLabel: "Tools",
     description: "Local Python tools and installed bundles",
     icon: Wrench,
+  },
+  {
+    id: "skills",
+    label: "Skills Library",
+    shortLabel: "Skills",
+    description: "Reusable instruction packs for agents and chat",
+    icon: Sparkles,
   },
   {
     id: "extensions",

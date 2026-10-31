@@ -5,7 +5,7 @@
 import React from "react";
 import { Search, X } from "lucide-react";
 import type { SectionId } from "../_config/sections";
-import type { AgentFilter, ToolFilter } from "../_types/store";
+import type { AgentFilter, ToolFilter, SkillFilter } from "../_types/store";
 
 /**
  * A single filter option rendered inside the segmented control.
@@ -36,6 +36,10 @@ export interface StoreToolbarProps {
   // Tools filter (only rendered when activeSection === "tools")
   toolFilter?: ToolFilter;
   onToolFilterChange?: (value: ToolFilter) => void;
+
+  // Skills filter (only rendered when activeSection === "skills")
+  skillFilter?: SkillFilter;
+  onSkillFilterChange?: (value: SkillFilter) => void;
 }
 
 const AGENT_FILTER_OPTIONS: ToolbarFilterOption<AgentFilter>[] = [
@@ -45,6 +49,12 @@ const AGENT_FILTER_OPTIONS: ToolbarFilterOption<AgentFilter>[] = [
 ];
 
 const TOOL_FILTER_OPTIONS: ToolbarFilterOption<ToolFilter>[] = [
+  { value: "all", label: "All" },
+  { value: "builtin", label: "Built-in" },
+  { value: "custom", label: "Custom" },
+];
+
+const SKILL_FILTER_OPTIONS: ToolbarFilterOption<SkillFilter>[] = [
   { value: "all", label: "All" },
   { value: "builtin", label: "Built-in" },
   { value: "custom", label: "Custom" },
@@ -103,6 +113,8 @@ export function StoreToolbar({
   onAgentFilterChange,
   toolFilter = "all",
   onToolFilterChange,
+  skillFilter = "all",
+  onSkillFilterChange,
 }: StoreToolbarProps) {
   return (
     <div className="w-full border-b border-border bg-card">
@@ -112,6 +124,7 @@ export function StoreToolbar({
         <div className="hidden sm:block text-[11px] font-mono text-muted-foreground">
           {activeSection === "agents" && "Browse autonomous personas"}
           {activeSection === "tools" && "Local + bundled capabilities"}
+          {activeSection === "skills" && "Reusable instruction packs"}
           {activeSection === "extensions" && "MCP server integrations"}
         </div>
 
@@ -152,6 +165,14 @@ export function StoreToolbar({
               value={toolFilter}
               onChange={onToolFilterChange}
               options={TOOL_FILTER_OPTIONS}
+            />
+          )}
+
+          {activeSection === "skills" && onSkillFilterChange && (
+            <SegmentedFilter<SkillFilter>
+              value={skillFilter}
+              onChange={onSkillFilterChange}
+              options={SKILL_FILTER_OPTIONS}
             />
           )}
         </div>

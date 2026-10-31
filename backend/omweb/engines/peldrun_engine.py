@@ -954,6 +954,57 @@ class PeldrunEngine(ExecutionEngine):
         if "mcp" in requested_tools:
             requested_tools = [t for t in requested_tools if t != "mcp"]
 
+        # ── Skill Injection ─────────────────────────────────────────
+        # Merge the agent's assigned skills (from agent_settings.json)
+        # with any skills explicitly invoked via /<skill-id> from the
+        # chat composer. Invoked skills take priority when the same ID
+        # appears in both channels. Each skill contributes a
+        # self-delimiting "--- BEGIN SKILL: id@version ---" block that
+        # the model can read without ambiguity.
+        #
+        # A skill that fails to load (missing file, oversized body,
+        # security violation) is skipped with a warning; the run
+        # continues. This ensures a single broken skill cannot take
+        # down a chat.
+        #
+        # Injection point: right before AgentSpec is constructed, so
+        # the skill block lands in `spec.system_prompt` — the value
+        # Core rebuilds messages from inside `core_executor.execute`.
+        _skill_injection = None
+        try:
+            from omweb.skills.assignments import resolve_skill_injection
+
+            _skill_injection = resolve_skill_injection(
+                agent_id=agent_id,
+                invoked_skill_ids=context.invoked_skills or [],
+            )
+            if _skill_injection.text:
+                system_prompt = (
+                    system_prompt.rstrip()
+                    + "\n\n[SKILL INSTRUCTIONS]\n"
+                    + _skill_injection.text
+                )
+                print(
+                    f"[ENGINE PELDRUN] Injected "
+                    f"{len(_skill_injection.skills)} skill(s) for job "
+                    f"{job_id}: "
+                    f"{[s['id'] for s in _skill_injection.skills]}"
+                )
+            for _skill_warn in _skill_injection.warnings:
+                logger.warning(
+                    "[ENGINE PELDRUN] Skill injection warning for job "
+                    "%s: %s",
+                    job_id,
+                    _skill_warn,
+                )
+        except Exception as _skill_err:
+            logger.warning(
+                "[ENGINE PELDRUN] Skill injection failed for job %s: %s. "
+                "Continuing without skills.",
+                job_id,
+                _skill_err,
+            )
+
         specialist_tools_map = _collect_specialist_tool_allowlists(set(available_web_tools.keys()))
 
         # 4. Build Canonical RunRequest
@@ -986,6 +1037,19 @@ class PeldrunEngine(ExecutionEngine):
             "authorized_tools": list(requested_tools),
             "resolved_custom_tools": list(resolved_tool_ids),
             "specialist_tools": specialist_tools_map,
+            # Skill injection telemetry: consumed by diagnostics and
+            # the run timeline, not by Core. Empty list when no skills
+            # were injected.
+            "injected_skills": (
+                [s["id"] for s in _skill_injection.skills]
+                if _skill_injection is not None
+                else []
+            ),
+            "skill_warnings": (
+                list(_skill_injection.warnings)
+                if _skill_injection is not None
+                else []
+            ),
             # [FIX-MULTIMODAL-PROPAGATE] Forward the multimodal attachment
             # references received from dispatcher.py so that
             # executor.py's [FIX-MULTIMODAL] block can resolve them to

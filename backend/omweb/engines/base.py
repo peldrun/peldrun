@@ -1,3 +1,4 @@
+# backend/omweb/engines/base.py
 """
 backend/omweb/engines/base.py
 
@@ -52,6 +53,16 @@ class EngineRunContext:
     # constructing the ``RunRequest``. Non-consumers ignore this field,
     # keeping all existing engine implementations backwards compatible.
     attachments: Optional[List[Dict[str, Any]]] = None
+
+    # [SKILLS] Explicit ``/<skill-id>`` invocations captured from the chat
+    # composer. The engine resolves these against the skill registry,
+    # merges them with the agent's assigned skills, and injects the
+    # combined instruction block into the system prompt.
+    #
+    # Populated by the dispatcher from ``llm_override["invoked_skills"]``.
+    # Always a list of canonical skill IDs (normalized at the composer
+    # boundary, re-normalized defensively in ``assignments``).
+    invoked_skills: Optional[List[str]] = None
 
 
 @runtime_checkable

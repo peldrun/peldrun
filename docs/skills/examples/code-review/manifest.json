@@ -1,0 +1,58 @@
+{
+  "schema_version": "1.0.0",
+  "id": "code_review",
+  "version": "1.0.0",
+  "name": "Code Review",
+  "display_name": "Code Review",
+
+  "description": "Systematic code review for bugs, security issues, and maintainability problems.",
+  "short_description": "Find real defects with evidence, ordered by severity.",
+  "store_description": "A structured code review workflow that inspects correctness, security, error handling, maintainability, and tests. Every finding is backed by a quoted excerpt and a concrete fix recommendation. Use this skill when the user asks you to review a patch, audit a file, or assess a change before merging.",
+
+  "tags": ["review", "audit", "security", "quality", "code"],
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+  "license": "MIT",
+  "homepage": "https://peldrun.ai/skills/code_review",
+
+  "release_date": "2025-01-15",
+  "stability": "stable",
+
+  "capabilities": {
+    "chat_invocable": true,
+    "agent_assignable": true,
+    "workflow_node": false
+  },
+
+  "execution": {
+    "type": "instructions",
+    "instructions_file": "SKILL.md"
+  },
+
+  "compatibility": {
+    "peldrun_min_version": "0.2.0"
+  },
+
+  "limits": {
+    "max_instructions_bytes": 262144
+  },
+
+  "examples": [
+    {
+      "description": "Invoke from chat",
+      "invocation": "/code_review",
+      "context": "User has just attached a .py file and asked to review it.",
+      "expected_outcome": "Agent produces findings grouped by severity with file:line references."
+    },
+    {
+      "description": "Assign to an agent",
+      "invocation": "Assign to 'code_architect' in /store/agents",
+      "context": "Every run of the agent should perform a review of produced files.",
+      "expected_outcome": "Agent always loads the code_review instructions before reasoning."
+    }
+  ]
+}

@@ -51,12 +51,6 @@ import { useChatStore } from "@/stores/chat-store";
  * temporary artifact store immediately so the user sees live progress,
  * and only their ``fileId`` references travel to the backend once the
  * user dispatches the task.
- *
- * Note: this type intentionally duplicates ``PendingAttachment`` from
- * ``composer.tsx``. The two composers are independent components with
- * different lifecycle contracts; sharing a type between them would
- * couple their evolution. If a third consumer appears, extract this
- * to a shared module then.
  */
 interface PendingImageAttachment {
   id: string;
@@ -110,6 +104,20 @@ function generateImageAttachmentId(): string {
   return `img_att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+// ---------------------------------------------------------------------------
+// Skill metadata model (shared with composer.tsx — kept intentionally
+// minimal here to avoid a cross-file dependency just for a shape).
+// ---------------------------------------------------------------------------
+
+interface SkillMeta {
+  id: string;
+  name: string;
+  description: string;
+  short_description?: string;
+  display_name?: string;
+  tags?: string[];
+}
+
 interface ChatLandingProps {
   inputValue: string;
   setInputValue: (val: string) => void;
@@ -139,6 +147,17 @@ export function ChatLanding({
 
   // Web Search: temporary per-message toggle, chat mode only.
   const [webSearchEnabled, setWebSearchEnabled] = useState(false);
+
+  // ── Skills ────────────────────────────────────────────────────
+  // `activeSkills` holds skill IDs the user explicitly selected from
+  // the / menu in the current draft; they travel to the backend as
+  // `invoked_skills` and are merged with the agent's assigned skills
+  // at prompt-injection time (see backend omweb/skills/assignments.py).
+  //
+  // `availableSkills` holds metadata for rendering the chip labels
+  // (name, description). The runtime only needs the IDs.
+  const [activeSkills, setActiveSkills] = useState<string[]>([]);
+  const [availableSkills, setAvailableSkills] = useState<SkillMeta[]>([]);
 
   // Multi-Agent Delegation Toggle State
   const [delegationAllowed, setDelegationAllowed] = useAppStorage(
@@ -170,6 +189,121 @@ export function ChatLanding({
     });
     return () => {
       unregisterPeldrun();
+    };
+  }, []);
+
+  // ── Skills: load catalogue and register each as a slash command ──
+  //
+  // Fetches /api/skills once on mount and re-fetches whenever
+  // `peldrun:skills-changed` is dispatched (by the /store skills
+  // section after install/delete/toggle). Each chat-invocable skill
+  // registers as a SlashCommandItem whose `execute` dispatches
+  // `peldrun:skill-invoked`; the next effect listens and adds the ID
+  // to `activeSkills`.
+  //
+  // Mirrors the equivalent logic in composer.tsx so both entry points
+  // behave identically.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    let cancelled = false;
+    let unregisterFns: Array<() => void> = [];
+
+    const loadAndRegisterSkills = async () => {
+      unregisterFns.forEach((fn) => fn());
+      unregisterFns = [];
+
+      try {
+        const res = await fetch("/api/skills?include_disabled=false");
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        const skills: SkillMeta[] = (Array.isArray(data.skills)
+          ? data.skills
+          : []
+        ).filter(
+          (s: any) =>
+            s &&
+            typeof s.id === "string" &&
+            s.enabled === true &&
+            s.chat_invocable === true &&
+            s.is_deprecated !== true
+        );
+        if (cancelled) return;
+
+        setAvailableSkills(skills);
+
+        for (const skill of skills) {
+          const unregister = commandRegistry.registerSlashCommand({
+            id: `skill-${skill.id}`,
+            trigger: skill.id,
+            label: `/${skill.id}`,
+            description:
+              skill.short_description ||
+              skill.description ||
+              `Invoke skill ${skill.id}`,
+            category: "skill",
+            icon: "Sparkles",
+            searchTerms: [
+              skill.name,
+              skill.display_name,
+              ...(Array.isArray(skill.tags) ? skill.tags : []),
+            ].filter(
+              (t): t is string =>
+                typeof t === "string" && t.trim().length > 0
+            ),
+            execute: ({ dispatchCustomEvent }) => {
+              dispatchCustomEvent("peldrun:skill-invoked", {
+                skillId: skill.id,
+              });
+            },
+          });
+          unregisterFns.push(unregister);
+        }
+      } catch (err) {
+        console.debug(
+          "[ChatLanding] Failed to load skills catalogue:",
+          err
+        );
+      }
+    };
+
+    void loadAndRegisterSkills();
+
+    const onSkillsChanged = () => {
+      void loadAndRegisterSkills();
+    };
+    window.addEventListener("peldrun:skills-changed", onSkillsChanged);
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener(
+        "peldrun:skills-changed",
+        onSkillsChanged
+      );
+      unregisterFns.forEach((fn) => fn());
+    };
+  }, []);
+
+  // ── Skills: listen for selections from the / menu ─────────────
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<{ skillId?: string }>).detail;
+      const skillId = detail?.skillId;
+      if (typeof skillId !== "string" || !skillId) return;
+
+      setActiveSkills((prev) =>
+        prev.includes(skillId) ? prev : [...prev, skillId]
+      );
+    };
+
+    window.addEventListener("peldrun:skill-invoked", handler as EventListener);
+    return () => {
+      window.removeEventListener(
+        "peldrun:skill-invoked",
+        handler as EventListener
+      );
     };
   }, []);
 
@@ -231,11 +365,6 @@ export function ChatLanding({
    *                to the temporary artifact store immediately.
    *   * Others  -> parent's ``landingAttachedFiles`` list, unchanged
    *                from the pre-multimodal behavior.
-   *
-   * This split preserves the parent's contract (``onStartTask`` keeps
-   * receiving the same ``File[]`` it always has) while giving images a
-   * dedicated upload lifecycle so the vision pipeline can resolve them
-   * later via their server-assigned ``fileId``.
    */
   const ingestLandingFiles = useCallback(
     (incoming: File[]) => {
@@ -252,7 +381,6 @@ export function ChatLanding({
         }
       }
 
-      // Non-images keep going through the parent's existing flow.
       if (nonImageFiles.length > 0) {
         setLandingAttachedFiles((prev) => [...prev, ...nonImageFiles]);
       }
@@ -273,8 +401,6 @@ export function ChatLanding({
 
       setPendingImageAttachments((prev) => [...prev, ...newAttachments]);
 
-      // Kick off uploads in parallel. Each completion mutates only its
-      // own attachment, so concurrent pastes never clobber each other.
       newAttachments.forEach((att) => {
         const attId = att.id;
         void (async () => {
@@ -330,10 +456,6 @@ export function ChatLanding({
     }
   };
 
-  /**
-   * ImagePastePlugin callback. Uniform with picker and drop: images
-   * always flow through the same immediate-upload path.
-   */
   const handleImagePasted = useCallback(
     (file: File) => {
       ingestLandingFiles([file]);
@@ -362,14 +484,17 @@ export function ChatLanding({
     const textToRun = (customPrompt !== undefined ? customPrompt : rawText).trim();
 
     const hasImages = pendingImageAttachments.length > 0;
-    if (!textToRun && landingAttachedFiles.length === 0 && !hasImages) {
+    if (
+      !textToRun &&
+      landingAttachedFiles.length === 0 &&
+      !hasImages &&
+      activeSkills.length === 0
+    ) {
       return;
     }
 
     // Only fully-uploaded images travel to the backend. Still-uploading
-    // or errored entries are excluded: the backend would otherwise
-    // receive null file IDs and the engine would treat each reference
-    // as broken. The user can retry dispatch once uploads settle.
+    // or errored entries are excluded.
     const readyImageRefs = pendingImageAttachments
       .filter((att) => att.status === "ready" && att.fileId)
       .map((att) => ({
@@ -389,8 +514,11 @@ export function ChatLanding({
       ...(execMode === "agent" && { delegation_allowed: delegationAllowed }),
       // Multimodal image references. Consumed by start_run.py and
       // forwarded to the engine as llm_override["attachments"].
-      // Omitted entirely when no image finished uploading successfully.
       ...(readyImageRefs.length > 0 ? { attachments: readyImageRefs } : {}),
+      // [SKILLS] Explicit skill invocations from the / menu.
+      // Forwarded to EngineRunContext.invoked_skills; the engine
+      // merges them with the agent's assigned skills at prompt time.
+      ...(activeSkills.length > 0 ? { invoked_skills: activeSkills } : {}),
     };
 
     onStartTask(textToRun, payloadOverride, landingAttachedFiles);
@@ -411,6 +539,7 @@ export function ChatLanding({
     setInputValue("");
     setLandingAttachedFiles([]);
     setPendingImageAttachments([]);
+    setActiveSkills([]);
     setWebSearchEnabled(false); // Reset after dispatch
   };
 
@@ -498,6 +627,42 @@ export function ChatLanding({
           isLandingDragging ? "ring-2 ring-primary/40 bg-card" : "bg-card"
         }`}
       >
+        {/* Active Skills Chips */}
+        {activeSkills.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2 px-2.5 pt-1 pb-2 border-b border-border/40 bg-primary/5 mb-2 rounded-t-xl">
+            <span className="flex items-center gap-1 text-[10px] text-primary font-semibold uppercase tracking-wider mr-1">
+              <Sparkles size={11} />
+              Skills
+            </span>
+            {activeSkills.map((skillId) => {
+              const skill = availableSkills.find((s) => s.id === skillId);
+              const label = skill?.name || skillId;
+              return (
+                <span
+                  key={skillId}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] bg-primary/10 border border-primary/30 text-primary"
+                  title={skill?.description || skillId}
+                >
+                  <Sparkles size={10} className="shrink-0" />
+                  <span className="font-mono font-semibold">{label}</span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setActiveSkills((prev) =>
+                        prev.filter((s) => s !== skillId)
+                      )
+                    }
+                    className="ml-1 p-0.5 rounded hover:bg-primary/20 cursor-pointer"
+                    aria-label={`Remove ${skillId}`}
+                  >
+                    <X size={10} />
+                  </button>
+                </span>
+              );
+            })}
+          </div>
+        )}
+
         {/* Attached Files & Image Badges Container */}
         {(landingAttachedFiles.length > 0 ||
           pendingImageAttachments.length > 0) && (
@@ -606,7 +771,9 @@ export function ChatLanding({
               landingAttachedFiles.length > 0 ||
               pendingImageAttachments.length > 0
                 ? "Add instructions for attached files..."
-                : dynamicPlaceholder
+                : activeSkills.length > 0
+                  ? "Describe what you want the skill to do..."
+                  : dynamicPlaceholder
             }
             onSubmit={() => handleDispatch()}
             onChange={(val) => setInputValue(val)}
@@ -641,6 +808,17 @@ export function ChatLanding({
               )}
             </button>
 
+            {/* Active skills indicator badge */}
+            {activeSkills.length > 0 && (
+              <span
+                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-mono bg-primary/10 border border-primary/30 text-primary"
+                title={`${activeSkills.length} skill(s) active`}
+              >
+                <Sparkles size={10} />
+                {activeSkills.length}
+              </span>
+            )}
+
             {/* Dynamic Reasoning Effort Selector */}
             {isReasoningSupported && (
               <div className="animate-in fade-in zoom-in-95 duration-200">
@@ -665,7 +843,7 @@ export function ChatLanding({
                 }
               >
                 <Globe size={14} className={webSearchEnabled ? "text-rb" : "text-muted-foreground"} />
-               </button>
+              </button>
             )}
 
             {/* Agent Selector, Tools, & Delegation (Agent Mode Only) */}
@@ -724,7 +902,8 @@ export function ChatLanding({
               disabled={
                 !inputValue.trim() &&
                 landingAttachedFiles.length === 0 &&
-                pendingImageAttachments.length === 0
+                pendingImageAttachments.length === 0 &&
+                activeSkills.length === 0
               }
               className="h-8 w-8 rounded-full bg-black dark:bg-white text-white dark:text-black flex items-center justify-center transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-peldrun-xs cursor-pointer hover:opacity-90"
               title="Dispatch Task (Enter)"

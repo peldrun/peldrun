@@ -21,6 +21,7 @@ import {
   Info,
   GitFork,
   Globe,
+  Sparkles,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AgentSelector } from "./agent-selector";
@@ -213,6 +214,27 @@ export function Composer({
     "peldrun_delegation_allowed" as Parameters<typeof useAppStorage>[0]
   );
 
+  // ── Skills ────────────────────────────────────────────────────
+  // `activeSkills` holds the skill IDs the user explicitly selected
+  // from the / menu in the current draft. They are injected into the
+  // run payload as `invoked_skills` and merged by the backend with
+  // the agent's assigned skills at prompt-injection time.
+  //
+  // `availableSkills` is the catalogue of chat-invocable skills
+  // fetched from /api/skills. It is used only to render skill
+  // metadata (name, description) on the chips; the runtime uses the
+  // IDs.
+  const [activeSkills, setActiveSkills] = useState<string[]>([]);
+  const [availableSkills, setAvailableSkills] = useState<
+    Array<{
+      id: string;
+      name: string;
+      description: string;
+      short_description?: string;
+      tags?: string[];
+    }>
+  >([]);
+
   const [failedDraft, setFailedDraft] = useState<{
     text: string;
   } | null>(null);
@@ -252,6 +274,116 @@ export function Composer({
 
     return () => {
       unregisterPeldrun();
+    };
+  }, []);
+
+  // ── Skills: load catalogue and register each as a slash command ──
+  //
+  // Fetches /api/skills once on mount and re-fetches whenever a
+  // `peldrun:skills-changed` event fires (dispatched by the /store
+  // skills section after install/delete/toggle). Every
+  // chat-invocable skill is registered as a SlashCommandItem; its
+  // `execute` handler does NOT insert text but dispatches
+  // `peldrun:skill-invoked`, which the next effect observes to add
+  // the skill ID to `activeSkills`.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    let cancelled = false;
+    let unregisterFns: Array<() => void> = [];
+
+    const loadAndRegisterSkills = async () => {
+      unregisterFns.forEach((fn) => fn());
+      unregisterFns = [];
+
+      try {
+        const res = await fetch("/api/skills?include_disabled=false");
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        const skills = (Array.isArray(data.skills) ? data.skills : []).filter(
+          (s: any) =>
+            s &&
+            typeof s.id === "string" &&
+            s.enabled === true &&
+            s.chat_invocable === true &&
+            s.is_deprecated !== true
+        );
+        if (cancelled) return;
+
+        setAvailableSkills(skills);
+
+        for (const skill of skills) {
+          const unregister = commandRegistry.registerSlashCommand({
+            id: `skill-${skill.id}`,
+            trigger: skill.id,
+            label: `/${skill.id}`,
+            description:
+              skill.short_description ||
+              skill.description ||
+              `Invoke skill ${skill.id}`,
+            category: "skill",
+            icon: "Sparkles",
+            searchTerms: [
+              skill.name,
+              skill.display_name,
+              ...(Array.isArray(skill.tags) ? skill.tags : []),
+            ].filter(
+              (t): t is string =>
+                typeof t === "string" && t.trim().length > 0
+            ),
+            execute: ({ dispatchCustomEvent }) => {
+              dispatchCustomEvent("peldrun:skill-invoked", {
+                skillId: skill.id,
+              });
+            },
+          });
+          unregisterFns.push(unregister);
+        }
+      } catch (err) {
+        console.debug(
+          "[Composer] Failed to load skills catalogue:",
+          err
+        );
+      }
+    };
+
+    void loadAndRegisterSkills();
+
+    const onSkillsChanged = () => {
+      void loadAndRegisterSkills();
+    };
+    window.addEventListener("peldrun:skills-changed", onSkillsChanged);
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener(
+        "peldrun:skills-changed",
+        onSkillsChanged
+      );
+      unregisterFns.forEach((fn) => fn());
+    };
+  }, []);
+
+  // ── Skills: listen for selections from the / menu ─────────────
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<{ skillId?: string }>).detail;
+      const skillId = detail?.skillId;
+      if (typeof skillId !== "string" || !skillId) return;
+
+      setActiveSkills((prev) =>
+        prev.includes(skillId) ? prev : [...prev, skillId]
+      );
+    };
+
+    window.addEventListener("peldrun:skill-invoked", handler as EventListener);
+    return () => {
+      window.removeEventListener(
+        "peldrun:skill-invoked",
+        handler as EventListener
+      );
     };
   }, []);
 
@@ -685,6 +817,13 @@ export function Composer({
           ...(readyImageRefs.length > 0
             ? { attachments: readyImageRefs }
             : {}),
+          // [SKILLS] Explicit skill invocations from the / menu.
+          // Dispatcher forwards these into EngineRunContext.invoked_skills;
+          // the engine merges them with the agent's assigned skills
+          // before building the system prompt.
+          ...(activeSkills.length > 0
+            ? { invoked_skills: activeSkills }
+            : {}),
         }
       );
 
@@ -721,6 +860,7 @@ export function Composer({
       setText("");
       setPendingAttachments([]);
       setSelectedMentions([]);
+      setActiveSkills([]);
       setFailedDraft(null);
       backupDraftRef.current = null;
       clearDraft(draftStorageKey);
@@ -877,6 +1017,41 @@ export function Composer({
                 task submission.
               </span>
             </div>
+          </div>
+        )}
+
+        {activeSkills.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2 px-3 pt-2 pb-1.5 border-b border-border/40 bg-primary/5">
+            <span className="flex items-center gap-1 text-[10px] text-primary font-semibold uppercase tracking-wider mr-1">
+              <Sparkles size={11} />
+              Skills
+            </span>
+            {activeSkills.map((skillId) => {
+              const skill = availableSkills.find((s) => s.id === skillId);
+              const label = skill?.name || skillId;
+              return (
+                <span
+                  key={skillId}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] bg-primary/10 border border-primary/30 text-primary"
+                  title={skill?.description || skillId}
+                >
+                  <Sparkles size={10} className="shrink-0" />
+                  <span className="font-mono font-semibold">{label}</span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setActiveSkills((prev) =>
+                        prev.filter((s) => s !== skillId)
+                      )
+                    }
+                    className="ml-1 p-0.5 rounded hover:bg-primary/20 cursor-pointer"
+                    aria-label={`Remove ${skillId}`}
+                  >
+                    <X size={10} />
+                  </button>
+                </span>
+              );
+            })}
           </div>
         )}
 

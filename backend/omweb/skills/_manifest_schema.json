@@ -1,0 +1,363 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://peldrun.dev/schemas/skill-manifest-v1.json",
+  "title": "PELDRUN Skill Manifest",
+  "description": "Schema for manifest.json inside a PELDRUN skill package. Every skill MUST ship a manifest.json that passes this schema before it can be installed, activated, or assigned. Aligned with the PELDRUN tool manifest conventions (see backend/omweb/tools/builtins/browser_interactive.json) for identity, authoring, and settings metadata.",
+  "type": "object",
+  "additionalProperties": false,
+
+  "required": [
+    "schema_version",
+    "id",
+    "version",
+    "name",
+    "description",
+    "execution"
+  ],
+
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^1\\.\\d+\\.\\d+(?:-[a-z0-9.\\-]+)?$",
+      "description": "Manifest schema version (semver). Major version MUST be 1."
+    },
+
+        "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_]{2,63}$",
+      "description": "Skill identifier: lowercase, 3-64 chars, [a-z0-9_]. The first character may be a letter OR a digit (e.g. '123_skill'). PELDRUN normalizes incoming IDs at install time (hyphens -> underscores, dots -> underscores, invalid chars stripped), so authors MAY use forms like 'code-review' or '123-skill' in the source repository."
+    },
+
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[a-z0-9.\\-]+)?$",
+      "description": "Skill release version (semver)."
+    },
+
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120,
+      "description": "Human-readable display name shown in the UI (store card, / menu)."
+    },
+
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120,
+      "description": "Optional override for the visible name; falls back to `name` when omitted."
+    },
+
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500,
+      "description": "Short one-line summary used by the / mention menu and the store card. Keep this under ~120 chars for best UI rendering."
+    },
+
+    "short_description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "Optional shortened variant; when omitted, `description` is used."
+    },
+
+    "store_description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000,
+      "description": "Longer description shown inside the skill's details drawer. Markdown allowed."
+    },
+
+    "usage_notes": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000,
+      "description": "Free-form guidance for users (e.g. 'Invoke after uploading a file'). Shown in the details drawer; not injected into the prompt."
+    },
+
+    "icon": {
+    "type": "string",
+    "maxLength": 200,
+    "pattern": "^[A-Za-z0-9_./\\-]+\\.svg$",
+    "description": "Optional relative path to an SVG icon inside the skill package (e.g. 'icons/code_review.svg'). MUST live inside the package; absolute paths and '..' segments are rejected. Served via GET /api/skills/{id}/icon.svg."
+    },
+
+    "icon_svg": {
+    "type": "string",
+    "minLength": 32,
+    "maxLength": 32768,
+    "description": "Optional inline SVG markup (max 32 KiB). Sanitized server-side at load time — <script>, event handlers (on*), javascript:/data: schemes, <foreignObject>, external <use>/<image> references, and <style>/@import are stripped. When both icon_svg and icon are present, icon_svg wins."
+    },
+
+    "author": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "url": { "type": "string", "format": "uri", "maxLength": 500 },
+        "email": { "type": "string", "format": "email", "maxLength": 200 }
+      }
+    },
+
+    "publisher_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "Optional reverse-DNS publisher identifier (e.g. 'org.peldrun.official')."
+    },
+
+    "trust": {
+      "type": "string",
+      "enum": ["verified", "community", "unverified"],
+      "default": "unverified",
+      "description": "Trust tier shown in the UI. Only 'verified' skills receive the shield badge."
+    },
+
+    "signature": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "Optional content signature for tamper detection. Currently recorded but not enforced; reserved for future supply-chain verification."
+    },
+
+    "license": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "description": "SPDX identifier (e.g. 'MIT', 'Apache-2.0') or 'proprietary'."
+    },
+
+    "license_url": {
+      "type": "string",
+      "format": "uri",
+      "maxLength": 500
+    },
+
+    "homepage": {
+      "type": "string",
+      "format": "uri",
+      "maxLength": 500
+    },
+
+    "docs_url": {
+      "type": "string",
+      "format": "uri",
+      "maxLength": 500
+    },
+
+    "demo_url": {
+      "type": ["string", "null"],
+      "format": "uri",
+      "maxLength": 500
+    },
+
+    "screenshots": {
+      "type": "array",
+      "items": { "type": "string", "maxLength": 500 },
+      "maxItems": 10,
+      "description": "Optional list of relative paths or URLs pointing at preview screenshots."
+    },
+
+    "release_date": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "description": "ISO 8601 date of the release (YYYY-MM-DD)."
+    },
+
+    "stability": {
+      "type": "string",
+      "enum": ["experimental", "beta", "stable", "deprecated"],
+      "default": "stable",
+      "description": "Lifecycle stability tier. Skills in 'deprecated' state remain loadable but are hidden from the / menu."
+    },
+
+    "changelog_url": {
+      "type": "string",
+      "format": "uri",
+      "maxLength": 500
+    },
+
+    "tags": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 32 },
+      "maxItems": 20,
+      "uniqueItems": true
+    },
+
+    "supported_languages": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z]{2}(-[A-Z]{2})?$" },
+      "maxItems": 10,
+      "uniqueItems": true,
+      "description": "ISO 639-1 language codes this skill's instructions are authored in."
+    },
+
+    "i18n": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+          "short_description": { "type": "string", "minLength": 1, "maxLength": 200 },
+          "store_description": { "type": "string", "minLength": 1, "maxLength": 4000 },
+          "usage_notes": { "type": "string", "minLength": 1, "maxLength": 2000 }
+        }
+      },
+      "description": "Optional per-language overrides keyed by ISO 639-1 code. Missing keys fall back to the top-level fields."
+    },
+
+    "compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "peldrun_min_version": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+\\.\\d+$",
+          "description": "Minimum PELDRUN version required by this skill."
+        },
+        "peldrun_max_version": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+\\.\\d+$",
+          "description": "Maximum PELDRUN version supported (inclusive). Omit for open-ended."
+        }
+      }
+    },
+
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "chat_invocable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Skill can be invoked via /<skill-id> from the chat composer."
+        },
+        "agent_assignable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Skill can be assigned to an agent; its instructions are then injected into every agent run for that agent."
+        },
+        "workflow_node": {
+          "type": "boolean",
+          "default": false,
+          "description": "Reserved for future Workflow engine integration. This is a declaration of intent only: it does NOT enable any runtime behavior in the current release."
+        }
+      }
+    },
+
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["instructions"],
+          "default": "instructions",
+          "description": "Execution strategy. The current release supports ONLY 'instructions' — the SKILL.md body is injected verbatim as additional system prompt text. Custom handlers (handler.py) are not executed in this phase."
+        },
+        "instructions_file": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.\\-]+\\.md$",
+          "default": "SKILL.md",
+          "description": "Relative path (within the skill package) to the instructions markdown file. Must not contain directory separators; the instructions file MUST live at the skill package root."
+        },
+        "references_dir": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.\\-]+/?$",
+          "description": "Optional relative directory at the skill root that holds on-demand reference files. Nested traversal is rejected."
+        }
+      }
+    },
+
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_instructions_bytes": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 1048576,
+          "default": 262144,
+          "description": "Hard cap on the size of the instructions file when injected into the prompt. Oversized skills are rejected at load time. Defaults to 256 KiB."
+        }
+      }
+    },
+
+    "settings": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "type": "object",
+          "description": "JSON Schema describing user-configurable settings for this skill. Mirrors the tool manifest's settings.schema. When absent, the skill exposes no user settings."
+        },
+        "defaults": {
+          "type": "object",
+          "description": "Default values applied when a user has not saved any override."
+        },
+        "required": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        }
+      }
+    },
+
+    "examples": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "invocation": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120,
+            "description": "How the user triggers this skill, e.g. '/code_review' or 'assign to code_architect'."
+          },
+          "context": {
+            "type": "string",
+            "maxLength": 1000,
+            "description": "Scenario or preconditions for the example."
+          },
+          "expected_outcome": {
+            "type": "string",
+            "maxLength": 1000,
+            "description": "Short summary of the expected behavior/output."
+          }
+        }
+      }
+    },
+
+    "deprecated": {
+      "type": "boolean",
+      "default": false
+    },
+
+    "deprecation_message": {
+      "type": ["string", "null"],
+      "maxLength": 500
+    },
+
+    "replaces": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_]{2,63}$" },
+      "maxItems": 10,
+      "uniqueItems": true,
+      "description": "Skill IDs this skill supersedes."
+    },
+    "replaced_by": {
+      "type": ["string", "null"],
+      "pattern": "^[a-z0-9][a-z0-9_]{2,63}$",
+      "description": "Skill ID that supersedes this one (used with `deprecated: true`)."
+    }
+  }
+}

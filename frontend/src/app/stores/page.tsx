@@ -13,11 +13,12 @@ import {
   SectionId,
   getSectionMeta,
 } from "./_config/sections";
-import type { AgentFilter, ToolFilter } from "./_types/store";
+import type { AgentFilter, ToolFilter, SkillFilter } from "./_types/store";
 import type { ExtensionDefinition } from "@/lib/types";
 import { useStoreData } from "./_hooks/useStoreData";
 import { useAgentActions } from "./_hooks/useAgentActions";
 import { useToolActions } from "./_hooks/useToolActions";
+import { useSkillActions } from "./_hooks/useSkillActions";
 import { useExtensionActions } from "./_hooks/useExtensionActions";
 import { useBundleActions } from "./_hooks/useBundleActions";
 
@@ -31,12 +32,18 @@ import {
 } from "./_sections/AgentsSection";
 import { ToolsSection, getToolsHeaderConfig } from "./_sections/ToolsSection";
 import {
+  SkillsSection,
+  getSkillsHeaderConfig,
+} from "./_sections/SkillsSection";
+import {
   ExtensionsSection,
   getExtensionsHeaderConfig,
 } from "./_sections/ExtensionsSection";
 
 import { AgentBuilderModal } from "./_modals/AgentBuilderModal";
 import { UploadModal } from "./_modals/UploadModal";
+import { SkillUploadModal } from "./_modals/SkillUploadModal";
+import { SkillDetailsDrawer } from "./_modals/SkillDetailsDrawer";
 import { MCPSettingsModal } from "./_modals/MCPSettingsModal";
 import { MCPToolsModal } from "@/app/stores/_modals/MCPToolsModal";
 import { MCPDetailDrawer } from "./_components/MCPDetailDrawer";
@@ -61,6 +68,7 @@ export default function StoresPage() {
   const [searchQuery, setSearchQuery] = useState("");
   const [agentFilter, setAgentFilter] = useState<AgentFilter>("all");
   const [toolFilter, setToolFilter] = useState<ToolFilter>("all");
+  const [skillFilter, setSkillFilter] = useState<SkillFilter>("all");
 
   // Bundle-specific UI state (drawer + upload modal).
   const [detailsBundle, setDetailsBundle] = useState<BundleEntry | null>(null);
@@ -73,6 +81,8 @@ export default function StoresPage() {
     setAgents,
     tools,
     setTools,
+    skills,
+    setSkills,
     extensions,
     setExtensions,
     bundles,
@@ -83,6 +93,7 @@ export default function StoresPage() {
   // ── Action hooks ────────────────────────────────────────────────
   const agentActions = useAgentActions({ agents, setAgents });
   const toolActions = useToolActions({ tools, setTools, reload });
+  const skillActions = useSkillActions({ skills, setSkills, reload });
   const extensionActions = useExtensionActions({ extensions, setExtensions });
   const bundleActions = useBundleActions({
     reload,
@@ -104,6 +115,7 @@ export default function StoresPage() {
   const counts: Record<SectionId, number> = {
     agents: agents.length,
     tools: tools.length,
+    skills: skills.length,
     extensions: extensions.length,
   };
 
@@ -123,6 +135,11 @@ export default function StoresPage() {
       return getToolsHeaderConfig({
         onInstallBundle: () => setIsBundleUploadOpen(true),
         onUploadSingleFile: () => toolActions.openUploadModal("tool"),
+      });
+    }
+    if (activeSection === "skills") {
+      return getSkillsHeaderConfig({
+        onInstallSkill: skillActions.openUploadModal,
       });
     }
     return getExtensionsHeaderConfig({
@@ -162,6 +179,8 @@ export default function StoresPage() {
             onAgentFilterChange={setAgentFilter}
             toolFilter={toolFilter}
             onToolFilterChange={setToolFilter}
+            skillFilter={skillFilter}
+            onSkillFilterChange={setSkillFilter}
           />
 
           <div className="flex-1 overflow-y-auto scrollbar-thin bg-storbg">
@@ -200,6 +219,20 @@ export default function StoresPage() {
                   onBundleActivate={bundleActions.handleBundleActivate}
                   onBundleDelete={bundleActions.handleBundleDelete}
                   onBundleDetails={setDetailsBundle}
+                />
+              )}
+
+              {activeSection === "skills" && (
+                <SkillsSection
+                  skills={skills}
+                  searchQuery={searchQuery}
+                  skillFilter={skillFilter}
+                  togglingSkillId={skillActions.togglingSkillId}
+                  deletingSkillId={skillActions.deletingSkillId}
+                  onToggleSkill={skillActions.handleToggleSkill}
+                  onDeleteSkill={skillActions.handleDeleteSkill}
+                  onOpenDetails={skillActions.handleOpenDetails}
+                  onOpenUpload={skillActions.openUploadModal}
                 />
               )}
 
@@ -322,6 +355,23 @@ export default function StoresPage() {
         open={extensionActions.isDetailsDrawerOpen}
         extension={extensionActions.detailsExtension}
         onClose={extensionActions.handleCloseDetails}
+      />
+
+      {/* Skill install (.zip) */}
+      <SkillUploadModal
+        open={skillActions.isUploadModalOpen}
+        selectedFile={skillActions.selectedUploadFile}
+        isUploading={skillActions.isUploading}
+        onFileSelect={skillActions.setSelectedUploadFile}
+        onSubmit={skillActions.handleUploadSubmit}
+        onClose={skillActions.closeUploadModal}
+      />
+
+      {/* Skill details drawer */}
+      <SkillDetailsDrawer
+        open={skillActions.isDetailsDrawerOpen}
+        skill={skillActions.detailsSkill}
+        onClose={skillActions.handleCloseDetails}
       />
 
     </div>

@@ -9,13 +9,13 @@ import {
   Info,
   Server,
   Settings,
+  Sparkles,
   Trash2,
   Wrench,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { AgentManifest } from "@/lib/types";
 import { AgentIcon } from "./AgentIcon";
-import { color } from "motion/react";
 
 /* ────────────────────────────────────────────────────────────────
  * Props
@@ -33,22 +33,15 @@ export interface AgentCardProps {
   onOpenSettings?: (agent: AgentManifest) => void;
   onOpenTools?: (agent: AgentManifest) => void;
   onOpenMcp?: (agent: AgentManifest) => void;
+  onOpenSkills?: (agent: AgentManifest) => void;
 }
 
 /* ────────────────────────────────────────────────────────────────
- * Visual constants — the single source of truth for the card layout
+ * Visual constants
  * ──────────────────────────────────────────────────────────────── */
 
-/**
- * Icon slot dimensions. The slot is the outer square that reserves
- * space (prevents layout shift while the SVG loads); the icon itself
- * is drawn at ICON_SIZE inside it.
- *
- * Change these to resize every agent icon in the app — no other file
- * needs editing.
- */
-const ICON_SLOT_SIZE = 66; // px — outer box
-const ICON_SIZE = 66; // px — actual icon rendering size
+const ICON_SLOT_SIZE = 66;
+const ICON_SIZE = 66;
 
 /* ────────────────────────────────────────────────────────────────
  * Manifest helpers
@@ -58,9 +51,7 @@ interface AgentExtraFields {
   core_color?: string;
   settings?: {
     tools_editable?: boolean;
-    schema?: {
-      properties?: Record<string, unknown>;
-    };
+    schema?: { properties?: Record<string, unknown> };
   };
 }
 
@@ -88,21 +79,6 @@ function getCoreColor(agent: AgentManifest): string | undefined {
  * Component
  * ──────────────────────────────────────────────────────────────── */
 
-/**
- * Card representing a single agent in the Agents Hub.
- *
- * Icon rendering contract:
- *   - ``core_color`` (from the manifest) is used ONLY for the subtle
- *     background wash behind the card content. It is never applied to
- *     the icon itself.
- *   - The icon inherits the card's text color via ``currentColor``
- *     (see ``text-foreground`` on the icon slot wrapper). Changing the
- *     surrounding text color changes the icon color automatically —
- *     no per-icon overrides anywhere.
- *   - Icon size is controlled by ``ICON_SIZE`` and ``ICON_SLOT_SIZE``
- *     above. AgentIcon is a pure renderer with no visual decisions of
- *     its own.
- */
 export function AgentCard({
   agent,
   isToggling,
@@ -114,6 +90,7 @@ export function AgentCard({
   onOpenSettings,
   onOpenTools,
   onOpenMcp,
+  onOpenSkills,
 }: AgentCardProps) {
   const isDisabled = agent.status === "disabled";
   const isProtected = agent.id === "peldrun";
@@ -121,16 +98,9 @@ export function AgentCard({
   const showSettings = hasConfigurableSettings(agent) && !!onOpenSettings;
   const showTools = hasEditableTools(agent) && !!onOpenTools;
   const showMcp = !!onOpenMcp;
-  // Read the EFFECTIVE MCP server list — this is what the runtime
-  // will actually bind to the agent after applying the user's
-  // ``disabled_mcp_servers`` / ``extra_mcp_servers`` overrides from
-  // ``agent_settings.json``.
-  //
-  // Fallback to the raw ``mcp_servers`` field for defence in depth:
-  // a backend that has not yet emitted ``effective_mcp_servers``
-  // would otherwise make the badge always show 0 even when the
-  // manifest declares servers. This fallback also keeps pre-Phase-8
-  // agents (custom, older backend, cached client payloads) correct.
+  const showSkills = !!onOpenSkills;
+
+  // Effective MCP server list (see _merge_mcp_state_for_agent).
   const effectiveMcpServers = Array.isArray(agent.effective_mcp_servers)
     ? agent.effective_mcp_servers
     : Array.isArray(agent.mcp_servers)
@@ -138,18 +108,28 @@ export function AgentCard({
     : [];
   const mcpServersCount = effectiveMcpServers.length;
 
+  // Effective skill list — computed the same way as MCP:
+  //   effective_skills = (manifest.skills − disabled_skills) ∪ extra_skills
+  // The backend attaches this field via ``_merge_skills_state_for_agent``
+  // in ``list_agents``. Fallback to ``skills`` for older cached payloads
+  // where the merged list is not yet present.
+  const effectiveSkills = Array.isArray((agent as any).effective_skills)
+    ? (agent as any).effective_skills
+    : Array.isArray((agent as any).skills)
+    ? (agent as any).skills
+    : [];
+  const skillsCount = effectiveSkills.length;
+
   return (
     <div
       className={`group relative text-black hover:text-[#fff] flex flex-col justify-between p-5 rounded-sm
         border border-t-[2px] transition-all duration-200 shadow-md hover:shadow-sm overflow-hidden ${
-        isDisabled
-          ? "bg-muted/30 border-border/60 opacity-80 hover:bg-black/25 !border-t-black"
-          : "bg-card hover:border-card/50"
-      }`}
-
+          isDisabled
+            ? "bg-muted/30 border-border/60 opacity-80 hover:bg-black/25 !border-t-black"
+            : "bg-card hover:border-card/50"
+        }`}
       style={{ borderTopColor: coreColor }}
     >
-      {/* ── core_color wash (decorative background) ────────────── */}
       {!isDisabled && coreColor && (
         <div
           className="absolute border-t-[5px] inset-0 pointer-events-none opacity-[0.08] group-hover:opacity-[0.8] transition-opacity"
@@ -159,14 +139,9 @@ export function AgentCard({
       )}
 
       <div className="relative">
-        {/* ── Header row: icon + name + toggle ─────────────────── */}
+        {/* Header row */}
         <div className="flex items-start justify-between mb-3.5">
-          <div className="flex items-center gap-3 min-w-0  text-inherit ">
-            {/* Icon slot — controls size AND text color.
-                `text-foreground` is what the icon inherits via
-                currentColor. To tint the icon differently per-theme
-                (or per-state), change this class — no other file
-                needs editing. */}
+          <div className="flex items-center gap-3 min-w-0 text-inherit">
             <div
               className="shrink-0 flex items-center justify-center text-inherit group-hover:scale-105 transition-transform"
               style={{
@@ -211,7 +186,7 @@ export function AgentCard({
           )}
         </div>
 
-        {/* ── Badges ───────────────────────────────────────────── */}
+        {/* Badges */}
         <div className="flex items-center gap-2 mb-3">
           {agent.is_builtin ? (
             <span className="px-2 py-0.5 rounded-sm text-[10px] font-mono uppercase font-semibold bg-card border border-sky-500/30 text-sky-700 dark:text-sky-300">
@@ -233,23 +208,37 @@ export function AgentCard({
           </span>
         </div>
 
-        {/* ── Description ──────────────────────────────────────── */}
+        {/* Description */}
         <p className="text-xs text-inherit line-clamp-2 mb-4 leading-relaxed">
           {agent.description || "Custom configured autonomous specialist."}
         </p>
 
-        {/* ── Scoped tools ─────────────────────────────────────── */}
+        {/* Scoped tools + counts */}
         <div className="mb-4">
           <div className="flex items-center justify-between mb-1.5">
             <span className="text-[10px] uppercase font-semibold text-inherit tracking-wider block">
               Scoped Tools ({agent.tools?.length || 0})
             </span>
-            {mcpServersCount > 0 && (
-              <span className="text-[10px] font-mono text-primary flex items-center gap-1 font-semibold">
-                <Server size={10} />
-                {mcpServersCount} MCP
-              </span>
-            )}
+            <div className="flex items-center gap-2">
+              {mcpServersCount > 0 && (
+                <span
+                  className="text-[10px] font-mono text-primary flex items-center gap-1 font-semibold"
+                  title={`${mcpServersCount} MCP server(s) bound`}
+                >
+                  <Server size={10} />
+                  {mcpServersCount} MCP
+                </span>
+              )}
+              {skillsCount > 0 && (
+                <span
+                  className="text-[10px] font-mono text-primary flex items-center gap-1 font-semibold"
+                  title={`${skillsCount} skill(s) assigned`}
+                >
+                  <Sparkles size={10} />
+                  {skillsCount} Skill{skillsCount === 1 ? "" : "s"}
+                </span>
+              )}
+            </div>
           </div>
           <div className="flex flex-wrap gap-1.5 max-h-16 overflow-y-auto scrollbar-none">
             {agent.tools && agent.tools.length > 0 ? (
@@ -270,7 +259,7 @@ export function AgentCard({
         </div>
       </div>
 
-      {/* ── Footer actions ─────────────────────────────────────── */}
+      {/* Footer actions */}
       <div className="relative pt-3.5 border-t border-border flex items-center justify-between">
         <div className="flex items-center gap-1">
           {onViewDetails && (
@@ -294,6 +283,18 @@ export function AgentCard({
               aria-label="Configure agent tools"
             >
               <Wrench size={13} />
+            </button>
+          )}
+
+          {showSkills && (
+            <button
+              type="button"
+              onClick={() => onOpenSkills!(agent)}
+              className="p-1.5 rounded-lg hover:bg-muted text-inherit hover:text-primary transition cursor-pointer"
+              title="Configure agent skills"
+              aria-label="Configure agent skills"
+            >
+              <Sparkles size={13} />
             </button>
           )}
 

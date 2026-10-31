@@ -67,6 +67,7 @@ from omweb.routers import (
     runtime_settings_rtr,
     search_rtr,
     setup,
+    skills as skills_rtr,
     source_control,
     status,
     storage,
@@ -118,6 +119,42 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.error(
             "Failed to start ResourceMonitorService on startup: %s",
+            exc,
+            exc_info=True,
+        )
+
+    # 1b. Skills subsystem: clean up any leftover staging or trash
+    # directories from a previous run that crashed mid-install.
+    # Runs synchronously (fast) and swallows errors — a cleanup
+    # failure must never block startup.
+    try:
+        from omweb.skills.manager import skill_manager
+
+        cleanup_report = skill_manager.cleanup_orphans()
+        logger.info(
+            "Skill subsystem cleanup on startup: %s",
+            cleanup_report,
+        )
+        # Prime the registry so the first request sees a warm cache
+        # and any broken packages surface in the startup log.
+        try:
+            skill_manager.list_skills()
+            broken = skill_manager.list_broken_skills()
+            if broken:
+                logger.warning(
+                    "Skills subsystem reports %d broken package(s) "
+                    "on startup: %s",
+                    len(broken),
+                    list(broken.keys()),
+                )
+        except Exception as warm_err:  # noqa: BLE001 — best-effort
+            logger.warning(
+                "Skill registry warm-up failed on startup: %s",
+                warm_err,
+            )
+    except Exception as exc:
+        logger.warning(
+            "Skill subsystem initialization failed on startup: %s",
             exc,
             exc_info=True,
         )
@@ -272,6 +309,11 @@ app.include_router(
     store_bundles.router,
     prefix="/api/store/tools",
     tags=["store", "bundles"],
+)
+app.include_router(
+    skills_rtr.router,
+    prefix="/api/skills",
+    tags=["skills"],
 )
 app.include_router(telemetry.router, prefix="/api/telemetry", tags=["telemetry"])
 
