@@ -8,15 +8,241 @@ Provides strictly typed, immutable-friendly execution state models with Pydantic
 
 from __future__ import annotations
 
+import base64
 import copy
+import hashlib
 import logging
 import time
 import uuid
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Union
 from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger("peldrun.engine.state")
+
+
+# ---------------------------------------------------------------------------
+# Multimodal image stripping helpers for snapshot persistence
+# ---------------------------------------------------------------------------
+# Checkpoints and DB state dumps must not embed base64 image payloads.
+# A single checkpoint would otherwise be megabytes; 30 steps would be
+# hundreds of megabytes per run, and every persisted run would carry a
+# duplicate of the same image data. See:
+#
+#   _strip_image_data_from_snapshot()  — data: URI → artifact-cache://<hash>
+#   _reinflate_image_data_from_snapshot()  — reverse, with cache miss fallback
+#
+# Cache layout:
+#   <storage_root>/artifacts/checkpoint_cache/<sha256_16>.png
+#
+# The 16-hex-digit prefix of the SHA-256 hash provides 64 bits of collision
+# resistance — sufficient for deduplicating images across hundreds of runs.
+# Files are content-addressed, so two uploads of the same screenshot share
+# one cache file regardless of fileId.
+# ---------------------------------------------------------------------------
+
+
+def _get_checkpoint_cache_dir() -> Path:
+    """
+    Return the checkpoint image cache directory, creating it if needed.
+
+    Lazily resolved so importing ``peldrun.engine.state`` remains cheap
+    and side-effect-free (matters for CLI tools that only touch
+    ``ExecutionStatus``).
+    """
+    try:
+        from peldrun.storage_paths import get_storage_root
+
+        cache_dir = get_storage_root() / "artifacts" / "checkpoint_cache"
+    except Exception:
+        # Fallback — should never happen in production, but a broken
+        # storage_paths import must not break the agent loop.
+        cache_dir = Path(".peldrun") / "artifacts" / "checkpoint_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def _hash_image_bytes(raw_bytes: bytes) -> str:
+    """Return a 16-hex-digit SHA-256 prefix for content-addressing."""
+    return hashlib.sha256(raw_bytes).hexdigest()[:16]
+
+
+def _mime_to_ext(mime: str) -> str:
+    """Map an image MIME type to a cache-friendly file extension."""
+    return {
+        "image/png": "png",
+        "image/jpeg": "jpg",
+        "image/jpg": "jpg",
+        "image/webp": "webp",
+        "image/gif": "gif",
+    }.get(mime.lower(), "png")
+
+
+def _ext_to_mime(ext: str) -> str:
+    """Inverse of ``_mime_to_ext``."""
+    return {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "webp": "image/webp",
+        "gif": "image/gif",
+    }.get(ext.lower(), "image/png")
+
+
+def _strip_image_data_from_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Replace inline ``data:image/...;base64,...`` URLs in every message
+    with short ``artifact-cache://<hash>.<ext>`` references, writing the
+    raw image bytes to the content-addressed cache.
+
+    Non-``data:`` URLs (e.g. ``http(s)://``, already-stripped
+    ``artifact-cache://``) are left untouched, so the function is
+    idempotent and safe to call on partially-stripped snapshots.
+
+    Mutates ``snapshot`` in place for efficiency but returns it for
+    chaining convenience.
+    """
+    messages = snapshot.get("messages")
+    if not isinstance(messages, list):
+        return snapshot
+
+    cache_dir = _get_checkpoint_cache_dir()
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") != "image_url":
+                continue
+            img_payload = part.get("image_url")
+            if not isinstance(img_payload, dict):
+                continue
+            url = img_payload.get("url")
+            if not isinstance(url, str) or not url.startswith("data:image/"):
+                continue
+            if ";base64," not in url:
+                continue
+
+            # Parse the mime out of "data:image/png;base64,...."
+            try:
+                header, b64_data = url.split(";base64,", 1)
+                mime = header.split(":", 1)[1] if ":" in header else "image/png"
+                raw_bytes = base64.b64decode(b64_data)
+            except Exception:
+                # Corrupt payload — leave as-is so the checkpoint still
+                # reflects the data, just bigger. Better than dropping it.
+                continue
+
+            hash_id = _hash_image_bytes(raw_bytes)
+            ext = _mime_to_ext(mime)
+            cache_path = cache_dir / f"{hash_id}.{ext}"
+
+            # Content-addressed: existing file is authoritative, do not
+            # overwrite (concurrent writers produce identical bytes by
+            # definition of the hash, so a race is benign).
+            if not cache_path.exists():
+                try:
+                    cache_path.write_bytes(raw_bytes)
+                except Exception as exc:
+                    logger.debug(
+                        "checkpoint cache write failed for %s: %s",
+                        cache_path,
+                        exc,
+                    )
+                    # Continue anyway — the reference will fail at
+                    # inflate time and produce a cache-miss placeholder.
+
+            img_payload["url"] = f"artifact-cache://{hash_id}.{ext}"
+
+    return snapshot
+
+
+def _reinflate_image_data_from_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Reverse ``_strip_image_data_from_snapshot``: convert every
+    ``artifact-cache://<hash>.<ext>`` URL back into a full data URI by
+    reading the cached bytes.
+
+    Cache misses (e.g. cache cleaned up, or written on a different
+    machine) are replaced with a placeholder text URL. The LLM provider
+    rejects invalid ``image_url`` payloads with a 400 error, so we swap
+    the entire part for a text placeholder rather than sending a broken
+    URL. This keeps the agent functional (it simply loses the historical
+    image) instead of aborting the resumed run.
+
+    Non-``artifact-cache://`` URLs are left untouched.
+    """
+    messages = snapshot.get("messages")
+    if not isinstance(messages, list):
+        return snapshot
+
+    cache_dir = _get_checkpoint_cache_dir()
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+
+        # Rebuild content in place so cache-miss placeholders can be
+        # swapped from image_url parts to text parts.
+        new_content: List[Any] = []
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                new_content.append(part)
+                continue
+
+            img_payload = part.get("image_url")
+            if not isinstance(img_payload, dict):
+                new_content.append(part)
+                continue
+
+            url = img_payload.get("url")
+            if not isinstance(url, str) or not url.startswith("artifact-cache://"):
+                new_content.append(part)
+                continue
+
+            filename = url.replace("artifact-cache://", "", 1)
+            # Reject path traversal in a persisted snapshot — the hash
+            # is hex, so any separator is a corruption/tampering signal.
+            if "/" in filename or "\\" in filename or ".." in filename:
+                new_content.append(
+                    {"type": "text", "text": "[image evicted: corrupt cache ref]"}
+                )
+                continue
+
+            cache_path = cache_dir / filename
+            if not cache_path.is_file():
+                new_content.append(
+                    {"type": "text", "text": "[image evicted: cache miss]"}
+                )
+                continue
+
+            try:
+                raw_bytes = cache_path.read_bytes()
+                b64 = base64.b64encode(raw_bytes).decode("ascii")
+                ext = filename.rsplit(".", 1)[-1] if "." in filename else "png"
+                mime = _ext_to_mime(ext)
+                img_payload["url"] = f"data:{mime};base64,{b64}"
+                new_content.append(part)
+            except Exception as exc:
+                logger.debug(
+                    "checkpoint cache read failed for %s: %s", cache_path, exc
+                )
+                new_content.append(
+                    {"type": "text", "text": "[image evicted: unreadable cache]"}
+                )
+
+        msg["content"] = new_content
+
+    return snapshot
 
 
 class ExecutionStatus(str, Enum):
@@ -527,11 +753,24 @@ class ExecutionState(BaseModel):
 
     # ----------------------------------------------------------- checkpointing
     def create_checkpoint(self) -> Checkpoint:
-        """Create and append an immutable snapshot of the current state."""
+        """Create and append an immutable snapshot of the current state.
+
+        Multimodal image data (base64 payloads) is stripped from the
+        checkpoint's ``state_dump`` and replaced with content-addressed
+        ``artifact-cache://<hash>`` references. This bounds the size of
+        every checkpoint to kilobytes regardless of how many images the
+        turn carries.
+
+        The live state (``self.messages``) is **not** modified — the
+        full data URIs remain available for the next LLM call. Only the
+        on-disk / in-memory ``checkpoints`` list is compacted, because
+        checkpoints are historical records, not live payloads.
+        """
         raw_dump = self.model_dump(mode="json", exclude={"checkpoints"})
+        stripped_dump = _strip_image_data_from_snapshot(raw_dump)
         checkpoint = Checkpoint(
             step=self.current_step,
-            state_dump=copy.deepcopy(raw_dump),
+            state_dump=copy.deepcopy(stripped_dump),
         )
         self.checkpoints.append(checkpoint)
         return checkpoint
@@ -550,13 +789,67 @@ class ExecutionState(BaseModel):
         return True
 
     # ---------------------------------------------------------- serialization
-    def to_snapshot_dict(self) -> Dict[str, Any]:
-        """Serialize current state to plain JSON-compatible dict."""
-        return self.model_dump(mode="json", exclude={"checkpoints"})
+    def to_snapshot_dict(self, strip_images: bool = False) -> Dict[str, Any]:
+        """
+        Serialize current state to a plain JSON-compatible dict.
+
+        Parameters
+        ----------
+        strip_images : bool
+            When ``True``, every inline ``data:image/...;base64,...`` URL
+            inside message content is replaced with a compact
+            ``artifact-cache://<hash>.<ext>`` reference, and the raw
+            bytes are written to the content-addressed checkpoint cache.
+            This shrinks the serialized snapshot from megabytes to
+            kilobytes for any turn that contains images.
+
+            Callers persisting the snapshot to disk (checkpoint JSON,
+            SQLite ``runs.state_json``) MUST pass ``strip_images=True``.
+            Callers that need the full payload (rare — usually only
+            tests and in-memory diagnostics) keep the default ``False``.
+
+        Returns
+        -------
+        Dict[str, Any]
+            JSON-serializable snapshot, ready for ``json.dumps``.
+        """
+        data = self.model_dump(mode="json", exclude={"checkpoints"})
+        if strip_images:
+            data = _strip_image_data_from_snapshot(data)
+        return data
 
     @classmethod
-    def from_snapshot_dict(cls, data: Dict[str, Any]) -> "ExecutionState":
-        """Reconstruct an ExecutionState from a dumped snapshot."""
+    def from_snapshot_dict(
+        cls,
+        data: Dict[str, Any],
+        inflate_images: bool = False,
+    ) -> "ExecutionState":
+        """
+        Reconstruct an ExecutionState from a dumped snapshot.
+
+        Parameters
+        ----------
+        data : Dict[str, Any]
+            Snapshot produced by ``to_snapshot_dict``.
+
+        inflate_images : bool
+            When ``True``, every ``artifact-cache://<hash>.<ext>``
+            reference inside message content is resolved back into a
+            full ``data:image/...;base64,...`` URI by reading the
+            cached bytes. Cache misses are replaced with a text
+            placeholder so the resumed run can continue with the
+            historical image missing rather than aborting.
+
+            Callers loading a snapshot from disk (checkpoint JSON,
+            SQLite ``runs.state_json``) MUST pass ``inflate_images=True``
+            so the restored state matches what the LLM expects.
+        """
+        if inflate_images:
+            # Deep-copy so we never mutate the caller's dict — some
+            # callers (e.g. ``checkpoint.arestore_state``) cache the
+            # original snapshot for later re-use.
+            data = copy.deepcopy(data)
+            _reinflate_image_data_from_snapshot(data)
         return cls(**data)
 
     # -------------------------------------------------------------------- llm

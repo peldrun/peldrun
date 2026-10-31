@@ -110,6 +110,33 @@ async def lifespan(app: FastAPI):
             exc_info=True,
         )
 
+    # 2. Start the periodic temp-artifact cleaner.
+    #
+    # Sweeps ``storage/artifacts/temp/`` every 6 hours and on startup,
+    # deleting files older than 24 hours. Reclaims the space occupied
+    # by pasted screenshots of past conversations — the workspace copy
+    # under ``<chat_files>/.peldrun/user_uploads/`` remains the
+    # authoritative fallback, so removing the temp file after 24h
+    # cannot break any in-flight or recently-resumed run.
+    #
+    # Enabled/disabled via PELDRUN_TEMP_CLEANUP_ENABLED (default "1").
+    # Interval and threshold overridable via
+    # PELDRUN_TEMP_CLEANUP_INTERVAL_HOURS (default "6") and
+    # PELDRUN_TEMP_CLEANUP_MAX_AGE_HOURS (default "24").
+    try:
+        from omweb.services.temp_artifacts_cleaner import (
+            temp_artifacts_cleaner,
+        )
+
+        await temp_artifacts_cleaner.start()
+        logger.info("TempArtifactsCleaner started cleanly on startup.")
+    except Exception as exc:
+        logger.warning(
+            "Failed to start TempArtifactsCleaner on startup: %s",
+            exc,
+            exc_info=True,
+        )
+
     yield
 
     # 1. Terminate active MCP subprocesses BEFORE anything else.
@@ -137,7 +164,24 @@ async def lifespan(app: FastAPI):
             "Failed to close McpSessionPool on shutdown: %s", exc
         )
 
-    # 2. Shutdown Resource Monitor subsystem
+    # 2. Stop the temp-artifact cleaner.
+    #
+    # Cheap (cancel task + await), so it runs before Resource Monitor
+    # shutdown. Placed here rather than last so its log line appears
+    # before the heavier subsystem shutdowns, keeping logs readable.
+    try:
+        from omweb.services.temp_artifacts_cleaner import (
+            temp_artifacts_cleaner,
+        )
+
+        await temp_artifacts_cleaner.stop()
+        logger.info("TempArtifactsCleaner stopped cleanly on shutdown.")
+    except Exception as exc:
+        logger.warning(
+            "Failed to stop TempArtifactsCleaner on shutdown: %s", exc
+        )
+
+    # 3. Shutdown Resource Monitor subsystem
     try:
         from omweb.services.resource_monitor_service import (
             get_resource_monitor_service,

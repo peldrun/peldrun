@@ -64,7 +64,13 @@ class CheckpointManager:
             step=state.current_step,
             label=label,
             file_path=str(file_path),
-            state_data=state.to_snapshot_dict(),
+            # [FIX-CHECKPOINT-OPT] strip_images=True: inline base64 image
+            # payloads are replaced with artifact-cache://<hash> references
+            # and the raw bytes are written to the content-addressed cache.
+            # Without this, each checkpoint would be megabytes on disk and
+            # the run's checkpoint directory would grow to hundreds of
+            # megabytes for any multimodal turn.
+            state_data=state.to_snapshot_dict(strip_images=True),
         )
 
         with open(file_path, "w", encoding="utf-8") as f:
@@ -106,7 +112,14 @@ class CheckpointManager:
         await self.ainitialize()
         for cp in self._checkpoints:
             if cp.id == checkpoint_id:
-                return ExecutionState.from_snapshot_dict(cp.state_data)
+                # [FIX-CHECKPOINT-OPT] inflate_images=True: every
+                # artifact-cache://<hash> reference is resolved back to a
+                # full data URI from the content-addressed cache. Cache
+                # misses become text placeholders so the resumed run
+                # continues with the image elided rather than aborting.
+                return ExecutionState.from_snapshot_dict(
+                    cp.state_data, inflate_images=True
+                )
 
         # Fallback to durable RunStore search
         try:
@@ -120,7 +133,10 @@ class CheckpointManager:
             )
             row = cursor.fetchone()
             if row:
-                return ExecutionState.from_snapshot_dict(json.loads(row["state_dump_json"]))
+                return ExecutionState.from_snapshot_dict(
+                    json.loads(row["state_dump_json"]),
+                    inflate_images=True,
+                )
         except Exception:
             pass
 

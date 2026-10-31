@@ -225,7 +225,21 @@ export function useSseStream(params: UseSseStreamParams) {
           payload.data?.thought ??
           payload.data?.content ??
           payload.data;
-        if (safeRender(raw).trim() !== "") {
+        const rendered = safeRender(raw);
+
+        // [STREAMING-AGENT] Whitespace handling is asymmetric:
+        //   * Deltas MUST be preserved verbatim, including pure
+        //     whitespace tokens (" ", "\n"), because concatenating
+        //     deltas without them corrupts word boundaries
+        //     ("hello" + "world" → "helloworld"). We accept any
+        //     non-empty string.
+        //   * Non-deltas are typically complete thoughts; we skip
+        //     whitespace-only noise to avoid empty timeline entries.
+        const shouldProcess = isDelta
+          ? rendered.length > 0
+          : rendered.trim() !== "";
+
+        if (shouldProcess) {
           if (isDelta) {
             ctx.setSteps((prev) => {
               const lastIdx = prev.length - 1;
@@ -237,7 +251,7 @@ export function useSseStream(params: UseSseStreamParams) {
                 const updated = [...prev];
                 updated[lastIdx] = {
                   ...updated[lastIdx],
-                  content: updated[lastIdx].content + safeRender(raw),
+                  content: updated[lastIdx].content + rendered,
                 };
                 return updated;
               }
@@ -247,7 +261,7 @@ export function useSseStream(params: UseSseStreamParams) {
                   id: `thought-${step}-${Date.now()}`,
                   step,
                   type: "thought",
-                  content: safeRender(raw),
+                  content: rendered,
                   timestamp: new Date().toLocaleTimeString(),
                 },
               ];
@@ -260,7 +274,7 @@ export function useSseStream(params: UseSseStreamParams) {
             [`active-${step}`]: true,
           }));
           if (!isDelta) {
-            logEntry(`[${logTimestamp}] [THOUGHT] ${safeRender(raw)}`);
+            logEntry(`[${logTimestamp}] [THOUGHT] ${rendered}`);
           }
         }
         if (payload.data?.tokens) ctx.setTokensUsed(payload.data.tokens);

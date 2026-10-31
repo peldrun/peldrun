@@ -20,6 +20,7 @@ import inspect
 import json
 import logging
 from pathlib import Path
+import time
 from typing import Any, Dict, List, Optional, Union
 import uuid
 
@@ -225,6 +226,40 @@ class ToolCallAgent(BaseAgent):
         """
         Execute cognitive reasoning phase with decoupled transient LLM retries.
         Explicitly propagates reasoning_effort from provider configuration to execution loop.
+
+        Real token-by-token streaming
+        -----------------------------
+        The LLM provider (``AsyncLLMClient.chat_completion``) exposes
+        ``on_chunk`` and ``on_thought_chunk`` callbacks that fire once per
+        generated token. This method wires those callbacks so that each
+        delta is emitted as ``EventType.THOUGHT`` with ``is_delta=True``,
+        letting the frontend render the reasoning **live** inside
+        ``ChatTimeline`` (the same experience as Chat mode's
+        ``finalResult`` bubble).
+
+        Buffering strategy
+        ------------------
+        Raw per-token SSE events would produce ~500 events per turn, each
+        persisted to ``run_store`` (SQLite) and forwarded over SSE —
+        significant overhead for what is visually indistinguishable from a
+        coarser cadence. We therefore batch deltas into a small buffer and
+        flush when EITHER:
+
+          * the buffer accumulates ``_STREAM_FLUSH_CHARS`` characters, OR
+          * ``_STREAM_FLUSH_INTERVAL`` seconds have elapsed since the last
+            flush.
+
+        At typical LLM speeds (~30 tok/s, ~4 chars/token) this yields
+        ~20-40 flushes per turn — smooth visually, an order of magnitude
+        cheaper than raw token events.
+
+        Non-streaming fallback
+        ----------------------
+        ``AsyncLLMClient`` may fall back to a non-streaming completion
+        (SDK init failure, empty stream). In that case ``on_chunk`` is
+        never invoked. We detect this via ``_streamed_any`` and emit the
+        full content as a single non-delta thought so the timeline still
+        reflects the reasoning.
         """
         tools_schema = self._get_tools_schema()
 
@@ -243,6 +278,93 @@ class ToolCallAgent(BaseAgent):
         if effort_val:
             extra_call_params["reasoning_effort"] = effort_val
 
+        # ──────────────────────────────────────────────────────────────
+        # Streaming buffer state (local to this think() invocation)
+        #
+        # Tuning knobs (env vars, no code changes needed at runtime):
+        #   PELDRUN_STREAM_FLUSH_INTERVAL — seconds between forced flushes
+        #     Default 0.05 (50 ms). Raise to 0.10 on fast models (>100 tok/s)
+        #     to halve SQLite/SSE write volume while remaining visually
+        #     indistinguishable to the user.
+        #   PELDRUN_STREAM_FLUSH_CHARS — minimum buffered chars before flush
+        #     Default 20. Raise to 40 to reduce event count proportionally.
+        #
+        # Both values are read fresh on every think() call so the operator
+        # can adjust them without restarting the process (e.g. via a
+        # supervisor that updates os.environ).
+        # ──────────────────────────────────────────────────────────────
+        import os as _os_env
+        try:
+            _STREAM_FLUSH_INTERVAL = float(
+                _os_env.environ.get("PELDRUN_STREAM_FLUSH_INTERVAL", "0.05")
+            )
+        except (TypeError, ValueError):
+            _STREAM_FLUSH_INTERVAL = 0.05
+        try:
+            _STREAM_FLUSH_CHARS = int(
+                _os_env.environ.get("PELDRUN_STREAM_FLUSH_CHARS", "20")
+            )
+        except (TypeError, ValueError):
+            _STREAM_FLUSH_CHARS = 20
+
+        # Clamp to sane bounds — protects against pathological env values
+        # (e.g. PELDRUN_STREAM_FLUSH_CHARS=0 would break batching; =10000
+        # would make the stream feel choppy).
+        _STREAM_FLUSH_INTERVAL = max(0.01, min(1.0, _STREAM_FLUSH_INTERVAL))
+        _STREAM_FLUSH_CHARS = max(5, min(200, _STREAM_FLUSH_CHARS))
+
+        _stream_buffer: List[str] = []
+        _streamed_any = False
+        _last_flush = time.monotonic()
+
+        async def _flush_deltas(force: bool = False) -> None:
+            nonlocal _last_flush, _streamed_any
+            if not _stream_buffer:
+                return
+            now = time.monotonic()
+            pending_len = sum(len(x) for x in _stream_buffer)
+            should_flush = (
+                force
+                or pending_len >= _STREAM_FLUSH_CHARS
+                or (now - _last_flush) >= _STREAM_FLUSH_INTERVAL
+            )
+            if not should_flush:
+                return
+            payload_text = "".join(_stream_buffer)
+            _stream_buffer.clear()
+            _last_flush = now
+            _streamed_any = True
+            try:
+                await self._emit(
+                    EventType.THOUGHT,
+                    step=step,
+                    payload={
+                        "thought": payload_text,
+                        "content": payload_text,
+                        "is_delta": True,
+                    },
+                )
+            except Exception as flush_err:
+                # A failed flush must never abort the generation loop;
+                # the user sees a slightly larger next flush instead.
+                logger.debug(
+                    "Streaming flush failed for step %d: %s", step, flush_err
+                )
+
+        async def _on_chunk(delta_text: str) -> None:
+            """Content-token callback from AsyncLLMClient."""
+            if not delta_text:
+                return
+            _stream_buffer.append(delta_text)
+            await _flush_deltas()
+
+        async def _on_thought_chunk(delta_text: str) -> None:
+            """Reasoning-token callback from AsyncLLMClient (e.g. R1 models)."""
+            if not delta_text:
+                return
+            _stream_buffer.append(delta_text)
+            await _flush_deltas()
+
         async def _call_llm(msgs: List[Dict[str, Any]]) -> LLMResponse:
             if hasattr(self.llm, "generate"):
                 return await self.llm.generate(
@@ -250,6 +372,8 @@ class ToolCallAgent(BaseAgent):
                     tools=tools_schema if tools_schema else None,
                     tool_choice="auto",
                     temperature=0.2,
+                    on_chunk=_on_chunk,
+                    on_thought_chunk=_on_thought_chunk,
                     **extra_call_params,
                 )
             elif hasattr(self.llm, "chat_completion"):
@@ -258,6 +382,8 @@ class ToolCallAgent(BaseAgent):
                     tools=tools_schema if tools_schema else None,
                     tool_choice="auto",
                     temperature=0.2,
+                    on_chunk=_on_chunk,
+                    on_thought_chunk=_on_thought_chunk,
                     **extra_call_params,
                 )
             elif hasattr(self.llm, "chat_complete"):
@@ -265,6 +391,8 @@ class ToolCallAgent(BaseAgent):
                     messages=msgs,
                     tools=tools_schema if tools_schema else None,
                     temperature=0.2,
+                    on_chunk=_on_chunk,
+                    on_thought_chunk=_on_thought_chunk,
                     **extra_call_params,
                 )
             else:
@@ -314,9 +442,31 @@ class ToolCallAgent(BaseAgent):
 
                 raise last_llm_exc
 
+        # ──────────────────────────────────────────────────────────────
+        # Final flush: push any residual buffered text (incomplete last
+        # word / sentence) so the timeline reflects the full generation.
+        # ──────────────────────────────────────────────────────────────
+        await _flush_deltas(force=True)
+
         thought_val = response.reasoning or response.thought or response.content or ""
-        if thought_val:
-            await self._emit(EventType.THOUGHT, step=step, payload={"thought": thought_val})
+
+        # ──────────────────────────────────────────────────────────────
+        # Non-streaming fallback:
+        # If the provider never invoked on_chunk (e.g. AsyncLLMClient
+        # fell back to stream=False after a transport error), emit the
+        # full content as a single non-delta thought so the timeline is
+        # not empty.
+        # ──────────────────────────────────────────────────────────────
+        if thought_val and not _streamed_any:
+            await self._emit(
+                EventType.THOUGHT,
+                step=step,
+                payload={
+                    "thought": thought_val,
+                    "content": thought_val,
+                    "is_delta": False,
+                },
+            )
 
         return response
 

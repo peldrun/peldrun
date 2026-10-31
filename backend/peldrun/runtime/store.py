@@ -210,7 +210,16 @@ class SqliteRunStore:
 
     def _sync_save_state(self, run_id: str, state: ExecutionState) -> None:
         conn = self._get_connection()
-        dump_str = json.dumps(state.to_snapshot_dict(), ensure_ascii=False)
+        # [FIX-CHECKPOINT-OPT] strip_images=True: the ``runs.state_json``
+        # column is overwritten on every step and re-read on resume. Without
+        # stripping, a multimodal turn would grow the SQLite row by
+        # ``n_steps × image_bytes × 1.37`` (base64 overhead) — tens of MB
+        # per run, dwarfing all other tables. With stripping, each row stays
+        # in the low kilobytes.
+        dump_str = json.dumps(
+            state.to_snapshot_dict(strip_images=True),
+            ensure_ascii=False,
+        )
         now = time.time()
         with conn:
             conn.execute(
@@ -236,7 +245,11 @@ class SqliteRunStore:
             return None
         try:
             data = json.loads(row["state_json"])
-            return ExecutionState.from_snapshot_dict(data)
+            # [FIX-CHECKPOINT-OPT] inflate_images=True resolves every
+            # artifact-cache://<hash> reference back to a full data URI.
+            # Cache misses become text placeholders so the resumed run
+            # continues with the historical image elided.
+            return ExecutionState.from_snapshot_dict(data, inflate_images=True)
         except Exception as ex:
             logger.error("Failed to reconstruct ExecutionState for run %s: %s", run_id, ex)
             return None

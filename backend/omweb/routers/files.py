@@ -10,6 +10,7 @@ Hardened under Phase M2 & Release Bug Fixes:
 import base64
 import os
 import shutil
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -40,6 +41,167 @@ SYSTEM_FILES = {"events.json", "session.json", "project.json", ".gitkeep", ".ds_
 # human-inspectable.
 TEMP_ARTIFACTS_DIR = STORAGE_DIR / "artifacts" / "temp"
 TEMP_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Content-addressed image cache written by
+# ``peldrun.engine.state._strip_image_data_from_snapshot``. Every
+# checkpoint that contains a base64 image stores only a
+# ``artifact-cache://<sha256_16>.<ext>`` reference; the raw bytes live
+# here, deduplicated across all checkpoints and all runs.
+#
+# Cleaned by ``cleanup_temp_artifacts`` under the same age threshold as
+# the temp store: 24 hours old checkpoints are no longer useful for
+# resume, and the image cache can be reclaimed in lockstep.
+CHECKPOINT_CACHE_DIR = STORAGE_DIR / "artifacts" / "checkpoint_cache"
+CHECKPOINT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Temporary artifact cleanup
+# ---------------------------------------------------------------------------
+# Temp artifacts are uploaded images and screenshots referenced by
+# ``fileId`` during a run. They are intentionally short-lived: once the
+# turn is finished, the workspace copy under
+# ``<chat_files>/.peldrun/user_uploads/`` is the authoritative fallback,
+# so the temp file only needs to survive long enough for the running
+# turn to finish.
+#
+# Without periodic cleanup the temp store grows unbounded — every pasted
+# screenshot of every conversation stays on disk forever. The endpoint
+# and helper below reclaim that space automatically.
+TEMP_ARTIFACT_MAX_AGE_HOURS_DEFAULT: float = 24.0
+TEMP_ARTIFACT_CLEANUP_INTERVAL_SECONDS_DEFAULT: float = 6 * 3600.0  # 6h
+
+
+def cleanup_temp_artifacts(
+    older_than_hours: float = TEMP_ARTIFACT_MAX_AGE_HOURS_DEFAULT,
+) -> Dict[str, Any]:
+    """
+    Delete temp artifacts whose last-modified timestamp is older than
+    ``older_than_hours``.
+
+    Design notes
+    ------------
+    * Only files directly inside ``TEMP_ARTIFACTS_DIR`` are considered.
+      The directory is flat by construction (``upload-temp`` writes
+      ``<fileId>`` at its root), so recursion is unnecessary and would
+      only widen the attack surface.
+    * The mtime — not atime — is used as the age signal, because atime
+      may be disabled by ``noatime`` mounts and would therefore never
+      advance.
+    * Files still being written by a concurrent upload are protected
+      implicitly: their mtime is refreshed on every chunk write, so they
+      will never fall below the threshold mid-upload.
+    * Errors on individual files (permission, transient locks) are
+      collected and returned rather than aborting the sweep. A single
+      stuck file must not block cleanup of the rest.
+
+    Returns
+    -------
+    dict
+        Report shape::
+
+            {
+                "scanned": int,            # files examined
+                "deleted_count": int,      # files removed
+                "kept_count": int,         # files still fresh
+                "deleted_bytes": int,      # total bytes reclaimed
+                "kept_bytes": int,         # total bytes still on disk
+                "threshold_hours": float,  # the cutoff used
+                "threshold_timestamp": float,
+                "deleted_files": [ ... ],  # up to 50 basenames
+                "errors": [ {"file": ..., "error": ...} ],
+                "directory_exists": bool,
+            }
+    """
+    now_ts = time.time()
+    threshold_ts = now_ts - (float(older_than_hours) * 3600.0)
+
+    report: Dict[str, Any] = {
+        "scanned": 0,
+        "deleted_count": 0,
+        "kept_count": 0,
+        "deleted_bytes": 0,
+        "kept_bytes": 0,
+        "threshold_hours": float(older_than_hours),
+        "threshold_timestamp": threshold_ts,
+        "deleted_files": [],
+        "errors": [],
+        "directory_exists": TEMP_ARTIFACTS_DIR.exists(),
+    }
+
+    if not TEMP_ARTIFACTS_DIR.exists():
+        return report
+
+    try:
+        entries = list(TEMP_ARTIFACTS_DIR.iterdir())
+    except Exception as exc:
+        report["errors"].append({
+            "file": "<directory>",
+            "error": f"Failed to enumerate: {exc}",
+        })
+        return report
+
+    def _sweep_directory(
+        directory: Path,
+        label: str,
+    ) -> None:
+        """
+        Delete files inside ``directory`` older than the shared threshold.
+
+        Accumulates into the outer ``report`` dict so the caller sees a
+        unified summary across all swept directories. Per-file errors
+        are collected, not raised.
+        """
+        if not directory.exists():
+            return
+        try:
+            local_entries = list(directory.iterdir())
+        except Exception as exc:
+            report["errors"].append({
+                "file": f"<{label}>",
+                "error": f"Failed to enumerate: {exc}",
+            })
+            return
+
+        for entry in local_entries:
+            try:
+                if not entry.is_file():
+                    continue
+                report["scanned"] += 1
+
+                stat = entry.stat()
+                size = int(stat.st_size)
+                mtime = float(stat.st_mtime)
+
+                if mtime > threshold_ts:
+                    report["kept_count"] += 1
+                    report["kept_bytes"] += size
+                    continue
+
+                entry.unlink()
+                report["deleted_count"] += 1
+                report["deleted_bytes"] += size
+                if len(report["deleted_files"]) < 50:
+                    # Prefix with the directory label so operators can
+                    # tell temp artifacts apart from checkpoint cache
+                    # files in the JSON response.
+                    report["deleted_files"].append(f"{label}:{entry.name}")
+            except Exception as exc:
+                report["errors"].append({
+                    "file": f"{label}:{entry.name}",
+                    "error": str(exc),
+                })
+
+    # Sweep the temp upload store first.
+    _sweep_directory(TEMP_ARTIFACTS_DIR, "temp")
+
+    # [FIX-CHECKPOINT-OPT] Sweep the checkpoint image cache under the
+    # same age threshold. Checkpoints older than 24 hours are no longer
+    # relevant for resume, so the images they reference can be reclaimed
+    # in lockstep with the temp artifacts that produced them.
+    _sweep_directory(CHECKPOINT_CACHE_DIR, "checkpoint_cache")
+
+    return report
 
 # Only image formats that both major vision providers accept are allowed.
 # SVG is excluded because it can carry script payloads and is rejected
@@ -476,6 +638,58 @@ async def delete_temp_artifact(file_id: str):
             status_code=500,
             detail=f"Failed to delete artifact {file_id}: {exc}",
         )
+
+
+@router.post("/temp/cleanup")
+async def cleanup_temp_artifacts_endpoint(
+    older_than_hours: float = Query(
+        TEMP_ARTIFACT_MAX_AGE_HOURS_DEFAULT,
+        ge=0.1,
+        le=720.0,
+        description=(
+            "Delete temp artifacts whose last-modified timestamp is "
+            "older than this many hours. Default 24. Range 0.1–720 "
+            "(6 min – 30 days)."
+        ),
+    ),
+):
+    """
+    Delete stale temp artifacts from ``storage/artifacts/temp/`` **and**
+    stale image files from ``storage/artifacts/checkpoint_cache/``.
+
+    Both directories are swept under the same age threshold. The
+    checkpoint cache holds the raw image bytes referenced by
+    ``artifact-cache://<hash>`` URLs in persisted checkpoints; once a
+    checkpoint is older than the threshold, its images are no longer
+    needed for resume and can be reclaimed together with the temp files.
+
+    Triggered externally by Windows Task Scheduler / cron, or manually
+    from the settings UI. Also invoked at application startup when the
+    lifespan-managed cleaner is wired up (see
+    ``omweb.services.temp_artifacts_cleaner``).
+
+    Response shape::
+
+        {
+            "status": "ok",
+            "scanned": 42,
+            "deleted_count": 15,
+            "kept_count": 27,
+            "deleted_bytes": 15728640,
+            "kept_bytes": 31457280,
+            "threshold_hours": 24.0,
+            "threshold_timestamp": 1793405020.89,
+            "deleted_files": ["img_abc.png", "img_def.png", ...],
+            "errors": [],
+            "directory_exists": true,
+        }
+
+    Safe to call repeatedly: only files whose mtime is strictly older
+    than the cutoff are removed. Concurrent uploads are protected
+    because their mtime refreshes on every chunk write.
+    """
+    report = cleanup_temp_artifacts(older_than_hours=older_than_hours)
+    return {"status": "ok", **report}
 
 
 @router.get("/download")

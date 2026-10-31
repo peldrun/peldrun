@@ -969,9 +969,32 @@ class PeldrunEngine(ExecutionEngine):
                 )
 
             elif event.type == EventType.THOUGHT or getattr(event.type, "name", "") == "STEP_PROGRESS":
-                thought_text = str(event.payload.get("thought", "")).strip()
-                if thought_text:
-                    latest_meaningful_thought = thought_text
+                # [STREAMING-AGENT] Streaming deltas and full-thought events
+                # share the same EventType.THOUGHT channel, discriminated by
+                # ``is_delta`` in the payload. Deltas must NOT be stripped
+                # (whitespace tokens like " " are semantically meaningful
+                # for word boundaries), and must be accumulated into
+                # ``latest_meaningful_thought`` rather than replacing it —
+                # otherwise a fallback final message derived from this
+                # variable would end up being the last single token.
+                raw_thought = event.payload.get("thought", "")
+                is_delta = bool(event.payload.get("is_delta"))
+                thought_text = str(raw_thought)
+
+                # For deltas: keep whitespace-only fragments.
+                # For non-deltas: skip whitespace-only noise.
+                should_emit = is_delta and thought_text != "" or (
+                    not is_delta and thought_text.strip()
+                )
+
+                if should_emit:
+                    if is_delta:
+                        latest_meaningful_thought = (
+                            (latest_meaningful_thought or "") + thought_text
+                        )
+                    else:
+                        latest_meaningful_thought = thought_text
+
                     await dispatch_event(
                         job_id,
                         SSEEvent(
@@ -980,6 +1003,7 @@ class PeldrunEngine(ExecutionEngine):
                             data={
                                 "thought": thought_text,
                                 "content": thought_text,
+                                "is_delta": is_delta,
                                 "seq": event_seq,
                                 "model": model_name,
                             },
