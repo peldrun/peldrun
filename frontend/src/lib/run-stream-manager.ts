@@ -5,9 +5,14 @@
  * Run Stream Manager — single owner of every active SSE connection.
  *
  * Replaces the three scattered EventSource paths that existed prior to
- * Phase D (`use-sse-stream.ts`, `useJobStream.ts`, `lib/sse.ts`). After
- * Phase F these three modules will be removed or converted to thin
- * compatibility shims over this manager.
+ * Phase D. Final state after Phase G:
+ *
+ *   * `components/chat/chat-container/hooks/use-sse-stream.ts`
+ *     — Thin compatibility shim: subscribes to this manager and
+ *       projects events into ChatContainer's local UI state.
+ *
+ *   * `hooks/useJobStream.ts`  — **removed** in Phase G.3.
+ *   * `lib/sse.ts`             — **removed** in Phase G.3.
  *
  * ## Responsibilities
  *

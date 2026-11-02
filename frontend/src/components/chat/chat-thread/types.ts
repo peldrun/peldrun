@@ -32,7 +32,41 @@ export interface AttachedUserFile {
   height?: number;
 }
 
-export type ChatStatus = "idle" | "running" | "paused" | "completed" | "failed";
+/**
+ * Canonical lifecycle status for chat runs.
+ *
+ * MUST stay in sync with `ChatStatus` in
+ * `components/chat/chat-container/types.ts` (which mirrors
+ * `SessionStatus` from `docs/state-contracts.md` §3).
+ *
+ * Duplication is intentional: importing from `chat-container/types.ts`
+ * here would create a build-order dependency from a leaf presentational
+ * module (`chat-thread/`) back into a container module
+ * (`chat-container/`), which is an anti-pattern. When the two diverge,
+ * the container's type is authoritative and this one must be updated
+ * to match.
+ *
+ * Only five values carry rendering semantics inside ChatThread
+ * (`idle`, `running`, `paused`, `completed`, `failed`). The remaining
+ * values are still accepted so that ChatContainer can pass its full
+ * status through without an adapter; each falls through to the
+ * nearest equivalent behavior (see comments in ChatThread's
+ * conditional blocks).
+ */
+export type ChatStatus =
+  | "idle"
+  | "pending"
+  | "queued"
+  | "starting"
+  | "running"
+  | "waiting_for_input"
+  | "retrying"
+  | "paused"
+  | "cancelling"
+  | "cancelled"
+  | "completed"
+  | "failed"
+  | "interrupted";
 
 
 export interface ChatTurn {
@@ -71,7 +105,16 @@ export interface ChatThreadProps {
   execMode: "agent" | "chat";
   activeGroupedSteps: Record<number, StepEvent[]>;
   currentStepNum: number;
-  status: "idle" | "running" | "paused" | "completed" | "failed";
+  /**
+   * Canonical run status. See `ChatStatus` above for why this is a
+   * full 13-value union rather than the historic 5-value inline type.
+   * ChatThread's conditional rendering only distinguishes
+   * `running` / `paused` / `failed`; all other values behave as
+   * "not running, not paused, not failed" (which is correct for
+   * `pending`, `starting`, `waiting_for_input`, `cancelling`,
+   * `cancelled`, `interrupted`, `retrying`, `queued`).
+   */
+  status: ChatStatus;
   elapsedSeconds: number;
   finalResult: string | null;
   producedFiles: { name: string; path: string }[];

@@ -41,7 +41,17 @@ export type RunStatus =
   | "cancelling"
   | "cancelled"
   | "completed"
-  | "failed";
+  | "failed"
+  // `interrupted` — the backend promoted a session from a non-
+  // terminal state to this value on startup because a previous
+  // process died while the run was still executing (see
+  // backend/omweb/services/recovery.py). It is a **terminal** state
+  // with a neutral UI indicator. `registerRun` is the only method
+  // that may exit a terminal state (it represents a fresh run on
+  // the same session).
+  //
+  // See docs/state-contracts.md §3.3 and §4.
+  | "interrupted";
 
 export interface Step {
   id: string;

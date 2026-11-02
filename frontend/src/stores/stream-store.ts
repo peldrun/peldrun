@@ -62,11 +62,7 @@ const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set<RunStatus>([
   "cancelled",
   "completed",
   "failed",
-  // `interrupted` is not in the RunStatus type today, but the reducer
-  // will accept it once types.ts is updated in a later phase. Include
-  // it defensively as a string so the retention sweep works even
-  // before the type catches up.
-  "interrupted" as RunStatus,
+  "interrupted",
 ]);
 
 

@@ -821,8 +821,30 @@ class AsyncLLMClient:
             stream_interrupted = False
 
             try:
+                _cancel_check_counter = 0
                 async for chunk in response:
                     now = time.time()
+
+                    # ─── Explicit cancellation yield point ──────────────
+                    #
+                    # [FIX-G.2] The OpenAI AsyncStream can buffer chunks
+                    # and return them synchronously from ``__anext__``.
+                    # Between two buffered chunks, no real ``await``
+                    # fires, so ``asyncio.CancelledError`` may not be
+                    # raised until the buffer is drained — allowing many
+                    # tokens to leak through after the user clicked
+                    # Stop (observed: ~200 tokens post-cancel).
+                    #
+                    # ``await asyncio.sleep(0)`` is a cheap task-switch
+                    # yield that guarantees the event loop runs any
+                    # pending cancellation before the next iteration.
+                    # We do it every iteration (not periodically) to
+                    # guarantee near-instant cancellation and because
+                    # the yield itself costs ~1µs — negligible against
+                    # the ~20ms per chunk from the LLM provider.
+                    _cancel_check_counter += 1
+                    await asyncio.sleep(0)
+
                     if hasattr(chunk, "usage") and chunk.usage:
                         captured_usage = self._normalize_raw_usage(chunk.usage)
 
@@ -899,6 +921,41 @@ class AsyncLLMClient:
                                     accumulated_tool_calls[idx]["name"] += fn.name
                                 if getattr(fn, "arguments", None):
                                     accumulated_tool_calls[idx]["arguments"] += fn.arguments
+
+            except asyncio.CancelledError:
+                # [FIX-G.2] Explicit cancellation handler.
+                #
+                # Two responsibilities:
+                #
+                #   1. Close the underlying HTTP response. Without this,
+                #      the async generator keeps a reference to the httpx
+                #      connection, which delays cleanup and can cause the
+                #      LM Studio server to keep generating in the
+                #      background (observed: tokens continued printing
+                #      for seconds after cancel).
+                #
+                #   2. Re-raise ``CancelledError`` immediately. Any
+                #      ``except Exception`` clause above (OOM, generic
+                #      stream read) does NOT catch CancelledError since
+                #      Python 3.8; we still want the explicit re-raise
+                #      so the intent is documented and future
+                #      ``except BaseException`` blocks don't accidentally
+                #      swallow it.
+                try:
+                    await response.aclose()
+                except Exception as _close_err:
+                    logger.debug(
+                        "[LLM CLIENT] response.aclose() raised during cancel: %s",
+                        _close_err,
+                    )
+                logger.info(
+                    "[LLM CLIENT] Stream cancelled for model '%s' "
+                    "(partial: %d content, %d reasoning chunk(s)).",
+                    chosen_model,
+                    len(accumulated_content),
+                    len(accumulated_reasoning),
+                )
+                raise
 
             except Exception as stream_read_err:
                 # [FIX-OOM-FAST-FAIL] Same rationale as streaming init.
@@ -1098,64 +1155,90 @@ class AsyncLLMClient:
 
         stream_resp = await self.client.chat.completions.create(**call_kwargs)
 
-        async for chunk in stream_resp:
-            now = time.time()
+        # [FIX-G.2] Wrap the entire async-for in a try/except so that
+        # cancellation can close the underlying response cleanly. Same
+        # rationale as chat_completion's stream branch above.
+        try:
+            async for chunk in stream_resp:
+                now = time.time()
 
-            if hasattr(chunk, "usage") and chunk.usage:
-                captured_usage = self._normalize_raw_usage(chunk.usage)
+                # [FIX-G.2] Explicit cancellable yield point.
+                await asyncio.sleep(0)
 
-            choices = chunk.choices or []
-            if not choices:
-                continue
+                if hasattr(chunk, "usage") and chunk.usage:
+                    captured_usage = self._normalize_raw_usage(chunk.usage)
 
-            first_choice = choices[0]
-            delta = first_choice.delta
+                choices = chunk.choices or []
+                if not choices:
+                    continue
 
-            content_delta = getattr(delta, "content", None)
-            reasoning_delta = (
-                getattr(delta, "reasoning_content", None)
-                or getattr(delta, "reasoning", None)
-                or getattr(delta, "thought", None)
-            )
-            if not reasoning_delta and hasattr(delta, "model_extra") and isinstance(delta.model_extra, dict):
+                first_choice = choices[0]
+                delta = first_choice.delta
+
+                content_delta = getattr(delta, "content", None)
                 reasoning_delta = (
-                    delta.model_extra.get("reasoning_content")
-                    or delta.model_extra.get("reasoning")
-                    or delta.model_extra.get("thought")
+                    getattr(delta, "reasoning_content", None)
+                    or getattr(delta, "reasoning", None)
+                    or getattr(delta, "thought", None)
                 )
-
-            if (content_delta or reasoning_delta) and first_token_at is None:
-                first_token_at = now
-
-            if content_delta:
-                accumulated_content.append(content_delta)
-            if reasoning_delta:
-                accumulated_reasoning.append(reasoning_delta)
-
-            tc_deltas: List[DeltaToolCall] = []
-            if getattr(delta, "tool_calls", None):
-                for idx, tc in enumerate(delta.tool_calls):
-                    fn = getattr(tc, "function", None)
-                    tc_deltas.append(
-                        DeltaToolCall(
-                            index=getattr(tc, "index", idx),
-                            id=getattr(tc, "id", None),
-                            name=getattr(fn, "name", None) if fn else None,
-                            arguments=getattr(fn, "arguments", None) if fn else None,
-                            type="function",
-                        )
+                if not reasoning_delta and hasattr(delta, "model_extra") and isinstance(delta.model_extra, dict):
+                    reasoning_delta = (
+                        delta.model_extra.get("reasoning_content")
+                        or delta.model_extra.get("reasoning")
+                        or delta.model_extra.get("thought")
                     )
 
-            finish_reason = getattr(first_choice, "finish_reason", None)
+                if (content_delta or reasoning_delta) and first_token_at is None:
+                    first_token_at = now
 
-            yield StreamChunk(
-                content_delta=content_delta,
-                reasoning_delta=reasoning_delta,
-                tool_call_deltas=tc_deltas,
-                finish_reason=finish_reason,
-                usage=captured_usage,
-                raw=chunk,
+                if content_delta:
+                    accumulated_content.append(content_delta)
+                if reasoning_delta:
+                    accumulated_reasoning.append(reasoning_delta)
+
+                tc_deltas: List[DeltaToolCall] = []
+                if getattr(delta, "tool_calls", None):
+                    for idx, tc in enumerate(delta.tool_calls):
+                        fn = getattr(tc, "function", None)
+                        tc_deltas.append(
+                            DeltaToolCall(
+                                index=getattr(tc, "index", idx),
+                                id=getattr(tc, "id", None),
+                                name=getattr(fn, "name", None) if fn else None,
+                                arguments=getattr(fn, "arguments", None) if fn else None,
+                                type="function",
+                            )
+                        )
+
+                finish_reason = getattr(first_choice, "finish_reason", None)
+
+                yield StreamChunk(
+                    content_delta=content_delta,
+                    reasoning_delta=reasoning_delta,
+                    tool_call_deltas=tc_deltas,
+                    finish_reason=finish_reason,
+                    usage=captured_usage,
+                    raw=chunk,
+                )
+
+        except asyncio.CancelledError:
+            # [FIX-G.2] Close the underlying response on cancellation,
+            # then re-raise. See chat_completion's CancelledError
+            # branch above for the full rationale.
+            try:
+                await stream_resp.aclose()
+            except Exception as _close_err:
+                logger.debug(
+                    "[LLM CLIENT] stream response.aclose() raised during cancel: %s",
+                    _close_err,
+                )
+            logger.info(
+                "[LLM CLIENT] Token stream cancelled for model '%s' "
+                "(partial: %d content chunk(s)).",
+                chosen_model,
+                len(accumulated_content),
             )
+            raise
 
         if captured_usage is None:
             full_out = "".join(accumulated_content)

@@ -44,8 +44,30 @@ export interface ChatContainerProps {
   initialJobId?: string | null;
 }
 
-/** Lifecycle status of the current chat run. */
-export type ChatStatus = "idle" | "running" | "paused" | "completed" | "failed";
+/**
+ * Lifecycle status of the current chat run.
+ *
+ * Mirrors `SessionStatus` from `session-store.ts` (and
+ * `docs/state-contracts.md` §3), plus a local-only `"idle"` sentinel
+ * used before any run has been dispatched. Keeping the union complete
+ * lets ChatContainer pass status values through without `as any`
+ * casts, and lets ChatSubHeader's exhaustive badge switch stay
+ * statically verifiable.
+ */
+export type ChatStatus =
+  | "idle"
+  | "pending"
+  | "queued"
+  | "starting"
+  | "running"
+  | "waiting_for_input"
+  | "retrying"
+  | "paused"
+  | "cancelling"
+  | "cancelled"
+  | "completed"
+  | "failed"
+  | "interrupted";
 
 /** Aggregated token usage counters for the current or completed run. */
 export interface TokenUsage {

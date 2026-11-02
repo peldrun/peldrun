@@ -456,6 +456,10 @@ export function reduceEvent(state: RunState, event: SSEEnvelope): RunState {
           "cancelled",
           "completed",
           "failed",
+          // Interrupted is included in the accepted list so that a
+          // recovery event (or a reload after a crash) can propagate
+          // the canonical terminal state into the reducer.
+          "interrupted",
         ].includes(incomingStatus)
       ) {
         mappedStatus = incomingStatus as RunStatus;

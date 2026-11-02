@@ -90,7 +90,11 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   );
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [historyTurns, setHistoryTurns] = useState<ChatTurn[]>([]);
-  const [status, setStatus] = useState<ChatStatus | "paused">("idle");
+  // After widening ChatStatus in chat-container/types.ts (Phase G.4.d),
+  // the union already includes "paused" and every other canonical
+  // status, so the extra `| "paused"` annotation and all the
+  // subsequent `as any` casts become unnecessary.
+  const [status, setStatus] = useState<ChatStatus>("idle");
   const [steps, setSteps] = useState<StepEvent[]>([]);
   const [finalResult, setFinalResult] = useState<string | null>(null);
   const [currentStepNum, setCurrentStepNum] = useState(0);
@@ -308,7 +312,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   // still fire ~5s later and call `runStreamManager.disconnect()` on
   // an already-disconnected job — harmless but noisy in the console.
   useEffect(() => {
-    if (status === ("cancelled" as any) || status === "failed") {
+    if (status === "cancelled" || status === "failed" || status === "interrupted") {
       if (stopFallbackTimerRef.current !== null) {
         clearTimeout(stopFallbackTimerRef.current);
         stopFallbackTimerRef.current = null;
@@ -326,7 +330,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     setTokensUsed,
     setCurrentUsageMetrics,
     setFinalResult,
-    setStatus: setStatus as any,
+    setStatus,
     setExpandedSteps,
     setHumanQuery,
     setShowRightPanel,
@@ -347,7 +351,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     setSelectedAgentId,
     setExecMode,
     setActiveModelName,
-    setStatus: setStatus as any,
+    setStatus,
     setFinalResult,
     setSessionTimestamp,
     setHistoryTurns,
@@ -537,7 +541,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     // the "frozen UI" perception that appeared when F.4.b removed the
     // optimistic setStatus. The final state ("cancelled") is applied by
     // Layer 2 (SSE event) or Layer 3 (fallback timer).
-    setStatus("cancelling" as any);
+    setStatus("cancelling");
     setHumanQuery(null);
 
     // ─── Layer 3: Safety-net timer ──────────────────────────────────
@@ -560,24 +564,16 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     stopFallbackTimerRef.current = setTimeout(() => {
       stopFallbackTimerRef.current = null;
       // Guard against a stale timer firing after the user has already
-      // started a new task.
+      // started a new task, or after the SSE path has already delivered
+      // the terminal `cancelled` event.
       setStatus((current) => {
-        // `current` is typed as `ChatStatus | "paused"`, but the
-        // fallback timer may fire after the SSE path has already
-        // delivered `cancelled` (which is not part of the local
-        // ChatStatus union). Comparing through `as string` avoids
-        // the TS2367 false positive while preserving the runtime
-        // check. A future types.ts update (Phase G) will widen
-        // ChatStatus to include the canonical SessionStatus values
-        // and remove this cast.
-        const currentStr = current as string;
-        if (currentStr === "cancelled") return current;
-        if (currentStr === "running") return current; // new run started
+        if (current === "cancelled") return current;
+        if (current === "running") return current; // new run started
         console.warn(
-          "[ChatContainer] Stop fallback triggered for %s after 5s without SSE cancelled",
+          "[ChatContainer] Stop fallback triggered for %s after 2s without SSE cancelled",
           jobIdToStop,
         );
-        return "cancelled" as any;
+        return "cancelled";
       });
       // Force-close the manager connection for this job so it does not
       // linger if the backend never sends a terminal event.
@@ -616,7 +612,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
           clearTimeout(stopFallbackTimerRef.current);
           stopFallbackTimerRef.current = null;
         }
-        setStatus("running" as any);
+        setStatus("running");
       }
       // Success: Layer 2 (SSE) or Layer 3 (fallback) will complete the
       // transition to `cancelled`.
@@ -629,7 +625,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         clearTimeout(stopFallbackTimerRef.current);
         stopFallbackTimerRef.current = null;
       }
-      setStatus("cancelled" as any);
+      setStatus("cancelled");
     }
   }, [activeJobId, status]);
 
@@ -1368,6 +1364,33 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     return null;
   }, [currentUsageMetrics, elapsedSeconds, tokensUsed.output]);
 
+  // Narrow the widened ChatStatus (13 values) down to the 5-value union
+  // that ChatThread currently declares. ChatThread only reacts to
+  // "running", "paused", "completed", "failed"; every other state maps
+  // to the closest semantic equivalent so its conditional rendering
+  // (live indicator, deliverable, regenerate button) behaves correctly:
+  //
+  //   pending/queued/starting/retrying  → "running"    (active work)
+  //   waiting_for_input                 → "paused"     (suspended, no live ticker)
+  //   cancelling                        → "paused"     (stop in flight, no live ticker)
+  //   cancelled/interrupted             → "completed"  (terminal; deliverable shown, regen allowed)
+  //   idle/running/paused/completed/failed → passthrough
+  //
+  // TODO (Phase G-follow): widen ChatThreadProps.status in
+  // `components/chat/chat-thread/types.ts` to accept the canonical
+  // ChatStatus union, then this adapter can be removed.
+  const threadStatus: "idle" | "running" | "paused" | "completed" | "failed" =
+    status === "pending" ||
+    status === "queued" ||
+    status === "starting" ||
+    status === "retrying"
+      ? "running"
+      : status === "waiting_for_input" || status === "cancelling"
+      ? "paused"
+      : status === "cancelled" || status === "interrupted"
+      ? "completed"
+      : status;
+
   // --- Render ---------------------------------------------------------------
   return (
     <div className="flex h-full w-full bg-background text-foreground overflow-hidden font-sans">
@@ -1428,7 +1451,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
                 }
               : undefined
           }
-          status={status as any}
+          status={status}
           activeModel={activeModelName}
         />
 
@@ -1459,7 +1482,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
               execMode === "agent" ? groupStepEvents(steps) : {}
             }
             currentStepNum={currentStepNum}
-            status={status}
+            status={threadStatus}
             elapsedSeconds={elapsedSeconds}
             finalResult={finalResult}
             producedFiles={producedFiles}
@@ -1517,12 +1540,12 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
               isRunning={
                 status === "running" ||
                 status === "paused" ||
-                status === ("cancelling" as any)
+                status === "cancelling"
               }
               disabled={
                 status === "running" ||
                 status === "paused" ||
-                status === ("cancelling" as any)
+                status === "cancelling"
               }
             />
           </div>
