@@ -3,6 +3,53 @@
 // Re-export store types for backwards compatibility across all components
 export type { AgentManifest, ToolDefinition, ExtensionDefinition, AgentUpsertPayload };
 
+
+// ============================================================================
+// API Error Contract
+//
+// Read operations (fetchProjects, fetchChats, fetchChatsPage) MUST throw
+// an ApiError on any failure, instead of silently returning an empty list.
+//
+// Rationale (docs/state-contracts.md §8.1, §13.9):
+//
+//   * An empty array is a legitimate result: "the server has zero
+//     matching items."
+//   * A network failure or 5xx is NOT the same thing, but the old
+//     implementation collapsed both into `[]`, causing centralized
+//     stores to wipe their cached data whenever a transient failure
+//     occurred (visible as the UI flashing "0 projects" after a
+//     brief network hiccup).
+//
+// Consumers of these functions (session-store, project-store) call them
+// inside try/catch and preserve their existing data on failure. The
+// caller can distinguish "no data" from "could not fetch" by inspecting
+// whether an exception was thrown.
+//
+// Write operations (createProject, deleteChat, renameChat, ...) keep
+// their existing `null`/`false` return contract. They are not data
+// sources for centralized state — callers handle them individually and
+// a "false" return is unambiguous ("the operation did not succeed").
+// ============================================================================
+
+export class ApiError extends Error {
+  /** HTTP status code, or 0 for network/parse failures. */
+  public readonly status: number;
+
+  /**
+   * The endpoint path that failed (may include query string).
+   * Useful for diagnostics and toast messages without a separate
+   * context parameter.
+   */
+  public readonly endpoint: string;
+
+  constructor(message: string, status: number, endpoint: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.endpoint = endpoint;
+  }
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -192,14 +239,26 @@ export function categorizeChatTimeBucket(val?: string | number | null): ChatTime
 // Projects API
 // ==========================================
 export async function fetchProjects(): Promise<Project[]> {
+  const endpoint = "/api/chats/projects";
   try {
-    const res = await fetch("/api/chats/projects", { cache: "no-store" });
-    if (!res.ok) return [];
+    const res = await fetch(endpoint, { cache: "no-store" });
+    if (!res.ok) {
+      throw new ApiError(
+        `Failed to load projects (HTTP ${res.status})`,
+        res.status,
+        endpoint,
+      );
+    }
     const data = await res.json();
     return data.projects || [];
-  } catch (e) {
-    console.error("fetchProjects error:", e);
-    return [];
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
+    // Network error, JSON parse error, or fetch abort.
+    throw new ApiError(
+      err instanceof Error ? err.message : "Network error",
+      0,
+      endpoint,
+    );
   }
 }
 
@@ -235,41 +294,52 @@ export async function deleteProject(projectId: string): Promise<boolean> {
 export async function fetchChats(
   optionsOrProjectId?: FetchChatsOptions | string
 ): Promise<ChatSession[]> {
+  const opts: FetchChatsOptions =
+    typeof optionsOrProjectId === "string"
+      ? { projectId: optionsOrProjectId }
+      : optionsOrProjectId ?? {};
+
+  const params = new URLSearchParams();
+  if (opts.projectId) params.append("project_id", opts.projectId);
+  if (opts.includeArchived) params.append("include_archived", "true");
+  if (opts.pinnedOnly) params.append("pinned_only", "true");
+  if (opts.archivedOnly) params.append("archived_only", "true");
+  if (opts.search) params.append("search", opts.search);
+
+  // Optional pagination parameters: only sent when the caller
+  // provides them so that existing callers keep the exact same
+  // behavior (fetch all) against backends that do not implement
+  // pagination.
+  if (opts.limit !== undefined) {
+    params.append("limit", String(clampChatsPageLimit(opts.limit)));
+  }
+  if (opts.cursor) {
+    params.append("cursor", opts.cursor);
+  }
+  if (opts.offset !== undefined && opts.offset >= 0) {
+    params.append("offset", String(Math.floor(opts.offset)));
+  }
+
+  const qs = params.toString() ? `?${params.toString()}` : "";
+  const endpoint = `/api/chats${qs}`;
   try {
-    const opts: FetchChatsOptions =
-      typeof optionsOrProjectId === "string"
-        ? { projectId: optionsOrProjectId }
-        : optionsOrProjectId ?? {};
-
-    const params = new URLSearchParams();
-    if (opts.projectId) params.append("project_id", opts.projectId);
-    if (opts.includeArchived) params.append("include_archived", "true");
-    if (opts.pinnedOnly) params.append("pinned_only", "true");
-    if (opts.archivedOnly) params.append("archived_only", "true");
-    if (opts.search) params.append("search", opts.search);
-
-    // Optional pagination parameters: only sent when the caller
-    // provides them so that existing callers keep the exact same
-    // behavior (fetch all) against backends that do not implement
-    // pagination.
-    if (opts.limit !== undefined) {
-      params.append("limit", String(clampChatsPageLimit(opts.limit)));
+    const res = await fetch(endpoint, { cache: "no-store" });
+    if (!res.ok) {
+      throw new ApiError(
+        `Failed to load chats (HTTP ${res.status})`,
+        res.status,
+        endpoint,
+      );
     }
-    if (opts.cursor) {
-      params.append("cursor", opts.cursor);
-    }
-    if (opts.offset !== undefined && opts.offset >= 0) {
-      params.append("offset", String(Math.floor(opts.offset)));
-    }
-
-    const qs = params.toString() ? `?${params.toString()}` : "";
-    const res = await fetch(`/api/chats${qs}`, { cache: "no-store" });
-    if (!res.ok) return [];
     const data = await res.json();
     return data.chats || [];
   } catch (err) {
-    console.error("fetchChats error:", err);
-    return [];
+    if (err instanceof ApiError) throw err;
+    throw new ApiError(
+      err instanceof Error ? err.message : "Network error",
+      0,
+      endpoint,
+    );
   }
 }
 
@@ -294,61 +364,67 @@ export async function fetchChats(
 export async function fetchChatsPage(
   options: FetchChatsOptions = {}
 ): Promise<PaginatedChats> {
-  const empty: PaginatedChats = {
-    items: [],
-    nextCursor: null,
-    total: null,
-    hasMore: false,
-  };
+  const params = new URLSearchParams();
+  if (options.projectId) params.append("project_id", options.projectId);
+  if (options.includeArchived) params.append("include_archived", "true");
+  if (options.pinnedOnly) params.append("pinned_only", "true");
+  if (options.archivedOnly) params.append("archived_only", "true");
+  if (options.search) params.append("search", options.search);
+  if (options.timeRange) params.append("time_range", options.timeRange);
 
-  try {
-    const params = new URLSearchParams();
-    if (options.projectId) params.append("project_id", options.projectId);
-    if (options.includeArchived) params.append("include_archived", "true");
-    if (options.pinnedOnly) params.append("pinned_only", "true");
-    if (options.archivedOnly) params.append("archived_only", "true");
-    if (options.search) params.append("search", options.search);
-    if (options.timeRange) params.append("time_range", options.timeRange);
-
-    const limit = clampChatsPageLimit(options.limit);
-    params.append("limit", String(limit));
-    if (options.cursor) params.append("cursor", options.cursor);
-    if (options.offset !== undefined && options.offset >= 0) {
-      params.append("offset", String(Math.floor(options.offset)));
-    }
-
-    const qs = params.toString() ? `?${params.toString()}` : "";
-    const res = await fetch(`/api/chats${qs}`, { cache: "no-store" });
-    if (!res.ok) return empty;
-
-    const data = await res.json();
-    const items: ChatSession[] = Array.isArray(data.chats) ? data.chats : [];
-
-    // Normalize cursor / total across common backend shapes.
-    const nextCursor: string | null =
-      typeof data.next_cursor === "string"
-        ? data.next_cursor
-        : typeof data.nextCursor === "string"
-        ? data.nextCursor
-        : null;
-
-    const total: number | null =
-      typeof data.total === "number" ? data.total : null;
-
-    const offset = options.offset ?? 0;
-    const backendHasMore =
-      typeof data.has_more === "boolean" ? (data.has_more as boolean) : null;
-    const hasMore =
-      backendHasMore !== null
-        ? backendHasMore
-        : nextCursor !== null ||
-          (total !== null && offset + items.length < total);
-
-    return { items, nextCursor, total, hasMore };
-  } catch (err) {
-    console.error("fetchChatsPage error:", err);
-    return empty;
+  const limit = clampChatsPageLimit(options.limit);
+  params.append("limit", String(limit));
+  if (options.cursor) params.append("cursor", options.cursor);
+  if (options.offset !== undefined && options.offset >= 0) {
+    params.append("offset", String(Math.floor(options.offset)));
   }
+
+  const qs = params.toString() ? `?${params.toString()}` : "";
+  const endpoint = `/api/chats${qs}`;
+
+  let data: any;
+  try {
+    const res = await fetch(endpoint, { cache: "no-store" });
+    if (!res.ok) {
+      throw new ApiError(
+        `Failed to load chats page (HTTP ${res.status})`,
+        res.status,
+        endpoint,
+      );
+    }
+    data = await res.json();
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
+    throw new ApiError(
+      err instanceof Error ? err.message : "Network error",
+      0,
+      endpoint,
+    );
+  }
+
+  const items: ChatSession[] = Array.isArray(data.chats) ? data.chats : [];
+
+  // Normalize cursor / total across common backend shapes.
+  const nextCursor: string | null =
+    typeof data.next_cursor === "string"
+      ? data.next_cursor
+      : typeof data.nextCursor === "string"
+      ? data.nextCursor
+      : null;
+
+  const total: number | null =
+    typeof data.total === "number" ? data.total : null;
+
+  const offset = options.offset ?? 0;
+  const backendHasMore =
+    typeof data.has_more === "boolean" ? (data.has_more as boolean) : null;
+  const hasMore =
+    backendHasMore !== null
+      ? backendHasMore
+      : nextCursor !== null ||
+        (total !== null && offset + items.length < total);
+
+  return { items, nextCursor, total, hasMore };
 }
 
 export async function deleteAllChats(): Promise<PurgeReport | null> {

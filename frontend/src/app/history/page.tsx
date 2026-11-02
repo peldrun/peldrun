@@ -39,6 +39,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { useConfirmModal } from "@/components/ui/ConfirmModal";
 import { showToast, ToastContainer } from "@/components/ui/ToastNotification";
+import { useSessionStore } from "@/stores/session-store";
 
 /**
  * Number of chats loaded per section per "Load More" click. Chosen to
@@ -325,7 +326,9 @@ export default function HistoryPage() {
           "Complete Disk Purge",
           `Purged ${report.deleted_sessions_count} sessions and freed ${report.freed_mb} MB.`
         );
-        window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
+        // Wipe the centralized store so the sidebar reflects the purge
+        // immediately (no polling, no custom events).
+        useSessionStore.getState().clearAll();
         loadAllSections();
         refreshStats();
       } else {
@@ -346,7 +349,12 @@ export default function HistoryPage() {
           "Updated",
           updated.is_pinned ? "Session pinned to top." : "Session unpinned."
         );
-        window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
+        // Sync the store so the sidebar reflects the pin state
+        // immediately.
+        useSessionStore.getState().patchSession(chatId, {
+          is_pinned: updated.is_pinned,
+          pinned: updated.is_pinned,
+        });
         loadAllSections();
         refreshStats();
       }
@@ -365,7 +373,13 @@ export default function HistoryPage() {
             ? "Archived and hidden from sidebar."
             : "Restored to active sidebar."
         );
-        window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
+        // Archiving removes the session from the sidebar list; un-
+        // archiving adds it back. patchSession handles both cases
+        // since the sidebar filter (`is_archived`) re-evaluates on
+        // every render.
+        useSessionStore.getState().patchSession(chatId, {
+          is_archived: updated.is_archived,
+        });
         loadAllSections();
         refreshStats();
       }
@@ -387,11 +401,16 @@ export default function HistoryPage() {
       const success = await deleteChat(chatId);
       if (success) {
         showToast.success("Session Purged", `Session ${chatId} completely removed.`);
-        window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
+        // removeSession wipes the entry from the sidebar list AND from
+        // any project cache (see session-store.ts Patch A.1).
+        useSessionStore.getState().removeSession(chatId);
         loadAllSections();
         refreshStats();
       } else {
-        showToast.error("Delete Failed", "Server could not delete session.");
+        showToast.error(
+          "Delete Failed",
+          "Server could not delete session (may have an active run).",
+        );
       }
     } catch (err: any) {
       showToast.error("Delete Error", err?.message);

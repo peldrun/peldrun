@@ -40,7 +40,30 @@ interface ChatSubHeaderProps {
    */
   onToggleSourceControlPanel?: () => void;
 
-  status?: "idle" | "running" | "ready" | "completed" | "error";
+  // Canonical status union — mirrors SessionStatus in
+  // docs/state-contracts.md §3. The previous narrower union
+  // ("idle" | "running" | "ready" | "completed" | "error") could
+  // not represent `cancelling`, `cancelled`, `paused`,
+  // `waiting_for_input`, or `failed`, forcing callers to pass
+  // values through `as any`. Keeping the union complete makes the
+  // badge logic below exhaustive and lets ChatContainer drop those
+  // casts in a future cleanup.
+  status?:
+    | "idle"
+    | "pending"
+    | "queued"
+    | "starting"
+    | "running"
+    | "waiting_for_input"
+    | "retrying"
+    | "paused"
+    | "cancelling"
+    | "cancelled"
+    | "completed"
+    | "failed"
+    | "interrupted"
+    | "error"
+    | "ready";
   sessionTitle?: string;
   stepCount?: number;
 
@@ -139,23 +162,114 @@ export function ChatSubHeader({
           </span>
         )}
 
-        {/* Semantic Status Badge - Only visible when actively RUNNING */}
-        {status === "running" && (
-          <div className="hidden sm:flex items-center gap-1.5">
-            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-sm text-[11px] font-mono font-medium bg-amber-500/15 text-amber-500 border border-amber-500/30">
-              <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
-              <span>RUNNING</span>
-            </span>
+        {/* ─── Status badge ────────────────────────────────────────
+            One badge, chosen by the current status. Each status uses
+            a distinct color so the operator can recognize the state
+            at a glance:
 
-            {typeof stepCount === "number" && (
-              <span className="text-[11px] font-mono text-muted-foreground px-1.5 py-0.5 rounded-sm bg-background border border-border">
-                Step {stepCount}
-              </span>
-            )}
-          </div>
-        )}
+              running             → amber, pulsing (active work)
+              cancelling          → rose, pulsing (stop in flight)
+              cancelled           → slate (user chose to stop)
+              failed              → rose (error)
+              completed           → emerald (success)
+              paused              → blue (operator suspended)
+              waiting_for_input   → violet (HITL or approval)
+              retrying            → amber (transient retry)
+              interrupted         → orange (server restart / crash)
 
-        {status === "running" && (
+            See docs/state-contracts.md §3.3 for terminal vs non-
+            terminal classification. */}
+        {(() => {
+          switch (status) {
+            case "running":
+              return (
+                <div className="hidden sm:flex items-center gap-1.5">
+                  <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-sm text-[11px] font-mono font-medium bg-amber-500/15 text-amber-500 border border-amber-500/30">
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                    <span>RUNNING</span>
+                  </span>
+                  {typeof stepCount === "number" && (
+                    <span className="text-[11px] font-mono text-muted-foreground px-1.5 py-0.5 rounded-sm bg-background border border-border">
+                      Step {stepCount}
+                    </span>
+                  )}
+                </div>
+              );
+
+            case "cancelling":
+              return (
+                <span className="hidden sm:inline-flex items-center gap-1.5 px-2 py-0.5 rounded-sm text-[11px] font-mono font-medium bg-rose-500/15 text-rose-500 border border-rose-500/30">
+                  <span className="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse" />
+                  <span>STOPPING…</span>
+                </span>
+              );
+
+            case "cancelled":
+              return (
+                <span className="hidden sm:inline-flex items-center gap-1.5 px-2 py-0.5 rounded-sm text-[11px] font-mono font-medium bg-slate-500/15 text-slate-500 dark:text-slate-300 border border-slate-500/30">
+                  <span className="w-1.5 h-1.5 rounded-full bg-slate-400" />
+                  <span>CANCELLED</span>
+                </span>
+              );
+
+            case "failed":
+              return (
+                <span className="hidden sm:inline-flex items-center gap-1.5 px-2 py-0.5 rounded-sm text-[11px] font-mono font-medium bg-rose-500/15 text-rose-500 border border-rose-500/30">
+                  <span className="w-1.5 h-1.5 rounded-full bg-rose-500" />
+                  <span>FAILED</span>
+                </span>
+              );
+
+            case "completed":
+              return (
+                <span className="hidden sm:inline-flex items-center gap-1.5 px-2 py-0.5 rounded-sm text-[11px] font-mono font-medium bg-emerald-500/15 text-emerald-500 border border-emerald-500/30">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                  <span>COMPLETED</span>
+                </span>
+              );
+
+            case "paused":
+              return (
+                <span className="hidden sm:inline-flex items-center gap-1.5 px-2 py-0.5 rounded-sm text-[11px] font-mono font-medium bg-blue-500/15 text-blue-500 border border-blue-500/30">
+                  <span className="w-1.5 h-1.5 rounded-full bg-blue-500" />
+                  <span>PAUSED</span>
+                </span>
+              );
+
+            case "waiting_for_input":
+              return (
+                <span className="hidden sm:inline-flex items-center gap-1.5 px-2 py-0.5 rounded-sm text-[11px] font-mono font-medium bg-violet-500/15 text-violet-500 border border-violet-500/30">
+                  <span className="w-1.5 h-1.5 rounded-full bg-violet-500 animate-pulse" />
+                  <span>AWAITING INPUT</span>
+                </span>
+              );
+
+            case "retrying":
+              return (
+                <span className="hidden sm:inline-flex items-center gap-1.5 px-2 py-0.5 rounded-sm text-[11px] font-mono font-medium bg-amber-500/15 text-amber-500 border border-amber-500/30">
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                  <span>RETRYING</span>
+                </span>
+              );
+
+            case "interrupted":
+              return (
+                <span className="hidden sm:inline-flex items-center gap-1.5 px-2 py-0.5 rounded-sm text-[11px] font-mono font-medium bg-orange-500/15 text-orange-500 border border-orange-500/30">
+                  <span className="w-1.5 h-1.5 rounded-full bg-orange-500" />
+                  <span>INTERRUPTED</span>
+                </span>
+              );
+
+            default:
+              return null;
+          }
+        })()}
+
+        {/* Stop button — visible during `running` OR `paused`, hidden
+            during `cancelling` to prevent double-click. The rose
+            theme (vs destructive) makes it visually consistent with
+            the "STOPPING…" badge above. */}
+        {(status === "running" || status === "paused") && (
           <Button
             variant="destructive"
             size="sm"

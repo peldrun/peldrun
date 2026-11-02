@@ -164,7 +164,12 @@ export function ChatLanding({
     "peldrun_delegation_allowed" as Parameters<typeof useAppStorage>[0]
   );
 
-  const { selectedAgentId } = useChatStore();
+  // Selective subscription: only re-render when `selectedAgentId` changes.
+  // Without the selector, any update to any other field of the chat store
+  // (messages, activeSteps, currentJobId, availableAgents) would trigger a
+  // re-render of this entire landing screen, which is the most expensive
+  // component in the chat pipeline. See docs/state-contracts.md §6.4.
+  const selectedAgentId = useChatStore((s) => s.selectedAgentId);
   const isTeamLead = (selectedAgentId || "peldrun").toLowerCase() === "peldrun";
 
   // Multi-tier storage state synchronization

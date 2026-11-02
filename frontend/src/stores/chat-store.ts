@@ -1,9 +1,21 @@
 "use client";
 
 import { create } from "zustand";
-import { fetchChats, ChatSession, deleteAllChats } from "@/lib/chatsApi";
 import { AgentManifest } from "@/lib/types";
-import { storage } from "@/lib/storage";
+// Note on removed imports (see docs/state-contracts.md §6.4):
+//
+//   * `fetchChats`, `ChatSession`, `deleteAllChats` were only used by
+//     the (now removed) `loadSessions`, `loadSessionDetail`, and
+//     `clearAllSessions` methods. Their responsibilities have moved to
+//     `session-store.ts` (`loadSidebarSessions` / `loadMoreSidebarSessions`)
+//     and to the individual delete-then-remove call patterns documented
+//     in the store boundary section.
+//
+//   * `storage` was only used inside `syncSessionAgentMetadata`, which
+//     has been removed. The `exec_mode` preference is now the single
+//     responsibility of the `use-app-storage` hook, and the
+//     `omweb:mode-change` event is dispatched directly by the composer
+//     and chat-landing components when the user switches modes.
 
 export interface AgentStep {
   id: string;
@@ -24,20 +36,25 @@ export interface ChatMessage {
 }
 
 interface ChatState {
+  // Local active-conversation state. This store owns the *currently
+  // focused* chat's UI state only; it is not a catalogue of sessions.
+  //
+  // Session metadata (the list of chats shown in the sidebar, history,
+  // and project pages) lives in `session-store.ts`. See the store
+  // boundary section in docs/state-contracts.md §6.4.
   messages: ChatMessage[];
   currentJobId: string | null;
   isRunning: boolean;
   selectedAgentId: string;
   availableAgents: AgentManifest[];
   activeSteps: AgentStep[];
-  sessions: ChatSession[];
+
+  // Agent selection
   setSelectedAgentId: (agentId: string) => void;
   setAvailableAgents: (agents: AgentManifest[]) => void;
   getAgentMaxSteps: (id?: string) => number;
-  syncSessionAgentMetadata: (chatData: any) => void;
-  loadSessions: () => Promise<void>;
-  loadSessionDetail: (chatId: string) => Promise<void>;
-  clearAllSessions: () => Promise<void>;
+
+  // Local message/step management
   addMessage: (message: ChatMessage) => void;
   updateMessageStatus: (id: string, status: ChatMessage["status"]) => void;
   appendStep: (step: AgentStep) => void;
@@ -54,25 +71,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
   selectedAgentId: "peldrun",
   availableAgents: [],
   activeSteps: [],
-  sessions: [],
 
   setSelectedAgentId: (agentId: string) => set({ selectedAgentId: agentId || "peldrun" }),
   setAvailableAgents: (agents: AgentManifest[]) => set({ availableAgents: agents }),
-
-  syncSessionAgentMetadata: (chatData: any) => {
-    if (!chatData) return;
-    const agentId = chatData.agent_id || "peldrun";
-    const mode = (chatData.mode === "chat" || chatData.mode === "agent") ? chatData.mode : "agent";
-    
-    set({ selectedAgentId: agentId });
-    
-    // Safely write to unified multi-tier storage engine
-    storage.set("exec_mode", mode);
-
-    if (typeof window !== "undefined") {
-      window.dispatchEvent(new CustomEvent("omweb:mode-change", { detail: mode }));
-    }
-  },
 
   getAgentMaxSteps: (id?: string) => {
     const targetId = id || get().selectedAgentId;
@@ -90,61 +91,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
       default:
         return 30;
     }
-  },
-
-  loadSessions: async () => {
-    try {
-      const chats = await fetchChats();
-      set({ sessions: chats });
-    } catch (err) {
-      console.error("Failed to load sessions:", err);
-    }
-  },
-
-  loadSessionDetail: async (chatId: string) => {
-    try {
-      const res = await fetch(`/api/chats/${chatId}`);
-      let chat = null;
-      if (res.ok) {
-        const data = await res.json();
-        chat = data.chat;
-      } else {
-        const chats = await fetchChats();
-        chat = chats.find((c: any) => c.job_id === chatId || c.id === chatId);
-      }
-
-      if (chat) {
-        set({
-          currentJobId: chat.job_id || null,
-          selectedAgentId: chat.agent_id || "peldrun",
-          messages: [
-            {
-              id: chat.id || "msg_1",
-              role: "user",
-              content: chat.prompt || chat.title,
-              timestamp: chat.created_at || new Date().toISOString(),
-              status: chat.status === "completed" ? "completed" : "running",
-            },
-          ],
-          activeSteps: (chat.events || []).map((ev: any, idx: number) => ({
-            id: `step_${idx}`,
-            step_number: idx + 1,
-            type: ev.type || "thought",
-            content: typeof ev.data === "string" ? ev.data : (ev.data?.content || JSON.stringify(ev.data)),
-            timestamp: new Date().toISOString(),
-            tool_name: ev.data?.name || ev.data?.tool_name || ev.tool_name,
-            tool_args: ev.data?.arguments || ev.data?.tool_args || ev.tool_args,
-          })),
-        });
-      }
-    } catch (err) {
-      console.error("Failed to load session detail:", err);
-    }
-  },
-
-  clearAllSessions: async () => {
-    await deleteAllChats();
-    set({ sessions: [], messages: [], currentJobId: null, activeSteps: [], selectedAgentId: "peldrun" });
   },
 
   addMessage: (message) => set((state) => ({ messages: [...state.messages, message] })),

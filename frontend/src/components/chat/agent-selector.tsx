@@ -14,7 +14,17 @@ interface AgentSelectorProps {
 }
 
 export function AgentSelector({ disabled = false }: AgentSelectorProps) {
-  const { selectedAgentId, setSelectedAgentId, setAvailableAgents } = useChatStore();
+  // Three independent subscriptions with stable identities.
+  //   * selectedAgentId       — re-renders only on agent change.
+  //   * setSelectedAgentId    — stable setter; never triggers re-render.
+  //   * setAvailableAgents    — stable setter; never triggers re-render.
+  //
+  // Without selectors, a message arriving during streaming would
+  // re-render this dropdown even though nothing it displays changed.
+  // See docs/state-contracts.md §6.4.
+  const selectedAgentId = useChatStore((s) => s.selectedAgentId);
+  const setSelectedAgentId = useChatStore((s) => s.setSelectedAgentId);
+  const setAvailableAgents = useChatStore((s) => s.setAvailableAgents);
   const [agents, setAgents] = useState<AgentManifest[]>([]);
   const [isOpen, setIsOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);

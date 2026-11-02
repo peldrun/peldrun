@@ -192,6 +192,89 @@ async def dispatch_event(job_id: str, event: SSEEvent) -> None:
             logger.warning(f"[SSE] Failed to enqueue event for job {job_id}: {exc}")
 
 
+async def dispatch_terminal_event(job_id: str, event: SSEEvent) -> None:
+    """
+    Dispatch a TERMINAL event, bypassing any pending queue backlog.
+
+    ## Why this exists
+
+    ``dispatch_event`` uses FIFO semantics. When a user clicks Stop while
+    the LLM stream is actively producing chunks, the queue contains many
+    ``chunk`` events. A terminal ``cancelled`` event dispatched via
+    ``dispatch_event`` lands at the END of the queue, so the SSE generator
+    (``streaming.py``) must process every pending chunk before it sees the
+    cancellation. The result is a 10+ second delay between the user's
+    click and the UI reflecting "cancelled" — during which the UI appears
+    frozen on "STOPPING…".
+
+    ## What this does
+
+    1. Iterates every listener queue for the given job.
+    2. Drains all pending non-terminal events (discarding them).
+    3. Enqueues the terminal event as the first (and only) item.
+
+    ## When to use
+
+    Use this ONLY for events that end the SSE stream:
+      * ``CANCELLED`` — user-initiated or system-initiated stop.
+      * ``FINAL`` — successful completion (typically arrives when the
+        LLM stream is already idle, but safe to use anyway).
+      * ``ERROR`` — unrecoverable failure.
+      * ``DONE`` — alias for ``final``.
+      * ``MCP_AUTH_REQUIRED`` — terminal for the current run.
+
+    Non-terminal events (``status``, ``thought``, ``chunk``, ``step_start``,
+    etc.) MUST continue to use ``dispatch_event``. Draining the queue for
+    a non-terminal event would cause the user to miss those events.
+
+    ## Interaction with streaming.py
+
+    After this function enqueues the terminal event, the SSE generator
+    (which is awaiting ``queue.get()``) receives it on the very next
+    iteration. ``streaming.py`` then persists the final session state
+    and terminates the response. No changes needed in ``streaming.py``.
+
+    ## Interaction with control.py
+
+    ``control.py`` calls this function for the ``cancelled`` event. Other
+    producers (``dispatcher.py`` for ``final``/``error``) can keep using
+    ``dispatch_event`` because the LLM stream is already idle by the time
+    those fire — but switching them is harmless and future-proof.
+    """
+    async with _listeners_lock:
+        listeners = list(_job_listeners.get(job_id, []))
+
+    for queue in listeners:
+        # Drain any pending non-terminal events.
+        drained = 0
+        while not queue.empty():
+            try:
+                queue.get_nowait()
+                drained += 1
+            except asyncio.QueueEmpty:
+                break
+
+        # Enqueue the terminal event as the only item.
+        try:
+            queue.put_nowait(event)
+            if drained > 0:
+                logger.info(
+                    "[SSE] Dropped %d pending event(s) before terminal %s "
+                    "for job %s",
+                    drained,
+                    event.type.value
+                    if hasattr(event.type, "value")
+                    else event.type,
+                    job_id,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[SSE] Failed to enqueue terminal event for job %s: %s",
+                job_id,
+                exc,
+            )
+
+
 async def subscribe_events(
     job_id: str,
     keepalive_interval: float = 15.0,
@@ -233,5 +316,6 @@ __all__ = [
     "register_job_listener",
     "unregister_job_listener",
     "dispatch_event",
+    "dispatch_terminal_event",
     "subscribe_events",
 ]

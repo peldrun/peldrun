@@ -39,6 +39,7 @@ import {
 import type { StepEvent } from "@/components/chat/chat-timeline";
 import type { EngineOption } from "@/components/chat/engine-selector";
 import { useChatStore } from "@/stores/chat-store";
+import { useSessionStore } from "@/stores/session-store";
 import { useSourceControlStore } from "@/features/source-control/state/source-control-store";
 import { useAppStorage } from "@/hooks/use-app-storage";
 import { inferModelCapabilities } from "@/lib/modelMetadata";
@@ -67,8 +68,17 @@ export type { ChatContainerProps };
 
 export function ChatContainer({ initialJobId }: ChatContainerProps) {
   const router = useRouter();
-  const { selectedAgentId, setSelectedAgentId, getAgentMaxSteps } =
-    useChatStore();
+
+  // Three independent subscriptions. Only `selectedAgentId` can trigger a
+  // re-render (when the user switches agents); both `setSelectedAgentId`
+  // and `getAgentMaxSteps` are stable references that never change, so
+  // subscribing to them via selectors costs nothing. Previously the whole
+  // store was subscribed, causing ChatContainer — which owns the entire
+  // chat timeline — to re-render on every unrelated mutation (message
+  // append, step append, etc.). See docs/state-contracts.md §6.4.
+  const selectedAgentId = useChatStore((s) => s.selectedAgentId);
+  const setSelectedAgentId = useChatStore((s) => s.setSelectedAgentId);
+  const getAgentMaxSteps = useChatStore((s) => s.getAgentMaxSteps);
 
   // --- UI / input state -----------------------------------------------------
   const [inputValue, setInputValue] = useState("");
@@ -279,12 +289,32 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   // value rather than a closure-captured snapshot.
   const currentStepNumRef = useRef(currentStepNum);
   const activeChatIdRef = useRef(activeChatId);
+
+  // Tracks the safety-net timer created by handleStopTask. Declared
+  // here (not further down) because it is referenced by the status
+  // effect below AND by handleStopTask. Placing it before the first
+  // consumer prevents a temporal-dead-zone TypeScript error.
+  const stopFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   useEffect(() => {
     currentStepNumRef.current = currentStepNum;
   }, [currentStepNum]);
   useEffect(() => {
     activeChatIdRef.current = activeChatId;
   }, [activeChatId]);
+
+  // Clear the stop-fallback timer as soon as the terminal state is
+  // reached through the SSE path. Without this, the fallback would
+  // still fire ~5s later and call `runStreamManager.disconnect()` on
+  // an already-disconnected job — harmless but noisy in the console.
+  useEffect(() => {
+    if (status === ("cancelled" as any) || status === "failed") {
+      if (stopFallbackTimerRef.current !== null) {
+        clearTimeout(stopFallbackTimerRef.current);
+        stopFallbackTimerRef.current = null;
+      }
+    }
+  }, [status]);
 
   const { connectStream, closeStream, eventSourceRef } = useSseStream({
     currentStepNumRef,
@@ -485,25 +515,123 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     setShowRightPanel,
   ]);
 
+  // Cleanup on unmount so a queued fallback never fires after the
+  // component is gone.
+  useEffect(() => {
+    return () => {
+      if (stopFallbackTimerRef.current !== null) {
+        clearTimeout(stopFallbackTimerRef.current);
+        stopFallbackTimerRef.current = null;
+      }
+    };
+  }, []);
+
   const handleStopTask = useCallback(async () => {
     if (!activeJobId || (status !== "running" && status !== "paused")) return;
-    try {
-      await fetch(`/api/run/jobs/${activeJobId}/stop`, { method: "POST" });
-      setStatus("failed");
-      setHumanQuery(null);
-      closeStream();
-      if (typeof window !== "undefined") {
-        window.dispatchEvent(
-          new CustomEvent("omweb:chat-status-changed", {
-            detail: { chatId: activeChatId, jobId: activeJobId, status: "failed" },
-          })
-        );
-        window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
-      }
-    } catch (e) {
-      console.error("[ChatContainer] Failed to stop job:", e);
+
+    const jobIdToStop = activeJobId;
+
+    // ─── Layer 1: Immediate visual feedback ─────────────────────────
+    //
+    // Show "cancelling" the instant the user clicks Stop. This prevents
+    // the "frozen UI" perception that appeared when F.4.b removed the
+    // optimistic setStatus. The final state ("cancelled") is applied by
+    // Layer 2 (SSE event) or Layer 3 (fallback timer).
+    setStatus("cancelling" as any);
+    setHumanQuery(null);
+
+    // ─── Layer 3: Safety-net timer ──────────────────────────────────
+    //
+    // If the SSE `cancelled` event does not arrive within 5 seconds
+    // (possible when the backend's LLM stream is orphaned — a known
+    // backend bug documented in docs/state-contracts.md §11), force
+    // the local state to `cancelled` and close the stream locally.
+    //
+    // The 2s window is:
+    //   * Long enough for a healthy SSE round-trip (typical latency:
+    //     50–200ms with Phase F.4.b's dispatch_terminal_event drain).
+    //   * Short enough that the user does not perceive a hang if the
+    //     backend is slow (the LLM cancellation bug in
+    //     AsyncLLMClient can delay the SSE "cancelled" beyond 2s, in
+    //     which case this fallback fires as the ultimate safety net).
+    if (stopFallbackTimerRef.current !== null) {
+      clearTimeout(stopFallbackTimerRef.current);
     }
-  }, [activeJobId, status, activeChatId, closeStream]);
+    stopFallbackTimerRef.current = setTimeout(() => {
+      stopFallbackTimerRef.current = null;
+      // Guard against a stale timer firing after the user has already
+      // started a new task.
+      setStatus((current) => {
+        // `current` is typed as `ChatStatus | "paused"`, but the
+        // fallback timer may fire after the SSE path has already
+        // delivered `cancelled` (which is not part of the local
+        // ChatStatus union). Comparing through `as string` avoids
+        // the TS2367 false positive while preserving the runtime
+        // check. A future types.ts update (Phase G) will widen
+        // ChatStatus to include the canonical SessionStatus values
+        // and remove this cast.
+        const currentStr = current as string;
+        if (currentStr === "cancelled") return current;
+        if (currentStr === "running") return current; // new run started
+        console.warn(
+          "[ChatContainer] Stop fallback triggered for %s after 5s without SSE cancelled",
+          jobIdToStop,
+        );
+        return "cancelled" as any;
+      });
+      // Force-close the manager connection for this job so it does not
+      // linger if the backend never sends a terminal event.
+      try {
+        // Local import to avoid a circular top-level dependency
+        // (run-stream-manager imports session-store, which imports
+        // chatsApi, which is also imported by ChatContainer's parent
+        // chain).
+        import("@/lib/run-stream-manager")
+          .then(({ runStreamManager }) => {
+            runStreamManager.disconnect(jobIdToStop);
+          })
+          .catch(() => {
+            /* best-effort */
+          });
+      } catch {
+        /* ignore */
+      }
+    }, 2000);
+
+    try {
+      const res = await fetch(
+        `/api/run/jobs/${encodeURIComponent(jobIdToStop)}/stop`,
+        { method: "POST" },
+      );
+
+      if (!res.ok) {
+        // Backend rejected the stop. Revert to running so the user can
+        // retry, and cancel the fallback timer.
+        console.warn(
+          "[ChatContainer] Stop request returned HTTP %d for job %s",
+          res.status,
+          jobIdToStop,
+        );
+        if (stopFallbackTimerRef.current !== null) {
+          clearTimeout(stopFallbackTimerRef.current);
+          stopFallbackTimerRef.current = null;
+        }
+        setStatus("running" as any);
+      }
+      // Success: Layer 2 (SSE) or Layer 3 (fallback) will complete the
+      // transition to `cancelled`.
+    } catch (e) {
+      console.error("[ChatContainer] Failed to send stop request:", e);
+      // Network failure: cancel the fallback and force `cancelled`
+      // immediately. The backend may or may not have received the
+      // request — the next reload will reconcile from session.json.
+      if (stopFallbackTimerRef.current !== null) {
+        clearTimeout(stopFallbackTimerRef.current);
+        stopFallbackTimerRef.current = null;
+      }
+      setStatus("cancelled" as any);
+    }
+  }, [activeJobId, status]);
 
   const handlePauseTask = useCallback(async () => {
     if (!activeJobId || status !== "running") return;
@@ -911,21 +1039,32 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         }
         setActiveJobId(jobId);
 
-        if (typeof window !== "undefined") {
-          window.dispatchEvent(
-            new CustomEvent("omweb:chat-status-changed", {
-              detail: {
-                chatId: returnedChatId,
-                jobId: jobId,
-                status: "running",
-                title: finalPrompt.slice(0, 30),
-              },
-            })
-          );
-          window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
+        // [Phase F.8-b] Seed the session store directly from the
+        // backend's response. start_run.py now returns a `session`
+        // object (see Phase F.8), so we can populate the store with
+        // the authoritative record (title, project_id, created_at,
+        // turns, events, ...) without a follow-up GET /api/chats/{id}.
+        //
+        // This runs BEFORE `connectStream` so the store contains the
+        // real session — `registerRun` (called by `connectStream`)
+        // then rebinds the `job_id` and reinforces `status: "running"`.
+        // Without this enrichment, the store would carry a minimal
+        // stub until the next full refresh.
+        if (data.session) {
+          useSessionStore.getState().upsertSession(data.session);
         }
 
-        connectStream(jobId);
+        // [Phase F.3.b] Pass chatId and metadata so registerRun can seed
+        // both stores before opening the SSE stream. The manager:
+        //   1. Calls streamStore.initializeRun(jobId, prompt)
+        //   2. Calls sessionStore.registerRun(chatId, jobId, {...})
+        //   3. Opens the SSE connection with after_sequence
+        // See lib/run-stream-manager.ts registerRun().
+        connectStream(jobId, returnedChatId, {
+          prompt: finalPrompt,
+          title: finalPrompt.slice(0, 40),
+          agentId: selectedAgentId,
+        });
         return { accepted: true, jobId, chatId: returnedChatId };
       } catch (err: any) {
         console.error("[ChatContainer] Execution dispatch error:", err);
@@ -1072,7 +1211,15 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
           const data = await res.json();
           const jobId = data.job_id;
           setActiveJobId(jobId);
-          connectStream(jobId);
+          // [Phase F.3.b] Pass the chat context so registerRun can seed
+          // the stores correctly. targetChatId is the current session's
+          // chat_id; the fallback to "" is defensive (the manager treats
+          // an empty chatId as invalid and logs a warning).
+          connectStream(jobId, targetChatId || "", {
+            prompt: promptToRerun,
+            title: promptToRerun.slice(0, 40),
+            agentId: selectedAgentId,
+          });
         } catch (err: any) {
           console.error("[ChatContainer] Regeneration dispatch error:", err);
           setStatus("failed");
@@ -1143,7 +1290,12 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
           const data = await res.json();
           const jobId = data.job_id;
           setActiveJobId(jobId);
-          connectStream(jobId);
+          // [Phase F.3.b] Same as the current-turn branch above.
+          connectStream(jobId, targetChatId || "", {
+            prompt: promptToRerun,
+            title: promptToRerun.slice(0, 40),
+            agentId: selectedAgentId,
+          });
         } catch (err: any) {
           console.error("[ChatContainer] Historical turn regeneration error:", err);
           setStatus("failed");
@@ -1358,8 +1510,20 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
                 handleStartTask(textToSend, llmOverride, files)
               }
               onStop={handleStopTask}
-              isRunning={status === "running" || status === "paused"}
-              disabled={status === "running" || status === "paused"}
+              // Treat `cancelling` the same as `running`/`paused` for
+              // the composer state: block input and keep the Stop
+              // button visible. This prevents the user from firing a
+              // new task while a cancellation is still in flight.
+              isRunning={
+                status === "running" ||
+                status === "paused" ||
+                status === ("cancelling" as any)
+              }
+              disabled={
+                status === "running" ||
+                status === "paused" ||
+                status === ("cancelling" as any)
+              }
             />
           </div>
         )}

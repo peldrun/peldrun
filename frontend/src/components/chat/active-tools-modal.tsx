@@ -109,7 +109,11 @@ interface McpGroup {
  * ──────────────────────────────────────────────────────────────── */
 
 export function ActiveToolsModal() {
-  const { selectedAgentId } = useChatStore();
+  // Single-field subscription. The modal only reads the selected agent id;
+  // it never writes to the chat store. A selector here prevents the modal
+  // from re-rendering every time a message arrives or an agent step is
+  // appended elsewhere in the app. See docs/state-contracts.md §6.4.
+  const selectedAgentId = useChatStore((s) => s.selectedAgentId);
 
   const [agents, setAgents] = useState<AgentManifest[]>([]);
   const [toolsState, setToolsState] = useState<AgentToolsState | null>(null);

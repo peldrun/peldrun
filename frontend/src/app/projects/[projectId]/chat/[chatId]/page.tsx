@@ -1,4 +1,5 @@
-﻿import React from "react";
+﻿//frontend\src\app\projects\[projectId]\chat\[chatId]\page.tsx
+import React from "react";
 
 interface ProjectChatPageProps {
   params: Promise<{ projectId: string; chatId: string }>;

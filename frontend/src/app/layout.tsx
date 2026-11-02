@@ -7,6 +7,7 @@ import { SourceControlSettingsProvider } from "@/features/source-control/state/s
 import { GenerativeUIBackendSync } from "@/components/generative-ui/backend-sync";
 import { I18nProvider } from "@/components/providers/i18n-provider";
 import { AppShell } from "@/components/layout/app-shell";
+import { AppDataBootstrap } from "@/components/providers/app-data-bootstrap";
 import { ToastContainer } from "@/components/ui/ToastNotification";
 import Script from "next/script";
 
@@ -107,6 +108,33 @@ export default async function RootLayout({
             <GenerativeUIBackendSync />
 
             <I18nProvider initialLocale={locale}>
+              {/*
+                App Data Bootstrap — one-shot data initialization at
+                app startup.
+
+                Mounted here so it lives inside every context the
+                centralized stores depend on:
+
+                  * StorageProvider — for cookies/localStorage used by
+                    useAppStorage (exec_mode, active_model, ...).
+
+                  * ThemeProvider   — for theme-aware error UIs (if any
+                    future store surfaces a toast on failure).
+
+                  * I18nProvider    — for i18n-aware error messages in
+                    the (upcoming) sidebar error banner.
+
+                The component renders null. Its only effect is a
+                useEffect that fires three parallel loads:
+
+                  * sessionStore.loadSidebarSessions()
+                  * projectStore.loadProjects()
+                  * runStreamManager.restoreActiveRuns()
+
+                See docs/state-contracts.md §4 for the full design
+                rationale and §5.2 for the lifecycle matrix.
+              */}
+              <AppDataBootstrap />
               <AppShell>{children}</AppShell>
             </I18nProvider>
 

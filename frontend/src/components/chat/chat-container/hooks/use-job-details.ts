@@ -24,7 +24,20 @@ interface UseJobDetailsParams {
   setCurrentStepNum: (n: number) => void;
   currentStepNumRef: React.MutableRefObject<number>;
   fetchJobFiles: (jobId: string) => void;
-  connectStream: (jobId: string) => void;
+  // [Phase F.3.b] connectStream now accepts the chatId and seeding
+  // metadata. This mirrors the signature exposed by useSseStream
+  // (chat-container/hooks/use-sse-stream.ts) after Phase F.3.a, which
+  // delegates to runStreamManager.registerRun().
+  connectStream: (
+    jobId: string,
+    chatId?: string,
+    options?: {
+      prompt?: string;
+      title?: string;
+      agentId?: string;
+      projectId?: string;
+    },
+  ) => void;
 }
 
 /**
@@ -238,7 +251,29 @@ export function useJobDetails(params: UseJobDetailsParams) {
 
       p.fetchJobFiles(data.id || jobId);
       if (data.status === "running") {
-        p.connectStream(data.id || jobId);
+        // [Phase F.3.b] Propagate the full (jobId, chatId, metadata)
+        // tuple so registerRun can seed the centralized stores and
+        // open the SSE stream with the correct resume point.
+        //
+        // `data` is the raw response from GET /api/run/jobs/{id}, whose
+        // shape is documented in backend/omweb/routers/run_routes/jobs.py.
+        // After Phase E.4 it includes chat_id, prompt, agent_id, and
+        // is_actively_running — all of which are forwarded here.
+        const resolvedJobId = data.id || jobId;
+        const resolvedChatId =
+          typeof data.chat_id === "string" && data.chat_id
+            ? data.chat_id
+            : undefined;
+        const resolvedPrompt =
+          typeof data.prompt === "string" ? data.prompt : undefined;
+        const resolvedAgentId =
+          typeof data.agent_id === "string" ? data.agent_id : undefined;
+
+        p.connectStream(resolvedJobId, resolvedChatId, {
+          prompt: resolvedPrompt,
+          title: resolvedPrompt ? resolvedPrompt.slice(0, 40) : undefined,
+          agentId: resolvedAgentId,
+        });
       }
     } catch (e) {
       console.error("Failed to fetch job details", e);

@@ -255,11 +255,18 @@ async def stream_job_events(job_id: str, after_sequence: int = Query(0, ge=0)):
 
                 p_id = chat.get("project_id", "default_project")
                 prompt_val = getattr(job, "prompt", None) or chat.get("prompt", "")
-                final_status = (
-                    "completed"
-                    if str(ev_type).lower() in ["final", "done"]
-                    else "failed"
-                )
+                # Canonical terminal status mapping (see docs/state-contracts.md §3.3).
+                # The previous implementation classified `cancelled` as
+                # `failed`, which caused user-initiated stops to surface as
+                # unrecoverable failures in the UI. The persisted status now
+                # matches the terminal SSE event name.
+                ev_type_lower = str(ev_type).lower()
+                if ev_type_lower in ("final", "done"):
+                    final_status = "completed"
+                elif ev_type_lower == "cancelled":
+                    final_status = "cancelled"
+                else:
+                    final_status = "failed"
 
                 fresh_summary = await usage_store.get_chat_usage_summary(chat_id)
                 turn_usage = (

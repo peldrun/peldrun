@@ -253,7 +253,12 @@ export function Composer({
   const [reasoningEffort] = useAppStorage("reasoning_effort");
   const [activeLlmOverride] = useAppStorage("active_llm_override");
 
-  const { selectedAgentId, setSelectedAgentId } = useChatStore();
+  // Two independent subscriptions. The read selector fires re-renders only
+  // when `selectedAgentId` changes; the setter selector is stable across
+  // renders and therefore never triggers a re-render on its own. See
+  // docs/state-contracts.md §6.4.
+  const selectedAgentId = useChatStore((s) => s.selectedAgentId);
+  const setSelectedAgentId = useChatStore((s) => s.setSelectedAgentId);
 
   const editorRef = useRef<LexicalEditorHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);

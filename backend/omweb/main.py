@@ -107,6 +107,65 @@ async def lifespan(app: FastAPI):
         2. Conclude the Resource Monitor session and flush sample buffers.
         3. Gracefully terminate the shared BrowserSessionManager.
     """
+    # 0. Reconcile persisted session state with the live run registry.
+    #
+    # Any session left in a non-terminal state (running, paused, starting,
+    # ...) by a crashed or interrupted previous process is promoted to
+    # "interrupted" so the frontend reports an accurate state and no
+    # phantom spinner is displayed in the sidebar or history views.
+    #
+    # This runs FIRST — before any subsystem — because:
+    #   * It is the fastest operation in the startup sequence (JSON file
+    #     scan only; no network, no subprocesses).
+    #   * It must complete even if a later subsystem fails to start, so
+    #     the user never observes a stale "running" state after a crash.
+    #
+    # See docs/state-contracts.md §7.3 for the full policy.
+    #
+    # Multi-worker note: this recovery assumes a single-process backend.
+    # In a multi-worker deployment each worker would see an empty
+    # ACTIVE_JOB_TASKS at startup and would therefore mark sessions that
+    # are actually owned by OTHER workers as "interrupted". The current
+    # deployment model is single-process (uvicorn default), so this is
+    # safe. A future multi-worker refactor must move the live-run
+    # registry to a shared store (Redis / disk lockfile) before enabling
+    # more than one worker.
+    try:
+        from omweb.services.recovery import recover_orphaned_sessions
+
+        _recovery_report = recover_orphaned_sessions()
+        if _recovery_report.get("interrupted"):
+            logger.warning(
+                "Session recovery promoted %d orphaned session(s) to "
+                "'interrupted' out of %d scanned (previous process likely "
+                "crashed or was forcibly terminated).",
+                _recovery_report["interrupted"],
+                _recovery_report["scanned"],
+            )
+        elif _recovery_report.get("skipped_unreadable") or _recovery_report.get(
+            "errors"
+        ):
+            logger.warning(
+                "Session recovery completed with warnings: scanned=%d "
+                "unreadable=%d errors=%d",
+                _recovery_report["scanned"],
+                _recovery_report.get("skipped_unreadable", 0),
+                len(_recovery_report.get("errors", [])),
+            )
+        else:
+            logger.info(
+                "Session recovery clean: %d session(s) scanned, no orphans.",
+                _recovery_report["scanned"],
+            )
+    except Exception as _rec_err:
+        # A recovery failure must never block startup. The next restart
+        # will retry the same scan; nothing is lost by skipping.
+        logger.warning(
+            "Session recovery skipped due to error: %s",
+            _rec_err,
+            exc_info=True,
+        )
+
     # 1. Start Resource Monitor subsystem
     try:
         from omweb.services.resource_monitor_service import (

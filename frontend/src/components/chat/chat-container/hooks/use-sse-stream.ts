@@ -19,6 +19,15 @@ import type {
   UsageMetrics,
 } from "../types";
 
+// [Phase F.3] SSE connection ownership moved to the shared
+// runStreamManager (see lib/run-stream-manager.ts). This hook no
+// longer opens its own EventSource — it subscribes to the manager
+// and processes the events that arrive. The manager keeps the
+// stores (stream-store + session-store) in sync on its own; this
+// hook's job is now purely to project events into ChatContainer's
+// local UI state (steps, finalResult, humanQuery, ...).
+import { runStreamManager } from "@/lib/run-stream-manager";
+
 /**
  * Metadata for an MCP server that requires credentials before it can
  * be used in the current chat.
@@ -111,7 +120,15 @@ interface UseSseStreamParams {
  *   lifetime of the component.
  */
 export function useSseStream(params: UseSseStreamParams) {
-  const eventSourceRef = useRef<EventSource | null>(null);
+  // [Phase F.3] The manager now owns the EventSource. This hook holds:
+  //   * unsubscribeRef  — cleanup function returned by subscribe().
+  //   * currentJobIdRef — tracks the job the subscription belongs to.
+  //   * eventSourceRef  — kept as a null stub for backwards compatibility
+  //                       with callers that still destructure it from the
+  //                       return value (currently only ChatContainer).
+  const unsubscribeRef = useRef<(() => void) | null>(null);
+  const currentJobIdRef = useRef<string | null>(null);
+  const eventSourceRef = useRef<EventSource | null>(null); // always null
 
   /**
    * Image results accumulated during the current run. Reset on every
@@ -145,29 +162,60 @@ export function useSseStream(params: UseSseStreamParams) {
   }, [params]);
 
   const closeStream = useCallback(() => {
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
+    // Drop the local subscription. This does NOT disconnect the
+    // manager from the SSE stream — the manager owns the connection
+    // lifecycle independently and may be tracking other jobs. To
+    // force-close the manager's connection for this job, call
+    // runStreamManager.disconnect(jobId) directly (currently used
+    // only by ChatContainer.handleNewSession).
+    if (unsubscribeRef.current) {
+      try {
+        unsubscribeRef.current();
+      } catch (err) {
+        if (DEBUG_SSE) {
+          console.warn("[SSE] unsubscribe threw during closeStream:", err);
+        }
+      }
+      unsubscribeRef.current = null;
     }
+    currentJobIdRef.current = null;
   }, []);
 
-  const connectStream = useCallback((jobId: string) => {
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-    }
-    // Reset accumulated image state on every fresh connection.
-    collectedImagesRef.current = [];
-    collectedImagesQueryRef.current = "";
-    collectedImagesProviderRef.current = "";
+  const connectStream = useCallback(
+    (
+      jobId: string,
+      chatId?: string,
+      options?: {
+        prompt?: string;
+        title?: string;
+        agentId?: string;
+        projectId?: string;
+      },
+    ) => {
+      // [Phase F.3] Drop the previous subscription before creating a
+      // new one. This is local cleanup only; the manager's connection
+      // lifetime is independent.
+      if (unsubscribeRef.current) {
+        try {
+          unsubscribeRef.current();
+        } catch (err) {
+          if (DEBUG_SSE) {
+            console.warn("[SSE] unsubscribe threw:", err);
+          }
+        }
+        unsubscribeRef.current = null;
+      }
 
-    const es = new EventSource(`/api/run/jobs/${jobId}/stream`);
-    eventSourceRef.current = es;
+      currentJobIdRef.current = jobId;
+      const resolvedChatId = chatId || jobId;
 
-    /** Tracks whether we deliberately closed the stream to suppress onerror work. */
-    let intentionallyClosed = false;
+      // Reset accumulated image state on every fresh connection.
+      collectedImagesRef.current = [];
+      collectedImagesQueryRef.current = "";
+      collectedImagesProviderRef.current = "";
 
-    /** Convenience accessor for the freshest params snapshot. */
-    const p = () => paramsRef.current;
+      /** Convenience accessor for the freshest params snapshot. */
+      const p = () => paramsRef.current;
 
     /** Append a visible step to the timeline, dropping empty entries. */
     const appendStep = (
@@ -550,8 +598,8 @@ export function useSseStream(params: UseSseStreamParams) {
         ctx.setStatus("completed");
         ctx.setExpandedSteps({});
         ctx.fetchJobFiles(jobId);
-        intentionallyClosed = true;
-        es.close();
+        // [Phase F.3] Connection close is handled by runStreamManager
+        // via its `isTerminalEvent` guard. No local `es.close()` here.
 
         if (typeof window !== "undefined") {
           window.dispatchEvent(
@@ -641,8 +689,7 @@ export function useSseStream(params: UseSseStreamParams) {
           }
         }
 
-        intentionallyClosed = true;
-        es.close();
+        // [Phase F.3] Connection close handled by runStreamManager.
 
         if (typeof window !== "undefined") {
           window.dispatchEvent(
@@ -720,8 +767,7 @@ export function useSseStream(params: UseSseStreamParams) {
           window.dispatchEvent(new CustomEvent("peldrun:run-completed"));
         }
         ctx.fetchJobFiles(jobId);
-        intentionallyClosed = true;
-        es.close();
+        // [Phase F.3] Connection close handled by runStreamManager.
 
         if (typeof window !== "undefined") {
           window.dispatchEvent(
@@ -736,119 +782,146 @@ export function useSseStream(params: UseSseStreamParams) {
           window.dispatchEvent(new CustomEvent("omweb:chats-updated"));
         }
       }
+
+      // -----------------------------------------------------------------
+      // Delegation / Multi-Agent lifecycle events
+      //
+      // [Phase F.3] These handlers were previously bound via a separate
+      // `DELEGATION_EVENT_TYPES.forEach` block that registered an
+      // `es.addEventListener` per event. Since the manager now owns the
+      // EventSource, the routing is unified: every event (including
+      // delegation events) flows through this function, so the manager
+      // subscription only needs a single dispatch point.
+      //
+      // Payload shape: same as the previous per-event listener — the
+      // fields are read from `payload.data` (which is `envelope.data`
+      // when the manager forwards an event).
+      // -----------------------------------------------------------------
+      else if (eventType === "approval_required") {
+        const approvalId = payload.data?.approval_request_id;
+        if (typeof approvalId === "string" && approvalId) {
+          ctx.setPendingApprovals((prev) => ({
+            ...prev,
+            [approvalId]: {
+              approvalRequestId: approvalId,
+              taskId: payload.data?.task_id || "",
+              parentRunId: payload.data?.parent_run_id || "",
+              targetAgentId: payload.data?.target_agent_id || "",
+              instruction: payload.data?.instruction || "",
+              status: "pending",
+              timeoutSeconds: payload.data?.timeout_seconds || 300,
+              createdAt: Date.now(),
+            },
+          }));
+        }
+        logEntry(
+          `[${logTimestamp}] [APPROVAL] ${payload.data?.target_agent_id || "agent"} awaiting approval`
+        );
+      } else if (eventType === "approval_resolved") {
+        const approvalId = payload.data?.approval_request_id;
+        if (typeof approvalId === "string" && approvalId) {
+          ctx.setPendingApprovals((prev) => {
+            const next = { ...prev };
+            delete next[approvalId];
+            return next;
+          });
+        }
+      } else if (eventType === "child_run_started") {
+        const childId = payload.data?.child_run_id;
+        if (typeof childId === "string" && childId) {
+          ctx.setActiveChildRuns((prev) => ({
+            ...prev,
+            [childId]: {
+              childRunId: childId,
+              parentRunId: payload.data?.parent_run_id || "",
+              taskId: payload.data?.task_id || "",
+              targetAgentId: payload.data?.target_agent_id || "",
+              instruction: payload.data?.instruction || "",
+              status: "running",
+              startedAt: Date.now(),
+              steps: [],
+              deliverables: [],
+            },
+          }));
+        }
+      } else if (
+        eventType === "child_run_completed" ||
+        eventType === "child_run_failed" ||
+        eventType === "child_run_cancelled"
+      ) {
+        const childId = payload.data?.child_run_id;
+        if (typeof childId === "string" && childId) {
+          const cStatus =
+            eventType === "child_run_completed"
+              ? "completed"
+              : eventType === "child_run_cancelled"
+              ? "cancelled"
+              : "failed";
+          ctx.setActiveChildRuns((prev) => {
+            const cur = prev[childId];
+            if (!cur) return prev;
+            return {
+              ...prev,
+              [childId]: {
+                ...cur,
+                status: cStatus,
+                deliverables: payload.data?.deliverables || cur.deliverables,
+                tokensUsed: payload.data?.tokens_used,
+                durationSeconds: payload.data?.duration_seconds,
+                error: payload.data?.error,
+              },
+            };
+          });
+        }
+      }
     };
 
-    /** Bind a single named SSE event and wire it to the router. */
-    const bindEvt = (name: string) => {
-      es.addEventListener(name, (e: any) => {
-        try {
-          handleEventPayload(name, JSON.parse(e.data));
-        } catch (parseErr) {
-          if (DEBUG_SSE) {
-            console.warn(
-              `[SSE] Failed to parse JSON for ${name}`,
-              parseErr,
-              e.data
-            );
-          }
-          handleEventPayload(name, { data: e.data });
-        }
-      });
-    };
-
-    (SSE_EVENT_TYPES as readonly string[]).forEach(bindEvt);
-
-    DELEGATION_EVENT_TYPES.forEach((name) => {
-      es.addEventListener(name, (e: any) => {
-        try {
-          const payload = JSON.parse(e.data);
-          const ctx = p();
-
-          if (name === "approval_required") {
-            ctx.setPendingApprovals((prev) => ({
-              ...prev,
-              [payload.data.approval_request_id]: {
-                approvalRequestId: payload.data.approval_request_id,
-                taskId: payload.data.task_id,
-                parentRunId: payload.data.parent_run_id,
-                targetAgentId: payload.data.target_agent_id,
-                instruction: payload.data.instruction,
-                status: "pending",
-                timeoutSeconds: payload.data.timeout_seconds || 300,
-                createdAt: Date.now(),
-              },
-            }));
-          } else if (name === "approval_resolved") {
-            ctx.setPendingApprovals((prev) => {
-              const next = { ...prev };
-              delete next[payload.data.approval_request_id];
-              return next;
-            });
-          } else if (name === "child_run_started") {
-            ctx.setActiveChildRuns((prev) => ({
-              ...prev,
-              [payload.data.child_run_id]: {
-                childRunId: payload.data.child_run_id,
-                parentRunId: payload.data.parent_run_id,
-                taskId: payload.data.task_id,
-                targetAgentId: payload.data.target_agent_id,
-                instruction: payload.data.instruction,
-                status: "running",
-                startedAt: Date.now(),
-                steps: [],
-                deliverables: [],
-              },
-            }));
-          } else if (
-            name === "child_run_completed" ||
-            name === "child_run_failed" ||
-            name === "child_run_cancelled"
-          ) {
-            const cStatus =
-              name === "child_run_completed"
-                ? "completed"
-                : name === "child_run_cancelled"
-                ? "cancelled"
-                : "failed";
-            ctx.setActiveChildRuns((prev) => {
-              const cur = prev[payload.data.child_run_id];
-              if (!cur) return prev;
-              return {
-                ...prev,
-                [payload.data.child_run_id]: {
-                  ...cur,
-                  status: cStatus,
-                  deliverables:
-                    payload.data.deliverables || cur.deliverables,
-                  tokensUsed: payload.data.tokens_used,
-                  durationSeconds: payload.data.duration_seconds,
-                  error: payload.data.error,
-                },
-              };
-            });
-          }
-        } catch (parseErr) {
-          console.error("Failed to parse SSE payload for", name, parseErr);
-        }
-      });
+    // -----------------------------------------------------------------
+    // [Phase F.3] Subscribe to the shared runStreamManager for this job.
+    //
+    // The manager owns the EventSource: it opens exactly one connection
+    // per jobId, handles reconnection with backoff, uses
+    // `after_sequence` to resume, detects heartbeats, and closes on
+    // terminal events. It also keeps stream-store and session-store
+    // in sync (see lib/run-stream-manager.ts).
+    //
+    // This hook's only remaining responsibility is to project each event
+    // into ChatContainer's local UI state via handleEventPayload. The
+    // envelope shape matches the payload shape handleEventPayload was
+    // written against:
+    //   envelope.type  ↔  event name
+    //   envelope.step  ↔  payload.step
+    //   envelope.data  ↔  payload.data
+    // -----------------------------------------------------------------
+    runStreamManager.registerRun(jobId, resolvedChatId, {
+      prompt: options?.prompt,
+      title: options?.title,
+      agentId: options?.agentId,
+      projectId: options?.projectId,
     });
 
-    /**
-     * Handle transport errors. The EventSource is closed to prevent the
-     * browser's automatic reconnect from spamming the backend. A simple
-     * one-second debounce guards against rapid successive errors triggering
-     * multiple `fetchJobFiles` calls.
-     */
-    es.onerror = () => {
-      if (intentionallyClosed) return;
-      es.close();
-      const now = Date.now();
-      const last = (es as any).__lastErrorFetch || 0;
-      if (now - last < 1000) return;
-      (es as any).__lastErrorFetch = now;
-      p().fetchJobFiles(jobId);
-    };
-  }, []); // Stable identity: prevents the parent's effects from re-running.
+    const unsubscribe = runStreamManager.subscribe(jobId, (_run, envelope) => {
+      // The manager fires subscribers once with a null envelope during
+      // initial sync (so consumers can read the current state without
+      // a race). We only process real events.
+      if (!envelope) return;
+
+      try {
+        handleEventPayload(envelope.type as string, envelope);
+      } catch (err) {
+        if (DEBUG_SSE) {
+          console.warn(
+            "[SSE] handleEventPayload threw for event type",
+            envelope.type,
+            err,
+          );
+        }
+      }
+    });
+
+    unsubscribeRef.current = unsubscribe;
+  },
+  []); // Stable identity: prevents the parent's effects from re-running.
 
   return { connectStream, closeStream, eventSourceRef };
 }

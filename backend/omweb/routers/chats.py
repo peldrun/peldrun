@@ -46,6 +46,92 @@ class ProjectCreateRequest(BaseModel):
 
 
 # ============================================================================
+# Active Run Guards
+#
+# Deletion endpoints must never remove a workspace while an agent is
+# still writing to it. The checks below inspect the run registry that is
+# populated by ``start_run.py`` when a job is scheduled and cleared by the
+# ``done_callback`` when the task finishes.
+#
+# A run is considered "active" when:
+#   * its job_id (or chat_id alias) is registered in ``ACTIVE_JOB_TASKS``, AND
+#   * the corresponding task is not yet done.
+#
+# The second condition filters out the brief window between task
+# completion and the done_callback cleanup, during which a stale entry
+# may still be present in the registry.
+#
+# See ``docs/state-contracts.md`` §7 for the full deletion policy.
+# ============================================================================
+
+def _is_task_alive(task: Any) -> bool:
+    """
+    Return True when a registry entry represents a live task.
+
+    ``None`` entries are never alive. Completed tasks are never alive.
+    The registry is populated with ``asyncio.Task`` instances by
+    ``start_run.py``; this helper avoids assuming the concrete type so
+    test doubles also work, and treats an unexpected ``done()`` failure
+    as "alive" so the caller fails safe (blocks the deletion).
+    """
+    if task is None:
+        return False
+    is_done = getattr(task, "done", None)
+    if callable(is_done):
+        try:
+            return not is_done()
+        except Exception:
+            return True
+    return True
+
+
+def _find_active_run_for_chat(
+    chat: Optional[Dict[str, Any]],
+    chat_id: str,
+    active_jobs: Dict[str, Any],
+) -> Optional[str]:
+    """
+    Return the identifier of an active run for ``chat``, or None.
+
+    Both the canonical ``chat_id`` and the chat's current ``job_id`` are
+    checked, because the run registry mirrors entries under both keys
+    (see ``start_run.py`` ``ACTIVE_JOB_TASKS[actual_job_id] = exec_task``
+    and ``ACTIVE_JOB_TASKS[chat_id] = exec_task``).
+    """
+    if not chat:
+        return None
+    candidates: set[str] = set()
+    if chat_id:
+        candidates.add(chat_id)
+    job_id = chat.get("job_id")
+    if isinstance(job_id, str) and job_id:
+        candidates.add(job_id)
+    for key in candidates:
+        if key and _is_task_alive(active_jobs.get(key)):
+            return key
+    return None
+
+
+def _find_active_run_for_project(
+    project_id: str,
+    active_jobs: Dict[str, Any],
+) -> Optional[str]:
+    """
+    Return the identifier of the first active run in ``project_id``,
+    or None when no chat under that project has a live run.
+    """
+    for c in project_manager.list_chats(project_id=project_id):
+        if not isinstance(c, dict):
+            continue
+        cid = c.get("id") or ""
+        job_id = c.get("job_id") or ""
+        for key in (cid, job_id):
+            if key and _is_task_alive(active_jobs.get(key)):
+                return key
+    return None
+
+
+# ============================================================================
 # 1. STATIC ROUTES (MUST BE DECLARED BEFORE ANY /{chat_id} PARAMETER ROUTE)
 # ============================================================================
 
@@ -73,6 +159,30 @@ async def get_project_detail(project_id: str):
 
 @router.delete("/projects/{project_id}")
 async def delete_project(project_id: str):
+    """
+    Delete a project workspace.
+
+    Rejects with HTTP 409 when any chat under this project has an active
+    run — the deletion would remove a workspace that the agent is still
+    writing into, producing corrupt or lost deliverables. The operator
+    must stop the run (or wait for it to finish) before retrying.
+
+    Lazy import of ``ACTIVE_JOB_TASKS`` avoids a module-load cycle
+    between ``omweb.routers.chats`` and ``omweb.routers.run_routes``.
+    """
+    from omweb.routers.run_routes.state import ACTIVE_JOB_TASKS
+
+    active_run_id = _find_active_run_for_project(project_id, ACTIVE_JOB_TASKS)
+    if active_run_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot delete project '{project_id}': "
+                f"run '{active_run_id}' is still active. "
+                f"Stop the run or wait for it to complete before deleting."
+            ),
+        )
+
     project_manager.delete_project(project_id)
     return {"status": "ok", "message": f"Project {project_id} deleted"}
 
@@ -90,6 +200,23 @@ async def sweep_orphans():
 
 
 # Bulk Delete & Purge All Endpoint
+#
+# WARNING — SCOPE NOTE (deferred):
+# ---------------------------------
+# This endpoint deletes EVERY chat and project workspace. It currently
+# does NOT check ``ACTIVE_JOB_TASKS``, so a bulk delete triggered while
+# any run is active will corrupt that run's workspace (identical risk
+# to the single-chat and project cases fixed above).
+#
+# The current version leaves this gap intentionally to preserve the
+# existing emergency-cleanup workflow used during local development and
+# test teardown. Any user-facing UI path that calls this endpoint MUST
+# present a confirmation that explicitly warns about the active-run risk.
+#
+# If the safety gap needs to be closed in a future revision, add the
+# same guard used in ``delete_project`` / ``delete_single_chat``: iterate
+# every entry in ``ACTIVE_JOB_TASKS`` and return 409 when any task is
+# still alive.
 @router.delete("/all")
 async def delete_all_chats():
     report = chat_storage_engine.delete_all_chats()
@@ -378,6 +505,27 @@ async def delete_single_chat(
     cleanup calls are best-effort: a failure is logged and ignored
     so that the primary deletion still reports success.
     """
+    # Reject the deletion when a run for this chat is still active.
+    # The check is authoritative: ``deep_delete_chat`` removes the
+    # physical workspace directory, which would corrupt any in-flight
+    # agent that is still writing files there.
+    #
+    # Lazy import of ``ACTIVE_JOB_TASKS`` avoids a module-load cycle
+    # between ``omweb.routers.chats`` and ``omweb.routers.run_routes``.
+    from omweb.routers.run_routes.state import ACTIVE_JOB_TASKS
+
+    chat = project_manager.get_chat(chat_id)
+    active_run_id = _find_active_run_for_chat(chat, chat_id, ACTIVE_JOB_TASKS)
+    if active_run_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot delete chat '{chat_id}': "
+                f"run '{active_run_id}' is still active. "
+                f"Stop the run or wait for it to complete before deleting."
+            ),
+        )
+
     res = chat_storage_engine.deep_delete_chat(chat_id)
 
     # Auto-cleanup source-control state. Both calls are
