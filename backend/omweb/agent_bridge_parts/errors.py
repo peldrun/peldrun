@@ -50,6 +50,92 @@ def format_smart_error(err: Exception, model_name: str, provider_name: str) -> s
     err_str = str(err)
     lower_err = err_str.lower()
 
+    # [Phase H] Out-of-memory detection must run FIRST — the OOM
+    # message contains the word "failed" (e.g. "Engine protocol predict
+    # stream returned an error"), and would otherwise be matched by the
+    # `"failed to load"` branch below, giving a misleading hint about
+    # reloading the model rather than reducing the model size or
+    # context.
+    if (
+        "ran out of memory" in lower_err
+        or "out of memory" in lower_err
+        or "bad allocation" in lower_err
+        or "cuda out of memory" in lower_err
+        or "insufficient memory" in lower_err
+        or "memory exhausted" in lower_err
+        or "cannot allocate" in lower_err
+    ):
+        return _err_card(
+            title=f"Model `{model_name}` ran out of memory",
+            description=(
+                f"The model **{model_name}** does not have enough "
+                f"GPU/RAM to complete the generation."
+            ),
+            hint=(
+                "In LM Studio: either eject and reload the model, "
+                "reduce the context length in the model settings, or "
+                "switch to a smaller quantization "
+                "(e.g. Q4_K_M instead of Q8_0)."
+            ),
+            # The raw error (`Error code: ...`) is intentionally NOT
+            # included here. For a matched OOM the formatted message
+            # already contains every actionable detail; the raw dump
+            # only repeats it. Full raw text remains available in the
+            # backend console log and in `job_manager.get_job(id).error`
+            # for debugging.
+        )
+
+    # Billing / credit exhaustion. Anthropic and OpenAI both return
+    # 400/403 with variations of "credit balance" / "insufficient
+    # quota" / "billing". Without this branch, the user would see a
+    # generic "Chat execution error" with a raw JSON dump — less
+    # actionable than a dedicated card.
+    if (
+        "credit balance" in lower_err
+        or "insufficient quota" in lower_err
+        or "insufficient credit" in lower_err
+        or "billing" in lower_err and "upgrade" in lower_err
+        or "exceeded your current quota" in lower_err
+    ):
+        return _err_card(
+            title=f"Provider `{provider_name}` account has insufficient credits",
+            description=(
+                f"The API key for **{provider_name}** does not have "
+                f"enough credit balance to complete this request."
+            ),
+            hint=(
+                f"Visit your {provider_name} billing page to add "
+                f"credits, or switch to a different provider/model "
+                f"in Settings."
+            ),
+            # Raw error dump omitted — see rationale in the OOM branch
+            # above. Backend logs contain the full payload.
+        )
+
+    # [Phase H] "Did not respond within N seconds" — emitted by the
+    # new `client.py` watchdog when the provider accepts the
+    # connection but never sends data.
+    if (
+        "did not respond within" in lower_err
+        or "did not produce any output within" in lower_err
+        or "stopped responding after" in lower_err
+    ):
+        return _err_card(
+            title=f"Provider `{provider_name}` is not responding",
+            description=(
+                f"Model **{model_name}** did not produce any output in "
+                f"time. This usually means the provider ejected the "
+                f"model, crashed, or lost network connectivity."
+            ),
+            hint=(
+                "Verify the provider is running and the model is "
+                "loaded, then retry. If using LM Studio, eject and "
+                "reload the model, or restart the Local Server."
+            ),
+            # Raw error dump omitted — see rationale in the OOM branch
+            # above. Backend logs contain the full payload.
+        )
+
     if (
         "failed to load model" in lower_err
         or "failed to load" in lower_err

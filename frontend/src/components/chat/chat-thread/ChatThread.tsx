@@ -90,8 +90,9 @@ export function ChatThread({
   onApproveDelegation,
   onRejectDelegation,
   onCancelSubtask,
-  onPauseJob,
-  onResumeJob,
+  // Pause/Resume were removed in Phase H — no LLM provider supports
+  // true streaming pause. These props are no longer destructured
+  // (unused → compile error under `noUnusedParameters`).
   onRegenerate,
   onOpenReview,
 }: ChatThreadProps) {
@@ -276,14 +277,14 @@ export function ChatThread({
           />
         )}
 
-        {/* Live Running / Paused Indicator */}
-        {(status === "running" || status === "paused") && !isHumanWaiting && activeApprovalList.length === 0 && (
+        {/* Live Running Indicator.
+            Pause was removed in Phase H — no LLM provider supports
+            true streaming pause, so the button was misleading. Stop
+            (available in ChatSubHeader) is the only lifecycle control. */}
+        {status === "running" && !isHumanWaiting && activeApprovalList.length === 0 && (
           <LiveStatusIndicator
-            message={status === "paused" ? "Execution paused by operator" : getLiveStatusMessage()}
+            message={getLiveStatusMessage()}
             elapsedSeconds={elapsedSeconds}
-            isPaused={status === "paused"}
-            onPause={onPauseJob}
-            onResume={onResumeJob}
           />
         )}
 
@@ -308,7 +309,11 @@ export function ChatThread({
             costUsd={costUsd}
             latencyMs={latencyMs}
             tokensPerSecond={tokensPerSecond}
-            onRegenerate={status !== "running" && status !== "paused" && onRegenerate ? () => onRegenerate(-1) : undefined}
+            onRegenerate={
+              status !== "running" && onRegenerate
+                ? () => onRegenerate(-1)
+                : undefined
+            }
           />
         )}
 

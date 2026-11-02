@@ -29,6 +29,41 @@ DEFAULT_LLM_BASE_URL = "http://127.0.0.1:1234/v1"
 DEFAULT_LLM_API_KEY = "EMPTY"
 DEFAULT_LLM_TIMEOUT_SECONDS = 300.0
 
+# ─── [Phase H — CRITICAL] Streaming chunk watchdog ──────────────────
+#
+# The OpenAI SDK does NOT apply its `timeout` parameter to each
+# `__anext__()` call on a streaming response. If the provider accepts
+# the TCP connection but goes silent (LM Studio with an ejected model,
+# crashed server, network black-hole), `async for chunk in response`
+# blocks FOREVER. `asyncio.CancelledError` from `step_task.cancel()`
+# cannot penetrate `__anext__()`, so the runner's step_timeout has
+# no effect either. The event loop freezes — Ctrl+C is the only
+# escape.
+#
+# These two watchdogs guarantee the loop ALWAYS either advances or
+# raises within a bounded time:
+#
+#   * FIRST_CHUNK_TIMEOUT — max wait for the FIRST chunk after the
+#     stream opens. Covers "model not loaded", "provider crashed on
+#     connect", "ejected model mid-session". 90s allows slow model
+#     loading but fails fast enough that users don't stare at a
+#     spinner for minutes.
+#
+#   * INTER_CHUNK_TIMEOUT — max silence between two consecutive
+#     chunks AFTER the first. Covers "crashed mid-generation",
+#     "OOM during generation", "network black-hole". 120s covers even
+#     a pathological long-think pause.
+#
+# Override via environment for faster local testing:
+#   PELDRUN_LLM_FIRST_CHUNK_TIMEOUT=30
+#   PELDRUN_LLM_INTER_CHUNK_TIMEOUT=60
+STREAM_FIRST_CHUNK_TIMEOUT_SECONDS = float(
+    os.environ.get("PELDRUN_LLM_FIRST_CHUNK_TIMEOUT", "90.0")
+)
+STREAM_INTER_CHUNK_TIMEOUT_SECONDS = float(
+    os.environ.get("PELDRUN_LLM_INTER_CHUNK_TIMEOUT", "120.0")
+)
+
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -772,7 +807,32 @@ class AsyncLLMClient:
 
         if call_kwargs.get("stream"):
             try:
-                response = await self.client.chat.completions.create(**call_kwargs)
+                # [Phase H — CRITICAL] The initial `create(stream=True)`
+                # call is NOT covered by the `__anext__` watchdog below
+                # — because the watchdog only starts after `create`
+                # returns the stream object. If the provider accepts
+                # the connection but never sends response headers
+                # (LM Studio with an ejected model, crashed server,
+                # network black-hole), `create` blocks on the httpx
+                # timeout (default 300s = 5 minutes). That's the exact
+                # "backend freezes, needs Ctrl+C" failure mode.
+                #
+                # Wrapping the call in `wait_for` bounds it to
+                # `STREAM_FIRST_CHUNK_TIMEOUT_SECONDS`, so the freeze
+                # becomes a fast, descriptive error.
+                response = await asyncio.wait_for(
+                    self.client.chat.completions.create(**call_kwargs),
+                    timeout=STREAM_FIRST_CHUNK_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    f"The provider for model '{chosen_model}' did not "
+                    f"respond within {STREAM_FIRST_CHUNK_TIMEOUT_SECONDS:.0f}s "
+                    f"after the connection was opened. The provider may "
+                    f"have ejected the model, crashed, or lost "
+                    f"connectivity. Check that the model is loaded and "
+                    f"the provider is running, then retry."
+                )
             except Exception as stream_init_err:
                 # [FIX-OOM-FAST-FAIL] OOM must never trigger a retry.
                 if _is_oom_error(stream_init_err):
@@ -795,7 +855,21 @@ class AsyncLLMClient:
                 )
                 call_kwargs["stream"] = False
                 try:
-                    fallback_resp = await self.client.chat.completions.create(**call_kwargs)
+                    # [Phase H] Same watchdog as above — the fallback
+                    # path is subject to the same "silent provider"
+                    # failure mode.
+                    fallback_resp = await asyncio.wait_for(
+                        self.client.chat.completions.create(**call_kwargs),
+                        timeout=STREAM_FIRST_CHUNK_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    raise RuntimeError(
+                        f"The provider for model '{chosen_model}' did "
+                        f"not respond within "
+                        f"{STREAM_FIRST_CHUNK_TIMEOUT_SECONDS:.0f}s in "
+                        f"the non-streaming fallback path. The provider "
+                        f"is likely ejected or crashed."
+                    )
                 except Exception as fallback_err:
                     if _is_oom_error(fallback_err):
                         raise RuntimeError(
@@ -822,26 +896,79 @@ class AsyncLLMClient:
 
             try:
                 _cancel_check_counter = 0
-                async for chunk in response:
-                    now = time.time()
+                _chunk_count = 0
+                _first_chunk_at: Optional[float] = None
 
-                    # ─── Explicit cancellation yield point ──────────────
-                    #
-                    # [FIX-G.2] The OpenAI AsyncStream can buffer chunks
-                    # and return them synchronously from ``__anext__``.
-                    # Between two buffered chunks, no real ``await``
-                    # fires, so ``asyncio.CancelledError`` may not be
-                    # raised until the buffer is drained — allowing many
-                    # tokens to leak through after the user clicked
-                    # Stop (observed: ~200 tokens post-cancel).
-                    #
-                    # ``await asyncio.sleep(0)`` is a cheap task-switch
-                    # yield that guarantees the event loop runs any
-                    # pending cancellation before the next iteration.
-                    # We do it every iteration (not periodically) to
-                    # guarantee near-instant cancellation and because
-                    # the yield itself costs ~1µs — negligible against
-                    # the ~20ms per chunk from the LLM provider.
+                # ─── [Phase H — CRITICAL] Watchdog-guarded stream ─────
+                #
+                # We replace ``async for chunk in response:`` with a
+                # manual ``await asyncio.wait_for(
+                # response.__anext__(), timeout=X)`` loop so every chunk
+                # arrival is bounded by a timeout. This is the ONLY way
+                # to guarantee that a stalled provider cannot freeze the
+                # backend event loop — the exact failure mode observed
+                # when LM Studio ejects a model mid-session and the SDK
+                # silently hangs on the next read.
+                #
+                # Semantics preserved:
+                #   * ``StopAsyncIteration`` ↔ normal loop exit
+                #   * ``asyncio.CancelledError`` ↔ propagated (Stop
+                #     button still works instantly)
+                #   * any other exception ↔ same handling as before
+                #
+                # Semantics ADDED:
+                #   * ``asyncio.TimeoutError`` ↔ converted to a
+                #     descriptive ``RuntimeError`` so the dispatcher
+                #     surfaces it to the frontend.
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(
+                            response.__anext__(),
+                            timeout=(
+                                STREAM_FIRST_CHUNK_TIMEOUT_SECONDS
+                                if _first_chunk_at is None
+                                else STREAM_INTER_CHUNK_TIMEOUT_SECONDS
+                            ),
+                        )
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError:
+                        waited = (
+                            STREAM_FIRST_CHUNK_TIMEOUT_SECONDS
+                            if _first_chunk_at is None
+                            else STREAM_INTER_CHUNK_TIMEOUT_SECONDS
+                        )
+                        # Close the underlying connection so the
+                        # provider stops generating server-side.
+                        try:
+                            await response.aclose()
+                        except Exception:
+                            pass
+                        if _chunk_count == 0:
+                            raise RuntimeError(
+                                f"The model '{chosen_model}' did not "
+                                f"produce any output within "
+                                f"{waited:.0f}s. The provider may have "
+                                f"ejected the model, crashed, or stopped "
+                                f"responding. Check that the model is "
+                                f"loaded and the provider is running, "
+                                f"then retry."
+                            )
+                        raise RuntimeError(
+                            f"The model '{chosen_model}' stopped "
+                            f"responding after {_chunk_count} chunk(s). "
+                            f"No new data arrived for {waited:.0f}s. The "
+                            f"provider likely crashed or the model was "
+                            f"ejected mid-generation. "
+                            f"Partial content: {len(accumulated_content)} "
+                            f"chunk(s) received before the stall."
+                        )
+
+                    now = time.time()
+                    if _first_chunk_at is None:
+                        _first_chunk_at = now
+                    _chunk_count += 1
+
                     _cancel_check_counter += 1
                     await asyncio.sleep(0)
 
@@ -1061,7 +1188,20 @@ class AsyncLLMClient:
                 ttft_ms=ttft_ms,
             )
 
-        response = await self.client.chat.completions.create(**call_kwargs)
+        # [Phase H] Same watchdog on the direct non-streaming path
+        # (when the caller explicitly passes stream=False).
+        try:
+            response = await asyncio.wait_for(
+                self.client.chat.completions.create(**call_kwargs),
+                timeout=STREAM_FIRST_CHUNK_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"The provider for model '{chosen_model}' did not "
+                f"respond within {STREAM_FIRST_CHUNK_TIMEOUT_SECONDS:.0f}s "
+                f"(non-streaming mode). The provider is likely ejected "
+                f"or crashed."
+            )
         return self._process_non_streaming_choice(
             response=response,
             effective_messages=effective_messages,

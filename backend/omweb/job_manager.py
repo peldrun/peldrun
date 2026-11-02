@@ -141,33 +141,32 @@ class JobManager:
         return self._pause_events.get(job_id)
 
     def pause_job(self, job_id: str) -> bool:
-        """Mark job status as paused and propagate pause signal to the active runner."""
-        job = self._jobs.get(job_id)
-        if job and job.status in ("running", "resuming"):
-            job.status = "paused"
-            job.is_paused = True
-            runner = self._runners.get(job_id)
-            if runner and hasattr(runner, "pause"):
-                runner.pause()
-            event = self._pause_events.get(job_id)
-            if event:
-                event.set()
-            return True
+        """
+        DEPRECATED — always returns False.
+
+        Pause was removed in Phase H. See control.py's deprecation
+        notice for the full rationale.
+
+        Kept as a no-op (rather than deleted) so that any remaining
+        internal callers don't hit AttributeError. The public
+        /pause endpoint returns 501 Not Implemented.
+        """
+        logger.debug(
+            "job_manager.pause_job(%s) called but Pause is deprecated.",
+            job_id,
+        )
         return False
 
     def resume_job(self, job_id: str) -> bool:
-        """Mark job status as running and propagate resume signal to the active runner."""
-        job = self._jobs.get(job_id)
-        if job and (job.status == "paused" or job.is_paused):
-            job.status = "running"
-            job.is_paused = False
-            runner = self._runners.get(job_id)
-            if runner and hasattr(runner, "resume"):
-                runner.resume()
-            event = self._pause_events.get(job_id)
-            if event:
-                event.clear()
-            return True
+        """
+        DEPRECATED — always returns False.
+
+        See pause_job above.
+        """
+        logger.debug(
+            "job_manager.resume_job(%s) called but Resume is deprecated.",
+            job_id,
+        )
         return False
 
     def append_event(self, job_id: str, event: Dict[str, Any]) -> None:

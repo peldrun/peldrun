@@ -78,21 +78,22 @@ export type SessionStatus =
   | "running"
   | "waiting_for_input"
   | "retrying"
-  | "paused"
+  // "paused" intentionally omitted in Phase H — no LLM provider
+  // supports true streaming pause. Stop (cancelled) is the only
+  // lifecycle control that actually terminates generation.
   | "cancelling"
   | "cancelled"
   | "completed"
   | "failed"
   | "interrupted";
 
-const VALID_STATUSES: ReadonlySet<string> = new Set<SessionStatus>([
+const _VALID_STATUSES: ReadonlySet<string> = new Set<SessionStatus>([
   "pending",
   "queued",
   "starting",
   "running",
   "waiting_for_input",
   "retrying",
-  "paused",
   "cancelling",
   "cancelled",
   "completed",
@@ -112,6 +113,10 @@ const LEGACY_STATUS_MAP: Readonly<Record<string, SessionStatus>> = {
   active: "pending",
   done: "completed",
   error: "failed",
+  // "paused" is mapped to "running" — a paused session from before
+  // Phase H never actually stopped generating tokens, so it was
+  // running the whole time. Treating it as "running" reflects reality.
+  paused: "running",
 };
 
 /**
@@ -127,7 +132,10 @@ export function normalizeStatus(raw: string | null | undefined): SessionStatus {
   const lower = String(raw).trim().toLowerCase();
   const legacy = LEGACY_STATUS_MAP[lower];
   if (legacy) return legacy;
-  if (VALID_STATUSES.has(lower)) return lower as SessionStatus;
+  // Typo fix (Phase H): the constant is defined as `_VALID_STATUSES`
+  // (with a leading underscore) at module scope. The reference here
+  // previously used the un-underscored name, causing a compile error.
+  if (_VALID_STATUSES.has(lower)) return lower as SessionStatus;
   return "pending";
 }
 
@@ -261,10 +269,19 @@ interface SessionState {
     data: Record<string, any>,
   ) => void;
 
-  /** Wipe all sessions and project caches (used by History's "Purge All"). */
+  // Maintenance operations
+  //
+  // `clearAll` — full reset (used by History's "Purge All Chats").
+  // `invalidateProjectSessions` — drops a single project's cache entry
+  //   so the next `loadProjectSessions(projectId)` refetches (used by
+  //   the Project Detail page after creating a new session inside the
+  //   project).
+  //
+  // Both were declared in the implementation object below but were
+  // missing from this interface, causing "Parameter 'projectId'
+  // implicitly has an 'any' type" (TS7006) because TypeScript had no
+  // way to infer the parameter type without the interface signature.
   clearAll: () => void;
-
-  /** Mark a project's session cache as stale so the next load refetches. */
   invalidateProjectSessions: (projectId: string) => void;
 
   // Test/diagnostic helper — clears all state.

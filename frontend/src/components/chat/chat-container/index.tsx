@@ -377,7 +377,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   }, [setActiveModelName]);
 
   useEffect(() => {
-    if (status === "running" || status === "paused" || steps.length > 0 || submittedPrompt) {
+    if (status === "running" || steps.length > 0 || submittedPrompt) {
       chatScrollBottomRef.current?.scrollIntoView({ behavior: "smooth" });
     }
   }, [steps, status, finalResult, submittedPrompt]);
@@ -531,7 +531,10 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   }, []);
 
   const handleStopTask = useCallback(async () => {
-    if (!activeJobId || (status !== "running" && status !== "paused")) return;
+    // Only allow Stop while the run is genuinely `running`. `cancelling`
+    // means Stop is already in flight (double-click guard); any other
+    // state means the run is not active.
+    if (!activeJobId || status !== "running") return;
 
     const jobIdToStop = activeJobId;
 
@@ -629,39 +632,13 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     }
   }, [activeJobId, status]);
 
-  const handlePauseTask = useCallback(async () => {
-    if (!activeJobId || status !== "running") return;
-    try {
-      await fetch(`/api/run/jobs/${activeJobId}/pause`, { method: "POST" });
-      setStatus("paused");
-      if (typeof window !== "undefined") {
-        window.dispatchEvent(
-          new CustomEvent("omweb:chat-status-changed", {
-            detail: { chatId: activeChatId, jobId: activeJobId, status: "paused" },
-          })
-        );
-      }
-    } catch (e) {
-      console.error("[ChatContainer] Failed to pause job:", e);
-    }
-  }, [activeJobId, status, activeChatId]);
-
-  const handleResumeTask = useCallback(async () => {
-    if (!activeJobId || status !== "paused") return;
-    try {
-      await fetch(`/api/run/jobs/${activeJobId}/resume`, { method: "POST" });
-      setStatus("running");
-      if (typeof window !== "undefined") {
-        window.dispatchEvent(
-          new CustomEvent("omweb:chat-status-changed", {
-            detail: { chatId: activeChatId, jobId: activeJobId, status: "running" },
-          })
-        );
-      }
-    } catch (e) {
-      console.error("[ChatContainer] Failed to resume job:", e);
-    }
-  }, [activeJobId, status, activeChatId]);
+  // Pause/Resume handlers were removed in Phase H.
+  // Reason: no LLM provider (LM Studio, GigaChat, OpenAI, Anthropic,
+  // Ollama) exposes true streaming-pause semantics. The button
+  // appeared to work in the UI but the LLM kept generating tokens
+  // in the background, causing visual contradiction. Professional
+  // tools (ChatGPT, Claude, Cursor, Gemini) offer Stop only.
+  // Stop (handleStopTask above) is the single universal control.
 
   // --- Human-in-the-loop ----------------------------------------------------
   const handleSendHumanAnswer = useCallback(
@@ -761,7 +738,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       if (
         (!rawText && (!filesToUpload || filesToUpload.length === 0)) ||
         status === "running" ||
-        status === "paused"
+        status === "cancelling"
       ) {
         throw new Error(
           "Task cannot be started with empty input or during ongoing run."
@@ -1146,7 +1123,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   // --- Turn Regeneration Handler --------------------------------------------
   const handleRegenerate = useCallback(
     async (turnIndex: number, turn?: ChatTurn) => {
-      if (status === "running" || status === "paused") return;
+      if (status === "running" || status === "cancelling") return;
 
       if (turnIndex === -1 || turnIndex === undefined) {
         // Regenerating the current/latest completed turn
@@ -1320,10 +1297,9 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     steps.length === 0 &&
     !submittedPrompt &&
     status !== "running" &&
-    status !== "paused";
+    status !== "cancelling";
 
   const getLiveStatusMessage = useCallback(() => {
-    if (status === "paused") return "Execution paused at step boundary";
     if (execMode === "chat") return "Synthesizing conversational response...";
     if (steps.length === 0)
       return "Analyzing request and formulating execution plan...";
@@ -1335,7 +1311,10 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     if (lastEvt.type === "thought")
       return "Deep reasoning and verifying solution...";
     return "Agent reasoning & executing autonomously...";
-  }, [execMode, steps, status]);
+    // `status` used to be in the deps array because the pre-Phase-H
+    // version returned "Execution paused..." for the paused state.
+    // That branch is gone, so `status` is no longer read here.
+  }, [execMode, steps]);
 
   const currentCostUsd = useMemo(() => {
     return currentUsageMetrics?.cost_usd ?? 0;
@@ -1364,31 +1343,27 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     return null;
   }, [currentUsageMetrics, elapsedSeconds, tokensUsed.output]);
 
-  // Narrow the widened ChatStatus (13 values) down to the 5-value union
-  // that ChatThread currently declares. ChatThread only reacts to
-  // "running", "paused", "completed", "failed"; every other state maps
-  // to the closest semantic equivalent so its conditional rendering
-  // (live indicator, deliverable, regenerate button) behaves correctly:
+  // Narrow the widened ChatStatus down to what ChatThread actually
+  // distinguishes. After Phase H (Pause removal), "paused" is no
+  // longer a valid status, so the adapter is much simpler:
   //
-  //   pending/queued/starting/retrying  → "running"    (active work)
-  //   waiting_for_input                 → "paused"     (suspended, no live ticker)
-  //   cancelling                        → "paused"     (stop in flight, no live ticker)
-  //   cancelled/interrupted             → "completed"  (terminal; deliverable shown, regen allowed)
-  //   idle/running/paused/completed/failed → passthrough
+  //   pending/queued/starting/retrying → "running"  (active work — spinner)
+  //   everything else                  → passthrough
   //
-  // TODO (Phase G-follow): widen ChatThreadProps.status in
-  // `components/chat/chat-thread/types.ts` to accept the canonical
-  // ChatStatus union, then this adapter can be removed.
-  const threadStatus: "idle" | "running" | "paused" | "completed" | "failed" =
+  // ChatThread only branches on `status === "running"` (live spinner)
+  // and `status === "failed"` (deliverable styling). All other values
+  // — including waiting_for_input, cancelling, cancelled, interrupted,
+  // completed — fall through to the "not running, not failed" branch,
+  // which is exactly what those states need.
+  //
+  // `threadStatus` is now typed as `ChatStatus` (from ./types), which
+  // matches `ChatThreadProps.status` after Phase H's type widening.
+  const threadStatus: ChatStatus =
     status === "pending" ||
     status === "queued" ||
     status === "starting" ||
     status === "retrying"
       ? "running"
-      : status === "waiting_for_input" || status === "cancelling"
-      ? "paused"
-      : status === "cancelled" || status === "interrupted"
-      ? "completed"
       : status;
 
   // --- Render ---------------------------------------------------------------
@@ -1518,8 +1493,6 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
             onApproveDelegation={handleApproveDelegation}
             onRejectDelegation={handleRejectDelegation}
             onCancelSubtask={handleCancelSubtask}
-            onPauseJob={handlePauseTask}
-            onResumeJob={handleResumeTask}
             onRegenerate={handleRegenerate}
             onOpenReview={handleOpenReview}
           />
@@ -1539,12 +1512,10 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
               // new task while a cancellation is still in flight.
               isRunning={
                 status === "running" ||
-                status === "paused" ||
                 status === "cancelling"
               }
               disabled={
                 status === "running" ||
-                status === "paused" ||
                 status === "cancelling"
               }
             />

@@ -868,8 +868,135 @@ async def run_instrumented(
 
     try:
         await engine.run(context)
-        _safe_monitor_complete_run(job_id)
-        _append_session_log(chat_id, project_id, "FINAL", "Execution completed successfully.")
+
+        # ─── [Phase H fix — CRITICAL] Post-run state verification ─────
+        #
+        # PeldrunEngine catches LLM/provider errors internally (in
+        # `executor.execute()`): it logs the failure, marks the job as
+        # failed via `job_manager.fail_job()`, and RETURNS NORMALLY to
+        # the caller WITHOUT re-raising.
+        #
+        # Consequence before this fix:
+        #   1. `dispatcher.py` saw `await engine.run(context)` return
+        #      without exception.
+        #   2. It called `_safe_monitor_complete_run(job_id)` (wrong).
+        #   3. It NEVER dispatched an `error` SSE event.
+        #   4. `streaming.py` waited forever for a terminal event (only
+        #      saw ping heartbeats) → SSE stream never closed.
+        #   5. Frontend stayed in "running" with no error — users saw
+        #      NOTHING even though the run had clearly failed.
+        #
+        # We now inspect the *actual persisted state* after the engine
+        # returns and synthesize the missing terminal SSE event so the
+        # frontend ALWAYS receives exactly one terminal signal.
+        # [FIX] ACTIVE_JOB_EVENTS lives in the run_routes state module,
+        # NOT in agent_bridge_parts.state. The two modules share the
+        # basename "state" but are different files:
+        #
+        #   omweb/routers/run_routes/state.py   → ACTIVE_JOB_EVENTS ✅
+        #   omweb/agent_bridge_parts/state.py   → human_answers, active_tasks, ...
+        #
+        # The previous `from .state import ...` resolved to the second
+        # module and raised ImportError, which was caught by the outer
+        # `except Exception` and synthesized an ERROR SSE event with
+        # the ImportError message instead of the real provider error.
+        from omweb.routers.run_routes.state import (
+            ACTIVE_JOB_EVENTS as _ACTIVE_JOB_EVENTS,
+        )
+
+        final_job = job_manager.get_job(job_id)
+        final_status = (final_job.status if final_job else "").lower()
+        final_error = (final_job.error if final_job else None) or ""
+
+        _events = _ACTIVE_JOB_EVENTS.get(job_id) or []
+        _terminal_types = {"final", "error", "cancelled", "done"}
+        _already_terminal = any(
+            str(ev.get("type", "")).lower() in _terminal_types
+            for ev in _events
+        )
+
+        if final_status == "failed":
+            err_msg = format_smart_error(
+                Exception(final_error or "Execution failed."),
+                model_name,
+                provider_name,
+            )
+            _safe_monitor_fail_run(job_id, error_message=err_msg)
+            _append_session_log(
+                chat_id, project_id, "ERROR",
+                final_error or "Execution failed.",
+            )
+            if not _already_terminal:
+                logger.warning(
+                    "[BRIDGE] Engine returned with status=failed for job "
+                    "%s but did NOT dispatch a terminal SSE event. "
+                    "Synthesizing ERROR: %s",
+                    job_id,
+                    final_error or "(no message)",
+                )
+                await dispatch_event(
+                    job_id,
+                    SSEEvent(
+                        type=SSEEventType.ERROR,
+                        step=1,
+                        data={
+                            "message": err_msg,
+                            "model": model_name,
+                            "provider": provider_name,
+                        },
+                    ),
+                )
+        elif final_status == "cancelled":
+            _safe_monitor_cancel_run(job_id)
+            _append_session_log(
+                chat_id, project_id, "SYSTEM",
+                "Execution cancelled.",
+            )
+            if not _already_terminal:
+                logger.warning(
+                    "[BRIDGE] Engine returned with status=cancelled for "
+                    "job %s but did NOT dispatch a terminal SSE event. "
+                    "Synthesizing CANCELLED.",
+                    job_id,
+                )
+                await dispatch_event(
+                    job_id,
+                    SSEEvent(
+                        type=SSEEventType.CANCELLED,
+                        step=1,
+                        data={"message": "Execution cancelled."},
+                    ),
+                )
+        else:
+            _safe_monitor_complete_run(job_id)
+            _append_session_log(
+                chat_id, project_id, "FINAL",
+                "Execution completed successfully.",
+            )
+            # If the engine marked the job complete but didn't dispatch
+            # a `final` event (some implementations rely on the caller
+            # to do it), synthesize one so the stream closes cleanly.
+            if not _already_terminal:
+                logger.warning(
+                    "[BRIDGE] Engine returned with status=%r for job %s "
+                    "but did NOT dispatch a terminal SSE event. "
+                    "Synthesizing FINAL.",
+                    final_status,
+                    job_id,
+                )
+                await dispatch_event(
+                    job_id,
+                    SSEEvent(
+                        type=SSEEventType.FINAL,
+                        step=1,
+                        data={
+                            "result": (
+                                (final_job.result if final_job else None)
+                                or ""
+                            ),
+                        },
+                    ),
+                )
     except asyncio.CancelledError:
         print(f"[BRIDGE] Job was cancelled/aborted: {job_id}")
         _safe_monitor_cancel_run(job_id)

@@ -280,122 +280,81 @@ async def stop_job(job_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Pause
+# Pause / Resume — DEPRECATED (Phase H)
+#
+# These endpoints remain registered so that older clients (or bookmarks
+# pointing at /pause) receive an explicit 501 response instead of a 404.
+# The response bodies are compatible with `JobControlResponse` so the
+# frontend's TypeScript parser doesn't crash on the shape.
+#
+# Rationale for removal
+# ---------------------
+# No LLM provider exposes true streaming-pause semantics. The HTTP
+# connection would need to stay open while the client stops consuming
+# chunks, which every provider treats as a slow consumer (not a pause).
+# The stream continues to generate in the background — consuming GPU
+# and network — while the UI falsely reports "PAUSED".
+#
+# The user-facing alternative is Stop (handleStopTask), which closes
+# the connection and genuinely terminates generation. This is what
+# every professional LLM tool (ChatGPT, Claude, Cursor, Gemini) does.
+#
+# Kept registered (rather than deleted) for backward compatibility:
+# stale client bundles still calling these endpoints get a clear 501
+# instead of a misleading 404, and operators see the deprecation
+# notice in the response body.
 # ---------------------------------------------------------------------------
 
 @router.post("/jobs/{job_id}/pause", response_model=JobControlResponse)
 async def pause_job(job_id: str):
     """
-    Pause a running job by job id or chat id.
+    DEPRECATED — returns HTTP 501 Not Implemented.
 
-    Dispatches a canonical ``status`` event with ``data.status="paused"``.
-    This is NOT a terminal event — the run continues to be tracked by the
-    stream manager and will resume when ``/resume`` is called.
+    Pause was removed in Phase H. No LLM provider supports true
+    streaming-pause: the backend keeps generating tokens while the
+    client stops consuming chunks, which is not what "pause" means.
+
+    Use POST /jobs/{job_id}/stop instead — it closes the HTTP
+    connection, terminates generation, and reflects the canonical
+    "cancelled" status.
     """
-    chat, chat_id = resolve_chat(job_id)
-
-    target_job_id = job_id
-    if chat and chat.get("job_id"):
-        target_job_id = chat.get("job_id")
-
-    # Update in-memory state and propagate to the active runner.
-    job_manager.pause_job(target_job_id)
-    if job_id != target_job_id:
-        job_manager.pause_job(job_id)
-
-    runner = (
-        job_manager.get_runner(target_job_id)
-        or job_manager.get_runner(job_id)
+    logger.warning(
+        "[DEPRECATED] /pause called for job %s. Pause was removed in "
+        "Phase H — use /stop instead.",
+        job_id,
     )
-    if runner and hasattr(runner, "pause"):
-        try:
-            runner.pause()
-        except Exception as exc:
-            logger.debug("runner.pause() raised: %s", exc)
+    from fastapi import HTTPException
 
-    # Persist to session.json.
-    if chat_id and chat:
-        chat_pid = chat.get("project_id", "default_project")
-        _persist_session_status(
-            chat_id,
-            "paused",
-            project_id=chat_pid,
-        )
-
-    # Canonical `status` event with data.status="paused".
-    await _dispatch_control_event(
-        target_job_id,
-        SSEEventType.STATUS,
-        {
-            "status": "paused",
-            "message": "Task paused by user",
-        },
+    raise HTTPException(
+        status_code=501,
+        detail=(
+            "Pause is not supported. No LLM provider exposes true "
+            "streaming pause semantics. Use POST "
+            f"/api/run/jobs/{job_id}/stop instead to terminate the run."
+        ),
     )
 
-    return {
-        "success": True,
-        "job_id": target_job_id,
-        "chat_id": chat_id,
-        "status": "paused",
-        "message": "Task paused successfully",
-    }
-
-
-# ---------------------------------------------------------------------------
-# Resume
-# ---------------------------------------------------------------------------
 
 @router.post("/jobs/{job_id}/resume", response_model=JobControlResponse)
 async def resume_job(job_id: str):
     """
-    Resume a paused job by job id or chat id.
+    DEPRECATED — returns HTTP 501 Not Implemented.
 
-    Dispatches a canonical ``status`` event with ``data.status="running"``.
+    Resume was removed in Phase H alongside Pause. See the pause
+    endpoint's docstring for the full rationale.
     """
-    chat, chat_id = resolve_chat(job_id)
-
-    target_job_id = job_id
-    if chat and chat.get("job_id"):
-        target_job_id = chat.get("job_id")
-
-    # Update in-memory state and propagate to the active runner.
-    job_manager.resume_job(target_job_id)
-    if job_id != target_job_id:
-        job_manager.resume_job(job_id)
-
-    runner = (
-        job_manager.get_runner(target_job_id)
-        or job_manager.get_runner(job_id)
+    logger.warning(
+        "[DEPRECATED] /resume called for job %s. Resume was removed in "
+        "Phase H — Pause no longer exists.",
+        job_id,
     )
-    if runner and hasattr(runner, "resume"):
-        try:
-            runner.resume()
-        except Exception as exc:
-            logger.debug("runner.resume() raised: %s", exc)
+    from fastapi import HTTPException
 
-    # Persist to session.json.
-    if chat_id and chat:
-        chat_pid = chat.get("project_id", "default_project")
-        _persist_session_status(
-            chat_id,
-            "running",
-            project_id=chat_pid,
-        )
-
-    # Canonical `status` event with data.status="running".
-    await _dispatch_control_event(
-        target_job_id,
-        SSEEventType.STATUS,
-        {
-            "status": "running",
-            "message": "Task resumed by user",
-        },
+    raise HTTPException(
+        status_code=501,
+        detail=(
+            "Resume is not supported. It was removed together with "
+            "Pause in Phase H. Use POST "
+            f"/api/run/jobs/{job_id}/stop to terminate the run instead."
+        ),
     )
-
-    return {
-        "success": True,
-        "job_id": target_job_id,
-        "chat_id": chat_id,
-        "status": "running",
-        "message": "Task resumed successfully",
-    }

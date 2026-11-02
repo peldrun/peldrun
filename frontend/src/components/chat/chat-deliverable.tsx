@@ -103,10 +103,22 @@ export function ChatDeliverable({
         </div>
       </div>
 
-      {/* 2. Primary Response rendered via GenerativeUIRouter */}
-      <div className="p-4 rounded-md bg-card/40 text-foreground text-sm leading-relaxed">
-        <MarkdownRenderer content={displayContent} />
-      </div>
+      {/* 2. Primary Response.
+          On failure/stop, this block is intentionally hidden: the
+          red alert box below (section 4) renders the same message
+          via MarkdownRenderer with the correct destructive styling.
+          Showing both would duplicate the message — once at the top
+          (with normal prose colors) and once in the alert box
+          (with destructive colors). The duplicate was confusing
+          users because the top occurrence rendered `### ⚠️ ...`
+          literally when the error text itself started with a
+          markdown header that the outer box wasn't designed to
+          wrap in prose styling. */}
+      {status !== "failed" && status !== "stopped" && (
+        <div className="p-4 rounded-md bg-card/40 text-foreground text-sm leading-relaxed">
+          <MarkdownRenderer content={displayContent} />
+        </div>
+      )}
 
       {/* 3. Diagnostic Trace Toggle */}
       {isTurnRawTrace && (
@@ -130,17 +142,32 @@ export function ChatDeliverable({
         </div>
       )}
 
-      {/* 4. Adaptive Deliverable Box: Error or Stop Alert */}
+      {/* 4. Adaptive Deliverable Box: Error or Stop Alert.
+          The message is rendered through MarkdownRenderer so the
+          structured error cards produced by the backend's
+          `format_smart_error` (### heading, > hint, ``` code block,
+          **bold**) render with proper formatting instead of showing
+          raw `### ⚠️ ...` and `> 💡 **Hint:**` syntax.
+          The prose classes inside the wrapper neutralize any
+          prose-inheritance conflicts with the destructive color
+          palette. */}
       {(status === "failed" || status === "stopped") && (
         <div className="p-3.5 rounded-lg bg-destructive/10 border border-destructive/30 text-destructive text-xs flex items-start gap-2.5">
           <AlertCircle size={15} className="shrink-0 mt-0.5" />
-          <div className="space-y-1">
+          <div className="space-y-1 flex-1 min-w-0">
             <span className="font-semibold block">
               {status === "stopped" ? "Execution Stopped by Operator" : "Execution Terminated with Error"}
             </span>
-            <p className="text-[11px] opacity-90 leading-relaxed font-mono whitespace-pre-wrap">
-              {finalResult || (status === "stopped" ? "Task was stopped by operator." : "Execution was aborted or encountered an error.")}
-            </p>
+            <div className="text-[11px] leading-relaxed prose prose-sm max-w-none prose-headings:text-destructive prose-headings:font-semibold prose-headings:text-sm prose-headings:mt-0 prose-headings:mb-1 prose-p:text-destructive prose-p:opacity-90 prose-p:text-[11px] prose-strong:text-destructive prose-blockquote:text-destructive prose-blockquote:border-destructive/40 prose-blockquote:text-[11px] prose-blockquote:opacity-90 prose-blockquote:my-1 prose-blockquote:py-1 prose-code:text-destructive prose-code:bg-destructive/10 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:text-[10px] prose-pre:bg-destructive/5 prose-pre:border prose-pre:border-destructive/20 prose-pre:text-destructive prose-pre:text-[10px] prose-pre:my-1 prose-pre:overflow-x-auto">
+              <MarkdownRenderer
+                content={
+                  finalResult ||
+                  (status === "stopped"
+                    ? "Task was stopped by operator."
+                    : "Execution was aborted or encountered an error.")
+                }
+              />
+            </div>
           </div>
         </div>
       )}

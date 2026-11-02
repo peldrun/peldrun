@@ -61,7 +61,8 @@ export type ChatStatus =
   | "running"
   | "waiting_for_input"
   | "retrying"
-  | "paused"
+  // "paused" intentionally omitted — see chat-container/types.ts
+  // for the Phase H rationale.
   | "cancelling"
   | "cancelled"
   | "completed"
@@ -106,13 +107,13 @@ export interface ChatThreadProps {
   activeGroupedSteps: Record<number, StepEvent[]>;
   currentStepNum: number;
   /**
-   * Canonical run status. See `ChatStatus` above for why this is a
-   * full 13-value union rather than the historic 5-value inline type.
-   * ChatThread's conditional rendering only distinguishes
-   * `running` / `paused` / `failed`; all other values behave as
-   * "not running, not paused, not failed" (which is correct for
-   * `pending`, `starting`, `waiting_for_input`, `cancelling`,
-   * `cancelled`, `interrupted`, `retrying`, `queued`).
+   * Canonical run status. ChatThread's conditional rendering only
+   * distinguishes `running` / `failed`; all other values behave as
+   * "not running, not failed" (which is correct for `pending`,
+   * `starting`, `waiting_for_input`, `cancelling`, `cancelled`,
+   * `interrupted`, `retrying`, `queued`).
+   *
+   * Pause was removed in Phase H — see chat-container/types.ts.
    */
   status: ChatStatus;
   elapsedSeconds: number;
@@ -138,9 +139,8 @@ export interface ChatThreadProps {
   onRejectDelegation?: (approvalId: string) => Promise<void>;
   onCancelSubtask?: (childRunId: string) => Promise<void>;
 
-  // Lifecycle control and regeneration callbacks
-  onPauseJob?: () => void;
-  onResumeJob?: () => void;
+  // Lifecycle control and regeneration callbacks.
+  // Pause/Resume hooks were removed in Phase H.
   onRegenerate?: (turnIndex: number, turn?: ChatTurn) => void;
   onOpenReview?: (operationId: string) => void;
 }

@@ -1526,20 +1526,65 @@ class PeldrunEngine(ExecutionEngine):
                 )
 
             elif event.type == EventType.ERROR:
-                err_msg = str(event.payload.get("error", "Runtime Error"))
-                await dispatch_event(
-                    job_id,
-                    SSEEvent(
-                        type=SSEEventType.ERROR,
-                        step=curr_step,
-                        data={
-                            "message": err_msg,
-                            "content": err_msg,
-                            "seq": event_seq,
-                            "model": model_name,
-                        },
-                    ),
+                # [FIX] AgentRunner (in peldrun/engine/runner.py) emits
+                # EventType.ERROR with payload = {"error": "", "message":
+                # "<actual text>", "error_type": ..., ...} — the actual
+                # error text lives in "message", NOT "error". Reading
+                # only "error" yields an empty string because the key
+                # exists (with an empty value), so `.get("error",
+                # "Runtime Error")` returns "" not the default.
+                #
+                # [FIX-FORMAT] The raw payload is a Python dict dump
+                # (e.g. `Error code: 400 - {'error': {'code':
+                # 'invalid_request_error', ...}}`) which is unreadable
+                # in the UI. We apply `format_smart_error` here so the
+                # frontend receives a clean markdown error card (OOM,
+                # credit balance, provider not responding, etc.)
+                # instead of the raw string.
+                #
+                # Note: this path fires BEFORE the FAILED branch below,
+                # so it is the FIRST terminal event the client sees.
+                # Once the client receives it, `runStreamManager`
+                # marks the stream terminal and ignores any later
+                # ERROR event — meaning the FAILED branch's own
+                # formatted message NEVER reaches the UI. This is
+                # precisely why the raw text was showing up in the
+                # user's screenshots despite the FAILED branch
+                # already being formatted.
+                raw_err_msg = str(
+                    event.payload.get("error")
+                    or event.payload.get("message")
+                    or "Runtime Error"
                 )
+                if raw_err_msg and raw_err_msg.strip():
+                    # Format the raw provider exception into a friendly
+                    # markdown card. Falls back to the raw text if
+                    # formatting itself raises for any reason.
+                    try:
+                        from omweb.agent_bridge_parts.errors import (
+                            format_smart_error as _fmt_err,
+                        )
+                        err_msg = _fmt_err(
+                            Exception(raw_err_msg),
+                            model_name,
+                            provider_name,
+                        )
+                    except Exception:
+                        err_msg = raw_err_msg
+
+                    await dispatch_event(
+                        job_id,
+                        SSEEvent(
+                            type=SSEEventType.ERROR,
+                            step=curr_step,
+                            data={
+                                "message": err_msg,
+                                "content": err_msg,
+                                "seq": event_seq,
+                                "model": model_name,
+                            },
+                        ),
+                    )
 
         async def _ordered_event_consumer() -> None:
             while True:
@@ -1674,11 +1719,20 @@ class PeldrunEngine(ExecutionEngine):
         step_count = run_result.total_steps if run_result.total_steps > 0 else current_core_step
 
         if run_result.status == RunStatus.FAILED:
-            err_msg = run_result.error or "Execution failed before reaching completion."
-            print(f"[ENGINE PELDRUN] Job {job_id} terminated as FAILED in step {step_count}: {err_msg}")
-            job_manager.fail_job(job_id, err_msg)
+            raw_err = run_result.error or "Execution failed before reaching completion."
+            print(f"[ENGINE PELDRUN] Job {job_id} terminated as FAILED in step {step_count}: {raw_err}")
+            job_manager.fail_job(job_id, raw_err)
             if not terminal_dispatched:
                 terminal_dispatched = True
+                # Format the raw provider exception into a friendly
+                # markdown error card (OOM, credit balance, provider
+                # not responding, etc.) before sending to the client.
+                # Falls back to the raw string if formatting fails.
+                try:
+                    from omweb.agent_bridge_parts.errors import format_smart_error as _fmt
+                    err_msg = _fmt(Exception(raw_err), model_name, provider_name)
+                except Exception:
+                    err_msg = raw_err
                 await dispatch_event(
                     job_id,
                     SSEEvent(

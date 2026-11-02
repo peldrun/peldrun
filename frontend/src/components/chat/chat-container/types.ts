@@ -62,7 +62,11 @@ export type ChatStatus =
   | "running"
   | "waiting_for_input"
   | "retrying"
-  | "paused"
+  // NOTE: "paused" is intentionally omitted. Pause was removed in
+  // Phase H because no LLM provider supports true streaming pause —
+  // the feature was misleading. See LiveStatusIndicator.tsx for the
+  // full rationale. Backend endpoints still exist for backward
+  // compatibility but return 501 Not Implemented.
   | "cancelling"
   | "cancelled"
   | "completed"
