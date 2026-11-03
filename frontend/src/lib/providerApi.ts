@@ -37,6 +37,12 @@ import type {
   ProviderPackageEntry,
 } from "@/app/stores/_types/store";
 
+// Note: `ProviderApiError` is now referenced by the new
+// `InstallJobStatus` interface below. It is re-imported here
+// explicitly to make that dependency clear at the top of the file.
+// The type was already imported above; no change to the import list
+// is needed. This comment is preserved for future readers.
+
 
 // ---------------------------------------------------------------------------
 // Base path
@@ -52,6 +58,50 @@ const PROVIDER_API_BASE = "/api/store/providers";
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Async install job types
+// ---------------------------------------------------------------------------
+//
+// The `/upload` endpoint now returns immediately with a `job_id` instead
+// of blocking until the install finishes. This prevents HTTP timeouts
+// during the pip install phase (which can take 30-60 seconds).
+//
+// The frontend polls `/install-status/{job_id}` every 1-2 seconds and
+// renders the `logs` array as a live progress timeline.
+
+/**
+ * Status of a single install job.
+ *
+ *   - "running" — the background task is still executing.
+ *   - "success" — install completed; `result` is populated.
+ *   - "failed"  — install failed; `error` is populated.
+ */
+export type InstallJobState = "running" | "success" | "failed";
+
+/**
+ * Full state of an install job.
+ *
+ * Returned by `getInstallStatus(jobId)`. Poll this endpoint while
+ * `status === "running"`; stop polling once it reaches a terminal
+ * state.
+ *
+ * `logs` contains one entry per meaningful event, capped at 500
+ * entries server-side (oldest dropped first). Each entry begins with
+ * a tag such as `[system]`, `[pip]`, or `[error]` that the UI can use
+ * to color-code the line.
+ */
+export interface InstallJobStatus {
+  job_id: string;
+  status: InstallJobState;
+  filename: string;
+  logs: string[];
+  result: ProviderInstallResult | null;
+  error: ProviderApiError | null;
+  started_at: string;
+  finished_at: string | null;
+}
+
 
 /**
  * Structured error thrown by every function in this module.
@@ -397,12 +447,20 @@ export async function getProviderHealth(
 // ===========================================================================
 
 /**
- * Upload a Provider Package ZIP and install it.
+ * Upload a Provider Package ZIP.
+ *
+ * Returns immediately with a `job_id`. The actual install (extract,
+ * venv creation, pip install, register) runs in a background task on
+ * the backend, so this function never times out even when pip takes
+ * a minute on a cold cache.
+ *
+ * Call `getInstallStatus(jobId)` in a loop to track progress and
+ * retrieve the final `ProviderInstallResult` (or error).
  */
 export async function uploadProvider(
   file: File,
   installDependencies: boolean = true,
-): Promise<ProviderInstallResult> {
+): Promise<{ job_id: string }> {
   if (!file.name.toLowerCase().endsWith(".zip")) {
     throw new ProviderApiRequestError(
       "Provider Packages must be uploaded as .zip archives.",
@@ -421,21 +479,53 @@ export async function uploadProvider(
 
   const data = await request<{
     status: string;
-    provider: ProviderInstallResult;
+    job_id: string;
+    message?: string;
   }>("/upload", {
     method: "POST",
     body: formData,
   });
 
-  if (!data.provider) {
+  if (!data.job_id) {
     throw new ProviderApiRequestError(
-      "Upload response was missing the provider object.",
+      "Upload response was missing the job_id field. The backend may "
+        + "be running an older version that does not support async "
+        + "install jobs. Restart PELDRUN to load the current build.",
       "INVALID_RESPONSE",
       {},
       200,
     );
   }
-  return data.provider;
+  return { job_id: data.job_id };
+}
+
+/**
+ * Fetch the current status of an install job.
+ *
+ * Returns the full job object: `status`, `logs`, `result`, `error`,
+ * and timestamps. Poll this endpoint while `status === "running"`.
+ *
+ * Throws `ProviderApiRequestError` with code `INSTALL_JOB_NOT_FOUND`
+ * when the job id does not exist (e.g. after a backend restart, which
+ * clears the in-memory job table).
+ */
+export async function getInstallStatus(
+  jobId: string,
+): Promise<InstallJobStatus> {
+  const data = await request<{
+    status: string;
+    job: InstallJobStatus;
+  }>(`/install-status/${encodeURIComponent(jobId)}`);
+
+  if (!data.job) {
+    throw new ProviderApiRequestError(
+      "Install-status response was missing the job object.",
+      "INVALID_RESPONSE",
+      {},
+      200,
+    );
+  }
+  return data.job;
 }
 
 

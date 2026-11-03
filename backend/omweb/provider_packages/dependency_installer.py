@@ -295,6 +295,7 @@ class DependencyInstaller:
         environments_root: Path,
         version: str,
         manifest: ProviderManifest,
+        progress_callback: Optional[Any] = None,
     ) -> EnvironmentInstallResult:
         """
         Create an isolated venv for ``version`` of the package and
@@ -412,6 +413,7 @@ class DependencyInstaller:
                     package_dir=package_dir,
                     python_exe=python_exe,
                     manifest=manifest,
+                    progress_callback=progress_callback,
                 )
             )
         except ProviderPackageEnvironmentError:
@@ -553,6 +555,7 @@ class DependencyInstaller:
         package_dir: Path,
         python_exe: Path,
         manifest: ProviderManifest,
+        progress_callback: Optional[Any] = None,
     ) -> Tuple[bool, str, str]:
         """
         Install dependencies into the venv.
@@ -571,41 +574,99 @@ class DependencyInstaller:
            dependencies in the manifest).
 
         Returns ``(installed, log_tail, skipped_reason)``.
+
+        The ``progress_callback``, when provided, receives a short
+        human-readable line for every meaningful event (pip output
+        line, high-level phase change). It is invoked synchronously
+        from within this coroutine, so callers must not block inside
+        it.
         """
         lockfile = package_dir / LOCKFILE_NAME
         requirements = package_dir / REQUIREMENTS_NAME
         pyproject = package_dir / PYPROJECT_NAME
 
+        if progress_callback is not None:
+            try:
+                progress_callback(
+                    "[system] Resolving dependency source..."
+                )
+            except Exception:
+                pass
+
         if lockfile.is_file():
+            if progress_callback is not None:
+                try:
+                    progress_callback(
+                        "[system] Using requirements.lock "
+                        "(hash-pinned, preferred)."
+                    )
+                except Exception:
+                    pass
             return await self._run_pip(
                 python_exe,
                 ["install", "-r", str(lockfile)],
                 label="requirements.lock",
+                progress_callback=progress_callback,
             )
 
         if requirements.is_file():
+            if progress_callback is not None:
+                try:
+                    progress_callback(
+                        "[system] Using requirements.txt."
+                    )
+                except Exception:
+                    pass
             return await self._run_pip(
                 python_exe,
                 ["install", "-r", str(requirements)],
                 label="requirements.txt",
+                progress_callback=progress_callback,
             )
 
         if pyproject.is_file():
+            if progress_callback is not None:
+                try:
+                    progress_callback(
+                        "[system] Using pyproject.toml "
+                        "(pip install -e .)."
+                    )
+                except Exception:
+                    pass
             return await self._run_pip(
                 python_exe,
                 ["install", "-e", str(package_dir)],
                 label="pyproject.toml",
+                progress_callback=progress_callback,
             )
 
         if manifest.dependencies:
+            if progress_callback is not None:
+                try:
+                    progress_callback(
+                        "[system] Using manifest.dependencies "
+                        f"({len(manifest.dependencies)} entr"
+                        f"{'y' if len(manifest.dependencies) == 1 else 'ies'})."
+                    )
+                except Exception:
+                    pass
             args = ["install"] + list(manifest.dependencies)
             return await self._run_pip(
                 python_exe,
                 args,
                 label="manifest.dependencies",
+                progress_callback=progress_callback,
             )
 
         # Nothing to install.
+        if progress_callback is not None:
+            try:
+                progress_callback(
+                    "[system] No dependency files found; "
+                    "skipping pip install."
+                )
+            except Exception:
+                pass
         return (False, "", "no_dependency_files")
 
     async def _run_pip(
@@ -614,33 +675,67 @@ class DependencyInstaller:
         args: Sequence[str],
         *,
         label: str,
+        progress_callback: Optional[Any] = None,
     ) -> Tuple[bool, str, str]:
         """
         Run ``python -m pip <args>`` in a subprocess with a hard timeout.
+
+        Streams stdout/stderr line-by-line to ``progress_callback`` (if
+        provided) so the UI can show a live install log. The complete
+        output is also collected so the tail can be reported on
+        failure.
 
         Returns ``(installed, log_tail, skipped_reason)`` on success.
         Raises ``ProviderPackageEnvironmentError`` on non-zero exit or
         timeout — the caller deletes the venv.
         """
+        # pip >= 26 (2026) made --no-warn-script-location an
+        # install-subcommand-only flag. When placed before "install"
+        # (as older pip allowed), pip exits with code 2 (usage error).
+        #
+        # Fix: pass --no-warn-script-location AFTER the subcommand.
+        # The subcommand is always the first element of ``args``
+        # (e.g. "install"), so we split it out and reassemble.
+        #
+        # Also: --disable-pip-version-check is deprecated in pip 26
+        # and emits a warning; it is no longer needed because pip 26
+        # does not perform the version check on every invocation.
+        subcommand = args[0] if args else "install"
+        subcommand_args = list(args[1:]) if len(args) > 1 else []
+
         pip_args = [
             "-m", "pip",
-            "--disable-pip-version-check",
             "--no-input",
             "--no-cache-dir",
+            subcommand,
             "--no-warn-script-location",
-            *args,
+            *subcommand_args,
         ]
 
         logger.info(
             "pip install via %s (label=%s)", python_exe, label
         )
 
+        if progress_callback is not None:
+            try:
+                progress_callback(
+                    f"[system] Running pip {subcommand} "
+                    f"(label={label})..."
+                )
+            except Exception:
+                pass
+
+        # Merge stderr into stdout so we preserve the original
+        # ordering of pip's output. pip writes progress (download
+        # bars, "Collecting", "Installing") to stdout, but warnings
+        # and errors to stderr; merging them together produces a
+        # linear, readable log.
         try:
             proc = await asyncio.create_subprocess_exec(
                 str(python_exe),
                 *pip_args,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
             )
         except FileNotFoundError as exc:
             raise ProviderPackageEnvironmentError(
@@ -654,9 +749,42 @@ class DependencyInstaller:
                 details={"interpreter": str(python_exe)},
             ) from exc
 
+        log_lines: List[str] = []
+
+        async def _stream_reader() -> None:
+            """
+            Read pip's merged output line-by-line.
+
+            Each line is (a) appended to ``log_lines`` for later
+            reporting, and (b) forwarded to ``progress_callback`` so
+            the UI sees it immediately.
+
+            The callback is wrapped in try/except so a buggy callback
+            cannot kill the pip process — a broken UI should never
+            break an install.
+            """
+            assert proc.stdout is not None
+            while True:
+                raw = await proc.stdout.readline()
+                if not raw:
+                    break
+                try:
+                    line = raw.decode("utf-8", errors="replace").rstrip()
+                except Exception:
+                    line = repr(raw)
+                if not line:
+                    continue
+                log_lines.append(line)
+                if progress_callback is not None:
+                    try:
+                        progress_callback(f"[pip] {line}")
+                    except Exception:
+                        # Never let a broken callback abort the stream.
+                        pass
+
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(),
+            await asyncio.wait_for(
+                asyncio.gather(_stream_reader(), proc.wait()),
                 timeout=self._timeout,
             )
         except asyncio.TimeoutError:
@@ -668,6 +796,14 @@ class DependencyInstaller:
                 await proc.wait()
             except Exception:
                 pass
+            if progress_callback is not None:
+                try:
+                    progress_callback(
+                        f"[error] pip timed out after "
+                        f"{self._timeout:.0f}s."
+                    )
+                except Exception:
+                    pass
             raise ProviderPackageEnvironmentError(
                 f"pip install timed out after {self._timeout:.0f}s "
                 f"(label={label}). The package's dependency tree may "
@@ -679,9 +815,16 @@ class DependencyInstaller:
             )
 
         returncode = proc.returncode
-        log_combined = self._combine_logs(stdout_bytes, stderr_bytes)
+        log_combined = "\n".join(log_lines)
 
         if returncode != 0:
+            if progress_callback is not None:
+                try:
+                    progress_callback(
+                        f"[error] pip exited with code {returncode}."
+                    )
+                except Exception:
+                    pass
             raise ProviderPackageEnvironmentError(
                 f"pip install failed (exit {returncode}, label={label}). "
                 f"See pip_log_tail for details.",
@@ -691,6 +834,14 @@ class DependencyInstaller:
                     "pip_log_tail": self._truncate(log_combined),
                 },
             )
+
+        if progress_callback is not None:
+            try:
+                progress_callback(
+                    f"[system] pip install completed (label={label})."
+                )
+            except Exception:
+                pass
 
         return (True, self._truncate(log_combined), "")
 

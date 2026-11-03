@@ -43,7 +43,7 @@
 
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { showToast } from "@/components/ui/ToastNotification";
 import {
   activateConnection as apiActivateConnection,
@@ -57,6 +57,7 @@ import {
   enableConnection as apiEnableConnection,
   enableProvider as apiEnableProvider,
   formatProviderError,
+  getInstallStatus as apiGetInstallStatus,
   getProvider as apiGetProvider,
   getProviderHealth as apiGetProviderHealth,
   installCertificate as apiInstallCertificate,
@@ -70,6 +71,7 @@ import {
   updateConnection as apiUpdateConnection,
   uploadProvider as apiUploadProvider,
   ProviderApiRequestError,
+  type InstallJobStatus,
   type SaveConnectionPayload,
 } from "@/lib/providerApi";
 import type {
@@ -138,6 +140,21 @@ export interface UseProviderActionsResult {
   handleOpenUpload: () => void;
   handleCloseUpload: () => void;
   handleUploadSubmit: () => Promise<void>;
+
+  /**
+   * Live state of the current install job, or ``null`` when no job is
+   * active.
+   *
+   * Populated by the polling loop that starts after a successful
+   * upload. The modal reads ``installJobStatus.logs`` to render a
+   * live progress timeline, and ``installJobStatus.status`` to know
+   * when the job has finished.
+   *
+   * Cleared when the modal closes after a successful install, or when
+   * ``handleOpenUpload()`` is called to start a new one. It is KEPT
+   * on failure so the user can inspect the logs before retrying.
+   */
+  installJobStatus: InstallJobStatus | null;
 
   // ── Catalog ────────────────────────────────────────────────────
   catalogItems: ProviderCatalogItem[];
@@ -292,6 +309,40 @@ export function useProviderActions({
     useState<boolean>(true);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+
+  // Live install job state.
+  //
+  // The upload endpoint returns immediately with a `job_id`; the
+  // actual install (extract + venv + pip + register) runs in the
+  // background. We poll `/install-status/{job_id}` every 1.5s and
+  // mirror the result into `installJobStatus` so the modal can
+  // render the log timeline live.
+  const [installJobStatus, setInstallJobStatus] =
+    useState<InstallJobStatus | null>(null);
+
+  // Interval handle for the polling loop. Stored in a ref so it
+  // survives re-renders without triggering them, and so we can
+  // clear it from outside the polling closure (e.g. from
+  // handleCloseUpload).
+  const installPollingRef = useRef<number | null>(null);
+
+  /**
+   * Stop the polling loop, if one is active.
+   *
+   * Safe to call multiple times. Used in three places:
+   *   1. From within the polling closure when the job reaches a
+   *      terminal state (success or failed).
+   *   2. From ``handleCloseUpload`` when the user closes the modal
+   *      mid-install.
+   *   3. From an unmount effect (added below) as a last-resort
+   *      cleanup.
+   */
+  const stopInstallPolling = useCallback(() => {
+    if (installPollingRef.current !== null) {
+      window.clearInterval(installPollingRef.current);
+      installPollingRef.current = null;
+    }
+  }, []);
 
   // ── Catalog state ────────────────────────────────────────────────
   const [catalogItems, setCatalogItems] = useState<ProviderCatalogItem[]>([]);
@@ -506,78 +557,19 @@ export function useProviderActions({
   }, []);
 
   // ═══════════════════════════════════════════════════════════════════
-  // Upload modal
-  // ═══════════════════════════════════════════════════════════════════
-
-  const handleOpenUpload = useCallback(() => {
-    setUploadSelectedFile(null);
-    setUploadInstallDependencies(true);
-    setUploadError(null);
-    setIsUploadModalOpen(true);
-  }, []);
-
-  const handleCloseUpload = useCallback(() => {
-    if (isUploading) return;
-    setIsUploadModalOpen(false);
-    setUploadSelectedFile(null);
-    setUploadError(null);
-  }, [isUploading]);
-
-  const handleUploadSubmit = useCallback(async () => {
-    if (!uploadSelectedFile) {
-      setUploadError("Please select a .zip file to upload.");
-      return;
-    }
-
-    setUploadError(null);
-    setIsUploading(true);
-
-    try {
-      const result = await apiUploadProvider(
-        uploadSelectedFile,
-        uploadInstallDependencies,
-      );
-
-      setIsUploadModalOpen(false);
-      setUploadSelectedFile(null);
-      setUploadError(null);
-      await reload();
-
-      showToast.success(
-        "Provider Installed",
-        `${result.display_name || result.name || result.id} v${result.version} is now available.`,
-      );
-
-      if (Array.isArray(result.warnings)) {
-        for (const w of result.warnings) {
-          if (typeof w === "string" && w.trim()) {
-            showToast.info("Install Notice", w);
-          }
-        }
-      }
-
-      void handleLoadCatalog();
-    } catch (err) {
-      const message = formatProviderError(err);
-      setUploadError(message);
-      showToast.error("Install Failed", message);
-
-      if (err instanceof ProviderApiRequestError) {
-        console.warn(
-          "[useProviderActions] Upload error details:",
-          err.code,
-          err.details,
-        );
-      }
-    } finally {
-      setIsUploading(false);
-    }
-  }, [uploadSelectedFile, uploadInstallDependencies, reload]);
-
-  // ═══════════════════════════════════════════════════════════════════
   // Catalog
   // ═══════════════════════════════════════════════════════════════════
 
+  /**
+   * Load the catalog of installable packages.
+   *
+   * Defined BEFORE handleUploadSubmit because handleUploadSubmit's
+   * dependency array references it. In JavaScript, a useCallback's
+   * dependency array is evaluated at the moment useCallback runs —
+   * if the referenced identifier is not yet initialized (Temporal
+   * Dead Zone), the page crashes with a ReferenceError before any
+   * render.
+   */
   const handleLoadCatalog = useCallback(async () => {
     setIsCatalogLoading(true);
     setCatalogError(null);
@@ -671,6 +663,191 @@ export function useProviderActions({
     },
     [catalogItems, reload, handleLoadCatalog],
   );
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Upload modal
+  // ═══════════════════════════════════════════════════════════════════
+
+  const handleOpenUpload = useCallback(() => {
+    // Ensure any prior polling has stopped before opening a fresh
+    // modal — otherwise a stale interval could update state from a
+    // previous job after the modal reopens.
+    stopInstallPolling();
+    setUploadSelectedFile(null);
+    setUploadInstallDependencies(true);
+    setUploadError(null);
+    setInstallJobStatus(null);
+    setIsUploading(false);
+    setIsUploadModalOpen(true);
+  }, [stopInstallPolling]);
+
+  const handleCloseUpload = useCallback(() => {
+    // Refuse to close while the install is running — the backend
+    // task will continue regardless, but hiding the modal would
+    // give the user the impression that it stopped.
+    if (isUploading) return;
+
+    // Defensive: stop polling even though `isUploading === false`
+    // implies it is already stopped. Guards against a future bug
+    // where `isUploading` and the polling state could diverge.
+    stopInstallPolling();
+
+    setIsUploadModalOpen(false);
+    setUploadSelectedFile(null);
+    setUploadError(null);
+    setInstallJobStatus(null);
+  }, [isUploading, stopInstallPolling]);
+
+  const handleUploadSubmit = useCallback(async () => {
+    if (!uploadSelectedFile) {
+      setUploadError("Please select a .zip file to upload.");
+      return;
+    }
+
+    // Reset any previous job state.
+    stopInstallPolling();
+    setUploadError(null);
+    setInstallJobStatus(null);
+    setIsUploading(true);
+
+    let jobId: string;
+    try {
+      // Step 1 — upload the ZIP. This returns in <100ms with a
+      // job_id; the actual install continues in the background.
+      const uploadResult = await apiUploadProvider(
+        uploadSelectedFile,
+        uploadInstallDependencies,
+      );
+      jobId = uploadResult.job_id;
+    } catch (err) {
+      // The upload itself failed (network, bad ZIP, validation).
+      // Nothing is running in the background.
+      const message = formatProviderError(err);
+      setUploadError(message);
+      showToast.error("Upload Failed", message);
+      setIsUploading(false);
+      if (err instanceof ProviderApiRequestError) {
+        console.warn(
+          "[useProviderActions] Upload error details:",
+          err.code,
+          err.details,
+        );
+      }
+      return;
+    }
+
+    // Step 2 — poll the job status until it reaches a terminal state.
+    //
+    // Two safety bounds:
+    //   * consecutiveErrors — if we fail to poll 5 times in a row,
+    //     assume the backend died and stop.
+    //   * MAX_POLL_DURATION_MS — hard cap on total polling time.
+    //     The backend has its own 10-minute pip timeout, so this
+    //     bound (11 minutes) is just a safety net.
+    const MAX_POLL_DURATION_MS = 11 * 60 * 1000;
+    const POLL_INTERVAL_MS = 1500;
+    const MAX_CONSECUTIVE_ERRORS = 5;
+    const pollStartedAt = Date.now();
+    let consecutiveErrors = 0;
+
+    const poll = async () => {
+      // Guard: the interval may fire after we already stopped polling
+      // (race with stopInstallPolling). Bail early.
+      if (installPollingRef.current === null) return;
+
+      // Guard: hard deadline.
+      if (Date.now() - pollStartedAt > MAX_POLL_DURATION_MS) {
+        stopInstallPolling();
+        setUploadError(
+          "Install is taking longer than expected. Check the backend logs.",
+        );
+        showToast.error("Install Timed Out", "See backend logs for details.");
+        setIsUploading(false);
+        return;
+      }
+
+      let job;
+      try {
+        job = await apiGetInstallStatus(jobId);
+      } catch (err) {
+        consecutiveErrors += 1;
+        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          stopInstallPolling();
+          const message = formatProviderError(err);
+          setUploadError(
+            `Lost contact with the backend while polling for install status: ${message}`,
+          );
+          showToast.error("Status Check Failed", message);
+          setIsUploading(false);
+        }
+        return;
+      }
+
+      // Reset the error counter on a successful poll.
+      consecutiveErrors = 0;
+
+      // Update the UI with the latest snapshot.
+      setInstallJobStatus(job);
+
+      if (job.status === "success" && job.result) {
+        // Terminal success.
+        stopInstallPolling();
+        setInstallJobStatus(null);
+        setUploadError(null);
+        setIsUploadModalOpen(false);
+        setUploadSelectedFile(null);
+        setIsUploading(false);
+
+        await reload();
+
+        showToast.success(
+          "Provider Installed",
+          `${job.result.display_name || job.result.name || job.result.id} v${job.result.version} is now available.`,
+        );
+
+        if (Array.isArray(job.result.warnings)) {
+          for (const w of job.result.warnings) {
+            if (typeof w === "string" && w.trim()) {
+              showToast.info("Install Notice", w);
+            }
+          }
+        }
+
+        void handleLoadCatalog();
+        return;
+      }
+
+      if (job.status === "failed") {
+        // Terminal failure. Keep the modal open with the logs and
+        // the error message so the user can inspect what happened
+        // and retry.
+        stopInstallPolling();
+        const message = job.error?.error || "Install failed.";
+        setUploadError(message);
+        showToast.error("Install Failed", message);
+        setIsUploading(false);
+        return;
+      }
+
+      // job.status === "running" — continue polling.
+    };
+
+    // First poll immediately so the modal populates without waiting
+    // for the 1.5s interval.
+    void poll();
+
+    // Continue polling at a fixed interval.
+    installPollingRef.current = window.setInterval(
+      () => void poll(),
+      POLL_INTERVAL_MS,
+    );
+  }, [
+    uploadSelectedFile,
+    uploadInstallDependencies,
+    reload,
+    handleLoadCatalog,
+    stopInstallPolling,
+  ]);
 
   // ═══════════════════════════════════════════════════════════════════
   // Configure modal + connections
@@ -1159,6 +1336,7 @@ export function useProviderActions({
     handleOpenUpload,
     handleCloseUpload,
     handleUploadSubmit,
+    installJobStatus,
 
     // Catalog
     catalogItems,

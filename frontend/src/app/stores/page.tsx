@@ -451,6 +451,7 @@ export default function StoresPage() {
         installDependencies={providerActions.uploadInstallDependencies}
         isUploading={providerActions.isUploading}
         errorMessage={providerActions.uploadError}
+        installJobStatus={providerActions.installJobStatus}
         onSelectFile={providerActions.setUploadSelectedFile}
         onToggleInstallDependencies={
           providerActions.setUploadInstallDependencies

@@ -74,8 +74,11 @@ See also
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -115,6 +118,13 @@ logger = logging.getLogger("omweb.routers.store.providers")
 
 router = APIRouter()
 
+# ---------------------------------------------------------------------------
+# Async Install Job Tracking (In-memory)
+# ---------------------------------------------------------------------------
+# We use an in-memory dict to track installation jobs. This prevents HTTP
+# timeouts during the long-running `pip install` phase. The frontend polls
+# `/install-status/{job_id}` to get real-time progress and final result.
+INSTALL_JOBS: Dict[str, Dict[str, Any]] = {}
 
 # ---------------------------------------------------------------------------
 # Error mapping
@@ -693,38 +703,193 @@ async def upload_provider_package(
             },
         )
 
+    # ------------------------------------------------------------------
+    # Create a background job and return immediately.
+    #
+    # Why async:
+    #   `pip install` can take 30-60s on a cold cache. Synchronous
+    #   endpoints time out at the HTTP proxy layer (~30s default in
+    #   Next.js). Moving the install to a background task fixes the
+    #   timeout: the request returns in <100ms, the actual work
+    #   continues in the event loop, and the frontend polls
+    #   `/install-status/{job_id}` for progress.
+    #
+    # The job state lives in `INSTALL_JOBS` (module-level dict). Jobs
+    # survive until server restart. This is intentional — the payload
+    # is small and bounded (500 log lines max), and persisting across
+    # restarts adds complexity without real value for a one-shot
+    # admin action.
+    # ------------------------------------------------------------------
+    job_id = f"job_{uuid.uuid4().hex[:12]}"
+    INSTALL_JOBS[job_id] = {
+        "job_id": job_id,
+        "status": "running",
+        "filename": filename,
+        "logs": ["[system] Upload received. Starting install pipeline..."],
+        "result": None,
+        "error": None,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+    }
+
+    # Best-effort cleanup: if we have accumulated a lot of jobs, drop
+    # the oldest completed ones. Never drop a running job.
+    if len(INSTALL_JOBS) >= 50:
+        completed = [
+            (jid, j["started_at"])
+            for jid, j in INSTALL_JOBS.items()
+            if j["status"] in ("success", "failed")
+        ]
+        completed.sort(key=lambda pair: pair[1])
+        excess = len(INSTALL_JOBS) - 49
+        for jid, _ in completed[:excess]:
+            INSTALL_JOBS.pop(jid, None)
+
+    # Fire-and-forget: the task reference is held by the event loop
+    # until completion, so we do not need to store it separately.
+    asyncio.create_task(
+        _run_install_background(
+            job_id=job_id,
+            content=content,
+            filename=filename,
+            install_dependencies=install_dependencies,
+        )
+    )
+
+    return {
+        "status": "accepted",
+        "job_id": job_id,
+        "message": (
+            "Install started. Poll /install-status/{job_id} for "
+            "progress and the final result."
+        ),
+    }
+
+
+async def _run_install_background(
+    *,
+    job_id: str,
+    content: bytes,
+    filename: str,
+    install_dependencies: bool,
+) -> None:
+    """
+    Background worker for a single install job.
+
+    Runs in the FastAPI event loop, but is not awaited by any HTTP
+    request. Mutates ``INSTALL_JOBS[job_id]`` in place so the
+    ``/install-status`` endpoint can report progress.
+
+    All exceptions are caught and stored on the job. An unhandled
+    exception would otherwise be logged by asyncio and silently
+    dropped, leaving the frontend polling forever.
+    """
+    job = INSTALL_JOBS.get(job_id)
+    if job is None:
+        # Should never happen — the job is inserted in the endpoint
+        # before the task is spawned. Logged for safety.
+        logger.warning("Install job %s disappeared; aborting.", job_id)
+        return
+
+    def _log(message: str) -> None:
+        # Cap the log buffer so a runaway pip cannot exhaust memory.
+        # Old lines are dropped from the FRONT, so the tail (which is
+        # most useful for diagnosis) survives.
+        if len(job["logs"]) >= 500:
+            job["logs"].pop(0)
+        job["logs"].append(message)
+
+    def _progress_callback(message: str) -> None:
+        # The dependency_installer invokes this from within the
+        # pip subprocess (on the event loop). Truncate each line so
+        # the JSON payload stays bounded.
+        try:
+            _log(message[:2000])
+        except Exception:
+            # A broken callback must never break the install.
+            pass
+
     try:
+        _log("[system] Validating and extracting package...")
+
         result = await provider_package_manager.install_bundle(
             zip_bytes=content,
             source_filename=filename,
             install_dependencies=install_dependencies,
             source="uploaded",
+            progress_callback=_progress_callback,
         )
+
+        job["status"] = "success"
+        job["result"] = result.model_dump()
+        job["finished_at"] = datetime.now(timezone.utc).isoformat()
+        _log(
+            f"[system] Installation completed successfully "
+            f"({result.id}@{result.version})."
+        )
+
     except ProviderPackageError as exc:
+        job["status"] = "failed"
+        job["error"] = exc.to_dict()
+        job["finished_at"] = datetime.now(timezone.utc).isoformat()
+        _log(f"[error] {exc.message}")
         logger.info(
-            "Provider package upload rejected: %s (%s)",
+            "Background install for job %s failed: %s (%s)",
+            job_id,
             exc.message,
             exc.code,
         )
-        raise _to_http_exception(exc)
+
     except Exception as exc:
-        logger.exception("Unexpected provider package install error")
+        job["status"] = "failed"
+        job["error"] = {
+            "error": f"Unexpected install failure: {exc}",
+            "code": "PROVIDER_PACKAGE_INSTALL_FAILED",
+            "details": {"exception_type": type(exc).__name__},
+        }
+        job["finished_at"] = datetime.now(timezone.utc).isoformat()
+        _log(f"[error] Unexpected failure: {exc}")
+        logger.exception(
+            "Unexpected background install failure for job %s", job_id
+        )
+
+
+@router.get("/install-status/{job_id}")
+async def get_install_status(job_id: str) -> Dict[str, Any]:
+    """
+    Return the status of an asynchronous install job.
+
+    The frontend polls this every 1-2 seconds while a job is
+    ``running``. Once the job reaches ``success`` or ``failed``,
+    polling stops and the UI processes the result (or shows the
+    error).
+
+    The full log buffer is returned so the UI can render a live
+    timeline. Log entries are capped at 500 server-side; the oldest
+    are dropped when the cap is exceeded.
+    """
+    job = INSTALL_JOBS.get(job_id)
+    if job is None:
         raise HTTPException(
-            status_code=500,
+            status_code=404,
             detail={
-                "error": f"Unexpected install failure: {exc}",
-                "code": "PROVIDER_PACKAGE_INSTALL_FAILED",
-                "details": {"exception_type": type(exc).__name__},
+                "error": f"Install job '{job_id}' not found.",
+                "code": "INSTALL_JOB_NOT_FOUND",
+                "details": {"job_id": job_id},
             },
         )
 
     return {
         "status": "ok",
-        "provider": result.model_dump(),
-        "registry": {
-            "total_providers": len(
-                provider_package_manager.list_packages()
-            ),
+        "job": {
+            "job_id": job["job_id"],
+            "status": job["status"],
+            "filename": job["filename"],
+            "logs": list(job["logs"]),
+            "result": job["result"],
+            "error": job["error"],
+            "started_at": job["started_at"],
+            "finished_at": job["finished_at"],
         },
     }
 

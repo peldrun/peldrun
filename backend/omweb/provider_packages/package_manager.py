@@ -399,6 +399,7 @@ class ProviderPackageManager:
         *,
         install_dependencies: bool = True,
         source: str = "uploaded",
+        progress_callback: Optional[Any] = None,
     ) -> ProviderPackageInstallResult:
         """
         Validate, extract, and register a provider package from a ZIP.
@@ -596,6 +597,7 @@ class ProviderPackageManager:
                     environments_root=self._environments_root(manifest.id),
                     version=manifest.version,
                     manifest=manifest,
+                    progress_callback=progress_callback,
                 )
                 status = "ok" if env_result.installed or env_result.skipped_reason else "ok"
                 steps.append(
