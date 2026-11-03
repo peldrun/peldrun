@@ -37,6 +37,7 @@ from peldrun.llm.client import AsyncLLMClient, _is_oom_error
 from peldrun.llm.capability_resolver import resolve_model_capabilities
 from peldrun.llm.contracts import ConnectionContext, ReasoningMode
 from peldrun.llm.providers import provider_factory
+from peldrun.llm.providers.custom_plugin import PLUGIN_DESCRIPTOR_KEY
 from peldrun.llm.request import (
     GenerationConfig,
     LLMRequest,
@@ -315,6 +316,305 @@ def _is_reasoning_model(model_name: str, active_llm: Optional[Dict[str, Any]] = 
             "thinking",
         )
     )
+
+
+def _resolve_provider_and_extras(
+    active_llm: Dict[str, Any],
+    *,
+    connection_id: str,
+) -> "tuple[str, Dict[str, Any]]":
+    """
+    Resolve the adapter provider_id and extra_params for an LLM request.
+
+    Priority
+    --------
+        1. If the active provider is an installed Provider Package
+           (registered with SOURCE_EXTERNAL and served by
+           PluginProviderAdapter), return its canonical ID and the
+           plugin descriptor in extra_params.
+
+        2. Otherwise, return ("openai_compat", {}) — preserving the
+           legacy behavior where every provider used the
+           OpenAI-compatible adapter. Built-in native adapters
+           (anthropic, google_genai) are deliberately NOT routed
+           here — that migration is deferred to M7.3, and enabling
+           it silently would break existing configs that point
+           "anthropic" at an OpenAI-compatible proxy.
+
+    The descriptor travels inside ``ConnectionContext.extra_params``
+    so that ``peldrun.llm`` never needs to import
+    ``omweb.provider_packages`` — preserving the architectural
+    boundary (see contracts.py for the rationale).
+
+    Parameters
+    ----------
+    active_llm
+        The merged LLM configuration dict (post-``llm_override``).
+        Reads ``provider``, ``provider_name``, and ``base_url``.
+    connection_id
+        Connection identifier (typically the job_id in the bridge).
+        Used only in logging.
+
+    Returns
+    -------
+    tuple[str, Dict[str, Any]]
+        ``(provider_id, extra_params)``. ``extra_params`` is empty
+        for the built-in fallback path, and contains
+        ``PLUGIN_DESCRIPTOR_KEY`` for plugin providers.
+    """
+    # ------------------------------------------------------------------
+    # 1. Collect candidate provider IDs from active_llm.
+    # ------------------------------------------------------------------
+    candidates: List[str] = []
+    seen_candidates: set = set()
+
+    def _push_candidate(value: Any) -> None:
+        if not isinstance(value, str):
+            return
+        normalized = value.strip().lower()
+        if not normalized or normalized in seen_candidates:
+            return
+        seen_candidates.add(normalized)
+        candidates.append(normalized)
+
+    _push_candidate(active_llm.get("provider"))
+    _push_candidate(active_llm.get("provider_name"))
+
+    # Base-URL hints for local servers — some flows do not set
+    # ``provider`` explicitly, only ``base_url``.
+    base_url = str(active_llm.get("base_url") or "")
+    if "11434" in base_url:
+        _push_candidate("ollama")
+    if "1234" in base_url:
+        _push_candidate("lmstudio")
+
+    if not candidates:
+        return ("openai_compat", {})
+
+    # ------------------------------------------------------------------
+    # 2. Try to resolve each candidate against the provider registry.
+    #
+    # Lazy imports: dispatcher.py is imported very early in the
+    # backend startup sequence, and provider_registry triggers a
+    # module-level bootstrap that is expensive. Deferring the import
+    # until the first LLM request keeps backend startup fast.
+    # ------------------------------------------------------------------
+    try:
+        from peldrun.llm.providers.registry import (
+            SOURCE_EXTERNAL,
+            provider_registry,
+        )
+    except Exception as exc:
+        logger.debug(
+            "[BRIDGE] provider_registry import failed for %r: %s",
+            connection_id,
+            exc,
+        )
+        return ("openai_compat", {})
+
+    for candidate in candidates:
+        registration = provider_registry.find(candidate)
+        if registration is None:
+            continue
+
+        # Only plugin providers qualify for plugin routing.
+        # Built-in native adapters (anthropic, google_genai, etc.)
+        # stay behind the openai_compat fallback to preserve the
+        # existing user experience — see the M7.3 note in
+        # ``run_direct_chat``.
+        if registration.source != SOURCE_EXTERNAL:
+            continue
+        if "custom_plugin" not in (registration.class_path or ""):
+            continue
+
+        descriptor_dict = _build_plugin_descriptor_dict(
+            registration.provider_id, connection_id=connection_id
+        )
+        if descriptor_dict is None:
+            logger.warning(
+                "[BRIDGE] Plugin provider %r is registered but its "
+                "descriptor could not be built (connection_id=%r). "
+                "Falling back to openai_compat; the request may fail "
+                "if the endpoint is not OpenAI-compatible.",
+                registration.provider_id,
+                connection_id,
+            )
+            continue
+
+        # ------------------------------------------------------------------
+        # Load the active connection for this package.
+        #
+        # A package must have at least one CONFIGURED connection (set by
+        # the user via Store → Providers → Configure) before it can be
+        # dispatched. Without one, the adapter has no endpoint, no API
+        # key, and no per-package extra fields — it cannot work.
+        #
+        # If no active connection exists, we fall back to ``openai_compat``
+        # so the request fails in a way the user recognizes ("this
+        # endpoint doesn't speak OpenAI") instead of failing with a
+        # cryptic "adapter has no base_url" error from inside the plugin
+        # worker.
+        # ------------------------------------------------------------------
+        try:
+            from omweb.routers.config_rtr import (
+                get_active_connection_for_package,
+            )
+
+            active_conn = get_active_connection_for_package(
+                registration.provider_id
+            )
+        except Exception as conn_err:
+            logger.warning(
+                "[BRIDGE] Could not read provider connections for %r: %s. "
+                "Falling back to openai_compat.",
+                registration.provider_id,
+                conn_err,
+            )
+            active_conn = None
+
+        if not active_conn:
+            logger.warning(
+                "[BRIDGE] Package %r is registered but has NO active "
+                "connection. Configure it in Store → Providers first. "
+                "Falling back to openai_compat for this request.",
+                registration.provider_id,
+            )
+            continue
+
+        # ------------------------------------------------------------------
+        # Build the effective connection data.
+        #
+        # Convention (matches the reference packages in the catalog):
+        #   * ``base_url``  — the connection's endpoint URL
+        #   * ``api_key``   — the connection's authentication secret
+        #
+        # Every OTHER field (``scope``, ``anthropic_version``,
+        # ``folder_id``, ``ca_bundle_file``, ...) is passed through
+        # ``extra_params`` so the adapter's Python code can read it via
+        # ``context.extra_params[<key>]``.
+        # ------------------------------------------------------------------
+        conn_fields = dict(active_conn.get("fields") or {})
+        base_url_override = str(
+            conn_fields.get("base_url") or ""
+        ).strip() or None
+        api_key_override = str(
+            conn_fields.get("api_key") or ""
+        ).strip() or None
+
+        extra_params: Dict[str, Any] = {
+            PLUGIN_DESCRIPTOR_KEY: descriptor_dict,
+        }
+        for field_key, field_val in conn_fields.items():
+            if field_key in ("base_url", "api_key"):
+                continue
+            extra_params[field_key] = field_val
+
+        # Reserved overrides: popped by the call site before building
+        # the ConnectionContext. The leading underscore marks them as
+        # peldrun-internal — adapters never see them.
+        extra_params["_peldrun_base_url"] = base_url_override
+        extra_params["_peldrun_api_key"] = api_key_override
+        extra_params["_peldrun_connection_id"] = active_conn.get("id")
+
+        logger.info(
+            "[BRIDGE] Routing %r through package %r (connection=%r, "
+            "transport=%s, extra_fields=%s).",
+            connection_id,
+            registration.provider_id,
+            active_conn.get("name"),
+            descriptor_dict.get("transport", "?"),
+            [
+                k for k in conn_fields.keys()
+                if k not in ("base_url", "api_key")
+            ],
+        )
+
+        return (registration.provider_id, extra_params)
+
+    return ("openai_compat", {})
+
+
+def _build_plugin_descriptor_dict(
+    provider_id: str,
+    *,
+    connection_id: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Build the plugin descriptor dict for the given ``provider_id``.
+
+    Reads the installed package via ``provider_package_manager`` and
+    returns the descriptor in the exact shape expected by
+    ``PluginProviderAdapter._extract_descriptor`` (matching the
+    structure produced by
+    ``custom_plugin.ensure_plugin_providers_registered``).
+
+    Returns ``None`` when the package is not installed, not enabled,
+    or the active version's files are missing from disk. In every
+    failure case the caller falls back to ``openai_compat``.
+    """
+    try:
+        from omweb.provider_packages.package_manager import (
+            provider_package_manager,
+        )
+    except Exception as exc:
+        logger.debug(
+            "[BRIDGE] provider_package_manager import failed for %r: %s",
+            provider_id,
+            exc,
+        )
+        return None
+
+    try:
+        descriptor_obj = (
+            provider_package_manager.get_active_adapter_descriptor(provider_id)
+        )
+    except Exception as exc:
+        logger.debug(
+            "[BRIDGE] get_active_adapter_descriptor(%r) failed: %s",
+            provider_id,
+            exc,
+        )
+        return None
+
+    if descriptor_obj is None:
+        logger.debug(
+            "[BRIDGE] No active adapter descriptor for plugin %r "
+            "(package not installed, disabled, or files missing). "
+            "connection_id=%r",
+            provider_id,
+            connection_id,
+        )
+        return None
+
+    # Best-effort lookup for the display name (used only in logs).
+    display_name: str = provider_id
+    try:
+        pkg_entry = provider_package_manager.get_package(provider_id)
+        if pkg_entry is not None:
+            display_name = (
+                pkg_entry.display_name or pkg_entry.name or pkg_entry.id
+            )
+    except Exception:
+        pass
+
+    return {
+        "provider_id": descriptor_obj.provider_id,
+        "version": descriptor_obj.version,
+        "transport": descriptor_obj.transport,
+        "api_contract": descriptor_obj.api_contract,
+        "entry_point": descriptor_obj.entry_point,
+        "class_name": descriptor_obj.class_name,
+        "base_adapter": descriptor_obj.base_adapter,
+        "package_dir": str(descriptor_obj.package_dir),
+        "venv_python": (
+            str(descriptor_obj.venv_python)
+            if descriptor_obj.venv_python is not None
+            else None
+        ),
+        "features": dict(descriptor_obj.features or {}),
+        "permissions": dict(descriptor_obj.permissions or {}),
+        "display_name": display_name,
+    }
 
 
 def _resolve_chat_system_prompt(
@@ -865,6 +1165,62 @@ async def run_instrumented(
             )
     else:
         final_prompt = cleaned_prompt  # preserve any @-rewrite from inline resolver
+
+    # [M9] Resolve provider routing for agent mode.
+    #
+    # Reuses the same helper as `run_direct_chat`. When the active
+    # provider is an installed Provider Package, we store the plugin
+    # descriptor in `active_llm` under two reserved keys. The
+    # executor (in peldrun.runtime) then reads them as plain data
+    # and builds a ConnectionContext with
+    # extra_params={PLUGIN_DESCRIPTOR_KEY: descriptor}.
+    #
+    # For all other providers, the reserved keys stay absent and
+    # executor falls back to `openai_compat` — identical behavior
+    # to before M9 for every user who has not installed a Provider
+    # Package.
+    #
+    # Architectural note: the descriptor travels as plain data so
+    # that peldrun.runtime never imports omweb. The dispatcher is
+    # the OMWeb layer where the descriptor is resolved; the executor
+    # is the peldrun.runtime layer where it is consumed opaquely.
+    try:
+        _plugin_provider_id, _plugin_extra_params = _resolve_provider_and_extras(
+            active_llm,
+            connection_id=job_id,
+        )
+        if _plugin_provider_id != "openai_compat" and _plugin_extra_params:
+            # Extract reserved overrides before storing in active_llm.
+            # These will be consumed by ``executor.py`` when it builds
+            # the ConnectionContext for the run.
+            _base_url_override = _plugin_extra_params.pop(
+                "_peldrun_base_url", None
+            )
+            _api_key_override = _plugin_extra_params.pop(
+                "_peldrun_api_key", None
+            )
+            _plugin_extra_params.pop("_peldrun_connection_id", None)
+
+            active_llm["_peldrun_provider_id"] = _plugin_provider_id
+            active_llm["_peldrun_extra_params"] = _plugin_extra_params
+            active_llm["_peldrun_base_url"] = _base_url_override
+            active_llm["_peldrun_api_key"] = _api_key_override
+
+            _desc = _plugin_extra_params.get(PLUGIN_DESCRIPTOR_KEY, {})
+            logger.info(
+                "[BRIDGE AGENT] Routing to plugin provider %r "
+                "(transport=%s) for job %s.",
+                _plugin_provider_id,
+                _desc.get("transport", "unknown"),
+                job_id,
+            )
+    except Exception as _plugin_resolve_err:
+        logger.warning(
+            "[BRIDGE AGENT] Plugin provider resolution failed for job "
+            "%s (falling back to openai_compat): %s",
+            job_id,
+            _plugin_resolve_err,
+        )
 
     context = EngineRunContext(
         job_id=job_id,
@@ -1533,36 +1889,83 @@ async def run_direct_chat(
             )
 
         # ------------------------------------------------------------------
-        # [M7.1] Adapter-based LLM invocation.
+        # [M7.1 / M9] Adapter-based LLM invocation.
         #
-        # Replaces the direct `AsyncLLMClient(...)` instantiation with the
-        # provider factory. Both dispatch paths (direct chat and agent)
-        # now share a single LLM creation entry point.
+        # Two paths share a single factory entry point:
         #
-        # Legacy adapter (`openai_compat`) is used for ALL providers in
-        # this stage — which internally wraps `OpenAICompatProvider` →
-        # `AsyncLLMClient`. This guarantees zero behavior change for
-        # existing users: same watchdog timeouts (now enforced by the
-        # StreamNormalizer), same OOM fast-fail, same error mapping,
-        # same SSE streaming events.
+        #   1. **Built-in / legacy** — ``adapter_provider_id`` is
+        #      ``"openai_compat"``, which internally wraps
+        #      ``OpenAICompatProvider`` → ``AsyncLLMClient``. Same
+        #      watchdog timeouts, OOM fast-fail, error mapping, and
+        #      SSE streaming events as before. This is the fallback
+        #      for every provider that is NOT an installed Provider
+        #      Package, preserving zero behavior change for existing
+        #      users.
         #
-        # M7.3 will add smart routing to native adapters (lmstudio_native,
-        # ollama_native) when available, without touching this block —
-        # just changing `adapter_provider_id` via a resolver function.
+        #   2. **Plugin** — when the user configured a provider
+        #      installed via ``/api/store/providers``, the resolver
+        #      returns its canonical ID plus a plugin descriptor. The
+        #      factory then creates a ``PluginProviderAdapter``, which
+        #      either delegates to a built-in ``base_adapter`` (for
+        #      ``compatible`` packages) or spawns an isolated worker
+        #      subprocess (for ``native`` / ``custom`` packages).
+        #
+        # The descriptor travels inside ``connection.extra_params``
+        # (key: ``_peldrun_plugin``) so that ``peldrun.llm`` never
+        # imports ``omweb.provider_packages`` — preserving the
+        # architectural boundary defined in contracts.py.
+        #
+        # M7.3 will additionally route built-in native adapters
+        # (anthropic, google_genai) to their proper paths. That
+        # migration is deliberately not done here yet, because
+        # existing users may have ``provider="anthropic"`` pointing
+        # at an OpenAI-compatible proxy; silently switching them to
+        # the native adapter would break their setup.
         # ------------------------------------------------------------------
-        adapter_provider_id = "openai_compat"
+        adapter_provider_id, adapter_extra_params = _resolve_provider_and_extras(
+            active_llm,
+            connection_id=job_id,
+        )
 
-        # Build connection context. The bridge only reads base_url,
-        # api_key, and timeout — extra_params stays empty for the legacy
-        # path. Native adapters (M7.3) will read api_surface / vertexai
-        # from extra_params when they take over.
+        # Extract reserved overrides. These are set by
+        # ``_resolve_provider_and_extras`` when the package has an
+        # active connection. ``base_url`` and ``api_key`` from the
+        # package's connection REPLACE the ones from ``active_llm`` —
+        # the package owns its own credentials.
+        base_url_override = adapter_extra_params.pop(
+            "_peldrun_base_url", None
+        )
+        api_key_override = adapter_extra_params.pop(
+            "_peldrun_api_key", None
+        )
+        adapter_extra_params.pop("_peldrun_connection_id", None)
+
+        if adapter_provider_id != "openai_compat":
+            logger.info(
+                "[BRIDGE DIRECT CHAT] Routing to plugin provider %r "
+                "(transport=%s) for job %s.",
+                adapter_provider_id,
+                (
+                    adapter_extra_params.get(PLUGIN_DESCRIPTOR_KEY, {}).get(
+                        "transport", "unknown"
+                    )
+                    if adapter_extra_params
+                    else "unknown"
+                ),
+                job_id,
+            )
+
+        # Build connection context. ``extra_params`` carries the plugin
+        # descriptor + any custom fields the package declared (scope,
+        # anthropic_version, ca_bundle_file, ...). For non-plugin
+        # paths, ``adapter_extra_params`` is empty.
         connection = ConnectionContext(
             connection_id=job_id,
             provider_id=adapter_provider_id,
-            base_url=base_url,
-            api_key=api_key,
+            base_url=base_url_override or base_url,
+            api_key=api_key_override or api_key,
             timeout=float(active_llm.get("timeout") or 300.0),
-            extra_params={},
+            extra_params=adapter_extra_params,
         )
 
         # Resolve model capabilities via the honest resolver. This is

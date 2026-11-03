@@ -13,7 +13,7 @@ import { ResourceDashboard } from '@/features/resource-monitor/components/Resour
 
 export default function ResourceMonitorPage() {
   return (
-    <main className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
+    <main className="ResourceDashboard mx-auto w-full overflow-hidden relative flex">
       <ResourceDashboard />
     </main>
   );

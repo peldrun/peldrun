@@ -30,7 +30,10 @@ import toml
 from peldrun.llm.catalog.provider_live import query_providers_batch
 from peldrun.llm.contracts import ConnectionContext
 # M11: adapter-based model discovery.
-from peldrun.llm.providers import provider_factory
+from peldrun.llm.providers import (
+    ensure_external_providers_discovered,
+    provider_factory,
+)
 
 try:
     import tomllib
@@ -806,6 +809,18 @@ async def _fetch_available_models_impl(payload: FetchModelsRequest):
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
+    # Ensure any externally-installed provider packages (entry points
+    # pip-installed into the main environment) are registered before
+    # discovery. Idempotent after the first call — negligible cost on
+    # repeated requests, but critical for the "install a package, then
+    # immediately scan for models" workflow.
+    try:
+        ensure_external_providers_discovered()
+    except Exception as exc:
+        logger.debug(
+            "External provider discovery failed (non-fatal): %s", exc
+        )
+
     # ------------------------------------------------------------------
     # Helper: parse a /models response into (ids, metadata).
     # ------------------------------------------------------------------
@@ -1162,6 +1177,42 @@ VAULT_FILE = VAULT_DIR / "models_vault.json"
 DEFAULT_VAULT = {
     "cloud_vault": [],
     "custom_endpoints": [],
+    # Provider Package connections (M9/M10).
+    #
+    # Each entry is a saved connection for an installed Provider Package.
+    # It is completely separate from ``custom_endpoints`` above, which
+    # serves the built-in provider flows (openai_compat, anthropic,
+    # google_genai, ollama_native, lmstudio_native) managed through
+    # the LLM Settings UI.
+    #
+    # Why separate?
+    #   * The LLM Settings UI shows ``custom_endpoints`` for manual
+    #     user-defined providers. If package connections lived there,
+    #     they would appear twice (once in LLM Settings, once in Store
+    #     → Providers), confusing the user.
+    #   * Packages need to be managed exclusively from the Store, with
+    #     their own lifecycle (enable/disable per connection, multiple
+    #     connections per package, custom fields from the manifest).
+    #
+    # Entry shape::
+    #
+    #     {
+    #       "id": "conn_<hex>",                    # stable UUID
+    #       "provider_package_id": "gigachat",     # manifest.id
+    #       "name": "Personal Account",            # user label
+    #       "enabled": true,                       # active flag
+    #       "is_active": true,                     # selected primary
+    #       "fields": {                            # per ConnectionFieldSpec
+    #         "base_url": "https://...",
+    #         "api_key": "...",
+    #         "credentials": "...",
+    #         "scope": "PERS",
+    #         ...
+    #       },
+    #       "created_at": "2025-...",
+    #       "updated_at": "2025-..."
+    #     }
+    "provider_connections": [],
     "lmstudio_vault": {
         "baseUrl": "http://127.0.0.1:1234/v1",
         "model": "qwen3-vl-8b-instruct",
@@ -1217,11 +1268,234 @@ async def get_models_vault():
 async def save_models_vault(payload: dict = Body(...)):
     """Save or update AI providers, models, and API keys in persistent storage."""
     current = load_vault_from_disk()
-    for key in ["cloud_vault", "custom_endpoints", "lmstudio_vault", "ollama_vault", "scanned_models"]:
+    for key in [
+        "cloud_vault",
+        "custom_endpoints",
+        "provider_connections",
+        "lmstudio_vault",
+        "ollama_vault",
+        "scanned_models",
+    ]:
         if key in payload:
             current[key] = payload[key]
     save_vault_to_disk(current)
     return {"status": "success", "vault": current}
+
+
+# ============================================================
+# Provider Package Connections (M9/M10)
+# ============================================================
+#
+# These helpers manage the ``provider_connections`` array inside
+# ``models_vault.json``. They are the ONLY write path for package
+# connections — the Store → Providers UI talks to them via the
+# ``/api/store/providers/{id}/connections/*`` endpoints (see
+# ``routers/store/providers.py``).
+#
+# Design:
+#   * Every connection has a stable UUID (``id``). The package id
+#     (``provider_package_id``) is the manifest's canonical id, NOT
+#     the connection id.
+#   * Multiple connections per package are supported (personal /
+#     work / sandbox), with exactly one marked ``is_active``.
+#   * ``fields`` is a free-form dict matching the package's
+#     ``connection_fields`` schema. Values are stored verbatim (no
+#     masking) so the adapter can read them at request time —
+#     masking happens ONLY at the API response layer, never here.
+#   * All writes are atomic (``save_vault_to_disk`` uses tmp+replace).
+
+
+def list_provider_connections(
+    package_id: Optional[str] = None,
+) -> list:
+    """
+    Return every saved connection, optionally filtered by package id.
+
+    Parameters
+    ----------
+    package_id
+        When provided, only connections whose ``provider_package_id``
+        matches are returned. When ``None``, all connections are
+        returned.
+
+    Returns
+    -------
+    list
+        A list of connection dicts. Empty list when the vault has
+        no connections or the section is missing.
+    """
+    vault = load_vault_from_disk()
+    raw = vault.get("provider_connections")
+    if not isinstance(raw, list):
+        return []
+    if package_id is None:
+        return [dict(c) for c in raw if isinstance(c, dict)]
+    return [
+        dict(c)
+        for c in raw
+        if isinstance(c, dict) and c.get("provider_package_id") == package_id
+    ]
+
+
+def get_provider_connection(connection_id: str) -> Optional[dict]:
+    """
+    Return a single connection by its UUID, or ``None`` if missing.
+    """
+    if not connection_id:
+        return None
+    for conn in list_provider_connections():
+        if conn.get("id") == connection_id:
+            return conn
+    return None
+
+
+def save_provider_connection(connection: dict) -> dict:
+    """
+    Insert or update a connection.
+
+    The connection dict MUST contain at least ``id``,
+    ``provider_package_id``, and ``fields``. ``name``, ``enabled``,
+    ``is_active``, ``created_at``, and ``updated_at`` are filled in
+    with defaults when missing.
+
+    When ``is_active`` is true, every OTHER connection of the same
+    ``provider_package_id`` is set to ``is_active: False`` — exactly
+    one active connection per package at any time.
+
+    Returns the saved connection (with all fields populated).
+    """
+    import uuid
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn = dict(connection) if isinstance(connection, dict) else {}
+
+    # Validate required fields.
+    if not conn.get("id"):
+        conn["id"] = f"conn_{uuid.uuid4().hex[:16]}"
+    if not conn.get("provider_package_id"):
+        raise HTTPException(
+            status_code=400,
+            detail="provider_package_id is required.",
+        )
+    if not isinstance(conn.get("fields"), dict):
+        conn["fields"] = {}
+
+    # Fill in defaults.
+    conn.setdefault("name", conn["provider_package_id"])
+    conn.setdefault("enabled", True)
+    conn.setdefault("is_active", False)
+    conn.setdefault("created_at", now)
+    conn["updated_at"] = now
+
+    # Load the full vault, mutate the connection list, save.
+    vault = load_vault_from_disk()
+    existing = vault.get("provider_connections")
+    if not isinstance(existing, list):
+        existing = []
+
+    # If activating this connection, deactivate siblings first.
+    if conn.get("is_active"):
+        for other in existing:
+            if (
+                isinstance(other, dict)
+                and other.get("provider_package_id")
+                == conn["provider_package_id"]
+                and other.get("id") != conn["id"]
+            ):
+                other["is_active"] = False
+
+    # Replace or append.
+    replaced = False
+    for i, other in enumerate(existing):
+        if isinstance(other, dict) and other.get("id") == conn["id"]:
+            existing[i] = conn
+            replaced = True
+            break
+    if not replaced:
+        existing.append(conn)
+
+    vault["provider_connections"] = existing
+    save_vault_to_disk(vault)
+    return conn
+
+
+def delete_provider_connection(connection_id: str) -> bool:
+    """
+    Delete a connection by its UUID.
+
+    Returns ``True`` when the connection existed and was removed,
+    ``False`` when no connection with that id exists.
+    """
+    if not connection_id:
+        return False
+    vault = load_vault_from_disk()
+    existing = vault.get("provider_connections")
+    if not isinstance(existing, list):
+        return False
+
+    before = len(existing)
+    filtered = [
+        c for c in existing
+        if isinstance(c, dict) and c.get("id") != connection_id
+    ]
+    if len(filtered) == before:
+        return False
+
+    vault["provider_connections"] = filtered
+    save_vault_to_disk(vault)
+    return True
+
+
+def set_provider_connection_enabled(
+    connection_id: str, enabled: bool
+) -> Optional[dict]:
+    """
+    Toggle the ``enabled`` flag for a connection.
+
+    Returns the updated connection, or ``None`` when not found.
+    """
+    conn = get_provider_connection(connection_id)
+    if conn is None:
+        return None
+    conn["enabled"] = bool(enabled)
+    return save_provider_connection(conn)
+
+
+def set_active_provider_connection(
+    connection_id: str,
+) -> Optional[dict]:
+    """
+    Mark a connection as the active one for its package.
+
+    Deactivates every sibling connection of the same package.
+    Returns the updated connection, or ``None`` when not found.
+    """
+    conn = get_provider_connection(connection_id)
+    if conn is None:
+        return None
+    conn["is_active"] = True
+    conn["enabled"] = True  # activating implies enabling
+    return save_provider_connection(conn)
+
+
+def get_active_connection_for_package(
+    package_id: str,
+) -> Optional[dict]:
+    """
+    Return the currently-active connection for a package, or ``None``.
+
+    "Active" means: ``is_active == True`` AND ``enabled == True``.
+    An active-but-disabled connection is treated as "no active
+    connection" — the runtime will refuse to use it.
+
+    Used by ``dispatcher._resolve_provider_and_extras`` to build
+    the ConnectionContext for a package-backed provider.
+    """
+    for conn in list_provider_connections(package_id):
+        if conn.get("is_active") and conn.get("enabled"):
+            return conn
+    return None
 
 
 # ============================================================

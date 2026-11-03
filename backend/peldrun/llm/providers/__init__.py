@@ -48,15 +48,33 @@ Design notes
    preserved so that any config value written by the pre-M2 UI keeps
    resolving. New aliases can be added without touching this file.
 
-4. No discovery of external packages happens here. External Provider
-   Packages (M9) are loaded by an explicit call to
-   ``provider_registry.discover_external_providers()`` from the Store
-   bootstrap path (M10). This keeps app startup fast and predictable.
+4. **External package discovery is EXPLICIT, not automatic.**
+   Built-in adapters are registered at module import (below).
+   External Provider Packages (installed as pip entry points) are only
+   picked up when the caller invokes
+   ``ensure_external_providers_discovered()``. This keeps app startup
+   fast and predictable, and lets the Store trigger a fresh scan after
+   a successful install without restarting the backend.
+
+   Discovery paths (M9 phase 1):
+
+   * **Entry-point discovery** — packages that were pip-installed into
+     the MAIN Python environment and declare an entry point in
+     ``peldrun.llm.providers.v1``. This path is handled by
+     ``ensure_external_providers_discovered()`` below.
+
+   * **M9-installed packages** — packages installed via
+     ``/api/store/providers/upload`` or ``install-from-catalog``.
+     These ship their own isolated venv and require the plugin_host
+     (phase 2) to actually execute. They are visible in the Store UI
+     immediately after install; they appear in LLM Settings once the
+     plugin_host registers them at its startup.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Optional
 
 from peldrun.llm.client import LLMConfig
@@ -221,6 +239,102 @@ _bootstrap_builtin_providers()
 
 
 # ---------------------------------------------------------------------------
+# External provider discovery (M9)
+# ---------------------------------------------------------------------------
+
+
+#: Guard against concurrent ``discover_external_providers`` calls. The
+#: underlying registry is thread-safe, but the discovery method scans
+#: ``importlib.metadata.entry_points`` which is expensive — serializing
+#: the scan avoids duplicate work when two callers race on the first
+#: invocation (e.g. lifespan startup + first config request).
+_external_discovery_lock = threading.Lock()
+
+#: Set to ``True`` after the first successful (or empty) discovery
+#: attempt. A subsequent call with ``force=False`` becomes a no-op.
+_external_discovery_attempted = False
+
+
+def ensure_external_providers_discovered(force: bool = False) -> int:
+    """
+    Discover Provider Packages installed as pip entry points.
+
+    Call sites
+    ----------
+    * ``omweb.main`` lifespan startup — picks up packages installed
+      before the current backend process started.
+    * ``omweb.routers.config_rtr`` before ``fetch-models`` — ensures
+      packages installed while the backend was running are visible
+      to the discovery path.
+    * Anywhere a caller needs a fresh scan — pass ``force=True``.
+
+    Behavior
+    --------
+    * **Idempotent by default.** After the first call, subsequent calls
+      with ``force=False`` return 0 immediately. This is intentional:
+      scanning ``importlib.metadata`` is not free, and nothing changes
+      between two sequential calls in the same process.
+    * **Thread-safe.** Two concurrent first-calls serialize; the
+      second sees ``_external_discovery_attempted=True`` and returns 0.
+    * **Never raises.** Any failure is logged at ERROR level and
+      returns 0. External discovery must never break backend startup
+      — the built-in adapters are already registered regardless of
+      what external discovery finds.
+    * **Idempotent registration.** The underlying registry uses
+      ``overwrite=False`` for external packages, so re-running
+      discovery does NOT clobber an existing registration. It only
+      adds new entries.
+
+    Parameters
+    ----------
+    force
+        When ``True``, re-scans even if a previous call completed. Use
+        this after the Store installs a new entry-point package (rare —
+        most M9 installs ship isolated venvs and are handled by the
+        plugin_host instead).
+
+    Returns
+    -------
+    int
+        The number of NEW providers registered by this call. ``0``
+        when nothing was added (either because none exist, or because
+        the call was a no-op due to ``_external_discovery_attempted``).
+    """
+    global _external_discovery_attempted
+
+    with _external_discovery_lock:
+        if _external_discovery_attempted and not force:
+            return 0
+
+        try:
+            count = provider_registry.discover_external_providers(
+                force_refresh=force,
+            )
+        except Exception as exc:
+            # A failure here must never break startup or a config
+            # request. The built-in adapters are already registered.
+            logger.error(
+                "External provider discovery failed: %s",
+                exc,
+                exc_info=True,
+            )
+            _external_discovery_attempted = True
+            return 0
+
+        _external_discovery_attempted = True
+
+        if count:
+            logger.info(
+                "Discovered %d external provider package(s).", count
+            )
+        else:
+            logger.debug(
+                "External provider discovery ran; no new packages found."
+            )
+        return count
+
+
+# ---------------------------------------------------------------------------
 # Legacy compatibility factory (unchanged signature, preserved behavior)
 # ---------------------------------------------------------------------------
 
@@ -304,4 +418,6 @@ __all__ = [
     "SOURCE_BUILTIN",
     "SOURCE_EXTERNAL",
     "SOURCE_RUNTIME",
+    # M9 discovery entry point
+    "ensure_external_providers_discovered",
 ]

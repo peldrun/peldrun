@@ -49,6 +49,7 @@ from peldrun.llm.contracts import (
     ReasoningMode,
 )
 from peldrun.llm.providers import provider_factory
+from peldrun.llm.providers.custom_plugin import PLUGIN_DESCRIPTOR_KEY
 from peldrun.llm.request import (
     GenerationConfig,
     LLMRequest,
@@ -466,28 +467,60 @@ class CoreRuntimeExecutor:
             llm_request_timeout = step_timeout
 
         # ------------------------------------------------------------------
-        # [M7.2] Adapter-based LLM setup.
+        # [M7.2 / M9] Adapter-based LLM setup.
         #
-        # Replaces the direct OpenAICompatProvider construction with the
-        # provider factory + bridge. Both dispatch paths (direct chat and
-        # agent) now share a single creation entry point.
+        # Two paths share a single factory entry point:
         #
-        # For this stage we still use the legacy `openai_compat`
-        # adapter — which internally wraps AsyncLLMClient. Behavior is
-        # IDENTICAL to pre-M7.2: same watchdog (now in StreamNormalizer),
-        # same streaming, same error mapping. The only differences are:
+        #   1. **Built-in / legacy** — ``adapter_provider_id`` is
+        #      ``"openai_compat"``, which internally wraps
+        #      ``OpenAICompatProvider`` → ``AsyncLLMClient``. Same
+        #      watchdog timeouts, OOM fast-fail, error mapping, and
+        #      SSE streaming behavior as before. The 4096-token hard
+        #      ceiling is gone (the value is already resolved by
+        #      ``dispatcher._resolve_model_max_output_tokens``).
         #
-        #   1. The 4096-token hard ceiling is gone.
-        #   2. Reasoning parameters are gated by the resolver instead of
-        #      being forwarded unconditionally.
-        #   3. The adapter's underlying HTTP client is closed in the
-        #      finally block, preventing socket leaks per run.
+        #   2. **Plugin** — when the dispatcher detected that the
+        #      active provider is an installed Provider Package, it
+        #      stored the canonical provider ID and the plugin
+        #      descriptor in ``llm_config`` under
+        #      ``_peldrun_provider_id`` / ``_peldrun_extra_params``.
+        #      We honor those here and pass them to the factory.
         #
-        # M7.3 will add smart routing to native adapters (lmstudio_native,
-        # ollama_native) without touching this block — only the
-        # `adapter_provider_id` selection changes.
+        # The descriptor travels as plain data so that
+        # ``peldrun.runtime`` never imports ``omweb`` — the
+        # descriptor was resolved in the OMWeb layer (dispatcher)
+        # and reaches us as an opaque dict.
         # ------------------------------------------------------------------
-        adapter_provider_id = "openai_compat"
+        adapter_provider_id = (
+            llm_cfg_dict.get("_peldrun_provider_id") or "openai_compat"
+        )
+        adapter_extra_params: Dict[str, Any] = (
+            llm_cfg_dict.get("_peldrun_extra_params") or {}
+        )
+
+        # Reserved overrides — populated by ``dispatcher.run_instrumented``
+        # when the package has an active connection. When present, they
+        # REPLACE the ``base_url`` and ``api_key`` from the run config,
+        # because the package owns its own credentials.
+        _base_url_override = llm_cfg_dict.get("_peldrun_base_url")
+        _api_key_override = llm_cfg_dict.get("_peldrun_api_key")
+
+        if adapter_provider_id != "openai_compat":
+            _transport_hint = (
+                adapter_extra_params.get(PLUGIN_DESCRIPTOR_KEY, {}).get(
+                    "transport", "unknown"
+                )
+                if adapter_extra_params
+                else "unknown"
+            )
+            logger.info(
+                "Agent run %s routing to plugin provider %r "
+                "(transport=%s, model=%s).",
+                run_id_str,
+                adapter_provider_id,
+                _transport_hint,
+                model_name,
+            )
 
         # Resolve model capabilities honestly. When no metadata exists,
         # the resolver returns everything as UNKNOWN. We then honor any
@@ -566,17 +599,30 @@ class CoreRuntimeExecutor:
             user_effort_str if user_wants_reasoning else "none"
         )
 
-        # Build the connection context. The bridge only reads base_url,
-        # api_key, and timeout — extra_params stays empty for the legacy
-        # path. Native adapters (M7.3) will read api_surface / vertexai
-        # from extra_params when they take over.
+        # Build the connection context.
+        #
+        # For the legacy openai_compat path, ``extra_params`` is empty
+        # (identical to pre-M9 behavior).
+        #
+        # For plugin providers, ``extra_params`` carries the descriptor
+        # that ``PluginProviderAdapter._extract_descriptor`` expects,
+        # keyed under ``PLUGIN_DESCRIPTOR_KEY``, plus every custom
+        # connection field the package declared (scope, folder_id,
+        # anthropic_version, ca_bundle_file, ...). The descriptor and
+        # the custom fields are passed as an opaque dict — executor
+        # never interprets them.
+        #
+        # ``base_url`` and ``api_key`` come from the package's active
+        # connection when available (``_base_url_override`` /
+        # ``_api_key_override``). Falls back to the run's config values
+        # otherwise, preserving pre-M9 behavior for built-in providers.
         connection = ConnectionContext(
             connection_id=run_id_str,
             provider_id=adapter_provider_id,
-            base_url=base_url,
-            api_key=api_key,
+            base_url=_base_url_override or base_url,
+            api_key=_api_key_override or api_key,
             timeout=llm_request_timeout,
-            extra_params={},
+            extra_params=adapter_extra_params,
         )
 
         # Build the base LLMRequest template. The bridge clones this

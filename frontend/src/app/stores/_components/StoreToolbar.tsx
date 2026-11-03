@@ -5,7 +5,12 @@
 import React from "react";
 import { Search, X } from "lucide-react";
 import type { SectionId } from "../_config/sections";
-import type { AgentFilter, ToolFilter, SkillFilter } from "../_types/store";
+import type {
+  AgentFilter,
+  ProviderFilter,
+  SkillFilter,
+  ToolFilter,
+} from "../_types/store";
 
 /**
  * A single filter option rendered inside the segmented control.
@@ -40,6 +45,10 @@ export interface StoreToolbarProps {
   // Skills filter (only rendered when activeSection === "skills")
   skillFilter?: SkillFilter;
   onSkillFilterChange?: (value: SkillFilter) => void;
+
+  // Providers filter (only rendered when activeSection === "providers")
+  providerFilter?: ProviderFilter;
+  onProviderFilterChange?: (value: ProviderFilter) => void;
 }
 
 const AGENT_FILTER_OPTIONS: ToolbarFilterOption<AgentFilter>[] = [
@@ -57,6 +66,20 @@ const TOOL_FILTER_OPTIONS: ToolbarFilterOption<ToolFilter>[] = [
 const SKILL_FILTER_OPTIONS: ToolbarFilterOption<SkillFilter>[] = [
   { value: "all", label: "All" },
   { value: "builtin", label: "Built-in" },
+  { value: "custom", label: "Custom" },
+];
+
+// Provider filter combines two axes:
+//   - state (all / enabled / disabled)
+//   - transport (native / compatible / custom)
+// The user can only pick one at a time; the section resolves it
+// according to its own precedence rules (see ProvidersSection).
+const PROVIDER_FILTER_OPTIONS: ToolbarFilterOption<ProviderFilter>[] = [
+  { value: "all", label: "All" },
+  { value: "enabled", label: "Enabled" },
+  { value: "disabled", label: "Disabled" },
+  { value: "native", label: "Native" },
+  { value: "compatible", label: "Compat" },
   { value: "custom", label: "Custom" },
 ];
 
@@ -115,6 +138,8 @@ export function StoreToolbar({
   onToolFilterChange,
   skillFilter = "all",
   onSkillFilterChange,
+  providerFilter = "all",
+  onProviderFilterChange,
 }: StoreToolbarProps) {
   return (
     <div className="w-full border-b border-border bg-card">
@@ -125,6 +150,7 @@ export function StoreToolbar({
           {activeSection === "agents" && "Browse autonomous personas"}
           {activeSection === "tools" && "Local + bundled capabilities"}
           {activeSection === "skills" && "Reusable instruction packs"}
+          {activeSection === "providers" && "Install LLM provider packages"}
           {activeSection === "extensions" && "MCP server integrations"}
         </div>
 
@@ -173,6 +199,14 @@ export function StoreToolbar({
               value={skillFilter}
               onChange={onSkillFilterChange}
               options={SKILL_FILTER_OPTIONS}
+            />
+          )}
+
+          {activeSection === "providers" && onProviderFilterChange && (
+            <SegmentedFilter<ProviderFilter>
+              value={providerFilter}
+              onChange={onProviderFilterChange}
+              options={PROVIDER_FILTER_OPTIONS}
             />
           )}
         </div>

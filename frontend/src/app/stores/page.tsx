@@ -13,7 +13,12 @@ import {
   SectionId,
   getSectionMeta,
 } from "./_config/sections";
-import type { AgentFilter, ToolFilter, SkillFilter } from "./_types/store";
+import type {
+  AgentFilter,
+  ProviderFilter,
+  SkillFilter,
+  ToolFilter,
+} from "./_types/store";
 import type { ExtensionDefinition } from "@/lib/types";
 import { useStoreData } from "./_hooks/useStoreData";
 import { useAgentActions } from "./_hooks/useAgentActions";
@@ -21,6 +26,7 @@ import { useToolActions } from "./_hooks/useToolActions";
 import { useSkillActions } from "./_hooks/useSkillActions";
 import { useExtensionActions } from "./_hooks/useExtensionActions";
 import { useBundleActions } from "./_hooks/useBundleActions";
+import { useProviderActions } from "./_hooks/useProviderActions";
 
 import { StoreSidebar } from "./_components/StoreSidebar";
 import { StoreHeader } from "./_components/StoreHeader";
@@ -36,6 +42,10 @@ import {
   getSkillsHeaderConfig,
 } from "./_sections/SkillsSection";
 import {
+  ProvidersSection,
+  getProvidersHeaderConfig,
+} from "./_sections/ProvidersSection";
+import {
   ExtensionsSection,
   getExtensionsHeaderConfig,
 } from "./_sections/ExtensionsSection";
@@ -47,6 +57,9 @@ import { SkillDetailsDrawer } from "./_modals/SkillDetailsDrawer";
 import { MCPSettingsModal } from "./_modals/MCPSettingsModal";
 import { MCPToolsModal } from "@/app/stores/_modals/MCPToolsModal";
 import { MCPDetailDrawer } from "./_components/MCPDetailDrawer";
+import { ProviderUploadModal } from "./_modals/ProviderUploadModal";
+import { ProviderDetailsDrawer } from "./_modals/ProviderDetailsDrawer";
+import { ProviderConfigureModal } from "./_modals/ProviderConfigureModal";
 
 /**
  * Store page orchestrator.
@@ -69,6 +82,7 @@ export default function StoresPage() {
   const [agentFilter, setAgentFilter] = useState<AgentFilter>("all");
   const [toolFilter, setToolFilter] = useState<ToolFilter>("all");
   const [skillFilter, setSkillFilter] = useState<SkillFilter>("all");
+  const [providerFilter, setProviderFilter] = useState<ProviderFilter>("all");
 
   // Bundle-specific UI state (drawer + upload modal).
   const [detailsBundle, setDetailsBundle] = useState<BundleEntry | null>(null);
@@ -86,6 +100,8 @@ export default function StoresPage() {
     extensions,
     setExtensions,
     bundles,
+    providers,
+    setProviders,
     loading,
     reload,
   } = useStoreData();
@@ -99,6 +115,11 @@ export default function StoresPage() {
     reload,
     detailsBundle,
     setDetailsBundle,
+  });
+  const providerActions = useProviderActions({
+    providers,
+    setProviders,
+    reload,
   });
 
   // ── Effects ─────────────────────────────────────────────────────
@@ -116,6 +137,7 @@ export default function StoresPage() {
     agents: agents.length,
     tools: tools.length,
     skills: skills.length,
+    providers: providers.length,
     extensions: extensions.length,
   };
 
@@ -140,6 +162,11 @@ export default function StoresPage() {
     if (activeSection === "skills") {
       return getSkillsHeaderConfig({
         onInstallSkill: skillActions.openUploadModal,
+      });
+    }
+    if (activeSection === "providers") {
+      return getProvidersHeaderConfig({
+        onUploadProvider: providerActions.handleOpenUpload,
       });
     }
     return getExtensionsHeaderConfig({
@@ -181,6 +208,8 @@ export default function StoresPage() {
             onToolFilterChange={setToolFilter}
             skillFilter={skillFilter}
             onSkillFilterChange={setSkillFilter}
+            providerFilter={providerFilter}
+            onProviderFilterChange={setProviderFilter}
           />
 
           <div className="flex-1 overflow-y-auto scrollbar-thin bg-storbg">
@@ -233,6 +262,43 @@ export default function StoresPage() {
                   onDeleteSkill={skillActions.handleDeleteSkill}
                   onOpenDetails={skillActions.handleOpenDetails}
                   onOpenUpload={skillActions.openUploadModal}
+                />
+              )}
+
+              {activeSection === "providers" && (
+                <ProvidersSection
+                  providers={providers}
+                  searchQuery={searchQuery}
+                  providerFilter={providerFilter}
+                  catalogItems={providerActions.catalogItems}
+                  isCatalogLoading={providerActions.isCatalogLoading}
+                  isRefreshingCatalog={providerActions.isRefreshingCatalog}
+                  catalogError={providerActions.catalogError}
+                  onLoadCatalog={providerActions.handleLoadCatalog}
+                  onRefreshCatalog={providerActions.handleRefreshCatalog}
+                  onInstallFromCatalog={
+                    providerActions.handleInstallFromCatalog
+                  }
+                  installingCatalogId={
+                    providerActions.installingCatalogId
+                  }
+                  togglingProviderId={
+                    providerActions.togglingProviderId
+                  }
+                  deletingProviderId={
+                    providerActions.deletingProviderId
+                  }
+                  activatingProviderId={
+                    providerActions.activatingProviderId
+                  }
+                  onToggleProvider={providerActions.handleToggleProvider}
+                  onDeleteProvider={providerActions.handleDeleteProvider}
+                  onActivateVersion={
+                    providerActions.handleActivateVersion
+                  }
+                  onOpenDetails={providerActions.handleOpenDetails}
+                  onOpenConfigure={providerActions.handleOpenConfigure}
+                  onOpenUpload={providerActions.handleOpenUpload}
                 />
               )}
 
@@ -372,6 +438,65 @@ export default function StoresPage() {
         open={skillActions.isDetailsDrawerOpen}
         skill={skillActions.detailsSkill}
         onClose={skillActions.handleCloseDetails}
+      />
+
+      {/* Provider upload modal (.zip) */}
+      <ProviderUploadModal
+        open={providerActions.isUploadModalOpen}
+        selectedFile={providerActions.uploadSelectedFile}
+        installDependencies={providerActions.uploadInstallDependencies}
+        isUploading={providerActions.isUploading}
+        errorMessage={providerActions.uploadError}
+        onSelectFile={providerActions.setUploadSelectedFile}
+        onToggleInstallDependencies={
+          providerActions.setUploadInstallDependencies
+        }
+        onSubmit={providerActions.handleUploadSubmit}
+        onClose={providerActions.handleCloseUpload}
+      />
+
+      {/* Provider details drawer */}
+      <ProviderDetailsDrawer
+        open={providerActions.isDetailsDrawerOpen}
+        details={providerActions.detailsProvider}
+        isLoading={providerActions.isDetailsLoading}
+        onClose={providerActions.handleCloseDetails}
+        onActivateVersion={providerActions.handleActivateVersion}
+        onToggleEnabled={providerActions.handleToggleProvider}
+        onDelete={providerActions.handleDeleteProvider}
+        toggling={
+          providerActions.detailsProvider !== null &&
+          providerActions.togglingProviderId ===
+            providerActions.detailsProvider.provider.id
+        }
+        deleting={
+          providerActions.detailsProvider !== null &&
+          providerActions.deletingProviderId ===
+            providerActions.detailsProvider.provider.id
+        }
+        activating={
+          providerActions.detailsProvider !== null &&
+          providerActions.activatingProviderId ===
+            providerActions.detailsProvider.provider.id
+        }
+      />
+
+      {/* Provider configure modal */}
+      <ProviderConfigureModal
+        open={providerActions.isConfigureModalOpen}
+        provider={providerActions.configureProvider}
+        connections={providerActions.connections}
+        isConnectionsLoading={providerActions.isConnectionsLoading}
+        connectionsError={providerActions.connectionsError}
+        connectionActionId={providerActions.connectionActionId}
+        onClose={providerActions.handleCloseConfigure}
+        onCreateConnection={providerActions.handleCreateConnection}
+        onUpdateConnection={providerActions.handleUpdateConnection}
+        onDeleteConnection={providerActions.handleDeleteConnection}
+        onEnableConnection={providerActions.handleEnableConnection}
+        onDisableConnection={providerActions.handleDisableConnection}
+        onActivateConnection={providerActions.handleActivateConnection}
+        onTestConnection={providerActions.handleTestConnection}
       />
 
     </div>

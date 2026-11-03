@@ -1,11 +1,11 @@
 // frontend/src/app/stores/_config/sections.tsx
 
-import { Bot, LucideIcon, Puzzle, Sparkles, Wrench } from "lucide-react";
+import { Bot, LucideIcon, Plug, Puzzle, Sparkles, Wrench } from "lucide-react";
 
 /**
  * Unique identifier for each store section.
  */
-export type SectionId = "agents" | "tools" | "skills" | "extensions";
+export type SectionId = "agents" | "tools" | "skills" | "providers" | "extensions";
 
 /**
  * Sidebar / navigation metadata for a store section.
@@ -57,6 +57,10 @@ export interface SectionHeaderConfig {
  *   - Tools second: fundamental capability layer.
  *   - Skills third: instructional packs assigned to agents or invoked
  *     from chat — sits naturally between Tools and MCP.
+ *   - Providers fourth: LLM provider packages. Placed after Skills
+ *     because it configures WHERE the model comes from (a
+ *     foundational setting usually changed once), while Skills and
+ *     Tools are content the user installs and swaps frequently.
  *   - Extensions (MCP) last: most advanced / least frequently used.
  */
 export const SECTIONS: SectionMeta[] = [
@@ -80,6 +84,13 @@ export const SECTIONS: SectionMeta[] = [
     shortLabel: "Skills",
     description: "Reusable instruction packs for agents and chat",
     icon: Sparkles,
+  },
+  {
+    id: "providers",
+    label: "AI Providers",
+    shortLabel: "Providers",
+    description: "Install LLM provider packages (native, compatible, custom)",
+    icon: Plug,
   },
   {
     id: "extensions",

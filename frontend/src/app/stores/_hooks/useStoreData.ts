@@ -14,7 +14,14 @@ import type {
   ExtensionDefinition,
 } from "@/lib/types";
 import { listBundles, type BundleEntry } from "@/lib/bundleApi";
-import type { SkillSummary } from "../_types/store";
+import {
+  listProviders,
+  type ProviderApiRequestError,
+} from "@/lib/providerApi";
+import type {
+  ProviderPackageEntry,
+  SkillSummary,
+} from "../_types/store";
 import { showToast } from "@/components/ui/ToastNotification";
 
 /**
@@ -23,21 +30,7 @@ import { showToast } from "@/components/ui/ToastNotification";
  * All /api/* requests flow through Next.js rewrites, which are
  * configured at build time in `next.config.mjs` via the
  * PELDRUN_BACKEND_URL environment variable. Returning an absolute URL
- * here (based on `window.location.port`) would break SSR/CSR parity:
- *
- *   - On the server, `window` is undefined, so the function would
- *     return the relative path "/api/...".
- *   - On the client, the same call would return
- *     "http://localhost:8088/api/...".
- *
- * The two results differ, so React reports a hydration mismatch on
- * every attribute derived from this value (e.g. <img src> and
- * mask-image in AgentIcon). Rewrites already route to the configured
- * backend regardless of port, so the absolute URL is unnecessary.
- *
- * The function is kept (rather than inlined) as a single extension
- * point for future cross-cutting concerns (auth headers, tracing)
- * without touching every call site.
+ * here (based on `window.location.port`) would break SSR/CSR parity.
  */
 export function getApiUrl(endpoint: string): string {
   return endpoint;
@@ -58,6 +51,21 @@ export interface StoreDataState {
   setExtensions: React.Dispatch<React.SetStateAction<ExtensionDefinition[]>>;
   bundles: BundleEntry[];
   setBundles: React.Dispatch<React.SetStateAction<BundleEntry[]>>;
+  /**
+   * Installed Provider Packages (M9 / M10).
+   *
+   * Populated from ``GET /api/store/providers`` — every registered
+   * package, enabled or disabled. The catalog of *installable*
+   * packages is fetched separately by the Providers section (via
+   * ``listCatalog()``) because it is a distinct data source and is
+   * not needed until the user opens that section.
+   *
+   * An empty array means "no provider packages installed" or "the
+   * request failed silently" (see the reload() comment for why a
+   * failure here does not block the rest of the catalog).
+   */
+  providers: ProviderPackageEntry[];
+  setProviders: React.Dispatch<React.SetStateAction<ProviderPackageEntry[]>>;
   loading: boolean;
   reload: () => Promise<void>;
 }
@@ -86,8 +94,8 @@ async function fetchSkills(): Promise<SkillSummary[]> {
  * Central data hook for the store page.
  *
  * Responsibilities:
- *  - Owns the five catalog collections (agents, tools, skills,
- *    extensions, bundles).
+ *  - Owns the six catalog collections (agents, tools, skills,
+ *    extensions, bundles, providers).
  *  - Exposes their setters so action hooks can apply optimistic updates
  *    without needing to re-fetch the whole catalog.
  *  - Provides a single `reload()` used after destructive or stateful
@@ -100,24 +108,37 @@ export function useStoreData(): StoreDataState {
   const [skills, setSkills] = useState<SkillSummary[]>([]);
   const [extensions, setExtensions] = useState<ExtensionDefinition[]>([]);
   const [bundles, setBundles] = useState<BundleEntry[]>([]);
+  const [providers, setProviders] = useState<ProviderPackageEntry[]>([]);
   const [loading, setLoading] = useState(false);
 
   const reload = useCallback(async () => {
     setLoading(true);
     try {
-      const [ag, tl, sk, ex, bd] = await Promise.all([
+      const [ag, tl, sk, ex, bd, pv] = await Promise.all([
         fetchStoreAgents(),
         fetchStoreTools(),
         fetchSkills(),
         fetchStoreExtensions(),
         // Bundles are non-critical: a failure must not break the page.
         listBundles().catch(() => [] as BundleEntry[]),
+        // Providers are non-critical for the same reason: a failure
+        // (e.g. a stale registry, an unreachable worker) must not
+        // prevent the Agents / Tools / Skills sections from
+        // rendering. The failure is logged for diagnostics.
+        listProviders().catch((err: ProviderApiRequestError) => {
+          console.warn(
+            "Provider list failed (non-fatal):",
+            err?.code || err?.message || err,
+          );
+          return [] as ProviderPackageEntry[];
+        }),
       ]);
       setAgents(ag || []);
       setTools(tl || []);
       setSkills(sk || []);
       setExtensions(ex || []);
       setBundles(bd || []);
+      setProviders(pv || []);
     } catch (err: any) {
       console.error("Failed to load store catalog:", err);
       showToast.error(
@@ -144,6 +165,8 @@ export function useStoreData(): StoreDataState {
     setExtensions,
     bundles,
     setBundles,
+    providers,
+    setProviders,
     loading,
     reload,
   };

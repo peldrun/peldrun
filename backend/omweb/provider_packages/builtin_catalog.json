@@ -1,0 +1,234 @@
+{
+  "schema_version": 1,
+  "description": "PELDRUN builtin Provider Package catalog. Every item below is currently PREVIEW-ONLY (no download_url and no checksum_sha256 published yet). Installable items require BOTH fields to be set. See catalog.py for the full installability rules.",
+  "items": [
+    {
+      "id": "openai-compatible-custom",
+      "name": "OpenAI-Compatible (Custom Endpoint)",
+      "display_name": "OpenAI-Compatible",
+      "description": "Connect any OpenAI-compatible endpoint (self-hosted, proxy, or third-party gateway) using the built-in openai_compat adapter. No code is shipped — only endpoint configuration and capability overrides.",
+      "version": "1.0.0",
+      "transport": "compatible",
+      "base_adapter": "openai_compat",
+      "features": {
+        "model_discovery": true,
+        "native_streaming": true,
+        "buffered_streaming": true,
+        "tool_calling": true,
+        "parallel_tool_calls": true,
+        "forced_tool_choice": true,
+        "vision": true,
+        "audio": false,
+        "structured_output": true,
+        "usage_reporting": true,
+        "reasoning": true
+      },
+      "permissions": {
+        "network": "connection_endpoint",
+        "secrets": ["connection.api_key"],
+        "workspace_access": false,
+        "shell_execute": false
+      },
+      "download_url": null,
+      "checksum_sha256": null,
+      "author": "PELDRUN",
+      "homepage": null,
+      "tags": ["openai-compatible", "custom-endpoint", "builtin"]
+    },
+    {
+      "id": "anthropic-compatible",
+      "name": "Anthropic Messages API (Compatible)",
+      "display_name": "Anthropic-Compatible",
+      "description": "Connect any provider that implements the Anthropic Messages API (Claude, Anthropic-compatible gateways, internal proxies) using the built-in anthropic adapter. No code is shipped.",
+      "version": "1.0.0",
+      "transport": "compatible",
+      "base_adapter": "anthropic",
+      "features": {
+        "model_discovery": true,
+        "native_streaming": true,
+        "buffered_streaming": true,
+        "tool_calling": true,
+        "parallel_tool_calls": true,
+        "forced_tool_choice": true,
+        "vision": true,
+        "audio": false,
+        "structured_output": false,
+        "usage_reporting": true,
+        "reasoning": true
+      },
+      "permissions": {
+        "network": "connection_endpoint",
+        "secrets": ["connection.api_key"],
+        "workspace_access": false,
+        "shell_execute": false
+      },
+      "download_url": null,
+      "checksum_sha256": null,
+      "author": "PELDRUN",
+      "homepage": null,
+      "tags": ["anthropic", "claude", "messages-api", "builtin"]
+    },
+    {
+      "id": "ollama-native",
+      "name": "Ollama (Native)",
+      "display_name": "Ollama",
+      "description": "Talk to a local Ollama server via its native /api/chat endpoint, with full support for thinking, tool calling, vision, and streaming.",
+      "version": "1.0.0",
+      "transport": "compatible",
+      "base_adapter": "ollama_native",
+      "features": {
+        "model_discovery": true,
+        "native_streaming": true,
+        "buffered_streaming": true,
+        "tool_calling": true,
+        "parallel_tool_calls": true,
+        "forced_tool_choice": false,
+        "vision": true,
+        "audio": false,
+        "structured_output": false,
+        "usage_reporting": true,
+        "reasoning": true
+      },
+      "permissions": {
+        "network": "connection_endpoint",
+        "secrets": [],
+        "workspace_access": false,
+        "shell_execute": false
+      },
+      "download_url": null,
+      "checksum_sha256": null,
+      "author": "PELDRUN",
+      "homepage": null,
+      "tags": ["ollama", "local", "builtin"]
+    },
+    {
+      "id": "lmstudio-native",
+      "name": "LM Studio (Native)",
+      "display_name": "LM Studio",
+      "description": "Talk to a local LM Studio server via its native /api/v0 endpoint, with precise stats, reasoning field, and full streaming support.",
+      "version": "1.0.0",
+      "transport": "compatible",
+      "base_adapter": "lmstudio_native",
+      "features": {
+        "model_discovery": true,
+        "native_streaming": true,
+        "buffered_streaming": true,
+        "tool_calling": true,
+        "parallel_tool_calls": true,
+        "forced_tool_choice": true,
+        "vision": true,
+        "audio": false,
+        "structured_output": true,
+        "usage_reporting": true,
+        "reasoning": true
+      },
+      "permissions": {
+        "network": "connection_endpoint",
+        "secrets": [],
+        "workspace_access": false,
+        "shell_execute": false
+      },
+      "download_url": null,
+      "checksum_sha256": null,
+      "author": "PELDRUN",
+      "homepage": null,
+      "tags": ["lmstudio", "local", "builtin"]
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "display_name": "DeepSeek",
+      "description": "Native DeepSeek adapter for the DeepSeek API, including reasoning support for deepseek-reasoner models.",
+      "version": "1.0.0",
+      "transport": "native",
+      "features": {
+        "model_discovery": true,
+        "native_streaming": true,
+        "buffered_streaming": true,
+        "tool_calling": true,
+        "parallel_tool_calls": true,
+        "forced_tool_choice": true,
+        "vision": false,
+        "audio": false,
+        "structured_output": true,
+        "usage_reporting": true,
+        "reasoning": true
+      },
+      "permissions": {
+        "network": "connection_endpoint",
+        "secrets": ["connection.api_key"],
+        "workspace_access": false,
+        "shell_execute": false
+      },
+      "download_url": null,
+      "checksum_sha256": null,
+      "author": "community",
+      "homepage": "https://api-docs.deepseek.com",
+      "tags": ["deepseek", "cloud", "community"]
+    },
+    {
+      "id": "mistral",
+      "name": "Mistral AI",
+      "display_name": "Mistral",
+      "description": "Native Mistral AI adapter covering the full Mistral model family, with tool calling and structured output support.",
+      "version": "1.0.0",
+      "transport": "native",
+      "features": {
+        "model_discovery": true,
+        "native_streaming": true,
+        "buffered_streaming": true,
+        "tool_calling": true,
+        "parallel_tool_calls": true,
+        "forced_tool_choice": true,
+        "vision": true,
+        "audio": false,
+        "structured_output": true,
+        "usage_reporting": true,
+        "reasoning": false
+      },
+      "permissions": {
+        "network": "connection_endpoint",
+        "secrets": ["connection.api_key"],
+        "workspace_access": false,
+        "shell_execute": false
+      },
+      "download_url": null,
+      "checksum_sha256": null,
+      "author": "community",
+      "homepage": "https://docs.mistral.ai",
+      "tags": ["mistral", "cloud", "community"]
+    },
+    {
+      "id": "groq",
+      "name": "Groq",
+      "display_name": "Groq",
+      "description": "Native Groq adapter for extremely fast inference on the Groq LPU cloud. Includes streaming and tool calling.",
+      "version": "1.0.0",
+      "transport": "native",
+      "features": {
+        "model_discovery": true,
+        "native_streaming": true,
+        "buffered_streaming": true,
+        "tool_calling": true,
+        "parallel_tool_calls": true,
+        "forced_tool_choice": true,
+        "vision": false,
+        "audio": false,
+        "structured_output": true,
+        "usage_reporting": true,
+        "reasoning": false
+      },
+      "permissions": {
+        "network": "connection_endpoint",
+        "secrets": ["connection.api_key"],
+        "workspace_access": false,
+        "shell_execute": false
+      },
+      "download_url": null,
+      "checksum_sha256": null,
+      "author": "community",
+      "homepage": "https://console.groq.com/docs",
+      "tags": ["groq", "cloud", "community"]
+    }
+  ]
+}

@@ -140,19 +140,23 @@ export function ResourceDashboard() {
   };
 
   return (
-    <div className="space-y-5">
+
+
+    <div className="ResourceMonitor bg-setbg w-full">
       {/* Header */}
-      <motion.div
+
+      <div className="header p-[15px] border border-b bg-slate-900 ">
+            <motion.div
         initial={{ opacity: 0, y: -8 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.35, ease: [0.16, 1, 0.3, 1] }}
         className="flex flex-wrap items-start justify-between gap-3"
       >
         <div>
-          <h1 className="text-xl font-semibold tracking-tight text-slate-900 dark:text-slate-50">
+          <h1 className="text-xl font-semibold tracking-tight text-slate-50">
             Resource Monitor
           </h1>
-          <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+          <p className="mt-0.5 text-xs text-slate-100">
             Live hardware telemetry, process tree tracking, and execution attribution
           </p>
         </div>
@@ -161,7 +165,8 @@ export function ResourceDashboard() {
             type="button"
             onClick={handleManualRefresh}
             disabled={isRefreshing}
-            className="group inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white/60 dark:bg-slate-900/60 px-3 py-1.5 text-sm font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50 transition-colors"
+            className="group inline-flex items-center gap-1.5 rounded-md border border-slate-800
+               bg-black px-3 py-1.5 text-sm font-medium text-slate-50 dark:text-slate-300 hover:bg-slate-950  disabled:opacity-50 transition-colors"
           >
             <RefreshCw
               className={cn('h-3.5 w-3.5', isRefreshing && 'animate-spin')}
@@ -173,30 +178,42 @@ export function ResourceDashboard() {
             type="button"
             onClick={() => setSettingsOpen(true)}
             disabled={!settings}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white/60 dark:bg-slate-900/60 px-3 py-1.5 text-sm font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50 transition-colors"
+            className="group inline-flex items-center gap-1.5 rounded-md border border-slate-800
+               bg-rb px-3 py-1.5 text-sm font-medium text-slate-50 dark:text-slate-300 hover:bg-rb/80   disabled:opacity-50 transition-colors"
           >
             <SettingsIcon className="h-3.5 w-3.5" strokeWidth={2.2} />
             Settings
           </button>
         </div>
       </motion.div>
+      </div>
+
+
+
+
+    <div className="space-y-5 max-w-7xl m-auto  sm:px-6 lg:px-8  px-4 py-6">
+
+
+    <div className="new p-b-3">
 
       {/* Error banner */}
-      <AnimatePresence>
-        {currentError && (
-          <motion.div
-            initial={{ opacity: 0, height: 0 }}
-            animate={{ opacity: 1, height: 'auto' }}
-            exit={{ opacity: 0, height: 0 }}
-            className="overflow-hidden"
-          >
-            <div className="flex items-start gap-2 rounded-lg border border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-950/30 px-4 py-2.5 text-sm text-red-700 dark:text-red-300">
-              <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" strokeWidth={2.2} />
-              <span>Failed to fetch live telemetry: {currentError.message}</span>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      <div className="p-2 mb-[15px] mt-[15px]">
+          <AnimatePresence>
+            {currentError && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: 'auto' }}
+                exit={{ opacity: 0, height: 0 }}
+                className="overflow-hidden"
+              >
+                <div className="flex items-start gap-2 rounded-lg border border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-950/30 px-4 py-2.5 text-sm text-red-700 dark:text-red-300">
+                  <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" strokeWidth={2.2} />
+                  <span>Failed to fetch live telemetry: {currentError.message}</span>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+      </div>
 
       {/* Diagnostic alerts */}
       <DiagnosticsAlertBanner events={visibleDiagnostics} onDismiss={handleDismissAlert} />
@@ -205,8 +222,8 @@ export function ResourceDashboard() {
       <HostOverviewCards snapshot={snapshot} isLoading={currentLoading} />
 
       {/* Tabs */}
-      <div className="border-b border-slate-200 dark:border-slate-800">
-        <nav className="-mb-px flex gap-1" aria-label="Resource Monitor Sections">
+      <div className="mt-[25px] pb-[15px] border-b border-slate-200 dark:border-slate-800 ">
+        <nav className="mb-px flex gap-1" aria-label="Resource Monitor Sections">
           {TABS.map((tab) => {
             const active = activeTab === tab.key;
             const Icon = tab.icon;
@@ -242,6 +259,7 @@ export function ResourceDashboard() {
           })}
         </nav>
       </div>
+
 
       {/* Tab content */}
       <AnimatePresence mode="wait">
@@ -297,6 +315,8 @@ export function ResourceDashboard() {
         onClose={() => setSettingsOpen(false)}
         onSave={handleSaveSettings}
       />
+    </div>
+     </div>
     </div>
   );
 }

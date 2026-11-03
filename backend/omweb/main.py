@@ -14,6 +14,7 @@ Initializes middleware, static files, and canonical REST routers:
 - /api/storage
 - /api/store
 - /api/store/tools/bundles (Tool Bundles Subsystem)
+- /api/store/providers (Provider Packages Subsystem — M9)
 - /api/telemetry (P1-03D Canonical Analytics & Metering APIs)
 - /api/source-control (Source Control Integration: providers,
   repositories, workspaces, approvals, operations, audit)
@@ -81,6 +82,13 @@ from omweb.routers import (
 
 # Tool Bundles Subsystem router
 from omweb.routers.store import bundles as store_bundles
+
+# Provider Packages Subsystem router (M9 administrative layer).
+#
+# Exposes /api/store/providers/* — list, upload, catalog, enable,
+# disable, activate, uninstall, health. The router itself is stateless;
+# all lifecycle state lives in storage/store/providers/.
+from omweb.routers.store import providers as store_providers
 
 # Attach the bundle manager to the tool registry so installed bundles
 # are discoverable by the agent runtime.
@@ -248,6 +256,68 @@ async def lifespan(app: FastAPI):
             exc_info=True,
         )
 
+    # 3. Discover Provider Packages installed as pip entry points.
+    #
+    # Idempotent and never raises — a discovery failure must not block
+    # startup, because the built-in adapters are registered at import
+    # time regardless of what discovery finds. M9-installed packages
+    # in isolated venvs are NOT discovered here — they are registered
+    # in step 4 below.
+    try:
+        from peldrun.llm.providers import (
+            ensure_external_providers_discovered,
+        )
+
+        _discovered = ensure_external_providers_discovered()
+        if _discovered:
+            logger.info(
+                "Discovered %d external provider package(s) on startup.",
+                _discovered,
+            )
+    except Exception as exc:
+        logger.warning(
+            "External provider discovery failed on startup "
+            "(non-fatal): %s",
+            exc,
+        )
+
+    # 4. Register installed Provider Packages as runtime adapters.
+    #
+    # Every enabled package from /api/store/providers gets a
+    # registration in provider_registry under its canonical ID, with
+    # PluginProviderAdapter as the adapter class and SOURCE_EXTERNAL
+    # as its source. After this runs, provider_factory.create(pkg_id,
+    # connection) returns a working adapter.
+    #
+    # For compatible packages: the adapter resolves to a built-in
+    # delegate (in-process, no worker). For native/custom packages:
+    # the adapter lazily spawns a worker subprocess on the first
+    # request (see WorkerSupervisor.start). Startup cost is therefore
+    # O(number of packages), not O(number of workers) — subprocess
+    # creation is deferred.
+    #
+    # Failures are logged at WARNING and never block startup, because
+    # a broken package must not prevent the backend from starting
+    # with its built-in providers intact.
+    try:
+        from peldrun.llm.providers.custom_plugin import (
+            ensure_plugin_providers_registered,
+        )
+
+        _plugins = ensure_plugin_providers_registered()
+        if _plugins:
+            logger.info(
+                "Registered %d provider package(s) as runtime adapters.",
+                _plugins,
+            )
+    except Exception as exc:
+        logger.warning(
+            "Provider package registration failed on startup "
+            "(non-fatal): %s",
+            exc,
+            exc_info=True,
+        )
+
     yield
 
     # 1. Terminate active MCP subprocesses BEFORE anything else.
@@ -382,6 +452,34 @@ app.include_router(
     store_bundles.router,
     prefix="/api/store/tools",
     tags=["store", "bundles"],
+)
+# Provider Packages Subsystem (M9).
+#
+# The router internally declares paths as `/`, `/catalog`, `/upload`,
+# `/{provider_id}`, etc. FastAPI matches in registration order, so
+# mounting at the literal prefix `/api/store/providers` gives us:
+#
+#     GET    /api/store/providers
+#     GET    /api/store/providers/catalog
+#     GET    /api/store/providers/catalog/{item_id}
+#     POST   /api/store/providers/catalog/refresh
+#     POST   /api/store/providers/upload
+#     POST   /api/store/providers/{provider_id}/install-from-catalog
+#     GET    /api/store/providers/{provider_id}
+#     DELETE /api/store/providers/{provider_id}
+#     POST   /api/store/providers/{provider_id}/enable
+#     POST   /api/store/providers/{provider_id}/disable
+#     POST   /api/store/providers/{provider_id}/activate
+#     GET    /api/store/providers/{provider_id}/health
+#
+# The provider package subsystem manages external LLM provider adapters
+# loaded from ZIP archives or the built-in catalog. It is entirely
+# disjoint from the tool bundle subsystem above — the two share only
+# the `/api/store` namespace for UI grouping.
+app.include_router(
+    store_providers.router,
+    prefix="/api/store/providers",
+    tags=["store", "providers"],
 )
 app.include_router(
     skills_rtr.router,
