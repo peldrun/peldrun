@@ -69,6 +69,18 @@ export interface ProvidersSectionProps {
    */
   onOpenConfigure: (providerId: string) => void;
 
+  // ── Certificate Manager modal ─────────────────────────────────
+  /**
+   * Called when the user clicks "Certificates" on a provider card.
+   * Opens the CertificateManagerModal, which shows the TLS
+   * certificates the package declares and offers a one-click
+   * install flow.
+   *
+   * Only rendered by cards whose ``has_certificates`` field is true
+   * — packages that do not declare certificates never trigger this.
+   */
+  onManageCertificates: (providerId: string) => void;
+
   // ── Upload modal trigger ──────────────────────────────────────
   onOpenUpload: () => void;
 }
@@ -358,6 +370,7 @@ export function ProvidersSection({
   onActivateVersion,
   onOpenDetails,
   onOpenConfigure,
+  onManageCertificates,
   onOpenUpload,
 }: ProvidersSectionProps) {
   const [activeTab, setActiveTab] = useState<TabId>("installed");
@@ -506,6 +519,7 @@ export function ProvidersSection({
                   onDelete={onDeleteProvider}
                   onDetails={onOpenDetails}
                   onConfigure={onOpenConfigure}
+                  onManageCertificates={onManageCertificates}
                   onActivateVersion={onActivateVersion}
                 />
               ))}

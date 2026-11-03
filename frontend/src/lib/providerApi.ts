@@ -26,8 +26,10 @@
  */
 
 import type {
+  CertificateStatusReport,
   ProviderApiError,
   ProviderCatalogItem,
+  ProviderCertificateRecord,
   ProviderConnection,
   ProviderDetailResponse,
   ProviderHealthReport,
@@ -757,6 +759,183 @@ export async function testConnection(
     latency_ms: Number(data.latency_ms) || 0,
     code: data.code ?? null,
     status_code: data.status_code ?? null,
+  };
+}
+
+
+// ===========================================================================
+// TLS certificates (M9/M11)
+// ===========================================================================
+//
+// A Provider Package can declare one or more TLS certificates it
+// requires on the host (root CA bundles, mTLS client certificates).
+// The Certificate Manager UI uses these endpoints to offer a
+// one-click "Download & Install" flow.
+//
+// Installation happens in the MAIN backend process (not the worker
+// subprocess) because the worker's network allowlist restricts
+// outbound requests to the connection's ``base_url`` host. The CA
+// host is different from the provider endpoint, so only the main
+// process can reach it. See ``certificate_manager.py`` for details.
+
+/**
+ * List every certificate declared by a package's active manifest,
+ * with its reconciled status.
+ *
+ * Status is reconciled live against the filesystem, so a user who
+ * manually deleted the CA file will see ``missing`` here without
+ * needing to click Test.
+ *
+ * The response contains one entry per declared certificate — even
+ * those never installed (status ``pending``).
+ */
+export async function listCertificates(
+  providerId: string,
+): Promise<CertificateStatusReport[]> {
+  const data = await request<{
+    status: string;
+    provider_id: string;
+    certificates: CertificateStatusReport[];
+    total: number;
+  }>(`/${encodeURIComponent(providerId)}/certificates`);
+
+  return Array.isArray(data.certificates) ? data.certificates : [];
+}
+
+/**
+ * Options for ``installCertificate``.
+ *
+ * Both fields are optional — passing ``{}`` (or omitting the arg
+ * entirely) uses the package's declared defaults.
+ */
+export interface InstallCertificateOptions {
+  /**
+   * Absolute path override for the installed file. When ``undefined``
+   * or ``null``, the backend uses ``CertificateSpec.default_destination``
+   * or a managed path under the provider's storage directory.
+   */
+  destination?: string | null;
+
+  /**
+   * When ``false``, an existing file at the destination causes a
+   * conflict error instead of being overwritten. Default ``true``.
+   */
+  allow_overwrite?: boolean;
+}
+
+/**
+ * Download, verify, and install a certificate.
+ *
+ * Returns the saved vault record plus a fresh status report. The
+ * status report may be ``null`` if the post-install verification
+ * failed (rare; a subsequent ``testCertificate`` call will retry).
+ */
+export async function installCertificate(
+  providerId: string,
+  certificateId: string,
+  options?: InstallCertificateOptions,
+): Promise<{
+  record: ProviderCertificateRecord;
+  statusReport: CertificateStatusReport | null;
+}> {
+  const body = {
+    destination: options?.destination ?? null,
+    allow_overwrite: options?.allow_overwrite ?? true,
+  };
+
+  const data = await request<{
+    status: string;
+    provider_id: string;
+    certificate_id: string;
+    record: ProviderCertificateRecord;
+    status_report: CertificateStatusReport | null;
+  }>(
+    `/${encodeURIComponent(providerId)}/certificates/${encodeURIComponent(certificateId)}/install`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+
+  if (!data.record) {
+    throw new ProviderApiRequestError(
+      "Install-certificate response was missing the record object.",
+      "INVALID_RESPONSE",
+      {},
+      200,
+    );
+  }
+
+  return {
+    record: data.record,
+    statusReport: data.status_report ?? null,
+  };
+}
+
+/**
+ * Re-check the status of an installed certificate without
+ * re-downloading.
+ *
+ * Updates the vault record's status and ``last_checked_at`` fields,
+ * then returns the full status report. Used by the UI's "Test"
+ * button in the Certificate Manager modal.
+ */
+export async function testCertificate(
+  providerId: string,
+  certificateId: string,
+): Promise<CertificateStatusReport> {
+  const data = await request<{
+    status: string;
+    provider_id: string;
+    certificate_id: string;
+    status_report: CertificateStatusReport;
+  }>(
+    `/${encodeURIComponent(providerId)}/certificates/${encodeURIComponent(certificateId)}/test`,
+    { method: "POST" },
+  );
+
+  if (!data.status_report) {
+    throw new ProviderApiRequestError(
+      "Test-certificate response was missing the status report.",
+      "INVALID_RESPONSE",
+      {},
+      200,
+    );
+  }
+  return data.status_report;
+}
+
+/**
+ * Delete a certificate record and (optionally) its file from disk.
+ *
+ * Idempotent: deleting a certificate that was never installed returns
+ * ``removed: false`` without error.
+ */
+export async function deleteCertificate(
+  providerId: string,
+  certificateId: string,
+  deleteFile: boolean = true,
+): Promise<{
+  provider_id: string;
+  certificate_id: string;
+  removed: boolean;
+}> {
+  const suffix = deleteFile ? "" : "?delete_file=false";
+  const data = await request<{
+    status: string;
+    provider_id: string;
+    certificate_id: string;
+    removed: boolean;
+  }>(
+    `/${encodeURIComponent(providerId)}/certificates/${encodeURIComponent(certificateId)}${suffix}`,
+    { method: "DELETE" },
+  );
+
+  return {
+    provider_id: data.provider_id ?? providerId,
+    certificate_id: data.certificate_id ?? certificateId,
+    removed: Boolean(data.removed),
   };
 }
 

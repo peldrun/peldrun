@@ -101,8 +101,12 @@ from omweb.provider_packages.errors import (
 from omweb.provider_packages.package_manager import (
     provider_package_manager,
 )
+from omweb.provider_packages.certificate_manager import (
+    certificate_manager,
+)
 from omweb.provider_packages.schema import (
     MANIFEST_FILENAME,
+    CertificateSpec,
     ProviderPackageEntry,
 )
 
@@ -238,6 +242,225 @@ def _describe_catalog_permissions(
 
 
 # ---------------------------------------------------------------------------
+# Certificate helpers
+# ---------------------------------------------------------------------------
+
+
+def _extract_certificate_specs(
+    manifest: Optional[Dict[str, Any]],
+) -> List[CertificateSpec]:
+    """
+    Extract and validate the ``CertificateSpec`` entries from a raw
+    ``manifest.json`` dict.
+
+    The manifest was already validated at install time, so every entry
+    SHOULD parse cleanly. This helper still logs and skips malformed
+    entries — a single broken spec must not break the entire listing
+    endpoint. The skip is a defense-in-depth measure against a
+    hand-edited manifest or a corrupted file.
+    """
+    if not isinstance(manifest, dict):
+        return []
+
+    raw_certs = manifest.get("certificates")
+    if not isinstance(raw_certs, list):
+        return []
+
+    result: List[CertificateSpec] = []
+    for raw in raw_certs:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            result.append(CertificateSpec.model_validate(raw))
+        except Exception as exc:
+            logger.warning(
+                "Skipping invalid certificate spec in manifest: %s", exc
+            )
+    return result
+
+
+def _get_certificate_spec_or_404(
+    provider_id: str,
+    certificate_id: str,
+) -> CertificateSpec:
+    """
+    Return the ``CertificateSpec`` declared by a package's active
+    manifest for the given ``certificate_id``, or raise an
+    ``HTTPException``.
+
+    Raises
+    ------
+    HTTPException(404)
+        When the package is not installed, the manifest is unreadable,
+        or the certificate id is not declared by the manifest.
+    """
+    entry = provider_package_manager.get_package(provider_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": (
+                    f"Provider package '{provider_id}' is not installed."
+                ),
+                "code": "PROVIDER_PACKAGE_NOT_FOUND",
+                "details": {"provider_id": provider_id},
+            },
+        )
+
+    manifest = _try_read_manifest(provider_id, entry.active_version)
+    if manifest is None:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": (
+                    f"Could not read manifest.json for "
+                    f"'{provider_id}' v{entry.active_version}."
+                ),
+                "code": "PROVIDER_PACKAGE_MANIFEST_UNREADABLE",
+                "details": {
+                    "provider_id": provider_id,
+                    "version": entry.active_version,
+                },
+            },
+        )
+
+    specs = _extract_certificate_specs(manifest)
+    for spec in specs:
+        if spec.id == certificate_id:
+            return spec
+
+    raise HTTPException(
+        status_code=404,
+        detail={
+            "error": (
+                f"Certificate '{certificate_id}' is not declared by "
+                f"provider '{provider_id}'."
+            ),
+            "code": "PROVIDER_CERTIFICATE_NOT_FOUND",
+            "details": {
+                "provider_id": provider_id,
+                "certificate_id": certificate_id,
+                "declared_certificates": [s.id for s in specs],
+            },
+        },
+    )
+
+
+def _compute_certificate_summary(
+    provider_id: str,
+    specs: List[CertificateSpec],
+) -> tuple[bool, str]:
+    """
+    Compute the aggregate certificate status for the store card badge.
+
+    Reads the certificate vault (cheap, no filesystem access beyond a
+    single ``is_file()`` per required certificate) and decides:
+
+        * ``none_required``  — the package declares no certificates.
+        * ``all_installed``  — every REQUIRED certificate has a record
+                               with status ``installed`` AND the file
+                               is still present on disk.
+        * ``some_missing``   — at least one REQUIRED certificate is
+                               missing, invalid, pending, or its file
+                               was deleted manually.
+        * ``unknown``        — unexpected state (should be rare).
+
+    Unlike ``certificate_manager.check_status()``, this helper does
+    NOT write to the vault. The list endpoint is called on every page
+    load, so it must be free of side effects. Full reconciliation
+    happens on demand via ``GET /{id}/certificates`` (which calls
+    ``check_status`` per certificate).
+    """
+    if not specs:
+        return (False, "none_required")
+
+    required_specs = [s for s in specs if s.required]
+    if not required_specs:
+        # Only optional certificates are declared — nothing to block on.
+        return (True, "all_installed")
+
+    try:
+        records_list = certificate_manager.list_records(provider_id)
+    except Exception as exc:
+        logger.warning(
+            "Could not read certificate records for %r: %s",
+            provider_id,
+            exc,
+        )
+        return (True, "unknown")
+
+    records_by_id = {r.certificate_id: r for r in records_list}
+
+    for spec in required_specs:
+        record = records_by_id.get(spec.id)
+        if record is None:
+            return (True, "some_missing")
+        if record.status != "installed":
+            return (True, "some_missing")
+
+        # Defense-in-depth: verify the file is still present. A user
+        # who deleted the file manually must see "missing" here, not
+        # a false green badge.
+        if not record.installed_path:
+            return (True, "some_missing")
+        try:
+            if not Path(record.installed_path).is_file():
+                return (True, "some_missing")
+        except Exception:
+            return (True, "some_missing")
+
+    return (True, "all_installed")
+
+
+def _enrich_entry_with_certificate_status(
+    entry: ProviderPackageEntry,
+) -> Dict[str, Any]:
+    """
+    Serialize a registry entry with the two certificate-status fields
+    the store card needs.
+
+    The base registry entry stores only what was known at install time
+    (name, description, features, ...). It does NOT carry the live
+    certificate status because that depends on the filesystem and can
+    change without touching the registry.
+
+    This helper reads the on-disk ``manifest.json`` to discover the
+    declared certificates, then delegates to
+    ``_compute_certificate_summary`` for the aggregate status.
+
+    Two new keys are added to the serialized dict:
+
+        * ``has_certificates``   — boolean or null (null when the
+                                   manifest could not be read).
+        * ``certificates_status`` — one of ``none_required``,
+                                    ``all_installed``, ``some_missing``,
+                                    ``unknown``.
+
+    Packages that do not declare certificates get ``has_certificates:
+    False`` and ``certificates_status: "none_required"`` — the card
+    will not render a certificate badge or button for them.
+    """
+    entry_dict = entry.model_dump()
+
+    manifest = _try_read_manifest(entry.id, entry.active_version)
+    if manifest is None:
+        # Manifest unreadable — cannot determine certificate state.
+        # Treat as "unknown" so the UI shows a neutral state rather
+        # than a misleading green or amber badge.
+        entry_dict["has_certificates"] = None
+        entry_dict["certificates_status"] = "unknown"
+        return entry_dict
+
+    specs = _extract_certificate_specs(manifest)
+    has_certs, cert_status = _compute_certificate_summary(
+        entry.id, specs
+    )
+    entry_dict["has_certificates"] = has_certs
+    entry_dict["certificates_status"] = cert_status
+    return entry_dict
+
+
+# ---------------------------------------------------------------------------
 # Request models
 # ---------------------------------------------------------------------------
 
@@ -249,6 +472,31 @@ class ActivateVersionRequest(BaseModel):
         ...,
         min_length=1,
         description="The previously installed version to activate.",
+    )
+
+
+class InstallCertificateRequest(BaseModel):
+    """
+    Body for ``POST /{provider_id}/certificates/{certificate_id}/install``.
+
+    Both fields are optional — sending an empty body is valid and uses
+    the package's declared defaults.
+    """
+
+    destination: Optional[str] = Field(
+        default=None,
+        description=(
+            "Absolute path override for the installed file. When "
+            "None, the manager uses CertificateSpec.default_destination, "
+            "or a managed path under the provider's storage directory."
+        ),
+    )
+    allow_overwrite: bool = Field(
+        default=True,
+        description=(
+            "When false, an existing file at the destination causes a "
+            "conflict error instead of being overwritten."
+        ),
     )
 
 
@@ -276,10 +524,13 @@ async def list_installed_providers(
     entries = provider_package_manager.list_packages(
         enabled_only=enabled_only
     )
+    providers = [
+        _enrich_entry_with_certificate_status(e) for e in entries
+    ]
     return {
         "status": "ok",
-        "providers": [_entry_to_dict(e) for e in entries],
-        "total": len(entries),
+        "providers": providers,
+        "total": len(providers),
     }
 
 
@@ -586,7 +837,7 @@ async def get_provider_detail(
 
     response: Dict[str, Any] = {
         "status": "ok",
-        "provider": _entry_to_dict(entry),
+        "provider": _enrich_entry_with_certificate_status(entry),
     }
 
     if include_manifest:
@@ -745,6 +996,294 @@ async def get_provider_health(provider_id: str) -> Dict[str, Any]:
         )
 
     return {"status": "ok", "health": report.model_dump()}
+
+
+# ---------------------------------------------------------------------------
+# Certificates — install, verify, list, delete
+# ---------------------------------------------------------------------------
+#
+# Certificates are declared by the package's manifest
+# (``ProviderManifest.certificates``). The Certificate Manager UI opens
+# a dedicated modal per package that offers:
+#
+#   * List: all declared certs with their current status.
+#   * Install: download + verify + write to disk (one click).
+#   * Test: re-check status without re-downloading.
+#   * Delete: remove the file and the record.
+#
+# Installation happens in the MAIN backend process (not the worker
+# subprocess), because the worker's network allowlist restricts
+# outbound requests to the connection's ``base_url`` host. The CA host
+# is a different host, so the download must happen outside the worker.
+# See ``certificate_manager.py`` for the full rationale.
+
+
+@router.get("/{provider_id}/certificates")
+async def list_provider_certificates(
+    provider_id: str,
+) -> Dict[str, Any]:
+    """
+    Return every certificate declared by a package's active manifest,
+    with its current status.
+
+    Status is reconciled live against the filesystem, so a user who
+    manually deleted the CA file will see ``missing`` here without
+    needing to click Test.
+
+    The response contains one entry per declared certificate — even
+    those that have never been installed. A never-installed certificate
+    appears with status ``pending``.
+    """
+    entry = provider_package_manager.get_package(provider_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": (
+                    f"Provider package '{provider_id}' is not installed."
+                ),
+                "code": "PROVIDER_PACKAGE_NOT_FOUND",
+                "details": {"provider_id": provider_id},
+            },
+        )
+
+    manifest = _try_read_manifest(provider_id, entry.active_version)
+    specs = _extract_certificate_specs(manifest)
+
+    reports: List[Dict[str, Any]] = []
+    for spec in specs:
+        try:
+            report = await certificate_manager.check_status(
+                provider_id, spec
+            )
+            reports.append(report.to_dict())
+        except Exception as exc:
+            # A failure to check one certificate must not fail the
+            # whole endpoint — the UI still needs to show the others.
+            logger.warning(
+                "Status check failed for certificate %r/%r: %s",
+                provider_id,
+                spec.id,
+                exc,
+            )
+            reports.append({
+                "provider_id": provider_id,
+                "certificate_id": spec.id,
+                "display_name": spec.display_name,
+                "status": "invalid",
+                "error_message": f"Status check failed: {exc}",
+                "required": spec.required,
+                "download_url": spec.download_url,
+                "docs_url": spec.docs_url,
+                "installed_path": None,
+                "expected_sha256": spec.download_sha256,
+                "actual_sha256": None,
+                "size_bytes": 0,
+                "installed_at": None,
+                "last_checked_at": None,
+            })
+
+    return {
+        "status": "ok",
+        "provider_id": provider_id,
+        "certificates": reports,
+        "total": len(reports),
+    }
+
+
+@router.post("/{provider_id}/certificates/{certificate_id}/install")
+async def install_provider_certificate(
+    provider_id: str,
+    certificate_id: str,
+    body: Optional[InstallCertificateRequest] = None,
+) -> Dict[str, Any]:
+    """
+    Download, verify, and install a certificate.
+
+    Sending an empty body is valid — the package's declared defaults
+    are used. A non-empty body may override ``destination`` (useful for
+    operators who want the CA at ``/etc/ssl/certs/...``) and
+    ``allow_overwrite``.
+
+    Returns the saved vault record plus a fresh status report, so the
+    UI can update the card and the modal without a second round-trip.
+    """
+    spec = _get_certificate_spec_or_404(provider_id, certificate_id)
+
+    # Convert the optional destination string to a Path. Reject
+    # relative paths — the caller must be explicit, since the resolved
+    # path depends on the backend's CWD otherwise.
+    destination: Optional[Path] = None
+    if body and body.destination:
+        candidate = Path(body.destination)
+        if not candidate.is_absolute():
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": (
+                        "destination must be an absolute path when "
+                        "provided."
+                    ),
+                    "code": "PROVIDER_CERTIFICATE_INVALID_DESTINATION",
+                    "details": {"destination": body.destination},
+                },
+            )
+        destination = candidate
+
+    allow_overwrite = body.allow_overwrite if body else True
+
+    try:
+        record = await certificate_manager.install(
+            provider_id=provider_id,
+            spec=spec,
+            destination=destination,
+            allow_overwrite=allow_overwrite,
+        )
+    except ProviderPackageError as exc:
+        logger.info(
+            "Certificate install failed for %r/%r: %s (%s)",
+            provider_id,
+            certificate_id,
+            exc.message,
+            exc.code,
+        )
+        raise _to_http_exception(exc)
+    except Exception as exc:
+        logger.exception(
+            "Unexpected certificate install error for %r/%r",
+            provider_id,
+            certificate_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": (
+                    f"Unexpected certificate install failure: {exc}"
+                ),
+                "code": "PROVIDER_CERTIFICATE_INSTALL_FAILED",
+                "details": {"exception_type": type(exc).__name__},
+            },
+        )
+
+    # Best-effort fresh status — if this fails, return the record
+    # alone rather than fail the endpoint.
+    try:
+        report = await certificate_manager.check_status(
+            provider_id, spec
+        )
+        status_report: Optional[Dict[str, Any]] = report.to_dict()
+    except Exception as exc:
+        logger.warning(
+            "Post-install status check failed for %r/%r: %s",
+            provider_id,
+            certificate_id,
+            exc,
+        )
+        status_report = None
+
+    return {
+        "status": "ok",
+        "provider_id": provider_id,
+        "certificate_id": certificate_id,
+        "record": record.model_dump(),
+        "status_report": status_report,
+    }
+
+
+@router.post("/{provider_id}/certificates/{certificate_id}/test")
+async def test_provider_certificate(
+    provider_id: str,
+    certificate_id: str,
+) -> Dict[str, Any]:
+    """
+    Re-check the status of a certificate without re-downloading.
+
+    Updates the vault record's ``status`` and ``last_checked_at``
+    fields, then returns the full status report. Used by the UI's
+    "Test" button in the Certificate Manager modal.
+    """
+    spec = _get_certificate_spec_or_404(provider_id, certificate_id)
+
+    try:
+        report = await certificate_manager.check_status(
+            provider_id, spec
+        )
+    except ProviderPackageError as exc:
+        raise _to_http_exception(exc)
+    except Exception as exc:
+        logger.exception(
+            "Unexpected certificate check error for %r/%r",
+            provider_id,
+            certificate_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": f"Status check failed: {exc}",
+                "code": "PROVIDER_CERTIFICATE_CHECK_FAILED",
+                "details": {"exception_type": type(exc).__name__},
+            },
+        )
+
+    return {
+        "status": "ok",
+        "provider_id": provider_id,
+        "certificate_id": certificate_id,
+        "status_report": report.to_dict(),
+    }
+
+
+@router.delete("/{provider_id}/certificates/{certificate_id}")
+async def delete_provider_certificate(
+    provider_id: str,
+    certificate_id: str,
+    delete_file: bool = Query(
+        True,
+        description=(
+            "When true (default), the installed file is also deleted "
+            "from disk. When false, only the vault record is removed "
+            "— useful for preserving a manually-installed certificate."
+        ),
+    ),
+) -> Dict[str, Any]:
+    """
+    Delete a certificate: the vault record, and optionally the file
+    on disk.
+
+    Idempotent — deleting a certificate that was never installed
+    returns ``removed: false`` without an error. The UI uses that
+    distinction to decide whether to show "Certificate removed" or
+    "Nothing to remove".
+    """
+    try:
+        removed = await certificate_manager.delete(
+            provider_id=provider_id,
+            certificate_id=certificate_id,
+            delete_file=delete_file,
+        )
+    except ProviderPackageError as exc:
+        raise _to_http_exception(exc)
+    except Exception as exc:
+        logger.exception(
+            "Unexpected certificate delete error for %r/%r",
+            provider_id,
+            certificate_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": f"Unexpected certificate delete failure: {exc}",
+                "code": "PROVIDER_CERTIFICATE_DELETE_FAILED",
+                "details": {"exception_type": type(exc).__name__},
+            },
+        )
+
+    return {
+        "status": "ok",
+        "provider_id": provider_id,
+        "certificate_id": certificate_id,
+        "removed": removed,
+    }
 
 
 __all__ = ["router"]

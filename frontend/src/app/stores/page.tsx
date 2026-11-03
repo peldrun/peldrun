@@ -60,6 +60,7 @@ import { MCPDetailDrawer } from "./_components/MCPDetailDrawer";
 import { ProviderUploadModal } from "./_modals/ProviderUploadModal";
 import { ProviderDetailsDrawer } from "./_modals/ProviderDetailsDrawer";
 import { ProviderConfigureModal } from "./_modals/ProviderConfigureModal";
+import { CertificateManagerModal } from "./_modals/CertificateManagerModal";
 
 /**
  * Store page orchestrator.
@@ -298,6 +299,9 @@ export default function StoresPage() {
                   }
                   onOpenDetails={providerActions.handleOpenDetails}
                   onOpenConfigure={providerActions.handleOpenConfigure}
+                  onManageCertificates={
+                    providerActions.handleOpenCertificateManager
+                  }
                   onOpenUpload={providerActions.handleOpenUpload}
                 />
               )}
@@ -497,6 +501,25 @@ export default function StoresPage() {
         onDisableConnection={providerActions.handleDisableConnection}
         onActivateConnection={providerActions.handleActivateConnection}
         onTestConnection={providerActions.handleTestConnection}
+      />
+
+      {/* Certificate manager modal.
+          Opened from the "Certificates" button on a provider card.
+          Only used by packages that declare certificates
+          (has_certificates === true). Packages without certificates
+          never trigger this modal. */}
+      <CertificateManagerModal
+        open={providerActions.isCertificateModalOpen}
+        provider={providerActions.certificateManagerProvider}
+        certificates={providerActions.certificates}
+        isLoading={providerActions.isLoadingCertificates}
+        error={providerActions.certificatesError}
+        actionId={providerActions.certificateActionId}
+        onClose={providerActions.handleCloseCertificateManager}
+        onRefresh={providerActions.handleRefreshCertificates}
+        onInstall={providerActions.handleInstallCertificate}
+        onTest={providerActions.handleTestCertificate}
+        onDelete={providerActions.handleDeleteCertificate}
       />
 
     </div>

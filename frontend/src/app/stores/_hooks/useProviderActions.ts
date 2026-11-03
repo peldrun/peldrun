@@ -49,6 +49,7 @@ import {
   activateConnection as apiActivateConnection,
   activateVersion as apiActivateVersion,
   createConnection as apiCreateConnection,
+  deleteCertificate as apiDeleteCertificate,
   deleteConnection as apiDeleteConnection,
   deleteProvider as apiDeleteProvider,
   disableConnection as apiDisableConnection,
@@ -58,10 +59,13 @@ import {
   formatProviderError,
   getProvider as apiGetProvider,
   getProviderHealth as apiGetProviderHealth,
+  installCertificate as apiInstallCertificate,
   installFromCatalog as apiInstallFromCatalog,
   listCatalog as apiListCatalog,
+  listCertificates as apiListCertificates,
   listConnections as apiListConnections,
   refreshCatalog as apiRefreshCatalog,
+  testCertificate as apiTestCertificate,
   testConnection as apiTestConnection,
   updateConnection as apiUpdateConnection,
   uploadProvider as apiUploadProvider,
@@ -69,6 +73,7 @@ import {
   type SaveConnectionPayload,
 } from "@/lib/providerApi";
 import type {
+  CertificateStatusReport,
   ProviderCatalogItem,
   ProviderConnection,
   ProviderHealthReport,
@@ -198,6 +203,52 @@ export interface UseProviderActionsResult {
     message: string;
     latency_ms: number;
   } | null>;
+
+  // ── Certificate Manager modal ─────────────────────────────────
+  //
+  // A separate modal from the connection modal, opened from a
+  // dedicated "Certificates" button on the provider card. It manages
+  // TLS certificates (root CA bundles, mTLS client certificates)
+  // declared by the package's manifest.
+  //
+  // Installation happens in the MAIN backend process (not the worker
+  // subprocess) because the worker's network allowlist restricts
+  // outbound requests to the connection's ``base_url`` host — the CA
+  // host is different. See ``certificate_manager.py``.
+
+  /**
+   * The provider package whose certificate manager is open, or
+   * ``null`` when the modal is closed.
+   */
+  certificateManagerProvider: ProviderPackageEntry | null;
+  isCertificateModalOpen: boolean;
+  handleOpenCertificateManager: (providerId: string) => void;
+  handleCloseCertificateManager: () => void;
+
+  /**
+   * The declared certificates with their reconciled status, for the
+   * currently open certificate manager.
+   */
+  certificates: CertificateStatusReport[];
+  isLoadingCertificates: boolean;
+  certificatesError: string | null;
+
+  /**
+   * Which certificate action is in flight, in
+   * ``"<action>:<cert_id>"`` format. ``null`` when nothing is running.
+   * The Certificate Manager modal uses this to show a spinner on the
+   * exact button that was clicked.
+   */
+  certificateActionId: string | null;
+
+  handleLoadCertificates: (providerId: string) => Promise<void>;
+  handleRefreshCertificates: () => Promise<void>;
+  handleInstallCertificate: (certificateId: string) => Promise<boolean>;
+  handleTestCertificate: (certificateId: string) => Promise<boolean>;
+  handleDeleteCertificate: (
+    certificateId: string,
+    deleteFile: boolean,
+  ) => Promise<boolean>;
 }
 
 
@@ -257,6 +308,20 @@ export function useProviderActions({
   const [connectionActionId, setConnectionActionId] = useState<string | null>(
     null,
   );
+
+  // ── Certificate Manager state ────────────────────────────────────
+  const [certificateManagerProvider, setCertificateManagerProvider] =
+    useState<ProviderPackageEntry | null>(null);
+  const [certificates, setCertificates] = useState<CertificateStatusReport[]>(
+    [],
+  );
+  const [isLoadingCertificates, setIsLoadingCertificates] = useState(false);
+  const [certificatesError, setCertificatesError] = useState<string | null>(
+    null,
+  );
+  const [certificateActionId, setCertificateActionId] = useState<
+    string | null
+  >(null);
 
   // ═══════════════════════════════════════════════════════════════════
   // List actions
@@ -844,6 +909,225 @@ export function useProviderActions({
   // Return
   // ═══════════════════════════════════════════════════════════════════
 
+  // ═══════════════════════════════════════════════════════════════════
+  // Certificate Manager
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Load every declared certificate for a package, with its current
+   * status.
+   *
+   * Called by ``handleOpenCertificateManager`` on modal open, and
+   * after every mutation. Never throws — a fetch failure sets
+   * ``certificatesError`` so the modal renders an inline error with
+   * a retry button.
+   */
+  const handleLoadCertificates = useCallback(
+    async (providerId: string) => {
+      setIsLoadingCertificates(true);
+      setCertificatesError(null);
+      try {
+        const list = await apiListCertificates(providerId);
+        setCertificates(list);
+      } catch (err) {
+        const message = formatProviderError(err);
+        setCertificatesError(message);
+        console.warn(
+          "[useProviderActions] Failed to load certificates for",
+          providerId,
+          ":",
+          err,
+        );
+      } finally {
+        setIsLoadingCertificates(false);
+      }
+    },
+    [],
+  );
+
+  /**
+   * Open the Certificate Manager modal for a provider package.
+   *
+   * Kicks off a background load of the declared certificates so the
+   * modal shows the current state as soon as it renders. The load is
+   * fire-and-forget — the modal handles ``isLoadingCertificates``.
+   */
+  const handleOpenCertificateManager = useCallback(
+    (providerId: string) => {
+      const provider = providers.find((p) => p.id === providerId);
+      if (!provider) {
+        showToast.error(
+          "Certificates Unavailable",
+          `Provider "${providerId}" not found.`,
+        );
+        return;
+      }
+      setCertificateManagerProvider(provider);
+      setCertificates([]);
+      setCertificatesError(null);
+      void handleLoadCertificates(providerId);
+    },
+    [providers, handleLoadCertificates],
+  );
+
+  const handleCloseCertificateManager = useCallback(() => {
+    if (certificateActionId !== null) return; // refuse to close mid-action
+    setCertificateManagerProvider(null);
+    setCertificates([]);
+    setCertificatesError(null);
+  }, [certificateActionId]);
+
+  /**
+   * Re-fetch the certificate list for the currently-open modal.
+   *
+   * Used by the "Refresh" button in the modal header. No-op when the
+   * modal is closed.
+   */
+  const handleRefreshCertificates = useCallback(async () => {
+    if (!certificateManagerProvider) return;
+    await handleLoadCertificates(certificateManagerProvider.id);
+  }, [certificateManagerProvider, handleLoadCertificates]);
+
+  /**
+   * Download, verify, and install a certificate.
+   *
+   * After success, reloads both the certificate list (to show the new
+   * status) and the provider list (to update the card's
+   * ``certificates_status`` badge).
+   */
+  const handleInstallCertificate = useCallback(
+    async (certificateId: string): Promise<boolean> => {
+      if (!certificateManagerProvider) return false;
+      const providerId = certificateManagerProvider.id;
+
+      setCertificateActionId(`install:${certificateId}`);
+      try {
+        await apiInstallCertificate(providerId, certificateId);
+        await handleLoadCertificates(providerId);
+        await reload();
+        showToast.success(
+          "Certificate Installed",
+          "The certificate is now installed on the host.",
+        );
+        return true;
+      } catch (err) {
+        showToast.error(
+          "Certificate Install Failed",
+          formatProviderError(err),
+        );
+        // Reload anyway — a failed install leaves a "missing" or
+        // "invalid" record in the vault that the user needs to see.
+        await handleLoadCertificates(providerId);
+        return false;
+      } finally {
+        setCertificateActionId(null);
+      }
+    },
+    [certificateManagerProvider, handleLoadCertificates, reload],
+  );
+
+  /**
+   * Re-check the status of an installed certificate without
+   * re-downloading.
+   *
+   * Uses the resulting status to pick the toast kind:
+   *   - installed → success
+   *   - invalid   → warning (with the error message)
+   *   - missing   → warning (with the error message)
+   *   - expired   → warning
+   */
+  const handleTestCertificate = useCallback(
+    async (certificateId: string): Promise<boolean> => {
+      if (!certificateManagerProvider) return false;
+      const providerId = certificateManagerProvider.id;
+
+      setCertificateActionId(`test:${certificateId}`);
+      try {
+        const report = await apiTestCertificate(providerId, certificateId);
+        await handleLoadCertificates(providerId);
+
+        const ok = report.status === "installed";
+        if (ok) {
+          showToast.success(
+            "Certificate Valid",
+            "The certificate file is present, hash matches, and format is valid.",
+          );
+        } else {
+          showToast.warning(
+            "Certificate Problem",
+            report.error_message ||
+              `Status: ${report.status}. Reinstall the certificate.`,
+          );
+        }
+        return ok;
+      } catch (err) {
+        showToast.error(
+          "Certificate Test Failed",
+          formatProviderError(err),
+        );
+        return false;
+      } finally {
+        setCertificateActionId(null);
+      }
+    },
+    [certificateManagerProvider, handleLoadCertificates],
+  );
+
+  /**
+   * Delete a certificate record and (optionally) its file from disk.
+   *
+   * After success, reloads both the certificate list and the provider
+   * list (the card's badge may change).
+   */
+  const handleDeleteCertificate = useCallback(
+    async (
+      certificateId: string,
+      deleteFile: boolean,
+    ): Promise<boolean> => {
+      if (!certificateManagerProvider) return false;
+      const providerId = certificateManagerProvider.id;
+
+      setCertificateActionId(`delete:${certificateId}`);
+      try {
+        const result = await apiDeleteCertificate(
+          providerId,
+          certificateId,
+          deleteFile,
+        );
+        await handleLoadCertificates(providerId);
+        await reload();
+
+        if (result.removed) {
+          showToast.success(
+            "Certificate Removed",
+            deleteFile
+              ? "The certificate file and record have been removed."
+              : "The certificate record has been removed. The file was preserved.",
+          );
+        } else {
+          showToast.info(
+            "Nothing to Remove",
+            "No installed record existed for this certificate.",
+          );
+        }
+        return true;
+      } catch (err) {
+        showToast.error(
+          "Certificate Delete Failed",
+          formatProviderError(err),
+        );
+        return false;
+      } finally {
+        setCertificateActionId(null);
+      }
+    },
+    [certificateManagerProvider, handleLoadCertificates, reload],
+  );
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Return
+  // ═══════════════════════════════════════════════════════════════════
+
   return {
     // Per-item loading states
     togglingProviderId,
@@ -902,5 +1186,20 @@ export function useProviderActions({
     handleDisableConnection,
     handleActivateConnection,
     handleTestConnection,
+
+    // Certificate Manager
+    certificateManagerProvider,
+    isCertificateModalOpen: certificateManagerProvider !== null,
+    handleOpenCertificateManager,
+    handleCloseCertificateManager,
+    certificates,
+    isLoadingCertificates,
+    certificatesError,
+    certificateActionId,
+    handleLoadCertificates,
+    handleRefreshCertificates,
+    handleInstallCertificate,
+    handleTestCertificate,
+    handleDeleteCertificate,
   };
 }

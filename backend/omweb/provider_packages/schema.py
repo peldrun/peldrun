@@ -116,6 +116,33 @@ MAX_COMPRESSION_RATIO: int = 100                          # 100:1
 MAX_PATH_LENGTH: int = 1024
 
 
+#: Key inside ``models_vault.json`` under which installed certificate
+#: records are stored. Certificates are managed separately from
+#: connections because they have a different lifecycle — they
+#: represent files that exist on the host filesystem, not just JSON
+#: values.
+CERTIFICATES_VAULT_KEY: str = "provider_certificates"
+
+#: Maximum size of a downloaded certificate file. Anything larger is
+#: almost certainly a misconfiguration or an attack. Real CA bundles
+#: are typically well under 50 KB.
+MAX_CERTIFICATE_BYTES: int = 1024 * 1024  # 1 MB
+
+#: Allowed certificate types. A provider may declare one or more of
+#: these. ``root_ca`` and ``bundle`` are CA files used for TLS server
+#: verification. ``client_cert`` and ``client_key`` are used for
+#: mutual TLS authentication.
+CERTIFICATE_TYPES: frozenset[str] = frozenset(
+    {"root_ca", "bundle", "client_cert", "client_key"}
+)
+
+#: Certificate status values used in the ``provider_certificates``
+#: vault records and in API responses.
+CERTIFICATE_STATUSES: frozenset[str] = frozenset(
+    {"installed", "missing", "invalid", "expired", "pending"}
+)
+
+
 #: Provider ID must be a filesystem-safe, URL-safe, snake-friendly
 #: identifier. It is used as a directory name, a registry key, and an
 #: entry-point name, so its character set is deliberately narrow.
@@ -362,6 +389,209 @@ class PackagePermissions(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Certificates
+# ---------------------------------------------------------------------------
+
+
+class CertificateSpec(BaseModel):
+    """
+    One certificate a Provider Package can install on the host.
+
+    Certificates are managed via a dedicated UI (the Certificate
+    Manager modal) that offers download + install + test in one place.
+    The spec declares WHERE to obtain the file, HOW to verify it, and
+    WHERE to place it. The actual installation is performed by
+    ``CertificateManager`` (``certificate_manager.py``), which records
+    the installed state in ``models_vault.json`` under the
+    ``provider_certificates`` key.
+
+    Why this is a first-class concept
+    ---------------------------------
+    Some providers — most notably Russian services like GigaChat and
+    YandexGPT — require a root CA that is not in ``certifi``. Users
+    today must manually download the CA, copy it to the host, and
+    paste an absolute path into a text field. That flow is error
+    prone (wrong CA, wrong encoding, wrong path). This model lets a
+    package declare the exact URL, hash, and destination, so the
+    Certificate Manager can handle the whole flow with a single click.
+
+    Reusability
+    -----------
+    The model is provider-agnostic. Any future provider that requires
+    a custom CA bundle, mTLS client certificate, or any other TLS
+    artifact can declare it here and get the full Certificate Manager
+    UI for free. No changes to PELDRUN's core are required.
+
+    Fields
+    ------
+    id
+        Stable identifier for this certificate WITHIN the package
+        (e.g. ``"russian_trusted_root_ca"``). Combined with the
+        package's ``id``, it uniquely identifies the installed
+        certificate. Changing ``id`` after users have installed the
+        package makes it a NEW certificate — the old one is orphaned.
+    display_name
+        User-facing label, e.g. ``"Russian Trusted Root CA"``.
+    description
+        One-line explanation for the UI.
+    download_url
+        The authoritative URL. Must be HTTPS. The Certificate Manager
+        downloads from this URL, with size and timeout limits.
+    download_sha256
+        Optional hex-encoded SHA-256. When present, the downloaded
+        file is verified against this hash before installation.
+        Strongly recommended for production packages.
+    download_filename
+        Suggested filename for the installed file. Used to construct
+        the default destination path. Should be a valid filename with
+        an extension such as ``.pem``, ``.crt``, or ``.cer``.
+    default_destination
+        Absolute path where the certificate should be installed by
+        default. When ``None``, the Certificate Manager picks a
+        managed path under the provider's storage directory — no
+        root privileges required.
+    certificate_type
+        One of ``root_ca``, ``bundle``, ``client_cert``, ``client_key``.
+        Used to determine format validation (PEM vs DER) and to
+        filter which certificates the UI shows per connection.
+    required
+        When true, the package cannot work without this certificate
+        installed. The Store card shows an amber "Certificate
+        required" badge when the cert is missing.
+    required_for_fields
+        Optional list of ``connection_fields[].key`` values this
+        certificate supports. When set, the Certificate Manager only
+        shows this certificate as required for connections that
+        declare one of these fields. Useful for certificates that
+        are only needed in specific scopes (e.g. only B2B).
+    docs_url
+        Optional link to the official documentation explaining why
+        this certificate is needed. Rendered as a "Learn more" link
+        in the Certificate Manager UI.
+    issuer
+        Optional human-readable issuer name for display purposes.
+    expires_at
+        Optional ISO-8601 date. When present, the UI shows a warning
+        when the certificate is close to expiry.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    # --- Identity ---
+    id: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Stable identifier within the package. Must match "
+            "^[a-z0-9][a-z0-9._-]*$."
+        ),
+    )
+    display_name: str = Field(..., min_length=1)
+    description: str = ""
+
+    # --- Source ---
+    download_url: str = Field(
+        ...,
+        description=(
+            "Authoritative HTTPS URL for the certificate. Required."
+        ),
+    )
+    download_sha256: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional hex-encoded SHA-256 of the downloaded file. "
+            "When present, the Certificate Manager verifies the "
+            "download against this hash before installing."
+        ),
+    )
+
+    # --- Destination ---
+    download_filename: str = Field(
+        ...,
+        description=(
+            "Suggested filename for the installed file "
+            "(e.g. 'russian_trusted_root_ca.pem')."
+        ),
+    )
+    default_destination: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional absolute path for the installed file. When "
+            "None, the Certificate Manager uses a managed path under "
+            "the provider's storage directory."
+        ),
+    )
+
+    # --- Classification ---
+    certificate_type: Literal[
+        "root_ca", "bundle", "client_cert", "client_key"
+    ] = "root_ca"
+
+    # --- Requirements ---
+    required: bool = True
+    required_for_fields: List[str] = Field(default_factory=list)
+
+    # --- Display metadata ---
+    docs_url: Optional[str] = None
+    issuer: Optional[str] = None
+    expires_at: Optional[str] = None
+
+    # ------------------------------------------------------------------
+    # Validators
+    # ------------------------------------------------------------------
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, v: str) -> str:
+        if not v or not _PROVIDER_ID_PATTERN.match(v):
+            raise ValueError(
+                f"certificate id '{v}' must match "
+                f"{_PROVIDER_ID_PATTERN.pattern}."
+            )
+        return v
+
+    @field_validator("download_url")
+    @classmethod
+    def _validate_download_url(cls, v: str) -> str:
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError(
+                "download_url must be a non-empty string."
+            )
+        if not v.lower().startswith(("https://", "http://")):
+            raise ValueError(
+                f"download_url must use http(s)://, got '{v}'."
+            )
+        return v
+
+    @field_validator("download_sha256")
+    @classmethod
+    def _validate_sha256(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        if not isinstance(v, str) or len(v) != 64:
+            raise ValueError(
+                "download_sha256 must be a 64-character hex digest."
+            )
+        try:
+            int(v, 16)
+        except ValueError as exc:
+            raise ValueError(
+                "download_sha256 must contain only hex characters."
+            ) from exc
+        return v.lower()
+
+    @field_validator("download_filename")
+    @classmethod
+    def _validate_filename(cls, v: str) -> str:
+        if not v or "/" in v or "\\" in v or ".." in v:
+            raise ValueError(
+                "download_filename must be a plain filename with no "
+                "directory components."
+            )
+        return v
+
+
+# ---------------------------------------------------------------------------
 # Connection fields
 # ---------------------------------------------------------------------------
 
@@ -592,6 +822,17 @@ class ProviderManifest(BaseModel):
         default_factory=list
     )
 
+    #: Certificates the package requires (root CA bundles, mTLS client
+    #: certificates, etc.). Each entry declares the source URL, the
+    #: expected hash, and the destination path. The Store's Certificate
+    #: Manager modal uses this to offer a one-click "Download & Install"
+    #: button — no manual file copying is required.
+    #:
+    #: An empty list means the package does not need any external
+    #: certificate files. This is the default and covers most cloud
+    #: providers (OpenAI, Anthropic, Google, DeepSeek, ...).
+    certificates: List[CertificateSpec] = Field(default_factory=list)
+
     #: Non-functional hints for the Store UI (TLS warnings, docs link,
     #: custom headers). Do NOT affect adapter behavior — the adapter
     #: code shipped inside the package is the single source of truth.
@@ -768,6 +1009,37 @@ class ProviderPackageVersionRecord(BaseModel):
     file_count: int
     entry_point: Optional[str] = None
     class_name: Optional[str] = None
+
+
+class ProviderCertificateRecord(BaseModel):
+    """
+    One installed certificate.
+
+    Persisted under ``models_vault.json`` at
+    ``provider_certificates[<cert_id>]``. A record exists for every
+    certificate the Certificate Manager has touched — including those
+    that failed installation, so the UI can show what went wrong.
+
+    Unlike connections, certificates represent FILES on the host
+    filesystem. Deleting the record without deleting the file leaves
+    an orphan; the Certificate Manager's DELETE endpoint handles
+    both in one operation.
+    """
+
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    id: str
+    provider_package_id: str
+    certificate_id: str
+    installed_path: Optional[str] = None
+    sha256: Optional[str] = None
+    size_bytes: int = 0
+    status: Literal[
+        "installed", "missing", "invalid", "expired", "pending"
+    ] = "pending"
+    installed_at: Optional[str] = None
+    last_checked_at: Optional[str] = None
+    error_message: Optional[str] = None
 
 
 class ProviderPackageEntry(BaseModel):
@@ -1015,6 +1287,11 @@ class ProviderPackageCatalogItem(BaseModel):
         default_factory=list
     )
 
+    #: Certificates the package will require once installed. Surfaced
+    #: in the catalog preview so the user knows the setup cost before
+    #: clicking Install. Mirrors ``ProviderManifest.certificates``.
+    certificates: List["CertificateSpec"] = Field(default_factory=list)
+
 
 __all__ = [
     # Constants
@@ -1030,6 +1307,10 @@ __all__ = [
     "MAX_FILE_COUNT",
     "MAX_COMPRESSION_RATIO",
     "MAX_PATH_LENGTH",
+    "CERTIFICATES_VAULT_KEY",
+    "MAX_CERTIFICATE_BYTES",
+    "CERTIFICATE_TYPES",
+    "CERTIFICATE_STATUSES",
     # Enums
     "ProviderTransport",
     "PermissionKind",
@@ -1041,9 +1322,11 @@ __all__ = [
     "PackagePermissions",
     "ConnectionFieldSpec",
     "RuntimeHints",
+    "CertificateSpec",
     # Manifest
     "ProviderManifest",
     # Installed state
+    "ProviderCertificateRecord",
     "ProviderPackageVersionRecord",
     "ProviderPackageEntry",
     "ProviderPackageRegistryIndex",

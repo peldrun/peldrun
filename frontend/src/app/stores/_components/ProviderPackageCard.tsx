@@ -9,11 +9,15 @@ import {
   Plug,
   Radio,
   Settings,
+  Shield,
+  ShieldAlert,
+  ShieldCheck,
   Sparkles,
   Trash2,
   Wrench,
 } from "lucide-react";
 import type {
+  CertificatesStatus,
   ProviderPackageEntry,
   ProviderTransport,
 } from "../_types/store";
@@ -67,6 +71,16 @@ export interface ProviderPackageCardProps {
   onDetails: (providerId: string) => void;
   /** Called when the Configure action is clicked. */
   onConfigure: (providerId: string) => void;
+  /**
+   * Called when the Certificates action is clicked.
+   *
+   * Opens the Certificate Manager modal, which shows the TLS
+   * certificates the package declares (root CA bundles, mTLS
+   * client certificates) and offers a one-click install flow.
+   *
+   * Only rendered when ``provider.has_certificates === true``.
+   */
+  onManageCertificates: (providerId: string) => void;
   /** Called when a specific installed version is selected. */
   onActivateVersion: (
     provider: ProviderPackageEntry,
@@ -184,6 +198,66 @@ function FeatureChips({ features }: { features: Record<string, boolean> }) {
 }
 
 /**
+ * Compact certificate status badge.
+ *
+ * Rendered only when the package declares certificates. The color
+ * encodes the urgency:
+ *
+ *   - purple  → installed (all required certificates are present)
+ *   - amber   → missing (at least one required certificate is missing)
+ *   - gray    → unknown (manifest was readable but status was not
+ *                computed — rare)
+ *
+ * A package that declares no certificates renders nothing here.
+ */
+function CertificateBadge({
+  hasCertificates,
+  status,
+}: {
+  hasCertificates: boolean | null | undefined;
+  status: CertificatesStatus | undefined;
+}) {
+  // No badge for packages that do not need certificates.
+  if (!hasCertificates) return null;
+
+  if (status === "all_installed") {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded-full border border-purple-500/20 bg-purple-500/10 px-2 py-0.5 text-[11px] font-medium text-purple-700 dark:text-purple-300"
+        title="All required TLS certificates are installed"
+      >
+        <ShieldCheck className="h-2.5 w-2.5" />
+        Certificates
+      </span>
+    );
+  }
+
+  if (status === "some_missing") {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded-full border border-amber-500/20 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-300"
+        title="Click Certificates to install the required TLS certificates"
+      >
+        <ShieldAlert className="h-2.5 w-2.5" />
+        Certificates missing
+      </span>
+    );
+  }
+
+  // Unknown or unset — render a neutral badge so the user knows the
+  // package declares certificates and can click through to inspect.
+  return (
+    <span
+      className="inline-flex items-center gap-1 rounded-full border border-muted-foreground/20 bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground"
+      title="This provider declares TLS certificates; click Certificates to inspect"
+    >
+      <Shield className="h-2.5 w-2.5" />
+      Certificates
+    </span>
+  );
+}
+
+/**
  * Small toggle switch. Uses `role="switch"` for accessibility and a
  * per-instance disabled state driven by ``toggling``.
  */
@@ -236,6 +310,7 @@ export function ProviderPackageCard({
   onDelete,
   onDetails,
   onConfigure,
+  onManageCertificates,
   onActivateVersion,
 }: ProviderPackageCardProps) {
   const displayName =
@@ -334,6 +409,18 @@ export function ProviderPackageCard({
                 Not configured
               </span>
             )}
+
+            {/* Certificate status badge.
+                Only rendered when the package declares certificates.
+                Purple is used to distinguish it from the connection
+                badge (emerald) and the "not configured" badge (amber).
+                The amber variant takes priority over purple because a
+                missing required certificate is a blocking issue, not
+                just informational. */}
+            <CertificateBadge
+              hasCertificates={provider.has_certificates}
+              status={provider.certificates_status}
+            />
           </div>
         </div>
       </div>
@@ -381,6 +468,33 @@ export function ProviderPackageCard({
             <Settings className="h-3.5 w-3.5" />
             Configure
           </button>
+
+          {/* Certificates — rendered only when the package declares
+              any. Uses amber when at least one required certificate
+              is missing, so it draws the eye exactly when the user
+              needs to act. */}
+          {provider.has_certificates && (
+            <button
+              type="button"
+              onClick={() => onManageCertificates(provider.id)}
+              disabled={isBusy}
+              className={[
+                "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
+                provider.certificates_status === "some_missing"
+                  ? "text-amber-700 dark:text-amber-300 hover:bg-amber-500/10"
+                  : "text-foreground hover:bg-muted",
+                isBusy ? "cursor-not-allowed opacity-50" : "",
+              ].join(" ")}
+              title={
+                provider.certificates_status === "some_missing"
+                  ? "Install the required TLS certificates"
+                  : "Manage TLS certificates for this provider"
+              }
+            >
+              <Shield className="h-3.5 w-3.5" />
+              Certificates
+            </button>
+          )}
 
           <button
             type="button"

@@ -374,6 +374,31 @@ export interface ProviderPackageEntry {
   runtime_hints?: RuntimeHints;
 
   /**
+   * Whether the package declares any TLS certificates it needs
+   * installed. Computed by the backend by reading the manifest.
+   *
+   *   - ``true``  — the package declares at least one certificate.
+   *   - ``false`` — the package declares no certificates.
+   *   - ``null``  — the backend could not read the manifest (degraded).
+   *
+   * Only used to decide whether to show the certificate badge on the
+   * card. The full certificate list is fetched on demand from
+   * ``GET /{provider_id}/certificates``.
+   */
+  has_certificates?: boolean | null;
+
+  /**
+   * Aggregate status of the package's required certificates.
+   *
+   * Populated by the backend on list/detail responses by reading the
+   * manifest and the vault. The card uses this to render:
+   *   - green badge "Certificates installed"
+   *   - amber badge "Certificates missing"
+   *   - no badge when ``none_required`` or ``unknown``.
+   */
+  certificates_status?: CertificatesStatus;
+
+  /**
    * Whether the package currently has an ACTIVE connection (is_active
    * AND enabled). Populated by the API on list/detail responses —
    * not by the manifest.
@@ -461,6 +486,136 @@ export interface RuntimeHints {
   custom_headers_from_fields?: Record<string, string>;
 }
 
+// ---------------------------------------------------------------------------
+// Certificates (TLS certificates, CA bundles, mTLS keys)
+// ---------------------------------------------------------------------------
+//
+// Some providers require a TLS certificate (root CA bundle, mTLS
+// client certificate) that is NOT part of the standard trust store
+// shipped with Python (certifi). The most prominent example is the
+// Russian Trusted Root CA used by GigaChat and YandexGPT.
+//
+// A Provider Package declares the certificates it needs in its
+// manifest. The Certificate Manager UI offers a one-click "Download &
+// Install" flow, removing the need for the user to manually download
+// the file and paste a path into a form.
+//
+// Certificates are stored on the filesystem and tracked in the vault
+// (``provider_certificates``). The card badge shows whether all
+// required certificates are installed.
+
+/**
+ * One certificate declaration from a package's manifest.
+ *
+ * Mirrors ``CertificateSpec`` on the Python side.
+ */
+export interface CertificateSpec {
+  /** Stable identifier within the package (e.g. "russian_trusted_root_ca"). */
+  id: string;
+  /** User-facing label (e.g. "Russian Trusted Root CA"). */
+  display_name: string;
+  /** One-line explanation shown under the label. */
+  description: string;
+  /** HTTPS URL the Certificate Manager downloads from. */
+  download_url: string;
+  /** Optional hex-encoded SHA-256. Verified after download when present. */
+  download_sha256?: string | null;
+  /** Suggested filename for the installed file. */
+  download_filename: string;
+  /** Absolute path override; when null, a managed path is used. */
+  default_destination?: string | null;
+  /** What kind of TLS artifact this is. */
+  certificate_type: "root_ca" | "bundle" | "client_cert" | "client_key";
+  /** When true, the package will not work without this certificate. */
+  required?: boolean;
+  /** Optional list of connection field keys this certificate supports. */
+  required_for_fields?: string[];
+  /** Optional docs link explaining why the certificate is needed. */
+  docs_url?: string | null;
+  /** Optional human-readable issuer. */
+  issuer?: string | null;
+  /** Optional ISO-8601 expiry date. */
+  expires_at?: string | null;
+}
+
+/**
+ * Certificate status values.
+ *
+ *   - "installed" — file present, hash matches (or no hash was declared).
+ *   - "missing"   — record exists but file is absent.
+ *   - "invalid"   — file present but hash or format mismatch.
+ *   - "expired"   — reserved for future use.
+ *   - "pending"   — never attempted (no vault record, no file).
+ */
+export type CertificateStatus =
+  | "installed"
+  | "missing"
+  | "invalid"
+  | "expired"
+  | "pending";
+
+/**
+ * One installed certificate record (persisted in the vault).
+ *
+ * Mirrors ``ProviderCertificateRecord`` on the Python side.
+ */
+export interface ProviderCertificateRecord {
+  /** Composite key: "<provider_id>:<certificate_id>". */
+  id: string;
+  provider_package_id: string;
+  certificate_id: string;
+  /** Absolute path to the installed file, or null on failure. */
+  installed_path?: string | null;
+  /** SHA-256 of the file at install / last check. */
+  sha256?: string | null;
+  size_bytes: number;
+  status: CertificateStatus;
+  installed_at?: string | null;
+  last_checked_at?: string | null;
+  error_message?: string | null;
+}
+
+/**
+ * Full status report returned by the certificates endpoint.
+ *
+ * Carries both the expected facts (from the manifest) and the actual
+ * facts (from the filesystem). The UI uses ``status`` for the badge,
+ * and the rest for the modal's detail rows.
+ *
+ * Mirrors ``CertificateStatusReport`` on the Python side.
+ */
+export interface CertificateStatusReport {
+  provider_id: string;
+  certificate_id: string;
+  display_name: string;
+  status: CertificateStatus;
+  installed_path?: string | null;
+  expected_sha256?: string | null;
+  actual_sha256?: string | null;
+  size_bytes: number;
+  installed_at?: string | null;
+  last_checked_at?: string | null;
+  error_message?: string | null;
+  download_url?: string | null;
+  docs_url?: string | null;
+  required: boolean;
+}
+
+/**
+ * Aggregate certificate status for the card badge.
+ *
+ *   - "none_required"  — the package declares no certificates.
+ *   - "all_installed"  — every required certificate is installed.
+ *   - "some_missing"   — at least one required certificate is missing.
+ *   - "unknown"        — backend could not compute (rare; treat as
+ *                        neutral, no badge).
+ */
+export type CertificatesStatus =
+  | "none_required"
+  | "all_installed"
+  | "some_missing"
+  | "unknown";
+
 /**
  * One saved connection for a Provider Package.
  *
@@ -525,6 +680,13 @@ export interface ProviderCatalogItem {
    * be needed before the user clicks Install.
    */
   connection_fields?: ConnectionFieldSpec[];
+
+  /**
+   * Certificates the package will require once installed. Surfaced in
+   * the catalog preview so the user knows the setup cost BEFORE
+   * clicking Install. Mirrors ``ProviderManifest.certificates``.
+   */
+  certificates?: CertificateSpec[];
 
   /**
    * Non-functional hints for the Store UI.
