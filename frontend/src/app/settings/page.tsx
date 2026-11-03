@@ -944,7 +944,7 @@ export default function SettingsPage() {
         saveStatus={saveStatus}
       />
 
-      <div className="taman w-full flex-1 overflow-y-auto p-0 space-y-6 bg-background">
+      <div className="taman w-full flex-1 overflow-y-auto p-0 space-y-6 bg-setbg">
         {activeTab === "llm" && (
           <LLMTab
             config={config}

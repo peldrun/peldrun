@@ -58,6 +58,8 @@
     --rb:  224.83  72.5% 52.94% ;
     --rby: 44.83 72.5% 52.94%;
     --storbg: 0  0% 93.33%;
+    --setbg:  0  0% 94.12%;
+
 
     --font-sans: 'DM Sans', sans-serif;
     --font-serif: 'Libre Baskerville', serif;
@@ -104,6 +106,7 @@
     --rb:  224.83  72.5% 52.94%;
     --rby: 44.83 72.5% 52.94%;
     --storbg:  0  0.7% 13.29%;
+    --setbg:  207.69  9.77% 26.08%;
 
 
   }

@@ -1650,6 +1650,75 @@ class PeldrunEngine(ExecutionEngine):
             except Exception:
                 consumer_task.cancel()
             print(f"[ENGINE PELDRUN] Task cancelled by operator for job: {job_id}")
+
+            # ------------------------------------------------------------------
+            # [M8.2-CANCEL] Emit a proper CANCELLED event BEFORE re-raising.
+            #
+            # Pre-M8.2 behavior: the engine re-raised CancelledError, the
+            # dispatcher synthesized a bare CANCELLED event with
+            # ``{"message": "Execution cancelled."}``. Because the event
+            # carried no ``result`` field, the frontend fell back to
+            # displaying the last CONTENT delta it had received — often a
+            # 20-character fragment mid-word (e.g. ``ism Russia overview".``).
+            # That fragment looked like an answer; the user thought the
+            # run failed silently.
+            #
+            # The fix: complete the job with a dedicated cancellation
+            # message that embeds the accumulated reasoning so the user
+            # sees WHY the run stopped and WHAT the model was doing when
+            # it did. The CANCELLED event carries the same message in
+            # its ``result`` field so the frontend displays it verbatim.
+            #
+            # The completion here does NOT use ``job_manager.fail_job``
+            # because cancellation is not a failure — the run terminated
+            # cleanly on operator request. ``complete_job`` marks the job
+            # as "completed" with a result; the streaming layer maps the
+            # CANCELLED event to ``status="cancelled"`` on the session,
+            # so the final stored state is "cancelled" (correct).
+            # ------------------------------------------------------------------
+            try:
+                cancellation_message = (
+                    f"### ⏹️ Execution cancelled by operator\n\n"
+                    f"The run was stopped at step {current_core_step}. "
+                    f"Partial output below."
+                )
+                if (
+                    latest_meaningful_thought
+                    and latest_meaningful_thought.strip()
+                ):
+                    # Cap at 2000 chars to avoid unbounded stored payloads
+                    # from runaway reasoning loops.
+                    thought_snippet = latest_meaningful_thought.strip()[:2000]
+                    cancellation_message += (
+                        "\n\n**Partial reasoning before cancellation:**\n\n"
+                        f"> {thought_snippet}"
+                    )
+
+                job_manager.complete_job(job_id, cancellation_message)
+
+                if not terminal_dispatched:
+                    terminal_dispatched = True
+                    await dispatch_event(
+                        job_id,
+                        SSEEvent(
+                            type=SSEEventType.CANCELLED,
+                            step=current_core_step,
+                            data={
+                                "message": "Execution cancelled by operator.",
+                                "result": cancellation_message,
+                                "model": model_name,
+                                "engine": self.engine_id,
+                            },
+                        ),
+                    )
+            except Exception as cancel_err:
+                logger.debug(
+                    "[ENGINE PELDRUN] Failed to emit cancellation for job "
+                    "%s: %s",
+                    job_id,
+                    cancel_err,
+                )
+
             raise
 
         except Exception as exc:

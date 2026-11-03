@@ -29,7 +29,22 @@ from omweb.job_manager import job_manager
 from omweb.project_manager import project_manager
 from omweb.sse_events import SSEEvent, SSEEventType, dispatch_event
 
-from peldrun.llm.client import AsyncLLMClient
+from peldrun.llm.accounting import (
+    InvocationContext,
+    default_tracker,
+)
+from peldrun.llm.client import AsyncLLMClient, _is_oom_error
+from peldrun.llm.capability_resolver import resolve_model_capabilities
+from peldrun.llm.contracts import ConnectionContext, ReasoningMode
+from peldrun.llm.providers import provider_factory
+from peldrun.llm.request import (
+    GenerationConfig,
+    LLMRequest,
+    ReasoningConfig,
+    ResponseFormat,
+    ToolChoiceSpec,
+)
+from peldrun.llm.stream_normalizer import collect_response
 from peldrun.runtime.pricing_store import NANO_USD_PER_USD, get_pricing_store
 from peldrun.runtime.usage_store import LLMInvocationRecord, get_usage_store
 from peldrun.tools.builtins.web_search import WebSearchTool
@@ -1517,33 +1532,145 @@ async def run_direct_chat(
                 ),
             )
 
-        client = AsyncLLMClient(
+        # ------------------------------------------------------------------
+        # [M7.1] Adapter-based LLM invocation.
+        #
+        # Replaces the direct `AsyncLLMClient(...)` instantiation with the
+        # provider factory. Both dispatch paths (direct chat and agent)
+        # now share a single LLM creation entry point.
+        #
+        # Legacy adapter (`openai_compat`) is used for ALL providers in
+        # this stage — which internally wraps `OpenAICompatProvider` →
+        # `AsyncLLMClient`. This guarantees zero behavior change for
+        # existing users: same watchdog timeouts (now enforced by the
+        # StreamNormalizer), same OOM fast-fail, same error mapping,
+        # same SSE streaming events.
+        #
+        # M7.3 will add smart routing to native adapters (lmstudio_native,
+        # ollama_native) when available, without touching this block —
+        # just changing `adapter_provider_id` via a resolver function.
+        # ------------------------------------------------------------------
+        adapter_provider_id = "openai_compat"
+
+        # Build connection context. The bridge only reads base_url,
+        # api_key, and timeout — extra_params stays empty for the legacy
+        # path. Native adapters (M7.3) will read api_surface / vertexai
+        # from extra_params when they take over.
+        connection = ConnectionContext(
+            connection_id=job_id,
+            provider_id=adapter_provider_id,
             base_url=base_url,
             api_key=api_key,
             timeout=float(active_llm.get("timeout") or 300.0),
+            extra_params={},
         )
 
-        completion_kwargs: Dict[str, Any] = {
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": float(active_llm.get("temperature", 0.7)),
-            "model": model_name,
-            "on_chunk": _handle_chunk,
-            "on_thought_chunk": _handle_thought_chunk,
-        }
+        # Resolve model capabilities via the honest resolver. This is
+        # the SAME function the agent executor uses, guaranteeing
+        # consistency across both dispatch paths.
+        model_caps = resolve_model_capabilities(
+            provider_id=adapter_provider_id,
+            model_id=model_name,
+            connection_id=None,
+        )
 
-        if is_reasoner and reasoning_effort in ("none", "minimal", "low", "medium", "high", "xhigh"):
-            completion_kwargs["reasoning_effort"] = reasoning_effort
-
-        try:
-            response = await client.chat_completion(**completion_kwargs)
-        except Exception as chat_err:
-            logger.warning(
-                "[BRIDGE DIRECT CHAT] Primary streaming chat completion failed (%s). Retrying with non-streaming fallback...",
-                chat_err,
+        # Build the reasoning intent for the request.
+        #
+        # Mapping (preserves current `AsyncLLMClient.chat_completion`
+        # behavior exactly):
+        #   - non-reasoner                          → enabled=False, mode=NONE
+        #   - reasoner with effort="none"           → enabled=True, mode=EFFORT, effort="none"
+        #     (this sends `reasoning_effort="none"` to the provider, which
+        #      is the explicit "please don't think" signal some models need)
+        #   - reasoner with effort=low/medium/high  → enabled=True, mode=EFFORT, effort=<value>
+        #   - reasoner with no effort configured    → enabled=True, mode=ADAPTIVE
+        if not is_reasoner:
+            reasoning_config = ReasoningConfig(
+                enabled=False, mode=ReasoningMode.NONE,
             )
-            completion_kwargs["stream"] = False
-            response = await client.chat_completion(**completion_kwargs)
+        elif reasoning_effort == "none":
+            reasoning_config = ReasoningConfig(
+                enabled=True,
+                mode=ReasoningMode.EFFORT,
+                effort="none",
+            )
+        elif reasoning_effort in (
+            "low", "medium", "high", "minimal", "xhigh",
+        ):
+            reasoning_config = ReasoningConfig(
+                enabled=True,
+                mode=ReasoningMode.EFFORT,
+                effort=reasoning_effort,
+            )
+        else:
+            reasoning_config = ReasoningConfig(
+                enabled=True, mode=ReasoningMode.ADAPTIVE,
+            )
+
+        # Build the unified request contract.
+        llm_request = LLMRequest(
+            provider_id=adapter_provider_id,
+            model_id=model_name,
+            connection_id=job_id,
+            messages=messages,
+            system_prompt=None,  # Already embedded in messages by ContextManager
+            tools=[],
+            tool_choice=ToolChoiceSpec(mode="auto"),
+            generation=GenerationConfig(
+                temperature=float(active_llm.get("temperature", 0.7)),
+                max_output_tokens=max_tokens,
+            ),
+            reasoning=reasoning_config,
+            response_format=ResponseFormat(kind="text"),
+            model_capabilities=model_caps,
+            connection=connection,
+        )
+
+        adapter = None
+        try:
+            adapter = provider_factory.create(adapter_provider_id, connection)
+
+            # Streaming first (preserves current UI behavior — SSE deltas
+            # fire as tokens arrive). Falls back to non-streaming on
+            # stream-init failure, exactly like before, EXCEPT that OOM
+            # errors are never retried (matches current fast-fail).
+            try:
+                response = await collect_response(
+                    adapter.stream(llm_request),
+                    model=model_name,
+                    on_chunk=_handle_chunk,
+                    on_thought_chunk=_handle_thought_chunk,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as stream_err:
+                # OOM: never retry — it wastes memory that the original
+                # allocation did not free, and the retry will fail again
+                # with a worse error. Re-raise immediately.
+                if _is_oom_error(stream_err):
+                    logger.error(
+                        "[BRIDGE DIRECT CHAT] OOM detected for model %r: %s. "
+                        "Not retrying.",
+                        model_name,
+                        stream_err,
+                    )
+                    raise
+
+                logger.warning(
+                    "[BRIDGE DIRECT CHAT] Streaming call failed (%s). "
+                    "Falling back to non-streaming.",
+                    stream_err,
+                )
+                response = await adapter.generate(llm_request)
+        finally:
+            if adapter is not None:
+                try:
+                    await adapter.close()
+                except Exception as close_err:
+                    logger.debug(
+                        "[BRIDGE DIRECT CHAT] adapter.close() raised: %s",
+                        close_err,
+                    )
 
         completed_time = time.time()
 
@@ -1563,58 +1690,47 @@ async def run_direct_chat(
                 ),
             )
 
-        pricing_store = get_pricing_store()
-        usage_store = get_usage_store()
+        # ------------------------------------------------------------------
+        # [M8.2] Unified accounting via LLMInvocationTracker.
+        #
+        # Replaces the direct usage_store / pricing_store block. The
+        # tracker writes a record even when `response.usage` is None
+        # (usage_source="unknown", cost_status="unknown"), which was
+        # previously skipped. It also records cost_status explicitly
+        # inside metadata so aggregations do not conflate "free" with
+        # "unknown pricing".
+        # ------------------------------------------------------------------
         usage = response.usage
-
-        cost_nano_usd = 0
-        pricing_rule_id = None
-        if usage:
-            cost_nano_usd, pricing_rule_id = await pricing_store.calculate_cost(
-                usage=usage,
-                provider=provider_name,
-                model=model_name,
-                base_url=base_url,
-            )
-
-        cost_usd = round(cost_nano_usd / NANO_USD_PER_USD, 6)
 
         inv_id = f"inv_chat_{uuid.uuid4().hex[:10]}"
         turn_id = f"turn_{len(turns) + 1}"
 
-        if usage:
-            record = LLMInvocationRecord(
-                invocation_id=inv_id,
-                job_id=job_id,
-                chat_id=chat_id,
-                project_id=project_id,
-                turn_id=turn_id,
-                mode="chat",
-                provider=provider_name,
-                model_requested=model_name,
-                model_returned=response.model or model_name,
-                status="completed",
-                input_tokens=usage.input_tokens,
-                output_tokens=usage.output_tokens,
-                total_tokens=usage.total_tokens,
-                cached_input_tokens=usage.cached_input_tokens,
-                reasoning_output_tokens=usage.reasoning_output_tokens,
-                usage_source=usage.source.value if hasattr(usage.source, "value") else str(usage.source),
-                estimated=usage.estimated,
-                tokenizer_id=usage.tokenizer_id,
-                tokenizer_version=usage.tokenizer_version,
-                estimation_method=usage.estimation_method,
-                started_at=start_time,
-                first_token_at=getattr(response, "first_token_at", None),
-                completed_at=completed_time,
-                latency_ms=round((completed_time - start_time) * 1000.0, 2),
-                ttft_ms=round(response.ttft_ms, 2) if response.ttft_ms is not None else None,
-                finish_reason=response.finish_reason,
-                pricing_version_id=pricing_rule_id,
-                cost_nano_usd=cost_nano_usd,
-            )
-            await usage_store.record_invocation(record)
+        tracker_ctx = InvocationContext(
+            provider=provider_name,
+            model_requested=model_name,
+            mode="chat",
+            job_id=job_id,
+            chat_id=chat_id,
+            project_id=project_id,
+            turn_id=turn_id,
+            base_url=base_url,
+        )
+        record = await default_tracker.complete(
+            response=response,
+            context=tracker_ctx,
+            started_at=start_time,
+            invocation_id=inv_id,
+        )
 
+        cost_nano_usd = record.cost_nano_usd
+        cost_usd = round(cost_nano_usd / NANO_USD_PER_USD, 6)
+
+        # Persist per-turn usage on the chat session — only when the
+        # provider actually reported usage. This mirrors the pre-M8.2
+        # behavior for the session summary (`turn_usage_dict`) while
+        # the ledger now records EVERY invocation, including those
+        # without usage.
+        if usage is not None:
             turn_usage_dict = {
                 "turn_id": turn_id,
                 "prompt_tokens": usage.input_tokens or 0,
@@ -1695,6 +1811,28 @@ async def run_direct_chat(
         print(f"[BRIDGE DIRECT CHAT] Job was cancelled: {job_id}")
         _safe_monitor_cancel_run(job_id)
         _append_session_log(chat_id, project_id, "SYSTEM", "Direct chat cancelled by user.")
+        # [M8.2] Record the cancellation in the ledger. Previously
+        # cancellations were invisible to accounting, so a user who
+        # pressed Stop after 30 seconds of generation left no trace.
+        try:
+            await default_tracker.cancel(
+                InvocationContext(
+                    provider=provider_name,
+                    model_requested=model_name,
+                    mode="chat",
+                    job_id=job_id,
+                    chat_id=chat_id,
+                    project_id=project_id,
+                    base_url=base_url,
+                ),
+                started_at=start_time,
+            )
+        except Exception as _cancel_rec_err:
+            logger.debug(
+                "Cancellation record skipped for %s: %s",
+                job_id,
+                _cancel_rec_err,
+            )
     except Exception as err:
         tb = traceback.format_exc()
         print(f"[BRIDGE DIRECT CHAT ERROR] {err}\n{tb}")
@@ -1702,6 +1840,27 @@ async def run_direct_chat(
         _safe_monitor_fail_run(job_id, error_message=err_msg)
         job_manager.fail_job(job_id, err_msg)
         _append_session_log(chat_id, project_id, "ERROR", err_msg)
+        # [M8.2] Record the failure in the ledger.
+        try:
+            await default_tracker.fail(
+                error=err,
+                context=InvocationContext(
+                    provider=provider_name,
+                    model_requested=model_name,
+                    mode="chat",
+                    job_id=job_id,
+                    chat_id=chat_id,
+                    project_id=project_id,
+                    base_url=base_url,
+                ),
+                started_at=start_time,
+            )
+        except Exception as _fail_rec_err:
+            logger.debug(
+                "Failure record skipped for %s: %s",
+                job_id,
+                _fail_rec_err,
+            )
         await dispatch_event(
             job_id,
             SSEEvent(

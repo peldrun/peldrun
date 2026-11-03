@@ -2,9 +2,9 @@
 provider = "lmstudio"
 provider_name = "LM Studio (Local)"
 model = "nvidia-nemotron-3-nano-4b"
-base_url = "http://127.0.0.1:1234/v1"
+base_url = "http://100.64.17.157:1235"
 api_key = "sk-lm-gFTaiAB5:PL9ecC0F3WiJjhr0nLja"
-max_tokens = 1048576
+max_tokens = 8192
 temperature = 0
 api_type = ""
 max_output_tokens = 12000
@@ -54,7 +54,7 @@ use_data_analysis_agent = false
 provider = "lmstudio"
 provider_name = "LM Studio (Local)"
 model = "nvidia-nemotron-3-nano-4b"
-base_url = "http://127.0.0.1:1234/v1"
+base_url = "http://100.64.17.157:1235"
 api_key = ""
 max_tokens = 8192
 temperature = 0
@@ -112,7 +112,7 @@ estimated_cost_per_query = 0.005
 
 [search.jina]
 enabled = true
-api_key = "jina••••••••TIZj"
+api_key = "jina_330c240e759743cdb99eb438bcf7f336o5v3iba1AQy2dOd7MDAFIjCcTIZj"
 timeout = 20
 cost_per_query = 0.002
 estimated_cost_per_query = 0.002

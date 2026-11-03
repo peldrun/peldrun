@@ -579,6 +579,7 @@ export function LLMTab(props: LLMTabProps) {
             ? (metadataVault[infoModalModel] as Parameters<typeof ModelInfoModal>[0]["explicitMeta"])
             : null
         }
+        providerId={config.llm.provider}
 />
 
       {/* Model discovery modal */}

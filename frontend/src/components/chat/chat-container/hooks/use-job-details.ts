@@ -7,6 +7,57 @@ import type { StepEvent } from "@/components/chat/chat-timeline";
 import { safeRender } from "../utils";
 import type { ChatStatus, TokenUsage, UsageMetrics } from "../types";
 
+
+/**
+ * Merge consecutive ``thought`` steps that belong to the same numeric
+ * step into a single block.
+ *
+ * Background
+ * ----------
+ * The SSE stream persists EVERY thought delta as its own event in
+ * ``session.json`` (one token = one event). The live SSE path in
+ * ``use-sse-stream.ts`` already concatenates these deltas into the
+ * last thought step during streaming, so the user sees one growing
+ * bubble. But the replay path (this file) creates a separate
+ * ``StepEvent`` per persisted event, which produces N separate
+ * bubbles on every page refresh — one for every token the model ever
+ * emitted.
+ *
+ * This function restores the same behavior for replay: consecutive
+ * thoughts for the same step become one coherent block. A tool call,
+ * observation, or any other event between two thoughts breaks the
+ * run (correctly), so reasoning on either side of a tool call is
+ * preserved as distinct blocks.
+ *
+ * Called BEFORE the empty-content filter so that whitespace-only
+ * deltas (e.g. ``" "`` between words) survive concatenation — the
+ * filter would otherwise drop them, corrupting word boundaries.
+ */
+function mergeConsecutiveThoughts(steps: StepEvent[]): StepEvent[] {
+  if (!steps || steps.length === 0) return steps;
+  const merged: StepEvent[] = [];
+  for (const step of steps) {
+    const last = merged.length > 0 ? merged[merged.length - 1] : null;
+    if (
+      last !== null &&
+      last.type === "thought" &&
+      step.type === "thought" &&
+      last.step === step.step
+    ) {
+      // Adjacent thoughts for the same step: concatenate content.
+      // Keep the earliest id/timestamp so React's key stays stable.
+      merged[merged.length - 1] = {
+        ...last,
+        content: last.content + step.content,
+      };
+    } else {
+      merged.push(step);
+    }
+  }
+  return merged;
+}
+
+
 interface UseJobDetailsParams {
   setActiveChatId: (id: string | null) => void;
   setSubmittedPrompt: (p: string) => void;
@@ -129,8 +180,11 @@ export function useJobDetails(params: UseJobDetailsParams) {
       if (data.turns && Array.isArray(data.turns)) {
         const loadedTurns: ChatTurn[] = data.turns.map(
           (t: any, idx: number) => {
-            const replayedSteps: StepEvent[] = (t.events || [])
-              .map((ev: any, evIdx: number) => ({
+            // Build raw steps first (no filtering). Filtering happens
+            // AFTER merge so that whitespace-only thought deltas (e.g.
+            // " " between words) survive concatenation.
+            const rawSteps: StepEvent[] = (t.events || []).map(
+              (ev: any, evIdx: number) => ({
                 id: `hist-${idx}-step-${evIdx}`,
                 step: ev.step || 1,
                 type: ev.type || "thought",
@@ -144,11 +198,18 @@ export function useJobDetails(params: UseJobDetailsParams) {
                 toolName:
                   ev.data?.tool_name || ev.data?.name || ev.data?.tool,
                 timestamp: ev.timestamp || "",
-              }))
-              .filter(
-                (ev: StepEvent) =>
-                  ev.content.trim() !== "" || Boolean(ev.toolName)
-              );
+              })
+            );
+
+            // [FIX-THOUGHT-MERGE] Collapse N consecutive thought deltas
+            // (same step) into one block, then filter out truly empty
+            // entries. Mirrors the live-streaming behavior in
+            // use-sse-stream.ts, which appends deltas to the last step.
+            const mergedSteps = mergeConsecutiveThoughts(rawSteps);
+            const replayedSteps = mergedSteps.filter(
+              (ev: StepEvent) =>
+                ev.content.trim() !== "" || Boolean(ev.toolName)
+            );
 
             return {
               id: t.job_id || `turn-${idx}`,
@@ -192,7 +253,10 @@ export function useJobDetails(params: UseJobDetailsParams) {
       }
 
       if (data.events && Array.isArray(data.events)) {
-        const replayed: StepEvent[] = [];
+        // Build raw steps first (no filtering). The filter runs after
+        // merge so that whitespace-only thought deltas survive
+        // concatenation and word boundaries are preserved.
+        const rawReplayed: StepEvent[] = [];
         data.events.forEach((ev: any, idx: number) => {
           const evType = ev.type || "thought";
           const evContent =
@@ -203,44 +267,53 @@ export function useJobDetails(params: UseJobDetailsParams) {
             JSON.stringify(ev);
           const rendered = safeRender(evContent);
           const tool = ev.data?.tool_name || ev.data?.name || ev.data?.tool;
-          if (rendered.trim() !== "" || Boolean(tool)) {
-            const replayedStep: StepEvent = {
-              id: `replay-${idx}-${Math.random()}`,
-              step: ev.step || 1,
-              type: evType,
-              content: rendered,
-              toolName: tool,
-              timestamp: ev.timestamp || new Date().toLocaleTimeString(),
-            };
 
-            // image_results events carry structured image metadata
-            // (proxied URLs, dimensions, source pages) that is NOT
-            // recoverable from the rendered markdown string. Without
-            // this preservation, the ChatTimeline receives an
-            // image_results step with an empty `images` array after
-            // a page refresh, so the gallery never renders again.
-            if (
-              evType === "image_results" &&
-              ev.data &&
-              typeof ev.data === "object"
-            ) {
-              const evImages = (ev.data as any).images;
-              if (Array.isArray(evImages) && evImages.length > 0) {
-                replayedStep.images = evImages;
-                replayedStep.imageProvider =
-                  typeof (ev.data as any).provider === "string"
-                    ? (ev.data as any).provider
-                    : undefined;
-                replayedStep.imageQuery =
-                  typeof (ev.data as any).query === "string"
-                    ? (ev.data as any).query
-                    : undefined;
-              }
+          const replayedStep: StepEvent = {
+            id: `replay-${idx}-${Math.random()}`,
+            step: ev.step || 1,
+            type: evType,
+            content: rendered,
+            toolName: tool,
+            timestamp: ev.timestamp || new Date().toLocaleTimeString(),
+          };
+
+          // image_results events carry structured image metadata
+          // (proxied URLs, dimensions, source pages) that is NOT
+          // recoverable from the rendered markdown string. Without
+          // this preservation, the ChatTimeline receives an
+          // image_results step with an empty `images` array after
+          // a page refresh, so the gallery never renders again.
+          if (
+            evType === "image_results" &&
+            ev.data &&
+            typeof ev.data === "object"
+          ) {
+            const evImages = (ev.data as any).images;
+            if (Array.isArray(evImages) && evImages.length > 0) {
+              replayedStep.images = evImages;
+              replayedStep.imageProvider =
+                typeof (ev.data as any).provider === "string"
+                  ? (ev.data as any).provider
+                  : undefined;
+              replayedStep.imageQuery =
+                typeof (ev.data as any).query === "string"
+                  ? (ev.data as any).query
+                  : undefined;
             }
-
-            replayed.push(replayedStep);
           }
+
+          rawReplayed.push(replayedStep);
         });
+
+        // [FIX-THOUGHT-MERGE] Collapse N consecutive thought deltas
+        // (same step) into one block, then filter out truly empty
+        // entries. This is what makes a page refresh show ONE
+        // reasoning block per step instead of one bubble per token.
+        const mergedReplayed = mergeConsecutiveThoughts(rawReplayed);
+        const replayed = mergedReplayed.filter(
+          (ev) => ev.content.trim() !== "" || Boolean(ev.toolName)
+        );
+
         p.setSteps(replayed);
         const maxStep = replayed.reduce((max, s) => Math.max(max, s.step), 0);
         if (maxStep > 0) {

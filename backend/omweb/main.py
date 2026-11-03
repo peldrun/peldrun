@@ -18,6 +18,8 @@ Initializes middleware, static files, and canonical REST routers:
 - /api/source-control (Source Control Integration: providers,
   repositories, workspaces, approvals, operations, audit)
 - /api/resource-monitor (PELDRUN Resource Monitor & Hardware Telemetry API)
+- /api/catalog (Model Capability Catalog — LiteLLM + HuggingFace +
+  cached provider_live facts, resolved via capability_resolver)
 
 Lifespan management:
     The application installs a FastAPI lifespan context manager that:
@@ -55,6 +57,7 @@ from integrations.source_control.providers import register_builtin_providers
 # Register built-in Git providers globally on startup
 register_builtin_providers()
 from omweb.routers import (
+    catalog_rtr,
     chats,
     config_rtr,
     files,
@@ -343,6 +346,17 @@ app.include_router(chats.router, prefix="/api/chats", tags=["chats"])
 app.include_router(run.router, prefix="/api/run", tags=["run"])
 app.include_router(status.router, prefix="/api/status", tags=["status"])
 app.include_router(config_rtr.router, prefix="/api/config", tags=["config"])
+# Model Capability Catalog.
+#
+# Read-only view over the cached capability resolution layer
+# (LiteLLM registry + HuggingFace configs + models_metadata.json).
+# The `POST /refresh` endpoint triggers a LiteLLM cache refresh
+# from GitHub — it never touches any provider's endpoint. Live
+# provider queries happen ONLY through /api/config/fetch-models
+# (the Scan Models button).
+app.include_router(
+    catalog_rtr.router, prefix="/api/catalog", tags=["catalog"]
+)
 app.include_router(
     generative_ui_rtr.router,
     prefix="/api/config",

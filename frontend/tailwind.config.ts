@@ -94,6 +94,7 @@ const config: Config = {
         cgood: "var(--cgood)",
 
         storbg:"hsl(var(--storbg))",
+        setbg: "hsl(var(--setbg))",
 
 
 

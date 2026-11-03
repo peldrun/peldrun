@@ -24,6 +24,14 @@ from omweb.config import BACKEND_DIR, PROJECT_ROOT, STORAGE_ROOT
 from pydantic import BaseModel
 import toml
 
+# Live-provider capability query — Ollama /api/show, LM Studio
+# /api/v0/models, Google per-model endpoint. Used by /fetch-models to
+# enrich the model list before persisting.
+from peldrun.llm.catalog.provider_live import query_providers_batch
+from peldrun.llm.contracts import ConnectionContext
+# M11: adapter-based model discovery.
+from peldrun.llm.providers import provider_factory
+
 try:
     import tomllib
 except ImportError:
@@ -207,7 +215,17 @@ def merge_unmasked(
 
 
 def save_metadata_cache(new_meta: dict) -> None:
-    """Persist models metadata cache to disk."""
+    """
+    Persist models metadata cache to disk (DESTRUCTIVE merge).
+
+    Used by POST /api/config/models-metadata — the frontend's manual
+    save path. The frontend sends complete entries that already
+    include `capability_sources = "manual"`, so a straight update is
+    correct here.
+
+    For the Scan Models flow, use `save_metadata_cache_merge` instead
+    so that manual overrides survive a rescan.
+    """
     data = {}
     if METADATA_CACHE.exists():
         try:
@@ -222,6 +240,364 @@ def save_metadata_cache(new_meta: dict) -> None:
             json.dump(data, f, indent=2)
     except Exception as e:
         logger.warning(f"Error saving metadata cache: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Merge-aware persistence (used by /fetch-models)
+# ---------------------------------------------------------------------------
+
+_CAPABILITY_FIELDS = ("vision", "trained_for_tool_use", "reasoning")
+
+_SCALAR_FIELDS = (
+    "max_context_length",
+    "max_output_tokens",
+    "params_string",
+    "publisher",
+    "architecture",
+    "family",
+    "display_name",
+    "type",
+)
+
+
+def _merge_metadata_entries(existing: dict, new: dict) -> dict:
+    """
+    Merge a freshly scanned metadata entry into an existing one,
+    preserving any user-authored manual overrides.
+
+    Rules
+    -----
+    * Scalar fields (context, params, quantization, arch, publisher,
+      family, display_name, type): new value wins if present.
+    * Capability booleans (vision, trained_for_tool_use, reasoning):
+        - If the existing entry has ``capability_sources[field] ==
+          "manual"``, the manual value is preserved unconditionally.
+        - Otherwise, the new value wins when it is declared by a
+          source (``provider_live``, ``provider_catalog``, etc.).
+    * ``capability_details.reasoning``: preserved when the existing
+      reasoning source is ``manual``; otherwise replaced by the new
+      details block.
+    """
+    if not isinstance(existing, dict):
+        return dict(new) if isinstance(new, dict) else {}
+    if not isinstance(new, dict):
+        return dict(existing)
+
+    result = dict(existing)
+
+    # Scalar fields: new wins if present and not None.
+    for key in _SCALAR_FIELDS:
+        if key in new and new[key] is not None:
+            result[key] = new[key]
+
+    if isinstance(new.get("quantization"), dict):
+        result["quantization"] = new["quantization"]
+
+    # Defensive extraction: a hand-edited or legacy entry may store
+    # ``capabilities`` as a list (e.g. LM Studio's raw ["tool_use"])
+    # instead of the dict of booleans our parser produces. dict(list)
+    # would raise ValueError and propagate to Starlette as plain-text
+    # "Internal Server Error" — exactly the failure mode observed
+    # when scanning Gemini/Google.
+    def _safe_dict(val: Any) -> Dict[str, Any]:
+        return dict(val) if isinstance(val, dict) else {}
+
+    existing_caps = _safe_dict(result.get("capabilities"))
+    new_caps = _safe_dict(new.get("capabilities"))
+    existing_sources = _safe_dict(result.get("capability_sources"))
+    new_sources = _safe_dict(new.get("capability_sources"))
+
+    for field in _CAPABILITY_FIELDS:
+        if field not in new_caps:
+            continue
+        if existing_sources.get(field) == "manual":
+            # Preserve user override; do not touch value or source.
+            continue
+        existing_caps[field] = new_caps[field]
+        if field in new_sources:
+            existing_sources[field] = new_sources[field]
+
+    result["capabilities"] = existing_caps
+    result["capability_sources"] = existing_sources
+
+    # capability_details: same manual-preservation rule.
+    existing_details = dict(result.get("capability_details") or {})
+    new_details = dict(new.get("capability_details") or {})
+
+    if "reasoning" in new_details:
+        if existing_sources.get("reasoning") != "manual":
+            existing_details["reasoning"] = new_details["reasoning"]
+
+    result["capability_details"] = existing_details
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# [M11] Adapter-based model discovery
+# ---------------------------------------------------------------------------
+
+#: Mapping from user-facing provider_id (or provider_type) to the
+#: canonical native adapter ID that owns discovery for it.
+#:
+#: Only providers that have a REGISTERED native adapter are mapped.
+#: Custom endpoints, DeepSeek, Mistral, Groq, OpenRouter, etc. are
+#: NOT in this map — they fall through to the legacy HTTP branches,
+#: which already work for OpenAI-compatible endpoints.
+#:
+#: "openai", "openai_compat", and "default" are deliberately NOT
+#: mapped: users often set one of them while pointing at a non-OpenAI
+#: endpoint (LM Studio proxy, DeepSeek, custom server). Mapping them
+#: to the native OpenAI SDK would change behavior for those users
+#: without their knowledge.
+_NATIVE_PROVIDER_MAP: Dict[str, str] = {
+    "lmstudio": "lmstudio_native",
+    "lm_studio": "lmstudio_native",
+    "lm-studio": "lmstudio_native",
+    "lmstudio_native": "lmstudio_native",
+    "ollama": "ollama_native",
+    "ollama_native": "ollama_native",
+    "anthropic": "anthropic",
+    "claude": "anthropic",
+    "google_genai": "google_genai",
+    "google-genai": "google_genai",
+    "google": "google_genai",
+    "gemini": "google_genai",
+    "openai_native": "openai_native",
+}
+
+
+async def _discover_via_adapter(
+    adapter_id: str,
+    base_url: str,
+    api_key: str,
+) -> list:
+    """
+    Try to use a registered adapter's ``discover_models()`` method.
+
+    Returns the raw list the adapter produces, or ``[]`` on any
+    failure (adapter not registered, missing SDK, network error,
+    auth failure, empty response). The caller MUST fall through to
+    the legacy HTTP branches when this returns ``[]`` so that
+    custom endpoints and unreachable providers keep working exactly
+    as before.
+
+    Why this matters
+    ----------------
+    The legacy ``fetch-models`` HTTP path sends
+    ``Authorization: Bearer <key>`` to ``<base>/models``. That works
+    for OpenAI-compatible providers. It DOES NOT work for:
+
+      * **Anthropic** — needs ``x-api-key`` (not Bearer).
+      * **Google**    — needs ``x-goog-api-key`` (not Bearer).
+      * **OpenAI**    — the official SDK handles pagination, retries,
+                        and headers more robustly than raw HTTP.
+
+    Adapters own their own auth, so this path fixes those providers
+    without any per-provider branching in the route handler.
+    """
+    try:
+        connection = ConnectionContext(
+            connection_id="discovery",
+            provider_id=adapter_id,
+            base_url=base_url or None,
+            api_key=api_key or None,
+            timeout=15.0,
+        )
+        adapter = provider_factory.create(adapter_id, connection)
+    except BaseException as exc:
+        logger.error(
+            "[fetch-models] Adapter creation failed for %r: %s",
+            adapter_id,
+            exc,
+            exc_info=True,
+        )
+        return []
+
+    try:
+        models = await adapter.discover_models(connection)
+        if not isinstance(models, list):
+            return []
+        return models
+    except Exception as exc:
+        logger.debug(
+            "[fetch-models] Adapter discover_models failed for %r: %s",
+            adapter_id,
+            exc,
+        )
+        return []
+    finally:
+        try:
+            await adapter.close()
+        except Exception:
+            pass
+
+
+def _parse_adapter_model_list(raw_list: list) -> Tuple[list, dict]:
+    """
+    Normalize the heterogeneous model list shapes returned by native
+    adapters into the ``models_metadata.json`` format.
+
+    Handles all five current shapes:
+
+      * **OpenAI**     — {id, object, created, owned_by}
+      * **Anthropic**  — {id, display_name, created_at, type}
+      * **Google**     — {id, full_name, display_name, description,
+                          input_token_limit, output_token_limit,
+                          supported_generation_methods}
+      * **Ollama**     — {id, size, digest, family, parameter_size,
+                          quantization_level}
+      * **LM Studio**  — {id, type, publisher, arch, quantization,
+                          max_context_length, capabilities}
+
+    Google embeddings-only models (no ``generateContent`` method) are
+    excluded from the returned list — they cannot serve chat requests
+    and would clutter the UI with unusable entries.
+
+    Returns ``(sorted_unique_model_ids, metadata_dict)``. The metadata
+    dict is keyed by model ID and already in the shape that
+    ``save_metadata_cache_merge`` expects.
+    """
+    model_ids: list = []
+    metadata: dict = {}
+
+    if not isinstance(raw_list, list):
+        logger.warning("[fetch-models] Adapter returned non-list: %r", type(raw_list))
+        return [], {}
+
+    for item in raw_list:
+        if not isinstance(item, dict):
+            continue
+
+        mid = item.get("id")
+        if not isinstance(mid, str) or not mid:
+            continue
+
+        # Google-only filter: skip embeddings-only models. The
+        # ``supported_generation_methods`` field is only present on
+        # Google responses; other adapters don't set it, so this
+        # branch is a no-op for them.
+        #
+        # Accept multiple shapes: plain strings ("generateContent"),
+        # and enums (which may stringify to "GenerationMethod.GENERATE_CONTENT"
+        # in some Python/SDK versions). Check both the raw and the
+        # camelCase form.
+        methods = item.get("supported_generation_methods")
+        if isinstance(methods, list) and methods:
+            has_generate = False
+            for m in methods:
+                if not isinstance(m, str):
+                    m = str(m)
+                if "generatecontent" in m.lower().replace("_", ""):
+                    has_generate = True
+                    break
+            if not has_generate:
+                continue
+
+        model_ids.append(mid)
+
+        entry: Dict[str, Any] = {
+            "key": mid,
+            "type": "llm",
+            "display_name": (
+                item.get("display_name") or mid
+            ),
+        }
+
+        # Context / output limits — multiple field names across adapters.
+        ctx = (
+            item.get("max_context_length")
+            or item.get("input_token_limit")
+            or item.get("context_length")
+            or item.get("context_window")
+        )
+        if isinstance(ctx, int) and ctx > 0:
+            entry["max_context_length"] = int(ctx)
+
+        out = (
+            item.get("max_output_tokens")
+            or item.get("output_token_limit")
+        )
+        if isinstance(out, int) and out > 0:
+            entry["max_output_tokens"] = int(out)
+
+        # Provider-specific descriptive fields.
+        publisher = item.get("publisher")
+        if isinstance(publisher, str) and publisher:
+            entry["publisher"] = publisher
+
+        arch = item.get("arch")
+        if isinstance(arch, str) and arch:
+            entry["architecture"] = arch
+
+        family = item.get("family")
+        if isinstance(family, str) and family:
+            entry["family"] = family
+
+        params = item.get("parameter_size")
+        if isinstance(params, str) and params:
+            entry["params_string"] = params
+
+        quant = (
+            item.get("quantization")
+            or item.get("quantization_level")
+        )
+        if isinstance(quant, str) and quant:
+            entry["quantization"] = {"name": quant}
+
+        # LM Studio ``type`` field overrides the default "llm".
+        model_type = item.get("type")
+        if isinstance(model_type, str) and model_type:
+            entry["type"] = model_type
+
+        metadata[mid] = entry
+
+    return sorted(set(model_ids)), metadata
+
+
+def save_metadata_cache_merge(new_meta: dict) -> None:
+    """
+    Merge new metadata into the cache while preserving manual overrides.
+
+    Used exclusively by ``/fetch-models`` so that a rescan does not
+    clobber any capability the user set by hand. Entries not present
+    in the cache are added verbatim; existing entries are merged
+    field by field via ``_merge_metadata_entries``.
+    """
+    data: dict = {}
+    if METADATA_CACHE.exists():
+        try:
+            with open(METADATA_CACHE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            data = {}
+
+    for key, new_entry in new_meta.items():
+        try:
+            if key in data and isinstance(data[key], dict):
+                data[key] = _merge_metadata_entries(data[key], new_entry)
+            else:
+                data[key] = new_entry
+        except Exception as merge_err:
+            # Never abort the whole merge because of a single entry.
+            logger.warning(
+                "merge_metadata_entries failed for key %r: %s — "
+                "storing new entry verbatim",
+                key,
+                merge_err,
+            )
+            data[key] = new_entry
+
+    try:
+        METADATA_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = METADATA_CACHE.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        tmp.replace(METADATA_CACHE)
+    except Exception as e:
+        logger.warning(f"Error saving merged metadata cache: {e}")
 
 
 @router.get("")
@@ -360,7 +736,64 @@ class FetchModelsRequest(BaseModel):
 
 @router.post("/fetch-models")
 async def fetch_available_models(payload: FetchModelsRequest):
-    """Query endpoint for dynamically discovered model identifiers and metadata."""
+    """
+    Discover available models from the provider endpoint, then — for
+    providers with a capability endpoint — query each model's
+    capabilities live and cache the results.
+
+    Flow
+    ----
+        1. GET ``<metadata_endpoint or base>/models`` → list of model
+           IDs plus any metadata the provider exposes there.
+
+        2. Live capability query per model:
+             * Ollama     → ``POST /api/show``
+             * LM Studio  → ``GET /api/v0/models``
+             * Google     → ``GET /v1beta/models/{name}``
+             * OpenAI / Anthropic / DeepSeek / others → skipped
+               (no capability endpoint exists; the entries are saved
+               with only what ``/models`` reported.)
+
+        3. Merge results into ``models_metadata.json`` in a MERGE-AWARE
+           fashion: any capability the user has previously set manually
+           (``capability_sources[field] == "manual"``) is preserved,
+           even when the live scan disagrees.
+
+    The frontend calls this via the "Scan Models" button. The result is
+    a complete per-model metadata snapshot ready to be used by
+    ``lookup_model_facts`` (and therefore by the runtime) without any
+    further network calls.
+    """
+    try:
+        return await _fetch_available_models_impl(payload)
+    except BaseException as exc:
+        # The exception handler itself must NEVER raise — otherwise the
+        # original error becomes a 500 with a plain-text body.
+        try:
+            logger.exception(
+                "Unhandled error in fetch_available_models for provider %r: %s",
+                getattr(payload, "provider_id", "?"),
+                exc,
+            )
+        except Exception:
+            pass
+
+        try:
+            err_type = type(exc).__name__
+            err_msg = str(exc)
+        except Exception:
+            err_type = "UnknownError"
+            err_msg = "<exception stringification failed>"
+
+        return {
+            "ok": False,
+            "error": f"Internal error: {err_type}: {err_msg}",
+            "models": [],
+            "models_metadata": {},
+        }
+
+
+async def _fetch_available_models_impl(payload: FetchModelsRequest):
     api_key = (payload.api_key or "").strip()
     if is_masked_secret_value(api_key):
         current = read_raw_config()
@@ -374,8 +807,7 @@ async def fetch_available_models(payload: FetchModelsRequest):
         headers["Authorization"] = f"Bearer {api_key}"
 
     # ------------------------------------------------------------------
-    # Helper: parse a list of model dicts and extract context metadata.
-    # Shared by all branches to keep parsing consistent.
+    # Helper: parse a /models response into (ids, metadata).
     # ------------------------------------------------------------------
     def _parse_model_list(raw_list: list) -> tuple:
         ids: list = []
@@ -389,7 +821,6 @@ async def fetch_available_models(payload: FetchModelsRequest):
             mid_str = str(mid)
             ids.append(mid_str)
 
-            # Also index the short form for "models/xxx" style IDs.
             if "/" in mid_str:
                 short = mid_str.rsplit("/", 1)[-1]
                 if short and short != mid_str:
@@ -425,11 +856,54 @@ async def fetch_available_models(payload: FetchModelsRequest):
         return sorted(set(ids)), meta
 
     # ------------------------------------------------------------------
-    # Branch 1: Explicit metadata endpoint from the vault (highest priority).
-    # Zero hardcoded provider logic.
+    # Step 1 — discover model list.
+    #
+    # [M11] Branch 0 takes priority: adapter-based discovery via the
+    # provider factory. Native adapters own their own SDK, auth
+    # headers, and response parsing, so this is the ONLY path that
+    # works correctly for Anthropic (needs x-api-key), Google (needs
+    # x-goog-api-key), and any future provider with a non-Bearer
+    # auth scheme.
+    #
+    # On any failure (unknown provider, adapter crash, empty
+    # response) we fall through to the legacy HTTP branches below,
+    # so custom OpenAI-compatible endpoints keep working exactly as
+    # they did before M11.
     # ------------------------------------------------------------------
+    model_ids: list = []
+    metadata: dict = {}
+    discovery_error: Optional[str] = None
+    discovery_method: str = "http"
+
+    native_id = _NATIVE_PROVIDER_MAP.get(p_id) or _NATIVE_PROVIDER_MAP.get(p_type)
+    if native_id:
+        adapter_models = await _discover_via_adapter(native_id, base, api_key)
+        if adapter_models:
+            adapter_ids, adapter_meta = _parse_adapter_model_list(adapter_models)
+            if adapter_ids:
+                model_ids = adapter_ids
+                metadata = adapter_meta
+                discovery_method = "adapter"
+                logger.info(
+                    "[fetch-models] Adapter %r discovered %d model(s).",
+                    native_id,
+                    len(adapter_ids),
+                )
+            else:
+                logger.debug(
+                    "[fetch-models] Adapter %r returned %d raw entries, "
+                    "none parsable.",
+                    native_id,
+                    len(adapter_models),
+                )
+
     explicit_meta = (payload.metadata_endpoint or "").strip()
-    if explicit_meta:
+
+    if model_ids:
+        # Branch 0 already produced the list — skip legacy branches.
+        pass
+    elif explicit_meta:
+        # Branch 1 — explicit metadata endpoint from the vault.
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(explicit_meta, headers=headers)
@@ -443,13 +917,6 @@ async def fetch_available_models(payload: FetchModelsRequest):
                 data = resp.json()
                 raw_list = data.get("data") or data.get("models") or []
                 model_ids, metadata = _parse_model_list(raw_list)
-                if metadata:
-                    save_metadata_cache(metadata)
-                return {
-                    "ok": True,
-                    "models": model_ids,
-                    "models_metadata": metadata,
-                }
         except Exception as exc:
             return {
                 "ok": False,
@@ -458,12 +925,9 @@ async def fetch_available_models(payload: FetchModelsRequest):
                 "models_metadata": {},
             }
 
-    # ------------------------------------------------------------------
-    # Branch 2: LM Studio fallback when no explicit endpoint is set.
-    # Tries /api/v1/models, /api/v0/models, then <base>/models.
-    # This is best-effort only; the preferred path is Branch 1.
-    # ------------------------------------------------------------------
-    if "lmstudio" in p_id or "lmstudio" in p_type or "1234" in base:
+    elif "lmstudio" in p_id or "lmstudio" in p_type or "1234" in base:
+        # Branch 2 — LM Studio. Try /api/v1/models, /api/v0/models,
+        # then /models in that order.
         clean_base = base.replace("/v1", "").rstrip("/")
         for ep in (
             f"{clean_base}/api/v1/models",
@@ -480,143 +944,213 @@ async def fetch_available_models(payload: FetchModelsRequest):
                     if not raw_models:
                         continue
                     model_ids, metadata = _parse_model_list(raw_models)
-                    if metadata:
-                        save_metadata_cache(metadata)
-                    return {
-                        "ok": True,
-                        "models": model_ids,
-                        "models_metadata": metadata,
-                    }
+                    break
             except Exception:
                 continue
-        # If all LM Studio endpoints failed, fall through to Branch 3.
 
-    # ------------------------------------------------------------------
-    # Branch 3: Generic `<base>/models` — works for DeepSeek, Anthropic,
-    # OpenAI-compat servers. Providers that don't return context there
-    # simply yield empty `models_metadata`; the UI reports this honestly.
-    # ------------------------------------------------------------------
-    url = base if base.endswith("/models") else f"{base}/models"
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, headers=headers)
-            if resp.status_code != 200:
-                return {
-                    "ok": False,
-                    "error": f"HTTP {resp.status_code}",
-                    "models": [],
-                    "models_metadata": {},
-                }
-            data = resp.json()
-            raw_list = data.get("data", []) or data.get("models", [])
-            model_ids, metadata = _parse_model_list(raw_list)
-            if metadata:
-                save_metadata_cache(metadata)
-            return {
-                "ok": True,
-                "models": model_ids,
-                "models_metadata": metadata,
-            }
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": f"Failed: {str(e)}",
-            "models": [],
-            "models_metadata": {},
-        }
+        if not model_ids:
+            # Fall back to generic /models probe.
+            url = base if base.endswith("/models") else f"{base}/models"
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(url, headers=headers)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        raw_list = data.get("data", []) or data.get("models", [])
+                        model_ids, metadata = _parse_model_list(raw_list)
+            except Exception:
+                pass
 
-    # ------------------------------------------------------------------
-    # Query the endpoint EXACTLY as configured in the vault. No provider
-    # branching, no URL rewriting, no field-name guessing per provider.
-    #
-    # The vault's `baseUrl` is the single source of truth. If a provider
-    # doesn't return context info from `<baseUrl>/models`, that is the
-    # provider's limitation — the caller (UI) reports it honestly.
-    # ------------------------------------------------------------------
-    url = base if base.endswith("/models") else f"{base}/models"
+    elif "ollama" in p_id or "ollama" in p_type or "11434" in base:
+        # Branch 2b — Ollama. Ollama does NOT expose `/models` at all.
+        # It offers two discovery endpoints:
+        #   * /api/tags  (native)  -> {models: [{name, model, ...}]}
+        #   * /v1/models (OpenAI-compat shim) -> {data: [{id, ...}]}
+        # We try native first (richer response), then the compat shim.
+        clean_base = base.replace("/v1", "").rstrip("/")
+        candidate_urls = [
+            f"{clean_base}/api/tags",
+            f"{clean_base}/v1/models",
+            f"{base}/models" if base.endswith("/v1") else None,
+        ]
+        for ep in candidate_urls:
+            if ep is None:
+                continue
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(ep, headers=headers)
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json()
+                    raw_models = data.get("models") or data.get("data") or []
+                    if not raw_models:
+                        continue
+                    model_ids, metadata = _parse_model_list(raw_models)
+                    if model_ids:
+                        break
+            except Exception:
+                continue
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, headers=headers)
-            if resp.status_code != 200:
-                return {
-                    "ok": False,
-                    "error": f"HTTP {resp.status_code}",
-                    "models": [],
-                    "models_metadata": {},
-                }
-
-            data = resp.json()
-            raw_list = data.get("data", []) or data.get("models", [])
-
-            model_ids: list = []
-            metadata: dict = {}
-
-            for m in raw_list:
-                if not isinstance(m, dict):
-                    continue
-
-                mid = m.get("id") or m.get("name")
-                if not mid:
-                    continue
-                mid_str = str(mid)
-                model_ids.append(mid_str)
-
-                # If the model id contains a slash (Google's "models/xxx"
-                # format), also index it by the short name so lookups by
-                # either form succeed.
-                if "/" in mid_str:
-                    short = mid_str.rsplit("/", 1)[-1]
-                    if short and short != mid_str:
-                        model_ids.append(short)
-
-                # Extract context window from any field present. The
-                # caller decides what to do if none exists — we do not
-                # fabricate values.
-                ctx = (
-                    m.get("max_context_length")
-                    or m.get("context_length")
-                    or m.get("context_window")
-                    or m.get("inputTokenLimit")
-                    or m.get("max_tokens")
-                )
-                out = (
-                    m.get("max_output_tokens")
-                    or m.get("max_completion_tokens")
-                    or m.get("outputTokenLimit")
-                )
-
-                if ctx is not None or out is not None:
-                    entry = {
-                        "key": mid_str,
-                        "type": m.get("type", "llm"),
-                        "display_name": m.get("display_name")
-                        or m.get("displayName")
-                        or mid_str,
-                        "max_context_length": int(ctx) if ctx else None,
-                        "max_output_tokens": int(out) if out else None,
+    else:
+        # Branch 3 — generic <base>/models.
+        url = base if base.endswith("/models") else f"{base}/models"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code != 200:
+                    return {
+                        "ok": False,
+                        "error": f"HTTP {resp.status_code}",
+                        "models": [],
+                        "models_metadata": {},
                     }
-                    metadata[mid_str] = entry
-                    if "/" in mid_str:
-                        short = mid_str.rsplit("/", 1)[-1]
-                        if short and short not in metadata:
-                            metadata[short] = {**entry, "key": short}
-
-            if metadata:
-                save_metadata_cache(metadata)
-
+                data = resp.json()
+                raw_list = data.get("data", []) or data.get("models", [])
+                model_ids, metadata = _parse_model_list(raw_list)
+        except Exception as e:
             return {
-                "ok": True,
-                "models": sorted(list(set(model_ids))),
-                "models_metadata": metadata,
+                "ok": False,
+                "error": f"Failed: {str(e)}",
+                "models": [],
+                "models_metadata": {},
             }
-    except Exception as e:
+
+    if not model_ids:
         return {
             "ok": False,
-            "error": f"Failed: {str(e)}",
+            "error": discovery_error or "No models discovered from provider.",
             "models": [],
             "models_metadata": {},
         }
+
+    # ------------------------------------------------------------------
+    # Step 2 — live capability enrichment.
+    #
+    # Only three providers expose a capability endpoint; the rest skip
+    # this step and are saved with whatever /models reported. The
+    # merge helper preserves any existing manual overrides.
+    # ------------------------------------------------------------------
+    # Live enrichment per-model is ONLY useful when the discovery layer
+    # did NOT already return rich metadata. For Google, the adapter's
+    # `discover_models()` already returns input_token_limit /
+    # output_token_limit / supported_generation_methods — re-querying
+    # 60 models at 2s each is pure latency (34s+) for zero gain.
+    #
+    # Ollama and LM Studio DO need enrichment: their `/models` returns
+    # only IDs, and `/api/show` / `/api/v0/models` add capabilities.
+    #
+    # Google is intentionally excluded. See comment above.
+    live_supported = p_id in (
+        "ollama",
+        "lmstudio",
+        "lm_studio",
+        "lm-studio",
+        "ollama_native",
+        "lmstudio_native",
+    )
+
+    if live_supported:
+        try:
+            connection = ConnectionContext(
+                connection_id=p_id or "default",
+                provider_id=p_id or "custom",
+                base_url=base,
+                api_key=api_key or None,
+            )
+            live_results = await query_providers_batch(
+                provider_id=p_id,
+                model_ids=model_ids,
+                connection=connection,
+            )
+            for mid, live_result in live_results.items():
+                live_meta = live_result.to_metadata_dict()
+                if mid in metadata:
+                    metadata[mid] = _merge_metadata_entries(
+                        metadata[mid], live_meta
+                    )
+                else:
+                    metadata[mid] = live_meta
+            logger.info(
+                "[fetch-models] Live enrichment for %s: %d/%d models "
+                "returned capability data.",
+                p_id,
+                len(live_results),
+                len(model_ids),
+            )
+        except Exception as exc:
+            # Live query is best-effort — the /models data is still
+            # persisted and returned.
+            logger.warning(
+                "[fetch-models] Live capability enrichment failed for "
+                "provider %s: %s",
+                p_id,
+                exc,
+            )
+
+    # ------------------------------------------------------------------
+    # Step 3 — merge-aware persistence.
+    #
+    # Preserves manual overrides. The frontend's `ModelInfoModal` is
+    # the only writer of manual sources, so rescanning cannot clobber
+    # the user's explicit choices.
+    # ------------------------------------------------------------------
+    if metadata:
+        try:
+            save_metadata_cache_merge(metadata)
+        except BaseException as persist_err:
+            # Persistence failure must NEVER break the response —
+            # the caller can still use the returned models_metadata.
+            logger.warning(
+                "[fetch-models] Persistence failed (non-fatal): %s",
+                persist_err,
+                exc_info=True,
+            )
+
+    # ----------------------------------------------------------------
+    # Guard against non-serializable values from provider SDKs.
+    # Google's `google-genai` SDK sometimes returns pydantic models,
+    # enums, or wrapper objects in `display_name` / `family` / etc.
+    # These pass through `_parse_adapter_model_list` (which only
+    # checks `isinstance(..., str)` for some fields), and can later
+    # fail FastAPI's jsonable_encoder — producing an opaque HTTP 500
+    # with a plaintext "Internal Server Error" body.
+    # ----------------------------------------------------------------
+    def _json_safe(value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {str(k): _json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_json_safe(v) for v in value]
+        if hasattr(value, "value"):
+            try:
+                return _json_safe(value.value)
+            except Exception:
+                pass
+        try:
+            return str(value)
+        except Exception:
+            return "<unserializable>"
+
+    try:
+        json.dumps({"models": model_ids, "models_metadata": metadata})
+    except TypeError as _ser_err:
+        logger.warning(
+            "[fetch-models] Non-JSON-serializable value detected — "
+            "sanitizing response. Detail: %s",
+            _ser_err,
+        )
+        return {
+            "ok": True,
+            "models": _json_safe(model_ids),
+            "models_metadata": _json_safe(metadata),
+        }
+
+    return {
+        "ok": True,
+        "models": model_ids,
+        "models_metadata": metadata,
+    }
 
 
 # ============================================================

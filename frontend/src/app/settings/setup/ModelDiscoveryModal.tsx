@@ -1,4 +1,6 @@
-﻿"use client";
+﻿// frontend/src/app/settings/setup/ModelDiscoveryModal.tsx
+"use client";
+
 import { ModelInfoModal } from "@/components/models/ModelInfoModal";
 import React, { useState, useEffect, useMemo } from "react";
 import {
@@ -18,9 +20,11 @@ import {
   Eye,
   Wrench,
   Database,
-  Layers
+  Layers,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { inferModelCapabilities, fetchModelFacts } from "@/lib/modelMetadata";
+import type { ModelFacts, CapabilitySource } from "@/lib/modelMetadata";
 
 interface ModelDiscoveryModalProps {
   isOpen: boolean;
@@ -43,13 +47,17 @@ export function ModelDiscoveryModal({
   apiKey,
   providerType = "",
   initialSavedModels = [],
-  onSaveModels
+  onSaveModels,
 }: ModelDiscoveryModalProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
   const [modelsMetadata, setModelsMetadata] = useState<Record<string, any>>({});
-  const [selectedModels, setSelectedModels] = useState<Set<string>>(new Set(initialSavedModels));
-  const [defaultModel, setDefaultModel] = useState<string>(initialSavedModels[0] || "");
+  const [selectedModels, setSelectedModels] = useState<Set<string>>(
+    new Set(initialSavedModels)
+  );
+  const [defaultModel, setDefaultModel] = useState<string>(
+    initialSavedModels[0] || ""
+  );
   const [isLoading, setIsLoading] = useState(false);
   const [infoModalModel, setInfoModalModel] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -58,18 +66,41 @@ export function ModelDiscoveryModal({
     setIsLoading(true);
     setError(null);
     try {
-      const res = await fetch("http://localhost:8088/api/config/fetch-models", {
+      // Relative path — routed through Next.js rewrites so the frontend
+      // works regardless of where the backend is deployed.
+      const res = await fetch("/api/config/fetch-models", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           base_url: baseUrl,
           api_key: apiKey,
           provider_id: providerId,
-          provider_type: providerType
-        })
+          provider_type: providerType,
+        }),
       });
-      const data = await res.json();
-      if (data.ok && Array.isArray(data.models) && data.models.length > 0) {
+      // Read the raw text FIRST so that a non-JSON response (e.g.
+      // Starlette's "Internal Server Error" plain-text fallback) shows
+      // the real HTTP status + snippet instead of a cryptic
+      // "Unexpected token 'I'" parse error.
+      const rawText = await res.text().catch(() => "");
+      let data: any = null;
+      try {
+        data = rawText ? JSON.parse(rawText) : null;
+      } catch {
+        throw new Error(
+          `Provider discovery returned non-JSON response (HTTP ${res.status}): ` +
+            (rawText.slice(0, 240) || "<empty body>")
+        );
+      }
+
+      if (!res.ok) {
+        throw new Error(
+          `Provider discovery failed (HTTP ${res.status}): ` +
+            (data?.error || data?.message || rawText.slice(0, 240))
+        );
+      }
+
+      if (data && data.ok && Array.isArray(data.models) && data.models.length > 0) {
         setDiscoveredModels(data.models);
         if (data.models_metadata) setModelsMetadata(data.models_metadata);
         // Pre-select models if already saved, or select first 3 if none saved
@@ -79,7 +110,8 @@ export function ModelDiscoveryModal({
           setDefaultModel(topFew[0] || "");
         }
       } else {
-        const msg = data.error || data.message || "No models returned from provider API.";
+        const msg =
+          data?.error || data?.message || "No models returned from provider API.";
         setError(msg);
       }
     } catch (err: any) {
@@ -143,6 +175,75 @@ export function ModelDiscoveryModal({
     onClose();
   };
 
+  // ------------------------------------------------------------------
+  // Fetch capability facts for all discovered models in the background.
+  // This guarantees the badges here match EXACTLY what ModelInfoModal
+  // shows, because both rely on the same backend catalog.
+  // ------------------------------------------------------------------
+  const [modelFactsMap, setModelFactsMap] = useState<Record<string, ModelFacts>>({});
+
+  useEffect(() => {
+    if (!providerId || discoveredModels.length === 0) return;
+
+    let cancelled = false;
+    const fetchAllFacts = async () => {
+      const newFacts: Record<string, ModelFacts> = {};
+      // Chunking to avoid overwhelming the backend/browser with 60+ requests
+      const batchSize = 10;
+      for (let i = 0; i < discoveredModels.length; i += batchSize) {
+        if (cancelled) return;
+        const batch = discoveredModels.slice(i, i + batchSize);
+        await Promise.all(
+          batch.map(async (mId) => {
+            if (modelFactsMap[mId]) return; // Already loaded
+            try {
+              const facts = await fetchModelFacts(providerId, mId);
+              if (facts) newFacts[mId] = facts;
+            } catch (e) {
+              // Ignore individual fetch errors
+            }
+          })
+        );
+      }
+      if (!cancelled && Object.keys(newFacts).length > 0) {
+        setModelFactsMap((prev) => ({ ...prev, ...newFacts }));
+      }
+    };
+
+          fetchAllFacts();
+      return () => { cancelled = true; };
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [discoveredModels, providerId]);
+/* ------------------------------------------------------------------ */
+  /* Source hint helper                                                 */
+  /*                                                                    */
+  /* Turns a CapabilitySource string into a human-readable label       */
+  /* shown in the badge tooltip. Mirrors the backend enum exactly, so  */
+  /* the user always knows WHERE the capability fact came from.        */
+  /* ------------------------------------------------------------------ */
+  const sourceHint = (source: string | undefined): string => {
+    switch (source) {
+      case "manual":
+        return "Set manually by you";
+      case "provider_live":
+        return "Reported by provider (live)";
+      case "provider_catalog":
+        return "Reported by provider catalog";
+      case "provider_metadata":
+        return "Reported by provider metadata";
+      case "model_metadata":
+        return "Saved in model metadata";
+      case "huggingface_config":
+        return "From HuggingFace config";
+      case "external_registry":
+        return "From LiteLLM registry";
+      case "capability_probe":
+        return "Confirmed by capability probe";
+      default:
+        return "Source unknown";
+    }
+  };
+
   if (!isOpen) return null;
 
   return (
@@ -181,7 +282,10 @@ export function ModelDiscoveryModal({
         {/* Search & Actions Bar */}
         <div className="p-3.5 border-b border-border/60 bg-muted/20 flex flex-col gap-2.5">
           <div className="relative">
-            <Search size={14} className="absolute left-2.5 top-2.5 text-muted-foreground" />
+            <Search
+              size={14}
+              className="absolute left-2.5 top-2.5 text-muted-foreground"
+            />
             <input
               type="text"
               placeholder="Search available models..."
@@ -193,7 +297,9 @@ export function ModelDiscoveryModal({
 
           <div className="flex items-center justify-between text-xs">
             <span className="text-muted-foreground font-mono text-[11px]">
-              Selected: <strong className="text-foreground">{selectedModels.size}</strong> of {discoveredModels.length} models
+              Selected:{" "}
+              <strong className="text-foreground">{selectedModels.size}</strong>{" "}
+              of {discoveredModels.length} models
             </span>
             <div className="flex items-center gap-2">
               <button
@@ -220,7 +326,10 @@ export function ModelDiscoveryModal({
                 disabled={isLoading}
                 className="text-[11px] text-primary hover:underline cursor-pointer flex items-center gap-1 disabled:opacity-50"
               >
-                <RefreshCw size={11} className={isLoading ? "animate-spin" : ""} />
+                <RefreshCw
+                  size={11}
+                  className={isLoading ? "animate-spin" : ""}
+                />
                 <span>Rescan</span>
               </button>
             </div>
@@ -232,7 +341,9 @@ export function ModelDiscoveryModal({
           {isLoading ? (
             <div className="h-44 flex flex-col items-center justify-center gap-2 text-muted-foreground">
               <RefreshCw size={22} className="animate-spin text-primary" />
-              <span className="text-xs">Querying available models from {providerName}...</span>
+              <span className="text-xs">
+                Querying available models from {providerName}...
+              </span>
             </div>
           ) : error ? (
             <div className="p-4 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-600 dark:text-rose-400 text-xs space-y-2">
@@ -260,11 +371,53 @@ export function ModelDiscoveryModal({
               const isSelected = selectedModels.has(modelId);
               const isDefault = defaultModel === modelId;
               const meta = modelsMetadata[modelId] || {};
-              
-              const isVision = meta.capabilities?.vision || modelId.toLowerCase().includes("vision") || modelId.toLowerCase().includes("-vl");
-              const isTools = meta.capabilities?.trained_for_tool_use || modelId.toLowerCase().includes("instruct") || modelId.toLowerCase().includes("tool");
-              const isReasoning = modelId.toLowerCase().includes("think") || modelId.toLowerCase().includes("reason") || modelId.toLowerCase().includes("-r1") || modelId.toLowerCase().includes("o1") || modelId.toLowerCase().includes("o3") || modelId.toLowerCase().includes("deepseek");
-              
+
+              /* ---------------------------------------------------------- */
+              /* Capability badges — read STRICTLY from metadata.           */
+              /*                                                            */
+              /* No name-pattern heuristics. A badge appears ONLY when the  */
+              /* metadata explicitly declares the capability as `true`.     */
+              /* When the metadata is silent (the common case for providers */
+              /* whose /models response has no capability fields — DeepSeek,*/
+              /* OpenAI, Anthropic), NO badge is shown. The user can open   */
+              /* the info modal to enable it manually.                      */
+              /*                                                            */
+              /* The `provider_live` source (Ollama / LM Studio / Google)   */
+              /* is populated during the last Scan Models run and appears   */
+              /* here immediately; for other providers, `manual` is the     */
+              /* only way to declare capabilities.                          */
+              /* ---------------------------------------------------------- */
+              // 1. Get base caps from local inference (vault/patterns)
+              const inferredCaps = inferModelCapabilities(modelId, meta as any, providerId) || {};
+
+              // 2. Get fetched catalog facts (same as ModelInfoModal)
+              const facts = modelFactsMap[modelId];
+
+              // 3. Determine final capabilities (facts override local)
+              let isVision = inferredCaps.isVision || meta.capabilities?.vision === true;
+              let isTools = inferredCaps.isTools || meta.capabilities?.trained_for_tool_use === true;
+              let isReasoning = inferredCaps.isReasoning || meta.capabilities?.reasoning === true;
+
+              let reasoningSource = inferredCaps.reasoningSource || meta.capability_sources?.reasoning || "unknown";
+              let visionSource = inferredCaps.visionSource || meta.capability_sources?.vision || "unknown";
+              let toolsSource = inferredCaps.toolsSource || meta.capability_sources?.trained_for_tool_use || "unknown";
+
+              if (facts) {
+                isVision = facts.vision.value;
+                isTools = facts.tools.value;
+                isReasoning = facts.reasoning.value;
+
+                reasoningSource = (facts.reasoning.source as CapabilitySource) || reasoningSource;
+                visionSource = (facts.vision.source as CapabilitySource) || visionSource;
+                toolsSource = (facts.tools.source as CapabilitySource) || toolsSource;
+              }
+
+              const capabilitySources = {
+                reasoning: reasoningSource,
+                vision: visionSource,
+                trained_for_tool_use: toolsSource,
+              };
+
               return (
                 <div
                   key={modelId}
@@ -277,12 +430,19 @@ export function ModelDiscoveryModal({
                 >
                   <div className="flex items-center justify-between w-full">
                     <div className="flex items-center gap-2.5 truncate flex-1 mr-2">
-                      <span className={`w-4 h-4 rounded flex items-center justify-center border transition-colors shrink-0 ${
-                        isSelected ? "bg-primary text-primary-foreground border-primary" : "border-border bg-background"
-                      }`}>
+                      <span
+                        className={`w-4 h-4 rounded flex items-center justify-center border transition-colors shrink-0 ${
+                          isSelected
+                            ? "bg-primary text-primary-foreground border-primary"
+                            : "border-border bg-background"
+                        }`}
+                      >
                         {isSelected && <Check size={11} />}
                       </span>
-                      <span className="truncate text-xs font-bold" title={meta.display_name || modelId}>
+                      <span
+                        className="truncate text-xs font-bold"
+                        title={meta.display_name || modelId}
+                      >
                         {meta.display_name || modelId}
                       </span>
                       <button
@@ -298,7 +458,10 @@ export function ModelDiscoveryModal({
                       </button>
                     </div>
 
-                    <div className="flex items-center gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+                    <div
+                      className="flex items-center gap-1 shrink-0"
+                      onClick={(e) => e.stopPropagation()}
+                    >
                       {isSelected && (
                         <button
                           type="button"
@@ -318,14 +481,52 @@ export function ModelDiscoveryModal({
 
                   {/* Badges Row */}
                   <div className="flex flex-wrap items-center gap-1.5 pl-6 font-sans">
-                     {isReasoning && <span className="flex items-center gap-1 text-[9.5px] font-semibold px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20" title="Reasoning Model"><Brain size={10}/> Reasoning</span>}
-                     {isVision && <span className="flex items-center gap-1 text-[9.5px] font-semibold px-1.5 py-0.5 rounded bg-violet-500/10 text-violet-600 dark:text-violet-400 border border-violet-500/20" title="Vision Capable"><Eye size={10}/> Vision</span>}
-                     {isTools && <span className="flex items-center gap-1 text-[9.5px] font-semibold px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20" title="Tool Calling"><Wrench size={10}/> Tools</span>}
-                     
-                     {meta.params_string && <span className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground border border-border"><Cpu size={9}/> {meta.params_string}</span>}
-                     {meta.max_context_length && <span className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground border border-border"><Database size={9}/> {Math.round(meta.max_context_length / 1024)}K ctx</span>}
-                     {meta.quantization?.name && <span className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground border border-border"><Layers size={9}/> {meta.quantization.name}</span>}
-                     {meta.publisher && <span className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground border border-border">{meta.publisher}</span>}
+                    {isReasoning && (
+                      <span
+                        className="flex items-center gap-1 text-[9.5px] font-semibold px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20"
+                        title={`Reasoning — ${sourceHint(capabilitySources.reasoning)}`}
+                      >
+                        <Brain size={10} /> Reasoning
+                      </span>
+                    )}
+                    {isVision && (
+                      <span
+                        className="flex items-center gap-1 text-[9.5px] font-semibold px-1.5 py-0.5 rounded bg-violet-500/10 text-violet-600 dark:text-violet-400 border border-violet-500/20"
+                        title={`Vision — ${sourceHint(capabilitySources.vision)}`}
+                      >
+                        <Eye size={10} /> Vision
+                      </span>
+                    )}
+                    {isTools && (
+                      <span
+                        className="flex items-center gap-1 text-[9.5px] font-semibold px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20"
+                        title={`Tools — ${sourceHint(capabilitySources.trained_for_tool_use)}`}
+                      >
+                        <Wrench size={10} /> Tools
+                      </span>
+                    )}
+
+                    {meta.params_string && (
+                      <span className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground border border-border">
+                        <Cpu size={9} /> {meta.params_string}
+                      </span>
+                    )}
+                    {meta.max_context_length && (
+                      <span className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground border border-border">
+                        <Database size={9} />{" "}
+                        {Math.round(meta.max_context_length / 1024)}K ctx
+                      </span>
+                    )}
+                    {meta.quantization?.name && (
+                      <span className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground border border-border">
+                        <Layers size={9} /> {String(meta.quantization.name)}
+                      </span>
+                    )}
+                    {meta.publisher && (
+                      <span className="flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground border border-border">
+                        {meta.publisher}
+                      </span>
+                    )}
                   </div>
                 </div>
               );
@@ -354,28 +555,21 @@ export function ModelDiscoveryModal({
             <span>Save Selected ({selectedModels.size})</span>
           </Button>
         </div>
-            {/* Nested Technical Specs Modal */}
 
-            <ModelInfoModal
-
-              isOpen={Boolean(infoModalModel)}
-
-              onClose={() => setInfoModalModel(null)}
-
-              modelKey={infoModalModel || ""}
-
-              explicitMeta={infoModalModel ? modelsMetadata[infoModalModel] : null}
-
-            />
-
-          </div>
-
-        </div>
-
-        );
+        {/* Nested Technical Specs Modal — pass providerId so the
+            capability facts are fetched from /api/catalog. */}
+        <ModelInfoModal
+          isOpen={Boolean(infoModalModel)}
+          onClose={() => setInfoModalModel(null)}
+          modelKey={infoModalModel || ""}
+          explicitMeta={
+            infoModalModel ? modelsMetadata[infoModalModel] || null : null
+          }
+          providerId={providerId}
+        />
+      </div>
+    </div>
+  );
 }
 
 export default ModelDiscoveryModal;
-
-
-

@@ -1,11 +1,96 @@
-﻿import type { ModelMetadata } from "./types";
+﻿// frontend/src/lib/modelMetadata.ts
+
+import type { ModelMetadata } from "./types";
 
 export const METADATA_STORAGE_KEY = "omweb_models_metadata_vault";
 
+/* -------------------------------------------------------------------------- */
+/* Source vocabulary                                                          */
+/* -------------------------------------------------------------------------- */
+
+export type CapabilitySource =
+  | "manual"
+  | "provider_live"
+  | "model_metadata"
+  | "provider_metadata"
+  | "huggingface_config"
+  | "external_registry"
+  | "provider_catalog"
+  | "capability_probe"
+  | "runtime_observation"
+  | "unknown";
+
+/* -------------------------------------------------------------------------- */
+/* Capability facts (from /api/catalog/models/{id})                           */
+/* -------------------------------------------------------------------------- */
+
+export interface CapabilityFact {
+  value: boolean;
+  source: CapabilitySource | string;
+  known: boolean;
+}
+
+export interface ModelFacts {
+  ok: boolean;
+  provider_id: string;
+  model_id: string;
+
+  vision: CapabilityFact;
+  tools: CapabilityFact;
+  reasoning: CapabilityFact;
+
+  reasoning_mode: string;
+  reasoning_effort_levels: string[];
+  reasoning_default_effort: string | null;
+  reasoning_min_budget_tokens: number | null;
+  reasoning_max_budget_tokens: number | null;
+
+  structured_output_mode: string;
+
+  audio: CapabilityFact;
+  modalities_input: string[];
+  modalities_output: string[];
+
+  context_window: number | null;
+  context_source: string | null;
+
+  external_matches: Record<string, string>;
+}
+
+/* -------------------------------------------------------------------------- */
+/* InferredCapabilities (sync, from local vault)                              */
+/* -------------------------------------------------------------------------- */
+
 export interface InferredCapabilities {
+  /**
+   * Canonical provider identifier (e.g. "ollama", "lmstudio", "openai").
+   * Populated from the caller's providerId argument. Used by the Info
+   * Modal to distinguish "Run Scan Models" (actionable for Ollama /
+   * LM Studio / Google) from "Provider does not advertise capabilities"
+   * (OpenAI / Anthropic / DeepSeek).
+   */
+  provider_id: string | null;
+
   isVision: boolean;
   isTools: boolean;
   isReasoning: boolean;
+
+  visionState: "supported" | "unsupported" | "unknown";
+  toolsState: "supported" | "unsupported" | "unknown";
+  reasoningState: "supported" | "unsupported" | "unknown";
+
+  visionSource: CapabilitySource;
+  toolsSource: CapabilitySource;
+  reasoningSource: CapabilitySource;
+
+  reasoningMode: string;
+  reasoningEffortLevels: string[];
+  reasoningDefaultEffort: string | null;
+  reasoningMinBudgetTokens: number | null;
+  reasoningMaxBudgetTokens: number | null;
+
+  matchedMetadataKey: string | null;
+
   contextDisplay: string | null;
   paramsDisplay: string | null;
   quantDisplay: string | null;
@@ -15,6 +100,71 @@ export interface InferredCapabilities {
   loadedContext: number | null;
   maxContext: number | null;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Composite metadata key helpers                                             */
+/* -------------------------------------------------------------------------- */
+
+export function buildModelMetadataKey(
+  providerId: string | null | undefined,
+  modelId: string,
+  connectionId?: string | null
+): string {
+  const provider = (providerId || "").trim().toLowerCase();
+  const model = (modelId || "").trim();
+  const conn = (connectionId || "").trim();
+  if (conn) return `${provider}::${conn}::${model}`;
+  if (provider) return `${provider}::${model}`;
+  return model;
+}
+
+export function getMetadataCandidateKeys(
+  providerId: string | null | undefined,
+  modelId: string,
+  connectionId?: string | null
+): string[] {
+  const provider = (providerId || "").trim().toLowerCase();
+  const model = (modelId || "").trim();
+  const conn = (connectionId || "").trim();
+  const keys: string[] = [];
+  const push = (k: string) => {
+    if (k && !keys.includes(k)) keys.push(k);
+  };
+
+  const modelVariants: string[] = [model];
+  if (model.includes("/")) {
+    const short = model.split("/").pop();
+    if (short && short !== model) modelVariants.push(short);
+  } else if (model) {
+    modelVariants.push(`models/${model}`);
+  }
+
+  if (conn) for (const m of modelVariants) push(`${provider}::${conn}::${m}`);
+  if (provider) for (const m of modelVariants) push(`${provider}::${m}`);
+  for (const m of modelVariants) push(m);
+
+  return keys;
+}
+
+export function lookupModelMetadata(
+  vault: Record<string, ModelMetadata>,
+  providerId: string | null | undefined,
+  modelId: string,
+  connectionId?: string | null
+): { meta: ModelMetadata | null; matchedKey: string | null } {
+  const candidates = getMetadataCandidateKeys(providerId, modelId, connectionId);
+  for (const key of candidates) {
+    const entry = vault[key];
+    if (entry && typeof entry === "object") {
+      return { meta: entry, matchedKey: key };
+    }
+  }
+  return { meta: null, matchedKey: null };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Vault I/O                                                                  */
+/* -------------------------------------------------------------------------- */
 
 export function getLocalMetadataVault(): Record<string, ModelMetadata> {
   if (typeof window === "undefined") return {};
@@ -26,30 +176,32 @@ export function getLocalMetadataVault(): Record<string, ModelMetadata> {
   }
 }
 
-export async function persistMetadataToServer(entries: Record<string, Partial<ModelMetadata>>) {
+export async function persistMetadataToServer(
+  entries: Record<string, Partial<ModelMetadata>>
+) {
   try {
-    // Relative path so the request is routed through Next.js rewrites
-    // (configured at build time via PELDRUN_BACKEND_URL). Using an
-    // absolute localhost URL would bypass those rewrites and silently
-    // pin the frontend to a hardcoded backend.
     await fetch("/api/config/models-metadata", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ metadata: entries })
+      body: JSON.stringify({ metadata: entries }),
     });
   } catch (err) {
     console.warn("Could not sync metadata with backend storage:", err);
   }
 }
 
-export function saveLocalMetadataVault(newEntries: Record<string, Partial<ModelMetadata>>, syncServer = true) {
+export function saveLocalMetadataVault(
+  newEntries: Record<string, Partial<ModelMetadata>>,
+  syncServer = true
+) {
   if (typeof window === "undefined") return;
   try {
     const current = getLocalMetadataVault();
     const updated = { ...current, ...newEntries };
     localStorage.setItem(METADATA_STORAGE_KEY, JSON.stringify(updated));
-    window.dispatchEvent(new CustomEvent("omweb:metadata-updated", { detail: updated }));
-
+    window.dispatchEvent(
+      new CustomEvent("omweb:metadata-updated", { detail: updated })
+    );
     if (syncServer) {
       persistMetadataToServer(newEntries);
     }
@@ -58,58 +210,238 @@ export function saveLocalMetadataVault(newEntries: Record<string, Partial<ModelM
   }
 }
 
+/* -------------------------------------------------------------------------- */
+/* Fetch merged facts from the backend catalog                                */
+/* -------------------------------------------------------------------------- */
+
 /**
- * Toggle reasoning mode manually for any model and persist permanently across reloads.
+ * Fetch capability facts from the backend catalog layer.
+ *
+ * The backend merges the local vault (which includes the last Scan
+ * Models results with `provider_live` sources), the LiteLLM external
+ * registry, and HuggingFace model configs into a single response with
+ * per-field source annotations. This function never triggers a
+ * provider query — that flow is triggered explicitly by Scan Models.
+ *
+ * Returns `null` on any failure (network, 4xx, 5xx, malformed JSON).
  */
-export function toggleModelReasoning(
-  modelKey: string | null | undefined,
+export async function fetchModelFacts(
+  providerId: string,
+  modelId: string,
+  connectionId?: string | null
+): Promise<ModelFacts | null> {
+  if (!providerId || !modelId) return null;
+  try {
+    const params = new URLSearchParams({ provider: providerId });
+    if (connectionId) params.set("connection_id", connectionId);
+    const url = `/api/catalog/models/${encodeURIComponent(
+      modelId
+    )}?${params.toString()}`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = (await res.json()) as ModelFacts;
+    return data && data.ok ? data : null;
+  } catch (err) {
+    console.warn(`fetchModelFacts failed for ${providerId}/${modelId}:`, err);
+    return null;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* User override writers                                                      */
+/* -------------------------------------------------------------------------- */
+
+function toggleBooleanCapability(
+  modelKey: string,
+  field: "vision" | "trained_for_tool_use",
   forceState?: boolean
 ): boolean {
-  if (typeof window === "undefined") return false;
-  if (!modelKey || typeof modelKey !== "string" || !modelKey.trim()) {
-    return false;
-  }
-  const currentVault = getLocalMetadataVault();
-  const currentMeta = currentVault[modelKey] || { key: modelKey, type: "llm" };
+  const vault = getLocalMetadataVault();
+  const currentMeta = vault[modelKey] || { key: modelKey, type: "llm" };
   const currentCaps = inferModelCapabilities(modelKey, currentMeta);
+  const currentBool =
+    field === "vision" ? currentCaps.isVision : currentCaps.isTools;
+  const nextState = typeof forceState === "boolean" ? forceState : !currentBool;
 
-  const nextState = typeof forceState === "boolean" ? forceState : !currentCaps.isReasoning;
+  const currentSources =
+    ((currentMeta as unknown as { capability_sources?: Record<string, string> })
+      .capability_sources) || {};
 
-  const updatedMeta: ModelMetadata = {
+  const updatedMeta = {
     ...currentMeta,
     capabilities: {
-      vision: currentCaps.isVision,
-      trained_for_tool_use: currentCaps.isTools,
       ...currentMeta.capabilities,
-      reasoning: nextState
-    }
-  };
+      [field]: nextState,
+    },
+    capability_sources: {
+      ...currentSources,
+      [field]: "manual",
+    },
+  } as unknown as ModelMetadata;
 
   saveLocalMetadataVault({ [modelKey]: updatedMeta }, true);
   return nextState;
 }
 
-export async function fetchServerMetadata(): Promise<Record<string, ModelMetadata>> {
+export function toggleModelVision(
+  modelKey: string | null | undefined,
+  forceState?: boolean
+): boolean {
+  if (typeof window === "undefined") return false;
+  if (!modelKey || !modelKey.trim()) return false;
+  return toggleBooleanCapability(modelKey, "vision", forceState);
+}
+
+export function toggleModelTools(
+  modelKey: string | null | undefined,
+  forceState?: boolean
+): boolean {
+  if (typeof window === "undefined") return false;
+  if (!modelKey || !modelKey.trim()) return false;
+  return toggleBooleanCapability(modelKey, "trained_for_tool_use", forceState);
+}
+
+export function toggleModelReasoning(
+  modelKey: string | null | undefined,
+  forceState?: boolean
+): boolean {
+  if (typeof window === "undefined") return false;
+  if (!modelKey || !modelKey.trim()) return false;
+
+  const currentVault = getLocalMetadataVault();
+  const currentMeta = currentVault[modelKey] || { key: modelKey, type: "llm" };
+  const currentCaps = inferModelCapabilities(modelKey, currentMeta);
+  const nextState =
+    typeof forceState === "boolean" ? forceState : !currentCaps.isReasoning;
+
+  const currentDetails =
+    ((currentMeta as unknown as { capability_details?: Record<string, unknown> })
+      .capability_details) || {};
+  const currentReasoningDetail =
+    (currentDetails.reasoning as Record<string, unknown> | undefined) || {};
+
+  const currentMode =
+    typeof currentReasoningDetail.mode === "string"
+      ? currentReasoningDetail.mode
+      : "toggle";
+  const effectiveMode =
+    currentMode === "automatic" || currentMode === "adaptive"
+      ? "toggle"
+      : currentMode;
+
+  const updatedMeta = {
+    ...currentMeta,
+    capabilities: {
+      ...currentMeta.capabilities,
+      reasoning: nextState,
+    },
+    capability_sources: {
+      ...((currentMeta as unknown as {
+        capability_sources?: Record<string, string>;
+      }).capability_sources || {}),
+      reasoning: "manual",
+    },
+    capability_details: {
+      ...currentDetails,
+      reasoning: {
+        ...currentReasoningDetail,
+        mode: effectiveMode,
+        state: nextState ? "supported" : "unsupported",
+      },
+    },
+  } as unknown as ModelMetadata;
+
+  saveLocalMetadataVault({ [modelKey]: updatedMeta }, true);
+  return nextState;
+}
+
+export function setModelReasoningEffort(
+  modelKey: string | null | undefined,
+  effort: string
+): void {
+  if (!modelKey || !modelKey.trim() || !effort) return;
+
+  const vault = getLocalMetadataVault();
+  const currentMeta = vault[modelKey] || { key: modelKey, type: "llm" };
+  const currentDetails =
+    ((currentMeta as unknown as { capability_details?: Record<string, unknown> })
+      .capability_details) || {};
+  const currentReasoningDetail =
+    (currentDetails.reasoning as Record<string, unknown> | undefined) || {};
+
+  const updatedMeta = {
+    ...currentMeta,
+    capabilities: {
+      ...currentMeta.capabilities,
+      reasoning: true,
+    },
+    capability_sources: {
+      ...((currentMeta as unknown as {
+        capability_sources?: Record<string, string>;
+      }).capability_sources || {}),
+      reasoning: "manual",
+    },
+    capability_details: {
+      ...currentDetails,
+      reasoning: {
+        ...currentReasoningDetail,
+        mode: "effort",
+        effort,
+        state: "supported",
+      },
+    },
+  } as unknown as ModelMetadata;
+
+  saveLocalMetadataVault({ [modelKey]: updatedMeta }, true);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Server sync                                                                */
+/* -------------------------------------------------------------------------- */
+
+export async function fetchServerMetadata(): Promise<
+  Record<string, ModelMetadata>
+> {
   try {
-    // Relative path - see next.config.mjs rewrites.
     const res = await fetch("/api/config/models-metadata");
     if (res.ok) {
       const data = await res.json();
       if (data.ok && data.metadata) {
-        // Merge server metadata with local manual overrides preserving user toggles
         const localVault = getLocalMetadataVault();
         const merged: Record<string, ModelMetadata> = { ...data.metadata };
 
         for (const [key, val] of Object.entries(localVault)) {
-          if (val && typeof val.capabilities?.reasoning === "boolean") {
+          if (!val) continue;
+          const localSources =
+            (val as unknown as { capability_sources?: Record<string, string> })
+              .capability_sources || {};
+          const hasManualOverride =
+            localSources.vision === "manual" ||
+            localSources.trained_for_tool_use === "manual" ||
+            localSources.reasoning === "manual";
+          if (hasManualOverride) {
             merged[key] = {
               ...(merged[key] || {}),
               ...val,
               capabilities: {
                 ...(merged[key]?.capabilities || {}),
-                ...val.capabilities
-              }
-            };
+                ...val.capabilities,
+              },
+              capability_sources: {
+                ...(((merged[key] as unknown as {
+                  capability_sources?: Record<string, string>;
+                }).capability_sources) || {}),
+                ...localSources,
+              },
+              capability_details: {
+                ...(((merged[key] as unknown as {
+                  capability_details?: Record<string, unknown>;
+                }).capability_details) || {}),
+                ...(((val as unknown as {
+                  capability_details?: Record<string, unknown>;
+                }).capability_details) || {}),
+              },
+            } as ModelMetadata;
           }
         }
 
@@ -123,30 +455,71 @@ export async function fetchServerMetadata(): Promise<Record<string, ModelMetadat
   return getLocalMetadataVault();
 }
 
-export function getModelMetadata(modelKey: string): ModelMetadata | null {
+export function getModelMetadata(
+  modelKey: string,
+  providerId?: string | null,
+  connectionId?: string | null
+): ModelMetadata | null {
   const vault = getLocalMetadataVault();
+  if (providerId) {
+    const { meta } = lookupModelMetadata(
+      vault,
+      providerId,
+      modelKey,
+      connectionId
+    );
+    if (meta) return meta;
+  }
   return vault[modelKey] || null;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Metadata reader (sync, from vault only)                                    */
+/* -------------------------------------------------------------------------- */
+
 /**
- * Universal capability inference function conforming to 2026 AI industry standards.
+ * Read capability information for a model FROM THE LOCAL VAULT ONLY.
+ *
+ * No network, no heuristics, no name-pattern matching. Every field
+ * comes from one of:
+ *   - `capabilities` + `capability_sources` written by Scan Models
+ *     (source = "provider_live") or by the user via the modal
+ *     (source = "manual") or by legacy saveLocalMetadataVault (source
+ *     = "provider_catalog" / "model_metadata").
+ *   - `capability_details.reasoning` for the reasoning control mode.
+ *
+ * When a field is absent, the state is `"unknown"` and the boolean is
+ * `false`. The UI shows an Enable button — it never fabricates a
+ * badge.
+ *
+ * For the richer merged view (with LiteLLM/HF fallbacks), use the
+ * async `fetchModelFacts()` function which hits `/api/catalog/...`.
  */
 export function inferModelCapabilities(
   modelKey: string | null | undefined,
-  explicitMeta?: Partial<ModelMetadata> | null
+  explicitMeta?: Partial<ModelMetadata> | null,
+  providerId?: string | null,
+  connectionId?: string | null
 ): InferredCapabilities {
-  // The storage schema now allows `active_model` to be `null` when the
-  // user has not yet selected a model. Every UI surface that renders
-  // model badges (chat landing, composer, engine selector, chat header)
-  // calls this function. Rather than forcing each caller to guard
-  // manually, we return a neutral capability profile here. This keeps
-  // the "unselected" state a first-class concept: no badges shown, no
-  // crash, no forced default model.
+  // Null guard.
   if (!modelKey || typeof modelKey !== "string" || !modelKey.trim()) {
     return {
+      provider_id: providerId || null,
       isVision: false,
       isTools: false,
       isReasoning: false,
+      visionState: "unknown",
+      toolsState: "unknown",
+      reasoningState: "unknown",
+      visionSource: "unknown",
+      toolsSource: "unknown",
+      reasoningSource: "unknown",
+      reasoningMode: "unreported",
+      reasoningEffortLevels: [],
+      reasoningDefaultEffort: null,
+      reasoningMinBudgetTokens: null,
+      reasoningMaxBudgetTokens: null,
+      matchedMetadataKey: null,
       contextDisplay: null,
       paramsDisplay: null,
       quantDisplay: null,
@@ -158,114 +531,186 @@ export function inferModelCapabilities(
     };
   }
 
-  const meta = explicitMeta || getModelMetadata(modelKey) || {};
-  const lowerKey = modelKey.toLowerCase();
+  // Metadata resolution (composite → legacy).
+  let meta: Partial<ModelMetadata> = (explicitMeta ||
+    {}) as Partial<ModelMetadata>;
+  let matchedKey: string | null = null;
 
-  // 1. Vision Capability
-  const isVision = Boolean(
-    meta.capabilities?.vision ||
-    lowerKey.includes("vision") ||
-    lowerKey.includes("-vl") ||
-    lowerKey.includes("llava") ||
-    lowerKey.includes("omni") ||
-    lowerKey.includes("4o") ||
-    lowerKey.includes("gemini") ||
-    lowerKey.includes("claude-3")
-  );
-
-  // 2. Tool / Function Calling Capability
-  const isTools = Boolean(
-    meta.capabilities?.trained_for_tool_use ||
-    lowerKey.includes("instruct") ||
-    lowerKey.includes("tool") ||
-    lowerKey.includes("function") ||
-    lowerKey.includes("-it") ||
-    lowerKey.includes("nemotron") ||
-    lowerKey.includes("gpt") ||
-    lowerKey.includes("claude") ||
-    lowerKey.includes("gemini") ||
-    lowerKey.includes("qwen") ||
-    lowerKey.includes("llama-3")
-  );
-
-  // 3. Reasoning / Deep Thinking Capability
-  // Explicit manual toggle takes precedence, followed by modern heuristics
-  const isReasoning = typeof meta.capabilities?.reasoning === "boolean"
-    ? meta.capabilities.reasoning
-    : Boolean(
-        lowerKey.includes("think") ||
-        lowerKey.includes("reason") ||
-        lowerKey.includes("-r1") ||
-        lowerKey.includes("deepseek-r1") ||
-        lowerKey.includes("claude-3-7") ||
-        lowerKey.includes("claude-3.7") ||
-        lowerKey.includes("gemini-2.0-flash") ||
-        lowerKey.includes("gemini-2.5") ||
-        lowerKey.includes("qwen-max") ||
-        lowerKey.includes("qwq") ||
-        lowerKey.includes("o1") ||
-        lowerKey.includes("o3") ||
-        lowerKey.includes("o4")
-      );
-
-  // 4. Context Window resolution with fallback to known standard model specifications
-  const loadedContext = meta.loaded_instances && meta.loaded_instances[0]?.config?.context_length
-    ? meta.loaded_instances[0].config.context_length
-    : null;
-
-  let maxContext = meta.max_context_length || null;
-  if (!maxContext) {
-    if (lowerKey.includes("gemini-1.5") || lowerKey.includes("gemini-2.0") || lowerKey.includes("gemini-2.5")) maxContext = 1048576;
-    else if (lowerKey.includes("claude-3-7") || lowerKey.includes("claude-3.7") || lowerKey.includes("claude-3-5")) maxContext = 200000;
-    else if (lowerKey.includes("gpt-4o") || lowerKey.includes("o1") || lowerKey.includes("o3") || lowerKey.includes("o4")) maxContext = 128000;
-    else if (lowerKey.includes("deepseek")) maxContext = 131072;
-    else if (lowerKey.includes("llama-3.1") || lowerKey.includes("llama-3.2") || lowerKey.includes("llama-3.3")) maxContext = 131072;
-    else if (lowerKey.includes("qwen3")) maxContext = 262144;
-    else if (lowerKey.includes("qwen2.5")) maxContext = 131072;
-    else if (lowerKey.includes("gemma-4")) maxContext = 262144;
-    else if (lowerKey.includes("nemotron")) maxContext = 20000;
+  if (explicitMeta) {
+    matchedKey = modelKey;
+  } else if (providerId) {
+    const vault = getLocalMetadataVault();
+    const lookup = lookupModelMetadata(vault, providerId, modelKey, connectionId);
+    if (lookup.meta) {
+      meta = lookup.meta as Partial<ModelMetadata>;
+      matchedKey = lookup.matchedKey;
+    } else {
+      const legacyEntry = getModelMetadata(modelKey);
+      if (legacyEntry) {
+        meta = legacyEntry as Partial<ModelMetadata>;
+        matchedKey = modelKey;
+      }
+    }
+  } else {
+    const legacyEntry = getModelMetadata(modelKey);
+    if (legacyEntry) {
+      meta = legacyEntry as Partial<ModelMetadata>;
+      matchedKey = modelKey;
+    }
   }
+
+  const explicitSources = ((meta as unknown as {
+    capability_sources?: Record<string, string>;
+  }).capability_sources || {}) as Record<string, string>;
+
+  const explicitDetails = ((meta as unknown as {
+    capability_details?: Record<string, unknown>;
+  }).capability_details || {}) as Record<string, unknown>;
+
+  // ------------------------------------------------------------------
+  // Three-valued state helpers.
+  //
+  // `undefined` (unknown) is NOT the same as `false` (explicitly
+  // unsupported). Providers that only return {id, object} never set
+  // these booleans — the user must be able to enable them manually.
+  // ------------------------------------------------------------------
+  const visionBool: boolean | undefined =
+    typeof meta.capabilities?.vision === "boolean"
+      ? meta.capabilities.vision
+      : undefined;
+  const toolsBool: boolean | undefined =
+    typeof meta.capabilities?.trained_for_tool_use === "boolean"
+      ? meta.capabilities.trained_for_tool_use
+      : undefined;
+  const reasoningBool: boolean | undefined =
+    typeof meta.capabilities?.reasoning === "boolean"
+      ? meta.capabilities.reasoning
+      : undefined;
+
+  const asState = (
+    v: boolean | undefined
+  ): "supported" | "unsupported" | "unknown" =>
+    v === true ? "supported" : v === false ? "unsupported" : "unknown";
+
+  const visionState = asState(visionBool);
+  const toolsState = asState(toolsBool);
+  const reasoningState = asState(reasoningBool);
+
+  // ------------------------------------------------------------------
+  // Reasoning mode resolution.
+  // ------------------------------------------------------------------
+  const reasoningDetail =
+    (explicitDetails.reasoning as Record<string, unknown> | undefined) || {};
+  const explicitMode =
+    typeof reasoningDetail.mode === "string" ? reasoningDetail.mode : "";
+
+  let reasoningMode: string;
+  if (explicitMode && explicitMode !== "") {
+    reasoningMode = explicitMode;
+  } else if (reasoningBool === true) {
+    reasoningMode = "toggle";
+  } else if (reasoningBool === false) {
+    reasoningMode = "none";
+  } else {
+    reasoningMode = "unreported";
+  }
+
+  const isReasoning = reasoningBool === true;
+  const isVision = visionBool === true;
+  const isTools = toolsBool === true;
+
+  // ------------------------------------------------------------------
+  // Source annotations — only meaningful when the value is known.
+  // ------------------------------------------------------------------
+  const asSource = (
+    bool: boolean | undefined,
+    source: string | undefined
+  ): CapabilitySource => {
+    if (bool === undefined) return "unknown";
+    return ((source as CapabilitySource) || "manual") as CapabilitySource;
+  };
+
+  const visionSource = asSource(visionBool, explicitSources.vision);
+  const toolsSource = asSource(toolsBool, explicitSources.trained_for_tool_use);
+  const reasoningSource = asSource(reasoningBool, explicitSources.reasoning);
+
+  // ------------------------------------------------------------------
+  // Reasoning sub-config (from metadata only).
+  // ------------------------------------------------------------------
+  const effortLevels: string[] = Array.isArray(reasoningDetail.effort_levels)
+    ? (reasoningDetail.effort_levels as unknown[]).filter(
+        (v): v is string => typeof v === "string"
+      )
+    : [];
+  const defaultEffort: string | null =
+    typeof reasoningDetail.default_effort === "string"
+      ? (reasoningDetail.default_effort as string)
+      : null;
+  const minBudget: number | null =
+    typeof reasoningDetail.min_budget_tokens === "number"
+      ? (reasoningDetail.min_budget_tokens as number)
+      : null;
+  const maxBudget: number | null =
+    typeof reasoningDetail.max_budget_tokens === "number"
+      ? (reasoningDetail.max_budget_tokens as number)
+      : null;
+
+  // ------------------------------------------------------------------
+  // Informational fields — ONLY from metadata.
+  // ------------------------------------------------------------------
+  const loadedContext: number | null =
+    ((meta.loaded_instances as unknown as Array<{
+      config?: { context_length?: number };
+    }> | undefined)?.[0]?.config?.context_length) ?? null;
+
+  const maxContext: number | null =
+    (meta.max_context_length as number | undefined) ?? null;
 
   let contextDisplay: string | null = null;
   if (loadedContext && maxContext) {
-    contextDisplay = `${Math.round(loadedContext / 1024)}K / ${Math.round(maxContext / 1024)}K ctx`;
+    contextDisplay = `${Math.round(loadedContext / 1024)}K / ${Math.round(
+      maxContext / 1024
+    )}K ctx`;
   } else if (loadedContext) {
     contextDisplay = `${Math.round(loadedContext / 1024)}K ctx`;
   } else if (maxContext) {
-    contextDisplay = maxContext >= 1024 ? `${Math.round(maxContext / 1024)}K ctx` : `${maxContext} ctx`;
+    contextDisplay =
+      maxContext >= 1024
+        ? `${Math.round(maxContext / 1024)}K ctx`
+        : `${maxContext} ctx`;
   }
 
-  // 5. Parameter Count
-  let paramsDisplay: string | null = meta.params_string || null;
-  if (!paramsDisplay) {
-    const match = lowerKey.match(/(\d+(\.\d+)?b)/);
-    if (match) paramsDisplay = match[1].toUpperCase();
-  }
-
-  // 6. Quantization
-  // Use `lowerKey` (already normalized above) instead of `modelKey`
-  // directly. This was the source of the runtime crash that broke
-  // /chat when `active_model` was null: `modelKey.match(...)` on a
-  // null input throws `TypeError: Cannot read properties of null`.
-  // `lowerKey` is guaranteed to be a string by the guard at the top
-  // of this function.
-  let quantDisplay: string | null = meta.quantization?.name || null;
-  if (!quantDisplay) {
-    const qMatch = lowerKey.match(/(q\d+_[a-z0-9_]+|qat|fp16|bf16|int8|int4)/i);
-    if (qMatch) quantDisplay = qMatch[1].toUpperCase();
-  }
+  const paramsDisplay: string | null =
+    (meta.params_string as string | undefined) || null;
+  const quantDisplay: string | null =
+    ((meta.quantization as { name?: string } | undefined)?.name) || null;
 
   return {
+    provider_id: providerId || null,
     isVision,
     isTools,
     isReasoning,
+    visionState,
+    toolsState,
+    reasoningState,
+    visionSource,
+    toolsSource,
+    reasoningSource,
+    reasoningMode,
+    reasoningEffortLevels: effortLevels,
+    reasoningDefaultEffort: defaultEffort,
+    reasoningMinBudgetTokens: minBudget,
+    reasoningMaxBudgetTokens: maxBudget,
+    matchedMetadataKey: matchedKey,
     contextDisplay,
     paramsDisplay,
     quantDisplay,
-    publisherDisplay: meta.publisher || null,
-    archDisplay: meta.architecture || null,
-    formatDisplay: meta.format ? meta.format.toUpperCase() : null,
+    publisherDisplay: (meta.publisher as string | undefined) || null,
+    archDisplay: (meta.architecture as string | undefined) || null,
+    formatDisplay: (meta.format as string | undefined)
+      ? (meta.format as string).toUpperCase()
+      : null,
     loadedContext,
-    maxContext
+    maxContext,
   };
 }

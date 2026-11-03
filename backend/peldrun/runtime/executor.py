@@ -35,8 +35,27 @@ from peldrun.engine.runner import AgentRunner, RunnerConfig
 from peldrun.engine.state import ExecutionState, MessageRole
 from peldrun.events.emitter import EventEmitter
 from peldrun.events.schema import EventType, PeldrunEvent
-from peldrun.llm.client import LLMConfig
-from peldrun.llm.providers.openai_compat import OpenAICompatProvider
+from peldrun.llm.accounting import (
+    InvocationContext,
+    default_tracker,
+)
+from peldrun.llm.capability_resolver import resolve_model_capabilities
+from peldrun.llm.client import LLMResponse
+from peldrun.llm.contracts import (
+    CapabilitySource,
+    CapabilityState,
+    ConnectionContext,
+    ModelCapabilities,
+    ReasoningMode,
+)
+from peldrun.llm.providers import provider_factory
+from peldrun.llm.request import (
+    GenerationConfig,
+    LLMRequest,
+    ReasoningConfig,
+    ResponseFormat,
+    ToolChoiceSpec,
+)
 from peldrun.runtime.contract import BudgetExceededError, RunRequest, RunResult, RunStatus
 from peldrun.runtime.diagnostics import DiagnosticsCollector
 from peldrun.runtime.pricing_store import get_pricing_store
@@ -47,6 +66,168 @@ from peldrun.tools.collection import ToolCollection
 from peldrun.tools.registry import ToolRegistry
 
 logger = logging.getLogger("peldrun.runtime.executor")
+
+
+# ---------------------------------------------------------------------------
+# ToolCallAgent bridge
+# ---------------------------------------------------------------------------
+
+
+class _ToolCallAgentBridge:
+    """
+    Presents a ``ProviderAdapter`` through the ``BaseLLMProvider``
+    interface that ``ToolCallAgent`` expects.
+
+    Background
+    ----------
+    ``ToolCallAgent`` (in ``peldrun.agents.tool_call_agent``) calls
+    ``llm.generate(messages=..., tools=..., tool_choice=...)`` on every
+    step. That is the legacy ``BaseLLMProvider`` signature. The
+    native adapters in ``peldrun.llm.providers`` expose the modern
+    ``generate(request: LLMRequest)`` interface instead.
+
+    This bridge absorbs the difference. It stores a base ``LLMRequest``
+    template (built once at construction from the run's connection,
+    model, capabilities, generation, and reasoning intent) and clones
+    it per call, overriding only ``messages``, ``tools``, and any
+    per-call generation overrides the agent supplies.
+
+    Design invariants
+    -----------------
+    * Zero capability logic. The bridge builds a request and delegates
+      to ``adapter.generate(...)``. Everything the plan says about
+      "the compiler owns intersection rules" stays true.
+    * Per-call overrides win. When ``ToolCallAgent`` passes
+      ``temperature=`` or ``max_tokens=`` explicitly, those values
+      override the base template's values, matching the pre-M7.2
+      behavior of ``AsyncLLMClient.chat_completion``.
+    * Reasoning overrides respected. If the agent passes
+      ``reasoning_effort="low"``, the bridge reconstructs the
+      ``ReasoningConfig`` for that specific call.
+    """
+
+    def __init__(
+        self,
+        adapter: Any,
+        base_request: LLMRequest,
+    ) -> None:
+        self._adapter = adapter
+        self._base_request = base_request
+        # Expose a subset of the legacy attributes for any consumer
+        # (ToolCallAgent internals, diagnostics) that reads them.
+        self.profile = getattr(adapter, "profile", None)
+        self.provider_id = getattr(adapter, "provider_id", None)
+
+    # ------------------------------------------------------------------
+
+    def _build_request(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        tool_choice: str,
+        **kwargs: Any,
+    ) -> LLMRequest:
+        """Clone the base request with this call's overrides applied."""
+        gen = self._base_request.generation
+        gen_updates: Dict[str, Any] = {}
+        if kwargs.get("temperature") is not None:
+            gen_updates["temperature"] = float(kwargs["temperature"])
+        if kwargs.get("max_tokens") is not None:
+            gen_updates["max_output_tokens"] = int(kwargs["max_tokens"])
+        if gen_updates:
+            gen = gen.model_copy(update=gen_updates)
+
+        reasoning = self._base_request.reasoning
+        per_call_effort = kwargs.get("reasoning_effort")
+        if per_call_effort is not None:
+            eff = str(per_call_effort).lower().strip()
+            if eff in ("none", "off", "0"):
+                reasoning = ReasoningConfig(
+                    enabled=False, mode=ReasoningMode.NONE,
+                )
+            elif eff in ("low", "medium", "high", "minimal", "xhigh"):
+                reasoning = ReasoningConfig(
+                    enabled=True,
+                    mode=ReasoningMode.EFFORT,
+                    effort=eff,
+                )
+            else:
+                reasoning = ReasoningConfig(
+                    enabled=True, mode=ReasoningMode.ADAPTIVE,
+                )
+
+        return self._base_request.model_copy(
+            update={
+                "messages": messages,
+                "tools": tools or [],
+                "tool_choice": ToolChoiceSpec(mode=tool_choice or "auto"),
+                "generation": gen,
+                "reasoning": reasoning,
+            }
+        )
+
+    # ------------------------------------------------------------------
+
+    async def generate(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: str = "auto",
+        **kwargs: Any,
+    ) -> LLMResponse:
+        """
+        Execute the request through the adapter.
+
+        Streaming vs non-streaming is decided by whether the caller
+        provided per-token callbacks:
+
+        * Callbacks present  → use ``adapter.stream()`` via
+          ``StreamNormalizer.collect_response()`` so ``on_chunk`` /
+          ``on_thought_chunk`` fire per token. This is what
+          ``ToolCallAgent`` needs to emit live THOUGHT / STEP_PROGRESS
+          events for the frontend.
+
+        * Callbacks absent   → use ``adapter.generate()`` directly
+          (non-streaming). The response shape is identical; the
+          difference is only in transport efficiency.
+
+        This mirrors the pre-M7.2 behavior of
+        ``AsyncLLMClient.chat_completion``:
+        - streaming when callbacks are provided (default for agent mode)
+        - buffered accumulation otherwise
+        """
+        # Extract callbacks before they leak into ``_build_request``
+        # (which would pass them as unknown kwargs to the compiled payload).
+        on_chunk = kwargs.pop("on_chunk", None)
+        on_thought_chunk = kwargs.pop("on_thought_chunk", None)
+        # ``stream`` is used by AsyncLLMClient historically. Strip it
+        # here because streaming is chosen by the presence of callbacks.
+        kwargs.pop("stream", None)
+
+        request = self._build_request(messages, tools, tool_choice, **kwargs)
+
+        if on_chunk is not None or on_thought_chunk is not None:
+            from peldrun.llm.stream_normalizer import collect_response
+
+            return await collect_response(
+                self._adapter.stream(request),
+                model=request.model_id,
+                # Pass the messages so the tokenizer fallback can
+                # estimate input tokens accurately when the provider
+                # did not report usage (LM Studio, older Ollama, ...).
+                messages=messages,
+                on_chunk=on_chunk,
+                on_thought_chunk=on_thought_chunk,
+            )
+
+        return await self._adapter.generate(request)
+
+    async def chat_completion(self, *args: Any, **kwargs: Any) -> LLMResponse:
+        return await self.generate(*args, **kwargs)
+
+    async def chat_complete(self, *args: Any, **kwargs: Any) -> LLMResponse:
+        return await self.generate(*args, **kwargs)
+
 
 EventListener = Callable[[PeldrunEvent], Awaitable[None]]
 
@@ -243,7 +424,12 @@ class CoreRuntimeExecutor:
         # 4. Configure LLM Provider with Scoped Budget Enforcement
         base_url = llm_cfg_dict.get("base_url") or "http://127.0.0.1:1234/v1"
         api_key = llm_cfg_dict.get("api_key") or "EMPTY"
-        max_tokens = min(int(llm_cfg_dict.get("max_tokens") or 4096), 4096)
+        # [M7.2] Removed the historical `min(..., 4096)` ceiling.
+        # The value is already resolved correctly by
+        # `dispatcher._resolve_model_max_output_tokens` before being
+        # placed in `llm_cfg_dict["max_tokens"]`. Enforcing a second
+        # hard cap here silently discarded the user's per-model budget.
+        max_tokens = int(llm_cfg_dict.get("max_tokens") or 8192)
         step_timeout = float(request.step_timeout_seconds or 120.0)
         model_name = llm_cfg_dict.get("model", "default")
         provider_name = llm_cfg_dict.get("provider", "openai")
@@ -279,25 +465,175 @@ class CoreRuntimeExecutor:
         except (TypeError, ValueError):
             llm_request_timeout = step_timeout
 
+        # ------------------------------------------------------------------
+        # [M7.2] Adapter-based LLM setup.
+        #
+        # Replaces the direct OpenAICompatProvider construction with the
+        # provider factory + bridge. Both dispatch paths (direct chat and
+        # agent) now share a single creation entry point.
+        #
+        # For this stage we still use the legacy `openai_compat`
+        # adapter — which internally wraps AsyncLLMClient. Behavior is
+        # IDENTICAL to pre-M7.2: same watchdog (now in StreamNormalizer),
+        # same streaming, same error mapping. The only differences are:
+        #
+        #   1. The 4096-token hard ceiling is gone.
+        #   2. Reasoning parameters are gated by the resolver instead of
+        #      being forwarded unconditionally.
+        #   3. The adapter's underlying HTTP client is closed in the
+        #      finally block, preventing socket leaks per run.
+        #
+        # M7.3 will add smart routing to native adapters (lmstudio_native,
+        # ollama_native) without touching this block — only the
+        # `adapter_provider_id` selection changes.
+        # ------------------------------------------------------------------
+        adapter_provider_id = "openai_compat"
+
+        # Resolve model capabilities honestly. When no metadata exists,
+        # the resolver returns everything as UNKNOWN. We then honor any
+        # explicit user intent by marking it as a manual override — this
+        # matches the plan's "manual > all" priority chain.
+        try:
+            model_caps: ModelCapabilities = resolve_model_capabilities(
+                provider_id=adapter_provider_id,
+                model_id=model_name,
+                connection_id=None,
+            )
+        except Exception as caps_err:
+            logger.debug(
+                "Capability resolution failed for %s: %s — treating as "
+                "all-unknown.",
+                model_name,
+                caps_err,
+            )
+            model_caps = ModelCapabilities()
+
+        # Parse the user's reasoning intent.
         raw_effort = llm_cfg_dict.get("reasoning_effort")
-        resolved_effort: Optional[str] = None
+        user_effort_str: Optional[str] = None
+        user_wants_reasoning = False
         if raw_effort:
             effort_str = str(raw_effort).lower().strip()
-            if effort_str in ("none", "off", "0"):
-                resolved_effort = "none"
-            else:
-                resolved_effort = effort_str
+            if effort_str not in ("none", "off", "0", ""):
+                user_wants_reasoning = True
+                user_effort_str = effort_str
 
-        llm_cfg = LLMConfig(
-            model=model_name,
+        # If the user explicitly wants reasoning but the resolver had no
+        # information (UNKNOWN), honor the user's manual override. This
+        # preserves the pre-M7.2 behavior where explicit `reasoning_effort`
+        # was forwarded to the API regardless of the model's declared
+        # support. Unsupported combinations still surface as provider
+        # errors, same as before.
+        if (
+            user_wants_reasoning
+            and model_caps.reasoning_details.state == CapabilityState.UNKNOWN
+        ):
+            model_caps.reasoning_details.state = CapabilityState.SUPPORTED
+            model_caps.reasoning_details.source = CapabilitySource.MANUAL
+
+        # Build the ReasoningConfig for the base request.
+        if user_wants_reasoning and user_effort_str in (
+            "low", "medium", "high", "minimal", "xhigh",
+        ):
+            reasoning_cfg = ReasoningConfig(
+                enabled=True,
+                mode=ReasoningMode.EFFORT,
+                effort=user_effort_str,
+            )
+        elif user_wants_reasoning:
+            # Explicit yes, no level — provider default (adaptive).
+            reasoning_cfg = ReasoningConfig(
+                enabled=True, mode=ReasoningMode.ADAPTIVE,
+            )
+        elif model_caps.reasoning_details.state == CapabilityState.SUPPORTED:
+            # Model supports reasoning but user did not specify effort —
+            # let the provider use its default.
+            reasoning_cfg = ReasoningConfig(
+                enabled=True, mode=ReasoningMode.ADAPTIVE,
+            )
+        else:
+            # No reasoning intent, no model support — do not send.
+            reasoning_cfg = ReasoningConfig(
+                enabled=False, mode=ReasoningMode.NONE,
+            )
+
+        # Compatibility mirror: the downstream ExecutionState metadata
+        # block still records "reasoning_effort" under its pre-M7.2 name.
+        # We derive it from the same intent that built `reasoning_cfg`
+        # so the persisted metadata stays coherent with what was actually
+        # sent to the provider.
+        resolved_effort: Optional[str] = (
+            user_effort_str if user_wants_reasoning else "none"
+        )
+
+        # Build the connection context. The bridge only reads base_url,
+        # api_key, and timeout — extra_params stays empty for the legacy
+        # path. Native adapters (M7.3) will read api_surface / vertexai
+        # from extra_params when they take over.
+        connection = ConnectionContext(
+            connection_id=run_id_str,
+            provider_id=adapter_provider_id,
             base_url=base_url,
             api_key=api_key,
-            temperature=float(spec.temperature),
-            max_tokens=max_tokens,
             timeout=llm_request_timeout,
-            reasoning_effort=resolved_effort,
+            extra_params={},
         )
-        llm_provider = OpenAICompatProvider(config=llm_cfg)
+
+        # Build the base LLMRequest template. The bridge clones this
+        # for each ToolCallAgent call, overriding messages/tools only.
+        base_llm_request = LLMRequest(
+            provider_id=adapter_provider_id,
+            model_id=model_name,
+            connection_id=run_id_str,
+            messages=[],
+            system_prompt=None,
+            tools=[],
+            tool_choice=ToolChoiceSpec(mode="auto"),
+            generation=GenerationConfig(
+                temperature=float(spec.temperature),
+                max_output_tokens=max_tokens,
+            ),
+            reasoning=reasoning_cfg,
+            response_format=ResponseFormat(kind="text"),
+            model_capabilities=model_caps,
+            connection=connection,
+        )
+
+        # Create the adapter via factory, then wrap in the bridge.
+        try:
+            adapter = provider_factory.create(adapter_provider_id, connection)
+        except Exception as create_err:
+            logger.exception(
+                "Failed to create LLM adapter for %s (%s): %s",
+                adapter_provider_id,
+                model_name,
+                create_err,
+            )
+            diag = diagnostics.finalize(
+                status=RunStatus.FAILED,
+                failure_reason=f"Adapter creation failed: {create_err}",
+            )
+            return RunResult(
+                run_id=run_id_str,
+                job_id=job_id,
+                status=RunStatus.FAILED,
+                output=None,
+                deliverables=[],
+                total_steps=0,
+                error=f"Adapter creation failed: {create_err}",
+                error_code="ADAPTER_CREATION_FAILED",
+                metadata={"diagnostics": diag.model_dump(mode="json")},
+                created_at=start_time,
+                completed_at=time.time(),
+                parent_run_id=parent_run_id,
+                root_run_id=root_run_id,
+                delegation_depth=delegation_depth,
+            )
+
+        llm_provider = _ToolCallAgentBridge(
+            adapter=adapter,
+            base_request=base_llm_request,
+        )
 
         original_generate = llm_provider.generate
         usage_store = get_usage_store()
@@ -322,6 +658,19 @@ class CoreRuntimeExecutor:
             cost_ceiling = request.metadata.get("max_cost_nano_usd") or request.metadata.get("root_cost_budget")
 
         async def _instrumented_generate(*args: Any, **kwargs: Any):
+            """
+            Wrap the bridge's ``generate`` with:
+
+            * Budget enforcement (pre and post-check).
+            * Unified accounting via ``default_tracker``.
+
+            Every invocation — success, failure, or cancellation —
+            produces a ``token_ledger`` record. Failures and
+            cancellations are recorded with ``usage_source="unknown"``
+            and ``cost_status="unknown"`` so they are not silently
+            lost (the pre-M8.2 code only recorded successful calls
+            that returned usage).
+            """
             nonlocal cumulative_tokens, cumulative_cost_nano
 
             if token_ceiling is not None and cumulative_tokens >= token_ceiling:
@@ -341,25 +690,98 @@ class CoreRuntimeExecutor:
                 )
 
             inv_start = time.time()
-            resp = await original_generate(*args, **kwargs)
+            inv_id = f"inv_{uuid.uuid4().hex[:12]}"
+            inv_step = str(diagnostics._current_step)
+
+            # One context object per call — captures identity, lineage,
+            # and step info that the tracker stores on the record.
+            tracker_ctx = InvocationContext(
+                provider=provider_name,
+                model_requested=model_name,
+                mode="agent",
+                job_id=job_id,
+                chat_id=chat_id,
+                project_id=project_id,
+                run_id=run_id_str,
+                step_id=inv_step,
+                base_url=base_url,
+                metadata={
+                    "parent_run_id": parent_run_id,
+                    "root_run_id": root_run_id,
+                    "delegation_depth": delegation_depth,
+                },
+            )
+
+            # ---------------------------------------------------------
+            # Execute the LLM call. Failures and cancellations are
+            # recorded before re-raising so accounting is complete
+            # even for aborted runs.
+            # ---------------------------------------------------------
+            try:
+                resp = await original_generate(*args, **kwargs)
+            except asyncio.CancelledError:
+                try:
+                    await default_tracker.cancel(
+                        tracker_ctx,
+                        started_at=inv_start,
+                        invocation_id=inv_id,
+                    )
+                except Exception as _cancel_rec_err:
+                    logger.debug(
+                        "Cancellation record skipped for run %s: %s",
+                        run_id_str,
+                        _cancel_rec_err,
+                    )
+                raise
+            except Exception as exc:
+                try:
+                    await default_tracker.fail(
+                        error=exc,
+                        context=tracker_ctx,
+                        started_at=inv_start,
+                        invocation_id=inv_id,
+                    )
+                except Exception as _fail_rec_err:
+                    logger.debug(
+                        "Failure record skipped for run %s: %s",
+                        run_id_str,
+                        _fail_rec_err,
+                    )
+                raise
+
             inv_end = time.time()
 
+            # ---------------------------------------------------------
+            # Record success via the unified tracker. This writes to
+            # `token_ledger` with `cost_status` explicitly set inside
+            # `metadata` (known / free / unknown). Works even when
+            # `resp.usage` is None.
+            # ---------------------------------------------------------
+            record = await default_tracker.complete(
+                response=resp,
+                context=tracker_ctx,
+                started_at=inv_start,
+                invocation_id=inv_id,
+            )
+
+            # ---------------------------------------------------------
+            # Budget accumulation. Sources of truth:
+            # * tokens: `resp.usage.total_tokens` when present, else
+            #   leave the counter unchanged (unknown usage cannot be
+            #   charged).
+            # * cost:   `record.cost_nano_usd` which the tracker
+            #   computed. Zero means free / unknown — either way we do
+            #   not increment (there is nothing to charge).
+            # ---------------------------------------------------------
             u = resp.usage
-            inv_id = f"inv_{uuid.uuid4().hex[:12]}"
+            if u and u.total_tokens:
+                cumulative_tokens += int(u.total_tokens)
+            if record.cost_nano_usd:
+                cumulative_cost_nano += int(record.cost_nano_usd)
 
-            cost_nano, rule_id = 0, None
-            if u:
-                cost_nano, rule_id = await pricing_store.calculate_cost(
-                    usage=u,
-                    provider=provider_name,
-                    model=model_name,
-                    base_url=base_url,
-                )
-                if u.total_tokens:
-                    cumulative_tokens += int(u.total_tokens)
-                if cost_nano:
-                    cumulative_cost_nano += int(cost_nano)
-
+            # ---------------------------------------------------------
+            # Diagnostics telemetry (unchanged semantics).
+            # ---------------------------------------------------------
             diagnostics.record_llm_invocation(
                 invocation_id=inv_id,
                 provider=provider_name,
@@ -372,51 +794,15 @@ class CoreRuntimeExecutor:
                 total_tokens=u.total_tokens if u else None,
                 cached_tokens=u.cached_input_tokens if u else None,
                 reasoning_tokens=u.reasoning_output_tokens if u else None,
-                cost_nano_usd=cost_nano,
+                cost_nano_usd=record.cost_nano_usd,
                 finish_reason=resp.finish_reason,
             )
 
-            if u:
-                record = LLMInvocationRecord(
-                    invocation_id=inv_id,
-                    run_id=run_id_str,
-                    job_id=job_id,
-                    project_id=project_id,
-                    chat_id=chat_id,
-                    step_id=str(diagnostics._current_step),
-                    mode="agent",
-                    provider=provider_name,
-                    model_requested=model_name,
-                    model_returned=resp.model or model_name,
-                    status="completed",
-                    input_tokens=u.input_tokens,
-                    output_tokens=u.output_tokens,
-                    total_tokens=u.total_tokens,
-                    cached_input_tokens=u.cached_input_tokens,
-                    reasoning_output_tokens=u.reasoning_output_tokens,
-                    usage_source=u.source.value if hasattr(u.source, "value") else str(u.source),
-                    estimated=u.estimated,
-                    tokenizer_id=u.tokenizer_id,
-                    tokenizer_version=u.tokenizer_version,
-                    estimation_method=u.estimation_method,
-                    started_at=inv_start,
-                    first_token_at=getattr(resp, "first_token_at", None),
-                    completed_at=inv_end,
-                    latency_ms=round((inv_end - inv_start) * 1000.0, 2),
-                    ttft_ms=round(resp.ttft_ms, 2) if resp.ttft_ms is not None else None,
-                    finish_reason=resp.finish_reason,
-                    pricing_version_id=rule_id,
-                    cost_nano_usd=cost_nano,
-                    parent_run_id=parent_run_id,
-                    root_run_id=root_run_id,
-                    metadata={
-                        "parent_run_id": parent_run_id,
-                        "root_run_id": root_run_id,
-                        "delegation_depth": delegation_depth,
-                    },
-                )
-                await usage_store.record_invocation(record)
-
+            # ---------------------------------------------------------
+            # Post-call budget check. Kept in the same place as
+            # pre-M8.2 so a single over-budget call still fails the
+            # run without dispatching another LLM request.
+            # ---------------------------------------------------------
             if token_ceiling is not None and cumulative_tokens > token_ceiling:
                 raise BudgetExceededError(
                     f"Cumulative token budget exceeded: {cumulative_tokens} > {token_ceiling}",
@@ -850,6 +1236,26 @@ class CoreRuntimeExecutor:
                 delegation_depth=delegation_depth,
             )
         finally:
+            # [M7.2] Close the adapter's underlying HTTP client.
+            #
+            # Every `provider_factory.create(...)` opens a fresh
+            # httpx.AsyncClient (or AsyncOpenAI) instance. Without an
+            # explicit close, those connections survive until process
+            # exit, accumulating one socket per run. On Linux this
+            # trips "too many open files" after roughly 10k runs; on
+            # Windows it triggers WinError 10048. Closing in the
+            # `finally` block guarantees release regardless of exit
+            # path (success, cancellation, budget-exceeded, unexpected
+            # exception).
+            try:
+                await adapter.close()
+            except Exception as close_err:
+                logger.debug(
+                    "Adapter close raised for run %s: %s",
+                    run_id_str,
+                    close_err,
+                )
+
             self._active_runners.pop(run_id_str, None)
             self._active_runners.pop(job_id, None)
             self._job_to_run.pop(job_id, None)

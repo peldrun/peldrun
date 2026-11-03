@@ -1,4 +1,5 @@
 """
+backend\peldrun\llm\__init__.py
 PELDRUN Core LLM Module.
 Exports universal client contracts, configuration models, and response structures.
 """
