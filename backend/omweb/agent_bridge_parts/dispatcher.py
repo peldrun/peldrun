@@ -1469,10 +1469,19 @@ async def run_direct_chat(
     print(f"\n[BRIDGE DIRECT CHAT] Initializing metered direct chat for job: {job_id}")
     job_scoped_artifacts.setdefault(job_id, [])
 
-    # [FIX-3.4c] Strip context_refs so they don't leak into the LLM config.
-    # Direct chat currently ignores file references (it doesn't build tool
-    # messages), but we pop them here for symmetry and to keep the LLM client
-    # configuration clean across all dispatch paths.
+    # [FIX-3.4c] Strip context_refs and attachments from llm_override so
+    # they do not leak into the LLM client configuration. Both are
+    # consumed locally by this function.
+    #
+    # [FIX-CHAT-REFS] Unlike the pre-fix behavior, `context_refs` is NO
+    # LONGER discarded. In chat mode there is no agent loop, so the
+    # model can never call a file-reading tool. Without injecting the
+    # file contents directly into the prompt, the model sees only the
+    # short "[Uploaded Files]: <name> (in workspace directory)" marker
+    # and has to invent an answer. We now resolve the refs here and
+    # inline their contents using the SAME `inject_referenced_files`
+    # helper that `run_instrumented` (agent mode) already uses. This
+    # closes the chat-vs-agent behavioral gap for file attachments.
     #
     # [FIX-MULTIMODAL-CHAT] Also pop multimodal attachments from llm_override
     # into a local variable. They are injected as ``image_url`` content parts
@@ -1480,10 +1489,17 @@ async def run_direct_chat(
     # them out of active_llm prevents accidental leaks into provider
     # configuration payloads.
     _chat_attachments: Optional[List[Dict[str, Any]]] = None
+    _chat_context_refs: Optional[List[Dict[str, Any]]] = None
     if isinstance(llm_override, dict):
         llm_override = dict(llm_override)
-        llm_override.pop("context_refs", None)
+        _chat_context_refs = llm_override.pop("context_refs", None)
         _chat_attachments = llm_override.pop("attachments", None)
+        if _chat_context_refs:
+            print(
+                f"[BRIDGE DIRECT CHAT] Resolved "
+                f"{len(_chat_context_refs)} context reference(s) for "
+                f"job {job_id}"
+            )
         if _chat_attachments:
             print(
                 f"[BRIDGE DIRECT CHAT] Resolved "
@@ -1752,6 +1768,88 @@ async def run_direct_chat(
                 model_id=model_name,
                 storage_root=project_manager.storage_dir,
             )
+
+        # ─────────────────────────────────────────────────────────────
+        # [FIX-CHAT-REFS] Inject referenced workspace file contents into
+        # the prompt BEFORE building the LLM messages. Chat mode has no
+        # tool-calling loop, so the model cannot read files on its own.
+        # Without this injection, `context_refs` (files uploaded via
+        # POST /api/files/upload and referenced by the composer) travel
+        # to the backend but never reach the model — the user sees only
+        # the short "[Uploaded Files]: name (in workspace directory)"
+        # marker in the prompt and the model has to answer blind.
+        #
+        # This mirrors the agent-mode flow exactly:
+        #   1. Resolve each structured ref against the chat workspace.
+        #   2. Read its content (with PDF text extraction + binary
+        #      detection — see mention_resolver.py).
+        #   3. Prepend a `<referenced_files>` block to the prompt.
+        #
+        # The helper is idempotent: if the refs list is empty or every
+        # ref fails to resolve, the prompt is returned unchanged.
+        #
+        # Placement note: this block runs AFTER the web-search
+        # augmentation so both sources can coexist in a single turn
+        # (web results + referenced files), and BEFORE
+        # `ContextManager.build_messages` so the injected content
+        # participates in the token budget accounting.
+        # ─────────────────────────────────────────────────────────────
+        if _chat_context_refs:
+            try:
+                _chat_project_dir = project_manager.get_chat_files_dir(
+                    chat_id, project_id
+                )
+                _chat_project_dir.mkdir(parents=True, exist_ok=True)
+
+                _resolved_refs = resolve_context_refs(
+                    _chat_context_refs, _chat_project_dir
+                )
+
+                # Also resolve inline @filename tokens — same as agent mode.
+                # The user may have typed `@report.pdf` manually instead of
+                # using the composer's typeahead.
+                _cleaned_prompt, _inline_refs = resolve_inline_mentions(
+                    augmented_prompt, _chat_project_dir
+                )
+
+                # Merge + dedupe by canonical relPath.
+                _merged: List[Dict[str, Any]] = []
+                _seen_refs: set = set()
+                for _r in _resolved_refs + _inline_refs:
+                    _rel = _r.get("relPath", "")
+                    if _rel and _rel not in _seen_refs:
+                        _seen_refs.add(_rel)
+                        _merged.append(_r)
+
+                if _merged:
+                    augmented_prompt = inject_referenced_files(
+                        _cleaned_prompt, _merged, _chat_project_dir
+                    )
+                    print(
+                        f"[BRIDGE DIRECT CHAT] Injected "
+                        f"{len(_merged)} file reference(s) into the "
+                        f"prompt for job {job_id}"
+                    )
+                else:
+                    # No refs resolved — keep the inline-cleaned prompt
+                    # (it may still contain @-marker rewrites) but log
+                    # the reason so the user can diagnose broken refs.
+                    augmented_prompt = _cleaned_prompt
+                    print(
+                        f"[BRIDGE DIRECT CHAT] Context refs present "
+                        f"but none resolved for job {job_id} — model "
+                        f"will see only the prompt text."
+                    )
+            except Exception as _refs_err:
+                # Injection is best-effort. If anything fails, the chat
+                # still runs with the original prompt — the user just
+                # does not get the file contents inlined.
+                logger.warning(
+                    "[BRIDGE DIRECT CHAT] Context ref injection failed "
+                    "for job %s: %s",
+                    job_id,
+                    _refs_err,
+                )
 
         chat_system_prompt = _resolve_chat_system_prompt(
             model_name=model_name,

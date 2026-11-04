@@ -105,6 +105,90 @@ function generateImageAttachmentId(): string {
 }
 
 // ---------------------------------------------------------------------------
+// Non-image file references (uploaded to workspace at attach time)
+// ---------------------------------------------------------------------------
+//
+// Unlike images — which go to the temporary artifact store and travel as
+// ``fileId`` references — non-image files (PDF, TXT, CSV, DOCX, ...) are
+// uploaded DIRECTLY to the chat workspace via ``POST /api/files/upload``
+// so that:
+//
+//   1. The backend can inline their CONTENT into the prompt (see
+//      ``dispatcher.run_direct_chat`` and ``run_instrumented`` — both
+//      call ``inject_referenced_files`` which reads from the workspace).
+//   2. The agent's file tools (``str_replace_editor``, ``file_ops``, ...)
+//      can find them at the workspace path without any additional
+//      copy step.
+//
+// The upload happens IMMEDIATELY on attach so the user sees live
+// progress, and so a single network failure never silently drops the
+// file (as was the case with the previous "upload-at-dispatch" flow).
+// Successful uploads carry a ``relPath`` (workspace-relative) which is
+// exactly what ``context_refs[].relPath`` expects on the backend.
+interface UploadedFileRef {
+  id: string;
+  fileName: string;
+  fileSize: number;
+  mimeType: string;
+  status: "uploading" | "ready" | "error";
+  relPath?: string;
+  errorMessage?: string;
+}
+
+interface UploadWorkspaceResponse {
+  files: Array<{ name: string; path: string; size?: number }>;
+}
+
+async function uploadFileToWorkspace(
+  file: File,
+  chatId: string,
+): Promise<{ name: string; path: string }> {
+  const formData = new FormData();
+  formData.append("files", file);
+  formData.append("chat_id", chatId);
+
+  const res = await fetch("/api/files/upload", {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!res.ok) {
+    let detail = "";
+    try {
+      detail = await res.text();
+    } catch {
+      /* ignore */
+    }
+    throw new Error(
+      `Upload failed (${res.status}${detail ? `: ${detail.slice(0, 120)}` : ""})`
+    );
+  }
+
+  const data = (await res.json()) as UploadWorkspaceResponse;
+  const uploaded = (data.files || [])[0];
+  if (!uploaded || !uploaded.path) {
+    throw new Error(
+      "Server returned no workspace path for the uploaded file."
+    );
+  }
+  return { name: uploaded.name || file.name, path: uploaded.path };
+}
+
+function generateUploadedFileRefId(): string {
+  return `upref_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function generateLandingChatId(): string {
+  // Mirrors the format used by ChatContainer.handleStartTask so the id
+  // is indistinguishable from one generated downstream. Charset matches
+  // (base36 timestamp + base36 random suffix) to avoid any collision or
+  // normalization surprises when the backend validates it.
+  return `chat_${Date.now().toString(36)}_${Math.random()
+    .toString(36)
+    .substring(2, 8)}`;
+}
+
+// ---------------------------------------------------------------------------
 // Skill metadata model (shared with composer.tsx — kept intentionally
 // minimal here to avoid a cross-file dependency just for a shape).
 // ---------------------------------------------------------------------------
@@ -134,7 +218,11 @@ export function ChatLanding({
   setInputValue,
   execMode,
   handleModeChange,
-  landingAttachedFiles,
+  // NOTE: ``landingAttachedFiles`` remains part of ChatLandingProps
+  // (for backward compatibility with the parent) but this component
+  // no longer reads it. Non-image files are uploaded to the workspace
+  // immediately and travel as ``context_refs`` instead — see
+  // ``uploadedFileRefs`` below for the new state container.
   setLandingAttachedFiles,
   onStartTask,
   formatFileSize,
@@ -144,6 +232,20 @@ export function ChatLanding({
   const [pendingImageAttachments, setPendingImageAttachments] = useState<
     PendingImageAttachment[]
   >([]);
+  // Non-image attachments, uploaded to the workspace immediately. Each
+  // entry represents one file that is uploading, ready, or errored.
+  // Successful entries flow to the backend as ``context_refs`` — the
+  // same channel @-mentions use — so their CONTENT is inlined into the
+  // prompt by ``mention_resolver.inject_referenced_files``.
+  const [uploadedFileRefs, setUploadedFileRefs] = useState<
+    UploadedFileRef[]
+  >([]);
+  // A client-side chat identifier reserved for this landing session.
+  // Generated once on mount so all non-image uploads from this composer
+  // land in the same workspace the eventual /api/run call will use.
+  // ChatLanding unmounts on the first successful dispatch, so the id
+  // is scoped exactly to the "fresh session" window.
+  const [landingChatId] = useState<string>(() => generateLandingChatId());
 
   // Web Search: temporary per-message toggle, chat mode only.
   const [webSearchEnabled, setWebSearchEnabled] = useState(false);
@@ -366,10 +468,24 @@ export function ChatLanding({
   /**
    * Route a batch of incoming files through the correct pipeline:
    *
-   *   * Images  -> internal ``pendingImageAttachments`` list, uploaded
-   *                to the temporary artifact store immediately.
-   *   * Others  -> parent's ``landingAttachedFiles`` list, unchanged
-   *                from the pre-multimodal behavior.
+   *   * Images  -> ``pendingImageAttachments`` list, uploaded to the
+   *                temporary artifact store immediately.
+   *   * Others  -> ``uploadedFileRefs`` list, uploaded to the CHAT
+   *                WORKSPACE immediately so the backend can inline
+   *                their content into the prompt.
+   *
+   * Both uploads run in parallel and update their own state entries on
+   * completion, so the user sees live progress chips for every
+   * attachment type.
+   *
+   * The parent's legacy ``landingAttachedFiles`` array is no longer
+   * populated. Files travel as ``context_refs`` (workspace-relative
+   * paths) in ``handleDispatch`` instead. This matches the flow that
+   * ``run_direct_chat`` and ``run_instrumented`` already expect — see
+   * ``dispatcher.inject_referenced_files`` — and eliminates the previous
+   * ``[Uploaded Files]: name (in workspace directory)`` prompt hack
+   * which only told the model that a file EXISTED without giving it
+   * any way to read the content in chat mode.
    */
   const ingestLandingFiles = useCallback(
     (incoming: File[]) => {
@@ -386,10 +502,65 @@ export function ChatLanding({
         }
       }
 
+      // ── Non-image pipeline: upload to workspace immediately ────
       if (nonImageFiles.length > 0) {
-        setLandingAttachedFiles((prev) => [...prev, ...nonImageFiles]);
+        const newRefs: UploadedFileRef[] = nonImageFiles.map((file) => ({
+          id: generateUploadedFileRefId(),
+          fileName: file.name || "attachment",
+          fileSize: file.size,
+          mimeType: file.type || "application/octet-stream",
+          status: "uploading" as const,
+        }));
+
+        setUploadedFileRefs((prev) => [...prev, ...newRefs]);
+
+        newRefs.forEach((ref, idx) => {
+          const file = nonImageFiles[idx];
+          const refId = ref.id;
+          void (async () => {
+            try {
+              const uploaded = await uploadFileToWorkspace(
+                file,
+                landingChatId
+              );
+              setUploadedFileRefs((prev) =>
+                prev.map((current) =>
+                  current.id === refId
+                    ? {
+                        ...current,
+                        status: "ready",
+                        relPath: uploaded.path,
+                        fileName: uploaded.name || current.fileName,
+                      }
+                    : current
+                )
+              );
+            } catch (error) {
+              console.error(
+                "[ChatLanding] File upload failed for",
+                ref.fileName,
+                error
+              );
+              setUploadedFileRefs((prev) =>
+                prev.map((current) =>
+                  current.id === refId
+                    ? {
+                        ...current,
+                        status: "error",
+                        errorMessage:
+                          error instanceof Error
+                            ? error.message
+                            : String(error),
+                      }
+                    : current
+                )
+              );
+            }
+          })();
+        });
       }
 
+      // ── Image pipeline: unchanged (temp artifact store) ───────
       if (imageFiles.length === 0) return;
 
       const newAttachments: PendingImageAttachment[] = imageFiles.map(
@@ -449,7 +620,7 @@ export function ChatLanding({
         })();
       });
     },
-    [setLandingAttachedFiles]
+    [landingChatId]
   );
 
   const handleLandingFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -486,12 +657,16 @@ export function ChatLanding({
     const rawText = landingEditorRef.current
       ? landingEditorRef.current.getText()
       : inputValue;
-    const textToRun = (customPrompt !== undefined ? customPrompt : rawText).trim();
+    const textToRun = (customPrompt !== undefined
+      ? customPrompt
+      : rawText
+    ).trim();
 
     const hasImages = pendingImageAttachments.length > 0;
+    const hasFiles = uploadedFileRefs.length > 0;
     if (
       !textToRun &&
-      landingAttachedFiles.length === 0 &&
+      !hasFiles &&
       !hasImages &&
       activeSkills.length === 0
     ) {
@@ -510,9 +685,27 @@ export function ChatLanding({
         height: att.height,
       }));
 
-    const payloadOverride = {
+    // Only fully-uploaded non-image files are forwarded to the backend
+    // as ``context_refs``. This is the SAME channel @-mentions use, so
+    // the dispatcher's existing ``inject_referenced_files`` path picks
+    // them up and inlines their CONTENT into the prompt (with PDF text
+    // extraction and binary classification handled inside
+    // ``mention_resolver.py``).
+    //
+    // Still-uploading or errored entries are excluded so the backend
+    // never receives a reference to a file that is not yet on disk.
+    const readyFileRefs = uploadedFileRefs
+      .filter((ref) => ref.status === "ready" && ref.relPath)
+      .map((ref) => ({
+        relPath: ref.relPath as string,
+        fileName: ref.fileName,
+      }));
+
+    const payloadOverride: any = {
       is_reasoning_model: isReasoningSupported,
-      reasoning_effort: isReasoningSupported ? (reasoningEffort || "none") : "none",
+      reasoning_effort: isReasoningSupported
+        ? reasoningEffort || "none"
+        : "none",
       // Attach web search flag (chat mode only)
       ...(execMode === "chat" && { web_search_enabled: webSearchEnabled }),
       // Attach delegation flag (agent mode only)
@@ -520,13 +713,29 @@ export function ChatLanding({
       // Multimodal image references. Consumed by start_run.py and
       // forwarded to the engine as llm_override["attachments"].
       ...(readyImageRefs.length > 0 ? { attachments: readyImageRefs } : {}),
+      // [FIX-CHAT-REFS] Non-image file references. Forwarded to the
+      // backend as llm_override["context_refs"], where the dispatcher
+      // resolves each one against the chat workspace and injects its
+      // content into the prompt. Without this, the file exists in the
+      // workspace but the model has no way to read it in chat mode.
+      ...(readyFileRefs.length > 0
+        ? { context_refs: readyFileRefs }
+        : {}),
+      // [FIX-CHAT-ID] Pin the chat_id so /api/run uses the same workspace
+      // the file uploads landed in. ChatContainer generates a fresh id
+      // when this field is absent — which would orphan every upload the
+      // user just did.
+      chat_id: landingChatId,
       // [SKILLS] Explicit skill invocations from the / menu.
       // Forwarded to EngineRunContext.invoked_skills; the engine
       // merges them with the agent's assigned skills at prompt time.
       ...(activeSkills.length > 0 ? { invoked_skills: activeSkills } : {}),
     };
 
-    onStartTask(textToRun, payloadOverride, landingAttachedFiles);
+    // [FIX-CHAT-REFS] No 3rd ``files`` argument: non-image files were
+    // already uploaded to the workspace on attach. The dispatcher picks
+    // them up via ``context_refs`` — no re-upload is needed.
+    onStartTask(textToRun, payloadOverride);
 
     // Success path: revoke preview URLs before clearing state so the
     // Blob references release immediately rather than waiting for GC.
@@ -542,8 +751,9 @@ export function ChatLanding({
 
     landingEditorRef.current?.clear();
     setInputValue("");
-    setLandingAttachedFiles([]);
+    setLandingAttachedFiles([]); // defensive: legacy state always empty
     setPendingImageAttachments([]);
+    setUploadedFileRefs([]);
     setActiveSkills([]);
     setWebSearchEnabled(false); // Reset after dispatch
   };
@@ -669,31 +879,50 @@ export function ChatLanding({
         )}
 
         {/* Attached Files & Image Badges Container */}
-        {(landingAttachedFiles.length > 0 ||
+        {(uploadedFileRefs.length > 0 ||
           pendingImageAttachments.length > 0) && (
           <div className="flex flex-col border-b border-border/40 bg-muted/20 mb-2 pb-1">
             <div className="flex flex-wrap gap-2 p-2.5 pb-1">
-              {/* Non-image files: legacy pipeline, held in parent state. */}
-              {landingAttachedFiles.map((file, idx) => (
+              {/* Non-image files: uploaded to workspace immediately. */}
+              {uploadedFileRefs.map((ref) => (
                 <div
-                  key={`legacy-${file.name}-${idx}`}
+                  key={ref.id}
                   className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs bg-muted/60 border border-border shadow-xs text-foreground animate-in fade-in"
                 >
                   <FileText size={13} className="text-primary shrink-0" />
                   <span
                     className="font-medium truncate max-w-[160px]"
-                    title={file.name}
+                    title={ref.fileName}
                   >
-                    {file.name}
+                    {ref.fileName}
                   </span>
                   <span className="text-[10px] text-muted-foreground font-mono">
-                    ({formatFileSize(file.size)})
+                    ({formatFileSize(ref.fileSize)})
                   </span>
+                  {ref.status === "uploading" && (
+                    <Loader2
+                      size={12}
+                      className="text-primary animate-spin shrink-0"
+                    />
+                  )}
+                  {ref.status === "ready" && (
+                    <CheckCircle2
+                      size={12}
+                      className="text-emerald-500 shrink-0"
+                    />
+                  )}
+                  {ref.status === "error" && (
+                    <AlertCircle
+                      size={12}
+                      className="text-rose-500 shrink-0"
+                      aria-label={ref.errorMessage || "Upload failed"}
+                    />
+                  )}
                   <button
                     type="button"
                     onClick={() =>
-                      setLandingAttachedFiles((prev) =>
-                        prev.filter((_, i) => i !== idx)
+                      setUploadedFileRefs((prev) =>
+                        prev.filter((r) => r.id !== ref.id)
                       )
                     }
                     className="p-0.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer ml-1"
@@ -761,8 +990,9 @@ export function ChatLanding({
             <div className="px-2.5 pb-1.5 text-[10px] text-muted-foreground/70 flex items-center gap-1">
               <Info size={10} className="shrink-0" />
               <span>
-                Images upload immediately. Non-image files are held in
-                memory and upload upon confirmed task submission.
+                Files upload to the workspace immediately so their
+                content can be inlined into the model's prompt. Images
+                upload to the temporary artifact store.
               </span>
             </div>
           </div>
@@ -773,7 +1003,7 @@ export function ChatLanding({
           <LexicalEditorComponent
             ref={landingEditorRef}
             placeholder={
-              landingAttachedFiles.length > 0 ||
+              uploadedFileRefs.length > 0 ||
               pendingImageAttachments.length > 0
                 ? "Add instructions for attached files..."
                 : activeSkills.length > 0
@@ -807,7 +1037,7 @@ export function ChatLanding({
               title="Attach files or images"
             >
               <Paperclip size={15} />
-              {(landingAttachedFiles.length > 0 ||
+              {(uploadedFileRefs.length > 0 ||
                 pendingImageAttachments.length > 0) && (
                 <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-primary" />
               )}
@@ -906,7 +1136,7 @@ export function ChatLanding({
               onClick={() => handleDispatch()}
               disabled={
                 !inputValue.trim() &&
-                landingAttachedFiles.length === 0 &&
+                uploadedFileRefs.length === 0 &&
                 pendingImageAttachments.length === 0 &&
                 activeSkills.length === 0
               }

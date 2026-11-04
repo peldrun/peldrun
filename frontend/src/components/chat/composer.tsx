@@ -126,7 +126,18 @@ export interface PendingAttachment {
   mimeType: string;
   isImage: boolean;
   status: "uploading" | "ready" | "error";
+  // For images: opaque fileId returned by /api/files/upload-temp.
   fileId?: string;
+  // For non-images: workspace-relative path returned by
+  // /api/files/upload. This is the value forwarded to the backend as
+  // ``context_refs[].relPath``, so the dispatcher's
+  // ``inject_referenced_files`` can find the file and inline its
+  // CONTENT into the prompt (with PDF extraction + binary detection
+  // handled inside ``mention_resolver.py``).
+  //
+  // Exactly one of ``fileId`` / ``relPath`` is populated on success,
+  // discriminated by ``isImage``.
+  relPath?: string;
   width?: number;
   height?: number;
   errorMessage?: string;
@@ -169,6 +180,66 @@ async function uploadImageToTemp(file: File): Promise<UploadTempResponse> {
 
 function generateAttachmentId(): string {
   return `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Workspace upload for non-image files
+// ---------------------------------------------------------------------------
+//
+// Non-image files (PDF, TXT, CSV, DOCX, ...) are uploaded DIRECTLY to
+// the chat workspace at attach time via ``POST /api/files/upload``.
+// This mirrors the ChatLanding flow and produces a workspace-relative
+// ``relPath`` that the backend's ``mention_resolver`` can read.
+//
+// Why not defer the upload to send time (the pre-fix behavior)?
+//   1. ``ChatContainer.handleStartTask`` re-uploads files passed via
+//      its ``filesToUpload`` argument, which produces a duplicate copy
+//      AND appends a useless ``[Uploaded Files]: name (in workspace
+//      directory)`` marker to the prompt. That marker gives the model
+//      no way to actually READ the content — the prompt contains only
+//      the filename, and chat mode has no tool-calling loop to read
+//      it. The result was that Chat-mode attachments were ignored
+//      entirely by the model.
+//   2. Uploading eagerly gives the user real progress feedback
+//      (spinner → check) and surfaces network errors immediately,
+//      instead of losing the file silently at send time.
+interface UploadWorkspaceResponse {
+  files: Array<{ name: string; path: string; size?: number }>;
+}
+
+async function uploadFileToWorkspace(
+  file: File,
+  chatId: string,
+): Promise<{ name: string; path: string }> {
+  const formData = new FormData();
+  formData.append("files", file);
+  formData.append("chat_id", chatId);
+
+  const res = await fetch("/api/files/upload", {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!res.ok) {
+    let detail = "";
+    try {
+      detail = await res.text();
+    } catch {
+      /* ignore */
+    }
+    throw new Error(
+      `Upload failed (${res.status}${detail ? `: ${detail.slice(0, 120)}` : ""})`
+    );
+  }
+
+  const data = (await res.json()) as UploadWorkspaceResponse;
+  const uploaded = (data.files || [])[0];
+  if (!uploaded || !uploaded.path) {
+    throw new Error(
+      "Server returned no workspace path for the uploaded file."
+    );
+  }
+  return { name: uploaded.name || file.name, path: uploaded.path };
 }
 
 interface ComposerProps {
@@ -583,8 +654,17 @@ export function Composer({
   const ingestFiles = useCallback((incoming: File[]) => {
     if (incoming.length === 0) return;
 
+    // A chat id is required to upload non-image files to the correct
+    // workspace. In the normal flow ``activeSessionId`` is set (the
+    // composer only renders after the first message), but if it is
+    // missing for any reason we fall back to the pre-fix behavior
+    // (hold in memory, upload on send via ChatContainer) rather than
+    // uploading to a random workspace that the run would not read.
+    const uploadChatId = activeSessionId || "";
+
     const newAttachments: PendingAttachment[] = [];
     const imagesToUpload: Array<{ id: string; file: File }> = [];
+    const filesToUpload: Array<{ id: string; file: File }> = [];
 
     for (const file of incoming) {
       const isImage = file.type.startsWith("image/");
@@ -603,6 +683,11 @@ export function Composer({
         });
         imagesToUpload.push({ id, file });
       } else {
+        // Non-image: start as "uploading" so the user sees live
+        // progress. Without a chat id we cannot upload, so fall back
+        // to "ready" with a note (ChatContainer will handle it as a
+        // legacy File-object upload, which still gives a chip but no
+        // content inlining — matching the pre-fix behavior).
         newAttachments.push({
           id,
           file,
@@ -610,8 +695,11 @@ export function Composer({
           fileSize: file.size,
           mimeType: file.type || "application/octet-stream",
           isImage: false,
-          status: "ready",
+          status: uploadChatId ? "uploading" : "ready",
         });
+        if (uploadChatId) {
+          filesToUpload.push({ id, file });
+        }
       }
     }
 
@@ -660,7 +748,50 @@ export function Composer({
         }
       })();
     });
-  }, []);
+
+    // Upload non-image files to the chat workspace in parallel. On
+    // success the attachment transitions to "ready" with a ``relPath``
+    // that ``handleSend`` forwards as ``context_refs[].relPath``.
+    filesToUpload.forEach(({ id, file }) => {
+      void (async () => {
+        try {
+          const uploaded = await uploadFileToWorkspace(file, uploadChatId);
+          setPendingAttachments((prev) =>
+            prev.map((att) =>
+              att.id === id
+                ? {
+                    ...att,
+                    status: "ready",
+                    relPath: uploaded.path,
+                    fileName: uploaded.name || att.fileName,
+                  }
+                : att
+            )
+          );
+        } catch (error) {
+          console.error(
+            "[Composer] File upload failed for",
+            file.name,
+            error
+          );
+          setPendingAttachments((prev) =>
+            prev.map((att) =>
+              att.id === id
+                ? {
+                    ...att,
+                    status: "error",
+                    errorMessage:
+                      error instanceof Error
+                        ? error.message
+                        : String(error),
+                  }
+                : att
+            )
+          );
+        }
+      })();
+    });
+  }, [activeSessionId]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
@@ -751,18 +882,27 @@ export function Composer({
     }
 
     // Partition attachments by kind:
-    //   * Non-images keep their raw File objects and are forwarded as the
-    //     legacy ``files`` argument so the parent's existing upload path
-    //     (POST /api/files/upload) keeps working unchanged.
+    //   * Non-images are ALREADY on the workspace (uploaded at attach
+    //     time by ``ingestFiles``). They travel as ``context_refs``
+    //     entries, so the dispatcher's ``inject_referenced_files`` path
+    //     can read and inline their CONTENT into the prompt. No raw
+    //     ``File`` objects are passed to the parent — that would trigger
+    //     a redundant ``POST /api/files/upload`` in ChatContainer and
+    //     append a useless ``[Uploaded Files]: name (in workspace
+    //     directory)`` marker to the prompt.
     //   * Ready images become AttachmentRef objects traveling inside
-    //     ``llmOverride.attachments``. The parent forwards them to the
-    //     backend, which stores only the lightweight ``file_id`` references.
-    //   * Still-uploading or errored images are excluded: sending them
-    //     would land on the backend with a null fileId and the engine
-    //     would treat the reference as broken.
-    const currentFiles = pendingAttachments
-      .filter((att) => !att.isImage)
-      .map((att) => att.file);
+    //     ``llmOverride.attachments``.
+    //   * Still-uploading or errored entries (of either kind) are
+    //     excluded: sending them would reach the backend with a null
+    //     reference and the engine would treat the reference as broken.
+    const readyFileRefs = pendingAttachments
+      .filter(
+        (att) => !att.isImage && att.status === "ready" && att.relPath
+      )
+      .map((att) => ({
+        relPath: att.relPath as string,
+        fileName: att.fileName,
+      }));
 
     const readyImageRefs = pendingAttachments
       .filter(
@@ -785,9 +925,12 @@ export function Composer({
     const editorMentions: Array<{ display: string; path: string }> =
       editorRef.current?.getFileMentions?.() ?? [];
 
-    // Deduplicate by canonical path. The user may legitimately reference
-    // the same file at multiple points in the message, but the payload
-    // (and the resulting chip row) must contain each file only once.
+    // Merge editor-mention refs with uploads-in-workspace refs into a
+    // single deduplicated ``context_refs`` list. Editor mentions come
+    // from inline `@file` tokens; uploaded-file refs come from the
+    // non-image pipeline added in this revision. Both point to files
+    // already on disk at a workspace-relative path, so the backend
+    // treats them identically.
     const seenPaths = new Set<string>();
     const contextRefs: Array<{ relPath: string; fileName: string }> = [];
     for (const m of editorMentions) {
@@ -796,6 +939,12 @@ export function Composer({
       seenPaths.add(path);
       const fileName = path.split("/").pop() || path;
       contextRefs.push({ relPath: path, fileName });
+    }
+    for (const r of readyFileRefs) {
+      const path = r.relPath.trim();
+      if (!path || seenPaths.has(path)) continue;
+      seenPaths.add(path);
+      contextRefs.push({ relPath: path, fileName: r.fileName });
     }
 
     const dispatchText = trimmedText
@@ -808,13 +957,30 @@ export function Composer({
     try {
       setIsSubmitting(true);
 
+      // ``files`` (second argument) is intentionally ``undefined``:
+      // non-image files were already uploaded to the workspace at
+      // attach time, and re-uploading them here would (a) create a
+      // duplicate copy and (b) append the deprecated
+      // ``[Uploaded Files]: name (in workspace directory)`` marker
+      // that gives the model no way to read the content in chat mode.
+      // They travel as ``context_refs`` instead — the same channel
+      // @-mentions use — so the dispatcher inlines their CONTENT.
+      //
+      // ``chat_id`` pins the target to the workspace where the
+      // uploads actually landed. In the normal flow this matches
+      // ``activeChatId`` anyway, but the explicit field protects
+      // against any future divergence.
       const sendResult = onSend(
         finalPromptText,
-        currentFiles.length > 0 ? currentFiles : undefined,
+        undefined,
         {
           ...currentPayload,
-          // [FIX-2.3] Structured workspace file references (from @-menu).
+          // [FIX-2.3 + FIX-CHAT-REFS] Structured workspace file
+          // references (editor @-mentions + uploaded non-images).
           context_refs: contextRefs.length > 0 ? contextRefs : undefined,
+          // [FIX-CHAT-ID] Pin the chat id so /api/run uses the same
+          // workspace where the file uploads landed.
+          ...(activeSessionId ? { chat_id: activeSessionId } : {}),
           // Multimodal image references (from /api/files/upload-temp).
           // Consumed by ``start_run.py`` and forwarded to the engine as
           // ``llm_override["attachments"]``. Omitted entirely when no
@@ -990,7 +1156,12 @@ export function Composer({
                       className="text-primary animate-spin shrink-0"
                     />
                   )}
-                  {att.status === "ready" && att.isImage && (
+                  {/* The check icon now appears for both images and
+                   *  non-images: non-images reach "ready" state after
+                   *  their workspace upload completes (previously they
+                   *  were created with status "ready" and shown without
+                   *  a check). */}
+                  {att.status === "ready" && (
                     <CheckCircle2
                       size={12}
                       className="text-emerald-500 shrink-0"
@@ -1017,9 +1188,9 @@ export function Composer({
             <div className="px-2.5 pb-1.5 text-[10px] text-muted-foreground/70 flex items-center gap-1">
               <Info size={10} className="shrink-0" />
               <span>
-                Images upload to the temporary artifact store immediately.
-                Non-image files are held in memory and upload upon confirmed
-                task submission.
+                Files upload to the workspace immediately so their content
+                can be inlined into the model&apos;s prompt. Images upload
+                to the temporary artifact store.
               </span>
             </div>
           </div>
