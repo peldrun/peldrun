@@ -444,9 +444,28 @@ export default function StoresPage() {
         onClose={skillActions.handleCloseDetails}
       />
 
-      {/* Provider upload modal (.zip) */}
+      {/* Provider install modal — serves BOTH the manual ZIP upload
+          flow and the catalog-item install flow. The only difference
+          is which mode is active; the progress bar, log console, and
+          result banners are identical, so users see the same steps
+          whether they uploaded a ZIP or clicked "Install" on a
+          catalog entry. */}
       <ProviderUploadModal
-        open={providerActions.isUploadModalOpen}
+        open={
+          providerActions.isUploadModalOpen ||
+          providerActions.catalogInstallItem !== null
+        }
+        mode={
+          providerActions.catalogInstallItem !== null ? "catalog" : "upload"
+        }
+        catalogItemName={
+          providerActions.catalogInstallItem?.display_name ||
+          providerActions.catalogInstallItem?.name ||
+          undefined
+        }
+        catalogItemVersion={
+          providerActions.catalogInstallItem?.version || undefined
+        }
         selectedFile={providerActions.uploadSelectedFile}
         installDependencies={providerActions.uploadInstallDependencies}
         isUploading={providerActions.isUploading}

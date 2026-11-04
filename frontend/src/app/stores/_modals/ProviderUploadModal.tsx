@@ -23,6 +23,26 @@ export interface ProviderUploadModalProps {
   /** Whether the modal is visible. */
   open: boolean;
 
+  /**
+   * Display mode.
+   *
+   *   - ``"upload"``  (default) — manual ZIP upload flow: file picker,
+   *                     install-dependencies checkbox, trust warning.
+   *   - ``"catalog"``           — catalog-driven install. The backend
+   *                     downloads the archive, so the picker, checkbox,
+   *                     and warning are hidden. The progress bar, log
+   *                     console, and result banners are identical in
+   *                     both modes — that is the point: users see the
+   *                     SAME steps either way.
+   */
+  mode?: "upload" | "catalog";
+
+  /** In ``"catalog"`` mode: the display name of the item being installed. */
+  catalogItemName?: string;
+
+  /** In ``"catalog"`` mode: the version of the item being installed. */
+  catalogItemVersion?: string;
+
   /** The .zip file selected by the user, or ``null``. */
   selectedFile: File | null;
 
@@ -174,6 +194,9 @@ function colorForTag(tag: string): string {
 
 export function ProviderUploadModal({
   open,
+  mode = "upload",
+  catalogItemName,
+  catalogItemVersion,
   selectedFile,
   installDependencies,
   isUploading,
@@ -184,6 +207,7 @@ export function ProviderUploadModal({
   onSubmit,
   onClose,
 }: ProviderUploadModalProps) {
+  const isCatalogMode = mode === "catalog";
   const fileInputRef = useRef<HTMLInputElement>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
 
@@ -253,7 +277,7 @@ export function ProviderUploadModal({
       <div
         className={[
           "relative z-10 flex w-full flex-col overflow-hidden rounded-xl border bg-card shadow-2xl max-h-[90vh]",
-          showProgress ? "max-w-3xl" : "max-w-xl",
+          showProgress || isCatalogMode ? "max-w-3xl" : "max-w-xl",
         ].join(" ")}
       >
         {/* ── Header ────────────────────────────────────────────── */}
@@ -270,10 +294,16 @@ export function ProviderUploadModal({
                 id="upload-modal-title"
                 className="text-sm font-semibold text-foreground"
               >
-                Install Provider Package
+                {isCatalogMode
+                  ? `Install ${catalogItemName || "Provider Package"}${
+                      catalogItemVersion ? ` v${catalogItemVersion}` : ""
+                    }`
+                  : "Install Provider Package"}
               </h2>
               <p className="mt-0.5 text-[11px] text-muted-foreground">
-                Upload a .zip containing a valid manifest.json.
+                {isCatalogMode
+                  ? "Downloading from the catalog and verifying SHA-256…"
+                  : "Upload a .zip containing a valid manifest.json."}
               </p>
             </div>
           </div>
@@ -295,8 +325,10 @@ export function ProviderUploadModal({
 
         {/* ── Body ──────────────────────────────────────────────── */}
         <div className="flex-1 overflow-y-auto scrollbar-thin px-5 py-4">
-          {/* Pre-flight view: file picker + options + errors */}
-          {!showProgress && (
+          {/* Pre-flight view — upload mode only. In catalog mode the
+              backend fetches the archive, so there is nothing for the
+              user to pick. */}
+          {!showProgress && !isCatalogMode && (
             <>
               <div className="mb-4">
                 <label className="mb-1 block text-[11px] font-semibold text-foreground">
@@ -374,6 +406,27 @@ export function ProviderUploadModal({
                 </div>
               )}
             </>
+          )}
+
+          {/* Catalog mode "starting" placeholder — shown in the
+              brief window between modal open and the first polling
+              response. Keeps the user oriented while the backend
+              is downloading the ZIP. */}
+          {!showProgress && isCatalogMode && (
+            <div className="flex flex-col items-center justify-center gap-3 py-12 text-center">
+              <Loader2 className="h-6 w-6 animate-spin text-primary" />
+              <div>
+                <p className="text-xs font-medium text-foreground">
+                  Starting catalog install…
+                </p>
+                <p className="mt-1 max-w-md text-[11px] text-muted-foreground">
+                  The backend is downloading{" "}
+                  {catalogItemName || "the package"}
+                  {catalogItemVersion ? ` v${catalogItemVersion}` : ""} and
+                  verifying its SHA-256. Progress will appear below.
+                </p>
+              </div>
+            </div>
           )}
 
           {/* Progress view */}
@@ -517,6 +570,8 @@ export function ProviderUploadModal({
           <div className="text-[10px] text-muted-foreground">
             {showProgress
               ? "The install runs on the backend; you can close this window once it finishes."
+              : isCatalogMode
+              ? "The ZIP is fetched from the catalog URL and verified against its SHA-256 before extraction."
               : "Only install packages you trust."}
           </div>
           <div className="flex items-center gap-2">
@@ -532,7 +587,7 @@ export function ProviderUploadModal({
                 ? "Close"
                 : "Cancel"}
             </button>
-            {!showProgress && (
+            {!showProgress && !isCatalogMode && (
               <button
                 type="button"
                 onClick={() => void onSubmit()}

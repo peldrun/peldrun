@@ -1099,7 +1099,10 @@ class ProviderPackageCatalog:
     # ------------------------------------------------------------------
 
     async def install_from_catalog(
-        self, item_id: str
+        self,
+        item_id: str,
+        *,
+        progress_callback: Optional[Any] = None,
     ) -> ProviderPackageInstallResult:
         """
         Download, verify, and install a catalog item.
@@ -1116,6 +1119,15 @@ class ProviderPackageCatalog:
         ----------
         item_id
             The catalog item's ``id`` field.
+        progress_callback
+            Optional callable invoked with human-readable progress
+            lines. The async install endpoint uses this to stream
+            download / verification / extraction / pip steps into
+            the job log so the frontend can render them live — same
+            UX as a manual ZIP upload. When ``None`` (the default),
+            no logging is emitted from this method; the manager's
+            own ``progress_callback`` (if any) still fires during
+            its phases.
 
         Returns
         -------
@@ -1132,6 +1144,17 @@ class ProviderPackageCatalog:
             Any error from the install pipeline itself (validation,
             conflict, environment, storage) is propagated unchanged.
         """
+
+        def _progress(message: str) -> None:
+            """Fire the callback, swallowing errors so a broken
+            consumer cannot abort the install."""
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(message)
+            except Exception:
+                pass
+
         # Best-effort refresh so an item published to the remote
         # catalog a minute ago is installable without waiting for the
         # listing endpoint's TTL to expire. Failure is non-fatal —
@@ -1160,10 +1183,21 @@ class ProviderPackageCatalog:
         assert item.download_url is not None
         assert item.checksum_sha256 is not None
 
+        display = item.display_name or item.name or item.id
+        _progress(
+            f"[system] Downloading {display} v{item.version} "
+            f"from {item.download_url}"
+        )
+
         zip_bytes = await self._download_zip(
             url=item.download_url,
             expected_sha256=item.checksum_sha256.strip().lower(),
             provider_hint=item.id,
+        )
+
+        _progress(
+            f"[system] Downloaded {len(zip_bytes)} bytes; "
+            f"SHA-256 verified."
         )
 
         # Delegate to the manager. Any install error propagates as-is;
@@ -1173,6 +1207,7 @@ class ProviderPackageCatalog:
             source_filename=f"{item.id}-{item.version}.zip",
             install_dependencies=True,
             source="catalog",
+            progress_callback=progress_callback,
         )
 
     # ------------------------------------------------------------------

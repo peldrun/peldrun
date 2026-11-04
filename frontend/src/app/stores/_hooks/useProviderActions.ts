@@ -156,6 +156,12 @@ export interface UseProviderActionsResult {
    */
   installJobStatus: InstallJobStatus | null;
 
+  /**
+   * The catalog item currently being installed, or ``null``.
+   * Drives ``ProviderUploadModal``'s "catalog" mode.
+   */
+  catalogInstallItem: ProviderCatalogItem | null;
+
   // ── Catalog ────────────────────────────────────────────────────
   catalogItems: ProviderCatalogItem[];
   isCatalogLoading: boolean;
@@ -319,6 +325,16 @@ export function useProviderActions({
   // render the log timeline live.
   const [installJobStatus, setInstallJobStatus] =
     useState<InstallJobStatus | null>(null);
+
+  /**
+   * The catalog item currently being installed, or ``null`` when no
+   * catalog install is in flight. Drives ``ProviderUploadModal``'s
+   * "catalog" mode (hides file picker, shows item name + version).
+   * Cleared on success; preserved on failure so the user can read the
+   * log before closing.
+   */
+  const [catalogInstallItem, setCatalogInstallItem] =
+    useState<ProviderCatalogItem | null>(null);
 
   // Interval handle for the polling loop. Stored in a ref so it
   // survives re-renders without triggering them, and so we can
@@ -636,32 +652,119 @@ export function useProviderActions({
       );
       if (!confirmed) return;
 
+      stopInstallPolling();
+      setUploadError(null);
+      setInstallJobStatus(null);
+      setIsUploading(true);
       setInstallingCatalogId(itemId);
+      setCatalogInstallItem(item);
+
+      let jobId: string;
       try {
-        const result = await apiInstallFromCatalog(itemId);
+        const response = await apiInstallFromCatalog(itemId);
+        jobId = response.job_id;
+      } catch (err) {
+        const message = formatProviderError(err);
+        setUploadError(message);
+        showToast.error("Install Failed", message);
+        setIsUploading(false);
+        setInstallingCatalogId(null);
+        setCatalogInstallItem(null);
+        return;
+      }
 
-        await reload();
-        void handleLoadCatalog();
+      const MAX_POLL_DURATION_MS = 11 * 60 * 1000;
+      const POLL_INTERVAL_MS = 1500;
+      const MAX_CONSECUTIVE_ERRORS = 5;
+      const pollStartedAt = Date.now();
+      let consecutiveErrors = 0;
 
-        showToast.success(
-          "Provider Installed",
-          `${result.display_name || result.name || result.id} v${result.version} is now available.`,
-        );
+      const poll = async () => {
+        if (installPollingRef.current === null) return;
 
-        if (Array.isArray(result.warnings)) {
-          for (const w of result.warnings) {
-            if (typeof w === "string" && w.trim()) {
-              showToast.info("Install Notice", w);
+        if (Date.now() - pollStartedAt > MAX_POLL_DURATION_MS) {
+          stopInstallPolling();
+          setUploadError(
+            "Install is taking longer than expected. Check the backend logs.",
+          );
+          showToast.error(
+            "Install Timed Out",
+            "See backend logs for details.",
+          );
+          setIsUploading(false);
+          setInstallingCatalogId(null);
+          setCatalogInstallItem(null);
+          return;
+        }
+
+        let job;
+        try {
+          job = await apiGetInstallStatus(jobId);
+        } catch (err) {
+          consecutiveErrors += 1;
+          if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+            stopInstallPolling();
+            const message = formatProviderError(err);
+            setUploadError(
+              `Lost contact with the backend while polling for install status: ${message}`,
+            );
+            showToast.error("Status Check Failed", message);
+            setIsUploading(false);
+            setInstallingCatalogId(null);
+            setCatalogInstallItem(null);
+          }
+          return;
+        }
+
+        consecutiveErrors = 0;
+        setInstallJobStatus(job);
+
+        if (job.status === "success" && job.result) {
+          stopInstallPolling();
+          setInstallJobStatus(null);
+          setUploadError(null);
+          setIsUploading(false);
+          setInstallingCatalogId(null);
+          setCatalogInstallItem(null);
+
+          await reload();
+          void handleLoadCatalog();
+
+          showToast.success(
+            "Provider Installed",
+            `${job.result.display_name || job.result.name || job.result.id} v${job.result.version} is now available.`,
+          );
+
+          if (Array.isArray(job.result.warnings)) {
+            for (const w of job.result.warnings) {
+              if (typeof w === "string" && w.trim()) {
+                showToast.info("Install Notice", w);
+              }
             }
           }
+          return;
         }
-      } catch (err) {
-        showToast.error("Install Failed", formatProviderError(err));
-      } finally {
-        setInstallingCatalogId(null);
-      }
+
+        if (job.status === "failed") {
+          stopInstallPolling();
+          const message = job.error?.error || "Install failed.";
+          setUploadError(message);
+          showToast.error("Install Failed", message);
+          setIsUploading(false);
+          setInstallingCatalogId(null);
+          // Preserve catalogInstallItem so the modal keeps rendering
+          // the log — the user must read what went wrong first.
+          return;
+        }
+      };
+
+      void poll();
+      installPollingRef.current = window.setInterval(
+        () => void poll(),
+        POLL_INTERVAL_MS,
+      );
     },
-    [catalogItems, reload, handleLoadCatalog],
+    [catalogItems, reload, handleLoadCatalog, stopInstallPolling],
   );
 
   // ═══════════════════════════════════════════════════════════════════
@@ -696,6 +799,7 @@ export function useProviderActions({
     setUploadSelectedFile(null);
     setUploadError(null);
     setInstallJobStatus(null);
+    setCatalogInstallItem(null);
   }, [isUploading, stopInstallPolling]);
 
   const handleUploadSubmit = useCallback(async () => {
@@ -1337,6 +1441,7 @@ export function useProviderActions({
     handleCloseUpload,
     handleUploadSubmit,
     installJobStatus,
+    catalogInstallItem,
 
     // Catalog
     catalogItems,

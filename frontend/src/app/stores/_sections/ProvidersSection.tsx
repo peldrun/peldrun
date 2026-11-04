@@ -340,7 +340,7 @@ function CatalogItemCard({
             works in every modern browser — no runtime color
             parsing needed on the client. */}
         <div
-          className="shrink-0 flex h-full w-20 items-center justify-center"
+          className="shrink-0 flex h-full w-30 items-center justify-center"
 
           aria-hidden="true"
         >

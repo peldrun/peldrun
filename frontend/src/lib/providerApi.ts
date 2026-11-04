@@ -588,32 +588,60 @@ export async function refreshCatalog(): Promise<{
 }
 
 /**
- * Download, verify, and install a catalog item.
+ * Response shape returned by ``POST /{id}/install-from-catalog``.
+ *
+ * The endpoint is now asynchronous — same contract as ``/upload``.
+ * It returns a ``job_id`` immediately, and the actual download +
+ * verification + install runs in a background task. Poll
+ * ``getInstallStatus(jobId)`` to track progress.
+ */
+export interface CatalogInstallAcceptedResponse {
+  status: "accepted";
+  job_id: string;
+  message: string;
+}
+
+/**
+ * Download, verify, and install a catalog item — asynchronously.
  *
  * For ``compatible`` transports, the backend installs from the
  * catalog item's manifest directly (no ZIP, no download). For
  * ``native`` / ``custom``, the backend downloads the ZIP, verifies
  * its SHA-256, extracts it, and creates an isolated venv.
+ *
+ * Returns immediately with ``{status, job_id, message}``. Call
+ * ``getInstallStatus(jobId)`` in a loop to display the same live
+ * progress timeline as the manual-upload flow — the backend emits
+ * identical log lines for both paths.
  */
 export async function installFromCatalog(
   providerId: string,
-): Promise<ProviderInstallResult> {
+): Promise<CatalogInstallAcceptedResponse> {
   const data = await request<{
     status: string;
-    provider: ProviderInstallResult;
+    job_id: string;
+    message?: string;
   }>(`/${encodeURIComponent(providerId)}/install-from-catalog`, {
     method: "POST",
   });
 
-  if (!data.provider) {
+  if (!data.job_id) {
     throw new ProviderApiRequestError(
-      "Install-from-catalog response was missing the provider object.",
+      "Install-from-catalog response was missing the job_id field. "
+        + "The backend may be running an older version that does not "
+        + "support async catalog installs. Restart PELDRUN to load "
+        + "the current build.",
       "INVALID_RESPONSE",
       {},
       200,
     );
   }
-  return data.provider;
+
+  return {
+    status: "accepted",
+    job_id: data.job_id,
+    message: data.message || "",
+  };
 }
 
 

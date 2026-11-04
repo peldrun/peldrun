@@ -1083,6 +1083,21 @@ async def _run_install_background(
             f"({result.id}@{result.version})."
         )
 
+        # Register the freshly-installed package in the runtime
+        # factory registry so "Test Connection" and "Scan Models" work
+        # immediately, without requiring a separate scan round-trip.
+        try:
+            from peldrun.llm.providers import (
+                ensure_external_providers_discovered,
+            )
+
+            ensure_external_providers_discovered()
+        except Exception as exc:
+            logger.debug(
+                "Post-install provider discovery failed (non-fatal): %s",
+                exc,
+            )
+
     except ProviderPackageError as exc:
         job["status"] = "failed"
         job["error"] = exc.to_dict()
@@ -1157,15 +1172,23 @@ async def get_install_status(job_id: str) -> Dict[str, Any]:
 @router.post("/{provider_id}/install-from-catalog")
 async def install_from_catalog(provider_id: str) -> Dict[str, Any]:
     """
-    Download, verify, and install a catalog item.
+    Download, verify, and install a catalog item — asynchronously.
+
+    Returns ``{"status": "accepted", "job_id": "...", "message": "..."}``
+    immediately. The actual download + install runs in a background
+    task and its progress is exposed via ``GET /install-status/{job_id}``
+    — the SAME polling contract the manual-upload endpoint uses. The
+    frontend therefore renders catalog installs through the identical
+    progress modal (phase bar + live log), eliminating the silent
+    failures the previous synchronous version produced.
 
     ``provider_id`` in the URL is the CATALOG ITEM's ``id``, not an
     already-installed package's provider_id — see the module docstring
     for the naming note.
 
     Pre-validates the item (exists, installable) so the common failure
-    modes return a proper 404 or 400 before any network call. Genuine
-    download or install errors are then mapped by ``_to_http_exception``.
+    modes return a proper 404 or 400 before any background task is
+    spawned.
     """
     catalog = get_provider_package_catalog()
 
@@ -1199,38 +1222,138 @@ async def install_from_catalog(provider_id: str) -> Dict[str, Any]:
             },
         )
 
+    job_id = f"job_{uuid.uuid4().hex[:12]}"
+    display = item.display_name or item.name or item.id
+    INSTALL_JOBS[job_id] = {
+        "job_id": job_id,
+        "status": "running",
+        "filename": f"{item.id}-{item.version}.zip",
+        "logs": [
+            f"[system] Starting catalog install for "
+            f"{display} v{item.version}..."
+        ],
+        "result": None,
+        "error": None,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+    }
+
+    if len(INSTALL_JOBS) >= 50:
+        completed = [
+            (jid, j["started_at"])
+            for jid, j in INSTALL_JOBS.items()
+            if j["status"] in ("success", "failed")
+        ]
+        completed.sort(key=lambda pair: pair[1])
+        excess = len(INSTALL_JOBS) - 49
+        for jid, _ in completed[:excess]:
+            INSTALL_JOBS.pop(jid, None)
+
+    asyncio.create_task(
+        _run_catalog_install_background(job_id=job_id, item_id=item.id)
+    )
+
+    return {
+        "status": "accepted",
+        "job_id": job_id,
+        "message": (
+            "Catalog install started. Poll /install-status/{job_id} "
+            "for progress and the final result."
+        ),
+    }
+
+
+async def _run_catalog_install_background(
+    *,
+    job_id: str,
+    item_id: str,
+) -> None:
+    """
+    Background worker for a catalog-item install job.
+
+    Mirrors ``_run_install_background`` (upload path) exactly: it
+    mutates ``INSTALL_JOBS[job_id]`` in place so the frontend's
+    polling loop can display the same progress timeline for catalog
+    installs as it does for manual ZIP uploads.
+
+    All exceptions are caught and stored on the job. An unhandled
+    exception would otherwise be logged by asyncio and silently
+    dropped, leaving the frontend polling forever.
+    """
+    job = INSTALL_JOBS.get(job_id)
+    if job is None:
+        logger.warning(
+            "Catalog install job %s disappeared; aborting.", job_id
+        )
+        return
+
+    def _log(message: str) -> None:
+        if len(job["logs"]) >= 500:
+            job["logs"].pop(0)
+        job["logs"].append(message)
+
+    def _progress_callback(message: str) -> None:
+        try:
+            _log(message[:2000])
+        except Exception:
+            pass
+
     try:
-        result = await catalog.install_from_catalog(provider_id)
+        catalog = get_provider_package_catalog()
+        result = await catalog.install_from_catalog(
+            item_id,
+            progress_callback=_progress_callback,
+        )
+
+        job["status"] = "success"
+        job["result"] = result.model_dump()
+        job["finished_at"] = datetime.now(timezone.utc).isoformat()
+        _log(
+            f"[system] Installation completed successfully "
+            f"({result.id}@{result.version})."
+        )
+
+        # Register the freshly-installed catalog package in the
+        # runtime factory registry so "Test Connection" works
+        # immediately after install completes.
+        try:
+            from peldrun.llm.providers import (
+                ensure_external_providers_discovered,
+            )
+
+            ensure_external_providers_discovered()
+        except Exception as exc:
+            logger.debug(
+                "Post-catalog-install provider discovery failed "
+                "(non-fatal): %s",
+                exc,
+            )
+
     except ProviderPackageError as exc:
+        job["status"] = "failed"
+        job["error"] = exc.to_dict()
+        job["finished_at"] = datetime.now(timezone.utc).isoformat()
+        _log(f"[error] {exc.message}")
         logger.info(
-            "Catalog install failed for %r: %s (%s)",
-            provider_id,
+            "Background catalog install for job %s failed: %s (%s)",
+            job_id,
             exc.message,
             exc.code,
         )
-        raise _to_http_exception(exc)
-    except Exception as exc:
-        logger.exception(
-            "Unexpected catalog install error for %r", provider_id
-        )
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": f"Unexpected catalog install failure: {exc}",
-                "code": "PROVIDER_PACKAGE_INSTALL_FAILED",
-                "details": {"exception_type": type(exc).__name__},
-            },
-        )
 
-    return {
-        "status": "ok",
-        "provider": result.model_dump(),
-        "registry": {
-            "total_providers": len(
-                provider_package_manager.list_packages()
-            ),
-        },
-    }
+    except Exception as exc:
+        job["status"] = "failed"
+        job["error"] = {
+            "error": f"Unexpected install failure: {exc}",
+            "code": "PROVIDER_PACKAGE_INSTALL_FAILED",
+            "details": {"exception_type": type(exc).__name__},
+        }
+        job["finished_at"] = datetime.now(timezone.utc).isoformat()
+        _log(f"[error] Unexpected failure: {exc}")
+        logger.exception(
+            "Unexpected background catalog install failure for job %s",
+            job_id,
+        )
 
 
 @router.get("/{provider_id}")
@@ -2278,7 +2401,10 @@ async def test_connection(
     # exercise validation).
     try:
         from peldrun.llm.contracts import ConnectionContext
-        from peldrun.llm.providers import provider_factory
+        from peldrun.llm.providers import (
+            ensure_external_providers_discovered,
+            provider_factory,
+        )
     except Exception as exc:
         logger.error("Could not import PELDRUN runtime: %s", exc)
         return {
@@ -2287,6 +2413,23 @@ async def test_connection(
             "message": f"PELDRUN runtime not available: {exc}",
             "latency_ms": 0.0,
         }
+
+    # Ensure any externally-installed provider packages are registered
+    # in the runtime factory registry BEFORE we call ``create()``.
+    #
+    # The registry is populated lazily (on the first ``fetch-models``
+    # call), but ``test_connection`` needs it too: a user who installs
+    # a package from the catalog and immediately clicks "Test" has
+    # never triggered a scan, so the package is on disk but NOT in the
+    # in-memory registry — and ``provider_factory.create()`` raises
+    # "Provider 'X' is not registered". Calling this here is idempotent
+    # (a cheap no-op when already registered) and closes that gap.
+    try:
+        ensure_external_providers_discovered()
+    except Exception as exc:
+        logger.warning(
+            "External provider discovery failed (non-fatal): %s", exc
+        )
 
     connection = ConnectionContext(
         connection_id=connection_id,
