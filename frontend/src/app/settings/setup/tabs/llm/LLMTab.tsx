@@ -19,6 +19,7 @@ import { LLMHeader } from "./components/LLMHeader";
 import { OverviewTab } from "./components/OverviewTab";
 import { LocalEnginesTab } from "./components/LocalEnginesTab";
 import { CloudProvidersTab } from "./components/CloudProvidersTab";
+import { StoreProvidersTab } from "./components/StoreProvidersTab";
 import { CustomEndpointsTab } from "./components/CustomEndpointsTab";
 import { sanitizeTokenInput, ensureOllamaV1, STORAGE_KEYS, writeLocalJson } from "./utils";
 import type {
@@ -287,11 +288,17 @@ export function LLMTab(props: LLMTabProps) {
   const handleTestLMStudio = useCallback(async () => {
     setTestingId("lmstudio");
     try {
+      // Forward the user's explicit metadata endpoint so the backend
+      // probe hits the URL they configured (e.g. ".../api/v1/models")
+      // instead of a URL computed from `baseUrl`. Without this, a base
+      // URL ending in `/api/v1` produced the double-suffixed
+      // `/api/api/v0/models` path visible in the LM Studio server log.
       const res = await testEndpoint(
         lmStudioSettings.baseUrl,
         lmStudioSettings.apiKey,
         lmStudioSettings.model,
-        ""
+        "",
+        lmStudioSettings.metadataEndpoint
       );
 
       setLmStudioSettings((prev) => ({
@@ -321,11 +328,16 @@ export function LLMTab(props: LLMTabProps) {
     setTestingId("ollama");
     const testUrl = ensureOllamaV1(ollamaSettings.baseUrl);
     try {
+      // Ollama exposes a native metadata endpoint (typically
+      // ".../api/tags"). Forward it verbatim when the user configured
+      // one; the backend falls back to computing an endpoint from
+      // `testUrl` otherwise.
       const res = await testEndpoint(
         testUrl,
         "",
         ollamaSettings.model || "test",
-        ""
+        "",
+        ollamaSettings.metadataEndpoint
       );
 
       setOllamaSettings((prev) => ({
@@ -543,6 +555,13 @@ export function LLMTab(props: LLMTabProps) {
           />
         )}
 
+        {activeSubTab === "store_providers" && (
+          <StoreProvidersTab
+            activateEngine={activateEngine}
+            activeProviderId={config.llm.provider}
+          />
+        )}
+
         {activeSubTab === "custom" && (
           <CustomEndpointsTab
             {...props}
@@ -592,6 +611,13 @@ export function LLMTab(props: LLMTabProps) {
           baseUrl={discovery.discoveryTarget.baseUrl}
           apiKey={discovery.discoveryTarget.apiKey}
           providerType={discovery.discoveryTarget.type}
+          // The user's explicit metadata endpoint from the vault,
+          // forwarded so the discovery query hits the URL they chose
+          // instead of a URL derived from `baseUrl`. Undefined for
+          // targets that do not set it; the modal then sends an empty
+          // string and the backend uses its native adapter discovery
+          // path (which probes /api/v1/models first).
+          metadataEndpoint={discovery.discoveryTarget.metadataEndpoint}
           initialSavedModels={discovery.discoveryTarget.savedModels || []}
           onSaveModels={handleSaveDiscovered}
         />

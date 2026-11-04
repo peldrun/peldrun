@@ -80,6 +80,11 @@ export function CustomEndpointsTab({
       savedModels: ce.savedModels || [],
       isCustom: true,
       badge: ce.badge,
+      // Forward the user's explicit metadata endpoint (saved on the
+      // custom endpoint during creation). Undefined for endpoints
+      // created before this field existed — the backend then falls
+      // back to `<endpointUrl>/models`.
+      metadataEndpoint: (ce as { metadataEndpoint?: string }).metadataEndpoint,
     });
   };
 

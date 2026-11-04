@@ -14,6 +14,7 @@ import {
   Brain,
   Eye,
   Wrench,
+  Package,
 } from "lucide-react";
 import { inferModelCapabilities, fetchServerMetadata } from "@/lib/modelMetadata";
 import { fetchVault } from "@/lib/vault";
@@ -55,6 +56,14 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
 
   const [activeCloudProviders, setActiveCloudProviders] = useState<any[]>([]);
   const [activeCustomEndpoints, setActiveCustomEndpoints] = useState<any[]>([]);
+  const [activeProviderPackages, setActiveProviderPackages] = useState<
+    Array<{
+      id: string;
+      displayName: string;
+      iconName: string;
+      models: string[];
+    }>
+  >([]);
   const [lmStudioItem, setLmStudioItem] = useState<any>(null);
   const [localGPUModels, setLocalGPUModels] = useState<string[]>([]);
   const [ollamaItem, setOllamaItem] = useState<any>(null);
@@ -149,16 +158,100 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
     }
   };
 
+  /**
+   * Load Provider Packages installed via Store -> Providers.
+   *
+   * Packages differ from cloud providers: their credentials live in
+   * `provider_connections` and are resolved by the backend dispatcher
+   * at request time. This is why `base_url` and `api_key` are sent
+   * as empty strings when activating a package model below.
+   *
+   * A package is exposed in the selector only when ALL are true:
+   *   1. The package is enabled in the registry.
+   *   2. It has an active + enabled connection.
+   *   3. It has at least one saved model (from a prior Scan Models).
+   *
+   * Data sources:
+   *   - /api/store/providers  -> package registry (name, icon, enabled)
+   *   - /api/config/vault     -> provider_connections + provider_package_models
+   */
+  const loadProviderPackages = async () => {
+    if (typeof window === "undefined") return;
+    try {
+      const [pkgsRes, vaultRes] = await Promise.all([
+        fetch("/api/store/providers").then((r) => r.json()),
+        fetch("/api/config/vault").then((r) => r.json()),
+      ]);
+
+      const providers: any[] = pkgsRes.providers || [];
+      const connections: any[] = vaultRes.provider_connections || [];
+      const savedByPackage: Record<
+        string,
+        { savedModels?: string[]; model?: string }
+      > = vaultRes.provider_package_models || {};
+
+      const usable = providers
+        .filter((p) => p.enabled)
+        .map((p) => {
+          const conn = connections.find(
+            (c) =>
+              c.provider_package_id === p.id && c.is_active && c.enabled
+          );
+          if (!conn) return null;
+          const saved = savedByPackage[p.id] || {};
+          const models = Array.isArray(saved.savedModels)
+            ? saved.savedModels
+            : [];
+          if (models.length === 0) return null;
+          return {
+            id: p.id as string,
+            displayName: (p.display_name || p.name || p.id) as string,
+            iconName: (p.icon || p.id) as string,
+            models,
+          };
+        })
+        .filter(
+          (
+            item
+          ): item is {
+            id: string;
+            displayName: string;
+            iconName: string;
+            models: string[];
+          } => item !== null
+        );
+
+      setActiveProviderPackages(usable);
+    } catch {
+      setActiveProviderPackages([]);
+    }
+  };
+
   useEffect(() => {
     loadRealProviders();
+    void loadProviderPackages();
     fetchVault().then(() => loadRealProviders());
     fetchServerMetadata().then((data) => setMetadataVault(data || {}));
 
     const onMetadataUpdate = (e: any) => setMetadataVault(e.detail || {});
     window.addEventListener("omweb:metadata-updated", onMetadataUpdate);
 
-    const onVaultUpdate = () => loadRealProviders();
+    const onVaultUpdate = () => {
+      loadRealProviders();
+      void loadProviderPackages();
+    };
     window.addEventListener("omweb:vault-updated", onVaultUpdate);
+
+    // The Store broadcasts this after install / uninstall / connection
+    // changes. Reloading here keeps the selector in sync without a
+    // page refresh (matches the behaviour of useProviderPackages).
+    const onPackageUpdate = () => {
+      void loadProviderPackages();
+    };
+    window.addEventListener(
+      "omweb:provider-package-updated",
+      onPackageUpdate
+    );
 
     const onModelChange = (e: any) => {
       if (e.detail?.model) setActiveModel(e.detail.model);
@@ -170,6 +263,10 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
       window.removeEventListener("omweb:model-change", onModelChange);
       window.removeEventListener("omweb:metadata-updated", onMetadataUpdate);
       window.removeEventListener("omweb:vault-updated", onVaultUpdate);
+      window.removeEventListener(
+        "omweb:provider-package-updated",
+        onPackageUpdate
+      );
     };
   }, [setActiveModel, setActiveProvider]);
 
@@ -189,6 +286,7 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
   const handleToggle = () => {
     if (!isOpen) {
       loadRealProviders();
+      void loadProviderPackages();
       fetchVault().then(() => loadRealProviders());
       fetchServerMetadata().then((data) => setMetadataVault(data || {}));
 
@@ -583,6 +681,75 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
                   </div>
                 );
               })}
+            </div>
+          )}
+
+          {activeProviderPackages.length > 0 && (
+            <div className="pt-1 border-t border-border/40 space-y-1.5">
+              <span className="text-[9px] font-bold text-muted-foreground uppercase px-2 block mb-1">
+                Store Provider Packages
+              </span>
+
+              {activeProviderPackages.map((pkg) => (
+                <div
+                  key={pkg.id}
+                  className="rounded-md bg-muted/20 border border-border/40 p-1.5 space-y-1"
+                >
+                  <div className="flex items-center justify-between px-1 py-0.5 text-[11px] font-semibold text-foreground">
+                    <span className="flex items-center gap-1.5">
+                      <Package size={12} className="text-purple-500" />
+                      <span>{pkg.displayName}</span>
+                    </span>
+                    <span className="text-[10px] text-muted-foreground font-mono">
+                      {pkg.models.length}{" "}
+                      {pkg.models.length === 1 ? "model" : "models"}
+                    </span>
+                  </div>
+
+                  <div className="space-y-0.5 pl-3">
+                    {pkg.models.map((m) => {
+                      const isSelected =
+                        activeProvider === pkg.displayName &&
+                        activeModel === m;
+                      return (
+                        <button
+                          key={m}
+                          type="button"
+                          onClick={() =>
+                            handleSelectEngine({
+                              model: m,
+                              provider: pkg.id,
+                              provider_name: pkg.displayName,
+                              // Empty on purpose — the backend
+                              // dispatcher resolves these from
+                              // `provider_connections` at request time.
+                              base_url: "",
+                              api_key: "",
+                              api_type: "",
+                            })
+                          }
+                          className={`w-full flex items-center justify-between px-2 py-1 rounded text-xs text-left transition-colors cursor-pointer ${
+                            isSelected
+                              ? "bg-primary/10 text-primary font-medium border border-primary/30"
+                              : "hover:bg-muted text-muted-foreground hover:text-foreground"
+                          }`}
+                        >
+                          <div className="flex items-center gap-1.5 truncate flex-1 min-w-0 mr-1.5">
+                            <span className="font-mono truncate">{m}</span>
+                            {renderModelBadges(m)}
+                          </div>
+                          {isSelected && (
+                            <Check
+                              size={12}
+                              className="text-primary shrink-0 ml-1"
+                            />
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
             </div>
           )}
         </div>

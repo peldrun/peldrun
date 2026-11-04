@@ -14,6 +14,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import shutil
 import time
 from typing import Any, Dict, Optional, Tuple
@@ -353,6 +354,70 @@ def _merge_metadata_entries(existing: dict, new: dict) -> dict:
 #: endpoint (LM Studio proxy, DeepSeek, custom server). Mapping them
 #: to the native OpenAI SDK would change behavior for those users
 #: without their knowledge.
+# ---------------------------------------------------------------------------
+# Provider base-URL normalization
+# ---------------------------------------------------------------------------
+#
+# Every local provider exposes multiple endpoint surfaces under one
+# server root:
+#
+#   LM Studio:   /v1/*        (OpenAI-compat shim)
+#                /api/v1/*    (native v1 - recent versions)
+#                /api/v0/*    (native v0 - older versions)
+#
+#   Ollama:      /v1/*        (OpenAI-compat shim)
+#                /api/*       (native)
+#
+# Users routinely paste the base URL with one of these suffixes already
+# attached. Any code that then constructs `<base>/<another-suffix>`
+# must strip the pre-existing suffix first, or it produces a double
+# path like `/api/api/v0/models` - the exact failure observed in the
+# LM Studio server log when `baseUrl` was set to
+# `http://host:1235/api/v1/`.
+#
+# The previous implementation used `.replace("/v1", "")`, which only
+# removed the literal `/v1` substring and left `/api` behind. The
+# regex below removes every known suffix idempotently.
+_PROVIDER_SUFFIX_PATTERN = re.compile(
+    r"/(?:api/v0|api/v1|openai/v1|openai|v1beta|v1|api)/?$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_provider_base(base_url: str) -> str:
+    """Strip any known endpoint suffix from a provider base URL.
+
+    Idempotent. Safe to call on the raw value from the vault; the
+    result is always the server root (host + optional port + path
+    prefix), never an endpoint-specific URL.
+
+    Examples
+    --------
+        http://127.0.0.1:1234              -> http://127.0.0.1:1234
+        http://127.0.0.1:1234/             -> http://127.0.0.1:1234
+        http://127.0.0.1:1234/v1           -> http://127.0.0.1:1234
+        http://127.0.0.1:1234/api          -> http://127.0.0.1:1234
+        http://127.0.0.1:1234/api/v0       -> http://127.0.0.1:1234
+        http://127.0.0.1:1234/api/v1       -> http://127.0.0.1:1234
+        http://127.0.0.1:1234/api/api/v0   -> http://127.0.0.1:1234
+    """
+    cleaned = (base_url or "").strip().rstrip("/")
+
+    # Collapse any literal double /api/ left behind by the legacy
+    # client, so that even a pre-broken value heals here.
+    while "/api/api/" in cleaned:
+        cleaned = cleaned.replace("/api/api/", "/api/")
+
+    # Strip known suffixes, possibly repeated (e.g. "/v1/api/v1").
+    while True:
+        stripped = _PROVIDER_SUFFIX_PATTERN.sub("", cleaned)
+        if stripped == cleaned or not stripped:
+            break
+        cleaned = stripped.rstrip("/")
+
+    return cleaned
+
+
 _NATIVE_PROVIDER_MAP: Dict[str, str] = {
     "lmstudio": "lmstudio_native",
     "lm_studio": "lmstudio_native",
@@ -368,6 +433,130 @@ _NATIVE_PROVIDER_MAP: Dict[str, str] = {
     "gemini": "google_genai",
     "openai_native": "openai_native",
 }
+
+
+async def _discover_via_external_package(package_id: str) -> list:
+    """
+    Discover models for an installed Provider Package by delegating to
+    its adapter via the plugin host.
+
+    The adapter runs in its own worker subprocess (isolated venv) and
+    owns its own authentication (OAuth, SigV4, etc.) and response
+    parsing — so this helper only needs to construct the descriptor
+    dict that tells the plugin host which adapter to load.
+
+    Returns the raw model list the adapter produced, or ``[]`` on any
+    failure. The caller falls back to legacy HTTP branches when this
+    returns an empty list, so misconfigured packages never break the
+    Scan Models flow.
+    """
+    try:
+        from omweb.provider_packages.package_manager import (
+            provider_package_manager as _ppm,
+        )
+    except Exception as exc:
+        logger.debug(
+            "[fetch-models] package_manager unavailable: %s", exc
+        )
+        return []
+
+    entry = _ppm.get_package(package_id)
+    if entry is None or not entry.enabled:
+        logger.debug(
+            "[fetch-models] Package %r not installed or disabled.",
+            package_id,
+        )
+        return []
+
+    descriptor = _ppm.get_active_adapter_descriptor(package_id)
+    if descriptor is None:
+        logger.debug(
+            "[fetch-models] Package %r has no active adapter descriptor.",
+            package_id,
+        )
+        return []
+
+    connection = get_active_connection_for_package(package_id)
+    if connection is None:
+        logger.debug(
+            "[fetch-models] Package %r has no active connection.",
+            package_id,
+        )
+        return []
+
+    # Lazy import to avoid the circular dependency:
+    #   config_rtr.py ← providers.py
+    # (providers.py imports list_provider_connections & friends from
+    # THIS module at load time, so we must defer the reverse import).
+    try:
+        from omweb.routers.store.providers import (
+            _inject_installed_certificates,
+            _try_read_manifest,
+        )
+    except Exception as exc:
+        logger.debug(
+            "[fetch-models] Could not import provider helpers: %s", exc
+        )
+        return []
+
+    try:
+        manifest = _try_read_manifest(package_id, entry.active_version)
+        fields = dict(connection.get("fields") or {})
+        fields = _inject_installed_certificates(
+            package_id, fields, manifest
+        )
+        base_url = fields.pop("base_url", None)
+        api_key = fields.pop("api_key", None)
+
+        # Serialize the descriptor into the shape the plugin host
+        # expects. Mirrors ``providers.py:test_connection()``.
+        fields["_peldrun_plugin"] = {
+            "provider_id": descriptor.provider_id,
+            "version": descriptor.version,
+            "hash": descriptor.hash,
+            "transport": descriptor.transport,
+            "api_contract": descriptor.api_contract,
+            "entry_point": descriptor.entry_point,
+            "class_name": descriptor.class_name,
+            "base_adapter": descriptor.base_adapter,
+            "package_dir": str(descriptor.package_dir),
+            "venv_python": (
+                str(descriptor.venv_python)
+                if descriptor.venv_python is not None
+                else None
+            ),
+            "features": dict(descriptor.features or {}),
+            "permissions": dict(descriptor.permissions or {}),
+            "enabled": descriptor.enabled,
+        }
+
+        ctx = ConnectionContext(
+            connection_id=connection["id"],
+            provider_id=package_id,
+            base_url=base_url or None,
+            api_key=api_key or None,
+            timeout=60.0,
+            extra_params=fields,
+        )
+
+        adapter = provider_factory.create(package_id, ctx)
+        try:
+            models = await adapter.discover_models(ctx)
+            if not isinstance(models, list):
+                return []
+            return models
+        finally:
+            try:
+                await adapter.close()
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.warning(
+            "[fetch-models] External package discovery failed for %r: %s",
+            package_id,
+            exc,
+        )
+        return []
 
 
 async def _discover_via_adapter(
@@ -472,8 +661,46 @@ def _parse_adapter_model_list(raw_list: list) -> Tuple[list, dict]:
         if not isinstance(item, dict):
             continue
 
-        mid = item.get("id")
+        # LM Studio's /api/v1/models uses ``key``; /api/v0/models uses
+        # ``id``. OpenAI / Anthropic / Google adapters all use ``id``.
+        # Accept all three forms.
+        mid = (
+            item.get("id")
+            or item.get("key")
+            or item.get("name")
+        )
         if not isinstance(mid, str) or not mid:
+            continue
+
+        # Generic embedding filter.
+        #
+        # Some providers (GigaChat, and any future provider whose
+        # /models endpoint does not declare a type discriminator)
+        # return chat AND embedding models in the same list. Embedding
+        # models cannot serve /chat/completions — selecting one in the
+        # UI would produce a provider error on the first message.
+        #
+        # Detection is by name pattern only because no provider-side
+        # signal exists. This is a heuristic; it matches every
+        # GigaChat embedding variant (Embeddings, Embeddings-2,
+        # EmbeddingsGigaR, GigaEmbeddings-3B-*) and OpenAI-style
+        # embeddings (text-embedding-3-small, etc.) while never
+        # matching a real chat model.
+        #
+        # Adapters that DO emit an explicit ``type: "embeddings"``
+        # field (like LM Studio) are also caught by the second
+        # condition, so this filter is safe to leave in place even
+        # after future adapter improvements.
+        if "embedding" in mid.lower():
+            logger.debug(
+                "[fetch-models] Skipping embedding model %r", mid
+            )
+            continue
+        if item.get("type") == "embeddings":
+            logger.debug(
+                "[fetch-models] Skipping embedding model %r (type)",
+                mid,
+            )
             continue
 
         # Google-only filter: skip embeddings-only models. The
@@ -524,34 +751,214 @@ def _parse_adapter_model_list(raw_list: list) -> Tuple[list, dict]:
         if isinstance(out, int) and out > 0:
             entry["max_output_tokens"] = int(out)
 
+        # ------------------------------------------------------------------
         # Provider-specific descriptive fields.
+        #
+        # LM Studio returns:
+        #   "params_string": "4.0B"
+        #   "architecture": "nemotron_h"
+        #   "quantization": {"name": "Q4_K_M", "bits_per_weight": 4}
+        #
+        # Ollama returns:
+        #   "parameter_size": "8.2B"
+        #   "family": "qwen3"
+        #   "quantization_level": "Q4_K_M"    (string)
+        #
+        # The previous version of this function:
+        #   * checked only ``arch`` (missing LM Studio's ``architecture``);
+        #   * only accepted ``quantization`` as a STRING (missing the
+        #     dict shape LM Studio returns);
+        #   * checked only ``parameter_size`` (missing LM Studio's
+        #     ``params_string``).
+        #
+        # Result: LM Studio models showed correct Context Window and
+        # Publisher but "Not reported" for Parameters, Quantization,
+        # and Architecture. The extraction below handles both shapes.
+        # ------------------------------------------------------------------
         publisher = item.get("publisher")
         if isinstance(publisher, str) and publisher:
             entry["publisher"] = publisher
 
-        arch = item.get("arch")
+        # Architecture — LM Studio uses "architecture"; Ollama uses
+        # "family"; older LM Studio versions used "arch". Accept all.
+        arch = item.get("architecture") or item.get("arch")
         if isinstance(arch, str) and arch:
             entry["architecture"] = arch
 
         family = item.get("family")
         if isinstance(family, str) and family:
             entry["family"] = family
+            # For Ollama, "family" doubles as architecture; only fill
+            # architecture from family when no explicit architecture
+            # was set above.
+            if "architecture" not in entry:
+                entry["architecture"] = family
 
-        params = item.get("parameter_size")
+        # Parameters — LM Studio uses "params_string"; Ollama uses
+        # "parameter_size".
+        params = item.get("params_string") or item.get("parameter_size")
         if isinstance(params, str) and params:
             entry["params_string"] = params
 
-        quant = (
-            item.get("quantization")
-            or item.get("quantization_level")
-        )
-        if isinstance(quant, str) and quant:
+        # Quantization — LM Studio returns a dict; Ollama returns a
+        # string in "quantization_level". Preserve LM Studio's dict
+        # shape verbatim (it carries bits_per_weight); synthesize a
+        # minimal {"name": ...} for string-shaped providers.
+        quant = item.get("quantization") or item.get("quantization_level")
+        if isinstance(quant, dict):
+            entry["quantization"] = dict(quant)
+        elif isinstance(quant, str) and quant:
             entry["quantization"] = {"name": quant}
 
         # LM Studio ``type`` field overrides the default "llm".
         model_type = item.get("type")
         if isinstance(model_type, str) and model_type:
             entry["type"] = model_type
+
+        # ------------------------------------------------------------------
+        # [FIX-LMSTUDIO-CAPS-V2] Extract the provider's capabilities.
+        #
+        # Two schemas coexist across LM Studio releases:
+        #
+        #   V2 (0.3.x+, /api/v1/models) — dict:
+        #     "capabilities": {
+        #       "vision": true,
+        #       "trained_for_tool_use": true,
+        #       "reasoning": {
+        #         "allowed_options": ["off", "on"],
+        #         "default": "on"
+        #       }
+        #     }
+        #
+        #   V1 (older, /api/v0/models) — list of tokens:
+        #     "capabilities": ["completion", "tool_use", "vision"]
+        #
+        # Both are authoritative. The V2 dict is preferred because it
+        # distinguishes "reasoning supported but always-on" (no toggle
+        # allowed) from "reasoning supported and user-toggleable" — a
+        # distinction the V1 token list cannot express.
+        #
+        # The output uses the canonical PELDRUN vocabulary with
+        # ``source = "provider_live"`` so the resolver prioritizes
+        # these facts (priority 95, below manual override, above
+        # every other automated source).
+        # ------------------------------------------------------------------
+        raw_caps = item.get("capabilities")
+        caps_dict: Optional[Dict[str, Any]] = None
+        caps_set: Optional[set] = None
+
+        if isinstance(raw_caps, dict):
+            caps_dict = raw_caps
+        elif isinstance(raw_caps, list) and raw_caps:
+            caps_set = {
+                str(c).strip().lower()
+                for c in raw_caps
+                if isinstance(c, str) and c.strip()
+            }
+
+        if caps_dict is not None or caps_set is not None:
+            entry.setdefault("capabilities", {})
+            entry.setdefault("capability_sources", {})
+
+            # ------------------------------------------------------------------
+            # [FIX-PACKAGE-SOURCES] Respect the adapter's own source hints.
+            #
+            # Different providers declare capabilities at different levels:
+            #
+            #   * LM Studio / Ollama — derived from a LIVE endpoint
+            #     (GET /api/v1/models, POST /api/show). The correct
+            #     provenance is "provider_live".
+            #
+            #   * Provider Packages (GigaChat, future plugins) — the
+            #     adapter's `discover_models()` returns a static list
+            #     built from the package's manifest.features. It is
+            #     NOT live-queried. The correct provenance is
+            #     "provider_catalog" (or whatever the adapter declared
+            #     in its own response).
+            #
+            # When the adapter explicitly sets `capability_sources`,
+            # honor it. Otherwise fall back to "provider_live" (which
+            # matches the pre-existing behavior for LM Studio/Ollama).
+            # ------------------------------------------------------------------
+            adapter_sources = item.get("capability_sources")
+            if not isinstance(adapter_sources, dict):
+                adapter_sources = {}
+
+            def _src(field: str) -> str:
+                """Return the source label to record for a capability field."""
+                raw = adapter_sources.get(field)
+                if isinstance(raw, str) and raw.strip():
+                    return raw.strip()
+                return "provider_live"
+
+            # ---- Vision ----
+            if caps_dict is not None:
+                vision_val = caps_dict.get("vision")
+                if isinstance(vision_val, bool):
+                    entry["capabilities"]["vision"] = vision_val
+                    entry["capability_sources"]["vision"] = _src("vision")
+            elif caps_set is not None:
+                if "vision" in caps_set or "vlm" in caps_set or model_type == "vlm":
+                    entry["capabilities"]["vision"] = True
+                    entry["capability_sources"]["vision"] = _src("vision")
+                else:
+                    entry["capabilities"]["vision"] = False
+                    entry["capability_sources"]["vision"] = _src("vision")
+
+            # ---- Tools ----
+            if caps_dict is not None:
+                tools_val = caps_dict.get("trained_for_tool_use")
+                if isinstance(tools_val, bool):
+                    entry["capabilities"]["trained_for_tool_use"] = tools_val
+                    entry["capability_sources"]["trained_for_tool_use"] = _src("trained_for_tool_use")
+            elif caps_set is not None:
+                if "tool_use" in caps_set or "tools" in caps_set:
+                    entry["capabilities"]["trained_for_tool_use"] = True
+                else:
+                    entry["capabilities"]["trained_for_tool_use"] = False
+                entry["capability_sources"]["trained_for_tool_use"] = _src("trained_for_tool_use")
+
+            # ---- Reasoning ----
+            reasoning_obj = caps_dict.get("reasoning") if caps_dict is not None else None
+            if isinstance(reasoning_obj, dict):
+                allowed = reasoning_obj.get("allowed_options")
+                mode = "toggle"
+                if isinstance(allowed, list):
+                    allowed_set = {str(a).strip().lower() for a in allowed if isinstance(a, str)}
+                    if "off" in allowed_set and "on" in allowed_set:
+                        mode = "toggle"
+                    elif allowed_set == {"on"}:
+                        mode = "automatic"
+                    elif allowed_set == {"off"}:
+                        mode = "none"
+                entry["capabilities"]["reasoning"] = (mode != "none")
+                entry["capability_sources"]["reasoning"] = _src("reasoning")
+                entry.setdefault("capability_details", {})
+                entry["capability_details"]["reasoning"] = {
+                    "mode": mode,
+                    "state": "supported" if mode != "none" else "unsupported",
+                    "allowed_options": list(allowed) if isinstance(allowed, list) else [],
+                    "default": reasoning_obj.get("default"),
+                }
+            elif isinstance(reasoning_obj, bool):
+                entry["capabilities"]["reasoning"] = reasoning_obj
+                entry["capability_sources"]["reasoning"] = _src("reasoning")
+                if reasoning_obj:
+                    entry.setdefault("capability_details", {})
+                    entry["capability_details"]["reasoning"] = {
+                        "mode": "toggle",
+                        "state": "supported",
+                    }
+            elif caps_set is not None:
+                has_reasoning = "reasoning" in caps_set or "thinking" in caps_set
+                entry["capabilities"]["reasoning"] = has_reasoning
+                entry["capability_sources"]["reasoning"] = _src("reasoning")
+                if has_reasoning:
+                    entry.setdefault("capability_details", {})
+                    entry["capability_details"]["reasoning"] = {
+                        "mode": "toggle",
+                        "state": "supported",
+                    }
 
         metadata[mid] = entry
 
@@ -680,6 +1087,11 @@ class TestLLMRequest(BaseModel):
     api_key: str
     model: str
     api_type: Optional[str] = ""
+    # Optional explicit metadata endpoint supplied by the frontend from
+    # the vault's `metadataEndpoint` field. When present, the probe
+    # hits this URL verbatim instead of guessing `<base>/models` - which
+    # is what caused the `/api/api/v0/models` failure.
+    metadata_endpoint: Optional[str] = ""
 
 
 @router.post("/test-llm")
@@ -694,15 +1106,29 @@ async def test_llm_connection(payload: TestLLMRequest):
     p_type = (payload.api_type or "").lower()
     headers = {"Content-Type": "application/json"}
 
+    # Explicit metadata endpoint from the vault takes priority.
+    #
+    # The user configured this URL themselves in the settings UI, so
+    # it is the authoritative probe target. Falling back to a
+    # constructed URL is only necessary when the field is empty -
+    # which is the case for legacy custom endpoints that have no
+    # dedicated metadata route.
+    explicit_meta = (payload.metadata_endpoint or "").strip()
+
     if "anthropic.com" in base or "anthropic" in p_type:
-        test_url = "https://api.anthropic.com/v1/models"
+        test_url = explicit_meta or "https://api.anthropic.com/v1/models"
         headers["x-api-key"] = api_key
         headers["anthropic-version"] = "2023-06-01"
     elif "googleapis.com" in base or "gemini" in p_type:
-        test_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        test_url = explicit_meta or (
+            f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        )
         headers["x-goog-api-key"] = api_key
     else:
-        test_url = base if base.endswith("/models") else f"{base}/models"
+        if explicit_meta:
+            test_url = explicit_meta
+        else:
+            test_url = base if base.endswith("/models") else f"{base}/models"
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         if "openrouter.ai" in base:
@@ -853,21 +1279,88 @@ async def _fetch_available_models_impl(payload: FetchModelsRequest):
                 or m.get("max_completion_tokens")
                 or m.get("outputTokenLimit")
             )
-            if ctx is not None or out is not None:
-                entry = {
-                    "key": mid_str,
-                    "type": m.get("type", "llm"),
-                    "display_name": m.get("display_name")
-                    or m.get("displayName")
-                    or mid_str,
-                    "max_context_length": int(ctx) if ctx else None,
-                    "max_output_tokens": int(out) if out else None,
-                }
-                meta[mid_str] = entry
-                if "/" in mid_str:
-                    short = mid_str.rsplit("/", 1)[-1]
-                    if short and short not in meta:
-                        meta[short] = {**entry, "key": short}
+
+            # Build the entry even when no context/output tokens are
+            # reported, so that capability facts from the same response
+            # are not lost. The prior `if ctx is not None or out is
+            # not None:` guard silently discarded models whose
+            # /models response carried only capabilities.
+            entry: Dict[str, Any] = {
+                "key": mid_str,
+                "type": m.get("type", "llm"),
+                "display_name": m.get("display_name")
+                or m.get("displayName")
+                or mid_str,
+            }
+            if ctx:
+                entry["max_context_length"] = int(ctx)
+            if out:
+                entry["max_output_tokens"] = int(out)
+
+            # Preserve and normalize capabilities when present. This is
+            # the same dual-shape extraction performed in
+            # ``_parse_adapter_model_list``; keeping the two in sync
+            # ensures Branch 2 produces metadata identical to Branch 0.
+            raw_caps = m.get("capabilities")
+            if isinstance(raw_caps, dict):
+                entry.setdefault("capabilities", {})
+                entry.setdefault("capability_sources", {})
+                for field, target_field in (
+                    ("vision", "vision"),
+                    ("trained_for_tool_use", "trained_for_tool_use"),
+                ):
+                    v = raw_caps.get(field)
+                    if isinstance(v, bool):
+                        entry["capabilities"][target_field] = v
+                        entry["capability_sources"][target_field] = "provider_live"
+                reason_obj = raw_caps.get("reasoning")
+                if isinstance(reason_obj, dict):
+                    allowed = reason_obj.get("allowed_options")
+                    mode = "toggle"
+                    if isinstance(allowed, list):
+                        allowed_set = {str(a).strip().lower() for a in allowed if isinstance(a, str)}
+                        if "off" in allowed_set and "on" in allowed_set:
+                            mode = "toggle"
+                        elif allowed_set == {"on"}:
+                            mode = "automatic"
+                        elif allowed_set == {"off"}:
+                            mode = "none"
+                    entry["capabilities"]["reasoning"] = (mode != "none")
+                    entry["capability_sources"]["reasoning"] = "provider_live"
+                    entry.setdefault("capability_details", {})
+                    entry["capability_details"]["reasoning"] = {
+                        "mode": mode,
+                        "state": "supported" if mode != "none" else "unsupported",
+                        "allowed_options": list(allowed) if isinstance(allowed, list) else [],
+                        "default": reason_obj.get("default"),
+                    }
+            elif isinstance(raw_caps, list) and raw_caps:
+                caps_set = {str(c).strip().lower() for c in raw_caps if isinstance(c, str)}
+                entry.setdefault("capabilities", {})
+                entry.setdefault("capability_sources", {})
+                entry["capabilities"]["vision"] = (
+                    "vision" in caps_set or "vlm" in caps_set
+                    or m.get("type") == "vlm"
+                )
+                entry["capabilities"]["trained_for_tool_use"] = (
+                    "tool_use" in caps_set or "tools" in caps_set
+                )
+                has_reasoning = "reasoning" in caps_set or "thinking" in caps_set
+                entry["capabilities"]["reasoning"] = has_reasoning
+                for f in ("vision", "trained_for_tool_use", "reasoning"):
+                    entry["capability_sources"][f] = "provider_live"
+                if has_reasoning:
+                    entry.setdefault("capability_details", {})
+                    entry["capability_details"]["reasoning"] = {
+                        "mode": "toggle",
+                        "state": "supported",
+                    }
+
+            meta[mid_str] = entry
+            if "/" in mid_str:
+                short = mid_str.rsplit("/", 1)[-1]
+                if short and short not in meta:
+                    meta[short] = {**entry, "key": short}
         return sorted(set(ids)), meta
 
     # ------------------------------------------------------------------
@@ -912,6 +1405,65 @@ async def _fetch_available_models_impl(payload: FetchModelsRequest):
                     len(adapter_models),
                 )
 
+    # ------------------------------------------------------------------
+    # Branch 0b — external Provider Package.
+    #
+    # Packages installed via the Store (M9) are NOT in
+    # _NATIVE_PROVIDER_MAP. Detect them through the runtime registry
+    # (source == "external") and delegate to their adapter. This makes
+    # GigaChat (and any future package) work through the EXACT SAME
+    # /fetch-models flow as built-in providers — no per-provider
+    # branching needed in this route.
+    # ------------------------------------------------------------------
+    if not model_ids and p_id:
+        logger.warning(
+            "[fetch-models] Branch 0b START: p_id=%r", p_id
+        )
+        try:
+            from peldrun.llm.providers.registry import (
+                SOURCE_EXTERNAL,
+                provider_registry as _pkg_registry,
+            )
+
+            _reg = _pkg_registry.find(p_id)
+            logger.warning(
+                "[fetch-models] Branch 0b: registry_hit=%r source=%r",
+                _reg is not None,
+                (_reg.source if _reg is not None else None),
+            )
+
+            if _reg is not None and _reg.source == SOURCE_EXTERNAL:
+                _ext_models = await _discover_via_external_package(p_id)
+                logger.warning(
+                    "[fetch-models] Branch 0b: "
+                    "_discover_via_external_package returned type=%s "
+                    "len=%d",
+                    type(_ext_models).__name__,
+                    len(_ext_models) if isinstance(_ext_models, list) else -1,
+                )
+                if _ext_models:
+                    _ext_ids, _ext_meta = _parse_adapter_model_list(
+                        _ext_models
+                    )
+                    if _ext_ids:
+                        model_ids = _ext_ids
+                        metadata = _ext_meta
+                        discovery_method = "external_package"
+                        logger.warning(
+                            "[fetch-models] Branch 0b SUCCESS: "
+                            "External package %r discovered %d model(s).",
+                            p_id,
+                            len(_ext_ids),
+                        )
+        except Exception as exc:
+            logger.warning(
+                "[fetch-models] Branch 0b EXCEPTION for %r: %s: %s",
+                p_id,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+
     explicit_meta = (payload.metadata_endpoint or "").strip()
 
     if model_ids:
@@ -943,7 +1495,12 @@ async def _fetch_available_models_impl(payload: FetchModelsRequest):
     elif "lmstudio" in p_id or "lmstudio" in p_type or "1234" in base:
         # Branch 2 — LM Studio. Try /api/v1/models, /api/v0/models,
         # then /models in that order.
-        clean_base = base.replace("/v1", "").rstrip("/")
+        #
+        # URL normalization MUST strip any suffix the caller already
+        # appended (e.g. `/api/v1`), otherwise the result becomes
+        # `/api/api/v0/models` — the exact failure observed in the
+        # LM Studio server log.
+        clean_base = _normalize_provider_base(base)
         for ep in (
             f"{clean_base}/api/v1/models",
             f"{clean_base}/api/v0/models",
@@ -982,7 +1539,9 @@ async def _fetch_available_models_impl(payload: FetchModelsRequest):
         #   * /api/tags  (native)  -> {models: [{name, model, ...}]}
         #   * /v1/models (OpenAI-compat shim) -> {data: [{id, ...}]}
         # We try native first (richer response), then the compat shim.
-        clean_base = base.replace("/v1", "").rstrip("/")
+        # Use the shared normalization helper — Ollama's base URL may
+        # also carry a trailing `/v1` from the OpenAI-compat shim.
+        clean_base = _normalize_provider_base(base)
         candidate_urls = [
             f"{clean_base}/api/tags",
             f"{clean_base}/v1/models",
@@ -1066,10 +1625,17 @@ async def _fetch_available_models_impl(payload: FetchModelsRequest):
 
     if live_supported:
         try:
+            # All providers in ``live_supported`` are local engines
+            # (LM Studio, Ollama) whose base URL may carry a stale
+            # endpoint suffix from the user's input. Normalize before
+            # passing to ``provider_live.py`` so it does not
+            # reconstruct a double-suffixed path like
+            # `/api/api/v0/models` for every model in the list.
+            live_base = _normalize_provider_base(base)
             connection = ConnectionContext(
                 connection_id=p_id or "default",
                 provider_id=p_id or "custom",
-                base_url=base,
+                base_url=live_base,
                 api_key=api_key or None,
             )
             live_results = await query_providers_batch(
@@ -1213,6 +1779,25 @@ DEFAULT_VAULT = {
     #       "updated_at": "2025-..."
     #     }
     "provider_connections": [],
+    # Per-package model selections.
+    #
+    # Structure:
+    #   {
+    #     "<provider_package_id>": {
+    #       "savedModels": ["model-a", "model-b"],
+    #       "model": "model-a"
+    #     }
+    #   }
+    #
+    # Completely separate from `cloud_vault` (which manages built-in
+    # providers like OpenAI / Anthropic via the Store-independent LLM
+    # Settings flow). This key stores ONLY model selections for
+    # packages installed from Store → Providers (GigaChat, etc.).
+    #
+    # The connection credentials themselves live in
+    # `provider_connections` above — this key only remembers which
+    # models the user picked for each package.
+    "provider_package_models": {},
     "lmstudio_vault": {
         "baseUrl": "http://127.0.0.1:1234/v1",
         "model": "qwen3-vl-8b-instruct",
@@ -1272,6 +1857,7 @@ async def save_models_vault(payload: dict = Body(...)):
         "cloud_vault",
         "custom_endpoints",
         "provider_connections",
+        "provider_package_models",
         "lmstudio_vault",
         "ollama_vault",
         "scanned_models",
@@ -1406,12 +1992,54 @@ def save_provider_connection(connection: dict) -> dict:
                 other["is_active"] = False
 
     # Replace or append.
+    #
+    # On UPDATE, we MERGE fields instead of replacing the whole
+    # record. The frontend sends only changed fields (to preserve
+    # masked secrets), so a naive replace would wipe out:
+    #   - credentials the user did not edit (they were masked in
+    #     the UI and not resubmitted);
+    #   - the "active" status if the user did not toggle it;
+    #   - the "enabled" status if the user did not toggle it;
+    #   - the original "created_at" timestamp.
+    #
+    # We also preserve name if it was not sent (rare, but happens
+    # if a caller updates only fields).
     replaced = False
     for i, other in enumerate(existing):
-        if isinstance(other, dict) and other.get("id") == conn["id"]:
-            existing[i] = conn
-            replaced = True
-            break
+        if not isinstance(other, dict) or other.get("id") != conn["id"]:
+            continue
+
+        # 1. Merge fields: existing values, then override with any
+        #    key present in the new payload. New value wins per-key.
+        existing_fields = other.get("fields") or {}
+        if not isinstance(existing_fields, dict):
+            existing_fields = {}
+        new_fields = conn.get("fields") or {}
+        merged_fields = dict(existing_fields)
+        for fk, fv in new_fields.items():
+            merged_fields[fk] = fv
+        conn["fields"] = merged_fields
+
+        # 2. Preserve metadata from the existing record when the
+        #    caller did not explicitly override it. This is a
+        #    setdefault-style fill AFTER the merge, so explicitly
+        #    passed values still win.
+        if "created_at" not in conn or not conn.get("created_at"):
+            conn["created_at"] = other.get("created_at", now)
+        if "name" not in conn or not conn.get("name"):
+            conn["name"] = other.get("name", conn["provider_package_id"])
+        if "enabled" not in conn:
+            conn["enabled"] = other.get("enabled", True)
+        # is_active is the trickiest: only preserve the old value
+        # when the caller did NOT pass `is_active`. Passing
+        # `is_active: false` explicitly must still deactivate.
+        if "is_active" not in conn:
+            conn["is_active"] = other.get("is_active", False)
+
+        existing[i] = conn
+        replaced = True
+        break
+
     if not replaced:
         existing.append(conn)
 

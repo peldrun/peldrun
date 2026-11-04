@@ -62,6 +62,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -119,6 +120,66 @@ _LMSTUDIO_STOP_REASON_MAP: Dict[str, str] = {
     "contextLengthReached": "length",
     "toolCalls": "tool_calls",
 }
+
+
+# ---------------------------------------------------------------------------
+# Base URL normalization
+# ---------------------------------------------------------------------------
+#
+# LM Studio exposes multiple endpoint surfaces under one server root:
+#
+#   /v1/*        — OpenAI-compatible shim (chat completions, models)
+#   /api/v1/*    — native v1 (recent versions; serves /api/v1/models)
+#   /api/v0/*    — native v0 (older versions; serves /api/v0/models,
+#                  /api/v0/chat/completions, /api/v0/chat/...)
+#
+# Callers routinely pass the base URL with one of these suffixes already
+# attached (e.g. ``http://host:1235/api/v1``). Building an endpoint URL
+# by naively stripping ``/v1`` produces a double path like
+# ``/api/api/v0/models`` when the caller's value already contained
+# ``/api`` - the exact failure observed in the LM Studio server log
+# when ``baseUrl`` was set to ``http://host:1235/api/v1/``.
+#
+# ``_normalize_lmstudio_root`` strips every known suffix idempotently
+# and collapses any legacy double-``/api/`` segment left in the vault.
+_PROVIDER_SUFFIX_PATTERN = re.compile(
+    r"/(?:api/v0|api/v1|openai/v1|openai|v1beta|v1|api)/?$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_lmstudio_root(base_url: str) -> str:
+    """Return the LM Studio server root, with any endpoint suffix removed.
+
+    Idempotent. Safe to call on the raw value from the vault; the result
+    is always the server root (scheme + host + optional port + optional
+    path prefix), never an endpoint-specific URL.
+
+    Examples
+    --------
+        http://127.0.0.1:1234              -> http://127.0.0.1:1234
+        http://127.0.0.1:1234/             -> http://127.0.0.1:1234
+        http://127.0.0.1:1234/v1           -> http://127.0.0.1:1234
+        http://127.0.0.1:1234/api          -> http://127.0.0.1:1234
+        http://127.0.0.1:1234/api/v0       -> http://127.0.0.1:1234
+        http://127.0.0.1:1234/api/v1       -> http://127.0.0.1:1234
+        http://127.0.0.1:1234/api/api/v0   -> http://127.0.0.1:1234
+    """
+    cleaned = (base_url or "").strip().rstrip("/")
+
+    # Collapse any literal double /api/ left in the vault by the legacy
+    # client, so even a pre-broken value heals here.
+    while "/api/api/" in cleaned:
+        cleaned = cleaned.replace("/api/api/", "/api/")
+
+    # Strip known suffixes, possibly repeated (e.g. "/v1/api/v1").
+    while True:
+        stripped = _PROVIDER_SUFFIX_PATTERN.sub("", cleaned)
+        if stripped == cleaned or not stripped:
+            break
+        cleaned = stripped.rstrip("/")
+
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -198,16 +259,34 @@ class LMStudioNativeAdapter:
 
         self.profile = self._profile
 
-        # Normalize the base URL to the LM Studio root (no /v1, no /api/v0).
-        base_url = (
+        # Normalize the base URL to the LM Studio root (no /v1, no
+        # /api/v0, no /api/v1). This is the single source of truth for
+        # every endpoint URL this adapter builds - see
+        # ``_normalize_lmstudio_root`` for the exact normalization rules
+        # and the failure mode this replaces.
+        base_url = _normalize_lmstudio_root(
             self._connection.base_url or _DEFAULT_BASE_URL
-        ).rstrip("/")
-        for suffix in ("/v1", "/api/v0"):
-            if base_url.endswith(suffix):
-                base_url = base_url[: -len(suffix)]
-                break
+        ) or _DEFAULT_BASE_URL.rstrip("/")
         self._base_url = base_url
+
+        # Chat completions continue to use the v0 native API - that is
+        # where LM Studio exposes the ``stats`` object and the native
+        # ``reasoning`` field this adapter depends on. Even LM Studio
+        # 0.3.x (which ships v1 model listing) keeps v0 for chat.
         self._api_v0 = f"{base_url}/api/v0"
+
+        # Model listing is served by different endpoints depending on
+        # the LM Studio version. Probe newest-first so a modern
+        # installation never logs a spurious 404 for the older native
+        # API:
+        #   /api/v1/models — LM Studio 0.3.x native v1 (newest)
+        #   /api/v0/models — LM Studio <0.3.x native v0 (legacy)
+        #   /v1/models     — OpenAI-compat shim (universal fallback)
+        self._models_endpoints = (
+            f"{base_url}/api/v1/models",
+            f"{base_url}/api/v0/models",
+            f"{base_url}/v1/models",
+        )
 
         # Optional bearer token. LM Studio's local server ignores it,
         # but reverse-proxied deployments may require one.
@@ -634,33 +713,63 @@ class LMStudioNativeAdapter:
         versions. When absent, the caller (``provider_live.py``) treats
         tool support as ``unknown``.
         """
-        try:
-            response = await self._http.get(
-                f"{self._api_v0}/models"
-            )
-        except Exception as exc:
+        # Probe every LM Studio model-listing endpoint in priority
+        # order (v1 → v0 → compat shim). The first that returns 200
+        # with a valid dict wins. This is what lets one adapter work
+        # across LM Studio 0.2.x, 0.3.x, and future versions without
+        # logging errors for endpoints that the running version does
+        # not serve.
+        payload: Optional[Dict[str, Any]] = None
+        last_error: Optional[str] = None
+
+        for url in self._models_endpoints:
+            try:
+                response = await self._http.get(url)
+            except Exception as exc:
+                last_error = f"{url}: network error ({exc})"
+                logger.debug(
+                    "LM Studio %s network error: %s", url, exc
+                )
+                continue
+
+            if response.status_code != 200:
+                last_error = f"{url}: HTTP {response.status_code}"
+                logger.debug(
+                    "LM Studio %s returned HTTP %d",
+                    url,
+                    response.status_code,
+                )
+                continue
+
+            try:
+                candidate = response.json()
+            except Exception as exc:
+                last_error = f"{url}: non-JSON response ({exc})"
+                logger.debug(
+                    "LM Studio %s returned non-JSON: %s", url, exc
+                )
+                continue
+
+            if not isinstance(candidate, dict):
+                last_error = (
+                    f"{url}: JSON root is not a dict "
+                    f"(got {type(candidate).__name__})"
+                )
+                continue
+
+            payload = candidate
+            break
+
+        if payload is None:
             logger.warning(
-                "LM Studio /api/v0/models failed: %s", exc
+                "LM Studio: no model-listing endpoint responded "
+                "successfully at %r (last error: %s).",
+                self._base_url,
+                last_error or "unknown",
             )
             return []
 
-        if response.status_code != 200:
-            logger.warning(
-                "LM Studio /api/v0/models returned HTTP %d",
-                response.status_code,
-            )
-            return []
-
-        try:
-            payload = response.json()
-        except Exception:
-            return []
-
-        raw_models = (
-            payload.get("data")
-            if isinstance(payload, dict)
-            else None
-        ) or []
+        raw_models = payload.get("data") or payload.get("models") or []
         if not isinstance(raw_models, list):
             return []
 
@@ -668,25 +777,80 @@ class LMStudioNativeAdapter:
         for item in raw_models:
             if not isinstance(item, dict):
                 continue
-            item_id = item.get("id")
+
+            # LM Studio's /api/v1/models uses ``key`` as the model
+            # identifier. The older /api/v0/models endpoint uses
+            # ``id``. Some very old builds use ``name``. Accept all
+            # three forms so the same adapter works across every LM
+            # Studio release. Missing this fallback made the modern
+            # /api/v1/models response produce an empty model list -
+            # the exact reason Branch 0 (native adapter discovery)
+            # silently returned [] on the user's installation.
+            item_id = (
+                item.get("key")
+                or item.get("id")
+                or item.get("name")
+            )
             if not isinstance(item_id, str) or not item_id:
                 continue
 
             entry: Dict[str, Any] = {"id": item_id}
+
+            # Preserve every descriptive field the LM Studio response
+            # carries. ``architecture`` is LM Studio's field name for
+            # what the rest of PELDRUN calls ``arch``; both are kept
+            # so downstream consumers (the metadata vault, the model
+            # cards) can read either.
             for field in (
                 "object",
                 "type",
                 "publisher",
                 "arch",
+                "architecture",
                 "compatibility_type",
                 "quantization",
                 "state",
                 "max_context_length",
+                "format",
+                "params_string",
+                "size_bytes",
+                "display_name",
+                "description",
+                "loaded_instances",
+                "variants",
+                "selected_variant",
             ):
                 if field in item:
                     entry[field] = item[field]
-            if isinstance(item.get("capabilities"), list):
-                entry["capabilities"] = list(item["capabilities"])
+
+            # ----------------------------------------------------------
+            # Capabilities: preserve the RAW shape LM Studio sends.
+            #
+            # Modern LM Studio (0.3.x+) returns a DICT of well-typed
+            # flags and nested objects:
+            #
+            #   "capabilities": {
+            #     "vision": true,
+            #     "trained_for_tool_use": true,
+            #     "reasoning": {
+            #       "allowed_options": ["off", "on"],
+            #       "default": "on"
+            #     }
+            #   }
+            #
+            # Older /api/v0/models responses use a flat LIST of tokens:
+            #
+            #   "capabilities": ["completion", "tool_use", "vision"]
+            #
+            # The downstream parser (_parse_adapter_model_list in
+            # config_rtr.py) knows how to translate both shapes. The
+            # adapter's only job is to not drop them.
+            # ----------------------------------------------------------
+            raw_caps = item.get("capabilities")
+            if isinstance(raw_caps, dict):
+                entry["capabilities"] = dict(raw_caps)
+            elif isinstance(raw_caps, list):
+                entry["capabilities"] = list(raw_caps)
 
             results.append(entry)
 
@@ -744,24 +908,29 @@ class LMStudioNativeAdapter:
         ``/api/v0/models/{id}``. We fetch the full list and match by
         exact ID, then by short-form ID (last segment after ``/``).
         """
-        try:
-            response = await self._http.get(
-                f"{self._api_v0}/models"
-            )
-        except Exception:
-            return None
-        if response.status_code != 200:
-            return None
-        try:
-            payload = response.json()
-        except Exception:
+        # Iterate the same endpoint priority list that
+        # ``discover_models`` uses. See its docstring for the
+        # rationale behind the v1 → v0 → compat ordering.
+        payload: Optional[Dict[str, Any]] = None
+        for url in self._models_endpoints:
+            try:
+                response = await self._http.get(url)
+            except Exception:
+                continue
+            if response.status_code != 200:
+                continue
+            try:
+                candidate = response.json()
+            except Exception:
+                continue
+            if isinstance(candidate, dict):
+                payload = candidate
+                break
+
+        if payload is None:
             return None
 
-        raw_models = (
-            payload.get("data")
-            if isinstance(payload, dict)
-            else None
-        ) or []
+        raw_models = payload.get("data") or payload.get("models") or []
         if not isinstance(raw_models, list):
             return None
 

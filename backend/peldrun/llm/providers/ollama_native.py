@@ -95,6 +95,7 @@ import asyncio
 import base64 as _b64
 import json
 import logging
+import re
 import time
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -137,6 +138,34 @@ logger = logging.getLogger("peldrun.llm.providers.ollama_native")
 
 #: Default Ollama base URL when the connection did not specify one.
 _DEFAULT_BASE_URL = "http://localhost:11434"
+
+
+# ---------------------------------------------------------------------------
+# Base URL normalization
+# ---------------------------------------------------------------------------
+#
+# Ollama exposes two surfaces under one server root: ``/v1/*`` (OpenAI
+# compat shim) and ``/api/*`` (native). Callers routinely paste the base
+# URL with one of these suffixes attached; the previous implementation
+# only checked ``.endswith("/v1")`` and would leave ``/api`` behind when
+# the caller's value was ``.../api/v1``.
+_PROVIDER_SUFFIX_PATTERN = re.compile(
+    r"/(?:api/v0|api/v1|openai/v1|openai|v1beta|v1|api)/?$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_ollama_root(base_url: str) -> str:
+    """Return the Ollama server root, with any endpoint suffix removed."""
+    cleaned = (base_url or "").strip().rstrip("/")
+    while "/api/api/" in cleaned:
+        cleaned = cleaned.replace("/api/api/", "/api/")
+    while True:
+        stripped = _PROVIDER_SUFFIX_PATTERN.sub("", cleaned)
+        if stripped == cleaned or not stripped:
+            break
+        cleaned = stripped.rstrip("/")
+    return cleaned
 
 
 #: Default request timeout.
@@ -236,12 +265,12 @@ class OllamaNativeAdapter:
 
         self.profile = self._profile
 
-        # Strip /v1 — Ollama's native API lives at the root.
-        base_url = (
+        # Strip any endpoint suffix (``/v1``, ``/api/v1``, ``/api``)
+        # so the adapter always builds paths from the server root.
+        # See ``_normalize_ollama_root`` above for the rationale.
+        base_url = _normalize_ollama_root(
             self._connection.base_url or _DEFAULT_BASE_URL
-        ).rstrip("/")
-        if base_url.endswith("/v1"):
-            base_url = base_url[: -len("/v1")]
+        ) or _DEFAULT_BASE_URL.rstrip("/")
         self._base_url = base_url
 
         # Optional bearer token (for reverse-proxied Ollama deployments).

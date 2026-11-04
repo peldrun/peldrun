@@ -111,6 +111,45 @@ function sanitizeSearchConfigForPersistence(rawSearch: unknown): any {
   return { ...search, engine, fallback_engines };
 }
 
+/**
+ * Strip any known endpoint suffix from a provider base URL.
+ *
+ * Provider base URLs are commonly stored with a routing suffix attached:
+ *
+ *   LM Studio:   /v1, /api/v0, /api/v1
+ *   Ollama:      /v1, /api
+ *   Google:      /v1beta, /openai/v1
+ *   OpenAI:      /v1
+ *
+ * Computed metadata endpoints MUST always start from the ROOT URL (host
+ * + port), not from an endpoint-specific URL. Naive string appending on
+ * a non-stripped base produces double-suffixed paths like
+ * `http://host:1234/api/api/v0/models` - the exact failure that
+ * produced "Unexpected endpoint or method" errors in the LM Studio
+ * server log when `baseUrl` was set to `http://host:1235/api/v1/`.
+ *
+ * The helper is idempotent: applying it to an already-clean URL is a
+ * no-op. It also collapses any legacy double-`/api/` segment left in
+ * `models_vault.json` by a previous client version, healing stale data
+ * on read.
+ */
+const PROVIDER_SUFFIX_REGEX = /\/(?:api\/v0|api\/v1|openai\/v1|openai|v1beta|v1|api)\/?$/i;
+
+function stripProviderSuffix(baseUrl: string): string {
+  let cleaned = (baseUrl || "").trim().replace(/\/+$/, "");
+  // Collapse legacy double-/api/ segments from earlier client bugs.
+  while (cleaned.includes("/api/api/")) {
+    cleaned = cleaned.replace("/api/api/", "/api/");
+  }
+  // Strip known suffixes, possibly repeated (e.g. "/v1/api/v1").
+  for (let i = 0; i < 5; i++) {
+    const stripped = cleaned.replace(PROVIDER_SUFFIX_REGEX, "").replace(/\/+$/, "");
+    if (stripped === cleaned || !stripped) break;
+    cleaned = stripped;
+  }
+  return cleaned;
+}
+
 export default function SettingsPage() {
   const [activeTab, setActiveTab] = useState<SettingsTab>("llm");
   const [saving, setSaving] = useState(false);
@@ -217,6 +256,10 @@ export default function SettingsPage() {
   // models_vault.json from storing `"metadataEndpoint": ""` for providers
   // whose endpoint is computable (LM Studio, Ollama, Google, Anthropic,
   // DeepSeek). OpenAI and unknown custom servers legitimately remain "".
+  //
+  // The user's explicit value (if provided) wins verbatim. Only the
+  // legacy double-/api/ bug from earlier client versions is healed
+  // automatically; every other value the user set is preserved.
   const resolveMetadataEndpoint = (
     providerId: string,
     baseUrl: string,
@@ -224,34 +267,55 @@ export default function SettingsPage() {
     userValue?: string,
   ): string => {
     const explicit = (userValue || "").trim();
-    if (explicit) return explicit;
+    if (explicit) {
+      // Honor the user's explicit choice, but heal the legacy
+      // double-/api/ bug from earlier client versions so existing
+      // models_vault.json entries do not stay broken forever.
+      let healed = explicit;
+      while (healed.includes("/api/api/")) {
+        healed = healed.replace("/api/api/", "/api/");
+      }
+      return healed;
+    }
 
     const id = String(providerId || providerName || "").toLowerCase();
-    const base = String(baseUrl || "").trim().replace(/\/+$/, "");
+    const root = stripProviderSuffix(String(baseUrl || ""));
+    const rawBase = String(baseUrl || "").toLowerCase();
 
+    // Provider-id detection takes priority over port heuristics so that
+    // a user running LM Studio on a non-default port (e.g. :1235) still
+    // gets the correct endpoint.
     if (
       id.includes("lmstudio") ||
       id.includes("lm-studio") ||
-      id.includes("lm_studio") ||
-      base.includes(":1234")
+      id.includes("lm_studio")
     ) {
-      return `${base.replace(/\/v1$/, "")}/api/v0/models`;
+      // Modern LM Studio (0.3.x+) serves /api/v1/models. Older
+      // versions serve /api/v0/models. The backend's native adapter
+      // probes v1 first and falls back to v0, so /api/v1/models is the
+      // safest computed default.
+      return `${root}/api/v1/models`;
     }
-    if (id === "ollama" || base.includes(":11434")) {
-      return `${base.replace(/\/v1$/, "")}/api/tags`;
+    if (id === "ollama") {
+      return `${root}/api/tags`;
     }
-    if (id === "google" || id === "gemini" || base.includes("googleapis.com")) {
-      const native = base
-        .replace(/\/openai\/v1$/, "")
-        .replace(/\/openai$/, "")
-        .replace(/\/v1beta$/, "")
-        .replace(/\/v1$/, "");
-      return `${native}/v1beta/models`;
+
+    // Port-based fallback for cases where the provider id is missing or
+    // unrecognised (e.g. a custom endpoint that mimics LM Studio).
+    if (rawBase.includes(":1234")) {
+      return `${root}/api/v1/models`;
     }
-    if (id === "anthropic" || id === "claude" || base.includes("anthropic.com")) {
+    if (rawBase.includes(":11434")) {
+      return `${root}/api/tags`;
+    }
+
+    if (id === "google" || id === "gemini" || rawBase.includes("googleapis.com")) {
+      return `${root}/v1beta/models`;
+    }
+    if (id === "anthropic" || id === "claude" || rawBase.includes("anthropic.com")) {
       return "https://api.anthropic.com/v1/models";
     }
-    if (id === "deepseek" || base.includes("deepseek.com")) {
+    if (id === "deepseek" || rawBase.includes("deepseek.com")) {
       return "https://api.deepseek.com/models";
     }
     return "";
@@ -361,14 +425,35 @@ export default function SettingsPage() {
             }
             return p;
           });
-        storedCloud = INITIAL_CLOUD_PROVIDERS.map((base) => {
-          const match = cleanCloud.find((p: any) => p.id === base.id);
-          return match ? { ...base, ...match } : base;
-        });
+  // Start from the hardcoded defaults (guarantees the 4 built-in
+// providers always exist), then APPEND every additional provider
+// that lives in the vault. Without this append, any user-added
+// cloud provider (OpenRouter, Groq, Together, custom OpenAI-
+// compatible endpoints saved as cloud_vault entries, ...) would
+// be silently discarded on every page load.
+const matchedDefaults = INITIAL_CLOUD_PROVIDERS.map((base) => {
+  const match = cleanCloud.find((p: any) => p.id === base.id);
+  return match ? { ...base, ...match } : base;
+});
+const extraProviders = cleanCloud.filter(
+  (p: any) => !INITIAL_CLOUD_PROVIDERS.some((base) => base.id === p.id)
+);
+storedCloud = [...matchedDefaults, ...extraProviders];
       }
 
       if (vault.custom_endpoints && Array.isArray(vault.custom_endpoints)) {
-        storedCustom = vault.custom_endpoints;
+        // Reset runtime health fields on every reload. `status`,
+        // `latency`, and `lastError` are TRANSIENT — they reflect
+        // the result of the last probe, which may be hours old.
+        // Persisting them across reloads makes the ConnectivityMatrix
+        // show "online" for an endpoint that has been offline for
+        // hours. The user must click "Test" again to re-verify.
+        storedCustom = vault.custom_endpoints.map((ce: any) => ({
+          ...ce,
+          status: "untested",
+          latency: undefined,
+          lastError: undefined,
+        }));
       }
 
       const loadedConfig: FullAppConfig = {
@@ -641,12 +726,28 @@ export default function SettingsPage() {
     showToast.info("Reverted to Local Engine", "LM Studio (Local GPU) is now active primary.");
   };
 
-  const testEndpoint = async (baseUrl: string, apiKey: string, model: string, apiType?: string) => {
+  const testEndpoint = async (
+    baseUrl: string,
+    apiKey: string,
+    model: string,
+    apiType?: string,
+    // The user's explicit metadata endpoint, when set. Passing it to
+    // the backend lets the probe hit the URL the user chose instead of
+    // a URL computed from `baseUrl` (which may be `.../api/v1/` and
+    // produce a double-suffixed path).
+    metadataEndpoint?: string,
+  ) => {
     try {
       const res = await fetch(getApiUrl("/api/config/test-llm"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, model, api_type: apiType || "" }),
+        body: JSON.stringify({
+          base_url: baseUrl,
+          api_key: apiKey,
+          model,
+          api_type: apiType || "",
+          metadata_endpoint: metadataEndpoint || "",
+        }),
       });
       const data = await res.json();
       return {
@@ -670,6 +771,10 @@ export default function SettingsPage() {
           base_url: lmStudioSettings.baseUrl,
           api_key: lmStudioSettings.apiKey,
           provider_id: "lmstudio",
+          // The user's explicit metadata endpoint takes priority over
+          // the backend's computed endpoint. Empty string means "use
+          // the provider's native adapter discovery path".
+          metadata_endpoint: lmStudioSettings.metadataEndpoint || "",
         }),
       });
       const data = await res.json();
@@ -817,29 +922,52 @@ export default function SettingsPage() {
         body: JSON.stringify(payload),
       });
 
-      if (res.ok) {
-        const updatedLM: LMStudioSettings = {
-          ...lmStudioSettings,
-          savedModels:
-            availableModels.length > 0
-              ? availableModels
-              : lmStudioSettings.savedModels || [],
-        };
+      // ------------------------------------------------------------------
+      // Vault and localStorage MUST be updated regardless of whether the
+      // config.toml save succeeded. They are independent persistence
+      // layers:
+      //   * config.toml      -> backend runtime config (llm.base_url, etc.)
+      //   * models_vault.json -> per-provider credentials + model lists
+      //   * localStorage     -> frontend override cache (active_llm_override)
+      //
+      // Previously, a config.toml failure (e.g., an unsupported search
+      // provider) blocked both the vault save AND the localStorage write.
+      // That left users with a stale `active_llm_override` (with the OLD
+      // base_url) even after they changed the URL in the UI and clicked
+      // Save. This is exactly the failure mode that produced the
+      // "backend still tries to reach 100.64.17.157:1235" bug.
+      // ------------------------------------------------------------------
+      const configSaved = res.ok;
+      let errMsg = "";
+      if (!configSaved) {
+        const errData = await res.json().catch(() => ({}));
+        errMsg = errData.detail || "Server rejected configuration payload.";
+      }
 
-        const safeOllamaVault: OllamaSettings = {
-          ...ollamaSettings,
-          savedModels: ollamaSettings.savedModels || [],
-        };
+      // Always refresh the local vault snapshot. Even if config.toml was
+      // rejected, the user's per-provider settings (baseUrl, apiKey, model
+      // lists) are still valid and must be persisted.
+      const updatedLM: LMStudioSettings = {
+        ...lmStudioSettings,
+        savedModels:
+          availableModels.length > 0
+            ? availableModels
+            : lmStudioSettings.savedModels || [],
+      };
 
-        // Resolve empty metadata endpoints to computed defaults before
-        // persisting, so models_vault.json always stores the real URL.
-        const enriched = enrichVaultDefaults({
-          lmStudioSettings: updatedLM,
-          ollamaSettings: safeOllamaVault,
-          cloudProviders,
-          customEndpoints,
-        });
+      const safeOllamaVault: OllamaSettings = {
+        ...ollamaSettings,
+        savedModels: ollamaSettings.savedModels || [],
+      };
 
+      const enriched = enrichVaultDefaults({
+        lmStudioSettings: updatedLM,
+        ollamaSettings: safeOllamaVault,
+        cloudProviders,
+        customEndpoints,
+      });
+
+      try {
         await saveVaultToBackend({
           cloud_vault: enriched.clouds,
           custom_endpoints: enriched.customs,
@@ -847,81 +975,88 @@ export default function SettingsPage() {
           ollama_vault: enriched.ol,
           scanned_models: availableModels,
         });
-
-        const finalConfig: FullAppConfig = {
-          ...config,
-          llm: activeLlm,
-          search: sanitizedSearch,
-          browser: {
-            ...config.browser,
-            max_content_length:
-              parseInt(String(config.browser.max_content_length), 10) || 2000,
-          },
-        };
-
-        setConfig(finalConfig);
-        setLmStudioSettings(enriched.lm);
-        setOllamaSettings(enriched.ol);
-        setCloudProviders(enriched.clouds);
-        setCustomEndpoints(enriched.customs);
-
-        initialLoadedRef.current = JSON.stringify({
-          config: finalConfig,
-          lmStudioSettings: enriched.lm,
-          ollamaSettings: enriched.ol,
-          cloudProviders: enriched.clouds,
-          customEndpoints: enriched.customs,
-        });
-
-        setSaveStatus({ ok: true, message: "Configuration & Vault permanently saved!" });
-        showToast.success("Saved Successfully", `Active: ${activeLlm.provider_name} (${activeLlm.model})`);
-
-        if (typeof window !== "undefined") {
-          const safeModel =
-            typeof activeLlm.model === "string" ? activeLlm.model.trim() : "";
-          const safeProvider =
-            typeof activeLlm.provider_name === "string"
-              ? activeLlm.provider_name.trim()
-              : "";
-
-          // Skip individual writes when the value is empty. Writing an
-          // empty string here would (a) fail the storage schema's
-          // string().min(1) rule on the next read via useAppStorage,
-          // and (b) re-trigger "not configured" UI even after a save.
-          if (safeModel) {
-            localStorage.setItem("omweb_active_model", safeModel);
-          }
-          if (safeProvider) {
-            localStorage.setItem("omweb_active_provider", safeProvider);
-          }
-          localStorage.setItem(
-            "omweb_active_llm_override",
-            JSON.stringify({
-              model: safeModel || null,
-              provider: activeLlm.provider || null,
-              provider_name: safeProvider || null,
-              base_url: activeLlm.base_url || null,
-              api_key: activeLlm.api_key || null,
-              api_type: activeLlm.api_type || "",
-            })
-          );
-          window.dispatchEvent(
-            new CustomEvent("omweb:model-change", {
-              detail: {
-                model: safeModel || null,
-                provider_name: safeProvider || null,
-              },
-            })
-          );
+      } catch (vaultErr: any) {
+        console.warn("[handleSave] Vault save failed:", vaultErr);
+        if (configSaved) {
+          errMsg = `Config saved, but vault failed: ${vaultErr.message}`;
         }
-
-        setTimeout(() => setSaveStatus(null), 4000);
-      } else {
-        const errData = await res.json().catch(() => ({}));
-        const msg = errData.detail || "Server rejected configuration payload.";
-        setSaveStatus({ ok: false, message: msg });
-        showToast.error("Save Failed", msg);
       }
+
+      // Always refresh active_llm_override in localStorage, using the
+      // CURRENT state (not the config.toml result). This is what the
+      // dispatcher actually reads for chat and agent requests.
+      const finalConfig: FullAppConfig = {
+        ...config,
+        llm: activeLlm,
+        search: sanitizedSearch,
+        browser: {
+          ...config.browser,
+          max_content_length:
+            parseInt(String(config.browser.max_content_length), 10) || 2000,
+        },
+      };
+
+      setConfig(finalConfig);
+      setLmStudioSettings(enriched.lm);
+      setOllamaSettings(enriched.ol);
+      setCloudProviders(enriched.clouds);
+      setCustomEndpoints(enriched.customs);
+
+      initialLoadedRef.current = JSON.stringify({
+        config: finalConfig,
+        lmStudioSettings: enriched.lm,
+        ollamaSettings: enriched.ol,
+        cloudProviders: enriched.clouds,
+        customEndpoints: enriched.customs,
+      });
+
+      if (typeof window !== "undefined") {
+        const safeModel =
+          typeof activeLlm.model === "string" ? activeLlm.model.trim() : "";
+        const safeProvider =
+          typeof activeLlm.provider_name === "string"
+            ? activeLlm.provider_name.trim()
+            : "";
+
+        if (safeModel) {
+          localStorage.setItem("omweb_active_model", safeModel);
+        }
+        if (safeProvider) {
+          localStorage.setItem("omweb_active_provider", safeProvider);
+        }
+        localStorage.setItem(
+          "omweb_active_llm_override",
+          JSON.stringify({
+            model: safeModel || null,
+            provider: activeLlm.provider || null,
+            provider_name: safeProvider || null,
+            base_url: activeLlm.base_url || null,
+            api_key: activeLlm.api_key || null,
+            api_type: activeLlm.api_type || "",
+          })
+        );
+        window.dispatchEvent(
+          new CustomEvent("omweb:model-change", {
+            detail: {
+              model: safeModel || null,
+              provider_name: safeProvider || null,
+            },
+          })
+        );
+      }
+
+      if (configSaved) {
+        setSaveStatus({ ok: true, message: "Configuration & Vault permanently saved!" });
+        showToast.success(
+          "Saved Successfully",
+          `Active: ${activeLlm.provider_name} (${activeLlm.model})`
+        );
+      } else {
+        setSaveStatus({ ok: false, message: errMsg });
+        showToast.error("Save Failed", errMsg);
+      }
+
+      setTimeout(() => setSaveStatus(null), 4000);
     } catch (e: any) {
       setSaveStatus({ ok: false, message: `Save failed: ${e.message}` });
       showToast.error("Save Failed", e.message);

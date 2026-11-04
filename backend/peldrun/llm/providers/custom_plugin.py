@@ -585,12 +585,96 @@ class PluginProviderAdapter:
                 details={"venv_python": venv_python_raw},
             )
 
-        permissions_raw = d.get("permissions") or []
-        if not isinstance(permissions_raw, list):
-            permissions_raw = []
-        permissions_list: List[str] = [
-            str(p) for p in permissions_raw if isinstance(p, str)
-        ]
+        # The descriptor carries the manifest's permission BLOCK (a dict
+        # with keys "network", "secrets", "workspace_access",
+        # "shell_execute"), not a pre-flattened list of PermissionKind
+        # strings. The IPC protocol expects the flat list, so we convert
+        # here — this is the ONLY place where the two representations
+        # meet.
+        #
+        # The mapping mirrors
+        # omweb.provider_packages.schema.PackagePermissions.to_permission_set():
+        #
+        #   network == "connection_endpoint"  → "network.connect"
+        #   "connection.api_key" in secrets   → "secrets.read:connection"
+        #   workspace_access == True          → forbidden; rejected at
+        #                                       manifest validation, never
+        #                                       emitted here
+        #   shell_execute == True             → forbidden; same
+        #
+        # Before this fix, the dict was silently dropped (isinstance
+        # check failed), the worker received permissions=[], and every
+        # network call failed with "did not declare the 'network.connect'
+        # permission" — even though the manifest clearly declared it.
+        permissions_raw = d.get("permissions")
+
+        if isinstance(permissions_raw, dict):
+            permissions_list: List[str] = []
+            if permissions_raw.get("network") == "connection_endpoint":
+                permissions_list.append("network.connect")
+            secrets_declared = permissions_raw.get("secrets") or []
+            if (
+                isinstance(secrets_declared, list)
+                and "connection.api_key" in secrets_declared
+            ):
+                permissions_list.append("secrets.read:connection")
+
+            # ------------------------------------------------------------------
+            # Implicit permissions.
+            #
+            # The manifest's `permissions` block only models *consent-worthy*
+            # choices: whether the adapter can reach the network and read
+            # its own credentials. These three capabilities are NOT optional
+            # choices — they are fundamental to what every provider adapter
+            # does. The runtime worker REQUIRES them for the corresponding
+            # message handlers to run:
+            #
+            #   models.discover → handle_discover_models()
+            #   llm.generate    → handle_generate()
+            #   llm.stream      → handle_stream_start()
+            #   usage.read      → accounting (future)
+            #
+            # Without adding them here, the worker rejects every discovery /
+            # generate / stream request with
+            #   "attempted to use permission 'models.discover', which was
+            #    not declared in its manifest"
+            # even though the package is fully configured and functional.
+            #
+            # Manifest authors do NOT need to declare these — doing so would
+            # be friction with zero security benefit, since a package that
+            # runs an LLM adapter by definition calls generate / stream /
+            # discover. Only `network` and `secrets` need explicit consent.
+            # ------------------------------------------------------------------
+            permissions_list.extend(
+                [
+                    "models.discover",
+                    "llm.generate",
+                    "llm.stream",
+                    "usage.read",
+                ]
+            )
+        elif isinstance(permissions_raw, list):
+            # Defensive: accept the flat-list form in case a future
+            # descriptor producer uses it directly.
+            permissions_list = [
+                str(p) for p in permissions_raw if isinstance(p, str)
+            ]
+            # Same implicit grants as the dict branch above.
+            for implicit_perm in (
+                "models.discover",
+                "llm.generate",
+                "llm.stream",
+                "usage.read",
+            ):
+                if implicit_perm not in permissions_list:
+                    permissions_list.append(implicit_perm)
+        else:
+            permissions_list = [
+                "models.discover",
+                "llm.generate",
+                "llm.stream",
+                "usage.read",
+            ]
 
         profile_dict: Dict[str, Any] = {
             "provider_id": self.provider_id,

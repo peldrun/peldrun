@@ -494,6 +494,66 @@ def _resolve_provider_and_extras(
         # ``context.extra_params[<key>]``.
         # ------------------------------------------------------------------
         conn_fields = dict(active_conn.get("fields") or {})
+
+        # ------------------------------------------------------------------
+        # Inject installed certificate paths into file-typed fields.
+        #
+        # This is the SAME injection that `providers.py::test_connection`
+        # performs. Without it, chat and agent dispatch receive an EMPTY
+        # `ca_bundle_path` (the vault stores `""` by default — the
+        # Certificate Manager populates it only during test runs via
+        # `_inject_installed_certificates`). The adapter then falls back
+        # to certifi — which does NOT contain the Russian Root CA — and
+        # the OAuth call fails with:
+        #
+        #   [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed:
+        #   self-signed certificate in certificate chain
+        #
+        # Real-world symptom observed before this fix:
+        #   * Test Connection:    ✅ works (providers.py injects certs)
+        #   * Chat / Agent mode:  ❌ SSL error (dispatcher did NOT inject)
+        #
+        # Reusing `_inject_installed_certificates` guarantees both paths
+        # produce byte-identical `ConnectionContext.extra_params`.
+        # ------------------------------------------------------------------
+        try:
+            from omweb.routers.store.providers import (
+                _inject_installed_certificates,
+                _try_read_manifest,
+            )
+            from omweb.provider_packages.package_manager import (
+                provider_package_manager as _ppm,
+            )
+
+            _pkg_entry = _ppm.get_package(registration.provider_id)
+            if _pkg_entry is not None:
+                _manifest = _try_read_manifest(
+                    registration.provider_id,
+                    _pkg_entry.active_version,
+                )
+                conn_fields = _inject_installed_certificates(
+                    registration.provider_id,
+                    conn_fields,
+                    _manifest,
+                )
+                if conn_fields.get("ca_bundle_path"):
+                    logger.info(
+                        "[BRIDGE] Injected ca_bundle_path for plugin "
+                        "%r: %s",
+                        registration.provider_id,
+                        conn_fields["ca_bundle_path"],
+                    )
+        except Exception as _inject_err:
+            # Non-fatal: a package without certificates works fine
+            # without injection. Packages that REQUIRE a CA bundle
+            # surface a clear SSL error at request time — same as
+            # the pre-fix behavior.
+            logger.debug(
+                "[BRIDGE] Certificate injection failed for %r: %s",
+                registration.provider_id,
+                _inject_err,
+            )
+
         base_url_override = str(
             conn_fields.get("base_url") or ""
         ).strip() or None

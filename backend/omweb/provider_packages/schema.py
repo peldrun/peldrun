@@ -393,6 +393,119 @@ class PackagePermissions(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class CertificateFileSpec(BaseModel):
+    """
+    One file inside a multi-file certificate bundle.
+
+    A Provider Package whose TLS chain requires more than one certificate
+    (root + intermediate CA is the common case — Sber/GigaChat is the
+    canonical example) declares each file as its own
+    ``CertificateFileSpec``. The Certificate Manager downloads every
+    file, verifies each one's optional SHA-256, and concatenates them
+    into a single ``download_filename`` per ``merge_strategy``.
+
+    Design intent
+    -------------
+    The user sees ONE certificate in the Certificate Manager and clicks
+    ONE button. Behind the scenes, the manager fetches however many
+    files the manifest requires, so the user never has to manually
+    download, merge, or configure multiple files.
+
+    Fields
+    ------
+    url
+        HTTPS URL for this specific file. The manager downloads it
+        with the same size / timeout / format checks used for the
+        legacy single-file path.
+    filename
+        Suggested filename. Used only for diagnostics and log output;
+        the final merged file is written to
+        ``CertificateSpec.download_filename``.
+    role
+        Position in the TLS chain. Used by ``merge_strategy`` to order
+        the files before concatenation:
+            * ``intermediate`` — must come BEFORE the root for OpenSSL
+                                 to build the chain correctly.
+            * ``leaf``         — server or client certificate (rarely
+                                 used at the CA bundle level).
+            * ``root``         — the trust anchor, comes LAST.
+    sha256
+        Optional per-file SHA-256. When present, the manager refuses
+        to include the file unless its hash matches — protecting
+        against a compromised or stale mirror.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    url: str = Field(
+        ...,
+        description=(
+            "HTTPS URL for this specific file. Downloaded with the "
+            "same size and timeout limits as a single-file certificate."
+        ),
+    )
+    filename: str = Field(
+        ...,
+        description=(
+            "Suggested filename used in logs and diagnostics. The "
+            "final merged file uses CertificateSpec.download_filename."
+        ),
+    )
+    role: Literal["root", "intermediate", "leaf"] = Field(
+        default="root",
+        description=(
+            "Position in the TLS chain. Determines ordering during "
+            "concatenation."
+        ),
+    )
+    sha256: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional hex-encoded SHA-256 of this file. When present, "
+            "the manager verifies it before including the file in the "
+            "bundle."
+        ),
+    )
+
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, v: str) -> str:
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("url must be a non-empty string.")
+        if not v.lower().startswith(("https://", "http://")):
+            raise ValueError(
+                f"url must use http(s)://, got '{v}'."
+            )
+        return v
+
+    @field_validator("filename")
+    @classmethod
+    def _validate_filename(cls, v: str) -> str:
+        if not v or "/" in v or "\\" in v or ".." in v:
+            raise ValueError(
+                "filename must be a plain filename with no directory "
+                "components."
+            )
+        return v
+
+    @field_validator("sha256")
+    @classmethod
+    def _validate_sha256(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        if not isinstance(v, str) or len(v) != 64:
+            raise ValueError(
+                "sha256 must be a 64-character hex digest."
+            )
+        try:
+            int(v, 16)
+        except ValueError as exc:
+            raise ValueError(
+                "sha256 must contain only hex characters."
+            ) from exc
+        return v.lower()
+
+
 class CertificateSpec(BaseModel):
     """
     One certificate a Provider Package can install on the host.
@@ -536,6 +649,48 @@ class CertificateSpec(BaseModel):
     issuer: Optional[str] = None
     expires_at: Optional[str] = None
 
+    # --- Multi-file bundle (Option A) ---
+    #: Optional list of individual files that together make up the
+    #: bundle. When present, the Certificate Manager downloads EVERY
+    #: file, verifies each one's optional SHA-256, orders them by
+    #: ``role`` per ``merge_strategy``, and concatenates them into a
+    #: single ``download_filename``.
+    #:
+    #: When ``None``, the legacy single-file behaviour applies: only
+    #: ``download_url`` is fetched.
+    #:
+    #: This field is what solves the "Sber needs root + sub CA in one
+    #: PEM" class of problems — the user sees one Install button, the
+    #: manager fetches both files, and the resulting bundle is
+    #: immediately usable by the adapter with no manual merging.
+    download_urls: Optional[List["CertificateFileSpec"]] = Field(
+        default=None,
+        description=(
+            "Optional multi-file bundle. When present, the manager "
+            "downloads every file and concatenates them into one "
+            "PEM file, ordered by role."
+        ),
+    )
+
+    #: How to order the ``download_urls`` before concatenation.
+    #: TLS chains verify the trust anchor LAST, so the default puts
+    #: the intermediate (and leaf, if any) BEFORE the root.
+    #:
+    #: ``concatenate_intermediate_first`` (default):
+    #:     [intermediate, leaf, root]
+    #: ``concatenate_root_first``:
+    #:     [root, leaf, intermediate]
+    merge_strategy: Literal[
+        "concatenate_intermediate_first",
+        "concatenate_root_first",
+    ] = Field(
+        default="concatenate_intermediate_first",
+        description=(
+            "Ordering strategy for the download_urls. The default "
+            "matches OpenSSL's trust chain verification order."
+        ),
+    )
+
     # ------------------------------------------------------------------
     # Validators
     # ------------------------------------------------------------------
@@ -589,6 +744,25 @@ class CertificateSpec(BaseModel):
                 "directory components."
             )
         return v
+
+    @model_validator(mode="after")
+    def _validate_bundle_consistency(self) -> "CertificateSpec":
+        """
+        When ``download_urls`` is provided, ensure the bundle is
+        coherent:
+            * at least one file,
+            * ``download_filename`` is still set (it is the target of
+              the merged bundle).
+        """
+        if self.download_urls is None:
+            return self
+        if len(self.download_urls) == 0:
+            raise ValueError(
+                "download_urls, when provided, must contain at least "
+                "one entry. Omit the field entirely for the legacy "
+                "single-file path."
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -832,6 +1006,51 @@ class ProviderManifest(BaseModel):
     #: certificate files. This is the default and covers most cloud
     #: providers (OpenAI, Anthropic, Google, DeepSeek, ...).
     certificates: List[CertificateSpec] = Field(default_factory=list)
+
+    #: Per-model fact overrides.
+    #:
+    #: Some providers do NOT expose model capabilities via their API.
+    #: GigaChat is the canonical example: its ``GET /models`` endpoint
+    #: returns only ``{id, object, owned_by}`` — no context length, no
+    #: vision flag, no tool-calling declaration. The information lives
+    #: in the provider's HTML documentation, not in the API.
+    #:
+    #: ``model_facts`` lets the package author encode that information
+    #: ONCE, in the manifest, so every user sees accurate values
+    #: without manual configuration. The adapter reads it in
+    #: ``discover_models()`` and merges it into the discovery result.
+    #:
+    #: Schema (per model)::
+    #:
+    #:     {
+    #:       "<model_id>": {
+    #:         "max_context_length": 128000,   # int, tokens
+    #:         "max_output_tokens": 8192,       # int, tokens
+    #:         "vision": true,                  # bool
+    #:         "tools": true,                   # bool (function calling)
+    #:         "reasoning": false,              # bool
+    #:         "audio": false                   # bool (audio input)
+    #:       }
+    #:     }
+    #:
+    #: Keys NOT present in ``model_facts`` fall back to the package-wide
+    #: ``features`` block (see ``PackageFeatureFlags``). This makes the
+    #: field purely additive: a package that does not need it can omit
+    #: it entirely, and existing packages keep working unchanged.
+    #:
+    #: The dict is intentionally loose (``Dict[str, Dict[str, Any]]``)
+    #: rather than a strict Pydantic model, so future capability keys
+    #: (e.g. ``structured_output``) can be added without a schema bump.
+    #: The adapter is responsible for validating the values it reads.
+    model_facts: Dict[str, Dict[str, Any]] = Field(
+        default_factory=dict,
+        description=(
+            "Per-model fact overrides for providers whose API does not "
+            "expose capabilities. Keys are model IDs; values are dicts "
+            "with optional fields: max_context_length, "
+            "max_output_tokens, vision, tools, reasoning, audio."
+        ),
+    )
 
     #: Non-functional hints for the Store UI (TLS warnings, docs link,
     #: custom headers). Do NOT affect adapter behavior — the adapter

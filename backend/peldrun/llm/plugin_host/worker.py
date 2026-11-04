@@ -517,9 +517,15 @@ async def handle_load_adapter(
     # adapter's DEPENDENCIES on sys.path but not the adapter source
     # itself.
     # --------------------------------------------------------------
-    package_dir = payload.connection.get("extra_params", {}).get(
-        "_peldrun_package_dir"
-    )
+    # ``package_dir`` is a top-level field on LoadAdapterPayload — it is
+    # populated by the supervisor from the plugin descriptor. Reading it
+    # from ``connection.extra_params["_peldrun_package_dir"]`` was a
+    # pre-release bug: the supervisor never wrote that key, so the
+    # worker never added the package directory to sys.path and the
+    # adapter import failed with:
+    #
+    #     ModuleNotFoundError: No module named '<package_module>'
+    package_dir = payload.package_dir
     sys_path_inserted = False
     if (
         isinstance(package_dir, str)

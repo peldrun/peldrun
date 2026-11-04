@@ -115,6 +115,7 @@ from omweb.provider_packages.errors import (
 from omweb.provider_packages.schema import (
     CERTIFICATES_VAULT_KEY,
     MAX_CERTIFICATE_BYTES,
+    CertificateFileSpec,
     CertificateSpec,
     ProviderCertificateRecord,
 )
@@ -489,9 +490,21 @@ class CertificateManager:
 
             # ----------------------------------------------------------
             # Step 2 — download.
+            #
+            # Two modes:
+            #   * Multi-file bundle (spec.download_urls present) —
+            #     download every file, verify each one, then
+            #     concatenate them into a single PEM bundle.
+            #     Sber-style TLS needs this: the chain requires both
+            #     the root and the intermediate CA in one file.
+            #   * Legacy single-file (spec.download_urls is None) —
+            #     unchanged behaviour for existing manifests.
             # ----------------------------------------------------------
             try:
-                data = await self._download(spec.download_url)
+                if spec.download_urls:
+                    data = await self._download_bundle(spec)
+                else:
+                    data = await self._download(spec.download_url)
             except Exception as exc:
                 error_message = f"Download failed: {exc}"
                 self._save_record(
@@ -514,6 +527,11 @@ class CertificateManager:
                         "provider_id": provider_id,
                         "certificate_id": spec.id,
                         "download_url": spec.download_url,
+                        "download_urls": (
+                            [f.url for f in spec.download_urls]
+                            if spec.download_urls
+                            else None
+                        ),
                     },
                 ) from exc
 
@@ -784,12 +802,54 @@ class CertificateManager:
             try:
                 with open(target, "rb") as f:
                     head = f.read(4096)
-                if not (_looks_like_pem(head) or _looks_like_der(head)):
+                is_pem = _looks_like_pem(head)
+                is_der = _looks_like_der(head)
+                if not (is_pem or is_der):
                     status = "invalid"
                     error_message = (
                         "File does not look like a PEM or DER "
                         "certificate."
                     )
+                elif is_pem and spec.download_urls:
+                    # --------------------------------------------------
+                    # Bundle completeness check.
+                    #
+                    # When the manifest declares a multi-file bundle,
+                    # the installed file MUST contain at least as many
+                    # PEM blocks as the manifest has files. This
+                    # catches the upgrade case: a user who installed
+                    # the OLD single-cert manifest still has a file
+                    # with only the root CA, while the current
+                    # manifest expects root + intermediate.
+                    #
+                    # Without this check, the file would look
+                    # "installed" (format OK, hash unset) and the
+                    # adapter would try to use a broken chain —
+                    # producing the confusing "self-signed certificate
+                    # in chain" error at request time.
+                    # --------------------------------------------------
+                    try:
+                        with open(target, "rb") as f:
+                            full = f.read()
+                        block_count = full.count(
+                            b"-----BEGIN CERTIFICATE-----"
+                        )
+                        expected_min = len(spec.download_urls)
+                        if block_count < expected_min:
+                            status = "invalid"
+                            error_message = (
+                                f"Certificate file contains "
+                                f"{block_count} PEM block(s) but the "
+                                f"manifest declares a bundle of "
+                                f"{expected_min}. Click Reinstall to "
+                                f"fetch the complete bundle."
+                            )
+                    except Exception as exc:
+                        status = "invalid"
+                        error_message = (
+                            f"Could not count certificates in file: "
+                            f"{exc}"
+                        )
             except Exception as exc:
                 status = "invalid"
                 error_message = f"Could not read file header: {exc}"
@@ -912,6 +972,157 @@ class CertificateManager:
     # ------------------------------------------------------------------
     # Internal — download
     # ------------------------------------------------------------------
+
+    async def _download_bundle(self, spec: CertificateSpec) -> bytes:
+        """
+        Download every file in a multi-file bundle and merge them into
+        one PEM byte string.
+
+        Order is determined by ``spec.merge_strategy``:
+            * ``concatenate_intermediate_first`` (default): intermediate
+              (and leaf) CAs come BEFORE the root. This matches what
+              OpenSSL expects — the trust anchor comes last.
+            * ``concatenate_root_first``: root first. Rarely correct,
+              but exposed for providers with unusual ordering needs.
+
+        Every downloaded file must pass:
+            * size limit (handled by ``_download``),
+            * per-file SHA-256 (when ``CertificateFileSpec.sha256`` is
+              provided),
+            * PEM/DER format check (looks like a certificate).
+
+        If ANY file fails, the whole bundle install fails — a partial
+        bundle is worse than no bundle at all for TLS verification,
+        because the error surfaces at request time with confusing
+        messages ("self-signed certificate in chain") rather than at
+        install time.
+        """
+        if not spec.download_urls:
+            # Defensive — caller already checked, but be explicit.
+            return await self._download(spec.download_url)
+
+        downloaded: List[tuple[CertificateFileSpec, bytes]] = []
+        for file_spec in spec.download_urls:
+            try:
+                file_bytes = await self._download(file_spec.url)
+            except Exception as exc:
+                raise ProviderPackageValidationError(
+                    f"Failed to download bundle file "
+                    f"{file_spec.filename!r} from {file_spec.url}: {exc}",
+                    code="PROVIDER_CERTIFICATE_BUNDLE_DOWNLOAD_FAILED",
+                    details={
+                        "bundle_file": file_spec.filename,
+                        "url": file_spec.url,
+                        "cause": str(exc),
+                    },
+                ) from exc
+
+            # Per-file SHA-256 verification.
+            if file_spec.sha256:
+                actual_hash = _sha256_of(file_bytes)
+                if actual_hash != file_spec.sha256:
+                    raise ProviderPackageValidationError(
+                        f"Bundle file {file_spec.filename!r} SHA-256 "
+                        f"mismatch. Expected {file_spec.sha256}, "
+                        f"got {actual_hash}.",
+                        code="PROVIDER_CERTIFICATE_BUNDLE_HASH_MISMATCH",
+                        details={
+                            "bundle_file": file_spec.filename,
+                            "url": file_spec.url,
+                            "expected_sha256": file_spec.sha256,
+                            "actual_sha256": actual_hash,
+                        },
+                    )
+
+            # Per-file format validation.
+            if not (
+                _looks_like_pem(file_bytes)
+                or _looks_like_der(file_bytes)
+            ):
+                raise ProviderPackageValidationError(
+                    f"Bundle file {file_spec.filename!r} does not look "
+                    f"like a PEM or DER certificate. The URL may have "
+                    f"returned an HTML page or another non-CA file.",
+                    code="PROVIDER_CERTIFICATE_BUNDLE_INVALID_FORMAT",
+                    details={
+                        "bundle_file": file_spec.filename,
+                        "url": file_spec.url,
+                    },
+                )
+
+            downloaded.append((file_spec, file_bytes))
+
+        # Order files according to merge_strategy.
+        ordered = self._apply_merge_strategy(
+            downloaded, spec.merge_strategy
+        )
+
+        # Concatenate with newline separators. Every PEM block must be
+        # newline-terminated before the next BEGIN header, otherwise
+        # OpenSSL fails to parse the trailing certificate.
+        chunks: List[bytes] = []
+        for file_spec, file_bytes in ordered:
+            # DER files must be converted to PEM before concatenation;
+            # a PEM bundle cannot mix DER and PEM segments.
+            if _looks_like_der(file_bytes) and not _looks_like_pem(
+                file_bytes
+            ):
+                try:
+                    pem = ssl.DER_cert_to_PEM_cert(file_bytes)
+                    chunks.append(pem.encode("ascii").rstrip() + b"\n")
+                except Exception as exc:
+                    raise ProviderPackageValidationError(
+                        f"Could not convert bundle file "
+                        f"{file_spec.filename!r} from DER to PEM: {exc}",
+                        code=(
+                            "PROVIDER_CERTIFICATE_BUNDLE_DER_CONVERT_FAILED"
+                        ),
+                        details={
+                            "bundle_file": file_spec.filename,
+                            "url": file_spec.url,
+                        },
+                    ) from exc
+            else:
+                chunks.append(file_bytes.rstrip() + b"\n")
+
+        merged = b"\n".join(chunks)
+        logger.info(
+            "Built certificate bundle: %d file(s) merged into %.1f KB.",
+            len(ordered),
+            len(merged) / 1024.0,
+        )
+        return merged
+
+    @staticmethod
+    def _apply_merge_strategy(
+        files: List[tuple[CertificateFileSpec, bytes]],
+        strategy: str,
+    ) -> List[tuple[CertificateFileSpec, bytes]]:
+        """
+        Order bundle files per the merge strategy.
+
+        TLS verification (OpenSSL, Python's ssl module) processes the
+        chain from leaf to root. The root CA is the trust anchor and
+        must appear LAST in a concatenated PEM bundle — otherwise the
+        handshake may fail with "unable to get local issuer" because
+        OpenSSL never reaches the root while building the chain.
+
+        Both strategies keep ``leaf`` in the middle. The only
+        difference is whether the intermediate comes before or after
+        the root:
+            * intermediate_first: [intermediate, leaf, root]
+            * root_first:         [root, leaf, intermediate]
+        """
+        if strategy == "concatenate_root_first":
+            order = {"root": 0, "leaf": 1, "intermediate": 2}
+        else:
+            # Default — matches the standard OpenSSL trust order.
+            order = {"intermediate": 0, "leaf": 1, "root": 2}
+
+        return sorted(
+            files,
+            key=lambda pair: order.get(pair[0].role, 99),
+        )
 
     async def _download(self, url: str) -> bytes:
         """

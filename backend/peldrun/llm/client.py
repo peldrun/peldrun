@@ -64,7 +64,10 @@ STREAM_INTER_CHUNK_TIMEOUT_SECONDS = float(
     os.environ.get("PELDRUN_LLM_INTER_CHUNK_TIMEOUT", "120.0")
 )
 
-from openai import AsyncOpenAI
+try:
+    from openai import AsyncOpenAI
+except ImportError:
+    AsyncOpenAI = None  # type: ignore[assignment]
 from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger("peldrun.llm.client")

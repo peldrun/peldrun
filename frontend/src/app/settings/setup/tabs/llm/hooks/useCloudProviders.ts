@@ -16,12 +16,20 @@ export interface UseCloudProvidersParams {
   /**
    * Endpoint probe delegated to the parent tab. Kept as a dependency so the
    * hook can stay agnostic about the transport (fetch/axios/mock).
+   *
+   * The optional `metadataEndpoint` parameter lets each call site
+   * forward the user's explicit metadata URL from the vault. When
+   * omitted, the backend falls back to computing a URL from
+   * `baseUrl` — which is correct for legacy endpoints but produced
+   * the double-`/api/api/v0/models` bug when `baseUrl` already
+   * included `/api/v1`.
    */
   testEndpoint: (
     baseUrl: string,
     apiKey: string,
     model: string,
-    apiType?: string
+    apiType?: string,
+    metadataEndpoint?: string
   ) => Promise<{ ok: boolean; message: string; latency?: number }>;
 }
 
@@ -105,7 +113,19 @@ export function useCloudProviders({
 
       setTestingId(providerId);
       try {
-        const res = await testEndpoint(cp.baseUrl, cp.apiKey, cp.model, cp.type);
+        // Forward the provider's explicit metadata endpoint (when the
+        // user set one in the vault) so the backend probe hits the
+        // exact URL they configured instead of a URL computed from
+        // `baseUrl`. For cloud providers this is typically the same as
+        // `baseUrl + /models`, but the user's explicit choice always
+        // wins.
+        const res = await testEndpoint(
+          cp.baseUrl,
+          cp.apiKey,
+          cp.model,
+          cp.type,
+          (cp as { metadataEndpoint?: string }).metadataEndpoint
+        );
 
         setCloudProviders((prev) =>
           prev.map((item) =>

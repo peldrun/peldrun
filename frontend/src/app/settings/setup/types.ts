@@ -9,7 +9,13 @@ export type SettingsTab =
   | "mcp"
   | "system";
 
-export type HubSubTab = "overview" | "budgets" | "lmstudio" | "cloud" | "custom";
+export type HubSubTab =
+  | "overview"
+  | "budgets"
+  | "lmstudio"
+  | "cloud"
+  | "store_providers"
+  | "custom";
 
 export type ApiModeType =
   | "Auto-detect"

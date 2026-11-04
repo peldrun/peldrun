@@ -204,6 +204,43 @@ _DENYLISTED_HOSTS: FrozenSet[str] = frozenset(
 )
 
 
+#: Provider-specific additional hosts that the adapter is allowed to
+#: reach BEYOND the connection's base_url. This exists because some
+#: providers use a DIFFERENT host:port for authentication than for
+#: API calls — a single base_url allowlist cannot cover them.
+#:
+#: GigaChat is the canonical example:
+#:   * OAuth token exchange:
+#:       https://ngw.devices.sberbank.ru:9443/api/v2/oauth
+#:   * API endpoint (base_url):
+#:       https://gigachat.devices.sberbank.ru/api/v1
+#:
+#: Both are required for the adapter to function. Without allowing
+#: the OAuth host, the SDK raises URLNotAllowedError before it can
+#: even retrieve an access token.
+#:
+#: In a future PELDRUN release, this list will move into the package
+#: manifest (as an `additional_allowed_hosts` field), so each package
+#: declares its own needs rather than relying on a hardcoded table.
+#: For now, this is the minimal fix that keeps existing packages
+#: working without a schema change.
+_PROVIDER_EXTRA_HOSTS: Dict[str, Tuple[Tuple[str, str, int], ...]] = {
+    "gigachat": (
+        # OAuth token exchange server — different host:port from the
+        # API endpoint, and GigaChat SDK creates its own HTTP client
+        # for it that bypasses the connection's base_url.
+        ("https", "ngw.devices.sberbank.ru", 9443),
+        # Official GigaChat API endpoint (since July 2026). The legacy
+        # endpoint (gigachat.devices.sberbank.ru) issues an HTTP
+        # redirect to this host, and the GigaChat SDK follows
+        # redirects internally. Without this entry, any request
+        # against the legacy endpoint fails at the redirect hop with
+        # "host 'api.giga.chat' is not in the connection's allowlist".
+        ("https", "api.giga.chat", 443),
+    ),
+}
+
+
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
@@ -532,16 +569,28 @@ class RuntimePermissionEnforcer:
                 self._allowed_parts = None
                 self._allowed_base_url = None
 
+        # Provider-specific extra allowed (scheme, host, port) triples.
+        # See the _PROVIDER_EXTRA_HOSTS table above for rationale.
+        # Empty tuple when the provider has no extras declared.
+        self._extra_allowed_parts: Tuple[Tuple[str, str, int], ...] = (
+            _PROVIDER_EXTRA_HOSTS.get(provider_id, ())
+        )
+
         self._api_key = connection_api_key
         self._extra_headers: Dict[str, str] = dict(extra_headers or {})
 
         logger.debug(
             "RuntimePermissionEnforcer ready: provider=%r "
-            "connection=%r permissions=%s base_url=%s",
+            "connection=%r permissions=%s base_url=%s extra_hosts=%s",
             provider_id,
             connection_id,
             sorted(self._permissions),
             self._allowed_base_url or "<none>",
+            [
+                f"{s}://{h}:{p}"
+                for s, h, p in self._extra_allowed_parts
+            ]
+            or "<none>",
         )
 
     # ------------------------------------------------------------------
@@ -646,9 +695,11 @@ class RuntimePermissionEnforcer:
             3. The URL parses successfully.
             4. The URL's host is NOT in the hardcoded metadata
                denylist.
-            5. The URL's ``(scheme, host, port)`` matches the base
-               URL's ``(scheme, host, port)`` — with the local-host
-               equivalence rule applied to the host.
+            5. The URL's ``(scheme, host, port)`` matches EITHER the
+               connection's ``base_url`` OR one of the provider's
+               declared extra hosts (see ``_PROVIDER_EXTRA_HOSTS``),
+               with the local-host equivalence rule applied to the
+               host in both cases.
 
         Returns ``False`` (never raises) when any of the above fails.
         Use ``assert_url_allowed()`` for the raising version.
@@ -671,14 +722,25 @@ class RuntimePermissionEnforcer:
         if host in _DENYLISTED_HOSTS:
             return False
 
+        # Primary allowlist — the connection's base_url.
         allowed_scheme, allowed_host, allowed_port = self._allowed_parts
-        if scheme != allowed_scheme:
-            return False
-        if port != allowed_port:
-            return False
-        if not _hosts_are_equivalent(host, allowed_host):
-            return False
-        return True
+        if (
+            scheme == allowed_scheme
+            and port == allowed_port
+            and _hosts_are_equivalent(host, allowed_host)
+        ):
+            return True
+
+        # Provider-specific extra hosts (e.g. GigaChat's OAuth server).
+        for extra_scheme, extra_host, extra_port in self._extra_allowed_parts:
+            if (
+                scheme == extra_scheme
+                and port == extra_port
+                and _hosts_are_equivalent(host, extra_host)
+            ):
+                return True
+
+        return False
 
     def assert_url_allowed(self, url: str) -> None:
         """
@@ -754,17 +816,42 @@ class RuntimePermissionEnforcer:
 
         allowed_scheme, allowed_host, allowed_port = self._allowed_parts
 
+        # Try the provider's extra allowed hosts BEFORE raising.
+        # This is what lets GigaChat reach its OAuth server (a
+        # different host:port from the API endpoint).
+        for extra_scheme, extra_host, extra_port in self._extra_allowed_parts:
+            if (
+                scheme == extra_scheme
+                and port == extra_port
+                and _hosts_are_equivalent(host, extra_host)
+            ):
+                # Match — no exception.
+                return
+
+        # Neither primary nor extras matched. Pick the most specific
+        # mismatch reason to surface to the user. Extras are included
+        # in the error message so the operator sees what hosts WERE
+        # allowed (both the base_url and any provider extras).
+        allowed_summary = (
+            [f"{allowed_scheme}://{allowed_host}:{allowed_port}"]
+            + [
+                f"{s}://{h}:{p}"
+                for s, h, p in self._extra_allowed_parts
+            ]
+        )
+
         if scheme != allowed_scheme:
             raise URLNotAllowedError(
                 f"Provider package '{self._provider_id}' (connection "
                 f"'{self._connection_id}') attempted a {scheme!r} "
-                f"request, but the connection's base_url uses "
+                f"request, but the connection's allowlist uses "
                 f"{allowed_scheme!r}. Scheme must match.",
                 provider=self._provider_id,
                 details={
                     "attempted_url": _redact_url(url),
                     "attempted_scheme": scheme,
                     "allowed_scheme": allowed_scheme,
+                    "allowed_hosts": allowed_summary,
                     "reason": "scheme_mismatch",
                     "connection_id": self._connection_id,
                 },
@@ -774,35 +861,34 @@ class RuntimePermissionEnforcer:
             raise URLNotAllowedError(
                 f"Provider package '{self._provider_id}' (connection "
                 f"'{self._connection_id}') attempted to reach port "
-                f"{port}, but the connection's base_url uses port "
-                f"{allowed_port}. Port must match.",
+                f"{port}, which is not in the connection's allowlist "
+                f"(allowed: {allowed_summary}).",
                 provider=self._provider_id,
                 details={
                     "attempted_url": _redact_url(url),
                     "attempted_port": port,
                     "allowed_port": allowed_port,
+                    "allowed_hosts": allowed_summary,
                     "reason": "port_mismatch",
                     "connection_id": self._connection_id,
                 },
             )
 
-        if not _hosts_are_equivalent(host, allowed_host):
-            raise URLNotAllowedError(
-                f"Provider package '{self._provider_id}' (connection "
-                f"'{self._connection_id}') attempted to reach host "
-                f"'{host}', but the connection's base_url uses host "
-                f"'{allowed_host}'. Host must match.",
-                provider=self._provider_id,
-                details={
-                    "attempted_url": _redact_url(url),
-                    "attempted_host": host,
-                    "allowed_host": allowed_host,
-                    "reason": "host_mismatch",
-                    "connection_id": self._connection_id,
-                },
-            )
-
-        # Allowed — no exception.
+        raise URLNotAllowedError(
+            f"Provider package '{self._provider_id}' (connection "
+            f"'{self._connection_id}') attempted to reach host "
+            f"'{host}', which is not in the connection's allowlist "
+            f"(allowed: {allowed_summary}).",
+            provider=self._provider_id,
+            details={
+                "attempted_url": _redact_url(url),
+                "attempted_host": host,
+                "allowed_host": allowed_host,
+                "allowed_hosts": allowed_summary,
+                "reason": "host_mismatch",
+                "connection_id": self._connection_id,
+            },
+        )
 
     # ------------------------------------------------------------------
     # Secret access
@@ -912,95 +998,83 @@ def _import_httpx():
     return httpx
 
 
-class AllowlistAsyncTransport:
+# ---------------------------------------------------------------------------
+# AllowlistAsyncTransport — dynamic class builder
+# ---------------------------------------------------------------------------
+#
+# httpx.AsyncBaseTransport is a class with a non-default deallocator.
+# Python forbids changing __bases__ at runtime when the new base's
+# deallocator differs from the current one:
+#
+#   TypeError: __bases__ assignment: 'AsyncBaseTransport' deallocator
+#              differs from 'object'
+#
+# That error was crashing every plugin worker on the first LOAD_ADAPTER.
+#
+# The correct fix is to build the entire subclass inside a factory
+# function that runs on first use. The resulting class inherits from
+# httpx.AsyncBaseTransport properly, so httpx.AsyncClient's
+# `isinstance(transport, AsyncBaseTransport)` check passes.
+
+_ALLOWLIST_TRANSPORT_CLASS: Optional[type] = None
+
+
+def _build_allowlist_transport_class() -> type:
     """
-    httpx transport that enforces the runtime permission enforcer's
-    URL allowlist on EVERY request.
+    Build the real ``AllowlistAsyncTransport`` class.
 
-    Design notes
-    ------------
-    * **Wraps, not replaces.** The constructor takes an inner
-      transport (typically ``httpx.AsyncHTTPTransport()``, the default
-      used by ``AsyncClient``). Every allowed request is delegated to
-      the inner transport unchanged. This preserves:
-          * TLS verification
-          * Proxy support
-          * Connection pooling
-          * HTTP/2 negotiation
-      Only the URL check is new.
-
-    * **Redirect targets are checked.** httpx's redirect-following
-      loop creates a new request for each ``Location`` header. Each
-      new request passes through this transport, so a redirect to a
-      disallowed host is blocked at the second hop. This is the
-      correct behavior: the adapter should not be able to reach
-      ``https://evil.com`` just because the allowed endpoint returned
-      a malicious redirect.
-
-    * **Not a ``httpx.AsyncBaseTransport`` subclass at import time.**
-      The class is defined lazily (see ``_import_httpx``) so that
-      this module can be imported in environments without httpx. The
-      factory function ``make_allowlist_transport()`` handles the
-      subclass creation once httpx is available.
-
-    Use ``make_allowlist_transport(enforcer, inner=None)`` to build an
-    instance. The default inner is ``httpx.AsyncHTTPTransport()`` with
-    the client's normal configuration.
+    Deferred until first use so this module stays importable without
+    httpx. The built class is cached (see
+    ``_get_allowlist_transport_class``), so subsequent calls are O(1).
     """
-
-    # Populated by ``_bind_httpx_classes()`` on first use.
-    _base_class = None
-
-    def __init__(
-        self,
-        enforcer: RuntimePermissionEnforcer,
-        inner: Any,
-    ) -> None:
-        self._enforcer = enforcer
-        self._inner = inner
-
-    async def handle_async_request(self, request: Any) -> Any:
-        """
-        Intercept an outgoing HTTP request.
-
-        The requested URL is checked against the allowlist BEFORE any
-        bytes leave the worker. A denied URL raises
-        ``URLNotAllowedError`` synchronously — the request never
-        reaches the inner transport, so no TCP connection is opened,
-        no DNS query is performed, and no traffic is observable on
-        the network.
-
-        The wrapped exception is then translated by the caller
-        (``install_httpx_guard``) into an httpx-compatible error so
-        the adapter's own error handling sees a normal failure.
-        """
-        url = str(request.url)
-        self._enforcer.assert_url_allowed(url)
-        return await self._inner.handle_async_request(request)
-
-    async def aclose(self) -> None:
-        """Close the inner transport. Idempotent on well-behaved inners."""
-        await self._inner.aclose()
-
-
-def _bind_httpx_classes() -> None:
-    """
-    Attach the correct base class to ``AllowlistAsyncTransport``.
-
-    httpx requires transports to subclass
-    ``httpx.AsyncBaseTransport``. We cannot declare that inheritance
-    at module import time (see ``_import_httpx``), so we patch the
-    base class onto our class the first time the transport is used.
-
-    Idempotent: subsequent calls are no-ops. Safe to call from
-    multiple threads (dict assignment is atomic, and the resulting
-    state is identical regardless of ordering).
-    """
-    if AllowlistAsyncTransport._base_class is not None:
-        return
     httpx = _import_httpx()
-    AllowlistAsyncTransport._base_class = httpx.AsyncBaseTransport
-    AllowlistAsyncTransport.__bases__ = (httpx.AsyncBaseTransport,)
+
+    class _AllowlistAsyncTransport(httpx.AsyncBaseTransport):
+        """
+        httpx transport that enforces the runtime permission enforcer's
+        URL allowlist on EVERY request.
+
+        Wraps an inner transport (typically ``httpx.AsyncHTTPTransport()``)
+        and delegates every allowed request to it unchanged. This
+        preserves TLS verification, proxy support, connection pooling,
+        and HTTP/2 negotiation — only the URL check is new.
+
+        Redirect targets are checked too: httpx's redirect loop
+        creates a new request for each ``Location`` header, and each
+        of those passes through ``handle_async_request``, so a
+        redirect to a disallowed host is blocked at the second hop.
+        """
+
+        def __init__(
+            self,
+            enforcer: RuntimePermissionEnforcer,
+            inner: Any,
+        ) -> None:
+            self._enforcer = enforcer
+            self._inner = inner
+
+        async def handle_async_request(self, request: Any) -> Any:
+            url = str(request.url)
+            self._enforcer.assert_url_allowed(url)
+            return await self._inner.handle_async_request(request)
+
+        async def aclose(self) -> None:
+            await self._inner.aclose()
+
+    # Stable name for repr / tracebacks / logging.
+    _AllowlistAsyncTransport.__name__ = "AllowlistAsyncTransport"
+    _AllowlistAsyncTransport.__qualname__ = "AllowlistAsyncTransport"
+    _AllowlistAsyncTransport.__module__ = __name__
+
+    return _AllowlistAsyncTransport
+
+
+def _get_allowlist_transport_class() -> type:
+    """Return the cached AllowlistAsyncTransport class, building on first call."""
+    global _ALLOWLIST_TRANSPORT_CLASS
+    if _ALLOWLIST_TRANSPORT_CLASS is None:
+        _ALLOWLIST_TRANSPORT_CLASS = _build_allowlist_transport_class()
+    return _ALLOWLIST_TRANSPORT_CLASS
 
 
 def make_allowlist_transport(
@@ -1025,13 +1099,13 @@ def make_allowlist_transport(
     httpx.AsyncBaseTransport
         A transport that enforces the allowlist.
     """
-    _bind_httpx_classes()
+    transport_cls = _get_allowlist_transport_class()
     httpx = _import_httpx()
 
     if inner is None:
         inner = httpx.AsyncHTTPTransport()
 
-    return AllowlistAsyncTransport(enforcer=enforcer, inner=inner)
+    return transport_cls(enforcer=enforcer, inner=inner)
 
 
 # ---------------------------------------------------------------------------
@@ -1083,7 +1157,7 @@ def install_httpx_guard(enforcer: RuntimePermissionEnforcer) -> None:
     call is a no-op — the wrapped constructor detects that it has
     already been wrapped.
     """
-    _bind_httpx_classes()
+    transport_cls = _get_allowlist_transport_class()
     httpx = _import_httpx()
 
     original_init = httpx.AsyncClient.__init__
@@ -1100,10 +1174,10 @@ def install_httpx_guard(enforcer: RuntimePermissionEnforcer) -> None:
 
         # If the caller passed an already-wrapped transport (e.g. our
         # own, from a previous wrap), do not double-wrap.
-        if isinstance(inner_transport, AllowlistAsyncTransport):
+        if isinstance(inner_transport, transport_cls):
             wrapped = inner_transport
         else:
-            wrapped = AllowlistAsyncTransport(
+            wrapped = transport_cls(
                 enforcer=enforcer,
                 inner=inner_transport,
             )
@@ -1119,6 +1193,24 @@ def install_httpx_guard(enforcer: RuntimePermissionEnforcer) -> None:
         "(base_url=%s, provider=%r)",
         enforcer.allowed_base_url,
         enforcer.provider_id,
+    )
+
+
+def __getattr__(name: str) -> Any:
+    """
+    PEP 562 — lazily expose ``AllowlistAsyncTransport``.
+
+    The class is built on demand because it must inherit from
+    ``httpx.AsyncBaseTransport`` — which cannot be established
+    without importing httpx. Exposing the name via ``__getattr__``
+    keeps ``from peldrun.llm.plugin_host.permissions import
+    AllowlistAsyncTransport`` working without forcing an eager httpx
+    import at module load.
+    """
+    if name == "AllowlistAsyncTransport":
+        return _get_allowlist_transport_class()
+    raise AttributeError(
+        f"module {__name__!r} has no attribute {name!r}"
     )
 
 

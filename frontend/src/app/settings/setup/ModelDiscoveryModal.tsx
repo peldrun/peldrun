@@ -34,6 +34,13 @@ interface ModelDiscoveryModalProps {
   baseUrl: string;
   apiKey: string;
   providerType?: string;
+  // Optional explicit metadata endpoint from the vault. When
+  // provided, forwarded to `/api/config/fetch-models` as
+  // `metadata_endpoint` so discovery honors the user's configured
+  // URL instead of the backend recomputing one from `baseUrl`. This
+  // is what prevents LM Studio base URLs like `.../api/v1` from
+  // producing the double-suffixed `/api/api/v0/models` path.
+  metadataEndpoint?: string;
   initialSavedModels?: string[];
   onSaveModels: (selectedModels: string[], defaultModel?: string) => void;
 }
@@ -46,6 +53,7 @@ export function ModelDiscoveryModal({
   baseUrl,
   apiKey,
   providerType = "",
+  metadataEndpoint,
   initialSavedModels = [],
   onSaveModels,
 }: ModelDiscoveryModalProps) {
@@ -76,6 +84,12 @@ export function ModelDiscoveryModal({
           api_key: apiKey,
           provider_id: providerId,
           provider_type: providerType,
+          // Forward the user's explicit metadata endpoint when the
+          // caller provided one. Empty string signals the backend to
+          // use its native adapter discovery path (which probes
+          // /api/v1/models → /api/v0/models → /v1/models in priority
+          // order).
+          metadata_endpoint: metadataEndpoint || "",
         }),
       });
       // Read the raw text FIRST so that a non-JSON response (e.g.
@@ -387,13 +401,26 @@ export function ModelDiscoveryModal({
               /* here immediately; for other providers, `manual` is the     */
               /* only way to declare capabilities.                          */
               /* ---------------------------------------------------------- */
-              // 1. Get base caps from local inference (vault/patterns)
+              // 1. Base capabilities from the discovery response
+              //    (whatever `_parse_adapter_model_list` persisted under
+              //    `capabilities` and `capability_sources`).
+              //
+              // 2. Catalog facts fetched asynchronously from
+              //    `/api/catalog/models/{modelId}`. These overlay the
+              //    discovery data — but ONLY when the catalog returns a
+              //    `known: true` fact.
+              //
+              // Critical: an `unknown` fact MUST NOT erase a `true` value
+              // that came from the provider's own `discover_models()`
+              // response. The previous code did `isTools = facts.tools.value`
+              // unconditionally, which silently overwrote a provider-declared
+              // `trained_for_tool_use: true` with `false` whenever the
+              // catalog endpoint returned `unknown` (e.g. for Provider
+              // Packages like GigaChat where `/api/catalog` falls back to
+              // LiteLLM and does not find the model).
               const inferredCaps = inferModelCapabilities(modelId, meta as any, providerId) || {};
-
-              // 2. Get fetched catalog facts (same as ModelInfoModal)
               const facts = modelFactsMap[modelId];
 
-              // 3. Determine final capabilities (facts override local)
               let isVision = inferredCaps.isVision || meta.capabilities?.vision === true;
               let isTools = inferredCaps.isTools || meta.capabilities?.trained_for_tool_use === true;
               let isReasoning = inferredCaps.isReasoning || meta.capabilities?.reasoning === true;
@@ -403,13 +430,27 @@ export function ModelDiscoveryModal({
               let toolsSource = inferredCaps.toolsSource || meta.capability_sources?.trained_for_tool_use || "unknown";
 
               if (facts) {
-                isVision = facts.vision.value;
-                isTools = facts.tools.value;
-                isReasoning = facts.reasoning.value;
-
-                reasoningSource = (facts.reasoning.source as CapabilitySource) || reasoningSource;
-                visionSource = (facts.vision.source as CapabilitySource) || visionSource;
-                toolsSource = (facts.tools.source as CapabilitySource) || toolsSource;
+                // Overlay only when the catalog is definitive. A missing
+                // catalog entry must not silently downgrade a capability
+                // that the provider itself declared.
+                if (facts.vision.known) {
+                  isVision = facts.vision.value;
+                  if (facts.vision.source) {
+                    visionSource = facts.vision.source as CapabilitySource;
+                  }
+                }
+                if (facts.tools.known) {
+                  isTools = facts.tools.value;
+                  if (facts.tools.source) {
+                    toolsSource = facts.tools.source as CapabilitySource;
+                  }
+                }
+                if (facts.reasoning.known) {
+                  isReasoning = facts.reasoning.value;
+                  if (facts.reasoning.source) {
+                    reasoningSource = facts.reasoning.source as CapabilitySource;
+                  }
+                }
               }
 
               const capabilitySources = {

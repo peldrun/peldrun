@@ -1451,4 +1451,648 @@ async def delete_provider_certificate(
     }
 
 
+# ===========================================================================
+# Provider Connections (M9/M10)
+# ===========================================================================
+#
+# A Provider Package can have MULTIPLE saved connections. Exactly one
+# is ``is_active`` — the runtime uses that one for dispatch.
+#
+# The actual storage logic lives in ``config_rtr.py`` (functions
+# ``list_provider_connections``, ``save_provider_connection``, etc.).
+# This module exposes them over HTTP and adds two behaviors that are
+# specific to the Provider Packages flow:
+#
+#   1. **Secret masking in responses.** Password and secret_file
+#      fields are returned as ``••••••••`` so the API response never
+#      contains the plaintext credential. The stored value is always
+#      intact; only the response representation is masked.
+#
+#   2. **Certificate path injection for ``test``.** Before probing a
+#      connection, we look for any certificate the package has
+#      installed and inject its path into the matching ``file``
+#      connection field (e.g. ``ca_bundle_path``). Without this, the
+#      adapter would use the system trust store and fail with an SSL
+#      error even though the user "installed the certificate"
+#      earlier via the Certificate Manager.
+
+from omweb.routers.config_rtr import (
+    delete_provider_connection as _vault_delete_connection,
+    get_provider_connection as _vault_get_connection,
+    list_provider_connections as _vault_list_connections,
+    save_provider_connection as _vault_save_connection,
+    set_active_provider_connection as _vault_set_active,
+    set_provider_connection_enabled as _vault_set_enabled,
+)
+
+
+def _mask_connection_fields(
+    connection: Dict[str, Any],
+    manifest: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Return a copy of ``connection`` with password / secret_file fields
+    replaced by the ``••••••••`` placeholder.
+
+    Masking is based on the manifest's ``connection_fields`` spec. A
+    field whose ``type`` is ``"password"`` or ``"secret_file"`` is
+    always masked when its value is a non-empty string.
+
+    The masked copy is what the API returns. The actual stored value
+    in ``models_vault.json`` remains the real credential — masking is
+    a presentation concern only.
+    """
+    result = dict(connection)
+    fields = dict(result.get("fields") or {})
+
+    if manifest is None:
+        # Manifest unreadable — we cannot reliably identify secret
+        # fields. Return the fields as-is rather than risk masking
+        # something the user needs to see, OR leaking a secret as
+        # plaintext. We choose "show plaintext" here because this
+        # branch only triggers on a corrupted manifest, which is a
+        # state where the user must repair before proceeding anyway.
+        result["fields"] = fields
+        return result
+
+    raw_specs = manifest.get("connection_fields") or []
+    secret_keys: set = set()
+    if isinstance(raw_specs, list):
+        for spec in raw_specs:
+            if not isinstance(spec, dict):
+                continue
+            if spec.get("type") in ("password", "secret_file"):
+                key = spec.get("key")
+                if isinstance(key, str) and key:
+                    secret_keys.add(key)
+
+    for key in secret_keys:
+        val = fields.get(key)
+        if isinstance(val, str) and val:
+            fields[key] = "\u2022" * 8
+
+    result["fields"] = fields
+    return result
+
+
+def _inject_installed_certificates(
+    provider_id: str,
+    fields: Dict[str, Any],
+    manifest: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Populate ``file`` connection fields with the installed certificate
+    paths.
+
+    GigaChat (and any future provider that requires a custom CA) has
+    a chicken-and-egg problem: the user installs the CA via the
+    Certificate Manager, but the ``ca_bundle_path`` connection field
+    is separate from the certificate record. Without this helper, the
+    adapter would receive an empty ``ca_bundle_path`` and fall back to
+    the system trust store, which fails on the Russian Root CA.
+
+    Precedence rules for each installed certificate:
+
+        1. If ``spec.required_for_fields`` lists specific field keys,
+           use those exact keys.
+        2. Else if the manifest declares EXACTLY ONE ``file`` /
+           ``secret_file`` field, use it.
+        3. Else if a field named ``ca_bundle_path`` exists, use it.
+
+    Rules 2 and 3 are heuristics for GigaChat-style packages. A
+    future provider can be explicit by setting
+    ``required_for_fields`` in its manifest.
+    """
+    if not manifest or not fields:
+        return dict(fields)
+
+    cert_specs = _extract_certificate_specs(manifest)
+    if not cert_specs:
+        return dict(fields)
+
+    try:
+        records = certificate_manager.list_records(provider_id)
+    except Exception:
+        return dict(fields)
+
+    records_by_cert_id = {r.certificate_id: r for r in records}
+
+    raw_fields = manifest.get("connection_fields") or []
+    file_field_keys = [
+        f.get("key") for f in raw_fields
+        if isinstance(f, dict)
+        and f.get("type") in ("file", "secret_file")
+        and isinstance(f.get("key"), str)
+    ]
+
+    result = dict(fields)
+    for spec in cert_specs:
+        record = records_by_cert_id.get(spec.id)
+        if record is None or not record.installed_path:
+            continue
+
+        target_keys: list = list(spec.required_for_fields or [])
+
+        if not target_keys and len(file_field_keys) == 1:
+            target_keys = file_field_keys
+
+        if not target_keys and "ca_bundle_path" in file_field_keys:
+            target_keys = ["ca_bundle_path"]
+
+        for key in target_keys:
+            current = result.get(key)
+            if not current:
+                result[key] = record.installed_path
+
+    return result
+
+
+@router.get("/{provider_id}/connections")
+async def list_connections(provider_id: str) -> Dict[str, Any]:
+    """
+    Return every saved connection for a provider package.
+
+    Password and secret_file fields are masked in the response.
+    """
+    entry = provider_package_manager.get_package(provider_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": f"Provider package '{provider_id}' is not installed.",
+                "code": "PROVIDER_PACKAGE_NOT_FOUND",
+                "details": {"provider_id": provider_id},
+            },
+        )
+
+    manifest = _try_read_manifest(provider_id, entry.active_version)
+    raw = _vault_list_connections(provider_id)
+    masked = [_mask_connection_fields(c, manifest) for c in raw]
+
+    return {
+        "status": "ok",
+        "provider_id": provider_id,
+        "connections": masked,
+        "total": len(masked),
+    }
+
+
+@router.post("/{provider_id}/connections")
+async def create_connection(
+    provider_id: str,
+    body: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Create a new connection for a provider package.
+
+    When ``is_active`` is ``true``, this connection becomes the one
+    the runtime uses; all siblings are deactivated.
+    """
+    entry = provider_package_manager.get_package(provider_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": f"Provider package '{provider_id}' is not installed.",
+                "code": "PROVIDER_PACKAGE_NOT_FOUND",
+                "details": {"provider_id": provider_id},
+            },
+        )
+
+    # Ensure provider_package_id is set (the frontend should send it,
+    # but we tolerate omission for defense in depth).
+    payload = dict(body)
+    payload["provider_package_id"] = provider_id
+
+    try:
+        saved = _vault_save_connection(payload)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to save connection for %r", provider_id)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": f"Could not save connection: {exc}",
+                "code": "PROVIDER_CONNECTION_SAVE_FAILED",
+                "details": {"exception_type": type(exc).__name__},
+            },
+        )
+
+    manifest = _try_read_manifest(provider_id, entry.active_version)
+    return {
+        "status": "ok",
+        "connection": _mask_connection_fields(saved, manifest),
+    }
+
+
+@router.put("/{provider_id}/connections/{connection_id}")
+async def update_connection(
+    provider_id: str,
+    connection_id: str,
+    body: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Update an existing connection.
+
+    Any field omitted from ``body["fields"]`` is preserved from the
+    current stored value — see the merge logic in
+    ``config_rtr.save_provider_connection``.
+    """
+    entry = provider_package_manager.get_package(provider_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": f"Provider package '{provider_id}' is not installed.",
+                "code": "PROVIDER_PACKAGE_NOT_FOUND",
+                "details": {"provider_id": provider_id},
+            },
+        )
+
+    existing = _vault_get_connection(connection_id)
+    if existing is None or existing.get("provider_package_id") != provider_id:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": f"Connection '{connection_id}' not found.",
+                "code": "PROVIDER_CONNECTION_NOT_FOUND",
+                "details": {"connection_id": connection_id},
+            },
+        )
+
+    payload = dict(body)
+    payload["id"] = connection_id
+    payload["provider_package_id"] = provider_id
+
+    try:
+        saved = _vault_save_connection(payload)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "Failed to update connection %r for %r",
+            connection_id, provider_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": f"Could not update connection: {exc}",
+                "code": "PROVIDER_CONNECTION_SAVE_FAILED",
+                "details": {"exception_type": type(exc).__name__},
+            },
+        )
+
+    manifest = _try_read_manifest(provider_id, entry.active_version)
+    return {
+        "status": "ok",
+        "connection": _mask_connection_fields(saved, manifest),
+    }
+
+
+@router.delete("/{provider_id}/connections/{connection_id}")
+async def delete_connection(
+    provider_id: str,
+    connection_id: str,
+) -> Dict[str, Any]:
+    """
+    Delete a connection.
+    """
+    existing = _vault_get_connection(connection_id)
+    if existing is None or existing.get("provider_package_id") != provider_id:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": f"Connection '{connection_id}' not found.",
+                "code": "PROVIDER_CONNECTION_NOT_FOUND",
+                "details": {"connection_id": connection_id},
+            },
+        )
+
+    removed = _vault_delete_connection(connection_id)
+    if not removed:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": f"Connection '{connection_id}' not found.",
+                "code": "PROVIDER_CONNECTION_NOT_FOUND",
+                "details": {"connection_id": connection_id},
+            },
+        )
+
+    return {
+        "status": "ok",
+        "connection_id": connection_id,
+        "removed": True,
+    }
+
+
+@router.post("/{provider_id}/connections/{connection_id}/enable")
+async def enable_connection(
+    provider_id: str,
+    connection_id: str,
+) -> Dict[str, Any]:
+    """Enable a previously disabled connection."""
+    existing = _vault_get_connection(connection_id)
+    if existing is None or existing.get("provider_package_id") != provider_id:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": f"Connection '{connection_id}' not found.",
+                "code": "PROVIDER_CONNECTION_NOT_FOUND",
+                "details": {"connection_id": connection_id},
+            },
+        )
+
+    saved = _vault_set_enabled(connection_id, True)
+    if saved is None:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Connection enable operation returned no record.",
+                "code": "PROVIDER_CONNECTION_ENABLE_FAILED",
+                "details": {"connection_id": connection_id},
+            },
+        )
+
+    entry = provider_package_manager.get_package(provider_id)
+    manifest = _try_read_manifest(provider_id, entry.active_version) if entry else None
+    return {
+        "status": "ok",
+        "connection": _mask_connection_fields(saved, manifest),
+    }
+
+
+@router.post("/{provider_id}/connections/{connection_id}/disable")
+async def disable_connection(
+    provider_id: str,
+    connection_id: str,
+) -> Dict[str, Any]:
+    """Disable a connection without deleting it."""
+    existing = _vault_get_connection(connection_id)
+    if existing is None or existing.get("provider_package_id") != provider_id:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": f"Connection '{connection_id}' not found.",
+                "code": "PROVIDER_CONNECTION_NOT_FOUND",
+                "details": {"connection_id": connection_id},
+            },
+        )
+
+    saved = _vault_set_enabled(connection_id, False)
+    if saved is None:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Connection disable operation returned no record.",
+                "code": "PROVIDER_CONNECTION_DISABLE_FAILED",
+                "details": {"connection_id": connection_id},
+            },
+        )
+
+    entry = provider_package_manager.get_package(provider_id)
+    manifest = _try_read_manifest(provider_id, entry.active_version) if entry else None
+    return {
+        "status": "ok",
+        "connection": _mask_connection_fields(saved, manifest),
+    }
+
+
+@router.post("/{provider_id}/connections/{connection_id}/activate")
+async def activate_connection(
+    provider_id: str,
+    connection_id: str,
+) -> Dict[str, Any]:
+    """
+    Mark this connection as the active one for the package.
+
+    Deactivates every sibling connection of the same package.
+    """
+    existing = _vault_get_connection(connection_id)
+    if existing is None or existing.get("provider_package_id") != provider_id:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": f"Connection '{connection_id}' not found.",
+                "code": "PROVIDER_CONNECTION_NOT_FOUND",
+                "details": {"connection_id": connection_id},
+            },
+        )
+
+    saved = _vault_set_active(connection_id)
+    if saved is None:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Connection activate operation returned no record.",
+                "code": "PROVIDER_CONNECTION_ACTIVATE_FAILED",
+                "details": {"connection_id": connection_id},
+            },
+        )
+
+    entry = provider_package_manager.get_package(provider_id)
+    manifest = _try_read_manifest(provider_id, entry.active_version) if entry else None
+    return {
+        "status": "ok",
+        "connection": _mask_connection_fields(saved, manifest),
+    }
+
+
+@router.post("/{provider_id}/connections/{connection_id}/test")
+async def test_connection(
+    provider_id: str,
+    connection_id: str,
+) -> Dict[str, Any]:
+    """
+    Probe the connection by calling the provider's discovery endpoint.
+
+    Uses the REAL stored credential values (not the masked
+    placeholders). Injects installed certificate paths so the adapter
+    can reach TLS-protected endpoints.
+
+    Always returns HTTP 200. The ``ok`` field carries the probe
+    result; ``message``, ``latency_ms``, ``code``, ``status_code``
+    add detail.
+    """
+    import time as _time
+
+    existing = _vault_get_connection(connection_id)
+    if existing is None or existing.get("provider_package_id") != provider_id:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": f"Connection '{connection_id}' not found.",
+                "code": "PROVIDER_CONNECTION_NOT_FOUND",
+                "details": {"connection_id": connection_id},
+            },
+        )
+
+    entry = provider_package_manager.get_package(provider_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": f"Provider package '{provider_id}' is not installed.",
+                "code": "PROVIDER_PACKAGE_NOT_FOUND",
+                "details": {"provider_id": provider_id},
+            },
+        )
+
+    manifest = _try_read_manifest(provider_id, entry.active_version)
+
+    # Inject installed certificate paths into file-based connection
+    # fields (e.g. ``ca_bundle_path``). Without this, the adapter would
+    # fall back to the system trust store, which does not include the
+    # Russian Root CA even after the user installed it via the
+    # Certificate Manager.
+    raw_fields = dict(existing.get("fields") or {})
+    fields = _inject_installed_certificates(provider_id, raw_fields, manifest)
+
+    base_url = fields.pop("base_url", None)
+    api_key = fields.pop("api_key", None)
+
+    # ------------------------------------------------------------------
+    # Build the plugin descriptor for the Provider Package.
+    #
+    # The factory returns ``PluginProviderAdapter`` for any registered
+    # external package. That adapter REQUIRES a descriptor dict in
+    # ``extra_params["_peldrun_plugin"]`` describing:
+    #
+    #   * transport ("native" / "custom")
+    #   * venv_python (absolute path to the isolated interpreter)
+    #   * entry_point (module:ClassName to import inside the worker)
+    #   * package_dir (version directory, added to sys.path in the worker)
+    #
+    # The dispatcher does this same step when handling a real chat
+    # message — we replicate it here so the Test button exercises the
+    # EXACT same code path.
+    # ------------------------------------------------------------------
+    descriptor = provider_package_manager.get_active_adapter_descriptor(
+        provider_id
+    )
+    if descriptor is None:
+        return {
+            "status": "ok",
+            "ok": False,
+            "message": (
+                f"Cannot test connection: provider package "
+                f"'{provider_id}' has no active adapter descriptor. "
+                f"The package may be disabled, its files missing, or "
+                f"its entry_point invalid. Check the Details view for "
+                f"the health report."
+            ),
+            "latency_ms": 0.0,
+        }
+
+    # Convert the dataclass to a JSON-serializable dict. ``Path`` values
+    # must become strings because the IPC layer between the supervisor
+    # and the worker is JSON-Lines, and Path is not serializable.
+    descriptor_dict = {
+        "provider_id": descriptor.provider_id,
+        "version": descriptor.version,
+        "hash": descriptor.hash,
+        "transport": descriptor.transport,
+        "api_contract": descriptor.api_contract,
+        "entry_point": descriptor.entry_point,
+        "class_name": descriptor.class_name,
+        "base_adapter": descriptor.base_adapter,
+        "package_dir": str(descriptor.package_dir),
+        "venv_python": (
+            str(descriptor.venv_python)
+            if descriptor.venv_python is not None
+            else None
+        ),
+        "features": dict(descriptor.features or {}),
+        "permissions": dict(descriptor.permissions or {}),
+        "enabled": descriptor.enabled,
+    }
+    fields["_peldrun_plugin"] = descriptor_dict
+
+    # Lazy-import PELDRUN internals so this module stays importable in
+    # environments without the full runtime (e.g. unit tests that only
+    # exercise validation).
+    try:
+        from peldrun.llm.contracts import ConnectionContext
+        from peldrun.llm.providers import provider_factory
+    except Exception as exc:
+        logger.error("Could not import PELDRUN runtime: %s", exc)
+        return {
+            "status": "ok",
+            "ok": False,
+            "message": f"PELDRUN runtime not available: {exc}",
+            "latency_ms": 0.0,
+        }
+
+    connection = ConnectionContext(
+        connection_id=connection_id,
+        provider_id=provider_id,
+        base_url=base_url or None,
+        api_key=api_key or None,
+        timeout=60.0,
+        extra_params=fields,
+    )
+
+    started = _time.time()
+    adapter = None
+    try:
+        adapter = provider_factory.create(provider_id, connection)
+        result = await adapter.validate_connection(connection)
+
+        latency = result.get("latency_ms")
+        if not isinstance(latency, (int, float)):
+            latency = round((_time.time() - started) * 1000.0, 2)
+
+        return {
+            "status": "ok",
+            "ok": bool(result.get("ok")),
+            "message": result.get("message", ""),
+            "latency_ms": latency,
+            "code": result.get("code"),
+            "status_code": result.get("status_code"),
+        }
+    except Exception as exc:
+        latency = round((_time.time() - started) * 1000.0, 2)
+        logger.warning(
+            "Connection test failed for %r/%r: %s",
+            provider_id,
+            connection_id,
+            exc,
+        )
+        return {
+            "status": "ok",
+            "ok": False,
+            "message": str(exc),
+            "latency_ms": latency,
+        }
+    finally:
+        if adapter is not None:
+            # Diagnostic logging around close so a freeze (if any)
+            # can be traced to the exact line.
+            logger.info(
+                "[test_connection] closing adapter for %r/%r",
+                provider_id,
+                connection_id,
+            )
+            try:
+                await asyncio.wait_for(adapter.close(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[test_connection] adapter.close() timed out for "
+                    "%r/%r after 10s — the worker may be wedged.",
+                    provider_id,
+                    connection_id,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "[test_connection] adapter.close() raised: %s",
+                    exc,
+                )
+            logger.info(
+                "[test_connection] adapter closed for %r/%r",
+                provider_id,
+                connection_id,
+            )
+
+
 __all__ = ["router"]

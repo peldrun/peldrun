@@ -6,6 +6,7 @@ and model discovery.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
@@ -15,10 +16,53 @@ import httpx
 from peldrun.llm.client import AsyncLLMClient, LLMConfig, LLMResponse, StreamChunk
 from peldrun.llm.providers.openai_compat import OpenAICompatProvider
 
+logger = logging.getLogger("peldrun.llm.providers.lmstudio")
+
 # Documented default endpoint for LM Studio.
 # Override via the LMSTUDIO_BASE_URL environment variable or
 # [llm.providers.lmstudio].base_url in config.toml.
 DEFAULT_LMSTUDIO_BASE_URL = "http://localhost:1234/v1"
+
+
+# ---------------------------------------------------------------------------
+# Base URL normalization
+# ---------------------------------------------------------------------------
+#
+# LM Studio exposes multiple endpoint surfaces under one server root:
+#
+#   /v1/*        — OpenAI-compat shim
+#   /api/v1/*    — native v1 (recent versions; serves /api/v1/models)
+#   /api/v0/*    — native v0 (older versions)
+#
+# Callers routinely paste the base URL with one of these suffixes
+# attached. The previous implementation used ``.replace("/v1", "")``,
+# which only removed the literal ``/v1`` substring and left ``/api``
+# behind - producing ``/api/api/v0/models`` when ``baseUrl`` was set
+# to ``http://host:1235/api/v1/``. The regex below strips every known
+# suffix idempotently and collapses any legacy double-``/api/``
+# segment left in the vault.
+_PROVIDER_SUFFIX_PATTERN = re.compile(
+    r"/(?:api/v0|api/v1|openai/v1|openai|v1beta|v1|api)/?$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_lmstudio_root(base_url: str) -> str:
+    """Return the LM Studio server root, with any endpoint suffix removed.
+
+    Idempotent. Safe to call on the raw value from the vault; the result
+    is always the server root (scheme + host + optional port + optional
+    path prefix), never an endpoint-specific URL.
+    """
+    cleaned = (base_url or "").strip().rstrip("/")
+    while "/api/api/" in cleaned:
+        cleaned = cleaned.replace("/api/api/", "/api/")
+    while True:
+        stripped = _PROVIDER_SUFFIX_PATTERN.sub("", cleaned)
+        if stripped == cleaned or not stripped:
+            break
+        cleaned = stripped.rstrip("/")
+    return cleaned
 
 
 def resolve_lmstudio_base_url(config: Optional[LLMConfig]) -> str:
@@ -104,25 +148,54 @@ class LMStudioProvider(OpenAICompatProvider):
             yield chunk
 
     async def discover_models(self) -> List[Dict[str, Any]]:
-        """Query LM Studio local models discovery endpoint."""
+        """Query LM Studio local models discovery endpoint.
+
+        Probes every known model-listing endpoint in priority order:
+        the newest native API first (``/api/v1/models``), then the
+        older native API (``/api/v0/models``), then the OpenAI-compat
+        shim (``/v1/models``). The first that returns 200 with a valid
+        JSON object wins.
+
+        Normalization rules and the failure mode this replaces
+        (double ``/api/api/...`` path) are documented at
+        ``_normalize_lmstudio_root`` above.
+        """
         http_client = self._get_http_client()
-        if http_client is not None:
-            base_endpoint = resolve_lmstudio_base_url(self.config)
-            clean_base = str(base_endpoint).replace("/v1", "").rstrip("/")
-            endpoints = [
-                f"{clean_base}/api/v1/models",
-                f"{clean_base}/api/v0/models",
-                "/v1/models",
-                "/models",
-            ]
-            for ep in endpoints:
-                try:
-                    resp = await http_client.get(ep)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        return data.get("models") or data.get("data") or []
-                except Exception:
-                    continue
+        if http_client is None:
+            return []
+
+        base_endpoint = resolve_lmstudio_base_url(self.config)
+        root = _normalize_lmstudio_root(base_endpoint)
+        if not root:
+            root = base_endpoint.rstrip("/")
+
+        endpoints = (
+            f"{root}/api/v1/models",
+            f"{root}/api/v0/models",
+            f"{root}/v1/models",
+        )
+
+        for ep in endpoints:
+            try:
+                resp = await http_client.get(ep)
+            except Exception as exc:
+                logger.debug(
+                    "LM Studio legacy discovery %s network error: %s",
+                    ep,
+                    exc,
+                )
+                continue
+            if resp.status_code != 200:
+                continue
+            try:
+                data = resp.json()
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            models = data.get("models") or data.get("data") or []
+            if isinstance(models, list):
+                return models
         return []
 
 

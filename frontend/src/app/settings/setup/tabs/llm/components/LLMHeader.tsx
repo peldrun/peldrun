@@ -10,6 +10,7 @@ import {
   Cloud,
   Terminal,
   Sliders,
+  Package,
 } from "lucide-react";
 import type { LLMHeaderProps } from "../types";
 
@@ -18,7 +19,7 @@ import type { LLMHeaderProps } from "../types";
 /* -------------------------------------------------------------------------- */
 
 interface SubTabDef {
-  id: "overview" | "lmstudio" | "cloud" | "custom" | "budgets";
+  id: "overview" | "lmstudio" | "cloud" | "store_providers" | "custom" | "budgets";
   label: string;
   icon: React.ReactNode;
 }
@@ -31,6 +32,11 @@ const SUB_TABS: readonly SubTabDef[] = [
     icon: <Cpu size={13} />,
   },
   { id: "cloud", label: "Cloud Providers", icon: <Cloud size={13} /> },
+  {
+    id: "store_providers",
+    label: "Store Providers",
+    icon: <Package size={13} />,
+  },
   { id: "custom", label: "Custom Endpoints", icon: <Terminal size={13} /> },
   {
     id: "budgets",

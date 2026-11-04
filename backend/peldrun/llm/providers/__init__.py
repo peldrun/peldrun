@@ -82,15 +82,14 @@ from peldrun.llm.providers.lmstudio import LMStudioProvider
 from peldrun.llm.providers.ollama import OllamaProvider
 from peldrun.llm.providers.openai_compat import BaseLLMProvider, OpenAICompatProvider
 
-# Native adapters (M5). Declared ADAPTER_STYLE = "v1" and PROFILE
-# as class attributes. Registered below alongside the legacy adapters
-# so that `provider_factory.create("openai_native", ...)` works
-# immediately after this module is imported.
-from peldrun.llm.providers.openai_native import OpenAINativeAdapter
-from peldrun.llm.providers.anthropic import AnthropicAdapter
-from peldrun.llm.providers.google_genai import GoogleGenAIAdapter
-from peldrun.llm.providers.ollama_native import OllamaNativeAdapter
-from peldrun.llm.providers.lmstudio_native import LMStudioNativeAdapter
+# Native adapters (M5) are imported LAZILY via module-level
+# `__getattr__` (PEP 562) and inside `_bootstrap_builtin_providers()`.
+# They are NOT imported eagerly here because each requires a
+# provider-specific SDK that may not be installed in the current
+# interpreter. In particular, plugin_host workers run inside an
+# isolated venv that only has the SDK for ONE package — eager imports
+# would crash the worker with ModuleNotFoundError before any adapter
+# could be loaded.
 
 # New: registry, factory, and context types.
 from peldrun.llm.providers.registry import (
@@ -177,56 +176,76 @@ def _bootstrap_builtin_providers() -> None:
     # ------------------------------------------------------------------
     # Native adapters (M5).
     #
-    # No aliases — legacy IDs stay bound to the legacy implementations
-    # to preserve existing configuration behavior. The native path is
-    # reachable by its canonical ID only.
+    # Each adapter is imported LAZILY inside this function so a missing
+    # provider SDK (e.g. `anthropic` inside a GigaChat-only worker venv)
+    # does NOT crash the bootstrap. Individual failures are logged and
+    # skipped — the remaining adapters still register normally.
     # ------------------------------------------------------------------
-    provider_registry.register(
-        provider_id="openai_native",
-        adapter_class=OpenAINativeAdapter,
-        api_contract="peldrun.llm.provider.v1",
-        source=SOURCE_BUILTIN,
-        display_name="OpenAI (Native)",
-        version="1.0.0",
-        overwrite=True,
+    import importlib as _importlib
+
+    def _register_native(
+        provider_id: str,
+        module_path: str,
+        class_name: str,
+        display_name: str,
+        *,
+        aliases: Optional[list] = None,
+    ) -> None:
+        try:
+            module = _importlib.import_module(module_path)
+            adapter_class = getattr(module, class_name)
+        except Exception as exc:
+            logger.warning(
+                "Skipping built-in provider '%s' — SDK not available "
+                "in this environment (%s: %s). This is expected for "
+                "isolated plugin worker venvs.",
+                provider_id,
+                type(exc).__name__,
+                exc,
+            )
+            return
+        provider_registry.register(
+            provider_id=provider_id,
+            adapter_class=adapter_class,
+            api_contract="peldrun.llm.provider.v1",
+            source=SOURCE_BUILTIN,
+            display_name=display_name,
+            version="1.0.0",
+            aliases=aliases or [],
+            overwrite=True,
+        )
+
+    _register_native(
+        "openai_native",
+        "peldrun.llm.providers.openai_native",
+        "OpenAINativeAdapter",
+        "OpenAI (Native)",
     )
-    provider_registry.register(
-        provider_id="anthropic",
-        adapter_class=AnthropicAdapter,
-        api_contract="peldrun.llm.provider.v1",
-        source=SOURCE_BUILTIN,
-        display_name="Anthropic",
-        version="1.0.0",
+    _register_native(
+        "anthropic",
+        "peldrun.llm.providers.anthropic",
+        "AnthropicAdapter",
+        "Anthropic",
         aliases=["claude"],
-        overwrite=True,
     )
-    provider_registry.register(
-        provider_id="google_genai",
-        adapter_class=GoogleGenAIAdapter,
-        api_contract="peldrun.llm.provider.v1",
-        source=SOURCE_BUILTIN,
-        display_name="Google Gemini (Native)",
-        version="1.0.0",
+    _register_native(
+        "google_genai",
+        "peldrun.llm.providers.google_genai",
+        "GoogleGenAIAdapter",
+        "Google Gemini (Native)",
         aliases=["gemini", "google-gemini", "google_gemini"],
-        overwrite=True,
     )
-    provider_registry.register(
-        provider_id="ollama_native",
-        adapter_class=OllamaNativeAdapter,
-        api_contract="peldrun.llm.provider.v1",
-        source=SOURCE_BUILTIN,
-        display_name="Ollama (Native)",
-        version="1.0.0",
-        overwrite=True,
+    _register_native(
+        "ollama_native",
+        "peldrun.llm.providers.ollama_native",
+        "OllamaNativeAdapter",
+        "Ollama (Native)",
     )
-    provider_registry.register(
-        provider_id="lmstudio_native",
-        adapter_class=LMStudioNativeAdapter,
-        api_contract="peldrun.llm.provider.v1",
-        source=SOURCE_BUILTIN,
-        display_name="LM Studio (Native)",
-        version="1.0.0",
-        overwrite=True,
+    _register_native(
+        "lmstudio_native",
+        "peldrun.llm.providers.lmstudio_native",
+        "LMStudioNativeAdapter",
+        "LM Studio (Native)",
     )
 
     logger.debug(
@@ -387,6 +406,45 @@ def get_provider(
         return OpenAICompatProvider(config=config, **kwargs)
     else:
         raise ValueError(f"Unsupported LLM provider identifier: '{provider_name}'")
+
+
+# ---------------------------------------------------------------------------
+# Lazy attribute access (PEP 562)
+# ---------------------------------------------------------------------------
+#
+# Adapter classes are imported on demand so that
+# `from peldrun.llm.providers import OpenAINativeAdapter` still works
+# without making the package __init__ eager-load every provider SDK.
+# This is essential for plugin_host workers that run in isolated venvs
+# containing only ONE provider's SDK.
+
+_LAZY_ADAPTERS = {
+    "BaseLLMProvider": "peldrun.llm.providers.openai_compat.BaseLLMProvider",
+    "OpenAICompatProvider": "peldrun.llm.providers.openai_compat.OpenAICompatProvider",
+    "LMStudioProvider": "peldrun.llm.providers.lmstudio.LMStudioProvider",
+    "OllamaProvider": "peldrun.llm.providers.ollama.OllamaProvider",
+    "OpenAINativeAdapter": "peldrun.llm.providers.openai_native.OpenAINativeAdapter",
+    "AnthropicAdapter": "peldrun.llm.providers.anthropic.AnthropicAdapter",
+    "GoogleGenAIAdapter": "peldrun.llm.providers.google_genai.GoogleGenAIAdapter",
+    "OllamaNativeAdapter": "peldrun.llm.providers.ollama_native.OllamaNativeAdapter",
+    "LMStudioNativeAdapter": "peldrun.llm.providers.lmstudio_native.LMStudioNativeAdapter",
+}
+
+
+def __getattr__(name: str) -> Any:
+    """PEP 562 — import adapter classes on demand."""
+    import importlib as _importlib
+
+    target = _LAZY_ADAPTERS.get(name)
+    if target is None:
+        raise AttributeError(
+            f"module 'peldrun.llm.providers' has no attribute {name!r}"
+        )
+    module_path, _, class_name = target.rpartition(".")
+    module = _importlib.import_module(module_path)
+    value = getattr(module, class_name)
+    globals()[name] = value
+    return value
 
 
 # ---------------------------------------------------------------------------

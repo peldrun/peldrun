@@ -8,6 +8,7 @@ Specialized provider for Ollama local service endpoints.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -19,6 +20,44 @@ from peldrun.llm.providers.openai_compat import OpenAICompatProvider
 # Override via the OLLAMA_HOST environment variable (Ollama's canonical
 # configuration variable) or [llm.providers.ollama].base_url in config.toml.
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
+
+
+# ---------------------------------------------------------------------------
+# Base URL normalization
+# ---------------------------------------------------------------------------
+#
+# Ollama exposes two surfaces under one server root:
+#
+#   /v1/*    — OpenAI-compat shim
+#   /api/*   — native API (tags, show, chat)
+#
+# Callers routinely paste the base URL with one of these suffixes
+# attached. The previous implementation used ``.replace("/v1", "")``,
+# which only stripped the literal ``/v1`` and left ``/api`` behind —
+# producing ``/api/api/tags`` when the caller's value already contained
+# ``/api/v1``.
+_PROVIDER_SUFFIX_PATTERN = re.compile(
+    r"/(?:api/v0|api/v1|openai/v1|openai|v1beta|v1|api)/?$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_ollama_root(base_url: str) -> str:
+    """Return the Ollama server root, with any endpoint suffix removed.
+
+    Idempotent. Safe to call on the raw value from the vault; the
+    result is always the server root (scheme + host + optional port),
+    never an endpoint-specific URL.
+    """
+    cleaned = (base_url or "").strip().rstrip("/")
+    while "/api/api/" in cleaned:
+        cleaned = cleaned.replace("/api/api/", "/api/")
+    while True:
+        stripped = _PROVIDER_SUFFIX_PATTERN.sub("", cleaned)
+        if stripped == cleaned or not stripped:
+            break
+        cleaned = stripped.rstrip("/")
+    return cleaned
 
 
 def resolve_ollama_base_url(config: Optional[LLMConfig]) -> str:

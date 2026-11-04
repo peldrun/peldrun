@@ -91,6 +91,14 @@ export function CloudProvidersTab({
       type: cp.type,
       savedModels: cp.savedModels || [],
       isCustom: false,
+      // Forward the provider's explicit metadata endpoint from the
+      // vault. `ModelDiscoveryModal` passes it to
+      // `/api/config/fetch-models` as `metadata_endpoint`, so the
+      // backend uses the user's configured URL verbatim instead of
+      // reconstructing one from `baseUrl`. This is what stops LM
+      // Studio base URLs ending in `/api/v1` from producing the
+      // double-suffixed `/api/api/v0/models` path.
+      metadataEndpoint: (cp as { metadataEndpoint?: string }).metadataEndpoint,
     });
   };
 

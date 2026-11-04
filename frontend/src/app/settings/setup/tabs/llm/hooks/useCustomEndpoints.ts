@@ -19,12 +19,20 @@ export interface UseCustomEndpointsParams {
   /**
    * Endpoint probe delegated to the parent tab. Kept as a dependency so the
    * hook stays agnostic about the transport used by the caller.
+   *
+   * The optional `metadataEndpoint` parameter lets each call site
+   * forward the user's explicit metadata URL from the vault. When
+   * omitted, the backend falls back to computing a URL from
+   * `baseUrl` — which is correct for legacy endpoints but produced
+   * the double-`/api/api/v0/models` bug when `baseUrl` already
+   * included `/api/v1`.
    */
   testEndpoint: (
     baseUrl: string,
     apiKey: string,
     model: string,
-    apiType?: string
+    apiType?: string,
+    metadataEndpoint?: string
   ) => Promise<{ ok: boolean; message: string; latency?: number }>;
 }
 
@@ -98,11 +106,17 @@ export function useCustomEndpoints({
   const handleTestCustomForm = useCallback(async () => {
     setTestingId("custom_form");
     try {
+      // Forward the user's explicit metadata endpoint from the form
+      // (when filled). The backend uses it verbatim instead of
+      // constructing `<base>/models`, which is what caused
+      // `/api/api/v0/models` failures for base URLs that already
+      // include an `/api/v1` suffix.
       const res = await testEndpoint(
         endpointForm.endpointUrl,
         endpointForm.apiKey,
         endpointForm.defaultModel,
-        ""
+        "",
+        endpointForm.metadataEndpoint
       );
 
       if (res.ok) {
@@ -134,11 +148,16 @@ export function useCustomEndpoints({
 
       setTestingId(endpointId);
       try {
+        // Saved custom endpoints carry their own `metadataEndpoint`
+        // from the create form (persisted to `models_vault.json`).
+        // Forward it so the probe hits the user's configured URL
+        // verbatim rather than a computed fallback.
         const res = await testEndpoint(
           ce.endpointUrl,
           ce.apiKey,
           ce.defaultModel,
-          ""
+          "",
+          (ce as { metadataEndpoint?: string }).metadataEndpoint
         );
 
         setCustomEndpoints((prev) =>

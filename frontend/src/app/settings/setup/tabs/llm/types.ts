@@ -99,6 +99,12 @@ export interface DiscoveryTarget {
   savedModels?: string[];
   isCustom?: boolean;
   badge?: string;
+  // The user's explicit metadata endpoint from the vault, when
+  // configured. Forwarded to `/api/config/fetch-models` as
+  // `metadata_endpoint` so the discovery query hits the URL the
+  // user chose instead of a URL derived from `baseUrl`. Undefined
+  // for targets where the field was never set.
+  metadataEndpoint?: string;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -163,11 +169,18 @@ export interface LLMTabProps {
     apiType: string
   ) => void;
   deactivateToDefault: () => void;
+  // The optional `metadataEndpoint` parameter lets each call site
+  // forward the user's explicit metadata URL from the vault. When
+  // omitted, the backend falls back to computing a URL from
+  // `baseUrl` — which is correct for legacy endpoints but produced
+  // the double-`/api/api/v0/models` bug when `baseUrl` already
+  // included `/api/v1`.
   testEndpoint: (
     baseUrl: string,
     apiKey: string,
     model: string,
-    apiType?: string
+    apiType?: string,
+    metadataEndpoint?: string
   ) => Promise<{ ok: boolean; message: string; latency?: number }>;
 }
 

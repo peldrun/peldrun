@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
@@ -99,12 +100,86 @@ DEFAULT_TIMEOUT_SECONDS: float = 5.0
 _OLLAMA_SHOW_PATH: str = "/api/show"
 
 
-#: LM Studio's v0 models endpoint.
-_LMSTUDIO_MODELS_PATH: str = "/api/v0/models"
+#: LM Studio's model listing endpoints, tried in priority order.
+#:
+#: LM Studio 0.3.x+ exposes ``/api/v1/models`` (the newer native
+#: API); earlier versions only have ``/api/v0/models``; and every
+#: version ships an OpenAI-compatible ``/v1/models`` shim. We try
+#: the newest first so that a modern LM Studio never generates a
+#: spurious 404 in its log.
+_LMSTUDIO_MODELS_PATHS: tuple[str, ...] = (
+    "/api/v1/models",
+    "/api/v0/models",
+    "/v1/models",
+)
 
 
 #: Google's per-model endpoint (appended to the base URL).
 _GOOGLE_MODEL_PATH_TEMPLATE: str = "/v1beta/{model_name}"
+
+
+# ---------------------------------------------------------------------------
+# Base URL normalization
+# ---------------------------------------------------------------------------
+#
+# Every local provider exposes multiple endpoint surfaces under one
+# server root:
+#
+#   LM Studio:   /v1/*        (OpenAI-compat shim)
+#                /api/v1/*    (native v1 - recent versions)
+#                /api/v0/*    (native v0 - older versions)
+#
+#   Ollama:      /v1/*        (OpenAI-compat shim)
+#                /api/*       (native)
+#
+# Users routinely paste the base URL with one of these suffixes already
+# attached. Any code that then constructs `<base>/<another-suffix>`
+# must strip the pre-existing suffix first, or it produces a double
+# path like `/api/api/v0/models` - the exact failure observed in the
+# LM Studio server log when `baseUrl` was set to
+# `http://host:1235/api/v1/`.
+#
+# The previous implementation used `base.replace("/v1", "")`, which
+# only removed the literal `/v1` substring and left `/api` behind.
+# The regex below removes every known suffix idempotently.
+_PROVIDER_SUFFIX_PATTERN = re.compile(
+    r"/(?:api/v0|api/v1|openai/v1|openai|v1beta|v1|api)/?$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_provider_root(base_url: str) -> str:
+    """Strip any known endpoint suffix from a provider base URL.
+
+    Idempotent. Safe to call on the raw value from the vault; the
+    result is always the server root (host + optional port + path
+    prefix), never an endpoint-specific URL.
+
+    Examples
+    --------
+        http://127.0.0.1:1234              -> http://127.0.0.1:1234
+        http://127.0.0.1:1234/             -> http://127.0.0.1:1234
+        http://127.0.0.1:1234/v1           -> http://127.0.0.1:1234
+        http://127.0.0.1:1234/api          -> http://127.0.0.1:1234
+        http://127.0.0.1:1234/api/v0       -> http://127.0.0.1:1234
+        http://127.0.0.1:1234/api/v1       -> http://127.0.0.1:1234
+        http://127.0.0.1:1234/api/api/v0   -> http://127.0.0.1:1234
+    """
+    cleaned = (base_url or "").strip().rstrip("/")
+
+    # Collapse any literal double /api/ left behind by the legacy
+    # client, so that even a pre-broken value heals here.
+    while "/api/api/" in cleaned:
+        cleaned = cleaned.replace("/api/api/", "/api/")
+
+    # Strip known suffixes, possibly repeated (e.g. "/v1/api/v1").
+    while True:
+        stripped = _PROVIDER_SUFFIX_PATTERN.sub("", cleaned)
+        if stripped == cleaned or not stripped:
+            break
+        cleaned = stripped.rstrip("/")
+
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -202,18 +277,42 @@ class ProviderLiveResult:
             entry["capability_sources"][target_field] = "provider_live"
 
         # Attach reasoning control mode when we know it.
-        # Ollama: reasoning is exposed via `think: true|false` → toggle.
-        # LM Studio / Google: control mechanism not declared by the
-        # endpoint → leave mode unset (resolver treats as NONE).
+        #
+        # The provider_id in this branch may be "lmstudio" (legacy) or
+        # "lmstudio_native" (native), so both are checked. Ollama uses
+        # the same mechanism (`think: true|false`).
+        #
+        # For LM Studio specifically, the mode is derived from
+        # ``capabilities.reasoning.allowed_options``:
+        #   ["off", "on"] → "toggle"     (user can control)
+        #   ["on"]        → "automatic"  (always on, no control)
+        #   ["off"]       → "none"       (disabled)
+        # For Ollama and any provider without allowed_options, mode is
+        # "toggle" (the only wire-level control they expose).
         if (
-            self.provider_id == "ollama"
+            self.provider_id in ("ollama", "lmstudio", "lmstudio_native")
             and "reasoning" in self.capabilities
         ):
             reasoning_supported = bool(self.capabilities["reasoning"])
-            entry["capability_details"]["reasoning"] = {
-                "mode": "toggle" if reasoning_supported else "none",
+            # Prefer the mode extracted from the provider's response;
+            # fall back to "toggle" for older payloads.
+            mode_value = self.metadata.get("_reasoning_mode") or (
+                "toggle" if reasoning_supported else "none"
+            )
+            detail: Dict[str, Any] = {
+                "mode": mode_value,
                 "state": "supported" if reasoning_supported else "unsupported",
             }
+            # Forward allowed_options / default when the provider
+            # declared them, so the RequestCompiler can validate the
+            # user's chosen value against the provider's vocabulary.
+            allowed_opts = self.metadata.get("_reasoning_allowed_options")
+            if isinstance(allowed_opts, list) and allowed_opts:
+                detail["allowed_options"] = allowed_opts
+            default_opt = self.metadata.get("_reasoning_default")
+            if isinstance(default_opt, str) and default_opt:
+                detail["default_effort"] = default_opt
+            entry["capability_details"]["reasoning"] = detail
 
         if self.context_window is not None and self.context_window > 0:
             entry["max_context_length"] = int(self.context_window)
@@ -354,12 +453,9 @@ async def _query_ollama(
     context window if a future cache exists, but we do not fabricate
     capability answers.
     """
-    base = (connection.base_url or "").rstrip("/")
+    base = _normalize_provider_root(connection.base_url or "")
     if not base:
         return None
-    # Strip /v1 — Ollama's native API lives at the root.
-    if base.endswith("/v1"):
-        base = base[: -len("/v1")]
     url = f"{base}{_OLLAMA_SHOW_PATH}"
 
     body = {"name": model_id}
@@ -491,71 +587,110 @@ async def _query_lmstudio(
     we leave those out of ``capabilities`` — the merge layer treats
     missing keys as unknown.
     """
-    base = (connection.base_url or "").rstrip("/")
+    base = _normalize_provider_root(connection.base_url or "")
     if not base:
         return None
-    # Strip /v1 suffix.
-    if base.endswith("/v1"):
-        base = base[: -len("/v1")]
-    url = f"{base}{_LMSTUDIO_MODELS_PATH}"
 
     headers = {"Accept": "application/json"}
     if connection.api_key:
         headers["Authorization"] = f"Bearer {connection.api_key}"
 
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.get(url, headers=headers)
-    except Exception as exc:
-        logger.debug(
-            "LM Studio /api/v0/models network error: %s", exc
-        )
-        return None
+    # Probe every LM Studio model-listing endpoint in priority order:
+    # the newest native API first (``/api/v1/models``), then the older
+    # native API (``/api/v0/models``), then the OpenAI-compat shim
+    # (``/v1/models``). The first endpoint that returns 200 with a
+    # valid JSON object wins.
+    #
+    # Rationale: the previous implementation always probed
+    # ``/api/v0/models``, which on modern LM Studio versions logs an
+    # "Unexpected endpoint or method" ERROR for every single call -
+    # multiplied by the number of models being enriched (once per
+    # model in the batch), producing dozens of noisy errors per scan.
+    # LM Studio 0.3.x+ serves ``/api/v1/models``; probing it first
+    # eliminates the noise entirely.
+    data: Optional[Dict[str, Any]] = None
+    last_error: Optional[str] = None
 
-    if resp.status_code != 200:
-        logger.debug(
-            "LM Studio /api/v0/models returned HTTP %d.", resp.status_code
-        )
-        return None
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for path in _LMSTUDIO_MODELS_PATHS:
+            url = f"{base}{path}"
+            try:
+                resp = await client.get(url, headers=headers)
+            except Exception as exc:
+                last_error = f"{path}: network error ({exc})"
+                logger.debug(
+                    "LM Studio %s network error: %s", path, exc
+                )
+                continue
 
-    try:
-        data = resp.json()
-    except Exception as exc:
-        logger.debug(
-            "LM Studio /api/v0/models returned non-JSON: %s", exc
-        )
-        return None
+            if resp.status_code != 200:
+                last_error = f"{path}: HTTP {resp.status_code}"
+                logger.debug(
+                    "LM Studio %s returned HTTP %d.",
+                    path,
+                    resp.status_code,
+                )
+                continue
 
-    if not isinstance(data, dict):
+            try:
+                candidate = resp.json()
+            except Exception as exc:
+                last_error = f"{path}: non-JSON response ({exc})"
+                logger.debug(
+                    "LM Studio %s returned non-JSON: %s", path, exc
+                )
+                continue
+
+            if not isinstance(candidate, dict):
+                last_error = f"{path}: JSON root is not a dict"
+                logger.debug(
+                    "LM Studio %s returned non-dict JSON (got %s).",
+                    path,
+                    type(candidate).__name__,
+                )
+                continue
+
+            data = candidate
+            break
+
+    if data is None:
+        logger.debug(
+            "LM Studio: no model-listing endpoint responded successfully "
+            "at %r (last error: %s).",
+            base,
+            last_error or "unknown",
+        )
         return None
 
     raw_models = data.get("data") or data.get("models") or []
     if not isinstance(raw_models, list):
         return None
 
-    # Find the entry that matches the requested model_id. LM Studio
-    # returns IDs with an owner prefix (e.g.
-    # "deepseek/deepseek-r1-0528-qwen3-8b"), but the vault may store
-    # the short form. Both are the SAME model — matching them is ID
-    # normalization, not capability inference.
+    # Find the entry that matches the requested model_id.
+    #
+    # LM Studio's /api/v1/models uses ``key`` as the identifier (with
+    # or without an ``owner/`` prefix). /api/v0/models uses ``id``.
+    # Older versions use ``name``. Accept all three.
     target: Optional[Dict[str, Any]] = None
     matched_server_id: Optional[str] = None
     for entry in raw_models:
         if not isinstance(entry, dict):
             continue
-        entry_id = entry.get("id") or entry.get("name")
+        entry_id = (
+            entry.get("key")
+            or entry.get("id")
+            or entry.get("name")
+        )
         if not isinstance(entry_id, str):
             continue
         if entry_id == model_id:
             target = entry
             matched_server_id = entry_id
             break
-        # Short-form match: "deepseek/x" → "x"
         if "/" in entry_id and entry_id.rsplit("/", 1)[-1] == model_id:
             target = entry
             matched_server_id = entry_id
             break
-        # Reverse short-form match: stored as "x", server has "owner/x"
         if "/" not in model_id and entry_id.endswith("/" + model_id):
             target = entry
             matched_server_id = entry_id
@@ -563,54 +698,117 @@ async def _query_lmstudio(
 
     if target is None:
         logger.debug(
-            "LM Studio /api/v0/models has no entry matching %r.", model_id
+            "LM Studio /api/v1/models has no entry matching %r.", model_id
         )
         return None
 
     # ------------------------------------------------------------------
-    # Definitive vision detection from `type`.
+    # Capability extraction from LM Studio's per-model descriptor.
     #
-    # LM Studio marks vision-enabled models as `type: "vlm"` and
-    # text-only models as `type: "llm"`. Embeddings models have
-    # `type: "embeddings"` and do not participate in chat capabilities.
+    # Two schemas coexist:
+    #
+    #   V2 (0.3.x+, /api/v1/models) — dict:
+    #     "capabilities": {
+    #       "vision": true,
+    #       "trained_for_tool_use": true,
+    #       "reasoning": {
+    #         "allowed_options": ["off", "on"],
+    #         "default": "on"
+    #       }
+    #     }
+    #
+    #   V1 (older, /api/v0/models) — list of tokens:
+    #     "capabilities": ["completion", "tool_use", "vision"]
+    #
+    # The V2 dict is preferred because:
+    #   * vision is an explicit boolean, independent of ``type`` (LM
+    #     Studio uses type="llm" even for VLM models, so type-based
+    #     vision detection is WRONG on 0.3.x+).
+    #   * ``reasoning.allowed_options`` distinguishes "user can toggle
+    #     reasoning on/off" (["off", "on"]) from "reasoning is always
+    #     on, no control" (["on"]) — a distinction V1 cannot express
+    #     and which materially affects the RequestCompiler (mode="toggle"
+    #     vs mode="automatic").
     # ------------------------------------------------------------------
     model_type = str(target.get("type") or "").lower()
     capabilities: Dict[str, bool] = {}
-    if model_type == "vlm":
-        capabilities["vision"] = True
-    elif model_type == "llm":
-        capabilities["vision"] = False
-    # Embeddings type — not a chat model. Skip capability claims.
+    reasoning_mode: Optional[str] = None
+    reasoning_allowed: list = []
+    reasoning_default: Optional[str] = None
 
-    # ------------------------------------------------------------------
-    # Tool-use detection from the `capabilities` array.
-    #
-    # LM Studio v0.4.x+ exposes an optional `capabilities` array on each
-    # model entry. Currently the only documented value is `"tool_use"`,
-    # which means the model was loaded with a chat template that
-    # declares tool support. Its ABSENCE means one of two things:
-    #
-    #   1. The field is missing entirely → the model does not declare
-    #      tool support. We report `unknown` (do not fabricate either
-    #      True or False).
-    #
-    #   2. The array is present but does not contain `"tool_use"` → the
-    #      model explicitly does NOT support tools. We report `False`.
-    #
-    # Both cases are surfaced honestly. The user can override via the
-    # info modal if their experience differs from LM Studio's
-    # declaration.
-    # ------------------------------------------------------------------
     raw_caps = target.get("capabilities")
-    if isinstance(raw_caps, list):
-        caps_set = {str(c).lower() for c in raw_caps if isinstance(c, str)}
-        # The array is exhaustive for the capabilities LM Studio knows
-        # about. `"tool_use"` is the only one currently documented.
-        capabilities["tools"] = "tool_use" in caps_set
-        # Note: LM Studio does NOT declare `vision` in this array — it
-        # uses `type: "vlm"` for that, handled above. It also does not
-        # declare `reasoning`. Both stay absent from the map unless
-        # their dedicated source (type or a future field) provides them.
+
+    if isinstance(raw_caps, dict):
+        # ---- V2 dict schema ----
+        vision_val = raw_caps.get("vision")
+        if isinstance(vision_val, bool):
+            capabilities["vision"] = vision_val
+
+        tools_val = raw_caps.get("trained_for_tool_use")
+        if isinstance(tools_val, bool):
+            capabilities["tools"] = tools_val
+
+        reasoning_obj = raw_caps.get("reasoning")
+        if isinstance(reasoning_obj, dict):
+            # Reasoning is supported. Derive the control mode from
+            # allowed_options so the RequestCompiler knows which
+            # wire-level parameter to emit.
+            allowed = reasoning_obj.get("allowed_options")
+            if isinstance(allowed, list):
+                reasoning_allowed = [
+                    str(a).strip().lower()
+                    for a in allowed if isinstance(a, str)
+                ]
+                allowed_set = set(reasoning_allowed)
+                if "off" in allowed_set and "on" in allowed_set:
+                    reasoning_mode = "toggle"       # user can toggle off/on
+                elif allowed_set == {"on"}:
+                    reasoning_mode = "automatic"    # always on, no control
+                elif allowed_set == {"off"}:
+                    reasoning_mode = "none"         # permanently disabled
+                else:
+                    reasoning_mode = "toggle"       # fallback
+            else:
+                reasoning_mode = "toggle"
+            default_val = reasoning_obj.get("default")
+            if isinstance(default_val, str):
+                reasoning_default = default_val
+            capabilities["reasoning"] = (reasoning_mode != "none")
+        elif isinstance(reasoning_obj, bool):
+            capabilities["reasoning"] = reasoning_obj
+            if reasoning_obj:
+                reasoning_mode = "toggle"
+
+    elif isinstance(raw_caps, list) and raw_caps:
+        # ---- V1 list schema ----
+        caps_set = {
+            str(c).strip().lower()
+            for c in raw_caps
+            if isinstance(c, str) and c.strip()
+        }
+        capabilities["vision"] = (
+            "vision" in caps_set
+            or "vlm" in caps_set
+            or model_type == "vlm"
+        )
+        capabilities["tools"] = (
+            "tool_use" in caps_set or "tools" in caps_set
+        )
+        has_reasoning = (
+            "reasoning" in caps_set or "thinking" in caps_set
+        )
+        capabilities["reasoning"] = has_reasoning
+        if has_reasoning:
+            reasoning_mode = "toggle"
+
+    else:
+        # ---- No capabilities field at all ----
+        # Oldest LM Studio versions. ``type`` is the ONLY reliable
+        # signal. But note: on 0.3.x+ even VLM models are type="llm",
+        # so trusting ``type`` here would produce false negatives.
+        # Leave capability facts absent (unknown) rather than guess.
+        if model_type == "vlm":
+            capabilities["vision"] = True
 
     # Context window.
     context: Optional[int] = None
@@ -618,17 +816,65 @@ async def _query_lmstudio(
     if isinstance(ctx_val, int) and ctx_val > 0:
         context = ctx_val
 
-    # Descriptive metadata.
+    # ------------------------------------------------------------------
+    # Descriptive metadata extraction.
+    #
+    # LM Studio's /api/v1/models returns a rich per-model descriptor
+    # with three fields whose shape differs from the rest of PELDRUN:
+    #
+    #   "params_string": "4.0B"                    — string (easy)
+    #   "architecture": "nemotron_h"                — field name differs
+    #                                                  from PELDRUN's "arch"
+    #   "quantization": {"name": "Q4_K_M",          — DICT, not string
+    #                    "bits_per_weight": 4}
+    #
+    # A prior version of this function only checked ``arch`` (missing
+    # LM Studio's ``architecture``), only accepted ``quantization`` as a
+    # string (missing the dict shape), and did not extract
+    # ``params_string`` at all. Result: models showed correct
+    # Context Window and Publisher but "Not reported" for Parameters,
+    # Quantization, and Architecture in the UI.
+    # ------------------------------------------------------------------
     metadata: Dict[str, Any] = {}
+
     publisher = target.get("publisher")
     if isinstance(publisher, str) and publisher:
         metadata["publisher"] = publisher
-    arch = target.get("arch")
+
+    # Architecture — LM Studio uses "architecture" (0.3.x+) or "arch"
+    # (older). Accept both.
+    arch = target.get("architecture") or target.get("arch")
     if isinstance(arch, str) and arch:
         metadata["architecture"] = arch
+
+    # Quantization — modern LM Studio returns a dict:
+    #   {"name": "Q4_K_M", "bits_per_weight": 4}
+    # Older versions returned a plain string. Preserve the dict shape
+    # when present (it carries bits_per_weight); otherwise synthesize a
+    # minimal {"name": ...} dict from the string.
     quant = target.get("quantization")
-    if isinstance(quant, str) and quant:
+    if isinstance(quant, dict):
+        qname = quant.get("name")
+        if isinstance(qname, str) and qname:
+            metadata["quantization_name"] = qname
+            # Preserve bits_per_weight for the future; to_metadata_dict
+            # currently emits only "name", but the raw value is
+            # available if the UI later needs finer detail.
+            bpw = quant.get("bits_per_weight")
+            if isinstance(bpw, int):
+                metadata["quantization_bits"] = bpw
+    elif isinstance(quant, str) and quant:
         metadata["quantization_name"] = quant
+
+    # Parameters — LM Studio uses "params_string".
+    params = target.get("params_string")
+    if isinstance(params, str) and params:
+        metadata["params_string"] = params
+
+    # Family — optional, present on some versions.
+    family = target.get("family")
+    if isinstance(family, str) and family:
+        metadata["family"] = family
 
     # Include the server-side ID in metadata so the caller can see
     # WHICH entry matched (helps diagnose "why is my model showing
@@ -637,9 +883,21 @@ async def _query_lmstudio(
     if matched_server_id and matched_server_id != model_id:
         metadata["server_model_id"] = matched_server_id
 
+    # Encode the reasoning-mode nuance into the metadata dict so that
+    # ``to_metadata_dict`` can build the correct ``capability_details``
+    # block. These keys are prefixed with "_reasoning_" to signal that
+    # they are transport-layer hints for the vault encoder, not fields
+    # that the user should see in the UI.
+    if reasoning_mode is not None:
+        metadata["_reasoning_mode"] = reasoning_mode
+    if reasoning_allowed:
+        metadata["_reasoning_allowed_options"] = reasoning_allowed
+    if reasoning_default:
+        metadata["_reasoning_default"] = reasoning_default
+
     return ProviderLiveResult(
         provider_id="lmstudio",
-        model_id=model_id,  # Use the requested ID so the vault merge lands on the correct key
+        model_id=model_id,
         capabilities=capabilities,
         context_window=context,
         max_output_tokens=None,
@@ -691,7 +949,7 @@ async def _query_google(
         * If the caller already passes ``models/gemini-pro``, it is
           used verbatim.
     """
-    base = (connection.base_url or "").rstrip("/")
+    base = _normalize_provider_root(connection.base_url or "")
     if not base:
         # Google has a canonical base; use it when the caller did not
         # provide one (very common for cloud providers).

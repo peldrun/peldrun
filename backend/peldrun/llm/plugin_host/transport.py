@@ -320,11 +320,39 @@ class SubprocessTransport(Transport):
         self._stdout = process.stdout
         self._closed = False
 
+        # ------------------------------------------------------------------
+        # Persistent read buffer.
+        #
+        # The StreamReader's internal buffer is NOT visible to us once
+        # we call read(N): the bytes are removed from the StreamReader
+        # and returned to the caller. If a single read() returns more
+        # than one complete message (which happens frequently during
+        # streaming — the worker emits many small events faster than
+        # the supervisor consumes them), the trailing partial message
+        # MUST be preserved for the next read_envelope() call.
+        #
+        # Keeping this as an instance field is the fix for the
+        # "Invalid envelope: Invalid JSON: expected value at line 1
+        # column 1" crash observed during GigaChat streaming: without
+        # this buffer, the start of a message was lost whenever a
+        # previous read() returned it as part of a multi-message
+        # chunk, and the next read_envelope() saw only the tail of
+        # that message (e.g. b'l,"tool_arguments_complete":...').
+        # ------------------------------------------------------------------
+        self._read_buffer: bytearray = bytearray()
+
     # ------------------------------------------------------------------
 
     async def read_envelope(self) -> Envelope:
         """
         Read one JSON-line message from the worker.
+
+        Uses a persistent instance-level buffer (``self._read_buffer``)
+        so that bytes belonging to the NEXT message — which may arrive
+        bundled with the current one in a single ``read(8192)`` call —
+        are never lost. This is essential during streaming, where the
+        worker emits many small ``stream_event`` messages faster than
+        the supervisor consumes them.
 
         Raises
         ------
@@ -343,47 +371,44 @@ class SubprocessTransport(Transport):
                 "Transport is closed; cannot read."
             )
 
-        buffer = bytearray()
-
         try:
             while True:
-                # Read a small chunk. Using a fixed chunk size (rather
-                # than readline) lets us enforce the size cap BEFORE
-                # the StreamReader buffers the whole line.
-                chunk = await self._stdout.read(8192)
-
-                if not chunk:
-                    # EOF. If we had partial data, the peer sent a
-                    # truncated line — treat as protocol error.
-                    if buffer:
-                        raise TransportReadError(
-                            "Worker closed stdout mid-message "
-                            f"(received {len(buffer)} bytes without "
-                            "a terminating newline)."
-                        )
-                    raise TransportClosedError(
-                        "Worker closed stdout (clean EOF)."
+                # If a complete line is already buffered from a
+                # previous read, consume it FIRST. This handles the
+                # common streaming case where one read() returned
+                # several complete messages plus a partial one.
+                newline_index = self._read_buffer.find(b"\n")
+                if newline_index >= 0:
+                    line = bytes(
+                        self._read_buffer[: newline_index + 1]
                     )
+                    del self._read_buffer[: newline_index + 1]
+                    return _parse_envelope(line)
 
-                buffer.extend(chunk)
-
-                if len(buffer) > MAX_MESSAGE_BYTES:
+                # Enforce the size cap BEFORE reading more data, so a
+                # peer that never sends a newline cannot exhaust
+                # memory.
+                if len(self._read_buffer) > MAX_MESSAGE_BYTES:
                     raise TransportMessageTooLargeError(
                         f"Message exceeded {MAX_MESSAGE_BYTES} bytes; "
                         f"aborting connection."
                     )
 
-                # A complete line is terminated by \n. The chunk may
-                # contain MORE than one line; the caller's next
-                # read_envelope() will consume the remainder. Because
-                # StreamReader is a buffered stream, that remainder is
-                # already in the reader's internal buffer — no data is
-                # lost.
-                if b"\n" in chunk:
-                    # Trim to the first newline; discard the tail.
-                    newline_index = buffer.find(b"\n")
-                    line = bytes(buffer[: newline_index + 1])
-                    return _parse_envelope(line)
+                chunk = await self._stdout.read(8192)
+
+                if not chunk:
+                    # EOF.
+                    if self._read_buffer:
+                        raise TransportReadError(
+                            "Worker closed stdout mid-message "
+                            f"(received {len(self._read_buffer)} "
+                            "bytes without a terminating newline)."
+                        )
+                    raise TransportClosedError(
+                        "Worker closed stdout (clean EOF)."
+                    )
+
+                self._read_buffer.extend(chunk)
 
         except TransportError:
             raise
