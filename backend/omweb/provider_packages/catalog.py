@@ -76,11 +76,13 @@ See also
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -112,8 +114,84 @@ logger = logging.getLogger("omweb.provider_packages.catalog")
 BUILTIN_CATALOG_FILENAME: str = "builtin_catalog.json"
 
 
-#: Environment variable for a custom catalog override.
+#: Environment variable for a custom catalog override (local file).
+#: When set, items with the same ID as a builtin or remote item
+#: REPLACE the corresponding entry. Used by operators who host their
+#: own curated catalog on disk, or by tests that need to inject a
+#: specific item set.
 CUSTOM_CATALOG_ENV_VAR: str = "PELDRUN_PROVIDER_CATALOG_PATH"
+
+
+#: Environment variable for the REMOTE catalog URL. When unset (the
+#: default), no remote fetch is ever attempted — PELDRUN ships with a
+#: fully self-contained builtin catalog and does not phone home.
+#: Operators who want to centralize catalog management across many
+#: PELDRUN instances can point this at a GitHub Raw URL (or any
+#: HTTPS-served JSON file with the same shape as
+#: ``builtin_catalog.json``).
+#:
+#: Opt-in by design: outbound network access on every store-page
+#: load would be a privacy and availability liability. Users who do
+#: not explicitly configure this URL see exactly the builtin catalog
+#: and nothing else.
+REMOTE_CATALOG_ENV_VAR: str = "PELDRUN_PROVIDER_CATALOG_URL"
+
+
+#: Default remote catalog URL, shipped with every PELDRUN build.
+#: This is the URL that the application uses out of the box when no
+#: environment variable overrides it. Its presence here is what makes
+#: the remote catalog work for every user without any manual setup.
+#:
+#: Override behavior:
+#:   * ``PELDRUN_PROVIDER_CATALOG_URL=<url>``  → use <url> instead
+#:   * ``PELDRUN_PROVIDER_CATALOG_URL=""``     → disable remote fetch
+#:                                               (offline-only mode)
+#:   * unset                                   → use this default
+DEFAULT_REMOTE_CATALOG_URL: str = (
+    "https://peldrunai.github.io/peldrun-provider-catalog/catalog.json"
+)
+
+
+#: Filename for the on-disk cache of the remote catalog. Placed in
+#: ``<backend>/data/`` next to ``models_vault.json`` and
+#: ``models_metadata.json`` — the same storage area the rest of the
+#: system uses for cross-session state.
+REMOTE_CATALOG_CACHE_FILENAME: str = "catalog_remote_cache.json"
+
+
+#: Cache TTL for the remote catalog (24 hours, matching the LiteLLM
+#: external registry pattern). The cache is served STALE during the
+#: refresh window — see ``ensure_fresh()``. A user who installs a
+#: package a minute after a new version lands will still see the
+#: previous catalog until the TTL elapses; the operator can force a
+#: refresh via the admin endpoint.
+REMOTE_CATALOG_TTL_SECONDS: int = 24 * 60 * 60
+
+
+#: Network timeout for a single remote catalog fetch. Kept tight so a
+#: wedged GitHub never blocks the store UI for more than this many
+#: seconds. The call is best-effort; a timeout leaves the previous
+#: cache intact.
+REMOTE_CATALOG_FETCH_TIMEOUT_SECONDS: float = 15.0
+
+
+#: Maximum size of a remote catalog response. A real catalog is a few
+#: kilobytes; anything over 2 MB is suspicious (or a misconfigured
+#: URL pointing at something that is not a catalog).
+REMOTE_CATALOG_MAX_BYTES: int = 2 * 1024 * 1024
+
+
+#: Maximum number of redirects followed during a remote fetch. GitHub
+#: Raw and Releases serve the content directly; any redirect chain
+#: longer than 3 hops is almost certainly an error page.
+REMOTE_CATALOG_MAX_REDIRECTS: int = 3
+
+
+#: Internal schema version for the on-disk remote cache. Bump when the
+#: cache format changes in a way that requires discarding the previous
+#: file. Independent of the catalog's own ``schema_version`` (which
+#: tracks the CATALOG format, not the CACHE format).
+REMOTE_CATALOG_CACHE_SCHEMA_VERSION: int = 1
 
 
 #: Hard timeout for the entire ZIP download, in seconds. Long enough
@@ -136,52 +214,162 @@ _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 # ---------------------------------------------------------------------------
 
 
-def _resolve_catalog_paths() -> List[Path]:
+def _resolve_remote_catalog_url() -> str:
     """
-    Return the ordered list of catalog file paths to read.
+    Resolve the effective remote catalog URL.
 
-    Order
-    -----
-    1. Custom catalog (via ``PELDRUN_PROVIDER_CATALOG_PATH``), if set
-       and the file exists.
-    2. Builtin catalog next to this module.
+    Resolution order
+    ----------------
+    1. ``PELDRUN_PROVIDER_CATALOG_URL`` is set to a NON-EMPTY string
+       → return it verbatim. This is the operator-override path
+         (self-hosted catalogs, internal mirrors, air-gapped deploys
+         with a local proxy).
 
-    Later sources override earlier ones at the ITEM level — an item
-    with the same ``id`` in the custom catalog replaces the builtin
-    entry of the same ID.
+    2. ``PELDRUN_PROVIDER_CATALOG_URL`` is set to an EMPTY string
+       → return empty. The operator explicitly disabled remote
+         fetching. PELDRUN will operate entirely offline against its
+         built-in catalog.
+
+    3. ``PELDRUN_PROVIDER_CATALOG_URL`` is NOT set (the common case
+       for a freshly-installed app on a user's machine)
+       → return ``DEFAULT_REMOTE_CATALOG_URL``. Every PELDRUN install
+         ships with the official catalog active out of the box.
+
+    This is the function every caller should use. Never read
+    ``os.environ`` for this variable directly — always go through
+    here, so the default-vs-override-vs-disable logic stays in one
+    place.
     """
-    paths: List[Path] = []
+    if REMOTE_CATALOG_ENV_VAR in os.environ:
+        return os.environ[REMOTE_CATALOG_ENV_VAR].strip()
+    return DEFAULT_REMOTE_CATALOG_URL
 
-    custom_path_str = os.environ.get(CUSTOM_CATALOG_ENV_VAR, "").strip()
-    if custom_path_str:
-        try:
-            custom_path = Path(custom_path_str).expanduser().resolve()
-            if custom_path.is_file():
-                paths.append(custom_path)
-            else:
-                logger.warning(
-                    "Custom catalog path '%s' does not exist; ignoring.",
-                    custom_path,
-                )
-        except Exception as exc:
-            logger.warning(
-                "Custom catalog path '%s' could not be resolved: %s; "
-                "ignoring.",
-                custom_path_str,
-                exc,
-            )
 
+def _default_cache_dir() -> Path:
+    """
+    Compute the default cache directory for the remote catalog.
+
+    Mirrors the location used by ``models_vault.json`` and
+    ``models_metadata.json``:
+
+        <backend>/data/catalog_remote_cache.json
+
+    Deferred path calculation (does not import ``omweb.config``) so
+    this module can be imported in tests without triggering the full
+    config bootstrap.
+    """
+    # __file__ = backend/omweb/provider_packages/catalog.py
+    # .parent            = backend/omweb/provider_packages/
+    # .parent.parent     = backend/omweb/
+    # .parent.parent.parent = backend/
+    backend_root = Path(__file__).resolve().parent.parent.parent
+    return backend_root / "data"
+
+
+def _load_builtin_catalog() -> Dict[str, ProviderPackageCatalogItem]:
+    """
+    Load the builtin catalog shipped with PELDRUN.
+
+    Always available — the offline baseline. If this file is missing
+    or corrupt, the catalog starts empty (a warning is logged). This
+    is the one source that MUST work without any network or filesystem
+    configuration.
+    """
     builtin_path = Path(__file__).resolve().parent / BUILTIN_CATALOG_FILENAME
-    if builtin_path.is_file():
-        paths.append(builtin_path)
-    else:
+    if not builtin_path.is_file():
         logger.info(
-            "Builtin catalog file not found at %s; the catalog will be "
-            "empty unless a custom catalog is configured.",
+            "Builtin catalog file not found at %s; the catalog will "
+            "start empty unless a custom or remote catalog is "
+            "configured.",
             builtin_path,
         )
+        return {}
+    try:
+        raw = builtin_path.read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+        return _parse_catalog_payload(parsed, source_path=builtin_path)
+    except Exception as exc:
+        logger.warning(
+            "Builtin catalog at %s is unreadable: %s",
+            builtin_path,
+            exc,
+        )
+        return {}
 
-    return paths
+
+def _load_custom_catalog() -> Dict[str, ProviderPackageCatalogItem]:
+    """
+    Load the operator-configured custom catalog (if any).
+
+    Read from the path in ``PELDRUN_PROVIDER_CATALOG_PATH``. Items
+    with the same ID as a builtin or remote entry REPLACE that entry
+    — the operator's local file is the highest local priority.
+    """
+    path_str = os.environ.get(CUSTOM_CATALOG_ENV_VAR, "").strip()
+    if not path_str:
+        return {}
+
+    try:
+        path = Path(path_str).expanduser().resolve()
+    except Exception as exc:
+        logger.warning(
+            "Could not resolve custom catalog path %r: %s",
+            path_str,
+            exc,
+        )
+        return {}
+
+    if not path.is_file():
+        logger.warning(
+            "Custom catalog path %s does not exist; ignoring.",
+            path,
+        )
+        return {}
+
+    try:
+        raw = path.read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+        return _parse_catalog_payload(parsed, source_path=path)
+    except Exception as exc:
+        logger.warning(
+            "Custom catalog at %s is unreadable: %s",
+            path,
+            exc,
+        )
+        return {}
+
+
+def _load_extra_paths(
+    paths: Iterable[Path],
+) -> Dict[str, ProviderPackageCatalogItem]:
+    """
+    Load catalog items from additional local paths (test injection).
+
+    Items loaded here have the HIGHEST priority in the merge —
+    callers who supply ``extra_paths`` explicitly want to override
+    everything else.
+    """
+    merged: Dict[str, ProviderPackageCatalogItem] = {}
+    for path in paths:
+        try:
+            if not path.is_file():
+                logger.warning(
+                    "Extra catalog path %s does not exist; skipping.",
+                    path,
+                )
+                continue
+            raw = path.read_text(encoding="utf-8")
+            parsed = json.loads(raw)
+            items = _parse_catalog_payload(parsed, source_path=path)
+            merged.update(items)
+        except Exception as exc:
+            logger.warning(
+                "Failed to load extra catalog from %s: %s",
+                path,
+                exc,
+            )
+            continue
+    return merged
 
 
 def _parse_catalog_payload(
@@ -290,53 +478,35 @@ def load_catalog(
     extra_paths: Optional[Iterable[Path]] = None,
 ) -> Dict[str, ProviderPackageCatalogItem]:
     """
-    Load and merge all catalog sources.
+    Load catalog items from all LOCAL sources (no network).
 
-    Parameters
-    ----------
-    extra_paths
-        Additional catalog file paths to merge. Used by tests and by
-        an admin endpoint that wants to preview a candidate catalog.
-        Higher-priority than the environment-variable custom catalog
-        (applied last, so items override everything else).
+    Priority (lowest first, each layer overrides the previous):
 
-    Returns
-    -------
-    Dict[str, ProviderPackageCatalogItem]
-        Keyed by catalog item ID.
+        1. Builtin catalog (``builtin_catalog.json``).
+        2. Custom catalog (``PELDRUN_PROVIDER_CATALOG_PATH``).
+        3. Extra paths (``extra_paths`` argument).
+
+    This function is kept for backward compatibility and for callers
+    that need explicit local-only loading (e.g. tests). It does NOT
+    consult the remote catalog — use ``ProviderPackageCatalog`` and
+    its ``ensure_fresh()`` method for remote support.
+
+    .. note::
+       This function fixes a prior ordering bug where the builtin
+       catalog silently OVERRODE the custom catalog. The documented
+       intent (in the module docstring and the previous
+       ``_resolve_catalog_paths`` docstring) has always been that
+       custom items override builtin entries with the same ID.
     """
-    all_paths = _resolve_catalog_paths()
-    if extra_paths:
-        all_paths.extend(Path(p).expanduser().resolve() for p in extra_paths)
-
     merged: Dict[str, ProviderPackageCatalogItem] = {}
-
-    for path in all_paths:
-        try:
-            raw_text = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            logger.warning(
-                "Could not read catalog file %s: %s; skipping.", path, exc
+    merged.update(_load_builtin_catalog())
+    merged.update(_load_custom_catalog())
+    if extra_paths:
+        merged.update(
+            _load_extra_paths(
+                [Path(p).expanduser().resolve() for p in extra_paths]
             )
-            continue
-        try:
-            parsed = json.loads(raw_text)
-        except json.JSONDecodeError as exc:
-            logger.warning(
-                "Catalog file %s is not valid JSON: %s; skipping.",
-                path,
-                exc,
-            )
-            continue
-
-        items = _parse_catalog_payload(parsed, source_path=path)
-        # Later sources override earlier ones at the item level.
-        merged.update(items)
-
-        logger.debug(
-            "Catalog source %s contributed %d items.", path, len(items)
         )
-
     return merged
 
 
@@ -397,16 +567,33 @@ class ProviderPackageCatalog:
     """
     Wraps the merged catalog with caching and download-install logic.
 
-    The catalog is loaded once at construction (or on ``reload()``).
-    Between reloads, ``list_items()`` and ``get_item()`` serve from the
-    in-memory cache — no disk I/O on the hot path.
+    The catalog is merged from FOUR sources (lowest priority first):
 
-    Thread-safety
-    -------------
+        1. **Builtin** — ``builtin_catalog.json`` shipped next to
+           this module. Always available, offline baseline.
+
+        2. **Remote** — fetched from ``PELDRUN_PROVIDER_CATALOG_URL``
+           (when configured) with a 24h disk cache. Optional;
+           disabled by default. Uses the LiteLLM-style pattern:
+           cache-first, stale-while-revalidate, offline-safe.
+
+        3. **Custom local** — set via
+           ``PELDRUN_PROVIDER_CATALOG_PATH``. Overrides both builtin
+           and remote. Used by operators who host their own curated
+           catalog on disk.
+
+        4. **Extra paths** — injected via the ``extra_paths``
+           constructor argument. Used by tests. Highest priority.
+
     Reads are safe without a lock (dict reads are atomic in CPython).
-    ``reload()`` replaces the entire dict reference atomically. Concurrent
-    reads during a reload see either the old dict or the new one, never a
-    partial state.
+    ``reload()`` and ``ensure_fresh()`` rebuild the merged view
+    atomically by swapping ``self._items`` — concurrent readers see
+    either the old state or the new one, never a partial state.
+
+    ``reload()`` is disk-only and can be called from synchronous
+    contexts. ``ensure_fresh()`` performs the network fetch and must
+    be awaited — call it from async endpoints before serving the
+    catalog to the UI.
     """
 
     def __init__(
@@ -414,12 +601,36 @@ class ProviderPackageCatalog:
         *,
         extra_paths: Optional[Iterable[Path]] = None,
         manager: Optional[ProviderPackageManager] = None,
+        cache_dir: Optional[Path] = None,
+        ttl_seconds: int = REMOTE_CATALOG_TTL_SECONDS,
     ) -> None:
         self._extra_paths: List[Path] = [
             Path(p).expanduser().resolve() for p in (extra_paths or [])
         ]
         self._manager = manager or default_manager
+
+        # Remote catalog cache.
+        self._cache_dir = cache_dir or _default_cache_dir()
+        self._cache_path = self._cache_dir / REMOTE_CATALOG_CACHE_FILENAME
+        self._ttl_seconds = int(ttl_seconds)
+
+        # Per-source item stores. Each is rebuilt independently so
+        # that a stale remote cannot poison the builtin baseline, and
+        # a corrupted custom file cannot hide the remote overlay.
+        self._builtin_items: Dict[str, ProviderPackageCatalogItem] = {}
+        self._custom_items: Dict[str, ProviderPackageCatalogItem] = {}
+        self._extra_items: Dict[str, ProviderPackageCatalogItem] = {}
+        self._remote_items: Dict[str, ProviderPackageCatalogItem] = {}
+
+        # Merged view — what every caller reads. Swapped atomically in
+        # ``_rebuild_merged_items`` so concurrent readers never see a
+        # partial state.
         self._items: Dict[str, ProviderPackageCatalogItem] = {}
+
+        # Remote fetch state.
+        self._remote_loaded_at: float = 0.0
+        self._remote_last_error: Optional[str] = None
+
         self.reload()
 
     # ------------------------------------------------------------------
@@ -430,14 +641,420 @@ class ProviderPackageCatalog:
         """
         Reload the catalog from disk. Returns the new item count.
 
-        Used by tests and by any future admin endpoint. Under normal
-        operation the catalog is loaded once at process startup.
+        Reads:
+
+            * Builtin catalog file (always — offline baseline).
+            * Custom local catalog (if configured).
+            * Extra paths (if any).
+            * Remote disk cache (if ``PELDRUN_PROVIDER_CATALOG_URL`` is
+              configured AND a cache file exists AND the cache is
+              schema-compatible AND the cache's source URL matches the
+              current one).
+
+        Does NOT fetch from the network — that is ``ensure_fresh()``'s
+        job, called by the async endpoints that serve the catalog. This
+        separation guarantees ``reload()`` is fast (disk-only) and can
+        be called from synchronous contexts (``__init__``, tests)
+        without blocking on the network.
         """
-        items = load_catalog(extra_paths=self._extra_paths)
-        # Atomic reference swap.
-        self._items = items
-        logger.info("Provider package catalog loaded: %d items.", len(items))
-        return len(items)
+        self._builtin_items = _load_builtin_catalog()
+        self._custom_items = _load_custom_catalog()
+        self._extra_items = _load_extra_paths(self._extra_paths)
+        self._load_remote_cache()
+        self._rebuild_merged_items()
+        logger.info(
+            "Provider package catalog reloaded: %d items "
+            "(builtin=%d, custom=%d, extra=%d, remote=%d).",
+            len(self._items),
+            len(self._builtin_items),
+            len(self._custom_items),
+            len(self._extra_items),
+            len(self._remote_items),
+        )
+        return len(self._items)
+
+    def _rebuild_merged_items(self) -> None:
+        """
+        Rebuild ``self._items`` from the per-source stores.
+
+        Priority (lowest first — later layers overwrite earlier ones):
+
+            1. builtin
+            2. remote
+            3. custom
+            4. extra
+
+        The whole replacement is a single reference assignment. Any
+        reader that is currently iterating an old dict keeps seeing the
+        old state — there is no partial view.
+        """
+        merged: Dict[str, ProviderPackageCatalogItem] = {}
+        merged.update(self._builtin_items)
+        merged.update(self._remote_items)
+        merged.update(self._custom_items)
+        merged.update(self._extra_items)
+        self._items = merged
+
+    # ------------------------------------------------------------------
+    # Remote catalog
+    # ------------------------------------------------------------------
+
+    async def ensure_fresh(self, force: bool = False) -> bool:
+        """
+        Ensure the remote catalog is fresh (fetch if stale or forced).
+
+        The effective URL is resolved by
+        ``_resolve_remote_catalog_url()``:
+
+            * ``PELDRUN_PROVIDER_CATALOG_URL`` set to a non-empty
+              string → use that URL (operator override).
+            * ``PELDRUN_PROVIDER_CATALOG_URL`` set to an empty string
+              → no-op (operator explicitly disabled remote fetching).
+            * ``PELDRUN_PROVIDER_CATALOG_URL`` unset → use
+              ``DEFAULT_REMOTE_CATALOG_URL``. This is the case for
+              every freshly-installed PELDRUN: the official catalog is
+              fetched automatically with no user configuration.
+
+        Parameters
+        ----------
+        force
+            When ``True``, bypass the TTL check and always refetch.
+
+        Returns
+        -------
+        bool
+            ``True`` when a valid remote catalog is loaded (either
+            from a fresh cache or from the network), ``False`` when
+            the remote fetch failed AND no cached copy exists. Never
+            raises — the caller is never blocked by an unreachable
+            GitHub.
+        """
+        url = _resolve_remote_catalog_url()
+        if not url:
+            # Operator explicitly disabled remote fetching
+            # (PELDRUN_PROVIDER_CATALOG_URL=""). Intentional offline
+            # deployment — not an error.
+            return True
+
+        # TTL check: serve from cache if still fresh (unless forced).
+        if not force and self._remote_loaded_at > 0:
+            age = time.time() - self._remote_loaded_at
+            if age <= self._ttl_seconds:
+                return True
+
+        ok = await self._fetch_remote(url)
+        if ok:
+            self._rebuild_merged_items()
+        return ok
+
+    async def refresh(self) -> bool:
+        """
+        Force-fetch from remote, ignoring TTL.
+
+        Used by the admin endpoint ``POST /api/store/providers/catalog/
+        refresh`` so operators can immediately pull a newly-published
+        catalog entry without waiting 24 hours.
+        """
+        return await self.ensure_fresh(force=True)
+
+    async def _fetch_remote(self, url: str) -> bool:
+        """
+        Download and cache the remote catalog. Never raises.
+
+        Enforces (in order):
+            * HTTP(S) scheme only — no ``file://``, ``data:``, etc.
+            * Streaming download with a hard byte cap — a malicious
+              server cannot exhaust memory by streaming gigabytes.
+            * Bounded redirect chain — max 3 hops.
+            * JSON parse — a malformed response leaves the previous
+              cache intact and reports the error via
+              ``_remote_last_error``.
+        """
+        if not url.lower().startswith(("http://", "https://")):
+            msg = (
+                f"Remote catalog URL scheme is not HTTP(S): {url!r}. "
+                f"Only http:// and https:// are allowed."
+            )
+            logger.warning(msg)
+            self._remote_last_error = msg
+            return False
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=REMOTE_CATALOG_FETCH_TIMEOUT_SECONDS,
+                follow_redirects=True,
+                max_redirects=REMOTE_CATALOG_MAX_REDIRECTS,
+            ) as client:
+                async with client.stream("GET", url) as response:
+                    if response.status_code != 200:
+                        msg = (
+                            f"Remote catalog returned HTTP "
+                            f"{response.status_code} from {url}."
+                        )
+                        logger.warning(msg)
+                        self._remote_last_error = msg
+                        return False
+
+                    content = bytearray()
+                    async for chunk in response.aiter_bytes(
+                        chunk_size=64 * 1024
+                    ):
+                        content.extend(chunk)
+                        if len(content) > REMOTE_CATALOG_MAX_BYTES:
+                            msg = (
+                                f"Remote catalog exceeds "
+                                f"{REMOTE_CATALOG_MAX_BYTES}-byte limit "
+                                f"(aborted at {len(content)} bytes)."
+                            )
+                            logger.warning(msg)
+                            self._remote_last_error = msg
+                            return False
+
+                    raw = json.loads(bytes(content).decode("utf-8"))
+        except Exception as exc:
+            msg = f"Failed to fetch remote catalog from {url}: {exc}"
+            logger.warning(msg)
+            self._remote_last_error = msg
+            return False
+
+        # Structural validation — the ONLY failure conditions.
+        #
+        # An empty ``items`` array is a legitimate, intentional state:
+        # a freshly-bootstrapped catalog repository that has not yet
+        # published any provider. Treating it as a fetch failure
+        # would:
+        #
+        #   * log a spurious warning every TTL cycle;
+        #   * skip writing the cache, so the fetch path itself would
+        #     never be proven to work end-to-end;
+        #   * surface a misleading "parsed to zero items" message that
+        #     reads like a bug rather than an intentional empty state.
+        #
+        # Only malformed payloads (non-object root, missing `items`,
+        # `items` not an array) count as fetch errors.
+        if not isinstance(raw, dict):
+            msg = (
+                f"Remote catalog at {url} is not a JSON object "
+                f"(got {type(raw).__name__})."
+            )
+            logger.warning(msg)
+            self._remote_last_error = msg
+            return False
+
+        raw_items = raw.get("items")
+        if not isinstance(raw_items, list):
+            msg = (
+                f"Remote catalog at {url} has no 'items' array "
+                f"(got {type(raw_items).__name__})."
+            )
+            logger.warning(msg)
+            self._remote_last_error = msg
+            return False
+
+        # From here on, the payload is structurally valid. An empty
+        # `items` array parses to `{}` and is accepted as-is.
+        items = _parse_catalog_payload(raw, source_path=Path(url))
+
+        fetched_at = time.time()
+        self._remote_items = items
+        self._remote_loaded_at = fetched_at
+        self._remote_last_error = None
+
+        await asyncio.to_thread(
+            self._write_remote_cache, items, url, fetched_at
+        )
+        logger.info(
+            "Fetched %d items from remote catalog (%s).",
+            len(items),
+            url,
+        )
+        return True
+
+    def _load_remote_cache(self) -> bool:
+        """
+        Load the remote catalog from the on-disk cache (sync).
+
+        The cache is valid only when ALL of the following hold:
+
+            * ``PELDRUN_PROVIDER_CATALOG_URL`` is currently set.
+            * The cache file exists.
+            * The cache's schema version matches
+              ``REMOTE_CATALOG_CACHE_SCHEMA_VERSION``.
+            * The cache's ``source_url`` matches the CURRENT env var
+              value — this guards against a stale cache written when
+              a different URL was configured. Without this check,
+              switching from catalog A to catalog B would silently
+              serve A's items until the first successful B fetch.
+
+        Returns ``True`` when the cache was loaded into
+        ``_remote_items``.
+        """
+        url = _resolve_remote_catalog_url()
+        if not url:
+            # Operator explicitly disabled remote fetching. Clear any
+            # stale in-memory state — the caller will see the builtin
+            # catalog alone.
+            self._remote_items = {}
+            self._remote_loaded_at = 0.0
+            return False
+
+        if not self._cache_path.is_file():
+            return False
+
+        try:
+            payload = json.loads(
+                self._cache_path.read_text(encoding="utf-8")
+            )
+        except Exception as exc:
+            logger.warning(
+                "Remote catalog cache at %s is unreadable: %s",
+                self._cache_path,
+                exc,
+            )
+            return False
+
+        if not isinstance(payload, dict):
+            return False
+
+        meta = payload.get("_cache_meta")
+        items_raw = payload.get("_items")
+        if not isinstance(meta, dict) or not isinstance(items_raw, dict):
+            logger.warning(
+                "Remote catalog cache is missing required keys "
+                "(_cache_meta / _items); ignoring."
+            )
+            return False
+
+        schema = meta.get("schema_version")
+        if schema != REMOTE_CATALOG_CACHE_SCHEMA_VERSION:
+            logger.info(
+                "Remote catalog cache schema=%r != expected=%r; "
+                "ignoring.",
+                schema,
+                REMOTE_CATALOG_CACHE_SCHEMA_VERSION,
+            )
+            return False
+
+        cached_url = meta.get("source_url")
+        if cached_url != url:
+            logger.info(
+                "Remote catalog cache source_url=%r != current=%r; "
+                "ignoring (the URL changed since this cache was "
+                "written).",
+                cached_url,
+                url,
+            )
+            return False
+
+        items: Dict[str, ProviderPackageCatalogItem] = {}
+        for item_id, item_dict in items_raw.items():
+            if not isinstance(item_dict, dict):
+                continue
+            try:
+                items[item_id] = ProviderPackageCatalogItem.model_validate(
+                    item_dict
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Skipping malformed cached item %r: %s",
+                    item_id,
+                    exc,
+                )
+                continue
+
+        self._remote_items = items
+        self._remote_loaded_at = float(meta.get("fetched_at") or 0.0)
+        logger.info(
+            "Loaded %d items from remote catalog cache (age=%.1fs).",
+            len(items),
+            max(0.0, time.time() - self._remote_loaded_at),
+        )
+        return True
+
+    def _write_remote_cache(
+        self,
+        items: Dict[str, ProviderPackageCatalogItem],
+        url: str,
+        fetched_at: float,
+    ) -> None:
+        """Persist the remote catalog to disk atomically. Never raises."""
+        try:
+            self._cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp = self._cache_path.with_suffix(".tmp")
+            payload = {
+                "_cache_meta": {
+                    "schema_version": REMOTE_CATALOG_CACHE_SCHEMA_VERSION,
+                    "fetched_at": fetched_at,
+                    "source_url": url,
+                    "item_count": len(items),
+                },
+                "_items": {k: v.model_dump() for k, v in items.items()},
+            }
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(self._cache_path)
+            logger.info(
+                "Wrote %d items to remote catalog cache at %s.",
+                len(items),
+                self._cache_path,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to write remote catalog cache at %s: %s",
+                self._cache_path,
+                exc,
+            )
+
+    def get_status(self) -> Dict[str, Any]:
+        """
+        Return a snapshot of the catalog state. Used by the admin
+        endpoint and for debugging.
+
+        The ``remote_url_source`` field reports how the effective URL
+        was determined:
+
+            * ``"default"``      — env var unset, using the built-in
+                                   ``DEFAULT_REMOTE_CATALOG_URL``. This
+                                   is the normal state for a
+                                   freshly-installed PELDRUN.
+            * ``"env_override"`` — env var set to a custom URL.
+            * ``"disabled"``     — env var set to an empty string.
+        """
+        effective_url = _resolve_remote_catalog_url()
+        explicit_override = (
+            REMOTE_CATALOG_ENV_VAR in os.environ
+            and bool(os.environ.get(REMOTE_CATALOG_ENV_VAR, "").strip())
+        )
+        explicit_disable = (
+            REMOTE_CATALOG_ENV_VAR in os.environ
+            and not os.environ.get(REMOTE_CATALOG_ENV_VAR, "").strip()
+        )
+        return {
+            "item_count": len(self._items),
+            "builtin_count": len(self._builtin_items),
+            "custom_count": len(self._custom_items),
+            "extra_count": len(self._extra_items),
+            "remote_count": len(self._remote_items),
+            "remote_url_configured": bool(effective_url),
+            "remote_url_effective": effective_url or None,
+            "remote_url_source": (
+                "env_override"
+                if explicit_override
+                else "disabled"
+                if explicit_disable
+                else "default"
+            ),
+            "remote_cache_age_seconds": (
+                max(0.0, time.time() - self._remote_loaded_at)
+                if self._remote_loaded_at > 0
+                else None
+            ),
+            "remote_ttl_seconds": self._ttl_seconds,
+            "remote_last_error": self._remote_last_error,
+            "cache_path": str(self._cache_path),
+        }
 
     # ------------------------------------------------------------------
     # Reads
@@ -515,6 +1132,19 @@ class ProviderPackageCatalog:
             Any error from the install pipeline itself (validation,
             conflict, environment, storage) is propagated unchanged.
         """
+        # Best-effort refresh so an item published to the remote
+        # catalog a minute ago is installable without waiting for the
+        # listing endpoint's TTL to expire. Failure is non-fatal —
+        # we fall back to the merged view that may already contain
+        # the item from cache or from a local source.
+        try:
+            await self.ensure_fresh()
+        except Exception:
+            # ensure_fresh() is documented never to raise, but this
+            # is a hard user-facing operation — never let a refresh
+            # bug block an install that could otherwise succeed.
+            pass
+
         item = self.get_or_raise(item_id)
 
         if not is_installable(item):
@@ -757,6 +1387,13 @@ def reset_provider_package_catalog_for_tests() -> None:
 __all__ = [
     "BUILTIN_CATALOG_FILENAME",
     "CUSTOM_CATALOG_ENV_VAR",
+    "REMOTE_CATALOG_ENV_VAR",
+    "REMOTE_CATALOG_CACHE_FILENAME",
+    "REMOTE_CATALOG_TTL_SECONDS",
+    "REMOTE_CATALOG_FETCH_TIMEOUT_SECONDS",
+    "REMOTE_CATALOG_MAX_BYTES",
+    "REMOTE_CATALOG_MAX_REDIRECTS",
+    "REMOTE_CATALOG_CACHE_SCHEMA_VERSION",
     "DOWNLOAD_TIMEOUT_SECONDS",
     "MAX_DOWNLOAD_REDIRECTS",
     "load_catalog",

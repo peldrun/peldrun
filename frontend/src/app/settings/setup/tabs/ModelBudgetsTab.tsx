@@ -27,12 +27,56 @@ import type {
  * Vault shape — mirrors backend/data/models_vault.json exactly
  * as written by config_rtr.load_vault_from_disk() / DEFAULT_VAULT.
  * ============================================================ */
+/**
+ * One connection record from `models_vault.json → provider_connections`.
+ *
+ * Each entry binds a provider package (e.g. "gigachat") to the
+ * credentials and base URL used to reach that package's API. Only the
+ * fields consumed by this tab are typed; the rest are kept opaque
+ * because the vault is owned by the backend.
+ */
+interface ProviderConnection {
+  name: string;
+  fields?: {
+    base_url?: string;
+    api_key?: string;
+    credentials?: string;
+    scope?: string;
+    ca_bundle_path?: string;
+    verify_ssl?: boolean;
+  };
+  is_active?: boolean;
+  id: string;
+  provider_package_id: string;
+  enabled?: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
 interface VaultData {
   cloud_vault?: CloudProviderVaultItem[];
   custom_endpoints?: CustomEndpoint[];
   lmstudio_vault?: (LMStudioSettings & { provider?: string; badge?: string; latency?: number }) | null;
   ollama_vault?: (OllamaSettings & { badge?: string; latency?: number }) | null;
   scanned_models?: string[];
+  /**
+   * Store → Providers connection records. Consumed by the provider-package
+   * section of the budget accordion to obtain each package's base URL and
+   * API key without duplicating credential storage.
+   */
+  provider_connections?: ProviderConnection[];
+  /**
+   * Models the user has explicitly selected per provider package via the
+   * Store Providers tab (`saveModelsForPackage`). Keyed by the
+   * provider_package_id (e.g. "gigachat"). This is the canonical source of
+   * truth for which models belong to a package — the provider_connections
+   * array alone is insufficient because a connection may exist with zero
+   * scanned models yet.
+   */
+  provider_package_models?: Record<
+    string,
+    { savedModels?: string[]; model?: string }
+  >;
 }
 
 interface ModelBudgetsTabProps {
@@ -135,7 +179,9 @@ function hasVaultPayload(payload: any): boolean {
       (payload.cloud_vault ||
         payload.custom_endpoints ||
         payload.lmstudio_vault ||
-        payload.ollama_vault)
+        payload.ollama_vault ||
+        payload.provider_connections ||
+        payload.provider_package_models)
   );
 }
 
@@ -500,6 +546,92 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
         badge,
         icon: <ProviderIcon badge={badge} />,
         models: ceModels.map((m) => {
+          const limits = resolveIntelligentLimits(m, metadataVault);
+          return {
+            modelId: m,
+            displayName: m,
+            defaultContextWindow: limits.contextWindow,
+            defaultMaxOutput: limits.maxOutput,
+          };
+        }),
+      });
+    }
+
+    /* -------- 5. Provider Packages (Store → Providers) --------
+     *
+     * Packages installed from Store → Providers (GigaChat, future
+     * packages) appear here as their own accordion group, exactly
+     * like cloud providers, LM Studio, Ollama, and custom endpoints.
+     *
+     * Data sources (all from models_vault.json — the single source
+     * of truth):
+     *   - provider_connections[]      → base_url / api_key per package
+     *   - provider_package_models{}   → which models the user
+     *                                    selected via the Store tab
+     *
+     * A package without saved models is intentionally skipped:
+     * budgets are per-model, so there is nothing to configure until
+     * the user has run "Scan Models" in the Store Providers tab.
+     * This mirrors the behaviour of every other provider group in
+     * this component.
+     *
+     * Multiple connections for the same package are collapsed to a
+     * single group; the first enabled connection wins. The Store
+     * enforces a single active connection per package at install
+     * time, so this is defensive rather than expected in practice.
+     * ------------------------------------------------ */
+    const packageModelsMap = vault?.provider_package_models ?? {};
+
+    // Resolve one connection per package for the Auto-Detect endpoint
+    // lookup. The backend already enforces "at most one active
+    // connection per package" via save_provider_connection(), but we
+    // still iterate defensively: prefer the connection explicitly
+    // marked is_active, otherwise fall back to the first enabled one
+    // (which matches the backend's get_active_connection_for_package
+    // resolution order). Connections with enabled === false are
+    // skipped entirely — an enabled=false connection is treated as
+    // "no connection" by the runtime, and showing it here would let
+    // the user trigger an Auto-Detect against a disabled endpoint.
+    const connectionsByPackage = new Map<string, ProviderConnection>();
+    for (const conn of vault?.provider_connections ?? []) {
+      if (!conn.provider_package_id) continue;
+      if (conn.enabled === false) continue;
+      const existing = connectionsByPackage.get(conn.provider_package_id);
+      // Prefer the active connection; otherwise keep the first enabled one.
+      if (!existing || (!existing.is_active && conn.is_active)) {
+        connectionsByPackage.set(conn.provider_package_id, conn);
+      }
+    }
+
+    for (const [packageId, pkgModels] of Object.entries(packageModelsMap)) {
+      const savedModels = Array.isArray(pkgModels?.savedModels)
+        ? pkgModels.savedModels.filter(
+            (m): m is string => typeof m === "string" && m.length > 0
+          )
+        : [];
+      if (savedModels.length === 0) continue;
+
+      const conn = connectionsByPackage.get(packageId);
+      const displayName = conn?.name?.trim() || packageId;
+      // The package id doubles as the badge key; PROVIDER_ICON_MAP
+      // already resolves "gigachat" → "gigachat" and future packages
+      // inherit the same convention.
+      const badge = packageId;
+
+      groups.push({
+        groupId: `provider_package_${packageId}`,
+        providerName: displayName,
+        providerKey: packageId,
+        // Trim because the vault may hold a single-space placeholder
+        // (" ") before the user fills in real credentials. Treating
+        // whitespace as empty prevents Auto-Detect from querying
+        // " " as a URL and surfacing a confusing HTTP error.
+        baseUrl: conn?.fields?.base_url?.trim() || "",
+        apiKey: conn?.fields?.api_key?.trim() || "",
+        metadataEndpoint: "",
+        badge,
+        icon: <ProviderIcon badge={badge} />,
+        models: savedModels.map((m) => {
           const limits = resolveIntelligentLimits(m, metadataVault);
           return {
             modelId: m,

@@ -21,6 +21,7 @@ import type {
   ProviderPackageEntry,
   ProviderTransport,
 } from "../_types/store";
+import { Icon } from "@/components/Icon/Icon";
 
 /**
  * One card in the Providers section grid.
@@ -55,8 +56,35 @@ import type {
  *     async handlers. The card does NOT await them — the parent
  *     manages loading state and error toasts.
  */
+/**
+ * Optional branding overrides from the catalog item, applied when
+ * the installed package was originally installed from the catalog.
+ *
+ * The installed ``ProviderPackageEntry`` does not carry
+ * ``brand_color`` / ``icon`` / ``icon_type`` — those live on the
+ * catalog item only. When the caller supplies them here, the card
+ * renders the branded glyph and the tinted icon container instead
+ * of the default transport color. Falls back to the transport
+ * color when absent (e.g. catalog is unreachable, or the package
+ * was uploaded manually).
+ */
+export interface ProviderBrandingOverride {
+  brand_color?: string | null;
+  icon?: string | null;
+  icon_type?: "name" | "svg";
+}
+
 export interface ProviderPackageCardProps {
   provider: ProviderPackageEntry;
+
+  /**
+   * Branding from the matching catalog item, when one exists.
+   * See ``ProviderBrandingOverride`` for the shape and semantics.
+   * Pass ``null`` or omit it when the package was not installed
+   * from the catalog.
+   */
+  brandingOverride?: ProviderBrandingOverride | null;
+
   /** True when the toggle is currently in flight for THIS provider. */
   toggling: boolean;
   /** True when a delete is currently in flight for THIS provider. */
@@ -258,6 +286,91 @@ function CertificateBadge({
 }
 
 /**
+ * Sanitize inline SVG markup from a catalog-supplied icon.
+ * Mirrors the pattern used by ``SkillIcon`` and
+ * ``CatalogItemDetailsModal``.
+ */
+function sanitizeBrandSvg(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed.includes("<svg")) return null;
+  return trimmed
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<foreignObject[\s\S]*?<\/foreignObject>/gi, "")
+    .replace(/\son\w+\s*=\s*(".*?"|'.*?'|[^\s>]+)/gi, "")
+    .replace(
+      /(href|xlink:href|src)\s*=\s*("javascript:[^"]*"|'javascript:[^']*'|"data:[^"]*"|'data:[^']*')/gi,
+      ""
+    )
+    .replace(/@import\s+url\s*\([^)]*\)/gi, "");
+}
+
+/**
+ * Render the branded icon glyph for an installed package.
+ *
+ * Priority
+ * --------
+ *   1. ``icon_type === "name"`` — the shared ``Icon`` component,
+ *      tinted by ``brand_color`` via CSS ``currentColor``.
+ *   2. ``icon_type === "svg"`` — inline sanitized SVG.
+ *   3. Fallback — the generic ``Plug`` glyph (default transport
+ *      aesthetic).
+ */
+function BrandedIcon({
+  icon,
+  iconType,
+  brandColor,
+  size = 20,
+}: {
+  icon?: string | null;
+  iconType?: "name" | "svg";
+  brandColor?: string | null;
+  size?: number;
+}) {
+  const brand = brandColor || "currentColor";
+  const value = (icon || "").trim();
+
+  if (value && (iconType || "name") === "name") {
+    return (
+      <span
+        style={{
+          color: brand,
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          width: size,
+          height: size,
+        }}
+        aria-hidden="true"
+      >
+        <Icon name={value} size={size} />
+      </span>
+    );
+  }
+
+  if (value && iconType === "svg") {
+    const safe = sanitizeBrandSvg(value);
+    if (safe) {
+      return (
+        <span
+          style={{
+            color: brand,
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            width: size,
+            height: size,
+          }}
+          aria-hidden="true"
+          dangerouslySetInnerHTML={{ __html: safe }}
+        />
+      );
+    }
+  }
+
+  return <Plug className="h-5 w-5" />;
+}
+
+/**
  * Small toggle switch. Uses `role="switch"` for accessibility and a
  * per-instance disabled state driven by ``toggling``.
  */
@@ -303,6 +416,7 @@ function EnabledToggle({
 
 export function ProviderPackageCard({
   provider,
+  brandingOverride,
   toggling,
   deleting,
   activating,
@@ -320,13 +434,25 @@ export function ProviderPackageCard({
   const iconClass =
     TRANSPORT_ICON_CLASSES[transport] ?? TRANSPORT_ICON_CLASSES.native;
 
+  // When the package was installed from the catalog, ``brandingOverride``
+  // carries the catalog's ``brand_color`` / ``icon`` / ``icon_type``.
+  // We use them to tint and icon-render the installed card exactly the
+  // way the catalog card does — so the same provider looks identical
+  // in both tabs. Falls through to the transport-colored icon
+  // container when the override is absent (manual upload, or the
+  // catalog is unreachable this session).
+  const brandColor = brandingOverride?.brand_color || null;
+  const brandIcon = brandingOverride?.icon || null;
+  const brandIconType = brandingOverride?.icon_type || "name";
+  const hasBranding = Boolean(brandColor || brandIcon);
+
   const hasMultipleVersions = provider.installed_versions.length > 1;
   const isBusy = toggling || deleting || activating;
 
   // Build the description preview. Falls back to a short generic
   // string when the manifest declared no description — showing
   // "No description provided." is friendlier than leaving the
-  // space blank, which makes the card look broken.
+  // space blank, which makes the row look broken.
   const description =
     (provider.description && provider.description.trim()) ||
     "No description provided.";
@@ -334,37 +460,65 @@ export function ProviderPackageCard({
   return (
     <article
       className={[
-        "group relative flex h-full flex-col rounded-xl border bg-card transition-all",
-        "hover:border-primary/40 hover:shadow-sm",
-        provider.enabled ? "" : "opacity-60",
+        // Horizontal list-row layout — matches the visual pattern
+        // used by ExtensionCard and SkillCard in this same store.
+        // On narrow viewports the actions wrap below the content.
+        "group relative flex flex-col sm:flex-row sm:items-center gap-4",
+        "p-4 rounded-sm border transition-all hover:shadow-sm",
+        provider.enabled
+          ? "border-card border-l-[5px] bg-card "
+          : "border-muted  bg-muted/20 opacity-70",
         deleting ? "pointer-events-none opacity-40" : "",
       ].join(" ")}
+
+      style={
+            hasBranding
+              ? {
+                  borderLeftColor: brandColor
+                    ? `${brandColor}`
+                    : undefined,
+                }
+              : undefined
+          }
+
     >
-      {/* ── Header: icon + title + toggle ─────────────────────── */}
-      <div className="flex items-start gap-3 p-4">
+      {/* ── Left: icon + content ─────────────────────────────── */}
+      <div className="flex  gap-3 sm:gap-4 flex-1 min-w-0 items-center">
+        {/* Icon container: uses the catalog's brand color when the
+            package was installed from the catalog, otherwise falls
+            back to the transport-derived classes (blue / green /
+            purple) that distinguish native / compatible / custom.
+            The two paths are mutually exclusive so there is no
+            visual confusion when both are available. */}
         <div
-          className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${iconClass}`}
+          className={
+            hasBranding
+              ? "shrink-0 flex h-full w-20 items-center justify-center"
+              : `shrink-0 flex h-full w-20 items-center justify-center ${iconClass}`
+          }
           aria-hidden="true"
         >
-          <Plug className="h-5 w-5" />
+          {hasBranding ? (
+            <BrandedIcon
+              icon={brandIcon}
+              iconType={brandIconType}
+              brandColor={brandColor}
+              size={70}
+            />
+          ) : (
+            <Plug className="h-20 w-20" />
+          )}
         </div>
 
         <div className="min-w-0 flex-1">
-          <div className="flex items-start justify-between gap-2">
+          {/* Title + badges row */}
+          <div className="flex items-center gap-2 flex-wrap mb-1">
             <h3
               className="truncate text-sm font-semibold text-foreground"
               title={displayName}
             >
               {displayName}
             </h3>
-            <EnabledToggle
-              enabled={provider.enabled}
-              busy={toggling}
-              onToggle={() => onToggle(provider.id)}
-            />
-          </div>
-
-          <div className="mt-1 flex flex-wrap items-center gap-1.5">
             <span className="inline-flex items-center rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-mono text-muted-foreground">
               v{provider.active_version}
             </span>
@@ -383,10 +537,6 @@ export function ProviderPackageCard({
                 From Catalog
               </span>
             )}
-            {/* Connection status — the single most important piece of
-                information for a plugin provider. "Not configured" is
-                rendered in amber because the user cannot use the
-                provider until they add a connection. */}
             {provider.has_active_connection ? (
               <span
                 className="inline-flex items-center gap-1 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:text-emerald-300"
@@ -409,157 +559,137 @@ export function ProviderPackageCard({
                 Not configured
               </span>
             )}
-
-            {/* Certificate status badge.
-                Only rendered when the package declares certificates.
-                Purple is used to distinguish it from the connection
-                badge (emerald) and the "not configured" badge (amber).
-                The amber variant takes priority over purple because a
-                missing required certificate is a blocking issue, not
-                just informational. */}
             <CertificateBadge
               hasCertificates={provider.has_certificates}
               status={provider.certificates_status}
             />
           </div>
+
+          {/* Description */}
+          <p
+            className="line-clamp-2 text-xs leading-relaxed text-muted-foreground"
+            title={description}
+          >
+            {description}
+          </p>
+
+          {/* Feature chips */}
+          {provider.features && Object.keys(provider.features).length > 0 && (
+            <div className="mt-2">
+              <FeatureChips features={provider.features} />
+            </div>
+          )}
         </div>
       </div>
 
-      {/* ── Description ───────────────────────────────────────── */}
-      <p
-        className="line-clamp-2 px-4 text-xs leading-relaxed text-muted-foreground"
-        title={description}
-      >
-        {description}
-      </p>
+      {/* ── Right: actions ───────────────────────────────────── */}
+      <div className="flex items-center gap-1.5 flex-wrap sm:flex-nowrap shrink-0 sm:self-center">
+        {hasMultipleVersions && (
+          <select
+            id={`activate-${provider.id}`}
+            value={provider.active_version}
+            disabled={isBusy}
+            onChange={(e) => {
+              const next = e.target.value;
+              if (next !== provider.active_version) {
+                onActivateVersion(provider, next);
+              }
+            }}
+            className={[
+              "rounded-md border bg-background px-1.5 py-1 text-[11px] font-mono",
+              "focus:outline-none focus:ring-1 focus:ring-primary/40",
+              activating ? "cursor-wait opacity-60" : "cursor-pointer",
+            ].join(" ")}
+            title="Activate version"
+          >
+            {provider.installed_versions.map((record) => (
+              <option key={record.version} value={record.version}>
+                v{record.version}
+              </option>
+            ))}
+          </select>
+        )}
 
-      {/* ── Feature chips ─────────────────────────────────────── */}
-      {provider.features && Object.keys(provider.features).length > 0 && (
-        <div className="px-4 pt-3">
-          <FeatureChips features={provider.features} />
-        </div>
-      )}
+        <button
+          type="button"
+          onClick={() => onConfigure(provider.id)}
+          disabled={isBusy}
+          className={[
+            "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors",
+            provider.has_active_connection
+              ? "text-foreground border border-border hover:bg-muted"
+              : "bg-primary text-primary-foreground hover:bg-primary/90",
+            isBusy ? "cursor-not-allowed opacity-50" : "cursor-pointer",
+          ].join(" ")}
+          title={
+            provider.has_active_connection
+              ? "Manage connections for this provider"
+              : "Add a connection to start using this provider"
+          }
+        >
+          <Settings className="h-3.5 w-3.5" />
+          Configure
+        </button>
 
-      {/* ── Footer actions ────────────────────────────────────── */}
-      <div className="mt-auto flex items-center justify-between gap-2 border-t px-3 py-2.5">
-        <div className="flex items-center gap-1">
-          {/* Configure is the primary action for a plugin provider —
-              without a connection, the provider cannot be used. We
-              place it FIRST so users find it immediately. When there
-              is no active connection, we emphasize it with a primary
-              style so it stands out. */}
+        {provider.has_certificates && (
           <button
             type="button"
-            onClick={() => onConfigure(provider.id)}
+            onClick={() => onManageCertificates(provider.id)}
             disabled={isBusy}
             className={[
-              "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
-              provider.has_active_connection
-                ? "text-foreground hover:bg-muted"
-                : "bg-primary text-primary-foreground hover:bg-primary/90",
-              isBusy ? "cursor-not-allowed opacity-50" : "",
+              "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors border",
+              provider.certificates_status === "some_missing"
+                ? "border-amber-500/30 text-amber-700 dark:text-amber-300 hover:bg-amber-500/10"
+                : "border-border text-foreground hover:bg-muted",
+              isBusy ? "cursor-not-allowed opacity-50" : "cursor-pointer",
             ].join(" ")}
             title={
-              provider.has_active_connection
-                ? "Manage connections for this provider"
-                : "Add a connection to start using this provider"
+              provider.certificates_status === "some_missing"
+                ? "Install the required TLS certificates"
+                : "Manage TLS certificates for this provider"
             }
           >
-            <Settings className="h-3.5 w-3.5" />
-            Configure
+            <Shield className="h-3.5 w-3.5" />
+            Certificates
           </button>
+        )}
 
-          {/* Certificates — rendered only when the package declares
-              any. Uses amber when at least one required certificate
-              is missing, so it draws the eye exactly when the user
-              needs to act. */}
-          {provider.has_certificates && (
-            <button
-              type="button"
-              onClick={() => onManageCertificates(provider.id)}
-              disabled={isBusy}
-              className={[
-                "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
-                provider.certificates_status === "some_missing"
-                  ? "text-amber-700 dark:text-amber-300 hover:bg-amber-500/10"
-                  : "text-foreground hover:bg-muted",
-                isBusy ? "cursor-not-allowed opacity-50" : "",
-              ].join(" ")}
-              title={
-                provider.certificates_status === "some_missing"
-                  ? "Install the required TLS certificates"
-                  : "Manage TLS certificates for this provider"
-              }
-            >
-              <Shield className="h-3.5 w-3.5" />
-              Certificates
-            </button>
-          )}
+        <button
+          type="button"
+          onClick={() => onDetails(provider.id)}
+          disabled={isBusy}
+          className={[
+            "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors border border-border",
+            "text-foreground hover:bg-muted",
+            isBusy ? "cursor-not-allowed opacity-50" : "cursor-pointer",
+          ].join(" ")}
+        >
+          <CheckCircle2 className="h-3.5 w-3.5" />
+          Details
+        </button>
 
-          <button
-            type="button"
-            onClick={() => onDetails(provider.id)}
-            disabled={isBusy}
-            className={[
-              "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
-              "text-foreground hover:bg-muted",
-              isBusy ? "cursor-not-allowed opacity-50" : "",
-            ].join(" ")}
-          >
-            <CheckCircle2 className="h-3.5 w-3.5" />
-            Details
-          </button>
-        </div>
+        <button
+          type="button"
+          onClick={() => onDelete(provider)}
+          disabled={isBusy}
+          aria-label={`Delete ${displayName}`}
+          className={[
+            "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors",
+            "text-destructive hover:bg-destructive/10",
+            isBusy ? "cursor-not-allowed opacity-50" : "cursor-pointer",
+          ].join(" ")}
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+          Delete
+        </button>
 
-        <div className="flex items-center gap-1">
-          {hasMultipleVersions && (
-            <div className="flex items-center gap-1">
-              <label
-                htmlFor={`activate-${provider.id}`}
-                className="text-[11px] text-muted-foreground"
-              >
-                Activate:
-              </label>
-              <select
-                id={`activate-${provider.id}`}
-                value={provider.active_version}
-                disabled={isBusy}
-                onChange={(e) => {
-                  const next = e.target.value;
-                  if (next !== provider.active_version) {
-                    onActivateVersion(provider, next);
-                  }
-                }}
-                className={[
-                  "rounded-md border bg-background px-1.5 py-0.5 text-[11px] font-mono",
-                  "focus:outline-none focus:ring-1 focus:ring-primary/40",
-                  activating ? "cursor-wait opacity-60" : "",
-                ].join(" ")}
-              >
-                {provider.installed_versions.map((record) => (
-                  <option key={record.version} value={record.version}>
-                    v{record.version}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
+        <div className="w-px h-6 bg-border mx-0.5" />
 
-          <button
-            type="button"
-            onClick={() => onDelete(provider)}
-            disabled={isBusy}
-            aria-label={`Delete ${displayName}`}
-            className={[
-              "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
-              "text-destructive hover:bg-destructive/10",
-              isBusy ? "cursor-not-allowed opacity-50" : "",
-            ].join(" ")}
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-            Delete
-          </button>
-        </div>
+        <EnabledToggle
+          enabled={provider.enabled}
+          busy={toggling}
+          onToggle={() => onToggle(provider.id)}
+        />
       </div>
     </article>
   );

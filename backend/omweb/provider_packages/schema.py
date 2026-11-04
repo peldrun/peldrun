@@ -1462,6 +1462,54 @@ class ProviderPackageHealthReport(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class DeveloperInfo(BaseModel):
+    """
+    Structured developer / maintainer metadata for a catalog item.
+
+    Kept as a nested object (rather than flat ``author_*`` fields) so
+    the UI can render a rich publisher block (avatar + name + links)
+    without ambiguity. All fields except ``name`` are optional.
+
+    Backward compatibility
+    ----------------------
+    The legacy flat fields ``author`` / ``author_url`` / ``homepage``
+    on ``ProviderPackageCatalogItem`` remain valid. Catalog authors
+    are encouraged to migrate to ``developer`` for richer UI, but old
+    catalogs continue to work unchanged.
+    """
+
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    name: str = Field(
+        ...,
+        min_length=1,
+        description="Human-readable publisher name.",
+    )
+    url: Optional[str] = Field(
+        default=None,
+        description="Publisher homepage or profile URL.",
+    )
+    email: Optional[str] = Field(
+        default=None,
+        description="Contact email (optional, shown only in details).",
+    )
+    avatar_url: Optional[str] = Field(
+        default=None,
+        description="Avatar / logo image URL (rendered in the details modal).",
+    )
+    github_username: Optional[str] = Field(
+        default=None,
+        description="GitHub username; the UI links to github.com/<username>.",
+    )
+    verified: bool = Field(
+        default=False,
+        description=(
+            "True when the publisher is a PELDRUN-verified entity. "
+            "Rendered as a shield icon next to the developer name."
+        ),
+    )
+
+
 class ProviderPackageCatalogItem(BaseModel):
     """
     One entry in the store catalog (``GET /api/store/providers/catalog``).
@@ -1471,6 +1519,26 @@ class ProviderPackageCatalogItem(BaseModel):
     package a user can install with one click. When ``download_url`` is
     present, the install path downloads the ZIP and runs the same
     validation pipeline as a manual upload.
+
+    Branding fields
+    ---------------
+    ``brand_color``, ``icon``, and ``icon_type`` let the catalog author
+    declare a visual identity for the provider. The Store renders the
+    icon in the package's brand color, matching the aesthetic of
+    user-installed packages (which derive the same data from their
+    manifest.json).
+
+    Developer fields
+    ----------------
+    ``developer`` is a structured object (name + links + avatar +
+    verified flag). The legacy flat fields ``author`` / ``author_url``
+    / ``homepage`` remain valid for backward compatibility.
+
+    Media / project links
+    ---------------------
+    ``repository_url``, ``license``, ``docs_url``, ``changelog_url``,
+    and ``screenshots`` give the details modal everything it needs to
+    render a full project card without a second network round-trip.
     """
 
     model_config = ConfigDict(extra="allow", populate_by_name=True)
@@ -1493,9 +1561,66 @@ class ProviderPackageCatalogItem(BaseModel):
     #: path verifies the hash before extraction.
     checksum_sha256: Optional[str] = None
 
+    # ------------------------------------------------------------------
+    # Branding
+    # ------------------------------------------------------------------
+    brand_color: Optional[str] = Field(
+        default=None,
+        description=(
+            "Primary brand color as a hex string (e.g. '#00C9A7'). "
+            "Rendered as the icon's accent color in the Store."
+        ),
+    )
+    icon: Optional[str] = Field(
+        default=None,
+        description=(
+            "Icon payload. When ``icon_type == 'name'``, this is the "
+            "base name of an asset in ``public/icon/`` (e.g. "
+            "'gigachat'). When ``icon_type == 'svg'``, this is the "
+            "full inline SVG markup. The Store sanitizes SVG before "
+            "rendering."
+        ),
+    )
+    icon_type: Literal["name", "svg"] = Field(
+        default="name",
+        description="How to interpret ``icon``.",
+    )
+
+    # ------------------------------------------------------------------
+    # Publisher metadata
+    # ------------------------------------------------------------------
     author: Optional[str] = None
     author_url: Optional[str] = None
     homepage: Optional[str] = None
+    developer: Optional[DeveloperInfo] = Field(
+        default=None,
+        description=(
+            "Structured developer metadata. Preferred over the flat "
+            "``author`` / ``author_url`` fields, which are retained "
+            "for backward compatibility."
+        ),
+    )
+    repository_url: Optional[str] = Field(
+        default=None,
+        description="Source repository URL (GitHub, GitLab, ...).",
+    )
+    license: Optional[str] = Field(
+        default=None,
+        description="SPDX license identifier (e.g. 'MIT', 'Apache-2.0').",
+    )
+    docs_url: Optional[str] = Field(
+        default=None,
+        description="Documentation URL.",
+    )
+    changelog_url: Optional[str] = Field(
+        default=None,
+        description="Changelog / release notes URL.",
+    )
+    screenshots: List[str] = Field(
+        default_factory=list,
+        description="Image URLs rendered in the details modal gallery.",
+    )
+
     tags: List[str] = Field(default_factory=list)
 
     #: Connection fields the package's manifest declares. Empty list
@@ -1555,5 +1680,6 @@ __all__ = [
     "ProviderPackageInstallResult",
     "ProviderPackageHealthCheck",
     "ProviderPackageHealthReport",
+    "DeveloperInfo",
     "ProviderPackageCatalogItem",
 ]

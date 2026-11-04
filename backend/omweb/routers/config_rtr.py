@@ -10,6 +10,7 @@ shared with the core runtime and surfaces TOML parse errors diagnostically.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -1815,20 +1816,48 @@ DEFAULT_VAULT = {
 
 
 def load_vault_from_disk() -> dict:
-    """Load persisted models vault from disk."""
+    """
+    Load persisted models vault from disk.
+
+    Every returned value is a DEEP copy, never a shallow one. This is
+    critical because callers (``save_provider_connection``,
+    ``save_models_vault``, the connection helpers below) mutate the
+    nested ``provider_connections`` / ``provider_package_models`` /
+    ``cloud_vault`` containers IN PLACE.
+
+    A shallow copy (``dict(DEFAULT_VAULT)``) only duplicates the outer
+    mapping; the nested lists and dicts remain shared by reference with
+    the module-level ``DEFAULT_VAULT`` constant. Any in-place mutation
+    would therefore leak across:
+
+      * subsequent requests in the same worker process,
+      * tests running back-to-back in a single Python interpreter,
+      * worker forks in a multi-process Uvicorn / Gunicorn deployment
+        (once polluted pre-fork, all children inherit the polluted state),
+      * schema upgrades (an old vault file gets the new default keys
+        injected by reference, then mutated by the next save).
+
+    Deep copying eliminates all of the above. ``DEFAULT_VAULT`` is
+    JSON-safe (only list / dict / str / int / bool / None), so
+    ``copy.deepcopy`` is cheap and fully sufficient.
+    """
     try:
         VAULT_DIR.mkdir(parents=True, exist_ok=True)
         if not VAULT_FILE.exists():
-            return dict(DEFAULT_VAULT)
+            return copy.deepcopy(DEFAULT_VAULT)
         with open(VAULT_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
             for k, v in DEFAULT_VAULT.items():
                 if k not in data:
-                    data[k] = v
+                    # Deep copy per-key for the same reason as above:
+                    # the value taken from DEFAULT_VAULT must never be
+                    # shared with it by reference, otherwise a mutation
+                    # of ``data[k]`` would mutate ``DEFAULT_VAULT[k]``.
+                    data[k] = copy.deepcopy(v)
             return data
     except Exception as e:
         logger.warning(f"[VAULT] Error reading vault file: {e}")
-        return dict(DEFAULT_VAULT)
+        return copy.deepcopy(DEFAULT_VAULT)
 
 
 def save_vault_to_disk(vault_data: dict) -> None:

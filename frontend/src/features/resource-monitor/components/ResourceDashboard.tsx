@@ -197,7 +197,7 @@ export function ResourceDashboard() {
     <div className="new p-b-3">
 
       {/* Error banner */}
-      <div className="p-2 mb-[15px] mt-[15px]">
+      <div className="p-2 mb-[15px] mt-[15px] ">
           <AnimatePresence>
             {currentError && (
               <motion.div
@@ -215,8 +215,11 @@ export function ResourceDashboard() {
           </AnimatePresence>
       </div>
 
-      {/* Diagnostic alerts */}
-      <DiagnosticsAlertBanner events={visibleDiagnostics} onDismiss={handleDismissAlert} />
+      <div className="DiagnosticsAlertBanner p-2 mb-[15px] mt-[15px] ">
+
+            {/* Diagnostic alerts */}
+            <DiagnosticsAlertBanner events={visibleDiagnostics} onDismiss={handleDismissAlert} />
+      </div>
 
       {/* Overview cards */}
       <HostOverviewCards snapshot={snapshot} isLoading={currentLoading} />

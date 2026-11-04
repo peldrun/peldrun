@@ -648,12 +648,58 @@ export interface ProviderConnection {
 }
 
 /**
+ * Structured developer / maintainer metadata for a catalog item.
+ *
+ * Mirrors ``DeveloperInfo`` on the Python side. All fields except
+ * ``name`` are optional. The Store renders a rich publisher block
+ * (avatar + name + verified shield + links) in the catalog details
+ * modal when this object is present.
+ *
+ * Backward compatibility
+ * ----------------------
+ * The legacy flat fields ``author`` / ``author_url`` on
+ * ``ProviderCatalogItem`` remain valid. When ``developer`` is
+ * missing, the UI falls back to those flat fields so old catalogs
+ * continue to work unchanged.
+ */
+export interface DeveloperInfo {
+  /** Human-readable publisher name. */
+  name: string;
+  /** Publisher homepage or profile URL. */
+  url?: string | null;
+  /** Contact email (rendered only in the details modal). */
+  email?: string | null;
+  /** Avatar / logo image URL. */
+  avatar_url?: string | null;
+  /** GitHub username; the UI links to github.com/<username>. */
+  github_username?: string | null;
+  /**
+   * True when the publisher is a PELDRUN-verified entity. Rendered
+   * as a shield icon next to the developer name.
+   */
+  verified?: boolean;
+}
+
+/**
  * One catalog item.
  *
  * Returned by ``GET /api/store/providers/catalog``. The
  * ``installable`` / ``installability_reason`` fields are computed
  * by the backend; ``download_url`` and ``checksum_sha256`` are both
  * required for an item to be installable (preview-only otherwise).
+ *
+ * Branding
+ * --------
+ * ``brand_color``, ``icon``, and ``icon_type`` let the catalog author
+ * declare a visual identity for the provider. The Store renders the
+ * icon in the package's brand color, matching the aesthetic of
+ * installed packages (which derive the same data from manifest.json).
+ *
+ * Installed state
+ * ---------------
+ * The catalog item itself does NOT carry an "installed" flag — that
+ * is derived at render time by cross-referencing the installed
+ * ``providers`` array. See ``ProviderCatalogInstallState`` below.
  */
 export interface ProviderCatalogItem {
   id: string;
@@ -669,9 +715,43 @@ export interface ProviderCatalogItem {
   download_url: string | null;
   checksum_sha256: string | null;
 
+  // ------------------------------------------------------------------
+  // Branding
+  // ------------------------------------------------------------------
+  /** Primary brand color as a hex string (e.g. ``"#00C9A7"``). */
+  brand_color?: string | null;
+  /**
+   * Icon payload. When ``icon_type === "name"``, this is the base
+   * name of an asset in ``public/icon/``. When ``icon_type === "svg"``,
+   * this is the full inline SVG markup (sanitized before rendering).
+   */
+  icon?: string | null;
+  /** How to interpret ``icon``. Defaults to ``"name"``. */
+  icon_type?: "name" | "svg";
+
+  // ------------------------------------------------------------------
+  // Publisher metadata
+  // ------------------------------------------------------------------
   author: string | null;
   author_url?: string | null;
   homepage: string | null;
+  /**
+   * Structured developer metadata. Preferred over ``author`` /
+   * ``author_url``. When present, the UI renders the richer
+   * publisher block in the details modal.
+   */
+  developer?: DeveloperInfo | null;
+  /** Source repository URL (GitHub, GitLab, ...). */
+  repository_url?: string | null;
+  /** SPDX license identifier (e.g. ``"MIT"``, ``"Apache-2.0"``). */
+  license?: string | null;
+  /** Documentation URL. */
+  docs_url?: string | null;
+  /** Changelog / release notes URL. */
+  changelog_url?: string | null;
+  /** Image URLs rendered in the details modal gallery. */
+  screenshots?: string[];
+
   tags: string[];
 
   /**
@@ -714,6 +794,54 @@ export interface ProviderCatalogItem {
    * sensitive permissions.
    */
   permission_warnings: string[];
+}
+
+/**
+ * Derived state computed by the UI at render time, by matching a
+ * ``ProviderCatalogItem`` against the installed ``providers`` list.
+ *
+ * The catalog item itself is unaware of install state — this struct
+ * captures the cross-reference so callers (the card, the details
+ * modal) can render the correct button and badges without
+ * duplicating the matching logic.
+ *
+ * Matching rule
+ * -------------
+ * A catalog item ``X`` matches an installed package ``P`` when
+ * ``X.id === P.id``. The manifest's ``id`` field is the canonical
+ * identifier across both surfaces, so equality is sufficient.
+ */
+export interface ProviderCatalogInstallState {
+  /** Whether the package is currently installed on this host. */
+  isInstalled: boolean;
+
+  /**
+   * Whether the installed package is enabled. ``false`` when the
+   * package is not installed at all (there is nothing to enable).
+   */
+  isEnabled: boolean;
+
+  /**
+   * The installed package's ``active_version``, or ``null`` when not
+   * installed. Used to display "Installed v1.0.0" vs the catalog's
+   * advertised version, which may differ.
+   */
+  installedVersion: string | null;
+
+  /**
+   * The installed package's list of version strings, sorted
+   * descending. Empty when not installed. Used by the details modal
+   * to show every available version for activation.
+   */
+  installedVersions: string[];
+
+  /**
+   * The installed package's entry, or ``null``. Kept on the struct
+   * so the card and modal can pass it directly to actions like
+   * ``onToggleProvider``, ``onConfigure``, ``onDelete`` without a
+   * second lookup.
+   */
+  installedPackage: ProviderPackageEntry | null;
 }
 
 /**

@@ -471,6 +471,111 @@ def _enrich_entry_with_certificate_status(
 
 
 # ---------------------------------------------------------------------------
+# Catalog install-state enrichment
+# ---------------------------------------------------------------------------
+
+
+def _enrich_catalog_item_with_install_state(
+    raw: Dict[str, Any],
+    installed_by_id: Dict[str, ProviderPackageEntry],
+) -> Dict[str, Any]:
+    """
+    Add install-state fields to a serialized catalog item.
+
+    The catalog item is a portable description of a package: it
+    declares the provider's identity, branding, developer metadata,
+    and download URL — but it is unaware of whether that package is
+    already installed on *this* PELDRUN instance. The UI needs that
+    information to render the correct action ("Install" vs
+    "Enable / Configure" vs "Already active") and to display the
+    installed version when it differs from the catalog's advertised
+    version.
+
+    The fields added here are computed at RESPONSE time by joining
+    the catalog item against the installed registry. They are NOT
+    part of the catalog's on-disk format — the JSON file remains
+    identical across every PELDRUN instance, keeping it portable.
+    Each instance derives its own install state at render time.
+
+    Fields added
+    ------------
+    * ``is_installed`` (bool)
+        True when the item's ``id`` matches an installed package.
+    * ``is_enabled`` (bool)
+        True only when the package is installed AND enabled. Always
+        ``false`` when the package is not installed (there is nothing
+        to enable).
+    * ``installed_version`` (str | None)
+        The installed package's ``active_version``, or ``None`` when
+        not installed. Used by the UI to show "Installed v1.0.0" vs
+        the catalog's ``version`` when they differ.
+    * ``installed_versions`` (list[str])
+        Every installed version, sorted descending. Empty when not
+        installed. Used by the details modal to offer rollback /
+        roll-forward version selection.
+    * ``has_active_connection`` (bool)
+        Same computation as ``ProviderPackageEntry.has_active_connection``
+        in the installed list. Present only when ``is_installed`` is
+        true. Lets the catalog card show "Not configured" without a
+        second fetch.
+    * ``active_connection_name`` (str | None)
+        Name of the active connection when one exists. Used by the
+        card to render the green "Connected" badge.
+
+    Parameters
+    ----------
+    raw
+        The catalog item already serialized to a dict (``item.model_dump()``),
+        including the ``installable`` / ``installability_reason`` /
+        ``permission_warnings`` fields that the caller has already added.
+    installed_by_id
+        Mapping of installed provider IDs to their registry entries.
+        Callers build this once per request so the join is O(1) per
+        item.
+    """
+    item_id = raw.get("id")
+    installed = installed_by_id.get(item_id) if item_id else None
+
+    if installed is None:
+        raw["is_installed"] = False
+        raw["is_enabled"] = False
+        raw["installed_version"] = None
+        raw["installed_versions"] = []
+        raw["has_active_connection"] = False
+        raw["active_connection_name"] = None
+        return raw
+
+    raw["is_installed"] = True
+    raw["is_enabled"] = bool(installed.enabled)
+    raw["installed_version"] = installed.active_version
+    raw["installed_versions"] = sorted(
+        [v.version for v in installed.installed_versions],
+        reverse=True,
+    )
+
+    # Derive the connection status from the vault. This mirrors the
+    # logic used by the installed-packages list endpoint so the card
+    # renders identically regardless of which tab the user is on.
+    try:
+        from omweb.routers.config_rtr import (
+            get_active_connection_for_package,
+        )
+
+        active_conn = get_active_connection_for_package(installed.id)
+    except Exception:
+        active_conn = None
+
+    if active_conn is not None:
+        raw["has_active_connection"] = True
+        raw["active_connection_name"] = active_conn.get("name") or None
+    else:
+        raw["has_active_connection"] = False
+        raw["active_connection_name"] = None
+
+    return raw
+
+
+# ---------------------------------------------------------------------------
 # Request models
 # ---------------------------------------------------------------------------
 
@@ -556,16 +661,53 @@ async def list_catalog_items() -> Dict[str, Any]:
 
     Each item includes:
 
-        * The catalog metadata (name, description, version, features).
-        * ``installable``: whether the item can be installed right now
-          (requires a valid ``download_url`` AND ``checksum_sha256``).
-        * ``installability_reason``: the human explanation of the above
-          flag — designed to render directly in a badge tooltip.
-        * ``permission_warnings``: the concrete strings to show in the
-          install confirmation dialog.
+        * **Catalog metadata** — name, description, version, transport,
+          features, permissions, tags, branding (``brand_color`` /
+          ``icon`` / ``icon_type``), developer info (``developer`` +
+          legacy ``author`` / ``author_url`` / ``homepage``), project
+          links (``repository_url`` / ``license`` / ``docs_url`` /
+          ``changelog_url`` / ``screenshots``), declared certificates,
+          and connection fields.
+
+        * **Installability** — ``installable`` (bool),
+          ``installability_reason`` (str), ``permission_warnings``
+          (list[str]).
+
+        * **Install state** — ``is_installed``, ``is_enabled``,
+          ``installed_version``, ``installed_versions``,
+          ``has_active_connection``, ``active_connection_name``.
+
+    The install-state fields are computed at response time by joining
+    the catalog against the installed registry. They are NOT part of
+    the catalog file itself — the on-disk JSON remains portable and
+    identical across every PELDRUN instance.
+
+    The remote catalog (when ``PELDRUN_PROVIDER_CATALOG_URL`` is set)
+    is refreshed before listing if the on-disk cache has expired. The
+    refresh is best-effort: a network failure leaves the previous
+    cache intact and this endpoint still returns the merged view —
+    the UI is never blocked by an unreachable GitHub.
     """
     catalog = get_provider_package_catalog()
+
+    # Best-effort remote refresh. TTL-guarded (24h default) so this
+    # is a no-op on the hot path. Failures are logged inside the
+    # catalog and do not raise.
+    try:
+        await catalog.ensure_fresh()
+    except Exception as exc:
+        logger.warning(
+            "Catalog refresh failed (non-fatal; serving cached view): %s",
+            exc,
+        )
+
     items = catalog.list_items()
+
+    # One registry read for the whole response — O(1) per item when
+    # joining.
+    installed_by_id: Dict[str, ProviderPackageEntry] = {
+        p.id: p for p in provider_package_manager.list_packages()
+    }
 
     result: List[Dict[str, Any]] = []
     for item in items:
@@ -575,7 +717,9 @@ async def list_catalog_items() -> Dict[str, Any]:
         raw["permission_warnings"] = _describe_catalog_permissions(
             item.permissions or {}
         )
-        result.append(raw)
+        result.append(
+            _enrich_catalog_item_with_install_state(raw, installed_by_id)
+        )
 
     return {
         "status": "ok",
@@ -584,16 +728,62 @@ async def list_catalog_items() -> Dict[str, Any]:
     }
 
 
+@router.get("/catalog/status")
+async def get_catalog_status() -> Dict[str, Any]:
+    """
+    Return a snapshot of the catalog state for diagnostics.
+
+    Exposes the per-source item counts (builtin / custom / extra /
+    remote), whether a remote URL is configured, the age of the
+    remote cache, and the last fetch error (if any). Intended for
+    operators who need to confirm that a configured
+    ``PELDRUN_PROVIDER_CATALOG_URL`` is actually contributing items.
+
+    No side effects — this endpoint does NOT trigger a refresh. Use
+    ``POST /catalog/refresh`` for that.
+
+    Route order note
+    ----------------
+    This handler MUST be registered BEFORE ``GET /catalog/{item_id}``
+    — otherwise FastAPI matches ``/catalog/status`` against the
+    ``{item_id}`` pattern first and dispatches here with
+    ``item_id="status"``.
+    """
+    catalog = get_provider_package_catalog()
+    return {
+        "status": "ok",
+        "catalog": catalog.get_status(),
+    }
+
+
 @router.get("/catalog/{item_id}")
 async def get_catalog_item(item_id: str) -> Dict[str, Any]:
     """
     Return a single catalog item by ID.
 
-    Same shape as one element of ``GET /catalog``. Returns 404 when the
-    item does not exist — this lets the frontend request the details
-    for a card the user clicked without re-fetching the entire catalog.
+    Same shape as one element of ``GET /catalog`` — including the
+    install-state fields (``is_installed`` / ``is_enabled`` /
+    ``installed_version`` / ``installed_versions`` /
+    ``has_active_connection`` / ``active_connection_name``) computed
+    by joining against the installed registry.
+
+    Returns 404 when the item does not exist — this lets the
+    frontend request the details for a card the user clicked without
+    re-fetching the entire catalog.
+
+    Refreshes the remote catalog first (TTL-guarded), so a user who
+    just published a new item to GitHub does not need to wait for the
+    listing endpoint to run before this one sees it.
     """
     catalog = get_provider_package_catalog()
+
+    try:
+        await catalog.ensure_fresh()
+    except Exception as exc:
+        logger.warning(
+            "Catalog refresh failed (non-fatal): %s", exc
+        )
+
     item = catalog.get_item(item_id)
     if item is None:
         raise HTTPException(
@@ -605,35 +795,100 @@ async def get_catalog_item(item_id: str) -> Dict[str, Any]:
             },
         )
 
+    # Single-item lookup — build the join map for just this entry.
+    installed = provider_package_manager.get_package(item_id)
+    installed_by_id: Dict[str, ProviderPackageEntry] = (
+        {item_id: installed} if installed is not None else {}
+    )
+
     raw = item.model_dump()
     raw["installable"] = is_installable(item)
     raw["installability_reason"] = installability_reason(item)
     raw["permission_warnings"] = _describe_catalog_permissions(
         item.permissions or {}
     )
-    return {"status": "ok", "item": raw}
+    return {
+        "status": "ok",
+        "item": _enrich_catalog_item_with_install_state(
+            raw, installed_by_id
+        ),
+    }
 
 
 @router.post("/catalog/refresh")
-async def refresh_catalog() -> Dict[str, Any]:
+async def refresh_catalog(
+    force_remote: bool = Query(
+        True,
+        description=(
+            "When true (default) and PELDRUN_PROVIDER_CATALOG_URL is "
+            "configured, bypass the 24h TTL and refetch from the "
+            "remote URL. When false, only the local files (builtin + "
+            "custom) are re-read, matching the pre-remote behavior."
+        ),
+    ),
+) -> Dict[str, Any]:
     """
-    Reload the catalog from disk.
+    Reload the catalog from disk AND (optionally) from the remote URL.
 
-    Re-reads ``builtin_catalog.json`` and (when configured) the custom
-    catalog at ``PELDRUN_PROVIDER_CATALOG_PATH``. Does NOT perform any
-    network call — the catalog file is a local artifact by design (see
-    ``catalog.py`` for the rationale).
+    Two-phase reload:
 
-    Useful when an operator edits the custom catalog without restarting
-    the backend, and in tests that swap the catalog file on disk.
+        1. **Local reload** — re-reads ``builtin_catalog.json`` and
+           (when configured) the custom catalog at
+           ``PELDRUN_PROVIDER_CATALOG_PATH``. Sync, fast, always
+           succeeds.
+
+        2. **Remote refresh** — when ``force_remote`` is true AND
+           ``PELDRUN_PROVIDER_CATALOG_URL`` is set, bypasses the TTL
+           and fetches from the remote URL. Best-effort: on network
+           failure the previous cache is preserved and the response
+           reports the error.
+
+    Used by operators to pull a newly-published catalog entry
+    immediately without waiting 24 hours, and by tests that swap a
+    catalog file on disk.
     """
     catalog = get_provider_package_catalog()
-    count = catalog.reload()
+
+    # Phase 1 — local reload (always runs, sync, cannot fail).
+    local_count = catalog.reload()
+
+    # Phase 2 — remote refresh (opt-in, async, best-effort).
+    remote_ok: Optional[bool] = None
+    if force_remote:
+        try:
+            remote_ok = await catalog.refresh()
+        except Exception as exc:
+            logger.warning(
+                "Remote catalog refresh raised (non-fatal): %s", exc
+            )
+            remote_ok = False
+
+    status = catalog.get_status()
+
     return {
         "status": "ok",
-        "total": count,
-        "message": f"Catalog reloaded: {count} item(s).",
+        "total": local_count,
+        "remote_refresh_attempted": force_remote,
+        "remote_refresh_ok": remote_ok,
+        "catalog_status": status,
+        "message": (
+            f"Catalog reloaded: {local_count} item(s)"
+            + (
+                f"; remote refresh "
+                f"{'succeeded' if remote_ok else 'failed or skipped'}"
+                if force_remote
+                else ""
+            )
+            + "."
+        ),
     }
+
+
+# NOTE: ``GET /catalog/status`` is registered ABOVE, immediately after
+# ``GET /catalog`` and BEFORE ``GET /catalog/{item_id}``. That ordering
+# is required: FastAPI matches routes in registration order, and the
+# ``{item_id}`` pattern would otherwise swallow ``/catalog/status``
+# with ``item_id="status"``. Do not move it back here.
 
 
 # ---------------------------------------------------------------------------
@@ -913,6 +1168,15 @@ async def install_from_catalog(provider_id: str) -> Dict[str, Any]:
     download or install errors are then mapped by ``_to_http_exception``.
     """
     catalog = get_provider_package_catalog()
+
+    # Best-effort refresh so an item published to the remote catalog
+    # is discoverable here even if the listing endpoint was not called
+    # first (e.g. direct API callers, or a race between page load and
+    # install click).
+    try:
+        await catalog.ensure_fresh()
+    except Exception:
+        pass
 
     item = catalog.get_item(provider_id)
     if item is None:

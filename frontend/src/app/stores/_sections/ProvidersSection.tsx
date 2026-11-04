@@ -1,7 +1,7 @@
 // frontend/src/app/stores/_sections/ProvidersSection.tsx
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   AlertCircle,
   CheckCircle2,
@@ -17,6 +17,7 @@ import {
   XCircle,
 } from "lucide-react";
 import type {
+  ProviderCatalogInstallState,
   ProviderCatalogItem,
   ProviderFilter,
   ProviderPackageEntry,
@@ -24,6 +25,8 @@ import type {
 } from "../_types/store";
 import type { SectionHeaderConfig } from "../_config/sections";
 import { ProviderPackageCard } from "../_components/ProviderPackageCard";
+import { CatalogItemDetailsModal } from "../_modals/CatalogItemDetailsModal";
+import { Icon } from "@/components/Icon/Icon";
 
 
 // ---------------------------------------------------------------------------
@@ -117,16 +120,169 @@ const TRANSPORT_BADGE_CLASSES: Record<ProviderTransport, string> = {
 // Catalog item card (simpler than the installed-package card)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Inline SVG sanitizer (defense-in-depth for catalog-authored icons)
+// ---------------------------------------------------------------------------
+
+/**
+ * Strip dangerous vectors from an inline SVG string before it is
+ * rendered with ``dangerouslySetInnerHTML``. The backend does not
+ * sanitize catalog-supplied SVG (a catalog is a text file, not an
+ * HTML response), so the frontend must guard against script tags,
+ * event handlers, and javascript: hrefs.
+ *
+ * Mirrors the pattern used by ``SkillIcon.tsx``.
+ */
+function sanitizeSvgInline(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed.includes("<svg")) return null;
+  return trimmed
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<foreignObject[\s\S]*?<\/foreignObject>/gi, "")
+    .replace(/\son\w+\s*=\s*(".*?"|'.*?'|[^\s>]+)/gi, "")
+    .replace(
+      /(href|xlink:href|src)\s*=\s*("javascript:[^"]*"|'javascript:[^']*'|"data:[^"]*"|'data:[^']*')/gi,
+      ""
+    )
+    .replace(/@import\s+url\s*\([^)]*\)/gi, "");
+}
+
+/**
+ * Render a catalog item's icon, respecting its declared branding.
+ *
+ * Priority
+ * --------
+ *   1. ``icon_type === "name"`` — delegate to the shared ``Icon``
+ *      component from ``@/components/Icon/Icon``. That component
+ *      renders the SVG inline and honors ``currentColor``, which
+ *      lets us tint it with ``brand_color`` by setting ``color`` on
+ *      the wrapper ``<span>``. (A plain ``<img>`` tag cannot tint an
+ *      external SVG — hence the switch from ``<img>`` to ``Icon``.)
+ *
+ *   2. ``icon_type === "svg"`` — inline sanitized SVG markup. Used
+ *      when the catalog author wants to ship a custom icon that is
+ *      not part of PELDRUN's bundled ``public/icon/`` inventory.
+ *
+ *   3. Fallback — the neutral ``Plug`` glyph in ``brand_color``.
+ *
+ * The wrapper is always a fixed-size ``<span>`` so the surrounding
+ * row layout never shifts when an icon is missing or slow to load.
+ */
+function CatalogItemIconInline({
+  item,
+  size = 20,
+}: {
+  item: ProviderCatalogItem;
+  size?: number;
+}) {
+  const brand = item.brand_color || "currentColor";
+  const iconValue = (item.icon || "").trim();
+  const iconType = item.icon_type || "name";
+
+  // Priority 1 — named icon via the shared Icon component.
+  // This is the recommended path: the icon name is resolved against
+  // the bundled inventory, and `currentColor` inherits `brand`.
+  if (iconValue && iconType === "name") {
+    return (
+      <span
+        style={{
+          color: brand,
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          width: size,
+          height: size,
+        }}
+        aria-hidden="true"
+      >
+        <Icon
+          name={iconValue}
+          size={size}
+          title={item.display_name || item.name || item.id}
+        />
+      </span>
+    );
+  }
+
+  // Priority 2 — inline SVG supplied by the catalog author.
+  if (iconValue && iconType === "svg") {
+    const safe = sanitizeSvgInline(iconValue);
+    if (safe) {
+      return (
+        <span
+          style={{
+            color: brand,
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            width: size,
+            height: size,
+          }}
+          aria-hidden="true"
+          dangerouslySetInnerHTML={{ __html: safe }}
+        />
+      );
+    }
+  }
+
+  // Priority 3 — neutral fallback in brand color.
+  return (
+    <span
+      style={{
+        color: brand,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        width: size,
+        height: size,
+      }}
+      aria-hidden="true"
+    >
+      <Plug style={{ width: size * 0.8, height: size * 0.8 }} />
+    </span>
+  );
+}
+
+
+// ---------------------------------------------------------------------------
+// Catalog item card
+// ---------------------------------------------------------------------------
+
 interface CatalogItemCardProps {
   item: ProviderCatalogItem;
+
+  /**
+   * Derived install state for this item, computed by the parent by
+   * joining against the installed ``providers`` list. Drives the
+   * badges and the primary action ("Install" vs "Update" vs
+   * "Configure").
+   */
+  installState: ProviderCatalogInstallState;
+
+  /** True while an install / update is in flight for this item. */
   installing: boolean;
+
+  /** Trigger install (or update) for this item. */
   onInstall: () => void;
+
+  /** Open the details modal for this item. */
+  onOpenDetails: () => void;
+
+  /** Open the Configure modal (only meaningful when installed). */
+  onConfigure: (providerId: string) => void;
+
+  /** Toggle enable/disable (only meaningful when installed). */
+  onToggleProvider: (providerId: string) => void;
 }
 
 function CatalogItemCard({
   item,
+  installState,
   installing,
   onInstall,
+  onOpenDetails,
+  onConfigure,
+  onToggleProvider,
 }: CatalogItemCardProps) {
   const displayName = item.display_name || item.name || item.id;
   const transport =
@@ -134,26 +290,72 @@ function CatalogItemCard({
   const badgeClass =
     TRANSPORT_BADGE_CLASSES[transport] ?? TRANSPORT_BADGE_CLASSES.native;
 
+  const hasVersionMismatch =
+    installState.isInstalled &&
+    installState.installedVersion !== null &&
+    installState.installedVersion !== item.version;
+
   const canInstall = item.installable && !installing;
 
+  // ---- Install-state badge --------------------------------------
+  const renderStateBadge = () => {
+    if (!installState.isInstalled) return null;
+    if (!installState.isEnabled) {
+      return (
+        <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/20 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-300">
+          <XCircle className="h-2.5 w-2.5" />
+          Disabled
+        </span>
+      );
+    }
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:text-emerald-300">
+        <CheckCircle2 className="h-2.5 w-2.5" />
+        Installed
+      </span>
+    );
+  };
+
   return (
-    <article className="group relative flex h-full flex-col rounded-xl border bg-card transition-all hover:border-primary/40 hover:shadow-sm">
-      {/* Header */}
-      <div className="flex items-start gap-3 p-4">
+    <article
+      className={[
+        "group relative flex flex-col sm:flex-row  items-center gap-4 ",
+        "p-4 rounded-sm border transition-all hover:shadow-md",
+        "border-card border-l-[5px] bg-card hover:border-card",
+      ].join(" ")}
+
+      style={{
+            borderLeftColor: item.brand_color
+              ? `${item.brand_color}` /* ~20% opacity */
+              : undefined,
+          }}
+
+    >
+      {/* ── Left: icon + content ─────────────────────────────── */}
+      <div className="flex items-center gap-3 sm:gap-4 flex-1 min-w-0">
+        {/* Icon container: tinted with the item's brand color.
+            Falls back to the neutral muted surface when the
+            catalog author did not declare ``brand_color``.
+            The 8-digit hex form (``#RRGGBBAA``) is CSS-native and
+            works in every modern browser — no runtime color
+            parsing needed on the client. */}
         <div
-          className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${badgeClass}`}
+          className="shrink-0 flex h-full w-20 items-center justify-center"
+
           aria-hidden="true"
         >
-          <Plug className="h-5 w-5" />
+          <CatalogItemIconInline item={item} size={55} />
         </div>
+
         <div className="min-w-0 flex-1">
-          <h3
-            className="truncate text-sm font-semibold text-foreground"
-            title={displayName}
-          >
-            {displayName}
-          </h3>
-          <div className="mt-1 flex flex-wrap items-center gap-1.5">
+          {/* Title + badges row */}
+          <div className="flex items-center gap-2 flex-wrap mb-1">
+            <h3
+              className="truncate text-sm font-semibold text-foreground"
+              title={displayName}
+            >
+              {displayName}
+            </h3>
             <span className="inline-flex items-center rounded-md bg-muted px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
               v{item.version}
             </span>
@@ -162,76 +364,161 @@ function CatalogItemCard({
             >
               {TRANSPORT_LABELS[transport] ?? transport}
             </span>
+            {renderStateBadge()}
+            {hasVersionMismatch && (
+              <span className="inline-flex items-center gap-1 rounded-full border border-blue-500/20 bg-blue-500/10 px-2 py-0.5 text-[11px] font-medium text-blue-700 dark:text-blue-300">
+                Update available
+              </span>
+            )}
             {!item.installable && (
               <span className="inline-flex items-center rounded-full border border-muted-foreground/20 bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
                 Preview only
               </span>
             )}
           </div>
+
+          {/* Description */}
+          <p
+            className="line-clamp-2 text-xs leading-relaxed text-muted-foreground"
+            title={item.description}
+          >
+            {item.description?.trim() || "No description provided."}
+          </p>
+
+          {/* Permission warnings (if any) */}
+          {item.permission_warnings && item.permission_warnings.length > 0 && (
+            <div className="mt-2">
+              <div className="flex items-start gap-1.5 rounded-md border border-amber-500/20 bg-amber-500/5 px-2 py-1.5">
+                <Shield className="mt-0.5 h-3 w-3 shrink-0 text-amber-600 dark:text-amber-400" />
+                <p className="text-[10px] leading-relaxed text-amber-900/80 dark:text-amber-200/70">
+                  {item.permission_warnings[0]}
+                  {item.permission_warnings.length > 1 && (
+                    <span className="ml-1 font-medium">
+                      +{item.permission_warnings.length - 1} more
+                    </span>
+                  )}
+                </p>
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Description */}
-      <p
-        className="line-clamp-2 px-4 text-xs leading-relaxed text-muted-foreground"
-        title={item.description}
-      >
-        {item.description?.trim() || "No description provided."}
-      </p>
-
-      {/* Permission warnings (if any) */}
-      {item.permission_warnings && item.permission_warnings.length > 0 && (
-        <div className="px-4 pt-3">
-          <div className="flex items-start gap-1.5 rounded-md border border-amber-500/20 bg-amber-500/5 px-2 py-1.5">
-            <Shield className="mt-0.5 h-3 w-3 shrink-0 text-amber-600 dark:text-amber-400" />
-            <p className="text-[10px] leading-relaxed text-amber-900/80 dark:text-amber-200/70">
-              {item.permission_warnings[0]}
-              {item.permission_warnings.length > 1 && (
-                <span className="ml-1 font-medium">
-                  +{item.permission_warnings.length - 1} more
-                </span>
-              )}
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* Footer */}
-      <div className="mt-auto flex items-center justify-between gap-2 border-t px-3 py-2.5">
-        <p
-          className="truncate text-[11px] text-muted-foreground"
-          title={item.installability_reason}
-        >
-          {item.installable ? "Ready to install" : item.installability_reason}
-        </p>
+      {/* ── Right: actions ───────────────────────────────────── */}
+      <div className="flex items-center gap-1.5 flex-wrap sm:flex-nowrap shrink-0 sm:self-center">
         <button
           type="button"
-          onClick={onInstall}
-          disabled={!canInstall}
-          className={[
-            "inline-flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
-            canInstall
-              ? "bg-primary text-primary-foreground hover:bg-primary/90"
-              : "cursor-not-allowed border bg-muted text-muted-foreground",
-          ].join(" ")}
+          onClick={onOpenDetails}
+          disabled={installing}
+          className="inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium border border-border text-foreground hover:bg-muted transition-colors disabled:cursor-not-allowed disabled:opacity-50 cursor-pointer"
         >
-          {installing ? (
-            <>
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              Installing…
-            </>
-          ) : item.installable ? (
-            <>
-              <Download className="h-3.5 w-3.5" />
-              Install
-            </>
-          ) : (
-            <>
-              <Eye className="h-3.5 w-3.5" />
-              Preview
-            </>
-          )}
+          <Eye className="h-3.5 w-3.5" />
+          Details
         </button>
+
+        {installState.isInstalled ? (
+          <>
+            <button
+              type="button"
+              onClick={() => onConfigure(item.id)}
+              disabled={installing}
+              className="inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium border border-border text-foreground hover:bg-muted transition-colors disabled:cursor-not-allowed disabled:opacity-50 cursor-pointer"
+            >
+              <Plug className="h-3.5 w-3.5" />
+              Configure
+            </button>
+
+            {hasVersionMismatch && (
+              <button
+                type="button"
+                onClick={onInstall}
+                disabled={!canInstall}
+                className={[
+                  "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors",
+                  canInstall
+                    ? "bg-primary text-primary-foreground hover:bg-primary/90 cursor-pointer"
+                    : "cursor-not-allowed border bg-muted text-muted-foreground",
+                ].join(" ")}
+                title={`Update from v${installState.installedVersion} to v${item.version}`}
+              >
+                {installing ? (
+                  <>
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    Updating…
+                  </>
+                ) : (
+                  <>
+                    <Download className="h-3.5 w-3.5" />
+                    Update
+                  </>
+                )}
+              </button>
+            )}
+
+            <div className="w-px h-6 bg-border mx-0.5" />
+
+            <button
+              type="button"
+              role="switch"
+              aria-checked={installState.isEnabled}
+              aria-label={
+                installState.isEnabled
+                  ? "Disable provider"
+                  : "Enable provider"
+              }
+              onClick={() => onToggleProvider(item.id)}
+              disabled={installing}
+              className={[
+                "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors",
+                installState.isEnabled
+                  ? "bg-emerald-500 hover:bg-emerald-600"
+                  : "bg-muted-foreground/30 hover:bg-muted-foreground/50",
+                installing
+                  ? "cursor-not-allowed opacity-60"
+                  : "cursor-pointer",
+              ].join(" ")}
+            >
+              <span
+                className={[
+                  "inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform",
+                  installState.isEnabled
+                    ? "translate-x-4"
+                    : "translate-x-0.5",
+                ].join(" ")}
+              />
+            </button>
+          </>
+        ) : (
+          <button
+            type="button"
+            onClick={onInstall}
+            disabled={!canInstall}
+            className={[
+              "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors",
+              canInstall
+                ? "bg-primary text-primary-foreground hover:bg-primary/90 cursor-pointer"
+                : "cursor-not-allowed border bg-muted text-muted-foreground",
+            ].join(" ")}
+            title={item.installability_reason}
+          >
+            {installing ? (
+              <>
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                Installing…
+              </>
+            ) : item.installable ? (
+              <>
+                <Download className="h-3.5 w-3.5" />
+                Install
+              </>
+            ) : (
+              <>
+                <Eye className="h-3.5 w-3.5" />
+                Preview
+              </>
+            )}
+          </button>
+        )}
       </div>
     </article>
   );
@@ -375,6 +662,88 @@ export function ProvidersSection({
 }: ProvidersSectionProps) {
   const [activeTab, setActiveTab] = useState<TabId>("installed");
 
+  /**
+   * The catalog item whose details modal is currently open, or
+   * ``null`` when closed. Kept separate from ``activeTab`` — the
+   * modal is orthogonal to which list the user is browsing.
+   */
+  const [detailsItem, setDetailsItem] = useState<ProviderCatalogItem | null>(
+    null,
+  );
+
+  /**
+   * Map of installed packages keyed by provider id. Used by
+   * ``computeInstallState`` to answer "is this catalog item
+   * installed on this instance?" in O(1) per item.
+   */
+  const installedById = useMemo(() => {
+    const map = new Map<string, ProviderPackageEntry>();
+    for (const p of providers) map.set(p.id, p);
+    return map;
+  }, [providers]);
+
+  /**
+   * Map of provider id → catalog branding override.
+   *
+   * Built from the catalog items currently loaded. Used to tint the
+   * installed package cards with the same brand color + icon that
+   * the catalog cards use. When the catalog is unavailable (remote
+   * fetch failed, or the package was uploaded manually), the map is
+   * empty and the installed card falls back to its transport color
+   * — a graceful degradation rather than a visual break.
+   */
+  const brandingByProviderId = useMemo(() => {
+    const map = new Map<
+      string,
+      {
+        brand_color?: string | null;
+        icon?: string | null;
+        icon_type?: "name" | "svg";
+      }
+    >();
+    for (const c of catalogItems) {
+      if (c.brand_color || c.icon) {
+        map.set(c.id, {
+          brand_color: c.brand_color ?? null,
+          icon: c.icon ?? null,
+          icon_type: c.icon_type,
+        });
+      }
+    }
+    return map;
+  }, [catalogItems]);
+
+  /**
+   * Compute the derived install state for a catalog item by joining
+   * against the installed registry. This is the single source of
+   * truth for "is it installed? enabled? at what version?" used by
+   * both the card badges and the details modal.
+   */
+  const computeInstallState = useCallback(
+    (item: ProviderCatalogItem): ProviderCatalogInstallState => {
+      const installed = installedById.get(item.id) ?? null;
+      if (!installed) {
+        return {
+          isInstalled: false,
+          isEnabled: false,
+          installedVersion: null,
+          installedVersions: [],
+          installedPackage: null,
+        };
+      }
+      return {
+        isInstalled: true,
+        isEnabled: installed.enabled,
+        installedVersion: installed.active_version,
+        installedVersions: [
+          ...installed.installed_versions.map((v) => v.version),
+        ].sort().reverse(),
+        installedPackage: installed,
+      };
+    },
+    [installedById],
+  );
+
   // --------------------------------------------------------------
   // Lazy catalog load — fetch once when the section first renders.
   //
@@ -507,11 +876,12 @@ export function ProvidersSection({
               onOpenUpload={onOpenUpload}
             />
           ) : (
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            <div className="flex flex-col gap-3">
               {filteredProviders.map((provider) => (
                 <ProviderPackageCard
                   key={provider.id}
                   provider={provider}
+                  brandingOverride={brandingByProviderId.get(provider.id)}
                   toggling={togglingProviderId === provider.id}
                   deleting={deletingProviderId === provider.id}
                   activating={activatingProviderId === provider.id}
@@ -538,18 +908,38 @@ export function ProvidersSection({
               error={catalogError}
             />
           ) : (
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            <div className="flex flex-col gap-3">
               {filteredCatalog.map((item) => (
                 <CatalogItemCard
                   key={item.id}
                   item={item}
+                  installState={computeInstallState(item)}
                   installing={installingCatalogId === item.id}
                   onInstall={() => void onInstallFromCatalog(item.id)}
+                  onOpenDetails={() => setDetailsItem(item)}
+                  onConfigure={onOpenConfigure}
+                  onToggleProvider={onToggleProvider}
                 />
               ))}
             </div>
           )}
         </>
+      )}
+
+      {/* ── Catalog item details modal ────────────────────────────── */}
+      {detailsItem && (
+        <CatalogItemDetailsModal
+          open={true}
+          item={detailsItem}
+          installState={computeInstallState(detailsItem)}
+          isInstalling={installingCatalogId === detailsItem.id}
+          installError={null}
+          onInstall={() => onInstallFromCatalog(detailsItem.id)}
+          onReinstall={() => onInstallFromCatalog(detailsItem.id)}
+          onToggleProvider={onToggleProvider}
+          onConfigure={onOpenConfigure}
+          onClose={() => setDetailsItem(null)}
+        />
       )}
     </div>
   );
