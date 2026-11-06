@@ -212,6 +212,12 @@ _PROFILE = AdapterProfile(
         "explicit reasoning field and precise stats. Native model "
         "discovery from /api/v0/models."
     ),
+    # Dynamic routing markers. Covers default ports, custom ports
+    # frequently used, and the explicit API paths users paste into
+    # the vault (e.g. http://172.18.48.1:1235/api/v1/).
+    default_base_url_markers=[
+        "1234", "1235", "lmstudio", "api/v0", "api/v1", "v1"
+    ],
 )
 
 

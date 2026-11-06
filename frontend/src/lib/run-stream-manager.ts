@@ -663,6 +663,14 @@ class RunStreamManager {
     // built-in error with a non-empty `.data` payload).
     if (connection.terminalReached) return;
 
+    // DIAGNOSTIC (temporary) — remove after verification
+    console.log(
+      "[RunStreamManager] event received: job=%s type=%s step=%s",
+      jobId,
+      eventType,
+      raw?.step,
+    );
+
     const envelope = buildEnvelope(jobId, eventType, raw);
 
     // 1. Reduce into stream-store.

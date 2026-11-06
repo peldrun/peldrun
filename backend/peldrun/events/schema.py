@@ -21,6 +21,11 @@ class EventType(str, Enum):
     SNAPSHOT = "snapshot"
     STEP_START = "step_start"
     THOUGHT = "thought"
+    # Streaming content delta — the model's user-visible output as it
+    # is generated, before the step ends. Kept distinct from THOUGHT
+    # (internal reasoning) so the frontend can render it in the main
+    # response bubble instead of the reasoning panel.
+    CHUNK = "chunk"
     AGENT_ACTIVITY = "agent_activity"
     TOOL_CALL = "tool_call"
     OBSERVATION = "observation"

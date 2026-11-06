@@ -427,32 +427,61 @@ class ToolCallAgent(BaseAgent):
             except (TypeError, ValueError):
                 _STREAM_FLUSH_CHARS = 20
 
-        # Clamp to sane bounds — protects against pathological values
-        # (0 would break batching; 10000 would make the stream choppy).
-        _STREAM_FLUSH_INTERVAL = max(0.01, min(1.0, _STREAM_FLUSH_INTERVAL))
-        _STREAM_FLUSH_CHARS = max(5, min(200, _STREAM_FLUSH_CHARS))
-
-        _stream_buffer: List[str] = []
-        _streamed_any = False
+        # Two independent buffers: content (user-visible output) and
+        # thought (internal reasoning). Mixing them into a single
+        # THOUGHT stream made the answer appear only at the very end of
+        # agent-mode runs, because the frontend renders CHUNK events in
+        # the main response bubble and THOUGHT events in the reasoning
+        # panel.
+        _content_buffer: List[str] = []
+        _thought_buffer: List[str] = []
+        _streamed_content_any = False
+        _streamed_thought_any = False
         _last_flush = time.monotonic()
 
-        async def _flush_deltas(force: bool = False) -> None:
-            nonlocal _last_flush, _streamed_any
-            if not _stream_buffer:
-                return
+        def _should_flush(buf: List[str], force: bool) -> bool:
+            if not buf:
+                return False
             now = time.monotonic()
-            pending_len = sum(len(x) for x in _stream_buffer)
-            should_flush = (
+            pending_len = sum(len(x) for x in buf)
+            return (
                 force
                 or pending_len >= _STREAM_FLUSH_CHARS
                 or (now - _last_flush) >= _STREAM_FLUSH_INTERVAL
             )
-            if not should_flush:
+
+        async def _flush_content(force: bool = False) -> None:
+            nonlocal _last_flush, _streamed_content_any
+            if not _should_flush(_content_buffer, force):
                 return
-            payload_text = "".join(_stream_buffer)
-            _stream_buffer.clear()
-            _last_flush = now
-            _streamed_any = True
+            payload_text = "".join(_content_buffer)
+            _content_buffer.clear()
+            _last_flush = time.monotonic()
+            _streamed_content_any = True
+            try:
+                await self._emit(
+                    EventType.CHUNK,
+                    step=step,
+                    payload={
+                        "delta": payload_text,
+                        "text": payload_text,
+                        "content": payload_text,
+                        "is_delta": True,
+                    },
+                )
+            except Exception as flush_err:
+                logger.debug(
+                    "Content flush failed for step %d: %s", step, flush_err
+                )
+
+        async def _flush_thought(force: bool = False) -> None:
+            nonlocal _last_flush, _streamed_thought_any
+            if not _should_flush(_thought_buffer, force):
+                return
+            payload_text = "".join(_thought_buffer)
+            _thought_buffer.clear()
+            _last_flush = time.monotonic()
+            _streamed_thought_any = True
             try:
                 await self._emit(
                     EventType.THOUGHT,
@@ -464,25 +493,43 @@ class ToolCallAgent(BaseAgent):
                     },
                 )
             except Exception as flush_err:
-                # A failed flush must never abort the generation loop;
-                # the user sees a slightly larger next flush instead.
                 logger.debug(
-                    "Streaming flush failed for step %d: %s", step, flush_err
+                    "Thought flush failed for step %d: %s", step, flush_err
                 )
 
+        async def _flush_all(force: bool = False) -> None:
+            await _flush_content(force=force)
+            await _flush_thought(force=force)
+
         async def _on_chunk(delta_text: str) -> None:
-            """Content-token callback from AsyncLLMClient."""
+            """Content-token callback — user-visible output.
+
+            Emits every delta immediately (force=True) so the frontend
+            can render word-by-word streaming, matching the pre-M8
+            behavior where each delta became a visible event. Rate
+            limiting via ``_should_flush`` is bypassed here because the
+            upstream provider ALREADY throttles deltas to a natural
+            token rate (~30/s), and the SSE channel can easily handle
+            that volume. Batching only helped for pathological
+            providers that send huge multi-KB chunks; those are rare
+            and the user's stated preference is per-token rendering.
+            """
             if not delta_text:
                 return
-            _stream_buffer.append(delta_text)
-            await _flush_deltas()
+            _content_buffer.append(delta_text)
+            await _flush_content(force=True)
 
         async def _on_thought_chunk(delta_text: str) -> None:
-            """Reasoning-token callback from AsyncLLMClient (e.g. R1 models)."""
+            """Reasoning-token callback — internal chain-of-thought.
+
+            Same force=True rationale as ``_on_chunk``: the user wants
+            to see reasoning unfold in real time inside the ``🧠 Agent
+            Reasoning`` panel of the step timeline.
+            """
             if not delta_text:
                 return
-            _stream_buffer.append(delta_text)
-            await _flush_deltas()
+            _thought_buffer.append(delta_text)
+            await _flush_thought(force=True)
 
         async def _call_llm(msgs: List[Dict[str, Any]]) -> LLMResponse:
             if hasattr(self.llm, "generate"):
@@ -603,24 +650,35 @@ class ToolCallAgent(BaseAgent):
         # Final flush: push any residual buffered text (incomplete last
         # word / sentence) so the timeline reflects the full generation.
         # ──────────────────────────────────────────────────────────────
-        await _flush_deltas(force=True)
+        await _flush_all(force=True)
 
-        thought_val = response.reasoning or response.thought or response.content or ""
-
-        # ──────────────────────────────────────────────────────────────
-        # Non-streaming fallback:
-        # If the provider never invoked on_chunk (e.g. AsyncLLMClient
-        # fell back to stream=False after a transport error), emit the
-        # full content as a single non-delta thought so the timeline is
-        # not empty.
-        # ──────────────────────────────────────────────────────────────
-        if thought_val and not _streamed_any:
+        # Fallback for the reasoning channel: if the provider never
+        # streamed any reasoning, emit the final reasoning text as a
+        # single non-delta THOUGHT so the reasoning panel is not empty.
+        thought_val = response.reasoning or response.thought or ""
+        if thought_val and not _streamed_thought_any:
             await self._emit(
                 EventType.THOUGHT,
                 step=step,
                 payload={
                     "thought": thought_val,
                     "content": thought_val,
+                    "is_delta": False,
+                },
+            )
+
+        # Fallback for the content channel: if the provider never
+        # streamed any content, surface the final answer as a single
+        # non-delta CHUNK so it appears in the main response bubble
+        # even on the non-streaming path.
+        if response.content and not _streamed_content_any:
+            await self._emit(
+                EventType.CHUNK,
+                step=step,
+                payload={
+                    "delta": response.content,
+                    "text": response.content,
+                    "content": response.content,
                     "is_delta": False,
                 },
             )
@@ -894,8 +952,9 @@ class ToolCallAgent(BaseAgent):
             if not tc.id:
                 tc.id = f"call_{uuid.uuid4().hex[:12]}"
 
-        tool_calls_payload = [
-            {
+        tool_calls_payload = []
+        for tc in response.tool_calls:
+            entry = {
                 "id": tc.id,
                 "type": "function",
                 "function": {
@@ -903,8 +962,16 @@ class ToolCallAgent(BaseAgent):
                     "arguments": json.dumps(tc.arguments, ensure_ascii=False) if isinstance(tc.arguments, dict) else str(tc.arguments),
                 },
             }
-            for tc in response.tool_calls
-        ]
+            # Gemini 2.5+ thinking models attach an opaque
+            # ``thought_signature`` to each function call. It MUST be
+            # echoed back verbatim when the message is replayed on the
+            # next turn, or the API returns 400 INVALID_ARGUMENT.
+            # Providers without this concept leave the field ``None``,
+            # so nothing extra is serialized for them.
+            _sig = getattr(tc, "thought_signature", None)
+            if _sig:
+                entry["thought_signature"] = _sig
+            tool_calls_payload.append(entry)
         self.messages.append({
             "role": "assistant",
             "content": response.content or "",

@@ -173,6 +173,20 @@ _PROFILE = AdapterProfile(
         "Native Google Gemini adapter. Uses google-genai SDK. "
         "Supports Gemini Developer API and Vertex AI."
     ),
+    # Markers that identify Google Gemini endpoints. When the user's
+    # vault base_url contains any of these substrings, the dispatcher
+    # will route the request here instead of openai_compat.
+    #
+    # Both "googleapis.com" (covers the native endpoint
+    # generativelanguage.googleapis.com) and "generativelanguage"
+    # (covers OpenAI-shim URLs like
+    # https://generativelanguage.googleapis.com/v1beta/openai) are
+    # declared. The `google_genai` adapter ignores `base_url` and
+    # builds its client from `api_key` only, so passing the OpenAI
+    # shim URL here is safe — the request will be sent to the
+    # native Gemini API and the thought_signature will be preserved
+    # end-to-end.
+    default_base_url_markers=["googleapis.com", "generativelanguage"],
 )
 
 
@@ -412,20 +426,35 @@ class GoogleGenAIAdapter:
                             except Exception:
                                 args = {}
 
-                        tool_calls_seen.append(
-                            ToolCall(
-                                id=str(call_id),
-                                name=str(name),
-                                arguments=args,
-                                type="function",
-                            )
+                        tc = ToolCall(
+                            id=str(call_id),
+                            name=str(name),
+                            arguments=args,
+                            type="function",
                         )
+                        # Preserve thought_signature for Gemini thinking models.
+                        sig = getattr(part, "thought_signature", None)
+                        if sig:
+                            try:
+                                tc.thought_signature = sig
+                            except Exception:
+                                pass
+                        # ``tool_index`` MUST be set to the call's
+                        # position. When Gemini returns multiple
+                        # parallel function calls, the normalizer uses
+                        # this index to keep them separate in its
+                        # accumulator. Without it, every call lands on
+                        # index=0 and their arguments concatenate into
+                        # one garbled ToolCall.
+                        this_call_index = len(tool_calls_seen)
+                        tool_calls_seen.append(tc)
 
                         seq += 1
                         yield LLMStreamEvent(
                             type=StreamEventType.TOOL_CALL_START,
                             tool_call_id=str(call_id),
                             tool_name=str(name),
+                            tool_index=this_call_index,
                             tool_arguments_delta=None,
                             sequence=seq,
                         )
@@ -434,7 +463,9 @@ class GoogleGenAIAdapter:
                             type=StreamEventType.TOOL_CALL_COMPLETE,
                             tool_call_id=str(call_id),
                             tool_name=str(name),
+                            tool_index=this_call_index,
                             tool_arguments_complete=args,
+                            provider_metadata={"thought_signature": sig} if sig else {},
                             sequence=seq,
                         )
 
@@ -827,14 +858,17 @@ class GoogleGenAIAdapter:
                         args_dict = raw_args
                     else:
                         args_dict = {}
-                    parts.append(
-                        google_types.Part(
-                            function_call=google_types.FunctionCall(
-                                name=str(name),
-                                args=args_dict,
-                            )
+                    part = google_types.Part(
+                        function_call=google_types.FunctionCall(
+                            name=str(name),
+                            args=args_dict,
                         )
                     )
+                    # Preserve thought_signature for Gemini thinking models.
+                    sig = tc.get("thought_signature")
+                    if sig:
+                        part.thought_signature = sig
+                    parts.append(part)
                 if parts:
                     contents.append(
                         google_types.Content(role="model", parts=parts)
@@ -1160,14 +1194,20 @@ class GoogleGenAIAdapter:
                             args = dict(args)
                         except Exception:
                             args = {}
-                    tool_calls.append(
-                        ToolCall(
-                            id=str(call_id),
-                            name=str(name),
-                            arguments=args,
-                            type="function",
-                        )
+                    tc = ToolCall(
+                        id=str(call_id),
+                        name=str(name),
+                        arguments=args,
+                        type="function",
                     )
+                    # Preserve thought_signature for Gemini thinking models.
+                    sig = getattr(part, "thought_signature", None)
+                    if sig:
+                        try:
+                            tc.thought_signature = sig
+                        except Exception:
+                            pass
+                    tool_calls.append(tc)
 
             finish_reason_raw = getattr(first, "finish_reason", None)
             if finish_reason_raw:

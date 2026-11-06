@@ -454,6 +454,13 @@ class PeldrunEngine(ExecutionEngine):
         files_baseline: Dict[str, Path] = _scan_workspace_files()
         known_artifact_paths: Set[str] = set(files_baseline.keys())
         latest_meaningful_thought: str = ""
+        # Accumulated user-visible content, streamed via EventType.CHUNK.
+        # Kept separate from ``latest_meaningful_thought`` (reasoning) so
+        # the final message is built from the actual response, not from
+        # internal chain-of-thought fragments. Falls back to
+        # ``latest_meaningful_thought`` only when the stream produced no
+        # content at all (non-streaming providers, provider errors).
+        accumulated_content: str = ""
 
         max_steps = int(manifest.get("max_steps") or 30)
         base_system_prompt = manifest.get(
@@ -1179,7 +1186,7 @@ class PeldrunEngine(ExecutionEngine):
             return discovered_paths
 
         async def _process_single_core_event(event: PeldrunEvent) -> None:
-            nonlocal latest_meaningful_thought, current_core_step, is_first_step_start, event_seq
+            nonlocal latest_meaningful_thought, accumulated_content, current_core_step, is_first_step_start, event_seq
             nonlocal collected_proxied_images, collected_images_query, collected_images_provider
 
             event_seq += 1
@@ -1247,6 +1254,45 @@ class PeldrunEngine(ExecutionEngine):
                             data={
                                 "thought": thought_text,
                                 "content": thought_text,
+                                "is_delta": is_delta,
+                                "seq": event_seq,
+                                "model": model_name,
+                            },
+                        ),
+                    )
+
+            elif event.type == EventType.CHUNK:
+                # Streaming content delta from the agent — the model's
+                # user-visible output. Dispatched as SSEEventType.CHUNK
+                # so the frontend renders it in the main response bubble
+                # (finalResult) instead of the reasoning panel.
+                raw_delta = (
+                    event.payload.get("delta")
+                    or event.payload.get("text")
+                    or event.payload.get("content")
+                    or ""
+                )
+                delta_text = str(raw_delta)
+                is_delta = bool(event.payload.get("is_delta"))
+                if delta_text:
+                    # Accumulate into `accumulated_content` so the final
+                    # message reflects the streamed response even when
+                    # `run_result.output` is empty or generic (e.g., when
+                    # the agent terminates via the `terminate` tool
+                    # without echoing the accumulated content back).
+                    if is_delta:
+                        accumulated_content = accumulated_content + delta_text
+                    else:
+                        accumulated_content = delta_text
+                    await dispatch_event(
+                        job_id,
+                        SSEEvent(
+                            type=SSEEventType.CHUNK,
+                            step=curr_step,
+                            data={
+                                "delta": delta_text,
+                                "text": delta_text,
+                                "content": delta_text,
                                 "is_delta": is_delta,
                                 "seq": event_seq,
                                 "model": model_name,
@@ -1682,15 +1728,15 @@ class PeldrunEngine(ExecutionEngine):
                     f"The run was stopped at step {current_core_step}. "
                     f"Partial output below."
                 )
-                if (
-                    latest_meaningful_thought
-                    and latest_meaningful_thought.strip()
-                ):
+                partial_text = (
+                    accumulated_content or latest_meaningful_thought
+                )
+                if partial_text and partial_text.strip():
                     # Cap at 2000 chars to avoid unbounded stored payloads
                     # from runaway reasoning loops.
-                    thought_snippet = latest_meaningful_thought.strip()[:2000]
+                    thought_snippet = partial_text.strip()[:2000]
                     cancellation_message += (
-                        "\n\n**Partial reasoning before cancellation:**\n\n"
+                        "\n\n**Partial output before cancellation:**\n\n"
                         f"> {thought_snippet}"
                     )
 
@@ -1853,8 +1899,17 @@ class PeldrunEngine(ExecutionEngine):
         # preserves the agent's output as the primary message and
         # only falls back to the deliverables block when the agent
         # produced no meaningful output of its own.
+        # Prefer the accumulated streamed content over the raw
+        # `run_result.output`. Background: agent mode streams content
+        # through `EventType.CHUNK`, which is independent of the
+        # reasoning channel (`latest_meaningful_thought`). When the
+        # provider is non-reasoning (GigaChat, Llama, Mistral, ...) the
+        # reasoning channel is empty, so falling back to it would
+        # produce either an empty message or a stray reasoning
+        # fragment. `accumulated_content` is the authoritative source.
+        streamed_fallback = accumulated_content or latest_meaningful_thought
         agent_output = sanitize_final_result_text(
-            run_result.output, latest_meaningful_thought
+            run_result.output, streamed_fallback
         )
 
         # Ignore generic success strings emitted by the terminate tool so

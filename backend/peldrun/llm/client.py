@@ -212,6 +212,12 @@ class ToolCall:
     name: str = ""
     arguments: Union[Dict[str, Any], str] = field(default_factory=dict)
     type: str = "function"
+    # Gemini 2.5+ thinking models attach an opaque, per-call signature to
+    # each FunctionCall part. It MUST be echoed back verbatim on the next
+    # turn or the API rejects the request with 400 INVALID_ARGUMENT
+    # ("Function call is missing a thought_signature"). Providers without
+    # this concept leave the field as ``None`` and it is never serialized.
+    thought_signature: Optional[str] = None
 
     def get(self, key: str, default: Any = None) -> Any:
         return getattr(self, key, default)
@@ -240,6 +246,10 @@ class DeltaToolCall:
     name: Optional[str] = None
     arguments: Optional[str] = None
     type: str = "function"
+    # Carries the ``thought_signature`` from a native TOOL_CALL_COMPLETE
+    # stream event (Google Gemini) into the accumulator. ``None`` for
+    # providers that do not emit one.
+    thought_signature: Optional[str] = None
 
 
 @dataclass

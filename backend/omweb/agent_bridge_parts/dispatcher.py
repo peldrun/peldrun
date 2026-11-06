@@ -18,7 +18,7 @@ import logging
 from pathlib import Path
 import time
 import traceback
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
 from omweb.agents.registry import AgentNotFoundError, agent_registry
@@ -318,6 +318,217 @@ def _is_reasoning_model(model_name: str, active_llm: Optional[Dict[str, Any]] = 
     )
 
 
+# =========================================================================
+# [M7.3] Native adapter routing (data-driven, zero hard-coding)
+# =========================================================================
+#
+# Routes a request to a Native Adapter ONLY when ALL of the following
+# are true:
+#
+#   1. ``use_native_adapters`` is not explicitly disabled by config.
+#   2. The provider's ``api_type`` is not an explicit opt-out
+#      (``"chat_completions"`` forces openai_compat).
+#   3. The provider name resolves to a REGISTERED Native Adapter in
+#      ``provider_registry`` (guarantees its SDK is installed).
+#   4. Either the caller's ``base_url`` is empty (use the provider's
+#      default endpoint), OR it contains one of the adapter's declared
+#      ``default_base_url_markers`` (e.g. "googleapis.com" for Google).
+#
+# The markers live on each adapter's ``_PROFILE`` in
+# ``peldrun/llm/providers/*.py``. This module contains NO mapping
+# table, NO marker list, NO alias list. Adding a new provider requires
+# exactly ONE change (declare markers on the adapter's ``_PROFILE``)
+# and NO edits to this file.
+#
+# When ANY condition fails, the caller falls back to ``openai_compat``
+# — the compatibility baseline that has always worked.
+# =========================================================================
+
+
+def _native_adapters_enabled(active_llm: Dict[str, Any]) -> bool:
+    """
+    Return True when Native Adapter routing is enabled.
+
+    Default: True (opt-out). The user can disable it per-deployment
+    via ``config.toml``::
+
+        [llm]
+        use_native_adapters = false
+
+    This flag exists as an emergency escape hatch — if a future
+    provider SDK introduces a regression, the operator can revert to
+    the ``openai_compat`` path without changing code.
+    """
+    raw = active_llm.get("use_native_adapters", True)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() not in ("false", "0", "no", "off")
+    return bool(raw)
+
+
+def _resolve_native_adapter(
+    active_llm: Dict[str, Any],
+    candidates: List[str],
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """
+    Resolve a Native Adapter for the active provider, or return None.
+
+    Returning ``None`` signals the caller to fall back to
+    ``openai_compat``. That fallback covers every "not sure" case —
+    Custom Endpoints, missing SDKs, custom proxy URLs, and explicit
+    opt-outs.
+
+    Every routing signal comes from:
+      • ``active_llm``        — populated from config.toml / vault
+      • ``provider_registry`` — populated by providers/__init__.py
+      • ``AdapterProfile``    — declared on each adapter class
+
+    Nothing is hard-coded here.
+    """
+    # Guard 1 — feature flag.
+    if not _native_adapters_enabled(active_llm):
+        logger.debug(
+            "[BRIDGE] Native adapters disabled by config "
+            "(use_native_adapters=false)."
+        )
+        return None
+
+    # Lazy import: dispatcher.py is imported very early in startup.
+    try:
+        from peldrun.llm.providers.registry import (
+            SOURCE_BUILTIN,
+            provider_registry,
+        )
+    except Exception as exc:
+        logger.debug(
+            "[BRIDGE] provider_registry import failed; skipping native "
+            "routing: %s",
+            exc,
+        )
+        return None
+
+    # Guard 2 — explicit api_type override from the vault / request.
+    #
+    # The frontend's API mode selector writes this value. Honoring it
+    # unconditionally means the user always retains final control —
+    # even for a provider that WOULD have used a Native Adapter.
+    api_type = str(active_llm.get("api_type") or "").strip().lower()
+
+    if api_type in (
+        "chat_completions", "chat-completions", "chat completions",
+        "openai_compat", "openai-compat",
+    ):
+        logger.info(
+            "[BRIDGE] api_type=%r explicitly forces openai_compat.",
+            api_type,
+        )
+        return None
+
+    if api_type in ("responses", "responses api", "responses-api"):
+        reg = provider_registry.find("openai_native")
+        if reg is not None and reg.source == SOURCE_BUILTIN:
+            logger.info(
+                "[BRIDGE] api_type=%r → openai_native.", api_type
+            )
+            return ("openai_native", {})
+        return None
+
+    if api_type in (
+        "anthropic", "anthropic_messages", "anthropic-messages",
+        "anthropic messages",
+    ):
+        reg = provider_registry.find("anthropic")
+        if reg is not None and reg.source == SOURCE_BUILTIN:
+            logger.info(
+                "[BRIDGE] api_type=%r → anthropic.", api_type
+            )
+            return ("anthropic", {})
+        return None
+
+    # Guard 3 + 4 — registry lookup + base_url marker match.
+    base_url = str(active_llm.get("base_url") or "").strip().lower()
+
+    for candidate in candidates:
+        registration = provider_registry.find(candidate)
+        if registration is None:
+            continue
+
+        # Skip plugin packages (handled by the plugin loop earlier).
+        if registration.source != SOURCE_BUILTIN:
+            continue
+        if "custom_plugin" in (registration.class_path or ""):
+            continue
+
+        # Skip legacy wrappers (openai_compat, lmstudio, ollama legacy).
+        adapter_class = registration.adapter_class
+        adapter_style = getattr(adapter_class, "ADAPTER_STYLE", "legacy")
+
+        # [M7.3 FIX] If a legacy adapter is matched, automatically check
+        # for its native equivalent (e.g., "lmstudio" -> "lmstudio_native").
+        if adapter_style != "v1":
+            native_reg = provider_registry.find(f"{candidate}_native")
+            if native_reg is not None:
+                registration = native_reg
+                adapter_class = registration.adapter_class
+                adapter_style = getattr(adapter_class, "ADAPTER_STYLE", "legacy")
+
+        if adapter_style != "v1":
+            continue
+
+        # Read the markers from the adapter's own PROFILE.
+        profile = getattr(adapter_class, "PROFILE", None)
+        markers: List[str] = []
+        if profile is not None:
+            raw_markers = getattr(profile, "default_base_url_markers", None)
+            if isinstance(raw_markers, list):
+                markers = [
+                    str(m).strip().lower()
+                    for m in raw_markers
+                    if isinstance(m, str) and str(m).strip()
+                ]
+
+        # Empty base_url → use the provider's default endpoint → Native.
+        if not base_url:
+            logger.info(
+                "[BRIDGE] Provider %r → native adapter %r "
+                "(default endpoint).",
+                candidate,
+                registration.provider_id,
+            )
+            return (registration.provider_id, {})
+
+        # Marker match → Native Adapter.
+        if markers and any(m in base_url for m in markers):
+            logger.info(
+                "[BRIDGE] Provider %r → native adapter %r "
+                "(base_url marker match: %r).",
+                candidate,
+                registration.provider_id,
+                active_llm.get("base_url"),
+            )
+            return (registration.provider_id, {})
+
+        # No marker match → the user is pointing the provider at a
+        # custom proxy. Respect that choice: use openai_compat.
+        logger.info(
+            "[BRIDGE] Provider %r has custom base_url %r — "
+            "using openai_compat (respecting user's proxy choice).",
+            candidate,
+            active_llm.get("base_url"),
+        )
+        return None
+
+    # No candidate matched any registered native adapter. This is the
+    # normal path for Custom Endpoints and unknown providers.
+    logger.debug(
+        "[BRIDGE] No native adapter for candidates=%r. "
+        "Using openai_compat.",
+        candidates,
+    )
+    return None
+
+
 def _resolve_provider_and_extras(
     active_llm: Dict[str, Any],
     *,
@@ -380,14 +591,11 @@ def _resolve_provider_and_extras(
     _push_candidate(active_llm.get("provider"))
     _push_candidate(active_llm.get("provider_name"))
 
-    # Base-URL hints for local servers — some flows do not set
-    # ``provider`` explicitly, only ``base_url``.
-    base_url = str(active_llm.get("base_url") or "")
-    if "11434" in base_url:
-        _push_candidate("ollama")
-    if "1234" in base_url:
-        _push_candidate("lmstudio")
-
+    # NOTE: We deliberately do NOT infer the provider from `base_url`
+    # or port numbers. The vault (`models_vault.json`) is the single
+    # source of truth for `provider` and `provider_name`. Any Custom
+    # Endpoint that does not match a registered built-in provider ID
+    # will safely fall through to `openai_compat`.
     if not candidates:
         return ("openai_compat", {})
 
@@ -590,6 +798,23 @@ def _resolve_provider_and_extras(
         )
 
         return (registration.provider_id, extra_params)
+
+    # ------------------------------------------------------------------
+    # [M7.3] Native Adapter routing (data-driven, no hard-coding).
+    #
+    # Runs AFTER the plugin loop, so a Store-installed Provider Package
+    # always wins over a built-in name collision (they cannot collide
+    # anyway — the registry protects built-ins — but this ordering
+    # documents the priority).
+    #
+    # If _resolve_native_adapter returns None, openai_compat is used.
+    # That fallback covers: Custom Endpoints, missing SDKs, custom
+    # proxy URLs, api_type="chat_completions", and
+    # use_native_adapters=false.
+    # ------------------------------------------------------------------
+    native_result = _resolve_native_adapter(active_llm, candidates)
+    if native_result is not None:
+        return native_result
 
     return ("openai_compat", {})
 
@@ -1249,7 +1474,12 @@ async def run_instrumented(
             active_llm,
             connection_id=job_id,
         )
-        if _plugin_provider_id != "openai_compat" and _plugin_extra_params:
+        # [M7.3 FIX] The previous condition required _plugin_extra_params
+        # to be truthy, which excluded Native Adapters (they return
+        # extra_params={} by design). Removing the second clause lets
+        # both plugin AND native adapters set _peldrun_provider_id, so
+        # the executor routes correctly.
+        if _plugin_provider_id != "openai_compat":
             # Extract reserved overrides before storing in active_llm.
             # These will be consumed by ``executor.py`` when it builds
             # the ConnectionContext for the run.
@@ -2099,19 +2329,31 @@ async def run_direct_chat(
         adapter_extra_params.pop("_peldrun_connection_id", None)
 
         if adapter_provider_id != "openai_compat":
-            logger.info(
-                "[BRIDGE DIRECT CHAT] Routing to plugin provider %r "
-                "(transport=%s) for job %s.",
-                adapter_provider_id,
-                (
-                    adapter_extra_params.get(PLUGIN_DESCRIPTOR_KEY, {}).get(
-                        "transport", "unknown"
-                    )
-                    if adapter_extra_params
-                    else "unknown"
-                ),
-                job_id,
+            # Distinguish plugin vs native in logs. `PLUGIN_DESCRIPTOR_KEY`
+            # is present ONLY for Store-installed Provider Packages;
+            # native adapters return empty extra_params.
+            _is_plugin = bool(
+                adapter_extra_params
+                and adapter_extra_params.get(PLUGIN_DESCRIPTOR_KEY)
             )
+            if _is_plugin:
+                _transport = adapter_extra_params.get(
+                    PLUGIN_DESCRIPTOR_KEY, {}
+                ).get("transport", "unknown")
+                logger.info(
+                    "[BRIDGE DIRECT CHAT] Routing to plugin provider "
+                    "%r (transport=%s) for job %s.",
+                    adapter_provider_id,
+                    _transport,
+                    job_id,
+                )
+            else:
+                logger.info(
+                    "[BRIDGE DIRECT CHAT] Routing to native adapter "
+                    "%r for job %s.",
+                    adapter_provider_id,
+                    job_id,
+                )
 
         # Build connection context. ``extra_params`` carries the plugin
         # descriptor + any custom fields the package declared (scope,

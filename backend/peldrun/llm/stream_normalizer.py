@@ -394,6 +394,20 @@ class StreamNormalizer:
                             "name": event.tool_name or "",
                         },
                     )
+                    # Native adapters (Google Gemini thinking models,
+                    # notably) attach an opaque per-call token in
+                    # ``provider_metadata["thought_signature"]``. It MUST
+                    # be forwarded to the accumulator so it reaches the
+                    # final ToolCall and is echoed back on the next turn.
+                    # Missing this was the root cause of
+                    # "Function call is missing a thought_signature".
+                    thought_sig: Optional[str] = None
+                    if event.provider_metadata:
+                        raw_sig = event.provider_metadata.get(
+                            "thought_signature"
+                        )
+                        if isinstance(raw_sig, str) and raw_sig:
+                            thought_sig = raw_sig
                     yield StreamChunk(
                         tool_call_deltas=[
                             DeltaToolCall(
@@ -402,6 +416,7 @@ class StreamNormalizer:
                                 name=sig["name"],
                                 arguments=args_str,
                                 type="function",
+                                thought_signature=thought_sig,
                             )
                         ]
                     )
@@ -511,6 +526,9 @@ class _ResponseAccumulator:
                     or f"call_{uuid.uuid4().hex[:8]}",
                     "name": getattr(delta, "name", None) or "",
                     "arguments": getattr(delta, "arguments", None) or "",
+                    "thought_signature": getattr(
+                        delta, "thought_signature", None
+                    ),
                 }
             else:
                 slot = self.tool_call_deltas[index]
@@ -523,6 +541,12 @@ class _ResponseAccumulator:
                 incoming_args = getattr(delta, "arguments", None)
                 if incoming_args:
                     slot["arguments"] += incoming_args
+                # Late-arriving thought_signature (some adapters emit
+                # it only on the COMPLETE event, not on incremental
+                # deltas). Any non-None value wins.
+                incoming_sig = getattr(delta, "thought_signature", None)
+                if incoming_sig:
+                    slot["thought_signature"] = incoming_sig
 
         # Finish reason / usage / provider metadata.
         if chunk.finish_reason is not None:
@@ -577,6 +601,7 @@ class _ResponseAccumulator:
                     name=slot.get("name") or "",
                     arguments=parsed_args,
                     type="function",
+                    thought_signature=slot.get("thought_signature"),
                 )
             )
 

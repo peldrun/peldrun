@@ -144,6 +144,30 @@ export function reduceEvent(state: RunState, event: SSEEnvelope): RunState {
         })),
       };
 
+    // Streaming content delta from agent mode (EventType.CHUNK).
+    // Accumulated into `finalAnswer` so the deliverable bubble renders
+    // the response as it is generated. The `final` event later
+    // overwrites (or confirms) the same field with the authoritative
+    // text — see `case "final"` below.
+    //
+    // Before this branch existed, CHUNK events fell through to
+    // `default` and were silently dropped, which had two visible
+    // symptoms:
+    //   1. During streaming: no visible output → the run looked frozen.
+    //   2. On completion: `run_result.output` was generic → the final
+    //      bubble showed either nothing or an unrelated reasoning
+    //      fragment.
+    case "chunk": {
+      const delta =
+        event.data.delta || event.data.text || event.data.content || "";
+      if (!delta) return base;
+      return {
+        ...base,
+        status: "running",
+        finalAnswer: (state.finalAnswer || "") + delta,
+      };
+    }
+
     case "tool_call":
     case "tool_called": {
       const toolCallId =
@@ -414,12 +438,24 @@ export function reduceEvent(state: RunState, event: SSEEnvelope): RunState {
     }
 
     case "final":
-    case "done":
+    case "done": {
+      // Preserve accumulated streaming content when the FINAL payload
+      // is empty. Background: agent mode may synthesize a FINAL with
+      // `result=""` when the run terminated via a tool that did not
+      // echo content back. The streamed `finalAnswer` already holds
+      // the authoritative text in that case, so overwriting it with
+      // "" would erase the visible output the user just watched
+      // stream in.
+      const authoritative =
+        event.data.result || event.data.output || "";
+      const finalAnswer =
+        authoritative || state.finalAnswer || "";
       return {
         ...base,
         status: "completed",
-        finalAnswer: event.data.result || event.data.output || "",
+        finalAnswer,
       };
+    }
 
     case "cancelled":
       return {

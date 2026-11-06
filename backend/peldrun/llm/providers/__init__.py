@@ -233,7 +233,13 @@ def _bootstrap_builtin_providers() -> None:
         "peldrun.llm.providers.google_genai",
         "GoogleGenAIAdapter",
         "Google Gemini (Native)",
-        aliases=["gemini", "google-gemini", "google_gemini"],
+        # "google" is added so provider_registry.find("google") resolves
+        # to the native adapter. The vault uses "google" as the provider
+        # id (see models_vault.json → cloud_vault[].id), so this alias is
+        # the ONLY way the dispatcher can discover that the user meant
+        # Google Gemini and NOT some custom OpenAI-compatible endpoint
+        # that happens to have been named "google".
+        aliases=["gemini", "google-gemini", "google_gemini", "google"],
     )
     _register_native(
         "ollama_native",

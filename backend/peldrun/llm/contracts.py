@@ -482,6 +482,35 @@ class AdapterProfile(BaseModel):
     #: Optional per-adapter notes surfaced in the Request Inspector.
     notes: Optional[str] = None
 
+    #: Host/path/port markers used by the dispatcher to decide whether
+    #: a configured ``base_url`` points at the provider's own endpoint
+    #: (in which case the Native Adapter should handle the request) or
+    #: at a user-controlled proxy (in which case ``openai_compat``
+    #: should be used to preserve the user's intent).
+    #:
+    #: This field exists so the routing decision lives in the ADAPTER
+    #: — where the provider-specific knowledge belongs — and NOT in a
+    #: hard-coded map inside ``dispatcher.py``. Adding a new provider
+    #: therefore requires exactly ONE change (declare markers on the
+    #: adapter's ``_PROFILE``) and NO edits to dispatcher.
+    #:
+    #: Matching is case-insensitive substring on the lowered ``base_url``.
+    #: Empty markers mean "the adapter does NOT participate in native
+    #: routing" — safe default for legacy adapters.
+    #:
+    #: An empty ``base_url`` from the caller is always treated as
+    #: "use the provider's default endpoint" and routes to the
+    #: Native Adapter regardless of markers.
+    #:
+    #: Examples
+    #: --------
+    #:     Google    -> ["googleapis.com"]
+    #:     Anthropic -> ["api.anthropic.com"]
+    #:     OpenAI    -> ["api.openai.com"]
+    #:     LM Studio -> ["1234", "lmstudio"]
+    #:     Ollama    -> ["11434", "ollama"]
+    default_base_url_markers: List[str] = Field(default_factory=list)
+
 
 # ---------------------------------------------------------------------------
 # Connection context

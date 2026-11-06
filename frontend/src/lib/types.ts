@@ -5,6 +5,7 @@ export type ServerEventName =
   | "run_started"
   | "step_start"
   | "thought"
+  | "chunk"
   | "tool_call"
   | "tool_called"
   | "tool_retry"
