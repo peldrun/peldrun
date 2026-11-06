@@ -4,7 +4,10 @@
 import React, { useState } from "react";
 import { motion } from "framer-motion";
 import { AlertCircle, Loader2, Package as PackageIcon } from "lucide-react";
-import { ModelDiscoveryModal } from "../../../ModelDiscoveryModal";
+import {
+  ModelDiscoveryModal,
+  type ModelsDiscoverySavePayload,
+} from "../../../ModelDiscoveryModal";
 import { PackageCard } from "./PackageCard";
 import {
   useProviderPackages,
@@ -80,12 +83,34 @@ export function StoreProvidersTab({
   };
 
   const handleSaveModels = async (
-    selectedModels: string[],
-    defaultModel?: string
+    payload: ModelsDiscoverySavePayload
   ) => {
     if (!scanning) return;
-    const primary = defaultModel || selectedModels[0] || "";
+
+    const selectedModels = payload.models;
+    const primary = payload.defaultModel || selectedModels[0] || "";
+
     try {
+      /* Persist ONLY the user's model selection (which models are
+         exposed + which one is the default).
+
+         Metadata persistence is intentionally NOT repeated here:
+         `ModelDiscoveryModal.fetchModelsFromApi()` already calls
+         `/api/config/fetch-models`, whose Step 3 invokes
+         `save_metadata_cache_merge(metadata)` on the backend. That
+         single call is the canonical write path for
+         `storage/models_metadata.json` — every branch (native
+         adapter, explicit metadata endpoint, generic `/models`,
+         external package) funnels through it, and merge rules
+         preserve any user-authored `manual` capability already on
+         disk. Adding a second write from the frontend would be
+         redundant and could race the scan if the two requests land
+         out of order.
+
+         The `facts` map (catalog capability overlay) is likewise
+         not re-persisted: the badges it drives are re-fetched
+         fresh on every `ModelInfoModal` render, so there is nothing
+         to durably store at this layer. */
       await saveModelsForPackage(scanning.id, selectedModels, primary);
     } finally {
       setScanning(null);

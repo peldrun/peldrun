@@ -118,6 +118,13 @@ class _ToolCallAgentBridge:
         # (ToolCallAgent internals, diagnostics) that reads them.
         self.profile = getattr(adapter, "profile", None)
         self.provider_id = getattr(adapter, "provider_id", None)
+        # [FIX-MODEL-NAME] Expose the model ID so error messages and
+        # diagnostics that read `self.llm.model` (e.g. the empty-
+        # response error in `tool_call_agent.step`) report the real
+        # model name instead of "unknown". Mirrors the legacy
+        # `AsyncLLMClient.model` attribute that `ToolCallAgent`
+        # historically looked up.
+        self.model = base_request.model_id
 
     # ------------------------------------------------------------------
 

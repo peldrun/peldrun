@@ -26,6 +26,31 @@ import { Button } from "@/components/ui/button";
 import { inferModelCapabilities, fetchModelFacts } from "@/lib/modelMetadata";
 import type { ModelFacts, CapabilitySource } from "@/lib/modelMetadata";
 
+/**
+ * Payload returned to the caller when the user confirms a model
+ * selection. Carries the raw provider metadata plus the catalog
+ * capability facts so the parent can persist them into
+ * `storage/models_metadata.json` alongside the vault and budget
+ * files (which are already saved from `models` + `defaultModel`).
+ */
+export interface ModelsDiscoverySavePayload {
+  models: string[];
+  defaultModel?: string;
+  /**
+   * Raw provider metadata as returned by `/api/config/fetch-models`
+   * under `models_metadata` (display_name, params_string,
+   * max_context_length, quantization, publisher, capabilities,
+   * capability_sources, ...).
+   */
+  metadata: Record<string, any>;
+  /**
+   * Catalog capability facts (vision / tools / reasoning) fetched
+   * from `/api/catalog/models/{modelId}`. Persisted so the badges
+   * shown here match exactly what `ModelInfoModal` renders.
+   */
+  facts: Record<string, ModelFacts>;
+}
+
 interface ModelDiscoveryModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -42,7 +67,7 @@ interface ModelDiscoveryModalProps {
   // producing the double-suffixed `/api/api/v0/models` path.
   metadataEndpoint?: string;
   initialSavedModels?: string[];
-  onSaveModels: (selectedModels: string[], defaultModel?: string) => void;
+  onSaveModels: (payload: ModelsDiscoverySavePayload) => void;
 }
 
 export function ModelDiscoveryModal({
@@ -185,7 +210,12 @@ export function ModelDiscoveryModal({
 
   const handleSave = () => {
     const list = Array.from(selectedModels);
-    onSaveModels(list, defaultModel || list[0]);
+    onSaveModels({
+      models: list,
+      defaultModel: defaultModel || list[0],
+      metadata: modelsMetadata,
+      facts: modelFactsMap,
+    });
     onClose();
   };
 

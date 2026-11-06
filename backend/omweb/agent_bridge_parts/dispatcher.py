@@ -173,25 +173,148 @@ def _check_model_metadata_reasoning(model_name: str) -> Optional[bool]:
     return None
 
 
-def _resolve_model_max_output_tokens(model_name: str, active_llm: Optional[Dict[str, Any]] = None) -> int:
+def _read_model_metadata_entry(model_name: str) -> Optional[Dict[str, Any]]:
     """
-    Dynamically resolve max output tokens for the target model.
+    Read one model's entry from ``models_metadata.json``.
 
-    Priority order (highest → lowest):
-    1. Per-model budget from storage/models_budget.json. This is the
-       authoritative source set in the "Model Budgets & Context" tab.
-    2. Explicit active_llm override (max_output_tokens or max_tokens).
-       Falls back here only when no per-model budget exists.
-    3. 8192 default.
+    ``models_metadata.json`` is the single source of truth for
+    provider-discovered facts about a model: ``max_context_length``,
+    ``max_output_tokens``, capabilities, reasoning mode, etc. The
+    user's per-model overrides in ``models_budget.json`` sit on top
+    of these facts, and ``config.toml`` is a legacy fallback that
+    MAY carry stale values.
 
-    The previous ordering let the global config.llm.max_output_tokens (shown
-    in the "Context Window & Token Budget Architecture" panel) silently
-    override the per-model value stored in models_budget.json. Users editing
-    the per-model tab saw no effect because the global value was checked
-    first.
+    Returns ``None`` on any read/parse failure — the caller falls
+    through to the other resolution layers.
     """
     try:
-        # Per-model budgets are authoritative.
+        from peldrun.storage_paths import get_storage_root
+
+        canonical = get_storage_root() / "models_metadata.json"
+        module_dir = Path(__file__).resolve().parent
+        candidates = [
+            canonical,
+            module_dir.parent.parent / "storage" / "models_metadata.json",
+            Path("storage/models_metadata.json").resolve(),
+            Path("backend/storage/models_metadata.json").resolve(),
+        ]
+        for p in candidates:
+            if not p.exists():
+                continue
+            data = json.loads(p.read_text(encoding="utf-8"))
+            entry = data.get(model_name) or data.get(model_name.lower())
+            if isinstance(entry, dict):
+                return entry
+    except Exception as exc:
+        logger.debug(
+            "Could not read metadata for %r: %s", model_name, exc
+        )
+    return None
+
+
+def _resolve_model_context_window(
+    model_name: str,
+    active_llm: Optional[Dict[str, Any]] = None,
+) -> int:
+    """
+    Resolve the model's context window in tokens.
+
+    Priority order (highest → lowest):
+    1. ``models_metadata.json`` → ``max_context_length``
+       (This is the authoritative value discovered from the provider's
+       live catalog — e.g., LM Studio's ``/api/v1/models`` response.
+       The user's config.toml may carry a stale or hand-edited value,
+       which is why this is preferred.)
+    2. ``active_llm`` → ``context_window`` (config.toml fallback for
+       custom endpoints that have no metadata entry).
+    3. Default 8192 (safe for any chat model).
+
+    This value is used to compute ``effective_limit`` in the token
+    budget, and to cap ``max_output_tokens`` in
+    ``_resolve_model_max_output_tokens``. Reading it from metadata
+    instead of config.toml prevents the "context_window=1048576 in
+    config.toml but actual model loaded with 8192" mismatch that
+    silently caused 400 errors from LM Studio.
+    """
+    meta = _read_model_metadata_entry(model_name)
+    if meta:
+        for key in ("max_context_length", "context_length", "context_window"):
+            val = meta.get(key)
+            if isinstance(val, int) and val > 0:
+                return val
+
+    if active_llm:
+        val = active_llm.get("context_window")
+        if val is not None:
+            try:
+                parsed = int(val)
+                if parsed > 0:
+                    return parsed
+            except (ValueError, TypeError):
+                pass
+
+    return 8192
+
+
+def _resolve_model_max_output_tokens(
+    model_name: str,
+    active_llm: Optional[Dict[str, Any]] = None,
+) -> int:
+    """
+    Resolve max output tokens for the target model.
+
+    Priority order (highest -> lowest):
+    1. ``models_budget.json`` -> ``max_output_tokens`` / ``max_tokens``
+       (Explicit user override in the Model Budgets UI. This is the
+       HIGHEST priority because the user deliberately chose this
+       value in the UI. Ignoring it was the root cause of the
+       Gemini 2.5/3.x finish_reason='length' failures: the user
+       configured 65536, a hardcoded cap silently reduced it to
+       4096, and the model burned the entire budget on reasoning.)
+    2. ``models_metadata.json`` -> ``max_output_tokens``
+       (Provider-discovered authoritative value from the last
+       Scan Models run.)
+    3. Derive from metadata's ``max_context_length // 4``
+       (with the LOADED context as an additional cap when present).
+    4. ``active_llm["max_output_tokens"]`` / ``["max_tokens"]``
+       (config.toml fallback for custom endpoints.)
+    5. Default 2048.
+
+    Safety
+    ------
+    The only hardcoded bound is ``_ABSOLUTE_CEILING = 131072``
+    (128K) — a guard against corrupted files containing absurd
+    values such as ``999_999_999``. It never interferes with a
+    legitimate model configuration: every current chat model
+    supports at most 128K output, so any value at or below that is
+    trusted as-is.
+
+    The LM Studio "HTTP 400 from small loaded context" failure is
+    handled by a DIFFERENT mechanism: when the model's metadata
+    carries ``loaded_context_length`` (or the equivalent nested
+    ``loaded_instances[0].config.context_length``), we cap the
+    output at ``loaded_context // 2`` — preserving the original
+    protection without the collateral damage of a global 4096 cap.
+
+    The blanket ``MAX_SAFE_OUTPUT_TOKENS = 4096`` was removed
+    because it silently overrode the user's explicit budget
+    setting AND the provider's authoritative declaration. Both
+    files exist precisely to be the source of truth; re-clamping
+    their values defeats their purpose.
+    """
+    # Absolute ceiling — guards against corrupted files only.
+    # 131072 (128K) is larger than any current model's output cap.
+    _ABSOLUTE_CEILING = 131072
+
+    # ------------------------------------------------------------------
+    # Layer 1 — models_budget.json (explicit user override).
+    #
+    # This is the Model Budgets UI's persistence target. The user
+    # explicitly set these values, so they MUST win over provider
+    # metadata. Previously this was Layer 2 (below metadata), which
+    # caused user overrides to be silently discarded.
+    # ------------------------------------------------------------------
+    try:
         from peldrun.storage_paths import get_storage_root
 
         canonical = get_storage_root() / "models_budget.json"
@@ -211,22 +334,81 @@ def _resolve_model_max_output_tokens(model_name: str, active_llm: Optional[Dict[
                     if budget_val is not None:
                         parsed_val = int(budget_val)
                         if parsed_val > 0:
-                            return parsed_val
+                            return min(parsed_val, _ABSOLUTE_CEILING)
     except Exception as e:
         logger.debug("Could not load budget cache for %s: %s", model_name, e)
 
-    # Fallback: global override from active_llm (config.toml / per-request).
+    # ------------------------------------------------------------------
+    # Layer 2 — models_metadata.json (provider-discovered).
+    # ------------------------------------------------------------------
+    meta = _read_model_metadata_entry(model_name)
+    if meta:
+        # Extract the ACTUAL loaded context (LM Studio / Ollama
+        # expose this; cloud providers do not). Two shapes:
+        #   - Top-level ``loaded_context_length``
+        #   - Nested ``loaded_instances[0].config.context_length``
+        loaded_ctx: Optional[int] = None
+        raw_loaded_top = meta.get("loaded_context_length")
+        if isinstance(raw_loaded_top, int) and raw_loaded_top > 0:
+            loaded_ctx = raw_loaded_top
+        else:
+            loaded_list = meta.get("loaded_instances")
+            if isinstance(loaded_list, list) and loaded_list:
+                first_inst = loaded_list[0]
+                if isinstance(first_inst, dict):
+                    inst_cfg = first_inst.get("config")
+                    if isinstance(inst_cfg, dict):
+                        nested_ctx = inst_cfg.get("context_length")
+                        if isinstance(nested_ctx, int) and nested_ctx > 0:
+                            loaded_ctx = nested_ctx
+
+        meta_out = meta.get("max_output_tokens")
+        if isinstance(meta_out, int) and meta_out > 0:
+            # [FIX-LMSTUDIO-LOADED-CONTEXT] When the model is
+            # loaded with a smaller context than the declared
+            # max_output, cap the output at loaded // 2. This
+            # preserves the original "HTTP 400 from LM Studio"
+            # protection WITHOUT the collateral damage of a
+            # global 4096 cap.
+            #
+            # Example:
+            #   meta max_output_tokens = 65536
+            #   loaded_context_length = 8192
+            #   -> return min(65536, 8192 // 2) = 4096  (safe)
+            #
+            #   meta max_output_tokens = 65536 (Gemini)
+            #   loaded_context_length = None
+            #   -> return min(65536, 131072) = 65536  (correct)
+            if loaded_ctx is not None and loaded_ctx > 0:
+                return min(meta_out, loaded_ctx // 2, _ABSOLUTE_CEILING)
+            return min(meta_out, _ABSOLUTE_CEILING)
+
+        # Fallback: derive from max_context_length // 4.
+        meta_ctx = meta.get("max_context_length")
+        if isinstance(meta_ctx, int) and meta_ctx > 0:
+            effective_ctx = meta_ctx
+            if loaded_ctx is not None and loaded_ctx > 0:
+                effective_ctx = min(meta_ctx, loaded_ctx)
+            derived = max(256, effective_ctx // 4)
+            return min(derived, _ABSOLUTE_CEILING)
+
+    # ------------------------------------------------------------------
+    # Layer 3 — active_llm (config.toml fallback).
+    # ------------------------------------------------------------------
     if active_llm:
         val = active_llm.get("max_output_tokens") or active_llm.get("max_tokens")
         if val is not None:
             try:
                 parsed = int(val)
                 if parsed > 0:
-                    return parsed
+                    return min(parsed, _ABSOLUTE_CEILING)
             except (ValueError, TypeError):
                 pass
 
-    return 8192
+    # ------------------------------------------------------------------
+    # Layer 4 — safe default.
+    # ------------------------------------------------------------------
+    return 2048
 
 
 def _resolve_model_temperature(
@@ -1298,6 +1480,46 @@ async def run_instrumented(
             _rt_err,
         )
 
+    # ─────────────────────────────────────────────────────────────
+    # [FIX-VAULT-SOURCE-OF-TRUTH] For local providers, prefer the
+    # value the Store UI saved (models_vault.json) over any stale
+    # base_url coming from config.toml or the browser's
+    # ``active_llm_override`` localStorage entry. This eliminates the
+    # "Test Connection succeeds but agent fails" mismatch observed in
+    # job_37e96b944afc.
+    #
+    # The vault read lives in ``config_rtr.get_local_provider_base_url``
+    # — routers own file access, dispatcher calls router helpers. No
+    # file I/O here, no hardcoded paths.
+    # ─────────────────────────────────────────────────────────────
+    try:
+        from omweb.routers.config_rtr import get_local_provider_base_url
+
+        _provider_hint = (
+            active_llm.get("provider")
+            or active_llm.get("provider_name")
+            or ""
+        )
+        _vault_url = get_local_provider_base_url(str(_provider_hint))
+        if _vault_url and _vault_url != str(active_llm.get("base_url") or ""):
+            logger.info(
+                "[BRIDGE] Vault override: replacing %r with %r for "
+                "provider %r (job=%s).",
+                active_llm.get("base_url"),
+                _vault_url,
+                _provider_hint,
+                job_id,
+            )
+            active_llm["base_url"] = _vault_url
+    except Exception as _vault_err:
+        # Non-fatal: a broken vault read must never block the run.
+        # We fall back to whatever config.toml / llm_override supplied.
+        logger.debug(
+            "Vault base_url override skipped for job %s: %s",
+            job_id,
+            _vault_err,
+        )
+
     p_cand = active_llm.get("provider_name") or active_llm.get("provider") or ""
     b_cand = str(active_llm.get("base_url") or "")
     if "1234" not in b_cand and "lmstudio" not in str(active_llm.get("provider") or "").lower():
@@ -1369,8 +1591,37 @@ async def run_instrumented(
         f"Task started: {prompt[:120]}",
     )
 
+    # ─────────────────────────────────────────────────────────────
+    # [FIX-METADATA-SOURCE-OF-TRUTH] Read context_window and
+    # max_output_tokens from models_metadata.json (the authoritative
+    # source populated by /api/config/fetch-models), NOT from
+    # config.toml. config.toml is a legacy fallback that may carry
+    # stale values from a different machine or session.
+    #
+    # Background: LM Studio's actual loaded context for
+    # nvidia-nemotron-3-nano-4b is 8192 tokens. config.toml had
+    # max_output_tokens = 12000 — when forwarded as max_tokens in
+    # the LM Studio request body, the server rejected the entire
+    # request with HTTP 400. The fix is to use the metadata's
+    # max_context_length as the ceiling for max_output_tokens, which
+    # produces a safe value that LM Studio accepts.
+    # ─────────────────────────────────────────────────────────────
+    _resolved_ctx = _resolve_model_context_window(model_name, active_llm)
+    if _resolved_ctx > 0:
+        active_llm["context_window"] = _resolved_ctx
+
     resolved_max_tokens = _resolve_model_max_output_tokens(model_name, active_llm)
     active_llm["max_tokens"] = resolved_max_tokens
+    active_llm["max_output_tokens"] = resolved_max_tokens
+
+    logger.info(
+        "[BRIDGE] Resolved limits for %r: context_window=%d, max_tokens=%d "
+        "(source: %s)",
+        model_name,
+        active_llm["context_window"],
+        resolved_max_tokens,
+        "metadata" if _read_model_metadata_entry(model_name) else "fallback",
+    )
 
     # [FIX-PER-MODEL-TEMP] Apply the per-model temperature override if one
     # is present in models_budget.json. When absent, the original
@@ -1634,30 +1885,15 @@ async def run_instrumented(
                 chat_id, project_id, "FINAL",
                 "Execution completed successfully.",
             )
-            # If the engine marked the job complete but didn't dispatch
-            # a `final` event (some implementations rely on the caller
-            # to do it), synthesize one so the stream closes cleanly.
-            if not _already_terminal:
-                logger.warning(
-                    "[BRIDGE] Engine returned with status=%r for job %s "
-                    "but did NOT dispatch a terminal SSE event. "
-                    "Synthesizing FINAL.",
-                    final_status,
-                    job_id,
-                )
-                await dispatch_event(
-                    job_id,
-                    SSEEvent(
-                        type=SSEEventType.FINAL,
-                        step=1,
-                        data={
-                            "result": (
-                                (final_job.result if final_job else None)
-                                or ""
-                            ),
-                        },
-                    ),
-                )
+            # [FIX-DUPLICATE-FINAL-ROOT] PeldrunEngine ALWAYS calls
+            # `job_manager.complete_job(...)` AND dispatches its own FINAL
+            # before returning. The dispatcher's previous attempt to
+            # synthesize a final event created duplicates because the
+            # engine's event bus and the dispatcher's `_ACTIVE_JOB_EVENTS`
+            # were out of sync. We now completely remove the synthesis.
+            # If the engine crashes before sending FINAL, the `except`
+            # block below will handle it.
+            pass
     except asyncio.CancelledError:
         print(f"[BRIDGE] Job was cancelled/aborted: {job_id}")
         _safe_monitor_cancel_run(job_id)
@@ -2234,8 +2470,27 @@ async def run_direct_chat(
                     job_id, _mm_exc,
                 )
 
+        # [FIX-METADATA-SOURCE-OF-TRUTH] Same block as in
+        # `run_instrumented`. Chat mode must read limits from
+        # models_metadata.json (authoritative) instead of config.toml
+        # (legacy fallback that may carry stale values). See the
+        # detailed rationale in `run_instrumented`.
+        _resolved_ctx = _resolve_model_context_window(model_name, active_llm)
+        if _resolved_ctx > 0:
+            active_llm["context_window"] = _resolved_ctx
+
         max_tokens = _resolve_model_max_output_tokens(model_name, active_llm)
         active_llm["max_tokens"] = max_tokens
+        active_llm["max_output_tokens"] = max_tokens
+
+        logger.info(
+            "[BRIDGE DIRECT CHAT] Resolved limits for %r: "
+            "context_window=%d, max_tokens=%d (source: %s)",
+            model_name,
+            active_llm["context_window"],
+            max_tokens,
+            "metadata" if _read_model_metadata_entry(model_name) else "fallback",
+        )
 
         # [FIX-PER-MODEL-TEMP] Same override as in `run_instrumented`. The
         # temperature used by the completion request reflects the per-model

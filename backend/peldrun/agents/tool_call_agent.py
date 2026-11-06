@@ -190,6 +190,12 @@ class ToolCallAgent(BaseAgent):
         # same arguments repeatedly. Cleared whenever a step contains
         # multiple tool calls (which breaks the "consecutive" pattern).
         self._recent_call_signatures: List[str] = []
+        # [FIX-NO-TOOL-NOT-DONE] Counts consecutive steps where the model
+        # produced text WITHOUT calling any tool. Used by ``step()`` to
+        # prevent infinite text-only loops while still allowing reasoning
+        # models (Nemotron, R1, QwQ, o1-style) to produce intermediate
+        # text mid-task without being misclassified as "task complete".
+        self._consecutive_no_tool_steps: int = 0
 
     @property
     def name(self) -> str:
@@ -601,9 +607,41 @@ class ToolCallAgent(BaseAgent):
                         exc,
                         llm_attempt,
                     )
-                    compact_msgs = list(self.messages[:2]) + list(self.messages[-3:])
-                    while compact_msgs and len(compact_msgs) > 2 and compact_msgs[2].get("role") == "tool":
-                        compact_msgs.pop(2)
+                    # [FIX-COMPACTION-OVERLAP] The naive
+                    # ``[:2] + [-3:]`` slices overlap whenever
+                    # ``len(self.messages) <= 4``, producing a
+                    # "compacted" list that is LARGER than the
+                    # original — each message appears twice. That
+                    # guaranteed the retry would ALSO fail with the
+                    # same 400, and two consecutive duplicate requests
+                    # were visible in the LM Studio server log at
+                    # 22:08:40.
+                    #
+                    # Fix: compute non-overlapping head + tail slices.
+                    # ``head_count + tail_count <= len(messages)`` is
+                    # guaranteed by construction, so no message is
+                    # ever included twice.
+                    #
+                    # Examples:
+                    #   len=2  [sys, user]              -> [sys, user]
+                    #   len=3  [sys, user, asst]        -> [sys, user, asst]
+                    #   len=4  [sys, user, asst, tool]  -> [sys, user, asst, tool]
+                    #   len=10 [sys, user, ... 8 more]  -> [sys, user, m7, m8, m9]
+                    tail_count = min(3, len(self.messages))
+                    head_count = min(2, max(0, len(self.messages) - tail_count))
+                    compact_msgs = (
+                        list(self.messages[:head_count])
+                        + list(self.messages[-tail_count:])
+                    )
+                    # Strip any leading ``tool`` message from the tail
+                    # slice. Some providers reject a tool message that
+                    # does not follow an assistant turn with
+                    # ``tool_calls``.
+                    while (
+                        len(compact_msgs) > head_count + 1
+                        and compact_msgs[head_count].get("role") == "tool"
+                    ):
+                        compact_msgs.pop(head_count)
 
                     for cmsg in compact_msgs:
                         if cmsg.get("role") == "tool":
@@ -944,9 +982,208 @@ class ToolCallAgent(BaseAgent):
                 self._recent_call_signatures.clear()
 
         if not response.tool_calls:
-            self._final_answer = response.content or response.thought or response.reasoning or "Task completed."
+            # [FIX-NO-TOOL-NOT-DONE] The prior behavior treated ANY model
+            # response without tool_calls as "task complete". That
+            # assumption is WRONG for agentic workloads:
+            #
+            #   * Reasoning-class models (Nemotron, DeepSeek-R1, QwQ,
+            #     o1/o3, "thinking" models) frequently emit intermediate
+            #     text ("Let me search for...") WITHOUT a tool call,
+            #     then call the tool on the next step. Ending the loop
+            #     here silently truncated the task — the model never
+            #     finished what the user asked for, but the engine
+            #     reported "completed successfully".
+            #
+            #   * The PELDRUN operational contract explicitly states
+            #     that the task is ONLY complete when the model calls
+            #     the ``terminate`` tool (see [OPERATIONAL DIRECTIVE]
+            #     §3 in peldrun_engine.py). Any other response must be
+            #     treated as intermediate.
+            #
+            # The correct behavior: send an explicit reminder asking the
+            # model to call ``terminate`` (if done) or continue with
+            # tools (if not done), then CONTINUE the loop.
+            #
+            # Safety rails (to bound the loop and prevent runaway text):
+            #   1. Max steps: reaching the ceiling without terminate
+            #      raises a clear failure.
+            #   2. Two consecutive no-tool responses: the model is
+            #      genuinely stuck → fail fast rather than loop forever.
+            self._final_answer = (
+                response.content
+                or response.thought
+                or response.reasoning
+                or ""
+            )
             state.final_output = self._final_answer
-            return True
+
+            # [FIX-EMPTY-RESPONSE] A truly empty response (no content,
+            # no reasoning, no tool_calls) is NOT an "agent forgot to
+            # call terminate" situation — it is a broken provider
+            # response. Retrying with a reminder will produce another
+            # empty response because the underlying cause is
+            # deterministic: wrong model name, wrong URL, missing
+            # permissions, or a safety filter that blocked everything.
+            #
+            # Fail immediately with a diagnostic message that surfaces:
+            #   * finish_reason (reveals safety_filter, length, etc.)
+            #   * provider + model (to identify which adapter ran)
+            #   * usage (to diagnose quota / billing issues)
+            # instead of waiting two steps and then reporting the
+            # misleading "no tool calls for 2 consecutive steps".
+            if not self._final_answer:
+                _provider = (
+                    getattr(self.llm, "provider_id", None) or "unknown"
+                )
+                _model = (
+                    getattr(self.llm, "model", None)
+                    or getattr(getattr(self.llm, "config", None), "model", None)
+                    or getattr(
+                        getattr(self.llm, "_base_request", None),
+                        "model_id", None,
+                    )
+                    or "unknown"
+                )
+                _finish_reason = response.finish_reason or "unknown"
+                _usage = getattr(response, "usage", None)
+                _usage_summary = (
+                    _usage.model_dump() if _usage is not None else None
+                )
+                # [FIX-EMPTY-DIAGNOSTIC] Enrich the diagnostic with the
+                # reasoning / output token split so the operator can
+                # distinguish "model crashed" from "model burned its
+                # budget on thinking". Gemini 2.5+ thinking models
+                # frequently hit finish_reason='length' with 3000+
+                # reasoning tokens and zero visible output — that is
+                # NOT a crash, it is a token-budget misconfiguration.
+                _hint = ""
+                if _usage is not None:
+                    _reasoning_tok = getattr(
+                        _usage, "reasoning_output_tokens", None
+                    )
+                    _output_tok = getattr(_usage, "output_tokens", None)
+                    if (
+                        isinstance(_reasoning_tok, int)
+                        and _reasoning_tok > 0
+                        and _finish_reason == "length"
+                    ):
+                        _hint = (
+                            f" HINT: the model consumed {_reasoning_tok} "
+                            f"reasoning tokens and hit "
+                            f"max_output_tokens before producing visible "
+                            f"text. Increase max_output_tokens (e.g. to "
+                            f"{max(8192, (_reasoning_tok or 0) + 2048)}) "
+                            f"or reduce the model's thinking_budget."
+                        )
+                raise RuntimeError(
+                    f"Provider returned an EMPTY response "
+                    f"(no content, no reasoning, no tool calls). "
+                    f"provider={_provider!r}, model={_model!r}, "
+                    f"finish_reason={_finish_reason!r}, "
+                    f"step={state.current_step}, "
+                    f"usage={_usage_summary}.{_hint} "
+                    f"Common causes: "
+                    f"(1) invalid or unsupported model name, "
+                    f"(2) wrong API URL / route (e.g. OpenAI shim URL "
+                    f"sent to native adapter), "
+                    f"(3) API key lacks access to the model, "
+                    f"(4) safety filter blocked the entire response. "
+                    f"Check provider logs and configuration before "
+                    f"retrying."
+                )
+
+            # [FIX-MULTIMODAL-NO-TOOLS] Multimodal turns where the
+            # provider disables tools (notably GigaChat v2, which
+            # discards tool definitions when images are present) can
+            # never emit a `terminate` call. Without this branch, the
+            # loop guard "2 consecutive no-tool steps" fires even
+            # though the user's request WAS fulfilled — the image was
+            # analyzed and the descriptive text is complete.
+            #
+            # Detect the case as: current step is the FIRST step AND
+            # at least one message in the conversation carries an
+            # `image_url` part. Multi-step continuations after the
+            # first step are excluded so Gemini (which DOES support
+            # tools + images) can still complete multi-tool workflows
+            # when it chooses to.
+            # [FIX-MULTIMODAL-NO-TOOLS-STEP2] Removed the `state.current_step <= 1`
+            # restriction. Some providers (GigaChat) discard tools when images
+            # are present, which forces the model to answer in plain text.
+            # If the conversation contains images and the model produced
+            # text, we accept it as the final answer regardless of the step.
+            _has_images = False
+            for _msg in self.messages:
+                if not isinstance(_msg, dict):
+                    continue
+                _mc = _msg.get("content")
+                if isinstance(_mc, list):
+                    for _p in _mc:
+                        if (
+                            isinstance(_p, dict)
+                            and _p.get("type") == "image_url"
+                        ):
+                            _has_images = True
+                            break
+                if _has_images:
+                    break
+
+            if _has_images and self._final_answer.strip():
+                logger.info(
+                    "Multimodal turn produced text without tool "
+                    "calls — accepting as final answer "
+                    "(provider disabled tools for image inputs)."
+                )
+                return True
+
+            # Safety rail 1 — step ceiling.
+            max_steps_ceiling = int(
+                getattr(state, "max_steps", None)
+                or getattr(self.config, "max_steps", None)
+                or 30
+            )
+            if state.current_step >= max_steps_ceiling:
+                raise RuntimeError(
+                    f"Agent reached the maximum step ceiling "
+                    f"({max_steps_ceiling}) without calling "
+                    f"'terminate'. Task was not completed. Last text: "
+                    f"{(self._final_answer or '')[:200]}"
+                )
+
+            # Safety rail 2 — consecutive no-tool responses.
+            self._consecutive_no_tool_steps += 1
+            if self._consecutive_no_tool_steps >= 2:
+                raise RuntimeError(
+                    f"Agent produced text without tool calls for "
+                    f"{self._consecutive_no_tool_steps} consecutive "
+                    f"steps. The model appears to be stuck thinking "
+                    f"out loud without using tools or 'terminate'. "
+                    f"Forcing termination. Last text: "
+                    f"{(self._final_answer or '')[:200]}"
+                )
+
+            # Reminder to the model. This becomes part of the
+            # conversation history (state.messages + self.messages),
+            # so on the next step the model sees it and can react:
+            #   * If the task is genuinely done → call 'terminate'.
+            #   * If more work is needed → call the next tool.
+            _reminder = (
+                "[SYSTEM] Your last response contained text but did "
+                "NOT call any tool. This does NOT end the task. "
+                "If the task is complete, you MUST call the "
+                "'terminate' tool to signal completion. If not "
+                "complete, use the available tools to make progress. "
+                "Do not reply with text alone."
+            )
+            state.add_message(role=MessageRole.USER, content=_reminder)
+            # Also reflect into the in-memory history so the next
+            # ``think()`` call (which uses ``self.messages``) sees it
+            # immediately even before ``_sync_messages_from_state``
+            # runs at the start of the next step.
+            self.messages.append({"role": "user", "content": _reminder})
+            return False
+
+        # Model produced tool calls — reset the no-tool counter.
+        self._consecutive_no_tool_steps = 0
 
         for tc in response.tool_calls:
             if not tc.id:

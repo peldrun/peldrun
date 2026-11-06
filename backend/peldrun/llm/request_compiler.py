@@ -1013,9 +1013,56 @@ class RequestCompiler:
         # ------------------------------------------------------------------
         # Compile tool_choice.
         # ------------------------------------------------------------------
+        # [FIX-TOOL-CHOICE-SPEC] Per the OpenAI Chat Completions spec,
+        # ``tool_choice`` MUST be a plain string for the three generic
+        # modes (``"none"`` / ``"auto"`` / ``"required"``). Only the
+        # "specific function" variant uses an object:
+        #   ``{"type": "function", "function": {"name": "..."}}``
+        #
+        # The previous implementation emitted ``{"type": "auto"}``,
+        # ``{"type": "none"}``, and ``{"type": "required"}`` — none of
+        # which are valid per the spec. Strict servers (LM Studio's
+        # ``/api/v0``, some OpenAI-compat proxies) rejected the request
+        # with HTTP 400 — verified manually against
+        # ``http://100.64.19.102:1235/api/v0/chat/completions``:
+        #     {"tool_choice": {"type": "auto"}}  -> HTTP 400
+        #     {"tool_choice": "auto"}            -> HTTP 200
+        #
+        # That 400 then triggered the "aggressive compaction" retry in
+        # ``tool_call_agent.py``, which (due to a separate bug fixed
+        # there) duplicated messages and failed again — producing the
+        # exact "two requests in a row, second one larger" pattern
+        # observed in the LM Studio server logs at 22:08:40.
+        # [FIX-TOOL-CHOICE-PER-ADAPTER] Emit the legacy OpenAI-shaped
+        # dict form here. The raw wire format differs per provider:
+        #
+        #   * LM Studio (llama.cpp) and OpenAI SDK reject the dict form
+        #     for generic modes ({"type": "auto"} → HTTP 400). They
+        #     want the plain string ("auto").
+        #
+        #   * Provider Packages shipped as ``native`` transport (GigaChat,
+        #     etc.) parse ``compiled.tool_choice`` with
+        #     ``tool_choice.get("type")`` internally. A plain string
+        #     raises ``'str' object has no attribute 'get'`` inside the
+        #     worker, which then surfaces as a PROVIDER_ERROR.
+        #
+        #   * Anthropic and Google adapters already convert this dict
+        #     into their own wire vocabulary via ``_convert_tool_choice``.
+        #
+        # The correct fix is to keep ``compiled.tool_choice`` in the
+        # dict form (backward-compatible for every plugin adapter that
+        # was written against the pre-fix contract) and let each adapter
+        # that needs the string form translate it locally:
+        #
+        #   * ``lmstudio_native.py::_build_body`` — dict → string
+        #   * ``openai_native.py::_build_chat_completions_kwargs`` —
+        #     dict → string (OpenAI SDK rejects the legacy dict shape)
+        #
+        # Both adapters accept BOTH forms so the translation is
+        # idempotent and defensive: if a future caller passes the string
+        # form directly, it is forwarded unchanged.
         compiled_choice: Optional[Dict[str, Any]] = None
         if tool_choice.mode == "auto":
-            # Auto is the default — only include when supported.
             compiled_choice = {"type": "auto"}
         elif tool_choice.mode == "none":
             compiled_choice = {"type": "none"}

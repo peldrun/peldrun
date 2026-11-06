@@ -56,10 +56,24 @@ export function CloudProviderCard({
   const iconName = resolveProviderIcon(provider.id || provider.name);
   const status = provider.status;
 
+  /* Defensive normalization.
+     The `provider` object is sourced from `localStorage` / the backend
+     vault, either of which may hold a legacy value for `savedModels`
+     (e.g. `{}` from an older write path) that is neither an array nor
+     a string. Calling `.includes()` or `.map()` on such a value
+     crashes the whole settings page, so we normalize once here and
+     use these local variables everywhere below. */
+  const savedModelsList: string[] = Array.isArray(provider.savedModels)
+    ? (provider.savedModels as string[])
+    : [];
+  const popularModelsList: string[] = Array.isArray(provider.popularModels)
+    ? (provider.popularModels as string[])
+    : [];
+
   const savedModelValue =
-    provider.savedModels && provider.savedModels.includes(provider.model)
+    savedModelsList.includes(provider.model)
       ? provider.model
-      : provider.popularModels.includes(provider.model)
+      : popularModelsList.includes(provider.model)
       ? provider.model
       : "custom";
 
@@ -153,9 +167,9 @@ export function CloudProviderCard({
               className="w-full bg-card border border-border rounded-sm px-2.5
               py-1.5 text-xs text-foreground font-mono shadow-sm focus:outline-none focus:ring-1 focus:ring-muted/40 transition-shadow cursor-pointer"
             >
-              {provider.savedModels && provider.savedModels.length > 0 && (
+              {savedModelsList.length > 0 && (
                 <optgroup label="Discovered & Saved Models">
-                  {provider.savedModels.map((m) => (
+                  {savedModelsList.map((m) => (
                     <option key={m} value={m}>
                       {m}
                     </option>
@@ -163,7 +177,7 @@ export function CloudProviderCard({
                 </optgroup>
               )}
               <optgroup label="Popular Presets">
-                {provider.popularModels.map((m) => (
+                {popularModelsList.map((m) => (
                   <option key={m} value={m}>
                     {m}
                   </option>
@@ -284,9 +298,9 @@ export function CloudProviderCard({
           >
             <RefreshCw size={11} className="text-primary" />
             <span>Scan Models</span>
-            {provider.savedModels && provider.savedModels.length > 0 && (
+            {savedModelsList.length > 0 && (
               <span className="ml-1 px-1.5 py-0.5 text-[10px] rounded-sm bg-primary/15 text-primary font-mono font-bold">
-                {provider.savedModels.length}
+                {savedModelsList.length}
               </span>
             )}
           </Button>

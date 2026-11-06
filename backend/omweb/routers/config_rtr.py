@@ -26,16 +26,33 @@ from omweb.config import BACKEND_DIR, PROJECT_ROOT, STORAGE_ROOT
 from pydantic import BaseModel
 import toml
 
-# Live-provider capability query — Ollama /api/show, LM Studio
-# /api/v0/models, Google per-model endpoint. Used by /fetch-models to
-# enrich the model list before persisting.
-from peldrun.llm.catalog.provider_live import query_providers_batch
-from peldrun.llm.contracts import ConnectionContext
-# M11: adapter-based model discovery.
-from peldrun.llm.providers import (
-    ensure_external_providers_discovered,
-    provider_factory,
-)
+# [FIX-LAZY-PELDRUN-IMPORTS] Defer peldrun imports until actual use.
+#
+# Motivation: this module is imported early in omweb.main's startup
+# chain (main.py → omweb.routers → config_rtr). If any peldrun
+# submodule is temporarily unimportable during that window — a
+# different venv during preflight checks, a stale .egg-link, a
+# sys.path not yet fully populated by uvicorn's launcher — the whole
+# ASGI app fails to import, and the preflight reports a confusing
+# "No module named 'peldrun'" even though the same peldrun package is
+# perfectly importable once the process is fully initialized.
+#
+# Moving the imports inside the functions that use them keeps this
+# module loadable in every environment while preserving identical
+# runtime behavior: the imports fire on the first /fetch-models call,
+# which is well after startup has completed.
+#
+# This mirrors the same pattern used in
+# ``omweb.agent_bridge_parts.dispatcher`` for
+# ``provider_registry``, ``provider_factory``, and ``_resolve_native_adapter``.
+#
+# Callers that need these symbols MUST import them inside the function
+# body, not at module top-level. The four functions affected:
+#   - _discover_via_adapter
+#   - _discover_via_external_package
+#   - _fetch_available_models_impl
+#
+# See the inline lazy imports at those call sites.
 
 try:
     import tomllib
@@ -315,9 +332,28 @@ def _merge_metadata_entries(existing: dict, new: dict) -> dict:
     for field in _CAPABILITY_FIELDS:
         if field not in new_caps:
             continue
-        if existing_sources.get(field) == "manual":
-            # Preserve user override; do not touch value or source.
+
+        # Rule 1: If the incoming entry declares itself as ``manual``,
+        # it ALWAYS wins. This is the write path used by
+        # ``ModelInfoModal`` when the user explicitly edits a
+        # capability. Without this branch, the previous
+        # ``existing_sources == "manual"`` guard would silently
+        # ignore every subsequent manual edit, permanently freezing
+        # the first manual value the user ever set.
+        if new_sources.get(field) == "manual":
+            existing_caps[field] = new_caps[field]
+            existing_sources[field] = "manual"
             continue
+
+        # Rule 2: Otherwise, preserve any existing manual override.
+        # This is the path used by ``/fetch-models`` during a rescan:
+        # automated discovery must never overwrite something the
+        # user configured by hand.
+        if existing_sources.get(field) == "manual":
+            continue
+
+        # Rule 3: Neither side is manual — the fresh automated value
+        # wins and its source is recorded verbatim.
         existing_caps[field] = new_caps[field]
         if field in new_sources:
             existing_sources[field] = new_sources[field]
@@ -485,6 +521,9 @@ async def _discover_via_external_package(package_id: str) -> list:
         )
         return []
 
+    from peldrun.llm.contracts import ConnectionContext
+    from peldrun.llm.providers import provider_factory
+
     # Lazy import to avoid the circular dependency:
     #   config_rtr.py ← providers.py
     # (providers.py imports list_provider_connections & friends from
@@ -589,6 +628,10 @@ async def _discover_via_adapter(
     Adapters own their own auth, so this path fixes those providers
     without any per-provider branching in the route handler.
     """
+    # Lazy import — see the [FIX-LAZY-PELDRUN-IMPORTS] note at the
+    # top of this module.
+    from peldrun.llm.contracts import ConnectionContext
+    from peldrun.llm.providers import provider_factory
     try:
         connection = ConnectionContext(
             connection_id="discovery",
@@ -736,6 +779,11 @@ def _parse_adapter_model_list(raw_list: list) -> Tuple[list, dict]:
         }
 
         # Context / output limits — multiple field names across adapters.
+        #
+        # ``max_context_length`` is the ARCHITECTURAL ceiling (e.g., 1M for
+        # NVIDIA Nemotron 3 Nano 4B). It does NOT reflect what the engine
+        # actually loaded, which is often much smaller (8K-32K depending on
+        # available RAM/VRAM).
         ctx = (
             item.get("max_context_length")
             or item.get("input_token_limit")
@@ -744,6 +792,43 @@ def _parse_adapter_model_list(raw_list: list) -> Tuple[list, dict]:
         )
         if isinstance(ctx, int) and ctx > 0:
             entry["max_context_length"] = int(ctx)
+
+        # [FIX-LOADED-CONTEXT] Extract the model's ACTUAL loaded context.
+        #
+        # LM Studio exposes the loaded size in two possible shapes:
+        #   - Top-level ``loaded_context_length`` (some versions)
+        #   - Nested ``loaded_instances[0].config.context_length`` (v0/v1)
+        #
+        # When present, this is the authoritative limit for token budget
+        # calculations. Agent mode failing with "HTTP 400 from LM Studio"
+        # was traced to reading ``max_context_length`` (1M) while LM Studio
+        # had the model loaded with only 8K-32K — input + max_tokens
+        # exceeded the loaded context, and LM Studio rejected the request
+        # rather than truncating.
+        loaded_ctx: Optional[int] = None
+        raw_loaded_top = item.get("loaded_context_length")
+        if isinstance(raw_loaded_top, int) and raw_loaded_top > 0:
+            loaded_ctx = raw_loaded_top
+        else:
+            loaded_list = item.get("loaded_instances")
+            if isinstance(loaded_list, list) and loaded_list:
+                first_inst = loaded_list[0]
+                if isinstance(first_inst, dict):
+                    inst_cfg = first_inst.get("config")
+                    if isinstance(inst_cfg, dict):
+                        nested_ctx = inst_cfg.get("context_length")
+                        if isinstance(nested_ctx, int) and nested_ctx > 0:
+                            loaded_ctx = nested_ctx
+        if loaded_ctx is not None:
+            entry["loaded_context_length"] = int(loaded_ctx)
+
+        # Preserve the raw ``loaded_instances`` block when present so the
+        # frontend (``modelMetadata.ts::inferModelCapabilities``) can render
+        # "8K / 1M ctx" badges directly from metadata without re-deriving
+        # the value from a separate field.
+        raw_loaded_list = item.get("loaded_instances")
+        if isinstance(raw_loaded_list, list):
+            entry["loaded_instances"] = list(raw_loaded_list)
 
         out = (
             item.get("max_output_tokens")
@@ -1075,9 +1160,31 @@ class UpdateMetadataRequest(BaseModel):
 
 @router.post("/models-metadata")
 async def update_models_metadata(payload: UpdateMetadataRequest):
-    """Update models metadata cache."""
+    """
+    Update models metadata cache.
+
+    Persistence is MERGE-AWARE. Two callers write through this
+    endpoint:
+
+      * ``ModelInfoModal`` — manual capability edits. The incoming
+        entry declares ``capability_sources[field] = "manual"``, so
+        ``_merge_metadata_entries`` rule 1 lets it override whatever
+        was on disk (including a previous manual value).
+
+      * ``ModelDiscoveryModal.handleSave`` — after the user selects
+        models and confirms, it forwards the enriched metadata
+        (provider scan + catalog facts) captured during discovery.
+        Those entries carry ``provider_live`` / ``external_registry``
+        sources, so rule 2 preserves any manual override the user
+        configured earlier.
+
+    A straight ``dict.update()`` (the previous behavior) would have
+    clobbered manual overrides on every discovery save — exactly the
+    failure mode reported when a rescan erased the user's capability
+    toggles.
+    """
     try:
-        save_metadata_cache(payload.metadata)
+        save_metadata_cache_merge(payload.metadata)
         return {"ok": True, "message": "Metadata persisted successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1235,6 +1342,14 @@ async def _fetch_available_models_impl(payload: FetchModelsRequest):
     headers = {"Accept": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+
+    # Lazy import — see the [FIX-LAZY-PELDRUN-IMPORTS] note at the
+    # top of this module. Deferring until first use means this route
+    # works even in environments where peldrun was not yet importable
+    # at module-load time.
+    from peldrun.llm.catalog.provider_live import query_providers_batch
+    from peldrun.llm.contracts import ConnectionContext
+    from peldrun.llm.providers import ensure_external_providers_discovered
 
     # Ensure any externally-installed provider packages (entry points
     # pip-installed into the main environment) are registered before
@@ -2135,6 +2250,70 @@ def set_active_provider_connection(
     conn["enabled"] = True  # activating implies enabling
     return save_provider_connection(conn)
 
+def get_local_provider_base_url(provider_id: str) -> Optional[str]:
+    """
+    Return the current base_url for a local provider from the vault.
+
+    Contract
+    --------
+    ``models_vault.json`` is the single source of truth for local
+    provider endpoints (lmstudio, ollama). The Store UI persists the
+    user's current host/port/path there on every Save or
+    "Set as Active Primary" click.
+
+    ``config/config.toml`` and any per-request ``llm_override`` can
+    carry stale values from previous sessions (different machine,
+    different LAN segment, different port). The dispatcher must
+    prefer the vault when both exist, or the user sees:
+        * Test Connection:  ✅ (reads form values directly)
+        * Agent run:        ❌ (reads stale config.toml base_url)
+
+    This helper is the ONLY supported way for callers outside this
+    router module to read a local provider's endpoint. Keeping the
+    file I/O here preserves the layering: routers own file access,
+    dispatcher/runtime layers call router helpers.
+
+    Parameters
+    ----------
+    provider_id
+        The provider identifier as it appears in ``active_llm``
+        (``provider`` or ``provider_name``). Case-insensitive; matches
+        the same variants used elsewhere in PELDRUN (``lmstudio``,
+        ``lm_studio``, ``lm-studio``, ``lm studio``, ``ollama``,
+        ``ollama_native``).
+
+    Returns
+    -------
+    str | None
+        The vault's ``baseUrl`` for the matching local provider, or
+        ``None`` when:
+          * the provider is not a recognized local provider,
+          * the vault file has no entry for it,
+          * the entry has no non-empty ``baseUrl``.
+    """
+    pid = (provider_id or "").strip().lower()
+    if not pid:
+        return None
+
+    vault_key: Optional[str] = None
+    if any(k in pid for k in ("lmstudio", "lm_studio", "lm-studio", "lm studio")):
+        vault_key = "lmstudio_vault"
+    elif "ollama" in pid:
+        vault_key = "ollama_vault"
+    else:
+        return None
+
+    vault = load_vault_from_disk()
+    entry = vault.get(vault_key) or {}
+    if not isinstance(entry, dict):
+        return None
+
+    # Vault UI writes ``baseUrl`` (camelCase). Accept ``base_url`` too
+    # in case older data or a future backend normalizes the field name.
+    url = entry.get("baseUrl") or entry.get("base_url")
+    if isinstance(url, str) and url.strip():
+        return url.strip()
+    return None
 
 def get_active_connection_for_package(
     package_id: str,

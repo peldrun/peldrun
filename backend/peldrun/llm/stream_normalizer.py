@@ -176,6 +176,18 @@ class StreamNormalizer:
         pending_usage: Optional[TokenUsage] = None
         pending_provider_metadata: Optional[Dict[str, Any]] = None
         last_tool_signature: Dict[int, Dict[str, Any]] = {}
+        # [FIX-DOUBLE-ARGS] Track which tool-call indexes have already
+        # emitted incremental TOOL_CALL_DELTA fragments during this
+        # stream. If deltas were emitted, the accumulator already has
+        # the full args string; re-emitting the COMPLETE args as
+        # another delta would concatenate two JSON objects
+        # (``{...}{...}``) and produce invalid JSON. That invalid JSON
+        # is what the accumulator falls back to wrapping in
+        # ``{"raw": "..."}`` — the exact bug that produced
+        # "Search Error: Query cannot be empty" and
+        # "Parameter 'path' cannot be empty" on LM Studio / Nemotron
+        # Nano 4B runs.
+        _tool_call_deltas_emitted: set = set()
 
         # ------------------------------------------------------------------
         # Watchdog state.
@@ -336,6 +348,15 @@ class StreamNormalizer:
                     sig = last_tool_signature[index]
                     piece = event.tool_arguments_delta
 
+                    # [FIX-DOUBLE-ARGS] Record that this index has
+                    # received at least one incremental delta. Later,
+                    # TOOL_CALL_COMPLETE will check this set to decide
+                    # whether to emit the complete args as a delta
+                    # (needed for Ollama / Google) or skip them
+                    # (correct for LM Studio / OpenAI which already
+                    # streamed the full JSON via deltas).
+                    _tool_call_deltas_emitted.add(index)
+
                     # Emit even when ``piece`` is empty — this carries
                     # the tool name to the accumulator on the very
                     # first delta.
@@ -371,6 +392,26 @@ class StreamNormalizer:
                         if event.tool_index is not None
                         else 0
                     )
+                    # [FIX-DOUBLE-ARGS] Skip when the adapter has
+                    # already streamed incremental deltas for this
+                    # index. Emitting the complete args as ANOTHER
+                    # delta would concatenate two JSON objects —
+                    # ``{...}{...}`` — which is invalid JSON. The
+                    # accumulator then falls back to wrapping it in
+                    # ``{"raw": "..."}``, breaking every downstream
+                    # tool call. This was the root cause of
+                    # "Search Error: Query cannot be empty" and
+                    # "Parameter 'path' cannot be empty" on LM Studio
+                    # / Nemotron Nano 4B runs.
+                    #
+                    # For adapters that ONLY emit TOOL_CALL_COMPLETE
+                    # without prior deltas (Ollama, Google), this
+                    # set is empty for the index, so we fall through
+                    # and emit the full args as a single delta —
+                    # preserving the original behavior for those
+                    # providers.
+                    if index in _tool_call_deltas_emitted:
+                        continue
                     args_complete = event.tool_arguments_complete
                     if args_complete is None:
                         continue

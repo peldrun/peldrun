@@ -212,11 +212,16 @@ _PROFILE = AdapterProfile(
         "explicit reasoning field and precise stats. Native model "
         "discovery from /api/v0/models."
     ),
-    # Dynamic routing markers. Covers default ports, custom ports
-    # frequently used, and the explicit API paths users paste into
-    # the vault (e.g. http://172.18.48.1:1235/api/v1/).
+    # Dynamic routing markers. Only match LM Studio's *characteristic*
+    # substrings: the default ports, the product name, and the native
+    # API paths. The previous list included the bare token ``"v1"``,
+    # which false-positives on every OpenAI-compatible custom endpoint
+    # (they all end with ``/v1``) and silently routed those requests
+    # to this adapter. Removing it makes routing conservative:
+    # a Custom Endpoint whose URL does not otherwise resemble LM Studio
+    # now correctly falls through to ``openai_compat``.
     default_base_url_markers=[
-        "1234", "1235", "lmstudio", "api/v0", "api/v1", "v1"
+        "1234", "1235", "lmstudio", "api/v0", "api/v1",
     ],
 )
 
@@ -1018,11 +1023,32 @@ class LMStudioNativeAdapter:
 
         # --------------------------------------------------------------
         # Tools + tool_choice — OpenAI-shaped, native-supported.
-        # --------------------------------------------------------------
+        #
+        # [FIX-TOOL-CHOICE-WIRE-FORMAT] LM Studio (built on llama.cpp)
+        # strictly validates ``tool_choice`` against the OpenAI Chat
+        # Completions spec: the three generic modes MUST be plain
+        # strings (``"auto"``, ``"none"``, ``"required"``). Sending the
+        # legacy object form ``{"type": "auto"}`` triggers HTTP 400.
+        #
+        # The compiler (``request_compiler._compile_tools``) emits the
+        # object form because Provider Packages (GigaChat etc.) parse
+        # it with ``.get("type")`` internally and cannot handle a raw
+        # string. Each adapter therefore translates the object form
+        # into its own wire vocabulary. For LM Studio, that means
+        # flattening the generic modes to a string. The
+        # ``{"type": "function", ...}`` case stays an object per spec.
         if compiled.tools:
             body["tools"] = compiled.tools
             if compiled.tool_choice:
-                body["tool_choice"] = compiled.tool_choice
+                _tc = compiled.tool_choice
+                if isinstance(_tc, dict) and _tc.get("type") in (
+                    "auto",
+                    "none",
+                    "required",
+                ):
+                    body["tool_choice"] = _tc["type"]
+                else:
+                    body["tool_choice"] = _tc
 
         # --------------------------------------------------------------
         # Response format — native supports json_object + json_schema.

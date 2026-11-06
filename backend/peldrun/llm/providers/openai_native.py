@@ -433,10 +433,26 @@ class OpenAINativeAdapter:
                 kwargs[key] = compiled.generation[key]
 
         # Tools.
+        #
+        # [FIX-TOOL-CHOICE-WIRE-FORMAT] Same rationale as
+        # ``lmstudio_native.py::_build_body``. The OpenAI Python SDK
+        # and the OpenAI REST API both require the generic modes as
+        # plain strings; the legacy ``{"type": "auto"}`` object form is
+        # rejected with HTTP 400. The compiler emits the object form
+        # for plugin compatibility (GigaChat etc.), so this adapter
+        # translates it locally.
         if compiled.tools:
             kwargs["tools"] = compiled.tools
             if compiled.tool_choice:
-                kwargs["tool_choice"] = compiled.tool_choice
+                _tc = compiled.tool_choice
+                if isinstance(_tc, dict) and _tc.get("type") in (
+                    "auto",
+                    "none",
+                    "required",
+                ):
+                    kwargs["tool_choice"] = _tc["type"]
+                else:
+                    kwargs["tool_choice"] = _tc
 
         # Response format.
         if compiled.response_format:
@@ -785,9 +801,17 @@ class OpenAINativeAdapter:
             if flat_tools:
                 kwargs["tools"] = flat_tools
                 if compiled.tool_choice:
-                    # Responses API tool_choice has the same shape as
-                    # Chat Completions.
-                    kwargs["tool_choice"] = compiled.tool_choice
+                    # Responses API tool_choice follows the same
+                    # string-for-generic-modes rule as Chat Completions.
+                    _tc = compiled.tool_choice
+                    if isinstance(_tc, dict) and _tc.get("type") in (
+                        "auto",
+                        "none",
+                        "required",
+                    ):
+                        kwargs["tool_choice"] = _tc["type"]
+                    else:
+                        kwargs["tool_choice"] = _tc
 
         # Response format — Responses uses "text.format" instead of
         # "response_format".

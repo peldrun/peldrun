@@ -1920,6 +1920,9 @@ class PeldrunEngine(ExecutionEngine):
             "task completed successfully",
             "task completed.",
             "task execution finished with status: success.",
+            "done",
+            "task complete",
+            "completed",
         }
         _normalized = (agent_output or "").strip().lower()
         agent_output_is_meaningful = bool(
@@ -1928,13 +1931,45 @@ class PeldrunEngine(ExecutionEngine):
             and _normalized not in _GENERIC_STRINGS
         )
 
+        # [FIX-ACCUMULATED-CONTENT-FALLBACK] The pre-fix logic discarded
+        # `streamed_fallback` whenever `run_result.output` was non-empty
+        # but generic. Real-world failure (job_4bc33f8fd493): the
+        # terminate tool returned "Task execution finished with status:
+        # success", `run_result.output` was non-empty → the sanitizer
+        # kept it → the meaningful check correctly rejected it as
+        # generic → but the final branch assigned `result_text =
+        # agent_output` again, i.e. the generic string. The accumulated
+        # streamed content (which the user watched appear on screen for
+        # several seconds) was silently discarded.
+        #
+        # New behavior: whenever `agent_output` is not meaningful
+        # (empty OR generic), prefer `streamed_fallback` if IT is
+        # meaningful. Only fall through to deliverables or the raw
+        # generic string when neither side produced real content.
+        _streamed_normalized = (streamed_fallback or "").strip().lower()
+        streamed_is_meaningful = bool(
+            streamed_fallback
+            and streamed_fallback.strip()
+            and _streamed_normalized not in _GENERIC_STRINGS
+        )
+
         if agent_output_is_meaningful:
             # The agent produced a meaningful message. Keep it as the
-            # final result. The deliverables list is still visible to
-            # the UI through the ARTIFACT_CREATED SSE events and the
-            # produced_files panel, so appending it here would only
-            # add noise (especially for cloned repositories).
+            # final result.
             result_text = agent_output
+        elif streamed_is_meaningful:
+            # [FIX-ACCUMULATED-CONTENT-FALLBACK] run_result.output was
+            # generic but the user watched meaningful content stream
+            # through CHUNK events. Use that accumulated content so the
+            # final message reflects what the user actually saw.
+            result_text = streamed_fallback
+            logger.info(
+                "[ENGINE PELDRUN] Using accumulated streamed content "
+                "(%d chars) as final result for job %s (run_result "
+                "output was generic).",
+                len(streamed_fallback or ""),
+                job_id,
+            )
         elif canonical_deliverables:
             # The agent produced no meaningful message; fall back to
             # the deliverables block so the user still knows what was
@@ -1953,9 +1988,9 @@ class PeldrunEngine(ExecutionEngine):
                 f"live in the **Preview** panel."
             )
         else:
-            # Neither the agent nor the file scanner produced
-            # anything. Keep the historical behavior: propagate the
-            # (empty or thought-derived) agent output unchanged.
+            # Neither the agent nor the streamed content produced
+            # meaningful text. Keep the raw (possibly generic) output
+            # so the user at least sees the run completed.
             result_text = agent_output
 
         # Inject any collected image results as an ``image_gallery``

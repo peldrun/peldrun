@@ -89,7 +89,12 @@ export function CloudProvidersTab({
       baseUrl: cp.baseUrl,
       apiKey: cp.apiKey,
       type: cp.type,
-      savedModels: cp.savedModels || [],
+      /* Normalize to a real array. A legacy vault / localStorage
+         entry may hold `savedModels` as a non-array (see the
+         defensive comment in CloudProviderCard.tsx). Passing a
+         non-iterable value here would make `new Set(...)` throw
+         inside ModelDiscoveryModal. */
+      savedModels: Array.isArray(cp.savedModels) ? cp.savedModels : [],
       isCustom: false,
       // Forward the provider's explicit metadata endpoint from the
       // vault. `ModelDiscoveryModal` passes it to

@@ -145,6 +145,109 @@ _FINISH_REASON_MAP: Dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
+# Thought signature helpers (Gemini thinking models)
+# ---------------------------------------------------------------------------
+#
+# Gemini 2.5 / 3.x thinking models attach an OPAQUE BYTES token to every
+# function_call part in their response. On the NEXT turn, when the
+# conversation history is replayed, the SAME token MUST be passed back
+# verbatim inside ``Part.thought_signature``. If it is missing or
+# altered, the API rejects the entire request with::
+#
+#   HTTP 400 INVALID_ARGUMENT: "Function call is missing a
+#   thought_signature in functionCall parts."
+#
+# The token is bytes at the SDK layer (``Part.thought_signature`` is
+# ``Optional[bytes]``). PELDRUN stores tool-call history as JSON, so
+# the value MUST be encoded to base64 on the storage boundary and
+# decoded back to raw bytes at the wire boundary.
+#
+# Without this encoding, three downstream layers silently break:
+#
+#   1. ``stream_normalizer.py`` rejects non-str signatures because
+#      ``isinstance(raw_sig, str)`` is False for bytes -> the token
+#      is dropped silently.
+#   2. ``ToolCall.thought_signature`` (typed Optional[str]) ends up
+#      holding raw bytes, which later fails ``json.dumps`` inside
+#      ExecutionState persistence.
+#   3. ``google_genai._convert_messages`` would pass a str directly
+#      to ``Part.thought_signature`` (Optional[bytes]) — Pydantic
+#      UTF-8 encodes the str, which produces DIFFERENT bytes than
+#      Google's original token → 400 INVALID_ARGUMENT.
+#
+# These two helpers normalize the representation so the base64 string
+# is what flows through the entire storage/transport pipeline, and the
+# raw bytes are only produced at the exact moment we set
+# ``Part.thought_signature``.
+
+
+def _encode_thought_signature(raw: Any) -> Optional[str]:
+    """
+    Normalize a thought_signature value to a base64 string for storage.
+
+    Accepts:
+        * ``bytes`` — SDK's canonical form (``Part.thought_signature``
+          is ``Optional[bytes]``).
+        * ``str``   — already base64 encoded (defensive passthrough for
+          hand-edited history or a future SDK that exposes str).
+        * ``None``  — no signature available.
+
+    Never raises. A malformed value falls back to ``None`` so a broken
+    signature cannot crash the stream — the request will fail later
+    with the standard "missing thought_signature" error (diagnosable),
+    rather than a confusing TypeError inside this helper.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        try:
+            import base64 as _b64
+
+            return _b64.b64encode(raw).decode("ascii")
+        except Exception:
+            return None
+    if isinstance(raw, str):
+        return raw if raw else None
+    try:
+        return str(raw)
+    except Exception:
+        return None
+
+
+def _decode_thought_signature(sig: Any) -> Optional[bytes]:
+    """
+    Normalize a stored thought_signature back to raw bytes for the SDK.
+
+    Accepts:
+        * ``str``    — base64 encoded (canonical storage form).
+        * ``bytes``  — already decoded (defensive passthrough).
+        * ``None``   — no signature.
+
+    Never raises. If the str is not valid base64 (hand-edited history,
+    older format), we fall back to UTF-8 encoding the raw string —
+    the SDK will reject it with a clear "invalid signature" error
+    rather than a TypeError raised inside this function.
+    """
+    if sig is None:
+        return None
+    if isinstance(sig, bytes):
+        return sig
+    if isinstance(sig, str):
+        if not sig:
+            return None
+        try:
+            import base64 as _b64
+
+            return _b64.b64decode(sig, validate=False)
+        except Exception:
+            try:
+                return sig.encode("utf-8")
+            except Exception:
+                return None
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Adapter profile
 # ---------------------------------------------------------------------------
 
@@ -432,13 +535,43 @@ class GoogleGenAIAdapter:
                             arguments=args,
                             type="function",
                         )
-                        # Preserve thought_signature for Gemini thinking models.
-                        sig = getattr(part, "thought_signature", None)
+                        # [FIX-THOUGHT-SIGNATURE] Gemini thinking models
+                        # attach an opaque bytes token to each
+                        # function_call part. It MUST be preserved
+                        # verbatim across turns, otherwise the next
+                        # request fails with HTTP 400 INVALID_ARGUMENT
+                        # ("Function call is missing a
+                        # thought_signature"). The token is bytes at
+                        # the SDK layer but PELDRUN stores tool-call
+                        # history as JSON, so we normalize to base64
+                        # str via ``_encode_thought_signature``. The
+                        # matching decode happens in
+                        # ``_convert_messages`` when history is
+                        # replayed.
+                        sig = _encode_thought_signature(
+                            getattr(part, "thought_signature", None)
+                        )
                         if sig:
                             try:
                                 tc.thought_signature = sig
                             except Exception:
                                 pass
+                        else:
+                            # Diagnostic: if this is a thinking model
+                            # and the SDK did NOT expose
+                            # thought_signature, the next turn WILL
+                            # fail with 400. Log it so the operator
+                            # can update the SDK.
+                            logger.debug(
+                                "GoogleGenAIAdapter: function_call "
+                                "for %r has no thought_signature. "
+                                "If the model is a thinking variant, "
+                                "the next turn will fail with HTTP "
+                                "400. Update google-genai SDK to a "
+                                "version that exposes "
+                                "Part.thought_signature.",
+                                name,
+                            )
                         # ``tool_index`` MUST be set to the call's
                         # position. When Gemini returns multiple
                         # parallel function calls, the normalizer uses
@@ -550,6 +683,26 @@ class GoogleGenAIAdapter:
                 if isinstance(raw_methods, list):
                     supported_methods = [str(m) for m in raw_methods if m]
 
+                # [FIX-CLOUD-BADGES] Google's /models endpoint does not
+                # return capability flags. We infer them from the model name
+                # so the frontend can display Tool/Vision/Reasoning badges.
+                model_name_lower = short.lower()
+                is_gemini = "gemini" in model_name_lower
+                is_vision = is_gemini or "vision" in model_name_lower
+                is_tools = is_gemini
+                is_reasoning = "2.5" in model_name_lower or "3." in model_name_lower or "thinking" in model_name_lower
+
+                caps_dict = {
+                    "vision": is_vision,
+                    "trained_for_tool_use": is_tools,
+                    "reasoning": is_reasoning,
+                }
+                caps_sources = {
+                    "vision": "provider_catalog",
+                    "trained_for_tool_use": "provider_catalog",
+                    "reasoning": "provider_catalog",
+                }
+
                 results.append(
                     {
                         "id": short,
@@ -563,6 +716,8 @@ class GoogleGenAIAdapter:
                             model, "output_token_limit", None
                         ),
                         "supported_generation_methods": supported_methods,
+                        "capabilities": caps_dict,
+                        "capability_sources": caps_sources,
                     }
                 )
         except Exception as exc:
@@ -864,10 +1019,29 @@ class GoogleGenAIAdapter:
                             args=args_dict,
                         )
                     )
-                    # Preserve thought_signature for Gemini thinking models.
+                    # [FIX-THOUGHT-SIGNATURE] Decode the stored base64
+                    # str back to raw bytes. ``Part.thought_signature``
+                    # is Optional[bytes] in the SDK — passing a str
+                    # would cause Pydantic to UTF-8 encode it, which
+                    # yields DIFFERENT bytes than Google's original
+                    # token and triggers HTTP 400 INVALID_ARGUMENT
+                    # ("Function call is missing a
+                    # thought_signature").
                     sig = tc.get("thought_signature")
                     if sig:
-                        part.thought_signature = sig
+                        decoded = _decode_thought_signature(sig)
+                        if decoded is not None:
+                            part.thought_signature = decoded
+                        else:
+                            logger.warning(
+                                "GoogleGenAIAdapter: stored "
+                                "thought_signature for %r could not "
+                                "be decoded from base64; the next "
+                                "request will likely fail with HTTP "
+                                "400. The stored value is %r.",
+                                name,
+                                str(sig)[:32],
+                            )
                     parts.append(part)
                 if parts:
                     contents.append(
@@ -1200,8 +1374,15 @@ class GoogleGenAIAdapter:
                         arguments=args,
                         type="function",
                     )
-                    # Preserve thought_signature for Gemini thinking models.
-                    sig = getattr(part, "thought_signature", None)
+                    # [FIX-THOUGHT-SIGNATURE] Same rationale as the
+                    # streaming path above. Encode to base64 str so
+                    # the value round-trips cleanly through JSON
+                    # storage and is not dropped by
+                    # ``stream_normalizer`` (which only accepts
+                    # str-typed signatures).
+                    sig = _encode_thought_signature(
+                        getattr(part, "thought_signature", None)
+                    )
                     if sig:
                         try:
                             tc.thought_signature = sig
@@ -1240,13 +1421,21 @@ class GoogleGenAIAdapter:
 
 def _map_finish_reason(raw: Any) -> str:
     """Map Google's finish_reason enum to canonical strings."""
-    # The SDK returns an enum or a string. Normalize to uppercase
-    # string then look up.
     if raw is None:
         return "stop"
     raw_str = (
         raw.name if hasattr(raw, "name") else str(raw)
     ).upper()
+
+    # [FIX-TOOL-ERROR-FALLBACK] If Gemini fails to generate a valid
+    # function call (MALFORMED_FUNCTION_CALL), it often still generates
+    # valid text alongside it. Returning "stop" instead of "tool_error"
+    # allows the agent to accept the text as the final answer rather
+    # than crashing with an "EMPTY response" error.
+    if raw_str in ("MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS"):
+        logger.warning("Gemini returned %s — falling back to text response.", raw_str)
+        return "stop"
+
     return _FINISH_REASON_MAP.get(raw_str, "stop")
 
 

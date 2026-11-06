@@ -3,7 +3,10 @@
 
 import React, { useCallback, useEffect, useState } from "react";
 import { showToast } from "@/components/ui/ToastNotification";
-import { ModelDiscoveryModal } from "../../ModelDiscoveryModal";
+import {
+  ModelDiscoveryModal,
+  type ModelsDiscoverySavePayload,
+} from "../../ModelDiscoveryModal";
 import { ModelInfoModal } from "@/components/models/ModelInfoModal";
 import {
   fetchServerMetadata,
@@ -29,6 +32,112 @@ import type {
   LLMTabProps,
   ModelMetadataVault,
 } from "./types";
+
+/* -------------------------------------------------------------------------- */
+/* Metadata persistence helper                                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Merge the raw provider metadata with the catalog capability facts
+ * collected by `ModelDiscoveryModal`, then persist the result to
+ * `/api/config/models-metadata`.
+ *
+ * Background
+ * ----------
+ * `ModelDiscoveryModal` collects two parallel sources of truth during
+ * a scan:
+ *
+ *   1. `metadata` — the raw `/api/config/fetch-models` response
+ *      (`display_name`, `params_string`, `max_context_length`,
+ *      `capabilities`, `capability_sources`, ...).
+ *   2. `facts` — the catalog capability facts fetched asynchronously
+ *      from `/api/catalog/models/{modelId}`, used by the modal to
+ *      render the Reasoning / Vision / Tools badges.
+ *
+ * The modal's badge rendering overlays `facts` on top of
+ * `metadata.capabilities` (see the "overlay only when the catalog is
+ * definitive" block in `ModelDiscoveryModal.tsx`). Without this
+ * helper, only `metadata` would reach `models_metadata.json` — the
+ * catalog facts would be lost, and a subsequent `ModelInfoModal`
+ * render would briefly disagree with what the user just saw in the
+ * discovery modal.
+ *
+ * Merge rules
+ * -----------
+ * For each capability (`vision`, `trained_for_tool_use`, `reasoning`):
+ *   - Overlay `facts[field].value` onto `capabilities[field]` ONLY
+ *     when `facts[field].known === true` (matches the UI's overlay
+ *     rule exactly).
+ *   - Record `facts[field].source` (falling back to
+ *     `"external_registry"`) into `capability_sources[field]`.
+ *
+ * The backend's `_merge_metadata_entries` then applies its own
+ * preservation rules — any existing `manual` source on disk wins over
+ * the incoming automated source, so a rescan never clobbers a
+ * user-authored capability.
+ *
+ * Failure handling
+ * ----------------
+ * The HTTP call is best-effort: a network blip must never block the
+ * vault + budget save path that already succeeded before this runs.
+ */
+async function persistDiscoveryMetadata(
+  payload: ModelsDiscoverySavePayload
+): Promise<void> {
+  const { metadata, facts } = payload;
+
+  /* Deep-copy the raw metadata so mutations below cannot leak back into
+     the modal's React state (the payload is a live reference). */
+  const merged: Record<string, Record<string, unknown>> = {};
+  for (const [modelId, entry] of Object.entries(metadata || {})) {
+    if (entry && typeof entry === "object") {
+      merged[modelId] = JSON.parse(JSON.stringify(entry));
+    }
+  }
+
+  /* Overlay catalog facts on top. */
+  for (const [modelId, factsEntry] of Object.entries(facts || {})) {
+    if (!factsEntry || typeof factsEntry !== "object") continue;
+    if (!merged[modelId]) merged[modelId] = {};
+
+    const entry = merged[modelId] as Record<string, unknown>;
+    const capabilities = {
+      ...((entry.capabilities as Record<string, unknown>) || {}),
+    };
+    const sources = {
+      ...((entry.capability_sources as Record<string, unknown>) || {}),
+    };
+
+    const overlay = (
+      field: "vision" | "tools" | "reasoning",
+      targetField: string
+    ): void => {
+      const fact = (factsEntry as Record<string, any>)[field];
+      if (!fact || !fact.known) return;
+      capabilities[targetField] = fact.value;
+      sources[targetField] = fact.source || "external_registry";
+    };
+
+    overlay("vision", "vision");
+    overlay("tools", "trained_for_tool_use");
+    overlay("reasoning", "reasoning");
+
+    entry.capabilities = capabilities;
+    entry.capability_sources = sources;
+  }
+
+  if (Object.keys(merged).length === 0) return;
+
+  try {
+    await fetch("/api/config/models-metadata", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ metadata: merged }),
+    });
+  } catch {
+    /* Non-fatal: metadata persistence must never abort the save flow. */
+  }
+}
 
 /* -------------------------------------------------------------------------- */
 /* Component                                                                  */
@@ -420,9 +529,21 @@ export function LLMTab(props: LLMTabProps) {
   /* -------------------------- Discovery persistence --------------------- */
 
   const handleSaveDiscovered = useCallback(
-    (selectedModels: string[], primaryModel?: string) => {
+    (payload: ModelsDiscoverySavePayload) => {
       const target = discovery.discoveryTarget;
       if (!target) return;
+
+      /* Defensive normalization of the incoming payload. The modal
+         always passes an array (built via `Array.from(Set)`), but a
+         legacy caller or a transient state could theoretically hand
+         us a non-iterable value. Guard here so the downstream
+         `savedModels` in the cloud-provider state is ALWAYS a real
+         array, which is what `CloudProviderCard` and the backend
+         expect. */
+      const selectedModels = Array.isArray(payload.models)
+        ? payload.models
+        : [];
+      const primaryModel = payload.defaultModel;
 
       if (target.isCustom) {
         custom.applyDiscoveredModels(
@@ -473,6 +594,17 @@ export function LLMTab(props: LLMTabProps) {
           return next;
         });
       }
+
+      /* NEW: persist the enriched metadata (provider scan + catalog
+         facts) to `storage/models_metadata.json`.
+
+         This is the write that was missing before — the modal
+         collected metadata + facts, but `handleSaveDiscovered` only
+         forwarded `models` / `primaryModel` and silently dropped the
+         rest, so `models_metadata.json` stayed stale after every
+         save. Failures are swallowed inside the helper and never
+         abort the vault/budget save that just completed. */
+      void persistDiscoveryMetadata(payload);
 
       showToast.success(
         "Models Saved",
