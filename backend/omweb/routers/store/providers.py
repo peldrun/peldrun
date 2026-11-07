@@ -422,35 +422,105 @@ def _compute_certificate_summary(
     return (True, "all_installed")
 
 
+def _resolve_active_connection(
+    provider_id: str,
+) -> tuple[bool, Optional[str]]:
+    """
+    Look up the package's active connection in the connection vault.
+
+    Returns ``(has_active, name)``. Never raises — a failure to read
+    the vault is treated as "no active connection" so the list
+    endpoint always succeeds and the UI renders a neutral badge
+    instead of an error.
+
+    This is the SINGLE source of truth for the
+    ``has_active_connection`` / ``active_connection_name`` fields on
+    both the installed-providers list (``GET /``) and the catalog
+    items (``GET /catalog``). Keeping the lookup in one helper
+    guarantees the two views can never disagree about a package's
+    connection state — which is exactly the drift that produced the
+    earlier "Not configured" bug on already-connected packages.
+    """
+    try:
+        from omweb.routers.config_rtr import (
+            get_active_connection_for_package,
+        )
+
+        active_conn = get_active_connection_for_package(provider_id)
+    except Exception as exc:
+        # The vault may be missing, locked, or mid-write. Treat any
+        # failure as "no active connection" — the list endpoint must
+        # never fail because of a transient vault read.
+        logger.debug(
+            "Active-connection lookup failed for %r: %s",
+            provider_id,
+            exc,
+        )
+        return (False, None)
+
+    if active_conn is None:
+        return (False, None)
+
+    # ``active_conn`` is a plain dict in the vault's on-disk format.
+    # Guard against a non-dict payload (corrupted vault) so a single
+    # bad record cannot break the whole listing.
+    name = active_conn.get("name") if isinstance(active_conn, dict) else None
+    return (True, name or None)
+
+
 def _enrich_entry_with_certificate_status(
     entry: ProviderPackageEntry,
 ) -> Dict[str, Any]:
     """
     Serialize a registry entry with the two certificate-status fields
-    the store card needs.
+    the store card needs, plus the LIVE connection state.
 
     The base registry entry stores only what was known at install time
     (name, description, features, ...). It does NOT carry the live
     certificate status because that depends on the filesystem and can
-    change without touching the registry.
+    change without touching the registry. Likewise, it does not know
+    which of the package's saved connections is currently active —
+    that lives in the connection vault, not the registry.
 
-    This helper reads the on-disk ``manifest.json`` to discover the
-    declared certificates, then delegates to
-    ``_compute_certificate_summary`` for the aggregate status.
+    This helper bridges both gaps:
 
-    Two new keys are added to the serialized dict:
+      * Reads the on-disk ``manifest.json`` to discover the declared
+        certificates and delegates to
+        ``_compute_certificate_summary`` for the aggregate status.
+      * Calls ``_resolve_active_connection`` to obtain the live
+        ``has_active_connection`` / ``active_connection_name`` pair.
 
-        * ``has_certificates``   — boolean or null (null when the
-                                   manifest could not be read).
-        * ``certificates_status`` — one of ``none_required``,
-                                    ``all_installed``, ``some_missing``,
-                                    ``unknown``.
+    Keys added to the serialized dict:
 
-    Packages that do not declare certificates get ``has_certificates:
-    False`` and ``certificates_status: "none_required"`` — the card
-    will not render a certificate badge or button for them.
+        * ``has_certificates``      — boolean or null (null when the
+                                      manifest could not be read).
+        * ``certificates_status``   — one of ``none_required``,
+                                      ``all_installed``,
+                                      ``some_missing``, ``unknown``.
+        * ``has_active_connection`` — true when the vault holds an
+                                      active connection for this
+                                      package.
+        * ``active_connection_name``— the active connection's
+                                      user-visible name, or ``None``.
+
+    Packages that do not declare certificates get
+    ``has_certificates: False`` and
+    ``certificates_status: "none_required"`` — the card will not
+    render a certificate badge or button for them.
+
+    CRITICAL: the connection lookup runs BEFORE the manifest read.
+    A corrupted or missing manifest must not make the card claim
+    "Not configured" when the vault in fact holds an active
+    connection — the two signals are independent and the fix that
+    shipped in this revision deliberately decouples them.
     """
     entry_dict = entry.model_dump()
+
+    # Connection state is always resolved, regardless of manifest
+    # readability. See the docstring note above.
+    has_active, active_name = _resolve_active_connection(entry.id)
+    entry_dict["has_active_connection"] = has_active
+    entry_dict["active_connection_name"] = active_name
 
     manifest = _try_read_manifest(entry.id, entry.active_version)
     if manifest is None:
@@ -553,24 +623,13 @@ def _enrich_catalog_item_with_install_state(
         reverse=True,
     )
 
-    # Derive the connection status from the vault. This mirrors the
-    # logic used by the installed-packages list endpoint so the card
-    # renders identically regardless of which tab the user is on.
-    try:
-        from omweb.routers.config_rtr import (
-            get_active_connection_for_package,
-        )
-
-        active_conn = get_active_connection_for_package(installed.id)
-    except Exception:
-        active_conn = None
-
-    if active_conn is not None:
-        raw["has_active_connection"] = True
-        raw["active_connection_name"] = active_conn.get("name") or None
-    else:
-        raw["has_active_connection"] = False
-        raw["active_connection_name"] = None
+    # Derive the connection status from the vault. Delegated to the
+    # shared ``_resolve_active_connection`` helper so this path and
+    # the installed-packages list endpoint can never disagree about a
+    # package's connection state.
+    has_active, active_name = _resolve_active_connection(installed.id)
+    raw["has_active_connection"] = has_active
+    raw["active_connection_name"] = active_name
 
     return raw
 
