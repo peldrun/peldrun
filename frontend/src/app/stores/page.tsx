@@ -444,12 +444,14 @@ export default function StoresPage() {
         open={skillActions.isDetailsDrawerOpen}
         skill={skillActions.detailsSkill}
         onClose={skillActions.handleCloseDetails}
+        onEditSubSkill={skillActions.handleOpenEditor}
       />
 
       {/* Skill editor modal */}
       <SkillEditorModal
         open={skillActions.isEditorOpen}
         skill={skillActions.editorSkill}
+        subSkillId={skillActions.editorSubSkillId}
         onClose={skillActions.handleCloseEditor}
         onSaved={skillActions.handleSkillSaved}
       />

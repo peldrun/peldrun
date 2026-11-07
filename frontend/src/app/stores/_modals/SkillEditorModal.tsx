@@ -122,12 +122,28 @@ import { SkillFloatingToolbarPlugin } from "@/components/skills/editor/skill-flo
 
 export interface SkillEditorModalProps {
   open: boolean;
-  /** The skill being edited. Null when the modal is closed. */
+  /** The skill (parent router) being edited. Null when closed. */
   skill: SkillSummary | null;
+  /**
+   * The sub-skill being edited, or ``null`` to edit the parent body.
+   *
+   * When set, the modal:
+   *   * fetches its body from ``GET /api/skills/{id}/sub-skills/{sub}/preview``
+   *   * saves via ``PUT /api/skills/{id}/sub-skills/{sub}/instructions``
+   *   * shows the sub-skill ID in the title breadcrumb
+   *   * preserves the sub-skill's own YAML frontmatter (server-side)
+   *
+   * Defaults to ``null`` for backward compatibility with callers that
+   * only edit the parent body.
+   */
+  subSkillId?: string | null;
   onClose: () => void;
   /**
-   * Called after a successful save with the updated skill record so the
-   * parent can merge it into its ``skills`` list without refetching.
+   * Called after a successful save with the updated parent skill so
+   * the parent can merge it into its ``skills`` list without
+   * refetching. For sub-skill edits, the parent's metadata is
+   * unchanged — the callback receives the same record and the merge
+   * is idempotent.
    */
   onSaved?: (updatedSkill: SkillSummary) => void;
 }
@@ -486,6 +502,7 @@ function SkillEditorToolbarPlugin() {
 export function SkillEditorModal({
   open,
   skill,
+  subSkillId = null,
   onClose,
   onSaved,
 }: SkillEditorModalProps) {
@@ -511,13 +528,17 @@ export function SkillEditorModal({
     setInitialMarkdown("");
     setDirty(false);
 
+    // Switch between parent-body and sub-skill endpoints based on
+    // the subSkillId prop. The two endpoints return identical
+    // payload shapes (``SkillPreview``), so downstream logic does
+    // not need to branch further.
+    const previewUrl = subSkillId
+      ? `/api/skills/${encodeURIComponent(skill.id)}/sub-skills/${encodeURIComponent(subSkillId)}/preview`
+      : `/api/skills/${encodeURIComponent(skill.id)}/preview`;
+
     (async () => {
       try {
-        const res = await fetch(
-          getApiUrl(
-            `/api/skills/${encodeURIComponent(skill.id)}/preview`,
-          ),
-        );
+        const res = await fetch(getApiUrl(previewUrl));
         if (cancelled) return;
 
         if (!res.ok) {
@@ -552,7 +573,7 @@ export function SkillEditorModal({
     return () => {
       cancelled = true;
     };
-  }, [open, skill]);
+  }, [open, skill, subSkillId]);
 
   // ── Escape closes (with unsaved-changes guard) ─────────────────────
   useEffect(() => {
@@ -613,16 +634,18 @@ export function SkillEditorModal({
     setError(null);
 
     try {
-      const res = await fetch(
-        getApiUrl(
-          `/api/skills/${encodeURIComponent(skill.id)}/instructions`,
-        ),
-        {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ instructions: trimmed }),
-        },
-      );
+      // Switch between parent-body and sub-skill endpoints. Both
+      // accept the same ``{ instructions: string }`` payload and
+      // return the parent skill summary in ``data.skill``.
+      const saveUrl = subSkillId
+        ? `/api/skills/${encodeURIComponent(skill.id)}/sub-skills/${encodeURIComponent(subSkillId)}/instructions`
+        : `/api/skills/${encodeURIComponent(skill.id)}/instructions`;
+
+      const res = await fetch(getApiUrl(saveUrl), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ instructions: trimmed }),
+      });
 
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
@@ -641,8 +664,10 @@ export function SkillEditorModal({
 
       const data: { status: string; skill: SkillSummary } = await res.json();
       showToast.success(
-        "Skill updated",
-        `${data.skill.name} instructions saved.`,
+        subSkillId ? "Sub-skill updated" : "Skill updated",
+        subSkillId
+          ? `${data.skill.name} › ${subSkillId} instructions saved.`
+          : `${data.skill.name} instructions saved.`,
       );
 
       if (typeof window !== "undefined") {
@@ -659,7 +684,7 @@ export function SkillEditorModal({
     } finally {
       setSaving(false);
     }
-  }, [skill, markdown, onSaved, onClose]);
+  }, [skill, markdown, onSaved, onClose, subSkillId]);
 
   // ── Reset to the loaded state ──────────────────────────────────────
   const handleReset = useCallback(() => {
@@ -753,9 +778,20 @@ export function SkillEditorModal({
                 className="text-base font-bold text-foreground truncate"
               >
                 Edit — {skill.display_name || skill.name}
+                {subSkillId && (
+                  <span className="text-muted-foreground font-normal">
+                    {" "}
+                    › <code className="font-mono text-primary">{subSkillId}</code>
+                  </span>
+                )}
               </h2>
               <p className="text-xs text-muted-foreground font-mono">
                 {skill.id} · v{skill.version}
+                {subSkillId && (
+                  <span className="ml-2 text-violet-600 dark:text-violet-400">
+                    · editing sub-skill
+                  </span>
+                )}
               </p>
             </div>
           </div>

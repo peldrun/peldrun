@@ -489,6 +489,243 @@ async def preview_skill(skill_id: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# GET /api/skills/{skill_id}/sub-skills/{sub_skill_id}/preview
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/{skill_id}/sub-skills/{sub_skill_id}/preview",
+    response_model=Dict[str, Any],
+)
+async def preview_sub_skill(
+    skill_id: str,
+    sub_skill_id: str,
+) -> Dict[str, Any]:
+    """
+    Return the instructions text of a single sub-skill for the editor.
+
+    Reads the file declared in the parent manifest's
+    ``sub_skills[i].instructions_file``, validates containment, and
+    returns the Markdown body (frontmatter stripped) so the operator
+    can edit it through the Skill Editor modal.
+
+    Error cases:
+        * 404 — parent skill not found.
+        * 404 — sub-skill ID not declared in the parent.
+        * 404 — sub-skill file missing on disk.
+        * 500 — containment violation or read failure (server-side bug).
+    """
+    from omweb.skills.manifest import parse_skill_md as _parse_md
+
+    try:
+        record = skill_manager.get_skill_or_raise(skill_id)
+    except SkillNotFoundError as exc:
+        raise _skill_error_to_http(exc, http_status=404)
+
+    sub = next(
+        (s for s in record.sub_skills if s.get("id") == sub_skill_id),
+        None,
+    )
+    if sub is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": (
+                    f"Sub-skill {sub_skill_id!r} not found in "
+                    f"{skill_id!r}."
+                ),
+                "code": "SUB_SKILL_NOT_FOUND",
+                "details": {
+                    "skill_id": record.id,
+                    "sub_skill_id": sub_skill_id,
+                    "available": [
+                        s.get("id") for s in record.sub_skills
+                        if s.get("id")
+                    ],
+                },
+            },
+        )
+
+    rel = sub.get("instructions_file")
+    if not isinstance(rel, str) or not rel:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Sub-skill has no instructions_file declared.",
+                "code": "SUB_SKILL_FILE_NOT_DECLARED",
+                "details": {
+                    "skill_id": record.id,
+                    "sub_skill_id": sub_skill_id,
+                },
+            },
+        )
+
+    candidate = (record.package_dir / rel).resolve()
+    try:
+        candidate.relative_to(record.package_dir.resolve())
+    except ValueError:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Sub-skill path escapes the parent package.",
+                "code": "SUB_SKILL_CONTAINMENT_VIOLATION",
+                "details": {
+                    "skill_id": record.id,
+                    "sub_skill_id": sub_skill_id,
+                    "path": rel,
+                },
+            },
+        )
+
+    if not candidate.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": f"Sub-skill file missing: {rel!r}.",
+                "code": "SUB_SKILL_FILE_MISSING",
+                "details": {
+                    "skill_id": record.id,
+                    "sub_skill_id": sub_skill_id,
+                    "path": rel,
+                },
+            },
+        )
+
+    try:
+        raw_text = candidate.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": f"Failed to read sub-skill file: {exc}",
+                "code": "SUB_SKILL_READ_FAILED",
+                "details": {
+                    "skill_id": record.id,
+                    "sub_skill_id": sub_skill_id,
+                    "path": rel,
+                },
+            },
+        )
+
+    # Strip frontmatter so the editor receives only the editable
+    # body — the same contract as the parent /preview endpoint. If
+    # the file has no valid frontmatter, return the raw text so the
+    # operator can still see and fix it, but log the reason so any
+    # corruption is visible in the backend log rather than hidden
+    # behind a silent ``{}`` in the API response.
+    try:
+        frontmatter, body = _parse_md(raw_text)
+    except Exception as parse_exc:
+        logger.warning(
+            "Sub-skill frontmatter parse failed for %r/%r: %s "
+            "(returning raw text as body).",
+            skill_id,
+            sub_skill_id,
+            parse_exc,
+        )
+        frontmatter = {}
+        body = raw_text
+
+    return {
+        "status": "success",
+        "skill_id": record.id,
+        "sub_skill_id": sub_skill_id,
+        "version": record.version,
+        "instructions": body,
+        "instructions_length": len(body),
+        "frontmatter": dict(frontmatter),
+    }
+
+
+# ---------------------------------------------------------------------------
+# PUT /api/skills/{skill_id}/sub-skills/{sub_skill_id}/instructions
+# ---------------------------------------------------------------------------
+
+@router.put(
+    "/{skill_id}/sub-skills/{sub_skill_id}/instructions",
+    response_model=Dict[str, Any],
+)
+async def update_sub_skill_instructions(
+    skill_id: str,
+    sub_skill_id: str,
+    req: SkillInstructionsUpdateRequest,
+) -> Dict[str, Any]:
+    """
+    Replace the SKILL.md body of a sub-skill within a router skill.
+
+    Same validation chain as ``PUT /{skill_id}/instructions``, but
+    targets the file declared in the parent manifest's
+    ``sub_skills[i].instructions_file``. The sub-skill's YAML
+    frontmatter is preserved verbatim from the existing file.
+
+    Error mapping:
+        * 404 — parent skill not found.
+        * 404 — sub-skill ID not declared in the parent.
+        * 403 — parent skill is not user-editable.
+        * 422 — validation failed (empty, oversized, missing
+                frontmatter, re-parse failure, path escape is 403
+                via SkillSecurityError).
+        * 500 — filesystem failure.
+    """
+    try:
+        record = skill_manager.update_sub_skill_instructions(
+            skill_id=skill_id,
+            sub_skill_id=sub_skill_id,
+            new_body=req.instructions,
+        )
+    except SkillNotFoundError as exc:
+        raise _skill_error_to_http(exc, http_status=404)
+    except SkillSecurityError as exc:
+        # Containment violations surface here because the manager
+        # raises SkillSecurityError for path escape. Non-editability
+        # also raises SkillSecurityError — both are client errors,
+        # so 403 is the right status for both.
+        raise _skill_error_to_http(exc, http_status=403)
+    except SkillValidationError as exc:
+        # Distinguish "sub-skill not declared" (404) from generic
+        # validation failures (422). The manager sets a ``reason``
+        # field for exactly this purpose. We build the HTTPException
+        # manually for the 404 case so the code becomes
+        # ``SUB_SKILL_NOT_FOUND`` (matching GET /preview) instead of
+        # the generic ``SKILL_VALIDATION_FAILED`` that would leak
+        # through ``SkillValidationError.DEFAULT_CODE``.
+        if exc.details.get("reason") == "sub_skill_not_found":
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": str(exc),
+                    "code": "SUB_SKILL_NOT_FOUND",
+                    "details": exc.details,
+                },
+            )
+        raise _skill_error_to_http(exc, http_status=422)
+    except SkillStorageError as exc:
+        logger.exception(
+            "Failed to persist sub-skill instructions for "
+            "%r/%r: %s",
+            skill_id,
+            sub_skill_id,
+            exc,
+        )
+        raise _skill_error_to_http(exc, http_status=500)
+    except SkillError as exc:
+        logger.warning(
+            "Unmapped SkillError during sub-skill update for "
+            "%r/%r: %s",
+            skill_id,
+            sub_skill_id,
+            exc,
+        )
+        raise _skill_error_to_http(exc, http_status=400)
+
+    return {
+        "status": "success",
+        "skill": _record_to_summary(record).model_dump(),
+        "sub_skill_id": sub_skill_id,
+        "instructions_length": len(req.instructions),
+    }
+
+
+# ---------------------------------------------------------------------------
 # PUT /api/skills/{skill_id}/instructions
 # ---------------------------------------------------------------------------
 

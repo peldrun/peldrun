@@ -1,4 +1,3 @@
-```markdown
 # PELDRUN Skills
 
 Skills are self-contained, versioned instruction packs that augment an
@@ -9,29 +8,40 @@ encode a repeatable workflow (a code-review checklist, a test-planning
 procedure, a security-audit routine) so that both chat invocations and agent
 assignments produce consistent, high-quality output.
 
-This document is the operator reference: what a skill is, how it is installed,
-managed, invoked, and diagnosed. For the authoring guide (how to write your
-own skill package), see [creating-skills.md](./creating-skills.md).
+A skill can be **simple** (a single instruction document) or a **router**
+(a parent skill that dispatches to one of several specialized sub-skills).
+Router skills pair naturally with **Progressive Disclosure** and the
+**BM25 Skill Router** to keep the system prompt small even when dozens of
+skills are installed.
+
+This document is the operator reference: what a skill is, how it is
+installed, managed, invoked, and diagnosed. For the authoring guide (how to
+write your own skill package, including router skills and sub-skills), see
+[creating-skills.md](./creating-skills.md).
 
 ---
 
 ## Table of Contents
 
 1. [Concept](#1-concept)
-2. [Where skills are used](#2-where-skills-are-used)
-3. [Two ways to invoke a skill](#3-two-ways-to-invoke-a-skill)
-4. [Package layout](#4-package-layout)
-5. [Installing a skill](#5-installing-a-skill)
-6. [Managing installed skills](#6-managing-installed-skills)
-7. [Assigning skills to agents](#7-assigning-skills-to-agents)
-8. [Invoking a skill from chat](#8-invoking-a-skill-from-chat)
-9. [Runtime injection](#9-runtime-injection)
-10. [Lifecycle states](#10-lifecycle-states)
-11. [Storage layout](#11-storage-layout)
-12. [REST API reference](#12-rest-api-reference)
-13. [Security model](#13-security-model)
-14. [Troubleshooting](#14-troubleshooting)
-15. [Reference example](#15-reference-example)
+2. [Progressive Disclosure](#2-progressive-disclosure)
+3. [Router Pattern (Sub-Skills)](#3-router-pattern-sub-skills)
+4. [BM25 Skill Router](#4-bm25-skill-router)
+5. [Where skills are used](#5-where-skills-are-used)
+6. [Package layout](#6-package-layout)
+7. [Installing a skill](#7-installing-a-skill)
+8. [Managing installed skills](#8-managing-installed-skills)
+9. [Editing skill content](#9-editing-skill-content)
+10. [Assigning skills to agents](#10-assigning-skills-to-agents)
+11. [Invoking a skill from chat](#11-invoking-a-skill-from-chat)
+12. [Runtime injection](#12-runtime-injection)
+13. [Skill tools](#13-skill-tools)
+14. [Lifecycle states](#14-lifecycle-states)
+15. [Storage layout](#15-storage-layout)
+16. [REST API reference](#16-rest-api-reference)
+17. [Security model](#17-security-model)
+18. [Troubleshooting](#18-troubleshooting)
+19. [Reference example](#19-reference-example)
 
 ---
 
@@ -59,18 +69,256 @@ capability — it changes the way the model applies its existing capabilities
   A broken skill can never crash a chat.
 - **Deterministic.** When multiple skills are active, they are injected in
   a stable, alphabetized order so prompt caching and reproducibility hold.
+- **Composable.** A skill can declare **sub-skills** and act as a router
+  (see §3). This is the mechanism that lets PELDRUN scale to hundreds of
+  skills without paying the token cost on every message.
 
 ---
 
-## 2. Where skills are used
+## 2. Progressive Disclosure
 
-Skills show up in three surfaces:
+Prior to Progressive Disclosure, every assigned skill's full body was
+injected into the system prompt on **every** run. That worked up to about
+10 skills; beyond that, the system prompt ballooned to thousands of tokens
+of guidance the model mostly ignored.
+
+Progressive Disclosure replaces "inject everything" with a three-tier model
+that loads content only when it is needed:
+
+| Tier | What it contains | When it is loaded | Typical size |
+|------|------------------|-------------------|--------------|
+| **L1: Catalog** | id + name + description + sub-skill names | Always (in every run) | 50–150 tokens per skill |
+| **L2: Instructions** | The full `SKILL.md` body (parent or sub-skill) | On demand, via the `load_skill` / `load_sub_skill` tool | 500–2000 tokens |
+| **L3: Resources** | Reference files under `references/` | On demand, via the `load_reference` tool | Variable |
+
+### What this looks like at runtime
+
+When Progressive Disclosure is enabled, the engine builds a **catalog**
+listing the top-K most relevant skills (see §4), appends it to the system
+prompt, and exposes three tools to the model:
+
+- `load_skill(skill_id)` — fetch a skill's full body.
+- `load_sub_skill(parent_id, sub_skill_id)` — fetch a sub-skill's body.
+- `load_reference(skill_id, rel_path)` — fetch a reference file.
+
+The model then decides at inference time which skills it actually needs. If
+the user's message is about SQL injection, the model loads only the
+`security_audit` sub-skill from `code_review`, not the entire code-review
+toolkit.
+
+### Feature flag
+
+Progressive Disclosure is controlled by a single environment variable:
+
+```
+PELDRUN_PROGRESSIVE_DISCLOSURE=true    # default
+```
+
+- **`true`** (default): catalog + skill tools.
+- **`false`**: legacy full-body injection. Every assigned skill's entire
+  `SKILL.md` is injected on every run, no tools are exposed. Useful for
+  environments that cannot upgrade their model harness, or as an emergency
+  rollback.
+
+The flag is read **on every run**, not cached at startup. Changing it takes
+effect on the next run without a restart. Startup logs record the effective
+mode:
+
+```
+INFO:omweb.main:Skills progressive disclosure: ENABLED (PELDRUN_PROGRESSIVE_DISCLOSURE=true (default)).
+```
+
+### Backward compatibility
+
+Skills without `sub_skills` work unchanged in either mode. The catalog
+simply lists them at the top level; the model calls `load_skill` to fetch
+their full body. The behavior of a plain skill is identical to the pre-
+feature runtime, just deferred by one tool call.
+
+---
+
+## 3. Router Pattern (Sub-Skills)
+
+A **router skill** is a skill whose body is short and whose job is to
+dispatch to one of several specialized **sub-skills**. Each sub-skill is a
+complete `SKILL.md` document with its own instructions, output format, and
+trigger keywords.
+
+### Why routers exist
+
+A deep single skill (e.g. `debugging`) accumulates guidance for every
+technique — root-cause tracing, defense in depth, methodology, verification
+— until its body exceeds the useful context budget. Splitting it into
+sub-skills lets the model load only the technique relevant to the current
+question:
+
+```
+debugging (router)
+├── root_cause_tracing        (~800 tokens)
+├── defense_in_depth          (~600 tokens)
+├── systematic_debugging      (~700 tokens)
+└── verification_before_completion  (~500 tokens)
+```
+
+Before: every debugging run cost ~2600 tokens (all four bodies).
+After: a debugging run costs ~200 tokens (router only) + ~800 tokens (the
+chosen sub-skill). That is an **85% reduction** for a single-skill package.
+
+### The router body
+
+The parent `SKILL.md` for a router is a short dispatch prompt: it lists the
+sub-skills, describes when to use each, and instructs the model to call
+`load_sub_skill`. It does **not** contain the review instructions themselves.
+
+```markdown
+---
+name: code_review
+description: Systematic code review with router-based sub-skill selection.
+---
+
+# Code Review Router
+
+You have access to four specialized sub-skills.
+
+## Sub-Skills
+
+### 1. correctness_analysis
+Use when: The user has code with potential logic bugs...
+
+### 2. security_audit
+Use when: The user mentions security, injection, secrets, auth...
+
+(...)
+
+## How to Activate
+
+Call `load_sub_skill(parent_id="code_review", sub_skill_id="<chosen>")`.
+```
+
+### The manifest declaration
+
+Sub-skills are declared in the parent's `manifest.json`:
+
+```json
+"sub_skills": [
+  {
+    "id": "security_audit",
+    "description": "Identify security vulnerabilities — injection, secrets, auth bypass.",
+    "triggers": ["security", "injection", "xss", "sql", "auth", "secret"],
+    "instructions_file": "sub_skills/security_audit/SKILL.md"
+  },
+  {
+    "id": "correctness_analysis",
+    "description": "Identify logic bugs, edge cases, incorrect control flow.",
+    "triggers": ["bug", "logic", "null", "crash", "correctness"],
+    "instructions_file": "sub_skills/correctness_analysis/SKILL.md"
+  }
+]
+```
+
+Each entry contributes to **two** things:
+
+1. **BM25 routing** — `triggers` and `description` are indexed so the parent
+   ranks higher when the user's message matches any of its sub-skills.
+   The parent never loses a match to a sibling sub-skill's tags.
+2. **Model-side dispatch** — the catalog and the router body both list the
+   sub-skill IDs and descriptions, so the model knows what to call.
+
+### When to use a router
+
+Use a router when:
+
+- The skill naturally covers **distinct aspects** of a task (correctness,
+  security, error handling, maintainability).
+- The combined body would exceed ~2,000 tokens.
+- Different invocations should produce **structurally different** output
+  (a security audit and a maintainability review have different templates).
+
+Do **not** use a router when:
+
+- The skill has one clear job with a single output format.
+- The sub-skills would each be under 300 tokens (the dispatch overhead is
+  not worth it).
+
+The recommended ceiling is **50 sub-skills per router**. Beyond that, the
+parent body itself becomes long enough that splitting the parent into
+multiple router skills is the better move.
+
+### Reference example
+
+The `code_review` skill shipped with PELDRUN is a router with four
+sub-skills (see §19). It is the canonical example for the pattern.
+
+---
+
+## 4. BM25 Skill Router
+
+The BM25 Skill Router is the ranking layer that picks the top-K most
+relevant skills for a given user message. It exists so that the catalog
+injected into the system prompt can stay small even when hundreds of skills
+are installed.
+
+### How it works
+
+1. Every skill is reduced to a searchable **corpus**: its `id`, `name`,
+   `description`, `short_description`, `tags`, and its **sub-skills'
+   `triggers`** (hoisted to the parent level).
+2. At run time, the user's message is tokenized and scored against each
+   corpus using **BM25Okapi** with standard parameters (`k1=1.5`, `b=0.75`).
+3. The top-K skills (default K=5) with a score above `min_score=0.1` are
+   selected for the catalog.
+
+### Determinism
+
+BM25 is deterministic: the same skill set and the same query produce the
+same ranking, run after run. This is essential for prompt caching — an
+identical catalog produces an identical prompt prefix.
+
+### Preprocessing
+
+- **Tokenization**: ASCII alphanumerics + underscores, lowercased. Identifiers
+  like `code_review` stay as a single token.
+- **Stopwords**: A fixed set of ~60 English stopwords is filtered from both
+  the corpus and the query. Without this filter, a query like
+  *"what is the weather in tokyo"* matches the word `the` in any skill
+  description and produces false positives.
+- **Non-ASCII input is unsupported**: Arabic, CJK, and other non-Latin
+  queries tokenize to an empty list and yield no matches. Multilingual
+  routing is out of scope for this release.
+
+### The tiny-corpus fallback
+
+BM25's IDF formula becomes non-positive when a query term appears in half
+or more of the corpus. In a corpus of 1 or 2 skills, EVERY matching term
+gets a negative IDF, so the top-scoring skill ends up with a **negative**
+score and is filtered out by `min_score`.
+
+To prevent this from making the feature dead-on-arrival for new installs,
+the router detects the degenerate case (`top_score <= 0`) and falls back to
+a simple **overlap count**: the score becomes the number of query tokens
+that appear in the skill's corpus. This preserves the "no match → no
+result" semantics while keeping the ranking meaningful for N ≤ 2.
+
+For N ≥ 3, the standard BM25 path is used automatically.
+
+### Explicit invocations bypass BM25
+
+A skill invoked via `/<skill-id>` in the composer is **always** included in
+the catalog, regardless of its BM25 score. The user's explicit intent
+overrides the ranker.
+
+---
+
+## 5. Where skills are used
+
+Skills show up in four surfaces:
 
 | Surface | Purpose | Reach |
 |---------|---------|-------|
 | **Chat composer (`/`)** | One-shot invocation for the current message | Frontend `/` menu → `invoked_skills` in the run payload |
 | **Agent assignment** | Ambient instruction loaded on every run of an agent | `/stores` → Agents → ✨ Skills modal → `agent_settings.json` |
-| **Store UI (`/stores/skills`)** | Install, enable, disable, delete, preview | Direct HTTP against `/api/skills/*` |
+| **Store UI (`/stores/skills`)** | Install, enable, disable, edit, delete, preview, ROUTER badge | Direct HTTP against `/api/skills/*` |
+| **LLM tool calls** | Model fetches skill bodies on demand (Progressive Disclosure) | `load_skill`, `load_sub_skill`, `load_reference` |
 
 The two invocation channels — chat `/` and agent assignment — are **merged
 at run time**. If the same skill is both assigned and invoked, it is injected
@@ -79,66 +327,37 @@ turn wins over the agent's ambient assignment).
 
 ---
 
-## 3. Two ways to invoke a skill
-
-### 3.1 From chat: `/skill_id`
-
-The chat composer (`chat-landing.tsx` on the home page, `composer.tsx` in an
-existing chat) exposes every `chat_invocable` skill as a slash command.
-
-```
-Type:    /code_review
-Shows:   ✨ /code_review  —  Systematic code review checklist
-Pick:    A chip appears above the editor
-Send:    The run payload includes invoked_skills=["code_review"]
-```
-
-- **Search works.** The `/` menu matches against skill id, display name,
-  description, and tags. Typing `/review` finds `code_review` because its
-  tags include `review`. Typing `/code-review` also works (hyphens are
-  normalized to underscores).
-- **Multiple skills per message.** Pick several; all are injected.
-- **Disabled skills are hidden.** If an operator disables a skill, it does
-  not appear in `/` until re-enabled.
-
-### 3.2 From an agent: assignment
-
-Open `/stores` → **Agents** → the ✨ icon on any agent card.
-
-```
-Manifest Skills:  [x] code_review     ← in the agent's manifest
-                  [ ] test_planning   ← also in the manifest
-Available Store:  [x] security_audit  ← added via extra_skills
-Effective:        code_review, test_planning, security_audit
-```
-
-Assignments are stored in `backend/storage/store/agents/agent_settings.json`
-under the agent's id, alongside `disabled_tools` and `disabled_mcp_servers`.
-This keeps one source of truth per agent.
-
-- **Assignable** requires `capabilities.agent_assignable = true` and
-  `status = "active"` in the skill.
-- **Deprecated** skills cannot be assigned.
-- **Locked** agents (with `settings.skills_editable = false`) cannot be
-  modified — the UI disables the save button and the backend returns 403.
-
----
-
-## 4. Package layout
+## 6. Package layout
 
 A skill package is a directory containing `manifest.json` and the instructions
-file (`SKILL.md` by default), both at the package root:
+file (`SKILL.md` by default), both at the package root.
+
+### Simple skill
 
 ```
 code-review/
-├── manifest.json                # required
-├── SKILL.md                     # required (or the file named in execution.instructions_file)
-├── icon.svg                     # optional (referenced by manifest.icon)
-├── references/                  # optional (loaded on demand)
-│   ├── checklist.md
-│   └── style-guide.md
-└── assets/                      # optional (not loaded by the runtime)
-    └── example.png
+├── manifest.json
+├── SKILL.md
+└── references/           # optional
+    └── style-guide.md
+```
+
+### Router skill
+
+```
+debugging/
+├── manifest.json                       # declares sub_skills
+├── SKILL.md                            # router body (short)
+├── icon.svg                            # optional
+└── sub_skills/
+    ├── root_cause_tracing/
+    │   └── SKILL.md
+    ├── defense_in_depth/
+    │   └── SKILL.md
+    ├── systematic_debugging/
+    │   └── SKILL.md
+    └── verification_before_completion/
+        └── SKILL.md
 ```
 
 **Rejected at install time:**
@@ -150,15 +369,16 @@ code-review/
 - `.git/`, `.svn/`, `node_modules/`, `.venv/`.
 - Files > 5 MiB each; archives > 100 MiB uncompressed.
 - More than 500 files; path depth > 10.
+- Any sub-skill path that escapes the parent package (containment check).
 
 The full validation rules are documented in
 [creating-skills.md](./creating-skills.md#2-package-structure).
 
 ---
 
-## 5. Installing a skill
+## 7. Installing a skill
 
-### 5.1 From the Store UI
+### From the Store UI
 
 1. Open `/stores`.
 2. Click **Skills** in the sidebar.
@@ -175,7 +395,7 @@ You will see:
 - **"Skill Install Notice"** — a non-fatal warning from the installer (for
   example, the `id` field was normalized from `code-review` to `code_review`).
 
-### 5.2 From the API
+### From the API
 
 ```bash
 curl -X POST http://127.0.0.1:8088/api/skills/install \
@@ -189,49 +409,42 @@ Response (success):
   "status": "success",
   "skill": {
     "id": "code_review",
-    "version": "1.0.0",
-    "name": "Code Review",
-    "status": "active",
+    "version": "2.0.0",
+    "has_sub_skills": true,
+    "sub_skills_count": 4,
     ...
   },
-  "was_upgrade": false,
+  "was_upgrade": true,
   "warnings": []
 }
 ```
 
-Response (rejection):
-
-```json
-{
-  "detail": {
-    "error": "Skill archive failed structural validation.",
-    "code": "SKILL_VALIDATION_FAILED",
-    "details": {
-      "errors": ["missing required file: manifest.json at zip root"]
-    }
-  }
-}
-```
-
-The full error code list is in [§14](#14-troubleshooting).
-
-### 5.3 What happens on disk
+### What happens on disk
 
 1. The ZIP is validated (structure + security) in memory.
 2. Contents are extracted to a staging directory
    (`backend/storage/store/skills/.tmp_<uuid>/`).
 3. `manifest.json` is parsed and normalized: `id` is lowercased,
    hyphens/dots → underscores, invalid characters removed.
-4. `SKILL.md` frontmatter is parsed.
-5. `icon_svg` (if present) is sanitized.
-6. `peldrun_min_version` / `peldrun_max_version` are checked against the
+4. The `sub_skills` array is validated:
+   - At most 50 entries.
+   - Every `id` matches `^[a-z0-9][a-z0-9_]{2,63}$` and is unique in the
+     parent.
+   - Every `description` is 10–500 characters.
+   - Every `instructions_file` matches
+     `^sub_skills/…\.md$` and contains no `..` segment.
+5. `SKILL.md` frontmatter is parsed for the router body.
+6. Each sub-skill's `SKILL.md` is validated on first load (not at install
+   time — the runtime checks containment on every `load_sub_skill` call).
+7. `icon_svg` (if present) is sanitized.
+8. `peldrun_min_version` / `peldrun_max_version` are checked against the
    running `peldrun.__version__`.
-7. The staging directory is atomically renamed to
+9. The staging directory is atomically renamed to
    `backend/storage/store/skills/<id>/`. Any existing package with the same
-   ID is moved to `.trash_<uuid>/` first (recoverable if the rename fails).
-8. The registry is refreshed so the skill appears immediately.
+   ID is moved to `.trash_<uuid>/` first.
+10. The registry is refreshed so the skill appears immediately.
 
-### 5.4 Idempotency
+### Idempotency
 
 Re-uploading the **same** ZIP (same `id`, same `version`, same content hash):
 
@@ -245,37 +458,46 @@ Re-uploading a **different** ZIP with the **same** `version`:
   version next time.
 - Replaces the previous package.
 
-This is useful during development: iterate on a `1.0.0` package without
-spamming version bumps. For anything published, always bump.
-
 ---
 
-## 6. Managing installed skills
+## 8. Managing installed skills
 
 Open `/stores` → **Skills**. Each row is one installed skill.
 
 ### Row anatomy
 
+**Simple skill:**
+
 ```
-[icon]  Code Review                                    ⓘ  🗑  ●
+[icon]  Code Review                                    ⓘ  ✏  🗑  ●
         CUSTOM  ACTIVE  ✓  v1.0.0
         Find real defects with evidence, ordered by severity.
         [review] [audit] [security] [quality] [code]
         ✨ invoke /code_review   🤖 agent-assignable
 ```
 
+**Router skill** (adds the ROUTER badge):
+
+```
+[icon]  Code Review                                    ⓘ  ✏  🗑  ●
+        CUSTOM  ACTIVE  ROUTER · 4  ✓  v2.0.0
+        Systematic code review with router-based sub-skill selection.
+        [review] [audit] [security] [quality] [code] [router]
+        ✨ invoke /code_review   🤖 agent-assignable
+```
+
 | Element | Meaning |
 |---------|---------|
-| **icon** | The skill's icon (`icon_svg` or `icon` file), or a Sparkles glyph if none. |
+| **icon** | The skill's icon (`icon_svg` or `icon` file), or a Sparkles glyph. |
 | **BUILT-IN / CUSTOM** | Whether the skill ships with PELDRUN or was installed by the user. |
 | **ACTIVE / DISABLED** | The global activation state. |
+| **ROUTER · N** | Present only for router skills. N is the sub-skill count. Violet badge. |
 | **✓ shield** | `trust: "verified"` in the manifest. |
-| **v1.0.0** | The installed version. |
+| **v2.0.0** | The installed version. |
 | **tags** | From `manifest.tags` — used by the `/` menu search. |
-| **✨ invoke /id** | The skill is `chat_invocable`. |
-| **🤖 agent-assignable** | The skill is `agent_assignable`. |
-| **ⓘ** | Open the details drawer (instructions preview, metadata, examples). |
-| **🗑** | Delete the package (only for custom skills). |
+| **ⓘ** | Open the details drawer. |
+| **✏** | Open the SKILL.md editor. Only shown when `user_editable: true`. |
+| **🗑** | Delete the package (custom skills only). |
 | **● toggle** | Enable / disable globally. |
 
 ### Actions
@@ -284,21 +506,113 @@ Open `/stores` → **Skills**. Each row is one installed skill.
 |--------|--------|
 | **Toggle off** | The skill is hidden from `/` and from agent injection. Package files remain. |
 | **Toggle on** | The skill returns to `/` and to agent injection. |
-| **Details (ⓘ)** | Read-only drawer with the SKILL.md body, metadata, tags, examples, and links. |
+| **Details (ⓘ)** | Read-only drawer with the SKILL.md body, metadata, tags, examples, links, and (for routers) the sub-skills list. |
+| **Edit (✏)** | Opens the SKILL.md editor. See §9. |
 | **Delete (🗑)** | Removes the package files from disk permanently. Custom skills only. |
 
 Every action that mutates state fires a `peldrun:skills-changed` browser event
 so open chat sessions immediately refresh their `/` menu without a reload.
 
+### The details drawer
+
+For a **simple skill**, the drawer shows: description, tags, capability
+chips, author, license, links, and the SKILL.md body (collapsible).
+
+For a **router skill**, the drawer adds a **Sub-Skills** section between the
+capability chips and the About block. Each sub-skill row shows:
+
+- Its `id` in monospace.
+- Its `description`.
+- Its trigger keywords as small chips.
+- An **EXCLUSIVE** badge if `capabilities.exclusive: true`.
+- A **pencil button** to open that sub-skill's body in the editor.
+
+Clicking the pencil opens the same editor modal but pre-focused on the
+sub-skill's `SKILL.md` (see §9).
+
 ---
 
-## 7. Assigning skills to agents
+## 9. Editing skill content
+
+Users can edit two things from the Store UI:
+
+1. The **router body** of any `user_editable` skill.
+2. The **body** of any sub-skill within that router.
+
+Both paths share the same editor modal, the same Lexical WYSIWYG, and the
+same save pipeline. The only difference is which file on disk the save
+operation targets.
+
+### Editing the router body
+
+1. Click the **pencil icon (✏)** on the skill card.
+2. The modal opens with the title `Edit — Code Review`.
+3. The current `SKILL.md` body appears (frontmatter is shown read-only above
+   the editor).
+4. Make changes. The **Save Changes** button enables when the body differs
+   from the loaded version.
+5. Click **Save Changes**.
+
+The save hits `PUT /api/skills/{skill_id}/instructions`. The server:
+
+1. Verifies `user_editable: true`.
+2. Verifies the body is non-empty and does not start with `---`.
+3. Verifies the body is under `limits.max_instructions_bytes`.
+4. Reads the existing `SKILL.md`, extracts the frontmatter block verbatim.
+5. Recomposes frontmatter + new body, re-parses to validate.
+6. Writes atomically via `.md.tmp` + `os.replace`.
+7. Refreshes the registry.
+
+### Editing a sub-skill body
+
+1. Open the details drawer for a router skill.
+2. Click the **pencil icon** on a sub-skill row.
+3. The modal opens with the title `Edit — Code Review › security_audit`.
+   The subtitle confirms `editing sub-skill`.
+4. The sub-skill's `SKILL.md` body appears (its own frontmatter, not the
+   router's, is shown read-only).
+5. Save as above.
+
+The save hits
+`PUT /api/skills/{skill_id}/sub-skills/{sub_skill_id}/instructions`. The
+server performs the same checks, PLUS:
+
+1. Verifies the parent declares a sub-skill with that `sub_skill_id`.
+2. Verifies the resolved file path stays inside the parent package
+   (containment check — defense in depth, since the manifest validation
+   already enforces this).
+3. Reads the sub-skill file, extracts its frontmatter, and preserves it.
+
+### What cannot be edited from the UI
+
+- **Manifest metadata.** `description`, `tags`, `capabilities`, `version` —
+  changing these requires editing `manifest.json` and reinstalling the
+  package. This is deliberate: version and capabilities affect runtime
+  behavior globally.
+- **Sub-skill IDs.** The sub-skill ID is the dispatch key used by
+  `load_sub_skill`. Changing it would break the router body's references.
+- **Sub-skill triggers.** These are indexed by BM25 and declared in the
+  manifest. Same reasoning as above.
+- **The frontmatter block.** Preserved verbatim server-side from the
+  existing file. If you need to change `name` or `description` inside the
+  frontmatter, reinstall the package.
+
+### File-size limit
+
+Every save enforces the same ceiling as the parent's
+`limits.max_instructions_bytes` (default 256 KiB, hard ceiling 1 MiB). The
+editor shows a live counter: `12,345 / 262,144 bytes`. Saves that exceed
+the ceiling are rejected with a `422` and an explanatory error message.
+
+---
+
+## 10. Assigning skills to agents
 
 Open `/stores` → **Agents** → the ✨ icon on any agent card.
 
 The modal has three sections:
 
-### 7.1 Manifest Skills
+### 10.1 Manifest Skills
 
 Skills declared in the agent's manifest (`skills: [...]` in the agent's
 `manifest.json`). Each row is a checkbox:
@@ -307,199 +621,280 @@ Skills declared in the agent's manifest (`skills: [...]` in the agent's
 - **Unchecked** → the skill is added to `disabled_skills` in
   `agent_settings.json`, so the runtime skips it.
 
-Rows that reference a skill ID which is no longer installed render with a
-`not in registry` badge. Clicking them still works (adds to `disabled`), so
-you can clean up stale references.
-
-### 7.2 Available Store Skills
+### 10.2 Available Store Skills
 
 Skills that are installed and not already in the agent's manifest. Each row
-is a checkbox:
+is a checkbox. Blocked rows (disabled, deprecated, or `agent_assignable:
+false`) appear but cannot be selected.
 
-- **Checked** → the skill is added to `extra_skills`.
-- **Unchecked** → the skill is not used by this agent (default).
+### 10.3 Effective Preview
 
-**Blocked rows** (disabled, deprecated, or `agent_assignable: false` in the
-skill manifest) appear but cannot be selected. The tooltip explains why.
+A live preview of the runtime skill list. For router skills, the preview
+shows the parent ID only — sub-skills are loaded on demand by the model at
+runtime.
 
-### 7.3 Effective Preview
-
-A live preview of the runtime skill list:
-
-```
-Effective:  [✨ code_review] [✨ security_audit] [✨ test_planning]
-```
-
-This is what the engine will inject. It updates as you toggle checkboxes.
-
-### 7.4 Where the state is stored
+### 10.4 Where the state is stored
 
 All assignments live in
-`backend/storage/store/agents/agent_settings.json`:
+`backend/storage/store/agents/agent_settings.json`. Tool overrides, MCP
+overrides, and skill overrides coexist in the same record; updating one does
+not erase the others.
 
-```json
-{
-  "code_architect": {
-    "disabled_skills": ["test_planning"],
-    "extra_skills":    ["code_review"],
-    "disabled_tools":  [],
-    "extra_tools":     []
-  }
-}
-```
+### 10.5 Locking an agent's skills
 
-One source of truth per agent. Tool overrides, MCP overrides, and skill
-overrides coexist in the same record; updating one does not erase the others.
-
-### 7.5 Locking an agent's skills
-
-An agent whose manifest contains:
-
-```json
-"settings": { "skills_editable": false }
-```
-
-cannot have its skills modified. The Skills modal renders read-only (save
-button disabled, checkboxes grayed out), and `PUT /api/store/agents/{id}/skills`
-returns **403 Forbidden**.
+An agent whose manifest contains `"settings": { "skills_editable": false }`
+cannot have its skills modified. The Skills modal renders read-only and
+`PUT /api/store/agents/{id}/skills` returns **403 Forbidden**.
 
 ---
 
-## 8. Invoking a skill from chat
+## 11. Invoking a skill from chat
 
-### 8.1 The `/` menu
+### The `/` menu
 
-In the chat composer, type `/`:
+Type `/` in the composer. Every `chat_invocable`, non-deprecated skill is
+offered as a slash command.
 
-```
-Slash Commands
-─────────────────────────────────────
-📟 /clear                Reset conversation
-🤖 /agent                Switch to Agent mode
-💬 /chat                 Switch to Chat mode
-✨ /code_review          Systematic code review checklist
-✨ /test_planning        Test-planning workflow
-```
+- **Search works.** Matches against id, display name, description, and tags.
+- **Hyphen normalization.** `/code-review` resolves to `code_review`.
+- **Multiple skills per message.** Pick several; all are injected.
 
-The menu:
+### Router skills in `/`
 
-- **Filters as you type** — `/cod` narrows to `/code_review`.
-- **Matches tags** — `/review` finds `code_review` via its `review` tag.
-- **Matches display names** — `/audit` finds `code_review` (tag), and
-  `/code` matches the id prefix.
-- **Normalizes hyphens** — `/code-review` resolves to `code_review`.
-- **Ranks results** — label prefix > tag prefix > contains.
+Selecting a router skill via `/` includes only the router's own body in the
+catalog. The model then decides (based on the message content) whether to
+call `load_sub_skill` to fetch a specific sub-skill. This is the intended
+behavior — the router pattern exists precisely so that selecting the parent
+does not require committing to a specific sub-skill upfront.
 
-### 8.2 The skill chip
+### The skill chip
 
-Selecting a skill does not insert text into the editor. It adds a chip above
-the editor:
+Selecting a skill adds a chip above the editor:
 
 ```
 ✨ Skills   [✨ Code Review ×]   [✨ Test Planning ×]
 ```
 
-- **×** removes the skill from the current message only.
-- The chips clear automatically on send.
-- Multiple skills can be stacked per message.
+`×` removes the skill from the current message only. Chips clear on send.
 
-### 8.3 What the model receives
+### What the model receives (Progressive Disclosure enabled)
 
-The system prompt gains a block at the end:
+When the run starts, the engine builds a catalog from the top-K BM25-ranked
+skills (plus any explicitly invoked skills), and appends it to the system
+prompt:
 
 ```
 [SKILL INSTRUCTIONS]
---- BEGIN SKILL: code_review@1.0.0 ---
-[Metadata: name="Code Review", tags=[review, audit, security]]
-<the SKILL.md body, verbatim>
---- END SKILL: code_review@1.0.0 ---
+You have access to the following skills. ...
+AVAILABLE SKILLS:
+- id='code_review' | name='Code Review' | Systematic code review with router-based sub-skill selection.
+  sub-skills:
+    * sub_skill='correctness_analysis': Identify logic bugs...
+    * sub_skill='security_audit': Identify security vulnerabilities...
+    * sub_skill='error_handling_review': Review exception hierarchies...
+    * sub_skill='maintainability_review': Review code for clarity...
 ```
 
-If multiple skills are active, they are concatenated in the order described
-in [§9](#9-runtime-injection).
+The model then calls `load_skill` / `load_sub_skill` to fetch actual
+content. See §12 and §13 for the full flow.
 
-### 8.4 Cancelling a skill mid-message
+### What the model receives (Progressive Disclosure disabled)
 
-Click the **×** on the chip. The skill is not injected for that message, but
-the assignment (if any) remains in place for future messages.
+Every assigned and invoked skill's full body is injected at the bottom of
+the system prompt, wrapped in delimiters:
+
+```
+--- BEGIN SKILL: code_review@2.0.0 ---
+[Metadata: name="Code Review", tags=[review, audit, security]]
+# Code Review Router
+...
+--- END SKILL: code_review@2.0.0 ---
+```
+
+This is the pre-feature behavior and is preserved as an escape hatch.
 
 ---
 
-## 9. Runtime injection
+## 12. Runtime injection
 
 When the engine (`backend/omweb/engines/peldrun_engine.py`) starts a run, it
-calls `omweb.skills.assignments.resolve_skill_injection` with:
+branches on the `PELDRUN_PROGRESSIVE_DISCLOSURE` flag.
 
-- `agent_id` — the agent's id.
-- `invoked_skill_ids` — the list from the payload's `invoked_skills` field
-  (populated by the dispatcher from the chat composer).
+### Mode A — Progressive Disclosure (default)
 
-### Merge algorithm
+1. **Read the candidate pool.** Every enabled, non-deprecated skill.
+2. **Rank against the user's message.** BM25 selects the top-K (default K=5).
+3. **Include invoked skills.** Any skill invoked via `/` is added on top,
+   regardless of BM25 score.
+4. **Build the catalog.** Render the selected skills as a compact text block
+   listing IDs, names, descriptions, and sub-skill names. Respect a 4,000-
+   character budget (skills beyond the budget are omitted with a "N more
+   omitted" notice).
+5. **Register the skill tools.** Build three `WebToolAdapter` instances
+   (`load_skill`, `load_sub_skill`, `load_reference`) and expose them to the
+   model alongside the run's normal tools.
+6. **Inject the catalog.** Append it to the system prompt under
+   `[SKILL INSTRUCTIONS]`.
+
+The model then drives the flow. A typical run looks like:
 
 ```
-1. Read assigned skills:
-      effective_skills = (manifest.skills − disabled_skills) ∪ extra_skills
-
-2. Normalize invoked skills:
-      lowercase → underscores → deduplicate
-
-3. Merge with invoked winning:
-      for each id in invoked: source[id] = "invoked"
-      for each id in assigned and not in invoked: source[id] = "assigned"
-
-4. Order deterministically:
-      invoked skills alphabetized first,
-      then assigned-not-already-invoked alphabetized.
-
-5. Load each skill:
-      for each id in order:
-          record = registry.get_skill(id)
-          if not record or not record.enabled: skip
-          if source == "invoked" and not chat_invocable: skip
-          if source == "assigned" and not agent_assignable: skip
-          block = loader.get_injection_block(record)
-          append to output
+User: "Audit this Python code for SQL injection..."
+  ↓
+Model: tool_call load_skill("code_review")
+  ↓
+Tool returns: router body + sub_skill list
+  ↓
+Model: tool_call load_sub_skill("code_review", "security_audit")
+  ↓
+Tool returns: sub-skill body
+  ↓
+Model: generates the final answer following the sub-skill's output format
 ```
 
-Failures at step 5 are logged as warnings and the skill is skipped. The run
-continues with the surviving skills.
+### Mode B — Legacy full injection
 
-### What gets injected
+1. **Read the assigned + invoked skills.** Merged as described in §1.
+2. **Load each skill's full body.**
+3. **Concatenate in deterministic order** (invoked first, then assigned, all
+   alphabetized).
+4. **Inject the combined block** under `[SKILL INSTRUCTIONS]`.
 
-The concatenated blocks are prepended to the system prompt under a
-`[SKILL INSTRUCTIONS]` header, after:
+No tools are exposed. The model sees every body but has no way to fetch
+additional content.
 
-- the agent's `system_prompt`,
-- `[OPERATIONAL DIRECTIVE]`,
-- `[MCP SERVER ACCESS]` (if MCP servers are active),
-- the Generative UI directive (if enabled).
+### Ordering and precedence (Mode B)
 
-The skill content lands **last** so the model reads it with full context of
-its operational rules and available tools.
+- **Invoked skills** are injected first, in alphabetical order.
+- **Assigned skills** are injected second, skipping any already injected
+  as invoked.
+- A skill appearing in both channels is injected once, marked `"invoked"`.
 
-### Context budget
+### Failure handling (both modes)
 
-The skills block counts against the model's context window like any other
-system prompt content. On large skills, this can squeeze out recent dialogue.
-The `limits.max_instructions_bytes` cap (default 256 KiB) is a hard ceiling;
-the practical recommendation is to keep `SKILL.md` under 8 KiB.
+A skill that fails to load (missing file, oversized body, unsafe SVG) is
+**skipped** with a warning. The run continues with the surviving skills. A
+broken skill can never crash a chat.
+
+For sub-skills, the failure mode is finer-grained: a sub-skill that fails
+to load returns `is_error: true` from `load_sub_skill`, and the model is
+informed of the reason via the tool's error payload. The rest of the run
+proceeds normally.
 
 ### Diagnostics
 
-The runtime metadata includes the injection result:
+The runtime metadata records the injection result:
 
 ```json
 {
-  "injected_skills": ["code_review", "test_planning"],
-  "skill_warnings": ["Skill 'stale_id' is not installed; skipping."]
+  "injected_skills": ["code_review"],
+  "skill_warnings": [],
+  "progressive_disclosure": true,
+  "skill_injection_mode": "catalog",
+  "skill_catalog_chars": 1029
 }
 ```
 
-These appear in the run's diagnostic log and in the run timeline (if enabled).
+These appear in the run's diagnostic log and in the run timeline (if
+enabled).
 
 ---
 
-## 10. Lifecycle states
+## 13. Skill tools
+
+Three tools are exposed to the model only when Progressive Disclosure is
+enabled. They live in `backend/omweb/skills/tools/` and are registered as
+`WebToolAdapter` instances in the run's `adapted_core_tools` list.
+
+### `load_skill(skill_id: str)`
+
+Returns the full body of a skill, wrapped in delimiters.
+
+**Response (success):**
+
+```json
+{
+  "ok": true,
+  "skill_id": "code_review",
+  "version": "2.0.0",
+  "has_sub_skills": true,
+  "sub_skills": ["correctness_analysis", "security_audit", "..."],
+  "content": "--- BEGIN SKILL: code_review@2.0.0 ---\n# Code Review Router\n...\n--- END SKILL: code_review@2.0.0 ---"
+}
+```
+
+**Response (error):** `{ "ok": false, "error": "...", "code": "SKILL_NOT_FOUND" | "SKILL_DISABLED" | "SKILL_LOAD_FAILED" }`.
+
+### `load_sub_skill(parent_id: str, sub_skill_id: str)`
+
+Returns the full body of a sub-skill within a router.
+
+**Response (success):**
+
+```json
+{
+  "ok": true,
+  "parent_id": "code_review",
+  "sub_skill_id": "security_audit",
+  "content": "--- BEGIN SUB-SKILL: code_review/security_audit ---\n# Security Audit\n...\n--- END SUB-SKILL: code_review/security_audit ---"
+}
+```
+
+**Response (error)** codes:
+
+- `INVALID_ARGUMENT` — empty input.
+- `SKILL_NOT_FOUND` — parent does not resolve.
+- `SKILL_DISABLED` — parent is not active.
+- `NOT_A_ROUTER` — parent declares no sub-skills.
+- `SUB_SKILL_NOT_FOUND` — sub ID not declared (response includes `available` list).
+- `SKILL_SECURITY_VIOLATION` — path escapes the parent package (containment).
+- `SUB_SKILL_FILE_MISSING` — declared file is absent on disk.
+- `SUB_SKILL_LOAD_FAILED` — read failed or file exceeded size cap.
+
+### `load_reference(skill_id: str, rel_path: str)`
+
+Returns the content of a reference file declared under the skill's
+`execution.references_dir`.
+
+**Response (success):**
+
+```json
+{
+  "ok": true,
+  "skill_id": "code_review",
+  "version": "2.0.0",
+  "rel_path": "checklist.md",
+  "content": "--- BEGIN REFERENCE: code_review:checklist.md ---\n...\n--- END REFERENCE: code_review:checklist.md ---"
+}
+```
+
+**Response (error)** codes:
+
+- `INVALID_ARGUMENT` — empty input.
+- `SKILL_NOT_FOUND` — skill does not resolve.
+- `SKILL_DISABLED` — skill is not active.
+- `REFERENCE_LOAD_FAILED` — file missing, empty, oversized, or skill has
+  no `references_dir`.
+- `REFERENCE_SECURITY_VIOLATION` — traversal, absolute path, disallowed
+  extension, symlink, or containment escape.
+
+### Guarantees
+
+All three tools share these properties:
+
+- **Never raise.** Every failure is encoded as `{ "ok": false, ... }`.
+- **Containment enforced.** No file outside the skill's package directory
+  can be read, even if a manifest is corrupted or a sub-skill is edited in
+  memory.
+- **Size caps enforced.** Both `load_instructions` and `load_sub_skill` cap
+  file reads at `limits.max_instructions_bytes` before reading.
+- **Delimiters.** Every successful response is wrapped in
+  `--- BEGIN ... ---` / `--- END ... ---` so the model can distinguish
+  skill content from user content.
+
+---
+
+## 14. Lifecycle states
 
 A skill has **three independent** boolean states. Do not conflate them:
 
@@ -511,13 +906,13 @@ A skill has **three independent** boolean states. Do not conflate them:
 
 ### State matrix
 
-| Installed | Enabled | Assigned | `/` menu | Agent injection |
-|-----------|---------|----------|----------|-----------------|
-| ✓ | ✓ | — | ✓ | — |
-| ✓ | ✓ | ✓ | ✓ | ✓ |
-| ✓ | — | ✓ | — | — (skipped silently) |
-| ✓ | — | — | — | — |
-| — | — | ✓ (stale) | — | — (warning logged) |
+| Installed | Enabled | Assigned | `/` menu | Catalog (PD) | Full injection |
+|-----------|---------|----------|----------|--------------|----------------|
+| ✓ | ✓ | — | ✓ | ✓ (if ranked) | — |
+| ✓ | ✓ | ✓ | ✓ | ✓ (if ranked) | ✓ |
+| ✓ | — | ✓ | — | — (silently skipped) | — |
+| ✓ | — | — | — | — | — |
+| — | — | ✓ (stale) | — | — (warning logged) | — |
 
 ### Deprecation overrides
 
@@ -526,30 +921,40 @@ as if `chat_invocable = false` and `agent_assignable = false`, regardless of
 the declared `capabilities`. It remains installed and enableable but is
 invisible to both runtime channels.
 
-### Deleting versus disabling
+### Sub-skills
 
-| Operation | Files removed | State cleared | Reversible |
-|-----------|---------------|---------------|------------|
-| **Disable** (toggle off) | No | Status → `"disabled"` | Yes (toggle on) |
-| **Delete** | Yes | Removed from registry; state entry pruned on next discovery | No |
-| **Deprecate** (author action) | No | Flags set in manifest | Yes (author action) |
+Sub-skills do not have independent lifecycle state. They are always
+"available" as long as their parent is installed and enabled. Editing a
+sub-skill's body does not affect its ID, its triggers, or the parent's
+routing behavior.
 
 ---
 
-## 11. Storage layout
+## 15. Storage layout
 
 ```
 backend/storage/store/skills/
 ├── skills_state.json                # global activation state
-├── code_review/
+├── code_review/                     # router skill
 │   ├── manifest.json
-│   ├── SKILL.md
-│   ├── .installed.json              # install metadata (content hash, source)
-│   ├── references/
-│   └── assets/
-├── test_planning/
-│   └── ...
-└── .tmp_<uuid>/                     # transient staging (cleaned on startup)
+│   ├── SKILL.md                     # router body
+│   ├── .installed.json
+│   ├── icon.svg                     # optional
+│   ├── references/                  # optional
+│   │   └── checklist.md
+│   └── sub_skills/
+│       ├── correctness_analysis/
+│       │   └── SKILL.md
+│       ├── security_audit/
+│       │   └── SKILL.md
+│       ├── error_handling_review/
+│       │   └── SKILL.md
+│       └── maintainability_review/
+│           └── SKILL.md
+├── test_planning/                   # simple skill
+│   ├── manifest.json
+│   └── SKILL.md
+└── .tmp_<uuid>/                     # transient staging
 ```
 
 ### `skills_state.json`
@@ -557,7 +962,7 @@ backend/storage/store/skills/
 ```json
 {
   "schema_version": 1,
-  "updated_at": "2025-01-15T10:30:00+00:00",
+  "updated_at": "2026-11-07T10:30:00+00:00",
   "states": {
     "code_review": "active",
     "test_planning": "disabled"
@@ -566,7 +971,7 @@ backend/storage/store/skills/
 ```
 
 Only skills present on disk appear in `states`. Orphan entries are pruned
-automatically on the next discovery pass.
+on the next discovery pass.
 
 ### `.installed.json`
 
@@ -574,26 +979,23 @@ automatically on the next discovery pass.
 {
   "schema_version": 1,
   "skill_id": "code_review",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "name": "Code Review",
-  "description": "Systematic code review for bugs, security, and maintainability.",
+  "description": "Systematic code review with router-based sub-skill selection.",
   "content_hash": "sha256:abc123def4567890",
-  "installed_at": "2025-01-15T10:30:00+00:00",
-  "source_filename": "code-review-v1.0.0.zip",
-  "size_bytes": 15234,
-  "file_count": 8,
+  "installed_at": "2026-11-07T10:30:00+00:00",
+  "source_filename": "code-review-v2.0.0.zip",
+  "size_bytes": 21534,
+  "file_count": 12,
   "original_id": "code-review"
 }
 ```
-
-`original_id` preserves the pre-normalization id (useful for tracing
-back to the source repository).
 
 ### Crash recovery
 
 If the process dies mid-install:
 
-- `.tmp_<uuid>/` — staging directory; cleaned on next startup or next install.
+- `.tmp_<uuid>/` — staging directory; cleaned on next startup or install.
 - `.trash_<uuid>/` — previous package moved aside during upgrade; restored
   to its original name on the next commit attempt, or cleaned up.
 
@@ -602,11 +1004,10 @@ lifespan handler and before every install.
 
 ---
 
-## 12. REST API reference
+## 16. REST API reference
 
-All routes are registered under `/api/skills` (see
-`backend/omweb/routers/skills.py`). Errors follow the shape
-`{ "detail": { "error": str, "code": str, "details": {} } }`.
+All routes are registered under `/api/skills` unless noted. Errors follow
+the shape `{ "detail": { "error": str, "code": str, "details": {} } }`.
 
 ### `GET /api/skills`
 
@@ -619,7 +1020,7 @@ List installed skills.
 | `search` | — | Free-form query. Matches id, name, display_name, tags, description. |
 | `include_disabled` | `true` | Include `status = "disabled"` skills. |
 | `include_deprecated` | `true` | Include skills marked deprecated. |
-| `include_broken` | `false` | Include packages that failed validation (in a separate `broken` map). |
+| `include_broken` | `false` | Include packages that failed validation. |
 | `limit` | `100` | Max results (search mode only). |
 
 **Response:**
@@ -627,44 +1028,102 @@ List installed skills.
 ```json
 {
   "status": "success",
-  "skills": [ { ...SkillSummary... } ],
+  "skills": [
+    {
+      "id": "code_review",
+      "version": "2.0.0",
+      "name": "Code Review",
+      "has_sub_skills": true,
+      "sub_skills_count": 4,
+      "..."
+    }
+  ],
   "total": 1,
-  "broken": { "old_skill": "Manifest 'id' invalid..." }
+  "broken": {}
 }
 ```
 
 ### `GET /api/skills/{skill_id}`
 
-Full detail: summary fields + `manifest` + `frontmatter`.
+Full detail: summary fields + `manifest` + `frontmatter` + `sub_skills`
+array (each entry has `id`, `description`, `triggers`, `capabilities`;
+`instructions_file` is deliberately excluded).
+
+### `GET /api/skills/{skill_id}/sub-skills`
+
+List the sub-skills of a router.
+
+**Response:**
+
+```json
+{
+  "status": "success",
+  "parent_id": "code_review",
+  "has_sub_skills": true,
+  "sub_skills": [
+    {
+      "id": "security_audit",
+      "description": "Identify security vulnerabilities...",
+      "triggers": ["security", "injection", "xss", "sql", "auth", "secret"],
+      "capabilities": { "exclusive": false }
+    }
+  ],
+  "count": 4
+}
+```
 
 ### `GET /api/skills/{skill_id}/icon.svg`
 
-Returns `image/svg+xml`. The content is sanitized server-side. Cached for
-1 hour.
-
-Returns 404 if the skill declares no icon.
+Returns `image/svg+xml`. Content is sanitized server-side. Cached for 1
+hour. Returns 404 if the skill declares no icon.
 
 ### `GET /api/skills/{skill_id}/preview`
 
-Returns the instructions text for the details drawer:
+Returns the router body's instructions text:
 
 ```json
 {
   "status": "success",
   "skill_id": "code_review",
-  "version": "1.0.0",
-  "instructions": "...",
+  "version": "2.0.0",
+  "instructions": "# Code Review Router\n...",
   "instructions_length": 3326,
-  "frontmatter": { "name": "code_review", ... }
+  "frontmatter": { "name": "code_review", "..." }
 }
 ```
 
+### `GET /api/skills/{skill_id}/sub-skills/{sub_skill_id}/preview`
+
+Returns a sub-skill's instructions text:
+
+```json
+{
+  "status": "success",
+  "skill_id": "code_review",
+  "sub_skill_id": "security_audit",
+  "version": "2.0.0",
+  "instructions": "# Security Audit\n...",
+  "instructions_length": 1953,
+  "frontmatter": { "name": "security_audit", "..." }
+}
+```
+
+### `PUT /api/skills/{skill_id}/instructions`
+
+Body: `{ "instructions": "new body without frontmatter" }`. Replaces the
+router body. Frontmatter preserved server-side. Returns 403 if the skill is
+not `user_editable`, 422 if validation fails.
+
+### `PUT /api/skills/{skill_id}/sub-skills/{sub_skill_id}/instructions`
+
+Body: `{ "instructions": "new sub-skill body" }`. Same contract, but
+targets the sub-skill's file. Errors: 404 if the sub-skill ID is not
+declared, 403 if path escapes the package, 422 for validation failures.
+
 ### `POST /api/skills/install`
 
-`multipart/form-data` with a `file` field containing the `.zip`.
-
-Returns 200 with `{ status, skill, was_upgrade, warnings }` on success, or
-4xx with the structured error on rejection.
+`multipart/form-data` with a `file` field containing the `.zip`. Returns
+`{ status, skill, was_upgrade, warnings }` on success.
 
 ### `POST /api/skills/{skill_id}/toggle`
 
@@ -681,216 +1140,342 @@ Under `/api/store/agents`:
 
 ### `GET /api/store/agents/{agent_id}/skills`
 
-```json
-{
-  "status": "ok",
-  "manifest_skills": [],
-  "disabled_skills": [],
-  "extra_skills": ["code_review"],
-  "effective_skills": ["code_review"],
-  "skills_editable": true,
-  "resolved_skills": [
-    {
-      "id": "code_review",
-      "resolved": true,
-      "name": "Code Review",
-      "version": "1.0.0",
-      "enabled": true,
-      "is_deprecated": false,
-      "agent_assignable": true
-    }
-  ],
-  "available_skills": [ ...SkillSummary-lite... ]
-}
-```
+Returns the current assignment state with resolved metadata.
 
 ### `PUT /api/store/agents/{agent_id}/skills`
 
-Body: `{ "disabled_skills": [...], "extra_skills": [...] }`.
-
-Validation:
-
-- Every id must resolve to an installed skill.
-- Every `extra_skills` entry must be `enabled`, `agent_assignable`, and not
-  `deprecated`.
-- The agent must have `skills_editable = true` (else 403).
+Body: `{ "disabled_skills": [...], "extra_skills": [...] }`. Every ID must
+resolve to an installed skill. `extra_skills` entries must additionally be
+enabled, `agent_assignable`, and not deprecated. Returns 403 if the agent
+is locked.
 
 ---
 
-## 13. Security model
+## 17. Security model
 
 ### Threat: malicious ZIP contents
 
-The validator rejects:
+The validator rejects path traversal, symlinks, forbidden file types
+(executables, bytecode, VCS metadata, environment folders), and zip bombs.
+All validations run **before any byte is written to disk**.
 
-- **Path traversal**: any `..` segment or absolute path inside the archive.
-- **Symlinks**: extracted entry that points elsewhere on the filesystem.
-- **Forbidden file types**: `.exe`, `.dll`, `.so`, `.dylib`, bytecode, VCS
-  metadata, env folders.
-- **Zip bombs**: per-file cap (5 MiB), total cap (100 MiB), entry count cap
-  (500), depth cap (10).
+### Threat: sub-skill path escape
 
-All validations run **before any byte is written to disk**. The validator is
-shared with the tool bundles subsystem (`omweb.tools.bundles.validator`) and
-has been the test target of `test_archive_security.py` since that subsystem
-shipped.
+Two independent layers protect against a sub-skill file reading outside
+its parent package:
+
+1. **Manifest validation** (at install time) — every `instructions_file`
+   must match `^sub_skills/…\.md$` and contain no `..` segment.
+2. **Runtime containment** (every `load_sub_skill` call) — the resolved
+   path must satisfy `candidate.resolve().relative_to(package_dir.resolve())`.
+   If a future code path mutates `record.sub_skills` in memory without
+   going through the manifest validator, this layer still catches the
+   escape.
+
+Both layers run on every `load_sub_skill` and every
+`PUT .../sub-skills/.../instructions`.
 
 ### Threat: malicious SVG in `icon_svg`
 
-The sanitizer (`omweb.skills.manifest.sanitize_svg`) enforces:
-
-- **Element whitelist** (no `script`, `foreignObject`, `use`, `image`,
-  `style`, `animate*`).
-- **Attribute whitelist** (no `on*`, no `href`, no `xlink:href`, no `style`).
-- **Value blacklist** (`javascript:`, `vbscript:`, `data:`, `@import`,
-  `expression(`).
-- **Local-only `url(#id)` references.**
-- **Size caps** (32 KiB, 200 elements, depth 8).
-- **ID prefixing** to prevent CSS collisions with the host page.
-
-The sanitized SVG is what gets served at `/api/skills/{id}/icon.svg`; the
-client does a second defense-in-depth pass.
+The sanitizer enforces an element whitelist (no `script`, `foreignObject`,
+`use`, `image`, `style`, `animate*`), an attribute whitelist (no `on*`, no
+`href`, no `style`), and a value blacklist (`javascript:`, `vbscript:`,
+`data:`, `@import`, `expression(`). The sanitized SVG is what gets served
+at `/api/skills/{id}/icon.svg`; the client does a second defense-in-depth
+pass.
 
 ### Threat: prompt injection via `SKILL.md`
 
-A skill's body is **injected into the system prompt**. This is by design —
-the operator is expected to trust installed skills the way they trust
-installed tools.
+A skill's body is injected into the system prompt. This is by design — the
+operator is expected to trust installed skills the way they trust installed
+tools.
 
 Mitigations:
 
-- **Only operators can install.** There is no auto-discovery from public
-  sources. Every install is an explicit, audited action.
-- **`trust` field** distinguishes verified publishers from community
+- Only operators can install. There is no auto-discovery from public sources.
+- The `trust` field distinguishes verified publishers from community
   packages. The shield badge is visible in the store card.
-- **`signature` field** (optional) records a content hash; future releases
-  will verify it against a trusted key.
-- **The skill is delimited.** The injected text is wrapped in
-  `--- BEGIN SKILL: id@version ---` / `--- END SKILL: id@version ---` so the
-  model can distinguish instructions from user content.
+- The `signature` field (optional) records a content hash.
+- The injected text is delimited (`--- BEGIN SKILL: ... ---`).
+
+### Threat: catalog poisoning via manifest fields
+
+The catalog block lists only `id`, `name`, `description`, and sub-skill
+names/descriptions. Every one of these fields is validated at install time
+(pattern, length caps). Newlines are collapsed to spaces before rendering,
+so a manifest cannot inject a fake `- id='evil' | name='evil'` line.
+
+### Threat: resource exhaustion
+
+- `limits.max_instructions_bytes` (default 256 KiB) caps body size.
+- `MAX_REFERENCE_BYTES` (512 KiB) caps reference files.
+- `MAX_TOTAL_REFERENCES_BYTES` (2 MiB) caps the aggregate.
+- `sub_skills` is capped at 50 per parent.
+- The catalog block is capped at 4,000 characters.
+
+Every cap is enforced before reading. A skill that fails any check is
+skipped at load time; the run continues.
 
 ### Threat: code execution
 
 **Not possible in this release.** `execution.type` accepts only
 `"instructions"`; there is no handler execution, no shell, no Python
-import. Adding `handler.py` support is a planned future feature that will
-require a separate approval workflow.
-
-### Threat: resource exhaustion
-
-The `limits.max_instructions_bytes` cap, the `MAX_REFERENCE_BYTES` per-file
-cap, and the `MAX_TOTAL_REFERENCES_BYTES` cap prevent a skill from consuming
-unbounded disk or context. A skill that fails these checks is skipped at load
-time; the run continues.
+import.
 
 ---
 
-## 14. Troubleshooting
+## 18. Troubleshooting
+
+### Progressive Disclosure is off and I want it on
+
+Check the startup log for:
+
+```
+INFO:omweb.main:Skills progressive disclosure: ENABLED (PELDRUN_PROGRESSIVE_DISCLOSURE=true (default)).
+```
+
+If it says `DISABLED`, set the environment variable and restart (or, since
+the flag is read on every run, just change the process env — the next run
+picks it up):
+
+```powershell
+$env:PELDRUN_PROGRESSIVE_DISCLOSURE="true"
+```
 
 ### The `/` menu does not show a skill I installed
 
 1. `GET /api/skills` — is it present?
-   - If yes → continue.
-   - If no → see "Install rejects" below.
 2. `GET /api/skills/{id}` — check `enabled`:
    - `false` → toggle it on in `/stores` → Skills.
-3. Check `chat_invocable` is `true` (should be unless the manifest sets it
-   to `false`).
+3. Check `chat_invocable` is `true`.
 4. Check `is_deprecated` is `false`.
-5. Reload the chat page. The `/` menu refreshes on `peldrun:skills-changed`;
-   if the event fired before the page loaded, a reload is needed.
+5. Reload the chat page.
+
+### The model calls `load_skill` but never `load_sub_skill`
+
+The model read the router body but chose not to dispatch to a sub-skill.
+Possible causes:
+
+- **The user's query was ambiguous.** Try a more specific prompt:
+  `"audit for SQL injection"` instead of `"review this"`.
+- **The router body does not clearly direct the model.** Make sure it
+  contains a `## How to Activate` section that names `load_sub_skill`
+  explicitly.
+- **The model is too small.** Sub-7B models sometimes ignore the dispatch
+  instruction. Try a larger model.
+
+### BM25 returns no skills
+
+Two common causes:
+
+1. **Only 1–2 skills installed.** The tiny-corpus fallback should kick in,
+   but if it does not, check `omweb/skills/router/bm25_router.py` is on
+   the current version.
+2. **Non-ASCII message.** Arabic, CJK, and other non-Latin scripts tokenize
+   to an empty list. Route via explicit `/` invocation instead.
 
 ### Install rejects with `SKILL_MANIFEST_INVALID`
 
 The `manifest.json` fails schema validation. The error response's
-`details.path` points to the failing field. Common causes:
+`details.path` points to the failing field. Common sub-skill causes:
 
 | Error | Fix |
 |-------|-----|
-| `id must match ^[a-z0-9][a-z0-9_]{2,63}$` | Use lowercase, digits, underscores, start with letter/digit, ≥3 chars. |
-| `schema_version major must be 1` | Use a `1.x.y` string. |
-| `execution.type must be 'instructions'` | Only `"instructions"` is accepted. |
+| `sub_skills[0].id must match …` | Use lowercase, digits, underscores, ≥3 chars. |
+| `Duplicate sub_skill id: 'x'` | Two entries share the same `id`. |
+| `sub_skills[0].instructions_file must …` | Must start with `sub_skills/` and end with `.md`. |
+| `sub_skills[0].instructions_file must not contain '..' segments` | Remove `..` from the path. |
+| `Manifest declares N sub-skills; max is 50` | Split the parent into multiple routers. |
 
 ### Install rejects with `SKILL_VALIDATION_FAILED`
 
-Structural problems with the package itself:
+Structural issues:
 
-| Error | Fix |
-|-------|-----|
+| Symptom | Fix |
+|---------|-----|
 | `missing required file: manifest.json at zip root` | Zip the contents, not the wrapping folder. |
-| `Skill package is missing SKILL.md` | Ensure the file named in `execution.instructions_file` exists at root. |
+| `Skill package is missing SKILL.md` | Ensure the file named in `execution.instructions_file` exists at the package root. |
 | `instructions_too_large` | Reduce `SKILL.md` or raise `limits.max_instructions_bytes`. |
-| `Missing '---' YAML frontmatter` | `SKILL.md` must start with `---` on line 1. |
 
-### Install rejects with `SKILL_SECURITY_VIOLATION`
+### `load_sub_skill` returns `SUB_SKILL_NOT_FOUND`
 
-A dangerous element, attribute, value, or file type was found. The error
-names the specific violation:
+The `sub_skill_id` passed by the model does not match any sub-skill
+declared in the parent's manifest. The error response includes an
+`available` list of valid IDs. This is usually the model's fault (it
+hallucinated an ID), not the manifest's. If the model repeats the mistake
+across runs, try shortening the sub-skill IDs or improving their
+descriptions in the router body.
 
-| Error | Fix |
-|-------|-----|
-| `svg_forbidden_element: script` | Remove `<script>` from `icon_svg`. |
-| `svg_external_url` | All `url(...)` refs must be `#local-id`. |
-| `forbidden file type: *.exe` | Remove executables from the package. |
+### `load_sub_skill` returns `SKILL_SECURITY_VIOLATION`
 
-### The skill is injected but the model ignores it
+The resolved file path escapes the parent package. This should only happen
+if the manifest was hand-edited after install, or a test harness mutated
+`record.sub_skills` in memory. Check the backend log for the exact
+`rel` path.
 
-- **Instructions too long.** Trim to the essential checklist. Aim for
-  < 8 KiB.
-- **Instructions too vague.** "Check for bugs" is weaker than a numbered
-  list of specific checks.
-- **Try `/` invocation instead of assignment.** Some models weight explicit
-  user-triggered skills more than ambient ones.
-- **Try a larger model.** Long system prompts are the first casualty on
-  small models.
+### `PUT .../sub-skills/.../instructions` returns 403
 
-### The `/` menu shows a skill that I deleted
+The parent skill is not `user_editable`. Built-in skills and skills shipped
+with `user_editable: false` cannot be edited from the UI. Reinstall the
+package with `user_editable: true` if you authored it.
 
-A stale cache in the browser. Reload the page. The `peldrun:skills-changed`
-event fires after deletion, but if a tab was open in the background when
-the delete happened, its event may have been missed. A reload fixes it.
+### The catalog is bigger than I expected
 
-### `PUT /api/store/agents/{id}/skills` returns 403
+The catalog block is capped at 4,000 characters (~1,000 tokens). If you
+have many skills with long descriptions, the top-K skills may fill the
+budget quickly. To reduce size:
 
-The agent's manifest has `settings.skills_editable: false`. This is a
-deliberate lock. If the agent is custom, edit its manifest (via the
-AgentBuilderModal) to remove the flag. If the agent is built-in and locked,
-you cannot assign skills to it — this is the intended behavior.
-
-### "This skill is not agent-assignable"
-
-The manifest has `capabilities.agent_assignable: false` (or the skill is
-deprecated). Either use it from `/` only, or edit the manifest (if you
-author the skill) to allow assignment.
+- Shorten `description` fields (the catalog uses `description`, not
+  `store_description`).
+- Shorten sub-skill `description` fields in the manifest.
+- Lower `top_k` (default 5) if you consistently see 5+ irrelevant entries.
 
 ---
 
-## 15. Reference example
+## 19. Reference example
 
-A complete, working skill is included at
-[`examples/code-review/`](./examples/code-review/). It demonstrates:
+The `code_review` skill is PELDRUN's canonical router example. It
+demonstrates every feature of the router pattern:
 
-- All the manifest fields that matter for a real skill (author, license,
-  tags, compatibility, capabilities).
-- A `SKILL.md` with concrete instructions and a defined output format.
-- Instructions for packaging it as a ZIP.
+- A parent `manifest.json` declaring four sub-skills with triggers.
+- A short router body in `SKILL.md` directing the model to
+  `load_sub_skill`.
+- Four sub-skill bodies (each 1.5–2.3 KiB) under `sub_skills/`.
+- `user_editable: true` on the parent so operators can tweak the router
+  body or any sub-skill body from the UI.
 
-To install it:
+### Structure
+
+```
+code_review/
+├── manifest.json
+├── SKILL.md                            # router body
+└── sub_skills/
+    ├── correctness_analysis/SKILL.md
+    ├── security_audit/SKILL.md
+    ├── error_handling_review/SKILL.md
+    └── maintainability_review/SKILL.md
+```
+
+### Manifest excerpt
+
+```json
+{
+  "schema_version": "1.0.0",
+  "id": "code_review",
+  "version": "2.0.0",
+  "name": "Code Review",
+  "description": "Systematic code review with router-based sub-skill selection.",
+  "tags": ["review", "audit", "security", "quality", "code", "router"],
+  "capabilities": {
+    "chat_invocable": true,
+    "agent_assignable": true,
+    "workflow_node": false
+  },
+  "execution": {
+    "type": "instructions",
+    "instructions_file": "SKILL.md"
+  },
+  "sub_skills": [
+    {
+      "id": "correctness_analysis",
+      "description": "Identify logic bugs, edge cases, incorrect control flow.",
+      "triggers": ["bug", "logic", "off-by-one", "null", "undefined", "edge case", "crash"],
+      "instructions_file": "sub_skills/correctness_analysis/SKILL.md"
+    },
+    {
+      "id": "security_audit",
+      "description": "Identify security vulnerabilities — injection, secrets, auth bypass.",
+      "triggers": ["security", "injection", "xss", "sql", "auth", "token", "secret"],
+      "instructions_file": "sub_skills/security_audit/SKILL.md"
+    },
+    {
+      "id": "error_handling_review",
+      "description": "Review exception hierarchies, retry logic, fallbacks, error propagation.",
+      "triggers": ["exception", "error", "try", "catch", "retry", "fallback", "logging"],
+      "instructions_file": "sub_skills/error_handling_review/SKILL.md"
+    },
+    {
+      "id": "maintainability_review",
+      "description": "Review code for clarity, coupling, duplication, naming.",
+      "triggers": ["refactor", "complexity", "naming", "duplication", "maintainability"],
+      "instructions_file": "sub_skills/maintainability_review/SKILL.md"
+    }
+  ],
+  "limits": { "max_instructions_bytes": 262144 },
+  "user_editable": true
+}
+```
+
+### Runtime flow (Progressive Disclosure enabled)
+
+```
+User: "Audit this Python code for SQL injection:
+       cursor.execute(f'SELECT * FROM users WHERE id = {user_id}')"
+  ↓
+[System prompt] contains catalog listing code_review + 4 sub-skills
+  ↓
+Model: tool_call load_skill(skill_id="code_review")
+  ↓
+[Tool result] --- BEGIN SKILL: code_review@2.0.0 --- ... --- END SKILL ---
+  ↓
+Model: tool_call load_sub_skill(parent_id="code_review", sub_skill_id="security_audit")
+  ↓
+[Tool result] --- BEGIN SUB-SKILL: code_review/security_audit --- ... --- END ---
+  ↓
+Model: final answer following security_audit's output format:
+      ## [Critical] Injection: SQL injection
+      **Location**: get_user.py:42
+      **Evidence**: cursor.execute(f"SELECT * FROM users WHERE id = {user_id}")
+      **Attack**: "1' OR '1'='1"
+      **Impact**: returns all users
+      **Fix**: use parameterized query
+```
+
+### Testing the example
+
+```python
+from fastapi.testclient import TestClient
+from omweb.main import app
+
+client = TestClient(app)
+
+# Verify the router is installed with 4 sub-skills
+r = client.get("/api/skills/code_review/sub-skills").json()
+assert r["count"] == 4
+assert {s["id"] for s in r["sub_skills"]} == {
+    "correctness_analysis", "security_audit",
+    "error_handling_review", "maintainability_review",
+}
+
+# Verify each sub-skill loads
+from omweb.skills.tools.load_sub_skill import execute
+for sub_id in ["correctness_analysis", "security_audit",
+                "error_handling_review", "maintainability_review"]:
+    res = execute("code_review", sub_id)
+    assert res["ok"] is True
+    assert res["content"].startswith(f"--- BEGIN SUB-SKILL: code_review/{sub_id} ---")
+```
+
+### Try it in the UI
+
+1. Open `/stores` → **Skills**. The `code_review` card shows the
+   **`ROUTER · 4`** badge.
+2. Click **ⓘ** — the drawer opens with the four sub-skills.
+3. Click the pencil on `security_audit` — the editor opens on that sub-
+   skill's body. Make a small change; save.
+4. Open a chat. Type `/code_review`. Send a SQL-injection prompt. Watch
+   the model call `load_skill` → `load_sub_skill` in the run timeline.
+5. Verify the answer follows the sub-skill's output template.
+
+### Packaging and installing
 
 ```powershell
-cd docs/skills/examples
-Compress-Archive -Path ".\code-review\*" -DestinationPath ".\code-review.zip" -Force
+cd backend/storage/store/skills
+Compress-Archive -Path ".\code_review\*" -DestinationPath ".\code_review.zip" -Force
 
-# Then install via the API
 curl -X POST http://127.0.0.1:8088/api/skills/install `
-  -F "file=@code-review.zip"
+  -F "file=@code_review.zip"
 ```
 
 Or drag the ZIP into `/stores` → Skills → **Install Skill**.
-
-Once installed:
-
-- Type `/code` in any chat to see the slash menu offer `✨ /code_review`.
-- Open `/stores` → Agents → ✨ on `peldrun` to assign it.
-- Run a task — the model's response follows the review checklist.
-```

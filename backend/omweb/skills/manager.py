@@ -424,6 +424,286 @@ class SkillManager:
         )
         return refreshed
 
+    def update_sub_skill_instructions(
+        self,
+        skill_id: str,
+        sub_skill_id: str,
+        new_body: str,
+    ) -> SkillRecord:
+        """
+        Replace the SKILL.md body of a sub-skill within a router skill.
+
+        Mirrors :meth:`update_skill_instructions` exactly, but targets
+        the file named by ``manifest.sub_skills[i].instructions_file``
+        instead of the parent's ``execution.instructions_file``. The
+        same validation chain applies:
+
+            1. Parent skill must exist and be ``user_editable``.
+            2. ``sub_skill_id`` must be declared in the parent's
+               ``sub_skills`` array.
+            3. The resolved file path must live INSIDE the package
+               (containment defense-in-depth).
+            4. New body must be non-empty and must not start with
+               ``---`` (prevents frontmatter duplication).
+            5. Body size must fit ``limits.max_instructions_bytes``.
+            6. Recomposed file (frontmatter + new body) must re-parse.
+            7. Atomic write via ``.md.tmp`` + ``os.replace``.
+
+        Unlike the parent-body path, this method does NOT tolerate a
+        missing frontmatter block in the original file. A sub-skill
+        file without YAML frontmatter is treated as corrupt (the same
+        way the loader treats it) and must be fixed by reinstalling
+        the package rather than partially patched.
+
+        Args:
+            skill_id:      Parent router skill's ID (aliases resolved).
+            sub_skill_id:  The sub-skill's ``id`` as declared in the
+                           parent manifest.
+            new_body:      New Markdown body WITHOUT frontmatter.
+
+        Raises:
+            SkillNotFoundError:   parent does not resolve.
+            SkillSecurityError:   parent is not user-editable, or the
+                                  sub-skill path escapes the package.
+            SkillValidationError: sub-skill not declared, empty body,
+                                  leading ``---``, oversized body,
+                                  missing/corrupt frontmatter, or
+                                  re-parse failure.
+            SkillStorageError:    filesystem read/write failure.
+        """
+        import re as _re
+
+        # ── 1. Resolve parent + editability gate ─────────────────
+        record = self.get_skill_or_raise(skill_id)
+
+        if not record.user_editable:
+            raise SkillSecurityError(
+                f"Skill '{record.id}' is not user-editable.",
+                details={
+                    "skill_id": record.id,
+                    "reason": "user_editable_false",
+                    "is_builtin": record.is_builtin,
+                },
+            )
+
+        if not record.sub_skills:
+            raise SkillValidationError(
+                f"Skill '{record.id}' is not a router "
+                f"(it declares no sub-skills).",
+                details={
+                    "skill_id": record.id,
+                    "reason": "not_a_router",
+                },
+            )
+
+        # ── 2. Locate the sub-skill declaration ──────────────────
+        sub = next(
+            (s for s in record.sub_skills if s.get("id") == sub_skill_id),
+            None,
+        )
+        if sub is None:
+            raise SkillValidationError(
+                f"Sub-skill {sub_skill_id!r} not found in "
+                f"{record.id!r}.",
+                details={
+                    "skill_id": record.id,
+                    "sub_skill_id": sub_skill_id,
+                    "reason": "sub_skill_not_found",
+                    "available": [
+                        s.get("id") for s in record.sub_skills
+                        if s.get("id")
+                    ],
+                },
+            )
+
+        instructions_file = sub.get("instructions_file")
+        if not isinstance(instructions_file, str) or not instructions_file:
+            raise SkillValidationError(
+                f"Sub-skill {sub_skill_id!r} has no "
+                f"instructions_file declared.",
+                details={
+                    "skill_id": record.id,
+                    "sub_skill_id": sub_skill_id,
+                    "reason": "missing_instructions_file",
+                },
+            )
+
+        # ── 3. Containment check (defense-in-depth) ──────────────
+        candidate = (record.package_dir / instructions_file).resolve()
+        try:
+            candidate.relative_to(record.package_dir.resolve())
+        except ValueError:
+            raise SkillSecurityError(
+                f"Sub-skill path {instructions_file!r} escapes the "
+                f"parent package.",
+                details={
+                    "skill_id": record.id,
+                    "sub_skill_id": sub_skill_id,
+                    "reason": "sub_skill_path_escape",
+                    "path": instructions_file,
+                },
+            )
+
+        if not candidate.is_file():
+            raise SkillValidationError(
+                f"Sub-skill file '{instructions_file}' is missing "
+                f"on disk.",
+                details={
+                    "skill_id": record.id,
+                    "sub_skill_id": sub_skill_id,
+                    "reason": "sub_skill_file_missing",
+                    "path": str(candidate),
+                },
+            )
+
+        # ── 4. Basic body validation ─────────────────────────────
+        body = (new_body or "").strip()
+        if not body:
+            raise SkillValidationError(
+                "Sub-skill instructions body cannot be empty.",
+                details={
+                    "skill_id": record.id,
+                    "sub_skill_id": sub_skill_id,
+                    "reason": "empty_body",
+                },
+            )
+
+        if body.startswith("---"):
+            raise SkillValidationError(
+                "Instructions must not include a frontmatter block. "
+                "The existing sub-skill frontmatter is preserved "
+                "automatically.",
+                details={
+                    "skill_id": record.id,
+                    "sub_skill_id": sub_skill_id,
+                    "reason": "frontmatter_in_body",
+                },
+            )
+
+        # ── 5. Size cap ──────────────────────────────────────────
+        declared_cap = (
+            (record.manifest.get("limits") or {}).get(
+                "max_instructions_bytes"
+            )
+            if isinstance(record.manifest.get("limits"), dict)
+            else None
+        )
+        max_bytes = DEFAULT_MAX_INSTRUCTIONS_BYTES
+        if isinstance(declared_cap, int) and declared_cap > 0:
+            max_bytes = min(declared_cap, MAX_INSTRUCTIONS_BYTES)
+
+        body_bytes = len(body.encode("utf-8"))
+        if body_bytes > max_bytes:
+            raise SkillValidationError(
+                f"Sub-skill instructions exceed {max_bytes} bytes "
+                f"({body_bytes} actual).",
+                details={
+                    "skill_id": record.id,
+                    "sub_skill_id": sub_skill_id,
+                    "reason": "instructions_too_large",
+                    "size_bytes": body_bytes,
+                    "limit": max_bytes,
+                },
+            )
+
+        # ── 6. Read existing file, extract frontmatter ───────────
+        try:
+            original = candidate.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise SkillStorageError(
+                f"Failed to read {instructions_file}: {exc}",
+                details={
+                    "skill_id": record.id,
+                    "sub_skill_id": sub_skill_id,
+                    "path": str(candidate),
+                },
+            ) from exc
+
+        match = _re.search(
+            r"\A---\r?\n(.*?)\r?\n---\r?\n",
+            original,
+            _re.DOTALL,
+        )
+        if not match:
+            raise SkillValidationError(
+                f"{instructions_file} has no YAML frontmatter block. "
+                f"The sub-skill file is corrupt; reinstall the "
+                f"package.",
+                details={
+                    "skill_id": record.id,
+                    "sub_skill_id": sub_skill_id,
+                    "reason": "missing_sub_skill_frontmatter",
+                },
+            )
+        frontmatter_block = match.group(0)
+
+        # ── 7. Recompose + re-validate before writing ────────────
+        new_content = frontmatter_block + "\n" + body + "\n"
+
+        try:
+            parse_skill_md(new_content)
+        except Exception as exc:
+            raise SkillValidationError(
+                f"Recomposed {instructions_file} failed validation: "
+                f"{exc}",
+                details={
+                    "skill_id": record.id,
+                    "sub_skill_id": sub_skill_id,
+                    "reason": "recompose_invalid",
+                },
+            ) from exc
+
+        # ── 8. Atomic write ──────────────────────────────────────
+        tmp_path = candidate.with_suffix(".md.tmp")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                fh.write(new_content)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+            os.replace(str(tmp_path), str(candidate))
+        except OSError as exc:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise SkillStorageError(
+                f"Failed to write sub-skill {instructions_file}: {exc}",
+                details={
+                    "skill_id": record.id,
+                    "sub_skill_id": sub_skill_id,
+                    "path": str(candidate),
+                },
+            ) from exc
+
+        # ── 9. Refresh registry (metadata may carry new content
+        #       hash if we add one later; today the registry only
+        #       stores metadata, but refreshing keeps the record
+        #       consistent with what a fresh load would produce). ──
+        try:
+            self.registry.refresh_skill(record.id)
+        except Exception as exc:  # noqa: BLE001 — never lose the save
+            logger.warning(
+                "Registry refresh failed after editing sub-skill "
+                "%r/%r: %s. On-disk change succeeded.",
+                record.id,
+                sub_skill_id,
+                exc,
+            )
+
+        logger.info(
+            "Sub-skill %r/%r instructions updated "
+            "(%d bytes).",
+            record.id,
+            sub_skill_id,
+            body_bytes,
+        )
+
+        refreshed = self.registry.get_skill(record.id)
+        return refreshed or record
+
     def list_broken_skills(self) -> Dict[str, str]:
         """
         Return ``{package_dirname: error_message}`` for packages that

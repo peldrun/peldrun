@@ -55,8 +55,17 @@ export interface UseSkillActionsResult {
 
   // Editor modal
   editorSkill: SkillSummary | null;
+  /**
+   * Sub-skill ID being edited, or ``null`` when editing the parent
+   * router body. The editor modal uses this to switch between the
+   * parent /preview + PUT endpoints and the sub-skill equivalents.
+   */
+  editorSubSkillId: string | null;
   isEditorOpen: boolean;
-  handleOpenEditor: (skill: SkillSummary) => void;
+  handleOpenEditor: (
+    skill: SkillSummary,
+    subSkillId?: string | null,
+  ) => void;
   handleCloseEditor: () => void;
   handleSkillSaved: (updated: SkillSummary) => void;
 }
@@ -98,6 +107,9 @@ export function useSkillActions({
 
   // ── Editor modal state ────────────────────────────────────────
   const [editorSkill, setEditorSkill] = useState<SkillSummary | null>(null);
+  const [editorSubSkillId, setEditorSubSkillId] = useState<string | null>(
+    null
+  );
 
   // ── Helpers ───────────────────────────────────────────────────
   //
@@ -305,19 +317,24 @@ export function useSkillActions({
   }, []);
 
   // ── Editor modal ──────────────────────────────────────────────
-  const handleOpenEditor = useCallback((skill: SkillSummary) => {
-    if (!skill.user_editable) {
-      showToast.info(
-        "Not editable",
-        `'${skill.name || skill.id}' is not user-editable.`
-      );
-      return;
-    }
-    setEditorSkill(skill);
-  }, []);
+  const handleOpenEditor = useCallback(
+    (skill: SkillSummary, subSkillId: string | null = null) => {
+      if (!skill.user_editable) {
+        showToast.info(
+          "Not editable",
+          `'${skill.name || skill.id}' is not user-editable.`
+        );
+        return;
+      }
+      setEditorSkill(skill);
+      setEditorSubSkillId(subSkillId);
+    },
+    []
+  );
 
   const handleCloseEditor = useCallback(() => {
     setEditorSkill(null);
+    setEditorSubSkillId(null);
   }, []);
 
   const handleSkillSaved = useCallback(
@@ -346,6 +363,7 @@ export function useSkillActions({
     handleOpenDetails,
     handleCloseDetails,
     editorSkill,
+    editorSubSkillId,
     isEditorOpen: Boolean(editorSkill),
     handleOpenEditor,
     handleCloseEditor,

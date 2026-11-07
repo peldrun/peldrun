@@ -11,6 +11,7 @@ import {
   FileText,
   Loader2,
   Network,
+  Pencil,
   ShieldCheck,
   Sparkles,
   Tag,
@@ -27,6 +28,17 @@ export interface SkillDetailsDrawerProps {
   open: boolean;
   skill: SkillSummary | null;
   onClose: () => void;
+  /**
+   * Optional: invoked when the user clicks the pencil icon next to a
+   * sub-skill. The callback receives the parent skill and the
+   * sub-skill ID; the parent decides whether to open the editor modal,
+   * show a toast, or ignore.
+   *
+   * Only rendered when both this prop is provided AND the parent skill
+   * is ``user_editable`` — matching the same gating that already
+   * protects the parent body editor.
+   */
+  onEditSubSkill?: (skill: SkillSummary, subSkillId: string) => void;
 }
 
 /**
@@ -46,6 +58,7 @@ export function SkillDetailsDrawer({
   open,
   skill,
   onClose,
+  onEditSubSkill,
 }: SkillDetailsDrawerProps) {
   const [preview, setPreview] = useState<SkillPreview | null>(null);
   const [loadingPreview, setLoadingPreview] = useState(false);
@@ -324,14 +337,29 @@ export function SkillDetailsDrawer({
                           <code className="text-[12px] font-mono font-semibold text-foreground">
                             {sub.id}
                           </code>
-                          {sub.capabilities?.exclusive && (
-                            <span
-                              className="px-1.5 py-0.5 rounded text-[9px] font-mono uppercase bg-amber-500/10 text-amber-700 dark:text-amber-400 border border-amber-500/20"
-                              title="Must be loaded alone (exclusive)"
-                            >
-                              EXCLUSIVE
-                            </span>
-                          )}
+                          <div className="flex items-center gap-1.5">
+                            {sub.capabilities?.exclusive && (
+                              <span
+                                className="px-1.5 py-0.5 rounded text-[9px] font-mono uppercase bg-amber-500/10 text-amber-700 dark:text-amber-400 border border-amber-500/20"
+                                title="Must be loaded alone (exclusive)"
+                              >
+                                EXCLUSIVE
+                              </span>
+                            )}
+                            {onEditSubSkill && skill.user_editable && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  onEditSubSkill(skill, sub.id)
+                                }
+                                className="p-1 rounded text-muted-foreground hover:text-primary hover:bg-primary/10 transition cursor-pointer"
+                                title={`Edit ${sub.id} instructions`}
+                                aria-label={`Edit ${sub.id} instructions`}
+                              >
+                                <Pencil size={11} />
+                              </button>
+                            )}
+                          </div>
                         </div>
                         <p className="text-xs text-muted-foreground leading-relaxed mb-2">
                           {sub.description}

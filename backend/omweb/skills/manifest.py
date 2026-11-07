@@ -289,6 +289,15 @@ def parse_skill_md(content: str) -> Tuple[Dict[str, Any], str]:
             details={"reason": "empty_content"},
         )
 
+    # Strip a UTF-8 BOM if present. Some Windows editors (Notepad,
+    # some VS Code configurations) prepend EF BB BF when saving files
+    # as "UTF-8 with BOM". Without this strip, the file would fail
+    # the ``startswith('---')`` check even though it is otherwise
+    # perfectly valid YAML frontmatter, and the /preview endpoint
+    # would silently return an empty frontmatter dict.
+    if content.startswith("\ufeff"):
+        content = content[1:]
+
     normalized = content.replace("\r\n", "\n").replace("\r", "\n")
 
     if not normalized.startswith("---"):
