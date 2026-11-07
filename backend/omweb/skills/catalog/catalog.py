@@ -70,6 +70,14 @@ DEFAULT_REMOTE_CATALOG_URL = (
 
 REMOTE_CATALOG_CACHE_FILENAME = "skill_catalog_remote_cache.json"
 REMOTE_CATALOG_TTL_SECONDS = 24 * 60 * 60
+# Negative cache TTL: after a FAILED remote fetch (HTTP error, network
+# error, malformed body), do not retry for this many seconds. Without
+# this, every ``GET /api/skills/catalog`` would hit the remote host
+# again -- spamming the logs and burning a network round-trip -- even
+# when the host has been 404ing for days. 5 minutes is short enough
+# that a transient outage recovers automatically, long enough that a
+# UI refresh loop cannot accidentally DoS the remote.
+REMOTE_CATALOG_NEGATIVE_TTL_SECONDS = 5 * 60
 REMOTE_CATALOG_FETCH_TIMEOUT_SECONDS = 15.0
 REMOTE_CATALOG_MAX_BYTES = 2 * 1024 * 1024
 REMOTE_CATALOG_MAX_REDIRECTS = 3
@@ -275,6 +283,12 @@ class SkillCatalog:
 
         self._items: Dict[str, SkillCatalogItem] = {}
         self._remote_loaded_at: float = 0.0
+        # Wall-clock timestamp of the last fetch ATTEMPT (success or
+        # failure). Used for the negative cache: after a failure,
+        # ``ensure_fresh`` must not retry until the negative TTL
+        # elapses, regardless of ``_remote_loaded_at`` (which only
+        # tracks SUCCESSFUL fetches).
+        self._remote_last_attempt_at: float = 0.0
         self._remote_last_error: Optional[str] = None
 
         self.reload()
@@ -333,7 +347,24 @@ class SkillCatalog:
     # -- Remote fetch -----------------------------------------------
 
     async def ensure_fresh(self, force: bool = False) -> bool:
-        """Fetch remote catalog if stale or forced. Never raises."""
+        """
+        Fetch remote catalog if stale or forced. Never raises.
+
+        Two TTLs apply:
+
+            * **Positive TTL** (``self._ttl_seconds``, default 24h):
+              after a SUCCESSFUL fetch, skip further fetches until
+              the TTL expires.
+            * **Negative TTL** (``REMOTE_CATALOG_NEGATIVE_TTL_SECONDS``,
+              5 min): after a FAILED fetch, skip retries for 5 min.
+              Without this, a persistently-404ing remote would be
+              hit on every ``GET /api/skills/catalog`` call -- one per
+              tab focus, one per page load -- flooding the logs and
+              burning a network round-trip on every render.
+
+        ``force=True`` (used by the "Refresh" button) bypasses BOTH
+        TTLs -- the user explicitly asked for a fresh attempt.
+        """
         if not _is_catalog_enabled():
             return False
 
@@ -341,10 +372,17 @@ class SkillCatalog:
         if not url:
             return True  # offline mode, builtin only
 
-        if not force and self._remote_loaded_at > 0:
-            age = time.time() - self._remote_loaded_at
-            if age <= self._ttl_seconds:
-                return True
+        if not force:
+            # Positive cache: a recent SUCCESS skips refetch.
+            if self._remote_loaded_at > 0:
+                age = time.time() - self._remote_loaded_at
+                if age <= self._ttl_seconds:
+                    return True
+            # Negative cache: a recent FAILURE skips refetch.
+            if self._remote_last_attempt_at > 0:
+                fail_age = time.time() - self._remote_last_attempt_at
+                if fail_age <= REMOTE_CATALOG_NEGATIVE_TTL_SECONDS:
+                    return False
 
         ok = await self._fetch_remote(url)
         if ok:
@@ -357,6 +395,11 @@ class SkillCatalog:
 
     async def _fetch_remote(self, url: str) -> bool:
         """Download + cache the remote catalog. Never raises."""
+        # Record the attempt timestamp BEFORE any I/O so the negative
+        # cache covers all failure paths that follow: bad scheme,
+        # network error, HTTP error, oversized body, malformed JSON.
+        self._remote_last_attempt_at = time.time()
+
         if not url.lower().startswith(("http://", "https://")):
             msg = f"Skill catalog URL scheme not HTTP(S): {url!r}"
             logger.warning(msg)
@@ -653,6 +696,7 @@ class SkillCatalog:
 
     def get_status(self) -> Dict[str, Any]:
         """Snapshot for admin/debug endpoints."""
+        now = time.time()
         return {
             "enabled": _is_catalog_enabled(),
             "item_count": len(self._items),
@@ -662,10 +706,24 @@ class SkillCatalog:
             "remote_count": len(self._remote_items),
             "remote_url_configured": bool(_resolve_remote_catalog_url()),
             "remote_url_effective": _resolve_remote_catalog_url() or None,
+            # Positive cache (age of last SUCCESSFUL fetch, or None).
             "remote_cache_age_seconds": (
-                max(0.0, time.time() - self._remote_loaded_at)
+                max(0.0, now - self._remote_loaded_at)
                 if self._remote_loaded_at > 0
                 else None
+            ),
+            # Negative cache (age of last fetch ATTEMPT). Exposed so
+            # operators can see WHY a GET /catalog is not triggering
+            # a remote call -- useful for distinguishing "remote is
+            # healthy, no fetch needed yet" from "remote is broken,
+            # we are in the negative-cache window".
+            "remote_last_attempt_age_seconds": (
+                max(0.0, now - self._remote_last_attempt_at)
+                if self._remote_last_attempt_at > 0
+                else None
+            ),
+            "remote_negative_cache_ttl_seconds": (
+                REMOTE_CATALOG_NEGATIVE_TTL_SECONDS
             ),
             "remote_last_error": self._remote_last_error,
         }
@@ -698,6 +756,7 @@ __all__ = [
     "DEFAULT_REMOTE_CATALOG_URL",
     "REMOTE_CATALOG_CACHE_FILENAME",
     "REMOTE_CATALOG_TTL_SECONDS",
+    "REMOTE_CATALOG_NEGATIVE_TTL_SECONDS",
     "SkillCatalog",
     "get_skill_catalog",
     "reset_skill_catalog_for_tests",
