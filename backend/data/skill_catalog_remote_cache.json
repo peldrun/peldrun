@@ -1,9 +1,9 @@
 {
   "_cache_meta": {
     "schema_version": 1,
-    "fetched_at": 1794085636.3541038,
+    "fetched_at": 1794086070.96274,
     "source_url": "https://peldrunai.github.io/peldrun-skill-catalog/catalog.json",
-    "item_count": 3
+    "item_count": 1
   },
   "_items": {
     "code_review": {
@@ -39,86 +39,6 @@
       ],
       "has_sub_skills": true,
       "sub_skills_count": 4,
-      "trust": "verified",
-      "stability": "stable",
-      "release_date": "2026-11-08",
-      "deprecation_message": null,
-      "install_warnings": [],
-      "installable": false,
-      "installability_reason": "Preview only -- no download URL published yet."
-    },
-    "debugging": {
-      "id": "debugging",
-      "name": "Debugging Toolkit",
-      "display_name": "Debugging Toolkit",
-      "description": "Systematic debugging with router-based sub-skill selection.",
-      "version": "1.0.0",
-      "download_url": null,
-      "checksum_sha256": null,
-      "brand_color": "#EF4444",
-      "icon": "bug",
-      "icon_type": "name",
-      "author": "PELDRUN Team",
-      "author_url": "https://peldrun.ai",
-      "homepage": "https://peldrun.ai/skills/debugging",
-      "developer": {
-        "name": "PELDRUN Team",
-        "url": "https://peldrun.ai",
-        "email": null,
-        "avatar_url": null,
-        "github_username": "peldrunai",
-        "verified": true
-      },
-      "repository_url": "https://github.com/peldrunai/peldrun-skill-debugging",
-      "license": "MIT",
-      "docs_url": null,
-      "tags": [
-        "debugging",
-        "troubleshooting",
-        "router"
-      ],
-      "has_sub_skills": true,
-      "sub_skills_count": 4,
-      "trust": "verified",
-      "stability": "stable",
-      "release_date": "2026-11-08",
-      "deprecation_message": null,
-      "install_warnings": [],
-      "installable": false,
-      "installability_reason": "Preview only -- no download URL published yet."
-    },
-    "test_planning": {
-      "id": "test_planning",
-      "name": "Test Planning",
-      "display_name": "Test Planning",
-      "description": "Translate requirements into a structured, prioritized test plan.",
-      "version": "1.0.0",
-      "download_url": null,
-      "checksum_sha256": null,
-      "brand_color": "#10B981",
-      "icon": "checklist",
-      "icon_type": "name",
-      "author": "PELDRUN Team",
-      "author_url": "https://peldrun.ai",
-      "homepage": "https://peldrun.ai/skills/test_planning",
-      "developer": {
-        "name": "PELDRUN Team",
-        "url": "https://peldrun.ai",
-        "email": null,
-        "avatar_url": null,
-        "github_username": "peldrunai",
-        "verified": true
-      },
-      "repository_url": "https://github.com/peldrunai/peldrun-skill-test-planning",
-      "license": "MIT",
-      "docs_url": null,
-      "tags": [
-        "testing",
-        "qa",
-        "planning"
-      ],
-      "has_sub_skills": false,
-      "sub_skills_count": 0,
       "trust": "verified",
       "stability": "stable",
       "release_date": "2026-11-08",
