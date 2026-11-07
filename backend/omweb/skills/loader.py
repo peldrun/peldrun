@@ -50,6 +50,7 @@ from omweb.skills.errors import (
     SkillSecurityError,
 )
 from omweb.skills.manifest import (
+    DEFAULT_MAX_INSTRUCTIONS_BYTES,
     MAX_INSTRUCTIONS_BYTES,
     sanitize_svg,
 )
@@ -242,7 +243,10 @@ def load_instructions(record: SkillRecord) -> str:
         if isinstance(record.manifest.get("limits"), dict)
         else None
     )
-    max_bytes = MAX_INSTRUCTIONS_BYTES
+    # Effective ceiling: min(declared, hard). When the manifest omits
+    # the field, DEFAULT_MAX_INSTRUCTIONS_BYTES (256 KiB) applies —
+    # matching the JSON Schema default and the install-time cap.
+    max_bytes = DEFAULT_MAX_INSTRUCTIONS_BYTES
     if isinstance(declared_cap, int) and declared_cap > 0:
         max_bytes = min(declared_cap, MAX_INSTRUCTIONS_BYTES)
 

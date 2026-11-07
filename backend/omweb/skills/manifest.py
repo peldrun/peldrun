@@ -79,7 +79,14 @@ DEFAULT_INSTRUCTIONS_FILE = "SKILL.md"
 MAX_SVG_BYTES = 32 * 1024
 MAX_SVG_ELEMENTS = 200
 MAX_SVG_DEPTH = 8
+
+# Absolute hard ceiling — no manifest can declare a value above this.
 MAX_INSTRUCTIONS_BYTES = 1024 * 1024  # 1 MiB hard ceiling
+
+# Default cap applied when a manifest omits limits.max_instructions_bytes.
+# Must stay in lockstep with the JSON Schema's ``default: 262144`` so
+# that install, edit, and injection all agree on the effective ceiling.
+DEFAULT_MAX_INSTRUCTIONS_BYTES = 256 * 1024  # 256 KiB
 
 # The packaged copy (``_manifest_schema.json``) is preferred for deploy
 # isolation; the docs/ copy is the human-readable reference. Loading
@@ -783,6 +790,22 @@ def _validate_manifest_minimal(manifest: Dict[str, Any]) -> None:
                 },
             )
 
+    # Type-only check for 'user_editable'. Absence is valid (defaults to
+    # True at the registry layer for backward compatibility); the field is
+    # NOT required. The full JSON Schema enforces the same constraint when
+    # jsonschema + the schema file are both available — this block keeps
+    # the invariant enforceable in degraded (schema-less) mode.
+    user_editable = manifest.get("user_editable")
+    if user_editable is not None and not isinstance(user_editable, bool):
+        raise SkillManifestError(
+            "Manifest 'user_editable' must be a boolean.",
+            details={
+                "field": "user_editable",
+                "value": str(user_editable)[:100],
+                "reason": "invalid_type",
+            },
+        )
+
 
 # ---------------------------------------------------------------------------
 # Version compatibility
@@ -998,10 +1021,14 @@ def load_skill_package(
             details={"path": str(resolved_instructions)},
         ) from exc
 
-    # 3. Instructions size cap (schema-provided limit narrows the ceiling)
+    # 3. Instructions size cap.
+    # The effective ceiling is: min(declared_cap, hard_ceiling) where
+    # ``declared_cap`` defaults to DEFAULT_MAX_INSTRUCTIONS_BYTES when
+    # the manifest omits the field. This mirrors the JSON Schema default
+    # (262144) while keeping the absolute 1 MiB ceiling in force.
     limits = raw_manifest.get("limits") or {}
     configured_cap = limits.get("max_instructions_bytes")
-    max_bytes = MAX_INSTRUCTIONS_BYTES
+    max_bytes = DEFAULT_MAX_INSTRUCTIONS_BYTES
     if isinstance(configured_cap, int) and configured_cap > 0:
         max_bytes = min(configured_cap, MAX_INSTRUCTIONS_BYTES)
 
@@ -1041,6 +1068,8 @@ __all__ = [
     "MANIFEST_FILENAME",
     "SKILL_MD_FILENAME",
     "DEFAULT_INSTRUCTIONS_FILE",
+    "DEFAULT_MAX_INSTRUCTIONS_BYTES",
+    "MAX_INSTRUCTIONS_BYTES",
     "ParsedSkillPackage",
     "parse_skill_md",
     "sanitize_svg",

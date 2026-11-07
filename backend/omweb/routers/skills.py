@@ -40,6 +40,8 @@ from omweb.skills.errors import (
     SkillLoadError,
     SkillNotFoundError,
     SkillSecurityError,
+    SkillStorageError,
+    SkillValidationError,
 )
 from omweb.skills.manager import skill_manager
 from omweb.skills.registry import SkillRecord
@@ -66,6 +68,7 @@ class SkillSummaryResponse(BaseModel):
     status: str
     enabled: bool
     is_builtin: bool
+    user_editable: bool = True
     is_deprecated: bool
     chat_invocable: bool
     agent_assignable: bool
@@ -119,6 +122,25 @@ class SkillPreviewResponse(BaseModel):
     instructions: str
     instructions_length: int
     frontmatter: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SkillInstructionsUpdateRequest(BaseModel):
+    """
+    Request body for ``PUT /api/skills/{id}/instructions``.
+
+    Only the Markdown body (below the YAML frontmatter) is accepted.
+    The frontmatter is preserved verbatim server-side from the
+    existing SKILL.md — sending it in this payload is a client error.
+    """
+
+    instructions: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "The new Markdown body WITHOUT frontmatter. The existing "
+            "frontmatter is preserved automatically."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +384,68 @@ async def preview_skill(skill_id: str) -> Dict[str, Any]:
         "instructions": instructions,
         "instructions_length": len(instructions),
         "frontmatter": dict(record.frontmatter),
+    }
+
+
+# ---------------------------------------------------------------------------
+# PUT /api/skills/{skill_id}/instructions
+# ---------------------------------------------------------------------------
+
+@router.put(
+    "/{skill_id}/instructions",
+    response_model=Dict[str, Any],
+)
+async def update_skill_instructions(
+    skill_id: str,
+    req: SkillInstructionsUpdateRequest,
+) -> Dict[str, Any]:
+    """
+    Replace the SKILL.md body of a user-editable skill.
+
+    The frontmatter block is NOT part of the payload and is preserved
+    verbatim from the existing SKILL.md. The request is rejected when:
+
+        * the skill does not exist (404),
+        * the skill is not user-editable (403),
+        * the body is empty, oversized, or fails re-parse (422),
+        * the write itself fails (500).
+
+    On success the registry is refreshed, so the next chat run that
+    injects this skill picks up the new body immediately.
+    """
+    try:
+        record = skill_manager.update_skill_instructions(
+            skill_id=skill_id,
+            new_body=req.instructions,
+        )
+    except SkillNotFoundError as exc:
+        raise _skill_error_to_http(exc, http_status=404)
+    except SkillSecurityError as exc:
+        raise _skill_error_to_http(exc, http_status=403)
+    except SkillValidationError as exc:
+        raise _skill_error_to_http(exc, http_status=422)
+    except SkillStorageError as exc:
+        logger.exception(
+            "Failed to persist instructions for skill %r: %s",
+            skill_id,
+            exc,
+        )
+        raise _skill_error_to_http(exc, http_status=500)
+    except SkillError as exc:
+        # Safety net: any future SkillError subclass that is not
+        # explicitly mapped above becomes a 400. Prevents 500s from
+        # leaking partial error shapes.
+        logger.warning(
+            "Unmapped SkillError during instructions update for %r: %s",
+            skill_id,
+            exc,
+        )
+        raise _skill_error_to_http(exc, http_status=400)
+
+    return {
+        "status": "success",
+        "skill": _record_to_summary(record).model_dump(),
+        "instructions_length": len(record.instructions),
     }
 
 

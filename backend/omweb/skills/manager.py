@@ -45,8 +45,19 @@ from typing import Any, Dict, List, Optional
 from omweb.skills.errors import (
     SkillError,
     SkillNotFoundError,
+    SkillSecurityError,
+    SkillStorageError,
+    SkillValidationError,
 )
+import os
+
 from omweb.skills.loader import load_icon, load_instructions
+from omweb.skills.manifest import (
+    DEFAULT_INSTRUCTIONS_FILE,
+    DEFAULT_MAX_INSTRUCTIONS_BYTES,
+    MAX_INSTRUCTIONS_BYTES,
+    parse_skill_md,
+)
 from omweb.skills.registry import (
     SkillRecord,
     SkillRegistry,
@@ -186,6 +197,232 @@ class SkillManager:
         """
         record = self.get_skill_or_raise(skill_id)
         return load_icon(record)
+
+    def update_skill_instructions(
+        self,
+        skill_id: str,
+        new_body: str,
+    ) -> SkillRecord:
+        """
+        Replace the SKILL.md body (below the YAML frontmatter) with
+        ``new_body``.
+
+        The frontmatter block is preserved verbatim — it is the
+        canonical source of ``name`` / ``description`` / any author
+        custom keys, and rewriting it would risk silent loss. Only the
+        Markdown body after the closing ``---`` is replaced.
+
+        Validation chain (in order):
+            1. ``user_editable`` must be true (403 otherwise). Built-in
+               skills are always non-editable.
+            2. Body must be non-empty.
+            3. Body must not start with ``---`` (prevents double-
+               frontmatter, the most common copy/paste mistake).
+            4. Body size must fit ``limits.max_instructions_bytes``
+               (narrowed by the absolute ``MAX_INSTRUCTIONS_BYTES``).
+            5. Recomposed file (frontmatter + new body) must re-parse
+               cleanly through ``parse_skill_md``.
+            6. Atomic write via ``.md.tmp`` + ``os.replace``.
+
+        After the write, the registry is refreshed so the next run of
+        ``resolve_skill_injection`` picks up the new body immediately.
+        If the refresh itself fails (e.g. a concurrent delete), the
+        on-disk change still succeeded; we fall back to mutating the
+        in-memory record and log a warning — the caller gets the
+        updated record either way.
+
+        Args:
+            skill_id:  Canonical ID, alias, or normalized form.
+            new_body:  Markdown body WITHOUT frontmatter.
+
+        Raises:
+            SkillNotFoundError:   when the ID does not resolve.
+            SkillSecurityError:   when ``user_editable`` is false.
+            SkillValidationError: on empty body, leading ``---``,
+                                  oversized body, or re-parse failure.
+            SkillStorageError:    on filesystem read/write failure.
+        """
+        import re as _re
+
+        # 1. Resolve record + editability gate (before any disk I/O)
+        record = self.get_skill_or_raise(skill_id)
+
+        if not record.user_editable:
+            raise SkillSecurityError(
+                f"Skill '{record.id}' is not user-editable.",
+                details={
+                    "skill_id": record.id,
+                    "reason": "user_editable_false",
+                    "is_builtin": record.is_builtin,
+                },
+            )
+
+        # 2. Basic body validation
+        body = (new_body or "").strip()
+        if not body:
+            raise SkillValidationError(
+                "Instructions body cannot be empty.",
+                details={
+                    "skill_id": record.id,
+                    "reason": "empty_body",
+                },
+            )
+
+        if body.startswith("---"):
+            raise SkillValidationError(
+                "Instructions must not include a frontmatter block. "
+                "The existing frontmatter is preserved automatically.",
+                details={
+                    "skill_id": record.id,
+                    "reason": "frontmatter_in_body",
+                },
+            )
+
+        # 3. Enforce size cap (manifest may narrow the absolute ceiling)
+        declared_cap = (
+            (record.manifest.get("limits") or {}).get(
+                "max_instructions_bytes"
+            )
+            if isinstance(record.manifest.get("limits"), dict)
+            else None
+        )
+        # Effective ceiling: min(declared, hard). When the manifest omits
+        # the field, DEFAULT_MAX_INSTRUCTIONS_BYTES (256 KiB) applies —
+        # matching the JSON Schema default and install-time validation.
+        max_bytes = DEFAULT_MAX_INSTRUCTIONS_BYTES
+        if isinstance(declared_cap, int) and declared_cap > 0:
+            max_bytes = min(declared_cap, MAX_INSTRUCTIONS_BYTES)
+
+        body_bytes = len(body.encode("utf-8"))
+        if body_bytes > max_bytes:
+            raise SkillValidationError(
+                f"Instructions exceed {max_bytes} bytes "
+                f"({body_bytes} actual).",
+                details={
+                    "skill_id": record.id,
+                    "reason": "instructions_too_large",
+                    "size_bytes": body_bytes,
+                    "limit": max_bytes,
+                },
+            )
+
+        # 4. Read the existing SKILL.md and extract the frontmatter block
+        execution_block = record.manifest.get("execution") or {}
+        instructions_file = (
+            execution_block.get("instructions_file")
+            if isinstance(execution_block, dict)
+            else None
+        ) or DEFAULT_INSTRUCTIONS_FILE
+
+        instructions_path = record.package_dir / instructions_file
+        if not instructions_path.is_file():
+            raise SkillValidationError(
+                f"Instructions file '{instructions_file}' is missing "
+                f"on disk.",
+                details={
+                    "skill_id": record.id,
+                    "path": str(instructions_path),
+                },
+            )
+
+        try:
+            original = instructions_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise SkillStorageError(
+                f"Failed to read {instructions_file}: {exc}",
+                details={
+                    "skill_id": record.id,
+                    "path": str(instructions_path),
+                },
+            ) from exc
+
+        # Accept both \n and \r\n line endings. The block ends with a
+        # trailing newline so the recomposed file keeps the blank line
+        # between frontmatter and body that every PELDRUN skill ships
+        # with (see parse_skill_md's delimiter contract).
+        match = _re.search(
+            r"\A---\r?\n(.*?)\r?\n---\r?\n",
+            original,
+            _re.DOTALL,
+        )
+        if not match:
+            raise SkillValidationError(
+                f"{instructions_file} has no YAML frontmatter block. "
+                f"The file may be corrupted; reinstall the skill.",
+                details={
+                    "skill_id": record.id,
+                    "reason": "missing_frontmatter",
+                },
+            )
+        frontmatter_block = match.group(0)  # includes '---\n...\n---\n'
+
+        # 5. Recompose and re-validate the full file BEFORE writing it
+        new_content = frontmatter_block + "\n" + body + "\n"
+
+        try:
+            parse_skill_md(new_content)
+        except Exception as exc:
+            raise SkillValidationError(
+                f"Recomposed {instructions_file} failed validation: "
+                f"{exc}",
+                details={
+                    "skill_id": record.id,
+                    "reason": "recompose_invalid",
+                },
+            ) from exc
+
+        # 6. Atomic write: temp file + fsync + os.replace
+        tmp_path = instructions_path.with_suffix(".md.tmp")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                fh.write(new_content)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    # fsync is best-effort on some filesystems.
+                    pass
+            os.replace(str(tmp_path), str(instructions_path))
+        except OSError as exc:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise SkillStorageError(
+                f"Failed to write {instructions_file}: {exc}",
+                details={
+                    "skill_id": record.id,
+                    "path": str(instructions_path),
+                },
+            ) from exc
+
+        # 7. Refresh the registry so the next injection sees the new body
+        refreshed: Optional[SkillRecord]
+        try:
+            refreshed = self.registry.refresh_skill(record.id)
+        except Exception as exc:  # noqa: BLE001 — never lose the save
+            logger.warning(
+                "Registry refresh failed after editing skill %r: %s. "
+                "Falling back to in-memory update.",
+                record.id,
+                exc,
+            )
+            refreshed = None
+
+        if refreshed is None:
+            # Fallback: mutate the in-memory record so the caller sees
+            # the new body even without a successful reload. The file
+            # on disk is already correct.
+            record.instructions = body
+            refreshed = record
+
+        logger.info(
+            "Skill %r instructions updated (%d bytes, previous %d bytes).",
+            record.id,
+            body_bytes,
+            len(refreshed.instructions.encode("utf-8")),
+        )
+        return refreshed
 
     def list_broken_skills(self) -> Dict[str, str]:
         """

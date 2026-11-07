@@ -1,7 +1,7 @@
 {
   "_cache_meta": {
     "schema_version": 1,
-    "fetched_at": 1793819010.5280948,
+    "fetched_at": 1794049958.5427763,
     "source_url": "https://peldrunai.github.io/peldrun-provider-catalog/catalog.json",
     "item_count": 1
   },
@@ -26,8 +26,8 @@
           "connection.api_key"
         ]
       },
-      "download_url": "https://github.com/peldrunai/peldrun-provider-gigachat/releases/download/v1.0.0/gigachat-1.0.0.zip",
-      "checksum_sha256": "67617250704f85b9dc0d606d0e9bf5231b978e915a14a64ea80d09c3359c2e96",
+      "download_url": "https://github.com/peldrunai/peldrun-provider-gigachat/releases/download/V1.0.2/gigachat-1.0.2.zip",
+      "checksum_sha256": "55b937d1e8990783913be875b972d8383f684dd1bf193f983e2b4bb468a10ea8",
       "brand_color": "#21A038",
       "icon": "gigachat",
       "icon_type": "name",

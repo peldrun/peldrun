@@ -7,6 +7,7 @@ import {
   Bot,
   Info,
   MessageSquare,
+  Pencil,
   ShieldCheck,
   Sparkles,
   Tag,
@@ -24,6 +25,13 @@ export interface SkillCardProps {
   onToggle: (skillId: string) => void;
   onDelete: (skillId: string) => void;
   onOpenDetails: (skill: SkillSummary) => void;
+  /**
+   * Optional: opens the SKILL.md editor for this skill.
+   * Only invoked when the skill is user-editable. When omitted, the
+   * pencil button is not rendered — this keeps the card reusable in
+   * contexts where editing is not available (e.g. read-only embeds).
+   */
+  onOpenEditor?: (skill: SkillSummary) => void;
 }
 
 /**
@@ -78,6 +86,7 @@ export function SkillCard({
   onToggle,
   onDelete,
   onOpenDetails,
+  onOpenEditor,
 }: SkillCardProps) {
   const isEnabled = skill.enabled;
   const isBuiltin = skill.is_builtin;
@@ -176,6 +185,23 @@ export function SkillCard({
             >
               <Info size={14} />
             </button>
+
+            {/* Edit button — rendered only when the skill is user-editable
+                AND the parent supplied an editor callback. The backend
+                already forces user_editable=false for built-ins, so no
+                separate is_builtin check is required here. */}
+            {skill.user_editable && onOpenEditor && (
+              <button
+                type="button"
+                onClick={() => onOpenEditor(skill)}
+                disabled={isDeleting}
+                className="p-1.5 rounded text-muted-foreground hover:text-primary hover:bg-primary/10 transition cursor-pointer disabled:opacity-50"
+                title="Edit instructions"
+                aria-label="Edit skill instructions"
+              >
+                <Pencil size={14} />
+              </button>
+            )}
 
             {!isBuiltin && (
               <button

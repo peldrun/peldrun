@@ -24,6 +24,7 @@ export interface SkillsSectionProps {
   onToggleSkill: (skillId: string) => void;
   onDeleteSkill: (skillId: string) => void;
   onOpenDetails: (skill: SkillSummary) => void;
+  onOpenEditor: (skill: SkillSummary) => void;
   onOpenUpload: () => void;
 }
 
@@ -79,6 +80,7 @@ export function SkillsSection({
   onToggleSkill,
   onDeleteSkill,
   onOpenDetails,
+  onOpenEditor,
   onOpenUpload,
 }: SkillsSectionProps) {
   const filteredSkills = useMemo(() => {
@@ -153,6 +155,7 @@ export function SkillsSection({
           onToggle={onToggleSkill}
           onDelete={onDeleteSkill}
           onOpenDetails={onOpenDetails}
+          onOpenEditor={onOpenEditor}
         />
       ))}
     </div>

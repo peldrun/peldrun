@@ -166,6 +166,7 @@ export interface SkillSummary {
   status: string;
   enabled: boolean;
   is_builtin: boolean;
+  user_editable: boolean;
   is_deprecated: boolean;
   chat_invocable: boolean;
   agent_assignable: boolean;

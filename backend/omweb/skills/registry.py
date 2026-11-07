@@ -183,6 +183,23 @@ class SkillRecord:
         caps = self.manifest.get("capabilities") or {}
         return bool(caps.get("workflow_node", False))
 
+    @property
+    def user_editable(self) -> bool:
+        """
+        Whether the operator can edit SKILL.md through the Store UI.
+
+        Rules:
+            * Built-in skills are ALWAYS read-only, regardless of the
+              manifest's ``user_editable`` flag. They ship with PELDRUN
+              and must not diverge from the shipped version.
+            * Otherwise, ``user_editable`` defaults to True when the
+              field is absent (backward compatibility with pre-2026
+              skill packages that predate the field).
+        """
+        if self.is_builtin:
+            return False
+        return bool(self.manifest.get("user_editable", True))
+
     # ── Public serialization ──────────────────────────────────────────
 
     def to_summary_dict(self) -> Dict[str, Any]:
@@ -205,6 +222,7 @@ class SkillRecord:
             "status": self.status,
             "enabled": self.enabled,
             "is_builtin": self.is_builtin,
+            "user_editable": self.user_editable,
             "is_deprecated": self.is_deprecated,
             "chat_invocable": self.chat_invocable,
             "agent_assignable": self.agent_assignable,

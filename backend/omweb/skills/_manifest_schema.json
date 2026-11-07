@@ -285,6 +285,12 @@
       }
     },
 
+    "user_editable": {
+      "type": "boolean",
+      "default": true,
+      "description": "When true, the operator can edit SKILL.md through the Store UI. Set false for skills shipped as built-ins or governed packages. Built-in skills (is_builtin=true) are always treated as non-editable regardless of this value. Omitted means true (backward compatibility with pre-2026 skill packages)."
+    },
+
     "settings": {
       "type": "object",
       "additionalProperties": false,

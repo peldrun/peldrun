@@ -52,6 +52,13 @@ export interface UseSkillActionsResult {
   isDetailsDrawerOpen: boolean;
   handleOpenDetails: (skill: SkillSummary) => void;
   handleCloseDetails: () => void;
+
+  // Editor modal
+  editorSkill: SkillSummary | null;
+  isEditorOpen: boolean;
+  handleOpenEditor: (skill: SkillSummary) => void;
+  handleCloseEditor: () => void;
+  handleSkillSaved: (updated: SkillSummary) => void;
 }
 
 /**
@@ -88,6 +95,9 @@ export function useSkillActions({
 
   // ── Details drawer state ──────────────────────────────────────
   const [detailsSkill, setDetailsSkill] = useState<SkillSummary | null>(null);
+
+  // ── Editor modal state ────────────────────────────────────────
+  const [editorSkill, setEditorSkill] = useState<SkillSummary | null>(null);
 
   // ── Helpers ───────────────────────────────────────────────────
   //
@@ -294,6 +304,31 @@ export function useSkillActions({
     setDetailsSkill(null);
   }, []);
 
+  // ── Editor modal ──────────────────────────────────────────────
+  const handleOpenEditor = useCallback((skill: SkillSummary) => {
+    if (!skill.user_editable) {
+      showToast.info(
+        "Not editable",
+        `'${skill.name || skill.id}' is not user-editable.`
+      );
+      return;
+    }
+    setEditorSkill(skill);
+  }, []);
+
+  const handleCloseEditor = useCallback(() => {
+    setEditorSkill(null);
+  }, []);
+
+  const handleSkillSaved = useCallback(
+    (updated: SkillSummary) => {
+      setSkills((prev) =>
+        prev.map((s) => (s.id === updated.id ? updated : s))
+      );
+    },
+    [setSkills]
+  );
+
   return {
     togglingSkillId,
     handleToggleSkill,
@@ -310,5 +345,10 @@ export function useSkillActions({
     isDetailsDrawerOpen: Boolean(detailsSkill),
     handleOpenDetails,
     handleCloseDetails,
+    editorSkill,
+    isEditorOpen: Boolean(editorSkill),
+    handleOpenEditor,
+    handleCloseEditor,
+    handleSkillSaved,
   };
 }

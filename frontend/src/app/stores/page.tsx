@@ -54,6 +54,7 @@ import { AgentBuilderModal } from "./_modals/AgentBuilderModal";
 import { UploadModal } from "./_modals/UploadModal";
 import { SkillUploadModal } from "./_modals/SkillUploadModal";
 import { SkillDetailsDrawer } from "./_modals/SkillDetailsDrawer";
+import { SkillEditorModal } from "./_modals/SkillEditorModal";
 import { MCPSettingsModal } from "./_modals/MCPSettingsModal";
 import { MCPToolsModal } from "@/app/stores/_modals/MCPToolsModal";
 import { MCPDetailDrawer } from "./_components/MCPDetailDrawer";
@@ -262,6 +263,7 @@ export default function StoresPage() {
                   onToggleSkill={skillActions.handleToggleSkill}
                   onDeleteSkill={skillActions.handleDeleteSkill}
                   onOpenDetails={skillActions.handleOpenDetails}
+                  onOpenEditor={skillActions.handleOpenEditor}
                   onOpenUpload={skillActions.openUploadModal}
                 />
               )}
@@ -442,6 +444,14 @@ export default function StoresPage() {
         open={skillActions.isDetailsDrawerOpen}
         skill={skillActions.detailsSkill}
         onClose={skillActions.handleCloseDetails}
+      />
+
+      {/* Skill editor modal */}
+      <SkillEditorModal
+        open={skillActions.isEditorOpen}
+        skill={skillActions.editorSkill}
+        onClose={skillActions.handleCloseEditor}
+        onSaved={skillActions.handleSkillSaved}
       />
 
       {/* Provider install modal — serves BOTH the manual ZIP upload
