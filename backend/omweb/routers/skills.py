@@ -43,12 +43,29 @@ from omweb.skills.errors import (
     SkillStorageError,
     SkillValidationError,
 )
+from omweb.skills.catalog import (
+    SkillCatalogItem,
+    get_skill_catalog,
+)
+from omweb.skills.catalog import (
+    SkillCatalogItem,
+    get_skill_catalog,
+)
 from omweb.skills.manager import skill_manager
 from omweb.skills.registry import SkillRecord
 
 
 logger = logging.getLogger("omweb.routers.skills")
 
+# Sub-router for the Skill Catalog.
+#
+# IMPORTANT: This MUST be registered BEFORE the main ``router`` in
+# ``main.py`` because the main router declares ``GET /{skill_id}``
+# which would otherwise match ``/catalog`` as ``skill_id="catalog"``.
+# FastAPI matches routes in registration order, not by specificity.
+catalog_router = APIRouter()
+
+# Main skills router (existing routes below).
 router = APIRouter()
 
 
@@ -68,6 +85,13 @@ class SkillSummaryResponse(BaseModel):
     status: str
     enabled: bool
     is_builtin: bool
+    # Origin of the installed package: "uploaded" (manual ZIP),
+    # "catalog" (Skill Catalog install), or "builtin" (shipped with
+    # PELDRUN). Added by the Skill Catalog feature so the frontend
+    # can render the "FROM CATALOG" badge without cross-referencing
+    # the catalog items list. Defaults to "uploaded" for pre-catalog
+    # installs, so the field is safe for existing clients to ignore.
+    source: str = "uploaded"
     user_editable: bool = True
     is_deprecated: bool
     chat_invocable: bool
@@ -76,6 +100,13 @@ class SkillSummaryResponse(BaseModel):
     has_icon_svg: bool
     has_icon_path: bool
     icon_path: Optional[str] = None
+    # Optional brand color from the manifest. Rendered as the card's
+    # left-border accent in the Store UI. ``None`` when the manifest
+    # omits the field; the frontend falls back to the theme's default
+    # border color. Validated at install time by the manifest schema
+    # (``^#[0-9A-Fa-f]{6}$``), so any non-None value here is a
+    # syntactically valid hex color.
+    brand_color: Optional[str] = None
     tags: List[str] = Field(default_factory=list)
     author: Dict[str, Any] = Field(default_factory=dict)
     publisher_id: Optional[str] = None
@@ -1023,4 +1054,158 @@ async def delete_skill(skill_id: str) -> Dict[str, Any]:
     }
 
 
-__all__ = ["router"]
+# ===========================================================================
+# Skill Catalog endpoints
+# ===========================================================================
+#
+# IMPORTANT: These routes live on a SEPARATE router (``catalog_router``)
+# that MUST be registered BEFORE the main ``router`` in ``main.py``.
+# The main router declares ``GET /{skill_id}`` which would otherwise
+# match ``/catalog`` with ``skill_id="catalog"`` -- FastAPI matches
+# routes in registration order, not by specificity.
+#
+# The 4 endpoints mirror the Provider Packages catalog API shape so
+# the frontend can reuse the same fetch/mutate patterns for both
+# subsystems.
+
+# ---------------------------------------------------------------------------
+# GET /api/skills/catalog
+# ---------------------------------------------------------------------------
+
+@catalog_router.get("/catalog", response_model=Dict[str, Any])
+async def list_skill_catalog() -> Dict[str, Any]:
+    """
+    List every catalog item with derived installability info.
+
+    Fetches from remote on first call (subject to 24h TTL) and caches
+    the result. Never raises -- if the remote fetch fails, the
+    builtin catalog is returned. The ``status_info`` field surfaces
+    the failure reason for debugging, without blocking the UI.
+    """
+    catalog = get_skill_catalog()
+    try:
+        await catalog.ensure_fresh()
+    except Exception as exc:  # noqa: BLE001 -- best-effort
+        logger.warning("Skill catalog refresh failed: %s", exc)
+
+    items = catalog.list_items()
+    return {
+        "status": "success",
+        "items": [item.model_dump() for item in items],
+        "total": len(items),
+        "status_info": catalog.get_status(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/skills/catalog/{item_id}
+# ---------------------------------------------------------------------------
+
+@catalog_router.get("/catalog/{item_id}", response_model=Dict[str, Any])
+async def get_skill_catalog_item(item_id: str) -> Dict[str, Any]:
+    """Return a single catalog item by ID."""
+    catalog = get_skill_catalog()
+    try:
+        item: SkillCatalogItem = catalog.get_or_raise(item_id)
+    except SkillError as exc:
+        raise _skill_error_to_http(exc, http_status=404)
+    return {"status": "success", "item": item.model_dump()}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/skills/catalog/refresh
+# ---------------------------------------------------------------------------
+
+@catalog_router.post("/catalog/refresh", response_model=Dict[str, Any])
+async def refresh_skill_catalog() -> Dict[str, Any]:
+    """Force-fetch the remote catalog, ignoring the 24h TTL."""
+    catalog = get_skill_catalog()
+    ok = await catalog.refresh()
+    status_info = catalog.get_status()
+    total = len(catalog.list_items())
+
+    if ok:
+        return {
+            "status": "success",
+            "total": total,
+            "message": f"Catalog refreshed ({total} items).",
+            "status_info": status_info,
+        }
+    return {
+        "status": "error",
+        "total": total,
+        "message": (
+            status_info.get("remote_last_error")
+            or "Refresh failed. See server logs for details."
+        ),
+        "status_info": status_info,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/skills/catalog/{item_id}/install
+# ---------------------------------------------------------------------------
+
+@catalog_router.post(
+    "/catalog/{item_id}/install",
+    response_model=Dict[str, Any],
+)
+async def install_skill_from_catalog(item_id: str) -> Dict[str, Any]:
+    """
+    Download, verify, and install a skill from the catalog.
+
+    This is synchronous (no job polling) because skills have no venv
+    and no pip step -- the whole operation is usually under 5 seconds.
+    Errors follow the standard ``{error, code, details}`` shape.
+    """
+    catalog = get_skill_catalog()
+    try:
+        result = await catalog.install_from_catalog(item_id)
+    except SkillError as exc:
+        logger.info(
+            "Skill catalog install rejected (%s): %s", exc.code, exc
+        )
+        status = 404 if exc.code == "SKILL_CATALOG_ITEM_NOT_FOUND" else 400
+        raise _skill_error_to_http(exc, http_status=status)
+    except Exception as exc:  # noqa: BLE001 -- defensive
+        logger.exception("Skill catalog install failed: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": f"Install failed: {exc}",
+                "code": "SKILL_CATALOG_INSTALL_FAILED",
+                "details": {"item_id": item_id},
+            },
+        )
+
+    # Re-read the installed record to return the full summary
+    # (including the ``source="catalog"`` field written by storage).
+    installed_record = skill_manager.get_skill(result.skill_id)
+    if installed_record is None:
+        # Extremely unlikely: install succeeded but registry refresh
+        # failed. Return what we know from the storage result.
+        logger.warning(
+            "Catalog install succeeded but skill %r is not visible in "
+            "the registry; returning storage-level summary.",
+            result.skill_id,
+        )
+        return {
+            "status": "success",
+            "skill": {
+                "id": result.skill_id,
+                "version": result.version,
+                "name": result.name,
+            },
+            "was_upgrade": result.was_upgrade,
+            "warnings": list(result.warnings),
+        }
+
+    return {
+        "status": "success",
+        "skill": _record_to_summary(installed_record).model_dump(),
+        "was_upgrade": result.was_upgrade,
+        "warnings": list(result.warnings),
+    }
+
+
+__all__ = ["router", "catalog_router"]

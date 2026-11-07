@@ -6,10 +6,19 @@ import { useCallback, useState } from "react";
 import { showToast } from "@/components/ui/ToastNotification";
 import { getApiUrl } from "./useStoreData";
 import type {
+  CatalogSkillInstallResult,
+  SkillCatalogItem,
+  SkillCatalogListResponse,
+  SkillCatalogRefreshResponse,
   SkillInstallResponse,
   SkillSummary,
   SkillToggleResponse,
 } from "../_types/store";
+import {
+  formatSkillCatalogError,
+  installSkillFromCatalog as apiInstallSkillFromCatalog,
+  refreshSkillCatalog as apiRefreshSkillCatalog,
+} from "@/lib/skillCatalogApi";
 
 /**
  * Arguments required by {@link useSkillActions}.
@@ -68,6 +77,47 @@ export interface UseSkillActionsResult {
   ) => void;
   handleCloseEditor: () => void;
   handleSkillSaved: (updated: SkillSummary) => void;
+
+  // ── Catalog ────────────────────────────────────────────────────
+  /** Loaded catalog items, or empty until first load. */
+  catalogItems: SkillCatalogItem[];
+  isCatalogLoading: boolean;
+  isCatalogRefreshing: boolean;
+  /** Last catalog load / refresh error, or ``null``. */
+  catalogError: string | null;
+  /**
+   * False when the backend reports ``PELDRUN_SKILL_CATALOG_ENABLED=false``.
+   * The SkillsSection uses this to hide the Catalog tab entirely.
+   * Defaults to ``true`` so the tab is visible before the first load
+   * completes (avoids a flicker on fast networks).
+   */
+  catalogEnabled: boolean;
+  /** Item ID currently being installed, or ``null``. */
+  installingCatalogId: string | null;
+  handleLoadCatalog: () => Promise<void>;
+  handleRefreshCatalog: () => Promise<void>;
+
+  // ── Install modal ─────────────────────────────────────────────
+  /**
+   * Catalog item to install (drives the install modal), or ``null``.
+   * When non-null, ``CatalogSkillInstallModal`` renders.
+   */
+  catalogInstallItem: SkillCatalogItem | null;
+  /**
+   * Terminal install result, or ``null`` while running. Mirrors the
+   * discriminated union consumed by ``CatalogSkillInstallModal``.
+   */
+  catalogInstallResult: CatalogSkillInstallResult | null;
+  /** Opens the install modal and kicks off the request. */
+  handleInstallFromCatalog: (item: SkillCatalogItem) => Promise<void>;
+  /** Closes the install modal and clears its state. */
+  handleCloseCatalogInstall: () => void;
+
+  // ── Details modal ─────────────────────────────────────────────
+  catalogDetailsItem: SkillCatalogItem | null;
+  isCatalogDetailsOpen: boolean;
+  handleOpenCatalogDetails: (item: SkillCatalogItem) => void;
+  handleCloseCatalogDetails: () => void;
 }
 
 /**
@@ -110,6 +160,26 @@ export function useSkillActions({
   const [editorSubSkillId, setEditorSubSkillId] = useState<string | null>(
     null
   );
+
+  // ── Catalog state ─────────────────────────────────────────────
+  const [catalogItems, setCatalogItems] = useState<SkillCatalogItem[]>([]);
+  const [isCatalogLoading, setIsCatalogLoading] = useState(false);
+  const [isCatalogRefreshing, setIsCatalogRefreshing] = useState(false);
+  const [catalogError, setCatalogError] = useState<string | null>(null);
+  const [catalogEnabled, setCatalogEnabled] = useState<boolean>(true);
+
+  // ── Catalog install modal state ───────────────────────────────
+  const [installingCatalogId, setInstallingCatalogId] = useState<
+    string | null
+  >(null);
+  const [catalogInstallItem, setCatalogInstallItem] =
+    useState<SkillCatalogItem | null>(null);
+  const [catalogInstallResult, setCatalogInstallResult] =
+    useState<CatalogSkillInstallResult | null>(null);
+
+  // ── Catalog details modal state ───────────────────────────────
+  const [catalogDetailsItem, setCatalogDetailsItem] =
+    useState<SkillCatalogItem | null>(null);
 
   // ── Helpers ───────────────────────────────────────────────────
   //
@@ -346,6 +416,153 @@ export function useSkillActions({
     [setSkills]
   );
 
+  // ── Catalog: load ─────────────────────────────────────────────
+  //
+  // Uses a direct fetch (rather than ``listSkillCatalog``) because we
+  // need to read ``status_info.enabled`` -- the thin API client helper
+  // intentionally drops it for cleaner call sites. One request gives
+  // us both the items and the kill-switch flag.
+  const handleLoadCatalog = useCallback(async () => {
+    setIsCatalogLoading(true);
+    setCatalogError(null);
+    try {
+      const res = await fetch(getApiUrl("/api/skills/catalog"));
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        const detail = errBody?.detail;
+        const msg =
+          (typeof detail === "string" && detail) ||
+          (detail && typeof detail === "object" && detail.error) ||
+          `HTTP ${res.status}`;
+        throw new Error(String(msg));
+      }
+      const data: SkillCatalogListResponse = await res.json();
+      setCatalogItems(Array.isArray(data.items) ? data.items : []);
+      // Kill switch: default to true when the backend omits the flag
+      // (older deployments or mocked responses).
+      setCatalogEnabled(data.status_info?.enabled ?? true);
+    } catch (err) {
+      setCatalogError(formatSkillCatalogError(err));
+    } finally {
+      setIsCatalogLoading(false);
+    }
+  }, []);
+
+  // ── Catalog: refresh (force) ──────────────────────────────────
+  //
+  // ``refreshSkillCatalog`` does NOT throw on a ``status: "error"``
+  // response -- that is a state (remote fetch failed but builtin
+  // catalog is still available) which we surface as a warning toast.
+  // It DOES throw on network failures and non-2xx responses.
+  const handleRefreshCatalog = useCallback(async () => {
+    setIsCatalogRefreshing(true);
+    setCatalogError(null);
+    try {
+      const resp: SkillCatalogRefreshResponse = await apiRefreshSkillCatalog();
+      if (resp.status === "error") {
+        setCatalogError(resp.message);
+        showToast.warning("Catalog Refresh Failed", resp.message);
+      } else {
+        showToast.success(
+          "Catalog Refreshed",
+          resp.message || `Catalog reloaded (${resp.total} items).`
+        );
+      }
+      // Re-fetch the item list so the UI reflects any change the
+      // refresh produced (new items, updated metadata).
+      await handleLoadCatalog();
+    } catch (err) {
+      const msg = formatSkillCatalogError(err);
+      setCatalogError(msg);
+      showToast.error("Refresh Failed", msg);
+    } finally {
+      setIsCatalogRefreshing(false);
+    }
+  }, [handleLoadCatalog]);
+
+  // ── Catalog: install ──────────────────────────────────────────
+  //
+  // Synchronous backend operation (2-5s typical). The install modal
+  // shows a simulated progress UI while the fetch is in-flight, then
+  // swaps to a real success/error banner using the response payload
+  // (or the thrown SkillCatalogApiError).
+  const handleInstallFromCatalog = useCallback(
+    async (item: SkillCatalogItem) => {
+      // Prevent concurrent installs from multiple card clicks.
+      if (installingCatalogId !== null) return;
+
+      // Open the modal in "running" state BEFORE the network call so
+      // the user sees immediate feedback.
+      setCatalogInstallItem(item);
+      setCatalogInstallResult(null);
+      setInstallingCatalogId(item.id);
+
+      try {
+        const result = await apiInstallSkillFromCatalog(item.id);
+        setCatalogInstallResult({
+          success: true,
+          skillId: result.skill.id,
+          version: result.skill.version,
+          name: result.skill.name,
+        });
+
+        showToast.success(
+          result.was_upgrade ? "Skill Updated" : "Skill Installed",
+          `${result.skill.name} v${result.skill.version} is now active.`
+        );
+        if (Array.isArray(result.warnings)) {
+          for (const w of result.warnings) {
+            if (typeof w === "string" && w.trim()) {
+              showToast.info("Install Notice", w);
+            }
+          }
+        }
+
+        // Refetch the installed skills so the Installed tab shows the
+        // new skill (and the card's Installed badge updates).
+        await reload();
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(new CustomEvent("peldrun:skills-changed"));
+        }
+      } catch (err) {
+        // Format the error into the discriminated-union failure shape.
+        // Keep the same error string the toast shows so the modal's
+        // failure banner and the toast agree.
+        const msg = formatSkillCatalogError(err);
+        const code =
+          err && typeof err === "object" && "code" in err
+            ? String((err as { code?: unknown }).code)
+            : undefined;
+        setCatalogInstallResult({ success: false, error: msg, code });
+        showToast.error("Install Failed", msg);
+      } finally {
+        setInstallingCatalogId(null);
+      }
+    },
+    [installingCatalogId, reload]
+  );
+
+  // ── Catalog: install modal close ──────────────────────────────
+  //
+  // Guarded against a close attempt while the fetch is still running
+  // -- the modal itself disables the close button, but defensive
+  // double-checking keeps the state consistent even if some future
+  // caller bypasses the modal.
+  const handleCloseCatalogInstall = useCallback(() => {
+    if (installingCatalogId !== null) return;
+    setCatalogInstallItem(null);
+    setCatalogInstallResult(null);
+  }, [installingCatalogId]);
+
+  // ── Catalog: details modal open / close ───────────────────────
+  const handleOpenCatalogDetails = useCallback((item: SkillCatalogItem) => {
+    setCatalogDetailsItem(item);
+  }, []);
+
+  const handleCloseCatalogDetails = useCallback(() => {
+    setCatalogDetailsItem(null);
+  }, []);
+
   return {
     togglingSkillId,
     handleToggleSkill,
@@ -368,5 +585,27 @@ export function useSkillActions({
     handleOpenEditor,
     handleCloseEditor,
     handleSkillSaved,
+
+    // Catalog
+    catalogItems,
+    isCatalogLoading,
+    isCatalogRefreshing,
+    catalogError,
+    catalogEnabled,
+    installingCatalogId,
+    handleLoadCatalog,
+    handleRefreshCatalog,
+
+    // Install modal
+    catalogInstallItem,
+    catalogInstallResult,
+    handleInstallFromCatalog,
+    handleCloseCatalogInstall,
+
+    // Details modal
+    catalogDetailsItem,
+    isCatalogDetailsOpen: catalogDetailsItem !== null,
+    handleOpenCatalogDetails,
+    handleCloseCatalogDetails,
   };
 }

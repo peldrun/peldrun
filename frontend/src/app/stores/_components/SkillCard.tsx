@@ -105,13 +105,18 @@ export function SkillCard({
     skill.agent_assignable ||
     skill.workflow_node;
 
+  const brandColor = skill.brand_color || null;
+
   return (
     <div
-      className={`flex items-start gap-4 p-4 rounded-sm border transition-all shadow-md ${
+      className={`flex items-start gap-4 p-4 rounded-sm border  transition-all ${
         !isEnabled
           ? "bg-muted/20 border-border/60 opacity-80"
-          : "bg-card border-card hover:border-primary/20 hover:shadow-sm"
+          : "bg-card border-card border-l-[5px] hover:border-primary/20 hover:shadow-md"
       }`}
+      style={{ borderLeftColor: brandColor || undefined }}
+
+
     >
       {/* ── Leading icon ─────────────────────────────────────── */}
       <div className="shrink-0 p-0 flex items-center justify-center m-auto w-[50px] text-primary">
@@ -124,7 +129,7 @@ export function SkillCard({
         <div className="flex items-start justify-between gap-3 mb-1.5">
           <div className="flex items-center gap-2 flex-wrap min-w-0">
             <h3
-              className="text-sm font-bold text-foreground font-mono truncate"
+              className="text-sm font-semibold text-foreground font-mono truncate"
               title={`${displayLabel} (${skill.id})`}
             >
               {displayLabel}
@@ -161,6 +166,37 @@ export function SkillCard({
                 }.`}
               >
                 ROUTER · {skill.sub_skills_count}
+              </span>
+            )}
+
+            {/*
+              Catalog provenance badge — shown only when the skill was
+              installed from the Skill Catalog (``source === "catalog"``).
+              Manual ZIP uploads (``source === "uploaded"``) and shipped
+              built-ins (``source === "builtin"``) do NOT render this
+              badge -- the BUILT-IN / CUSTOM identity badge already
+              conveys that distinction.
+
+              Color choice: emerald matches the ``ShieldCheck`` icon
+              used for ``trust === "verified"``, signalling that the
+              package came from a curated source rather than a manual
+              upload. Amber is reserved for DEPRECATED so the two
+              badges are never confused.
+
+              The ``source`` field is guaranteed present on every
+              ``SkillSummary`` from ``GET /api/skills`` after the
+              catalog rollout. For older backends that predate the
+              field, TypeScript sees ``undefined`` at runtime (the
+              type is not ``optional`` but the runtime value may still
+              be missing) -- the strict equality against ``"catalog"``
+              handles that gracefully: the badge simply does not render.
+            */}
+            {skill.source === "catalog" && (
+              <span
+                className="px-1.5 py-0.5 rounded text-[10px] font-mono uppercase bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border border-emerald-500/20"
+                title="Installed from the Skill Catalog."
+              >
+                FROM CATALOG
               </span>
             )}
 

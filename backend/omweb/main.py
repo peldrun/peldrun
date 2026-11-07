@@ -507,6 +507,15 @@ app.include_router(
     prefix="/api/store/providers",
     tags=["store", "providers"],
 )
+# Skill Catalog sub-router MUST be registered BEFORE the main skills
+# router. The main router declares `GET /{skill_id}` which would
+# otherwise match `/catalog` as `skill_id="catalog"`. FastAPI matches
+# routes in registration order, not by specificity.
+app.include_router(
+    skills_rtr.catalog_router,
+    prefix="/api/skills",
+    tags=["skills", "catalog"],
+)
 app.include_router(
     skills_rtr.router,
     prefix="/api/skills",

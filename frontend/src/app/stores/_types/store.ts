@@ -174,6 +174,20 @@ export interface SkillSummary {
   has_icon_svg: boolean;
   has_icon_path: boolean;
   icon_path: string | null;
+  /**
+   * Optional brand color declared in the manifest's ``brand_color``
+   * field. Used as the card's left-border accent in the Store UI.
+   *
+   *   - A 6-digit hex string (e.g. ``"#8B5CF6"``) when the manifest
+   *     declares one.
+   *   - ``null`` when the manifest omits the field. The card falls
+   *     back to the theme's default border color -- pre-catalog
+   *     skills render unchanged.
+   *
+   * The backend validates the format at install time (``^#[0-9A-Fa-f]{6}$``),
+   * so any non-null value here is a syntactically valid color.
+   */
+  brand_color?: string | null;
   tags: string[];
   author: SkillAuthor;
   publisher_id: string | null;
@@ -198,6 +212,20 @@ export interface SkillSummary {
    */
   has_sub_skills: boolean;
   sub_skills_count: number;
+  /**
+   * Origin of the installed package, persisted in ``.installed.json``
+   * at install time and exposed by every skill endpoint:
+   *
+   *   - ``"uploaded"`` -- manual ZIP upload through the Skills section
+   *   - ``"catalog"``  -- installed from the Skill Catalog
+   *   - ``"builtin"``  -- shipped with PELDRUN
+   *
+   * The store card uses this to render a "FROM CATALOG" badge without
+   * a cross-reference against ``catalogItems``. The field defaults
+   * to ``"uploaded"`` in the backend, so any skill installed before
+   * the catalog feature shipped is classified correctly.
+   */
+  source: "uploaded" | "catalog" | "builtin";
 }
 
 /**
@@ -981,3 +1009,211 @@ export interface ProviderApiError {
   code: string;
   details: Record<string, unknown>;
 }
+
+
+// ─────────────────────────────────────────────────────────────────
+// Skill Catalog
+// ─────────────────────────────────────────────────────────────────
+//
+// Types mirror the HTTP responses from ``omweb.routers.skills``'s
+// catalog sub-router (see ``routers/skills.py``):
+//
+//   GET  /api/skills/catalog                    → SkillCatalogListResponse
+//   GET  /api/skills/catalog/{item_id}          → { status, item }
+//   POST /api/skills/catalog/refresh            → SkillCatalogRefreshResponse
+//   POST /api/skills/catalog/{item_id}/install  → SkillInstallResponse
+//
+// The shape is deliberately parallel to ``ProviderCatalogItem`` /
+// ``ProviderCatalogInstallState`` so the two store sections can
+// share card/modal UX patterns without a shared abstract type. The
+// skill variant adds a few skill-specific fields (``has_sub_skills``,
+// ``trust``, ``stability``, ``install_warnings``) that the provider
+// variant does not need.
+
+/**
+ * One catalog item describing an installable skill.
+ *
+ * Returned by ``GET /api/skills/catalog``. The ``installable`` and
+ * ``installability_reason`` fields are computed server-side at load
+ * time; the rest are declarative metadata from the catalog source
+ * (builtin JSON, remote GitHub Pages, or a local override file).
+ *
+ * Install requires BOTH ``download_url`` AND ``checksum_sha256``.
+ * Missing either -> preview-only: the card shows a "Preview" button
+ * and the modal cannot start the download.
+ *
+ * Why every catalog field is optional except the identity trio
+ * (``id`` / ``name`` / ``version``): the builtin catalog ships
+ * preview-only entries with no ZIP, and future catalog authors may
+ * publish less metadata than the backend Pydantic model allows.
+ * The backend never rejects a missing optional field -- it computes
+ * ``installable = false`` and the UI disables the Install button.
+ */
+export interface SkillCatalogItem {
+  // -- Identity ---------------------------------------------------
+  id: string;
+  name: string;
+  display_name: string | null;
+  description: string;
+  version: string;
+
+  // -- Source -----------------------------------------------------
+  download_url: string | null;
+  checksum_sha256: string | null;
+
+  // -- Branding ---------------------------------------------------
+  brand_color?: string | null;
+  icon?: string | null;
+  icon_type?: "name" | "svg";
+
+  // -- Publisher --------------------------------------------------
+  author: string | null;
+  author_url?: string | null;
+  homepage: string | null;
+  developer?: DeveloperInfo | null;
+  repository_url?: string | null;
+  license?: string | null;
+  docs_url?: string | null;
+
+  // -- Discovery --------------------------------------------------
+  tags: string[];
+
+  // -- Skill-specific ---------------------------------------------
+  has_sub_skills: boolean;
+  sub_skills_count: number;
+  trust: "verified" | "community" | "unverified";
+  stability: "experimental" | "beta" | "stable" | "deprecated";
+  release_date?: string | null;
+  deprecation_message?: string | null;
+
+  // -- Install-time warnings --------------------------------------
+  /**
+   * Advisory strings shown in the install confirmation dialog.
+   * Examples:
+   *   - "This skill uses the Router pattern. Requires Progressive
+   *      Disclosure to work correctly."
+   *   - "This skill is deprecated. Consider installing X instead."
+   *   - "This skill is marked as untrusted. Only install if you
+   *      know the author."
+   *
+   * Populated by the catalog author in ``catalog.json``. The UI
+   * never infers these -- if the array is empty, no warning is
+   * shown.
+   */
+  install_warnings: string[];
+
+  // -- Computed by backend ----------------------------------------
+  /** True iff both ``download_url`` and a valid SHA-256 are present. */
+  installable: boolean;
+  /** Human-readable explanation rendered verbatim as a button tooltip. */
+  installability_reason: string;
+}
+
+/**
+ * Derived state computed by the UI at render time, by matching a
+ * ``SkillCatalogItem`` against the installed ``skills`` array.
+ *
+ * Parallel to ``ProviderCatalogInstallState``. The card and the
+ * install modal use this struct to decide which button to render
+ * (Install / Update / View Installed) and which badges to show.
+ *
+ * Matching rule
+ * -------------
+ * ``catalogItem.id === installedSkill.id``.
+ *
+ * Both sides are normalized to PELDRUN's canonical form (lowercase
+ * snake_case). The backend normalizes catalog item IDs in
+ * ``catalog._parse_catalog_payload`` so an author using ``code-review``
+ * in the catalog still matches an installed ``code_review`` skill.
+ */
+export interface SkillCatalogInstallState {
+  /** Whether a matching skill is currently installed. */
+  isInstalled: boolean;
+
+  /** Whether the matching skill is active (``status === "active"``). */
+  isEnabled: boolean;
+
+  /** Installed version, or ``null`` when not installed. */
+  installedVersion: string | null;
+
+  /**
+   * The full installed ``SkillSummary``, or ``null``. Kept on the
+   * struct so the card can pass it directly to ``onOpenInstalled`` /
+   * ``onDelete`` without a second lookup.
+   */
+  installedSkill: SkillSummary | null;
+}
+
+/**
+ * Response body of ``GET /api/skills/catalog``.
+ *
+ * The ``status_info`` block is optional on the wire -- the backend
+ * always includes it today, but a future proxy or mock could omit
+ * it without breaking the client (the frontend only reads it for
+ * debugging, never for branching).
+ */
+export interface SkillCatalogListResponse {
+  status: string;
+  items: SkillCatalogItem[];
+  total: number;
+  status_info?: {
+    enabled: boolean;
+    item_count: number;
+    builtin_count: number;
+    custom_count: number;
+    remote_count: number;
+    remote_url_configured: boolean;
+    remote_url_effective: string | null;
+    remote_cache_age_seconds: number | null;
+    remote_last_error: string | null;
+  };
+}
+
+/**
+ * Response body of ``POST /api/skills/catalog/refresh``.
+ *
+ * ``status === "error"`` when the remote fetch failed but the
+ * builtin catalog is still available -- the UI should surface
+ * ``message`` as a warning toast and keep the current items
+ * (the backend does not clear them on failure).
+ */
+export interface SkillCatalogRefreshResponse {
+  status: "success" | "error";
+  total: number;
+  message: string;
+  status_info?: SkillCatalogListResponse["status_info"];
+}
+
+/**
+ * Terminal result of a catalog install, as consumed by
+ * ``CatalogSkillInstallModal``.
+ *
+ * The modal is a self-contained UI component: it does not know
+ * about ``useSkillActions``, does not call any API, and does not
+ * touch the cache. It only receives:
+ *
+ *   - ``item``: what is being installed (from the catalog list)
+ *   - ``result``: either ``null`` (still running), a success
+ *     payload, or a failure payload with the raw backend error.
+ *
+ * The caller (``useSkillActions``) is responsible for invoking
+ * ``installSkillFromCatalog``, translating its result (or thrown
+ * ``SkillCatalogApiError``) into this discriminated union, and
+ * clearing it when the modal closes.
+ *
+ * This separation means the modal's progress UI is provably
+ * independent of the API client: the same modal would work against
+ * any synchronous install endpoint.
+ */
+export type CatalogSkillInstallResult =
+  | {
+      success: true;
+      skillId: string;
+      version: string;
+      name: string;
+    }
+  | {
+      success: false;
+      error: string;
+      code?: string;
+    };

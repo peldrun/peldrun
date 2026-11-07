@@ -358,10 +358,23 @@ class SkillStorage:
         zip_bytes: bytes,
         *,
         source_filename: str = "skill.zip",
+        source: str = "uploaded",
     ) -> SkillInstallResult:
         """
         Run the full install pipeline: validate, extract, normalize,
         verify, and atomically commit.
+
+        Args:
+            zip_bytes:       The raw ZIP payload.
+            source_filename: Original filename, recorded in the
+                             ``.installed.json`` sidecar for auditing.
+            source:          Where this package came from. One of
+                             ``"uploaded"`` (manual ZIP upload),
+                             ``"catalog"`` (Skill Catalog install),
+                             or ``"builtin"`` (shipped with PELDRUN).
+                             Unknown values are coerced to
+                             ``"uploaded"`` so a buggy caller cannot
+                             poison the persisted sidecar.
 
         Any failure cleans up the staging directory before re-raising
         a SkillError subclass. On success, the previous package (if any)
@@ -537,11 +550,24 @@ class SkillStorage:
                     )
 
             # ── 6. Write .installed.json sidecar into the staging dir
+            # Defensive: coerce unknown `source` values to "uploaded"
+            # so a buggy caller cannot write a sidecar that the
+            # registry will later reject or misclassify.
+            if source not in ("uploaded", "catalog", "builtin"):
+                logger.warning(
+                    "Unknown install source %r for skill %r; "
+                    "coercing to 'uploaded'.",
+                    source,
+                    normalized_id,
+                )
+                source = "uploaded"
+
             installed_at = _now_iso()
             meta = {
                 "schema_version": INSTALLED_META_SCHEMA_VERSION,
                 "skill_id": normalized_id,
                 "version": str(parsed.manifest["version"]),
+                "source": source,
                 "name": str(
                     parsed.manifest.get("display_name")
                     or parsed.manifest.get("name")

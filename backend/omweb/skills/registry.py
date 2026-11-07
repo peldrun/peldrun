@@ -63,6 +63,7 @@ from omweb.skills.manifest import (
     ParsedSkillPackage,
     load_skill_package,
 )
+from omweb.skills.storage import INSTALLED_META_FILENAME
 
 
 logger = logging.getLogger("omweb.skills.registry")
@@ -146,6 +147,12 @@ class SkillRecord:
     package_dir: Path
     status: str = "active"
     is_builtin: bool = False
+    # Origin of the skill package: "uploaded" (manual ZIP),
+    # "catalog" (installed via Skill Catalog), or "builtin" (shipped
+    # with PELDRUN). Populated by ``_load_one_package`` from
+    # ``.installed.json`` when available; falls back to "uploaded"
+    # for legacy installs without the field.
+    source: str = "uploaded"
     # Populated from ParsedSkillPackage.sub_skills at discovery time.
     # Empty tuple means the skill is NOT a router — it behaves exactly
     # like a pre-feature skill. Each entry is the raw dict from
@@ -235,6 +242,12 @@ class SkillRecord:
             "has_icon_svg": bool(self.icon_svg),
             "has_icon_path": bool(self.icon_path),
             "icon_path": self.icon_path,
+            # Optional brand color from the manifest (added in the
+            # catalog rollout). Rendered as the card's left-border
+            # accent. ``None`` when the manifest omits the field --
+            # the frontend falls back to the theme's default border
+            # color, so pre-catalog skills render unchanged.
+            "brand_color": self.manifest.get("brand_color"),
             "tags": list(self.manifest.get("tags") or []),
             "author": dict(author) if isinstance(author, dict) else {},
             "publisher_id": self.manifest.get("publisher_id"),
@@ -252,6 +265,7 @@ class SkillRecord:
             # list (see GET /api/skills/{id}/sub-skills).
             "has_sub_skills": bool(self.sub_skills),
             "sub_skills_count": len(self.sub_skills),
+            "source": self.source,
         }
 
     def to_full_dict(self) -> Dict[str, Any]:
@@ -442,6 +456,28 @@ class SkillRegistry:
                 skill_id,
             )
 
+        # Read the .installed.json sidecar to determine source.
+        # Falls back to "uploaded" for legacy installs (pre-catalog)
+        # and for packages installed without a sidecar.
+        source: str = "builtin" if is_builtin else "uploaded"
+        if not is_builtin:
+            meta_path = package_dir / INSTALLED_META_FILENAME
+            if meta_path.is_file():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    raw_source = meta.get("source")
+                    if isinstance(raw_source, str) and raw_source in (
+                        "uploaded",
+                        "catalog",
+                        "builtin",
+                    ):
+                        source = raw_source
+                except Exception:
+                    # Corrupt sidecar -> default to "uploaded". Do not
+                    # block discovery; a bad sidecar must not prevent
+                    # the skill from loading.
+                    pass
+
         status = loaded_states.get(skill_id, "active")
         if status not in VALID_STATUSES:
             logger.warning(
@@ -469,6 +505,7 @@ class SkillRegistry:
             package_dir=package_dir,
             status=status,
             is_builtin=is_builtin,
+            source=source,
             sub_skills=tuple(parsed.sub_skills),
         )
 

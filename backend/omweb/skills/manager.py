@@ -721,9 +721,21 @@ class SkillManager:
         zip_bytes: bytes,
         *,
         source_filename: str = "skill.zip",
+        source: str = "uploaded",
     ) -> SkillInstallResult:
         """
         Install a skill package from a zip payload.
+
+        Args:
+            zip_bytes:       The raw ZIP payload.
+            source_filename: Original filename, recorded in the
+                             ``.installed.json`` sidecar for auditing.
+            source:          Where this package came from. One of
+                             ``"uploaded"`` (manual ZIP upload),
+                             ``"catalog"`` (Skill Catalog install),
+                             or ``"builtin"`` (shipped with PELDRUN).
+                             Propagated verbatim to ``SkillStorage``,
+                             which validates and records it.
 
         Flow:
             1. Clean up orphan temp / trash directories (cheap, once
@@ -740,6 +752,7 @@ class SkillManager:
         result = self.storage.install_skill(
             zip_bytes,
             source_filename=source_filename,
+            source=source,
         )
 
         try:

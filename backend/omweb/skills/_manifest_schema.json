@@ -90,6 +90,12 @@
     "description": "Optional inline SVG markup (max 32 KiB). Sanitized server-side at load time — <script>, event handlers (on*), javascript:/data: schemes, <foreignObject>, external <use>/<image> references, and <style>/@import are stripped. When both icon_svg and icon are present, icon_svg wins."
     },
 
+    "brand_color": {
+    "type": "string",
+    "pattern": "^#[0-9A-Fa-f]{6}$",
+    "description": "Optional primary brand color as a 6-digit hex string (e.g. '#8B5CF6'). Rendered as the skill card's left-border accent in the Store UI and propagated to the Skill Catalog when the skill is published. When omitted, the UI falls back to the theme's default border color."
+    },
+
     "author": {
       "type": "object",
       "additionalProperties": false,

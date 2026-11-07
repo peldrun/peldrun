@@ -16,7 +16,10 @@ import {
 import type {
   AgentFilter,
   ProviderFilter,
+  SkillCatalogInstallState,
+  SkillCatalogItem,
   SkillFilter,
+  SkillSummary,
   ToolFilter,
 } from "./_types/store";
 import type { ExtensionDefinition } from "@/lib/types";
@@ -55,6 +58,8 @@ import { UploadModal } from "./_modals/UploadModal";
 import { SkillUploadModal } from "./_modals/SkillUploadModal";
 import { SkillDetailsDrawer } from "./_modals/SkillDetailsDrawer";
 import { SkillEditorModal } from "./_modals/SkillEditorModal";
+import { CatalogSkillInstallModal } from "./_modals/CatalogSkillInstallModal";
+import { CatalogSkillDetailsModal } from "./_modals/CatalogSkillDetailsModal";
 import { MCPSettingsModal } from "./_modals/MCPSettingsModal";
 import { MCPToolsModal } from "@/app/stores/_modals/MCPToolsModal";
 import { MCPDetailDrawer } from "./_components/MCPDetailDrawer";
@@ -62,6 +67,37 @@ import { ProviderUploadModal } from "./_modals/ProviderUploadModal";
 import { ProviderDetailsDrawer } from "./_modals/ProviderDetailsDrawer";
 import { ProviderConfigureModal } from "./_modals/ProviderConfigureModal";
 import { CertificateManagerModal } from "./_modals/CertificateManagerModal";
+
+/**
+ * Compute the catalog install state for a given item.
+ *
+ * Uses the same matching rule as ``SkillsSection``: strict ID
+ * equality against the ``skills`` array. Keeping the derivation in
+ * one shared helper guarantees that the details modal and the
+ * catalog card agree about whether an item is installed, which
+ * avoids a UI inconsistency where the card says "Installed" but
+ * the modal still offers an Install button (or vice versa).
+ */
+function computeCatalogInstallState(
+  item: SkillCatalogItem | null,
+  skills: SkillSummary[],
+): SkillCatalogInstallState {
+  if (!item) {
+    return {
+      isInstalled: false,
+      isEnabled: false,
+      installedVersion: null,
+      installedSkill: null,
+    };
+  }
+  const installed = skills.find((s) => s.id === item.id) ?? null;
+  return {
+    isInstalled: Boolean(installed),
+    isEnabled: installed?.enabled ?? false,
+    installedVersion: installed?.version ?? null,
+    installedSkill: installed,
+  };
+}
 
 /**
  * Store page orchestrator.
@@ -265,6 +301,20 @@ export default function StoresPage() {
                   onOpenDetails={skillActions.handleOpenDetails}
                   onOpenEditor={skillActions.handleOpenEditor}
                   onOpenUpload={skillActions.openUploadModal}
+                  // Catalog props (forwarded from useSkillActions).
+                  // All ten are required -- SkillsSection is entirely
+                  // driven by the parent hook and never fetches on
+                  // its own.
+                  catalogItems={skillActions.catalogItems}
+                  isCatalogLoading={skillActions.isCatalogLoading}
+                  isCatalogRefreshing={skillActions.isCatalogRefreshing}
+                  catalogError={skillActions.catalogError}
+                  catalogEnabled={skillActions.catalogEnabled}
+                  installingCatalogId={skillActions.installingCatalogId}
+                  onLoadCatalog={skillActions.handleLoadCatalog}
+                  onRefreshCatalog={skillActions.handleRefreshCatalog}
+                  onInstallFromCatalog={skillActions.handleInstallFromCatalog}
+                  onOpenCatalogDetails={skillActions.handleOpenCatalogDetails}
                 />
               )}
 
@@ -454,6 +504,49 @@ export default function StoresPage() {
         subSkillId={skillActions.editorSubSkillId}
         onClose={skillActions.handleCloseEditor}
         onSaved={skillActions.handleSkillSaved}
+      />
+
+      {/* Catalog skill details modal.
+          Opened by ``handleOpenCatalogDetails`` (called from the
+          "Details" button on CatalogSkillCard). Shows the item's
+          install warnings, tags, links, and installability reason.
+
+          The install action closes THIS modal FIRST, then opens the
+          install modal -- so the two never overlap. Without the
+          close-first step, both backdrops would render simultaneously
+          and the z-index order would determine which click lands where
+          (undefined behavior across browsers). */}
+      <CatalogSkillDetailsModal
+        open={skillActions.isCatalogDetailsOpen}
+        item={skillActions.catalogDetailsItem}
+        installState={computeCatalogInstallState(
+          skillActions.catalogDetailsItem,
+          skills,
+        )}
+        installing={
+          skillActions.installingCatalogId ===
+          skillActions.catalogDetailsItem?.id
+        }
+        onInstall={() => {
+          const item = skillActions.catalogDetailsItem;
+          if (!item) return;
+          skillActions.handleCloseCatalogDetails();
+          void skillActions.handleInstallFromCatalog(item);
+        }}
+        onClose={skillActions.handleCloseCatalogDetails}
+      />
+
+      {/* Catalog skill install modal.
+          Opened by ``handleInstallFromCatalog``. Renders a simulated
+          multi-phase progress bar while the synchronous install runs
+          on the backend, then swaps to a REAL success/error banner
+          (drawn from ``catalogInstallResult``). The pattern mirrors
+          ``ProviderUploadModal`` in catalog mode. */}
+      <CatalogSkillInstallModal
+        open={skillActions.catalogInstallItem !== null}
+        item={skillActions.catalogInstallItem}
+        result={skillActions.catalogInstallResult}
+        onClose={skillActions.handleCloseCatalogInstall}
       />
 
       {/* Provider install modal — serves BOTH the manual ZIP upload
