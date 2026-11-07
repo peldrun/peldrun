@@ -106,6 +106,7 @@ export const LexicalEditorComponent = forwardRef<
     autoFocus = false,
     onClearEditor,
     chatId,
+    typeaheadEnabled = true,
     onImagePasted,
   },
   ref
@@ -311,7 +312,11 @@ export const LexicalEditorComponent = forwardRef<
         )}
         <FloatingToolbarPlugin />
         {/* Typeahead is registered before Submit to ensure menu capture on Enter */}
-        <TypeaheadMenuPlugin onClearEditor={onClearEditor} chatId={chatId} />
+        <TypeaheadMenuPlugin
+          onClearEditor={onClearEditor}
+          chatId={chatId}
+          enabled={typeaheadEnabled}
+        />
         <SubmitCommandPlugin onSubmit={handleSubmit} disabled={disabled} />
       </LexicalComposer>
     </div>

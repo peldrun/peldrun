@@ -28,6 +28,7 @@ import {
   CheckCircle2,
   Loader2,
 } from "lucide-react";
+import { showToast } from "@/components/ui/ToastNotification";
 import { AgentSelector } from "./agent-selector";
 import { ActiveToolsModal } from "./active-tools-modal";
 import { ReasoningEffortSelector } from "./reasoning-effort-selector";
@@ -261,6 +262,14 @@ export function ChatLanding({
   const [activeSkills, setActiveSkills] = useState<string[]>([]);
   const [availableSkills, setAvailableSkills] = useState<SkillMeta[]>([]);
 
+  // ── Assigned skills (for duplicate detection) ─────────────────
+  // When a user invokes a skill via `/` that is already assigned to
+  // the currently-selected agent, we skip adding it to `activeSkills`
+  // and show a toast explaining that it runs automatically.
+  const [assignedSkillIds, setAssignedSkillIds] = useState<Set<string>>(
+    () => new Set()
+  );
+
   // Multi-Agent Delegation Toggle State
   const [delegationAllowed, setDelegationAllowed] = useAppStorage(
     "peldrun_delegation_allowed" as Parameters<typeof useAppStorage>[0]
@@ -273,6 +282,15 @@ export function ChatLanding({
   // component in the chat pipeline. See docs/state-contracts.md §6.4.
   const selectedAgentId = useChatStore((s) => s.selectedAgentId);
   const isTeamLead = (selectedAgentId || "peldrun").toLowerCase() === "peldrun";
+
+  // Refs mirror the latest state into the long-lived
+  // `peldrun:skill-invoked` listener registered once on mount.
+  // Declared here (after `selectedAgentId`) so they capture the
+  // correct values on first render.
+  const assignedSkillIdsRef = useRef<Set<string>>(new Set());
+  const execModeRef = useRef(execMode);
+  const selectedAgentIdRef = useRef(selectedAgentId);
+  const availableSkillsRef = useRef<SkillMeta[]>([]);
 
   // Multi-tier storage state synchronization
   const [activeModel, setActiveModel] = useAppStorage("active_model");
@@ -312,6 +330,13 @@ export function ChatLanding({
   // behave identically.
   useEffect(() => {
     if (typeof window === "undefined") return;
+    // Skip skill registration in chat mode. The typeahead menu is
+    // disabled in chat mode (see typeaheadEnabled below), so slash
+    // commands can never be triggered. Skipping also avoids a
+    // pointless fetch.
+    if (execMode !== "agent") {
+      return;
+    }
 
     let cancelled = false;
     let unregisterFns: Array<() => void> = [];
@@ -389,7 +414,7 @@ export function ChatLanding({
       );
       unregisterFns.forEach((fn) => fn());
     };
-  }, []);
+  }, [execMode]);
 
   // ── Skills: listen for selections from the / menu ─────────────
   useEffect(() => {
@@ -399,6 +424,28 @@ export function ChatLanding({
       const detail = (event as CustomEvent<{ skillId?: string }>).detail;
       const skillId = detail?.skillId;
       if (typeof skillId !== "string" || !skillId) return;
+
+      // Duplicate check: if the user invokes a skill via `/` that is
+      // already assigned to the currently-selected agent, skip adding
+      // it to `activeSkills` and inform them.
+      if (
+        execModeRef.current === "agent" &&
+        assignedSkillIdsRef.current.has(skillId)
+      ) {
+        const skillMeta = availableSkillsRef.current.find(
+          (s) => s.id === skillId
+        );
+        const skillName = skillMeta?.name || skillId;
+        const agentDisplayName = selectedAgentIdRef.current
+          ? `"${selectedAgentIdRef.current}"`
+          : "the default agent";
+        showToast.info(
+          "Skill Already Assigned",
+          `"${skillName}" is already assigned to ${agentDisplayName}. ` +
+            `It runs automatically with every message — no need to invoke it via /.`
+        );
+        return;
+      }
 
       setActiveSkills((prev) =>
         prev.includes(skillId) ? prev : [...prev, skillId]
@@ -413,6 +460,78 @@ export function ChatLanding({
       );
     };
   }, []);
+
+  // ── Fetch assigned skills for duplicate detection ─────────────
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (execMode !== "agent") {
+      setAssignedSkillIds(new Set());
+      return;
+    }
+
+    const agentForFetch = selectedAgentId || "peldrun";
+    let cancelled = false;
+
+    const fetchAssigned = async () => {
+      try {
+        const res = await fetch(
+          `/api/store/agents/${encodeURIComponent(agentForFetch)}/skills`
+        );
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        const effective: string[] = Array.isArray(data.effective_skills)
+          ? data.effective_skills
+          : [];
+        setAssignedSkillIds(new Set(effective));
+      } catch (err) {
+        console.debug(
+          "[ChatLanding] Failed to fetch agent assigned skills:",
+          err
+        );
+      }
+    };
+
+    void fetchAssigned();
+
+    const onAgentSkillsChanged = () => {
+      void fetchAssigned();
+    };
+    window.addEventListener(
+      "peldrun:agent-skills-changed",
+      onAgentSkillsChanged
+    );
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener(
+        "peldrun:agent-skills-changed",
+        onAgentSkillsChanged
+      );
+    };
+  }, [execMode, selectedAgentId]);
+
+  // ── Prune activeSkills on mode / assignment changes ───────────
+  useEffect(() => {
+    if (execMode !== "agent") {
+      // Chat mode does not support skill invocation.
+      setActiveSkills((prev) => (prev.length === 0 ? prev : []));
+      return;
+    }
+    if (assignedSkillIds.size === 0) return;
+    setActiveSkills((prev) => {
+      const filtered = prev.filter((id) => !assignedSkillIds.has(id));
+      return filtered.length === prev.length ? prev : filtered;
+    });
+  }, [execMode, assignedSkillIds]);
+
+  // Mirror the latest state into refs consumed by the long-lived
+  // `peldrun:skill-invoked` listener.
+  useEffect(() => {
+    assignedSkillIdsRef.current = assignedSkillIds;
+    execModeRef.current = execMode;
+    selectedAgentIdRef.current = selectedAgentId;
+    availableSkillsRef.current = availableSkills;
+  });
 
   // Synchronize server metadata for dynamic capability evaluation
   useEffect(() => {
@@ -1012,6 +1131,7 @@ export function ChatLanding({
             }
             onSubmit={() => handleDispatch()}
             onChange={(val) => setInputValue(val)}
+            typeaheadEnabled={execMode === "agent"}
             onImagePasted={handleImagePasted}
             contentClassName={
               isExpanded

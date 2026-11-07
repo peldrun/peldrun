@@ -76,14 +76,14 @@ export function ToastContainer() {
               ? "bg-rose-950/85 border-rose-500/40 text-rose-100 dark:bg-rose-950/90"
               : t.type === "warning"
               ? "bg-amber-950/85 border-amber-500/40 text-amber-100 dark:bg-amber-950/90"
-              : "bg-slate-900/90 border-slate-700 text-slate-100"
+              : "bg-green-100 border-green-100 text-black"
           }`}
         >
           <div className="shrink-0 mt-0.5">
             {t.type === "success" && <CheckCircle2 size={17} className="text-emerald-400" />}
             {t.type === "error" && <AlertCircle size={17} className="text-rose-400" />}
             {t.type === "warning" && <AlertTriangle size={17} className="text-amber-400" />}
-            {t.type === "info" && <Info size={17} className="text-sky-400" />}
+            {t.type === "info" && <Info size={17} className="text-green-950" />}
           </div>
 
           <div className="flex-1 space-y-0.5 pr-2">

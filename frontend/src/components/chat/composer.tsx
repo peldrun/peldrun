@@ -24,6 +24,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { showToast } from "@/components/ui/ToastNotification";
 import { AgentSelector } from "./agent-selector";
 import { EngineSelector } from "./engine-selector";
 import { ActiveToolsModal } from "./active-tools-modal";
@@ -306,6 +307,17 @@ export function Composer({
     }>
   >([]);
 
+  // ── Assigned skills (for duplicate detection) ─────────────────
+  // When a user invokes a skill via `/` that is already assigned to
+  // the currently-selected agent, we skip adding it to `activeSkills`
+  // and show a toast explaining that it runs automatically. This
+  // avoids duplicating the skill's catalog entry (as both "invoked"
+  // and "assigned") and saves the `load_skill` / `load_sub_skill`
+  // round trips the model would otherwise still make.
+  const [assignedSkillIds, setAssignedSkillIds] = useState<Set<string>>(
+    () => new Set()
+  );
+
   const [failedDraft, setFailedDraft] = useState<{
     text: string;
   } | null>(null);
@@ -330,6 +342,24 @@ export function Composer({
   // docs/state-contracts.md §6.4.
   const selectedAgentId = useChatStore((s) => s.selectedAgentId);
   const setSelectedAgentId = useChatStore((s) => s.setSelectedAgentId);
+
+  // Refs mirror the latest state into the long-lived
+  // `peldrun:skill-invoked` listener, which is registered once on
+  // mount and therefore cannot capture fresh values from its closure.
+  // Declared here (after `execMode` and `selectedAgentId`) so they
+  // capture the correct values on first render.
+  const assignedSkillIdsRef = useRef<Set<string>>(new Set());
+  const execModeRef = useRef(execMode);
+  const selectedAgentIdRef = useRef(selectedAgentId);
+  const availableSkillsRef = useRef<
+    Array<{
+      id: string;
+      name: string;
+      description: string;
+      short_description?: string;
+      tags?: string[];
+    }>
+  >([]);
 
   const editorRef = useRef<LexicalEditorHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -364,6 +394,13 @@ export function Composer({
   // the skill ID to `activeSkills`.
   useEffect(() => {
     if (typeof window === "undefined") return;
+    // Skip skill registration entirely in chat mode. The composer's
+    // typeahead menu is disabled in chat mode (see typeaheadEnabled
+    // below), so registered slash commands can never be triggered.
+    // Skipping also avoids a pointless fetch to /api/skills.
+    if (execMode !== "agent") {
+      return;
+    }
 
     let cancelled = false;
     let unregisterFns: Array<() => void> = [];
@@ -438,7 +475,7 @@ export function Composer({
       );
       unregisterFns.forEach((fn) => fn());
     };
-  }, []);
+  }, [execMode]);
 
   // ── Skills: listen for selections from the / menu ─────────────
   useEffect(() => {
@@ -448,6 +485,30 @@ export function Composer({
       const detail = (event as CustomEvent<{ skillId?: string }>).detail;
       const skillId = detail?.skillId;
       if (typeof skillId !== "string" || !skillId) return;
+
+      // Duplicate check: if the user invokes a skill via `/` that is
+      // already assigned to the currently-selected agent, skip adding
+      // it to `activeSkills` and inform them. The skill will still be
+      // injected automatically by the agent's assignment; sending it
+      // again as `invoked_skills` would be redundant.
+      if (
+        execModeRef.current === "agent" &&
+        assignedSkillIdsRef.current.has(skillId)
+      ) {
+        const skillMeta = availableSkillsRef.current.find(
+          (s) => s.id === skillId
+        );
+        const skillName = skillMeta?.name || skillId;
+        const agentDisplayName = selectedAgentIdRef.current
+          ? `"${selectedAgentIdRef.current}"`
+          : "the default agent";
+        showToast.info(
+          "Skill Already Assigned",
+          `"${skillName}" is already assigned to ${agentDisplayName}. ` +
+            `It runs automatically with every message — no need to invoke it via /.`
+        );
+        return;
+      }
 
       setActiveSkills((prev) =>
         prev.includes(skillId) ? prev : [...prev, skillId]
@@ -462,6 +523,87 @@ export function Composer({
       );
     };
   }, []);
+
+  // ── Fetch assigned skills for duplicate detection ─────────────
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (execMode !== "agent") {
+      setAssignedSkillIds(new Set());
+      return;
+    }
+
+    // Match the effective-agent resolution used by getActivePayload:
+    // the explicitly-selected agent, or "peldrun" as the documented
+    // default when no selection has been made yet.
+    const agentForFetch = selectedAgentId || "peldrun";
+    let cancelled = false;
+
+    const fetchAssigned = async () => {
+      try {
+        const res = await fetch(
+          `/api/store/agents/${encodeURIComponent(agentForFetch)}/skills`
+        );
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        const effective: string[] = Array.isArray(data.effective_skills)
+          ? data.effective_skills
+          : [];
+        setAssignedSkillIds(new Set(effective));
+      } catch (err) {
+        console.debug(
+          "[Composer] Failed to fetch agent assigned skills:",
+          err
+        );
+      }
+    };
+
+    void fetchAssigned();
+
+    const onAgentSkillsChanged = () => {
+      void fetchAssigned();
+    };
+    window.addEventListener(
+      "peldrun:agent-skills-changed",
+      onAgentSkillsChanged
+    );
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener(
+        "peldrun:agent-skills-changed",
+        onAgentSkillsChanged
+      );
+    };
+  }, [execMode, selectedAgentId]);
+
+  // ── Prune activeSkills on mode / assignment changes ───────────
+  useEffect(() => {
+    if (execMode !== "agent") {
+      // Chat mode does not support skill invocation. Clear any chips
+      // left over from a previous agent-mode draft so the payload
+      // never carries `invoked_skills` in chat mode.
+      setActiveSkills((prev) => (prev.length === 0 ? prev : []));
+      return;
+    }
+    if (assignedSkillIds.size === 0) return;
+    // Prune any skills that became assigned after they were added as
+    // invoked. Without this, the run would still carry the skill in
+    // `invoked_skills`, even though the agent's assignment already
+    // provides it.
+    setActiveSkills((prev) => {
+      const filtered = prev.filter((id) => !assignedSkillIds.has(id));
+      return filtered.length === prev.length ? prev : filtered;
+    });
+  }, [execMode, assignedSkillIds]);
+
+  // Mirror the latest state into refs consumed by the long-lived
+  // `peldrun:skill-invoked` listener. Runs after every render.
+  useEffect(() => {
+    assignedSkillIdsRef.current = assignedSkillIds;
+    execModeRef.current = execMode;
+    selectedAgentIdRef.current = selectedAgentId;
+    availableSkillsRef.current = availableSkills;
+  });
 
   useEffect(() => {
     const handleMentionSelect = (event: Event) => {
@@ -1242,6 +1384,7 @@ export function Composer({
           disabled={disabled || isRunning || isSubmitting}
           onSubmit={handleSend}
           onChange={handleEditorChange}
+          typeaheadEnabled={execMode === "agent"}
           onImagePasted={handleImagePasted}
           contentClassName={
             isExpanded

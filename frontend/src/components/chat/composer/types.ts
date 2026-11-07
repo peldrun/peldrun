@@ -32,6 +32,16 @@ export interface LexicalEditorProps {
   onClearEditor?: () => void;
   chatId?: string;
   /**
+   * When ``false``, the composer's typeahead menu (``/`` slash
+   * commands and ``@`` mentions) is suppressed. The characters remain
+   * typeable as plain text.
+   *
+   * Defaults to ``true``. The chat composer sets this to ``false`` in
+   * chat mode, where neither skill invocation nor @-mention agent
+   * switching are supported.
+   */
+  typeaheadEnabled?: boolean;
+  /**
    * Invoked once per image file pasted into the editor.
    *
    * When omitted, the ImagePastePlugin is not mounted and image pastes

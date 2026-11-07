@@ -34,6 +34,19 @@ import {
 interface TypeaheadMenuPluginProps {
   onClearEditor?: () => void;
   chatId?: string;
+  /**
+   * When ``false``, the plugin does not open the typeahead menu for
+   * either ``/`` (slash commands) or ``@`` (mentions). The characters
+   * themselves remain typeable as plain text; only the popup is
+   * suppressed.
+   *
+   * Used by both composers to disable slash-command and mention
+   * behaviour in chat mode, where skills are not supported and file
+   * references flow through the paperclip upload pipeline.
+   *
+   * Defaults to ``true``.
+   */
+  enabled?: boolean;
 }
 
 function getTextBeforeCaret(editor: LexicalEditor): string {
@@ -64,6 +77,7 @@ function getTextBeforeCaret(editor: LexicalEditor): string {
 export function TypeaheadMenuPlugin({
   onClearEditor,
   chatId,
+  enabled = true,
 }: TypeaheadMenuPluginProps) {
   const [editor] = useLexicalComposerContext();
   const [isOpen, setIsOpen] = useState(false);
@@ -111,6 +125,17 @@ export function TypeaheadMenuPlugin({
     triggerType === 'slash' ? slashResults.length : dynamicMentions.length;
 
   useEffect(() => {
+    // When disabled, close any open menu and skip trigger detection
+    // entirely. Slash and mention characters remain typeable as plain
+    // text — only the popup is suppressed. This effect also re-runs
+    // when ``enabled`` flips, so a menu already open when the user
+    // switches to chat mode is closed cleanly.
+    if (!enabled) {
+      setIsOpen(false);
+      setTriggerType(null);
+      return;
+    }
+
     return editor.registerUpdateListener(() => {
       const textBeforeCaret = getTextBeforeCaret(editor);
 
@@ -137,7 +162,7 @@ export function TypeaheadMenuPlugin({
       setIsOpen(false);
       setTriggerType(null);
     });
-  }, [editor]);
+  }, [editor, enabled]);
 
   const handleExecuteSelection = useCallback(
     (targetIndex?: number) => {
