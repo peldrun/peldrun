@@ -57,7 +57,7 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 
 class SkillSummaryResponse(BaseModel):
-    """Public summary of a skill — mirrors ``SkillRecord.to_summary_dict``."""
+    """Public summary of a skill - mirrors ``SkillRecord.to_summary_dict``."""
 
     id: str
     version: str
@@ -88,13 +88,37 @@ class SkillSummaryResponse(BaseModel):
     capabilities: Dict[str, Any] = Field(default_factory=dict)
     execution: Dict[str, Any] = Field(default_factory=dict)
     package_dir: str = ""
+    # Router metadata (Progressive Disclosure). Defaults preserve the
+    # existing API contract for non-router skills - the frontend gates
+    # the ROUTER badge on ``has_sub_skills == true``.
+    has_sub_skills: bool = False
+    sub_skills_count: int = 0
+
+
+class SubSkillSummary(BaseModel):
+    """
+    Public shape of a single sub-skill entry.
+
+    Returned by ``GET /api/skills/{id}/sub-skills`` and embedded inside
+    the detail response so the drawer can render the router without a
+    second round-trip. Deliberately excludes ``instructions_file``
+    from the public API surface - that path is an internal packaging
+    detail and exposing it invites manual filesystem tinkering.
+    """
+
+    id: str
+    description: str
+    triggers: List[str] = Field(default_factory=list)
+    capabilities: Dict[str, Any] = Field(default_factory=dict)
 
 
 class SkillDetailResponse(SkillSummaryResponse):
-    """Full detail — includes raw manifest and SKILL.md frontmatter."""
+    """Full detail - includes raw manifest and SKILL.md frontmatter."""
 
     manifest: Dict[str, Any] = Field(default_factory=dict)
     frontmatter: Dict[str, Any] = Field(default_factory=dict)
+    # Full sub-skill list for router skills. Empty list for non-routers.
+    sub_skills: List[SubSkillSummary] = Field(default_factory=list)
 
 
 class SkillInstallResponse(BaseModel):
@@ -166,8 +190,25 @@ def _record_to_summary(record: SkillRecord) -> SkillSummaryResponse:
 
 
 def _record_to_detail(record: SkillRecord) -> SkillDetailResponse:
-    """Convert a ``SkillRecord`` into the full detail model."""
-    return SkillDetailResponse(**record.to_full_dict())
+    """
+    Convert a ``SkillRecord`` into the full detail model.
+
+    The raw ``sub_skills`` list on the record carries the internal
+    ``instructions_file`` path; we strip it here so it never reaches
+    the HTTP response (defense-in-depth: the schema would reject the
+    extra key on ``SubSkillSummary`` anyway, but explicit is safer).
+    """
+    data = record.to_full_dict()
+    data["sub_skills"] = [
+        {
+            "id": sub.get("id", ""),
+            "description": sub.get("description", ""),
+            "triggers": list(sub.get("triggers") or []),
+            "capabilities": dict(sub.get("capabilities") or {}),
+        }
+        for sub in (data.get("sub_skills") or [])
+    ]
+    return SkillDetailResponse(**data)
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +333,66 @@ async def get_skill(skill_id: str) -> Dict[str, Any]:
     return {
         "status": "success",
         "skill": _record_to_detail(record).model_dump(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/skills/{skill_id}/sub-skills
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/{skill_id}/sub-skills",
+    response_model=Dict[str, Any],
+)
+async def get_skill_sub_skills(skill_id: str) -> Dict[str, Any]:
+    """
+    Return the sub-skills of a router skill.
+
+    The response always includes ``has_sub_skills`` and ``sub_skills``
+    (possibly empty). Non-router skills return ``has_sub_skills: false``
+    and an empty list - the endpoint never 404s just because the skill
+    is not a router. It 404s only when the parent skill does not exist.
+
+    Response shape::
+
+        {
+          "status": "success",
+          "parent_id": "debugging",
+          "has_sub_skills": true,
+          "sub_skills": [
+            {
+              "id": "root_cause_tracing",
+              "description": "...",
+              "triggers": ["bug", "crash"],
+              "capabilities": {"exclusive": false}
+            },
+            ...
+          ],
+          "count": 4
+        }
+    """
+    try:
+        record = skill_manager.get_skill_or_raise(skill_id)
+    except SkillNotFoundError as exc:
+        raise _skill_error_to_http(exc, http_status=404)
+
+    sub_entries: List[Dict[str, Any]] = [
+        {
+            "id": str(sub.get("id") or ""),
+            "description": str(sub.get("description") or ""),
+            "triggers": list(sub.get("triggers") or []),
+            "capabilities": dict(sub.get("capabilities") or {}),
+        }
+        for sub in record.sub_skills
+        if isinstance(sub, dict) and sub.get("id")
+    ]
+
+    return {
+        "status": "success",
+        "parent_id": record.id,
+        "has_sub_skills": bool(record.sub_skills),
+        "sub_skills": sub_entries,
+        "count": len(sub_entries),
     }
 
 

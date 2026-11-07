@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import xml.etree.ElementTree as ET
@@ -105,6 +105,14 @@ _SEMVER_RE = re.compile(
     re.IGNORECASE,
 )
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_]{2,63}$")
+# Mirrors the JSON Schema pattern for sub_skills[].instructions_file.
+# Allows nested folders under sub_skills/ (e.g.
+# "sub_skills/root_cause_tracing/SKILL.md"). The '..' segment check is
+# performed explicitly in _validate_sub_skills — the pattern itself
+# permits '.' and '..' because '.' is a valid filename character.
+_SUB_SKILL_PATH_RE = re.compile(
+    r"^sub_skills/(?:[A-Za-z0-9_.\-]+/)*[A-Za-z0-9_.\-]+\.md$"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -806,6 +814,180 @@ def _validate_manifest_minimal(manifest: Dict[str, Any]) -> None:
             },
         )
 
+    # Validate sub_skills. In schema-less mode this is the only line of
+    # defense; when jsonschema is available, load_skill_package re-runs
+    # the same function after schema validation to catch duplicate IDs
+    # (not expressible in JSON Schema).
+    _validate_sub_skills(manifest)
+
+
+def _validate_sub_skills(manifest: Dict[str, Any]) -> None:
+    """
+    Validate the ``sub_skills`` array of a manifest.
+
+    Runs structural checks (type, patterns, length limits) AND semantic
+    checks (unique sub-skill IDs) that JSON Schema cannot express.
+
+    Called from two places:
+
+    1. ``_validate_manifest_minimal`` — fallback path when jsonschema
+       is not installed, so schema-less deployments still reject bad
+       sub_skills definitions.
+    2. ``load_skill_package`` — unconditional call after schema
+       validation, because duplicate-ID detection is not expressible
+       in JSON Schema and must always run.
+
+    The function is idempotent: re-running it on a valid manifest has
+    no side effects. When both call sites fire (schema-less mode) the
+    cost is trivially small (sub_skills arrays are capped at 50 items).
+
+    Raises:
+        SkillManifestError: on any structural or semantic violation.
+            ``details.reason`` identifies the specific failure class.
+    """
+    sub_skills = manifest.get("sub_skills")
+    if sub_skills is None:
+        return
+
+    if not isinstance(sub_skills, list):
+        raise SkillManifestError(
+            "Manifest 'sub_skills' must be an array.",
+            details={"field": "sub_skills", "reason": "invalid_type"},
+        )
+
+    if len(sub_skills) > 50:
+        raise SkillManifestError(
+            f"Manifest declares {len(sub_skills)} sub-skills; max is 50.",
+            details={"field": "sub_skills", "reason": "too_many"},
+        )
+
+    seen_ids: set[str] = set()
+    for idx, sub in enumerate(sub_skills):
+        if not isinstance(sub, dict):
+            raise SkillManifestError(
+                f"sub_skills[{idx}] must be an object.",
+                details={
+                    "field": f"sub_skills[{idx}]",
+                    "reason": "invalid_type",
+                },
+            )
+
+        sub_id = sub.get("id")
+        if not isinstance(sub_id, str) or not sub_id:
+            raise SkillManifestError(
+                f"sub_skills[{idx}].id must be a non-empty string.",
+                details={
+                    "field": f"sub_skills[{idx}].id",
+                    "reason": "invalid_id",
+                },
+            )
+        if not _ID_RE.match(sub_id):
+            raise SkillManifestError(
+                f"sub_skills[{idx}].id must match "
+                f"^[a-z0-9][a-z0-9_]{{2,63}}$, got {sub_id!r}.",
+                details={
+                    "field": f"sub_skills[{idx}].id",
+                    "value": sub_id,
+                    "reason": "invalid_pattern",
+                },
+            )
+        if sub_id in seen_ids:
+            raise SkillManifestError(
+                f"Duplicate sub_skill id: {sub_id!r}.",
+                details={
+                    "field": "sub_skills",
+                    "duplicate_id": sub_id,
+                    "reason": "duplicate_id",
+                },
+            )
+        seen_ids.add(sub_id)
+
+        description = sub.get("description")
+        if (
+            not isinstance(description, str)
+            or not (10 <= len(description) <= 500)
+        ):
+            raise SkillManifestError(
+                f"sub_skills[{idx}].description must be a string of "
+                f"10-500 characters.",
+                details={
+                    "field": f"sub_skills[{idx}].description",
+                    "reason": "invalid_length",
+                },
+            )
+
+        instructions_file = sub.get("instructions_file")
+        if not isinstance(instructions_file, str) or not instructions_file:
+            raise SkillManifestError(
+                f"sub_skills[{idx}].instructions_file must be a "
+                f"non-empty string.",
+                details={
+                    "field": f"sub_skills[{idx}].instructions_file",
+                    "reason": "invalid_type",
+                },
+            )
+        if not _SUB_SKILL_PATH_RE.match(instructions_file):
+            raise SkillManifestError(
+                f"sub_skills[{idx}].instructions_file must be a "
+                f"relative path under 'sub_skills/' ending in '.md' "
+                f"(e.g. 'sub_skills/root_cause_tracing/SKILL.md'), "
+                f"got {instructions_file!r}.",
+                details={
+                    "field": f"sub_skills[{idx}].instructions_file",
+                    "value": instructions_file,
+                    "reason": "invalid_pattern",
+                },
+            )
+        # Defense-in-depth: the pattern permits '..' because '.' is a
+        # legal filename character. Reject traversal explicitly so the
+        # caller gets a clear error instead of a downstream containment
+        # failure in load_sub_skill.
+        if ".." in instructions_file.split("/"):
+            raise SkillManifestError(
+                f"sub_skills[{idx}].instructions_file must not "
+                f"contain '..' segments.",
+                details={
+                    "field": f"sub_skills[{idx}].instructions_file",
+                    "value": instructions_file,
+                    "reason": "path_traversal",
+                },
+            )
+
+        triggers = sub.get("triggers")
+        if triggers is not None:
+            if not isinstance(triggers, list):
+                raise SkillManifestError(
+                    f"sub_skills[{idx}].triggers must be an array.",
+                    details={
+                        "field": f"sub_skills[{idx}].triggers",
+                        "reason": "invalid_type",
+                    },
+                )
+            if len(triggers) > 20:
+                raise SkillManifestError(
+                    f"sub_skills[{idx}].triggers declares "
+                    f"{len(triggers)} items; max is 20.",
+                    details={
+                        "field": f"sub_skills[{idx}].triggers",
+                        "reason": "too_many",
+                    },
+                )
+            for tidx, trig in enumerate(triggers):
+                if (
+                    not isinstance(trig, str)
+                    or not (1 <= len(trig) <= 64)
+                ):
+                    raise SkillManifestError(
+                        f"sub_skills[{idx}].triggers[{tidx}] must "
+                        f"be a non-empty string of 1-64 characters.",
+                        details={
+                            "field": (
+                                f"sub_skills[{idx}].triggers[{tidx}]"
+                            ),
+                            "reason": "invalid_type_or_length",
+                        },
+                    )
+
 
 # ---------------------------------------------------------------------------
 # Version compatibility
@@ -910,6 +1092,7 @@ class ParsedSkillPackage:
     frontmatter: Dict[str, Any]
     sanitized_icon_svg: Optional[str]
     package_dir: Path
+    sub_skills: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
 
 
 def load_skill_package(
@@ -969,6 +1152,11 @@ def load_skill_package(
         )
 
     validate_manifest_schema(raw_manifest)
+    # Always run semantic checks on sub_skills. The JSON Schema covers
+    # the structural side (types, patterns, maxItems), but duplicate-ID
+    # detection is not expressible there — so we re-run the full check
+    # here. Idempotent and cheap (sub_skills arrays are capped at 50).
+    _validate_sub_skills(raw_manifest)
     validate_compatibility(raw_manifest, running_version=running_version)
 
     # 2. Resolve the instructions file path safely
@@ -1061,6 +1249,7 @@ def load_skill_package(
         frontmatter=frontmatter,
         sanitized_icon_svg=sanitized_icon_svg,
         package_dir=package_dir,
+        sub_skills=tuple(raw_manifest.get("sub_skills") or ()),
     )
 
 

@@ -285,6 +285,51 @@
       }
     },
 
+    "sub_skills": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "description", "instructions_file"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_]{2,63}$",
+            "description": "Sub-skill identifier. MUST be unique within the parent skill."
+          },
+          "description": {
+            "type": "string",
+            "minLength": 10,
+            "maxLength": 500,
+            "description": "What this sub-skill does AND when to use it. Consumed by the router prompt and by BM25 ranking."
+          },
+          "triggers": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "maxItems": 20,
+            "description": "Optional keywords for BM25 routing. Falls back to 'description' when omitted."
+          },
+          "instructions_file": {
+            "type": "string",
+            "pattern": "^sub_skills/(?:[A-Za-z0-9_.\\-]+/)*[A-Za-z0-9_.\\-]+\\.md$",
+            "description": "Relative path (within the parent package) to the sub-skill's SKILL.md. MUST start with 'sub_skills/' and end with '.md'. Nested folders are allowed (e.g. 'sub_skills/root_cause_tracing/SKILL.md')."
+          },
+          "capabilities": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "exclusive": {
+                "type": "boolean",
+                "default": false,
+                "description": "When true, this sub-skill MUST be the only one loaded at a time within the parent skill."
+              }
+            }
+          }
+        }
+      }
+    },
+
     "user_editable": {
       "type": "boolean",
       "default": true,

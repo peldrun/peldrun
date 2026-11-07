@@ -65,6 +65,9 @@ from omweb.skills.registry import (
     normalize_skill_id,
     skill_registry,
 )
+from omweb.skills.router.bm25_router import BM25SkillRouter
+from omweb.skills.router.catalog_builder import build_catalog_block
+from omweb.skills.router.token_estimator import estimate_tokens
 
 
 logger = logging.getLogger("omweb.skills.assignments")
@@ -486,10 +489,162 @@ def resolve_skill_injection(
     )
 
 
+# ---------------------------------------------------------------------------
+# Progressive Disclosure resolver — catalog-based injection
+# ---------------------------------------------------------------------------
+
+def resolve_skill_injection_catalog(
+    agent_id: str,
+    invoked_skill_ids: Optional[List[str]] = None,
+    user_message: str = "",
+    *,
+    top_k: int = 5,
+    use_bm25: bool = True,
+) -> SkillInjection:
+    """
+    Progressive-disclosure variant of :func:`resolve_skill_injection`.
+
+    Instead of injecting every assigned skill's full body, this function
+    returns a compact Catalog block listing the top-k most relevant
+    skills (ranked by BM25 against ``user_message``). The model then
+    calls ``load_skill``/``load_sub_skill`` at inference time to fetch
+    only the bodies it needs.
+
+    Pool of candidates:
+        ALL enabled non-deprecated skills, NOT just the agent's
+        assigned ones. This is the core of Progressive Disclosure —
+        the catalog exposes the full toolkit so the model can pick the
+        right tool regardless of static assignment.
+
+        Invoked skills (via ``/<skill-id>``) are ALWAYS included in the
+        catalog regardless of their BM25 score, because the user chose
+        them explicitly. When the BM25 pool is empty (no user message,
+        BM25 disabled, or all scores below ``min_score``), the invoked
+        skills alone populate the catalog.
+
+    Args:
+        agent_id:           The agent whose assignment channel to
+                            consult for the ``source`` label.
+        invoked_skill_ids:  Explicit ``/`` invocations for this turn.
+        user_message:       The current user prompt (BM25 query).
+        top_k:              Maximum catalog size from BM25. Invoked
+                            skills are added on top (they can push the
+                            count above top_k).
+        use_bm25:           If False, skip ranking and include every
+                            enabled skill (capped by the catalog
+                            builder's character budget).
+
+    Returns:
+        A :class:`SkillInjection` whose ``text`` is the formatted
+        catalog block (or empty if no skill is included), whose
+        ``skills`` list carries telemetry per entry, and whose
+        ``warnings`` list accumulates non-fatal issues.
+
+        Important: ``text`` here is NOT a list of full skill bodies.
+        The engine appends it to the system prompt as instructions
+        plus a compact catalog. The model is expected to call
+        ``load_skill`` for the actual content.
+    """
+    warnings: List[str] = []
+
+    # ── 1. Source map (assigned vs invoked) ───────────────────────
+    assigned_ids = get_effective_skill_ids(agent_id)
+    source_by_id: Dict[str, str] = {sid: "assigned" for sid in assigned_ids}
+
+    invoked_set: set[str] = set()
+    for raw in invoked_skill_ids or []:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        normalized = normalize_skill_id(raw)
+        if not normalized:
+            continue
+        source_by_id[normalized] = "invoked"
+        invoked_set.add(normalized)
+
+    # ── 2. Candidate pool (all enabled, non-deprecated) ───────────
+    all_enabled = skill_registry.list_skills(
+        include_disabled=False,
+        include_deprecated=False,
+    )
+    if not all_enabled:
+        return SkillInjection(text="", skills=[], warnings=warnings)
+
+    # ── 3. Ranking ────────────────────────────────────────────────
+    scores: Dict[str, float] = {}
+    if use_bm25 and user_message:
+        try:
+            router = BM25SkillRouter(all_enabled)
+            ranked = router.rank(user_message, top_k=top_k)
+            selected: List[SkillRecord] = [s for s, _ in ranked]
+            scores = {s.id: float(sc) for s, sc in ranked}
+        except Exception as exc:  # noqa: BLE001 — never raise
+            warnings.append(
+                f"BM25 routing failed; falling back to full catalog: {exc}"
+            )
+            logger.warning(
+                "BM25 ranking failed for agent %r: %s", agent_id, exc
+            )
+            selected = list(all_enabled)
+    else:
+        selected = list(all_enabled)
+
+    # ── 4. Always include invoked skills ──────────────────────────
+    # A skill the user explicitly invoked must appear in the catalog
+    # even if BM25 dropped it (short description, unusual query, or
+    # an empty candidate pool). We iterate over the FULL pool so that
+    # an invoked skill missing from `selected` is re-added in place.
+    selected_ids = {s.id for s in selected}
+    for skill in all_enabled:
+        if skill.id in invoked_set and skill.id not in selected_ids:
+            selected.append(skill)
+            selected_ids.add(skill.id)
+
+    if not selected:
+        return SkillInjection(text="", skills=[], warnings=warnings)
+
+    # ── 5. Build catalog block ────────────────────────────────────
+    catalog = build_catalog_block(selected)
+    if not catalog:
+        return SkillInjection(text="", skills=[], warnings=warnings)
+
+    injected: List[Dict[str, Any]] = [
+        {
+            "id": s.id,
+            "version": s.version,
+            "name": s.name,
+            "source": source_by_id.get(s.id, "ranked"),
+            "has_sub_skills": bool(s.sub_skills),
+            "score": scores.get(s.id, 0.0),
+        }
+        for s in selected
+    ]
+
+    logger.info(
+        "Progressive disclosure catalog: %d skill(s) (assigned=%d, "
+        "invoked=%d, ranked=%d), ~%d tokens.",
+        len(selected),
+        sum(1 for s in selected if source_by_id.get(s.id) == "assigned"),
+        sum(1 for s in selected if source_by_id.get(s.id) == "invoked"),
+        sum(
+            1
+            for s in selected
+            if source_by_id.get(s.id) not in ("assigned", "invoked")
+        ),
+        estimate_tokens(catalog),
+    )
+
+    return SkillInjection(
+        text=catalog,
+        skills=injected,
+        warnings=warnings,
+    )
+
+
 __all__ = [
     "SkillInjection",
     "get_agent_skills_state",
     "get_effective_skill_ids",
     "save_agent_skills_state",
     "resolve_skill_injection",
+    "resolve_skill_injection_catalog",
 ]

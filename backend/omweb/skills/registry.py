@@ -146,6 +146,11 @@ class SkillRecord:
     package_dir: Path
     status: str = "active"
     is_builtin: bool = False
+    # Populated from ParsedSkillPackage.sub_skills at discovery time.
+    # Empty tuple means the skill is NOT a router — it behaves exactly
+    # like a pre-feature skill. Each entry is the raw dict from
+    # manifest.json (id, description, instructions_file, triggers, ...).
+    sub_skills: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
 
     # ── Derived booleans ──────────────────────────────────────────────
 
@@ -242,6 +247,11 @@ class SkillRecord:
             "capabilities": dict(self.manifest.get("capabilities") or {}),
             "execution": dict(self.manifest.get("execution") or {}),
             "package_dir": str(self.package_dir),
+            # Router metadata. The frontend uses these to render the
+            # "ROUTER · N" badge without pulling the full sub-skills
+            # list (see GET /api/skills/{id}/sub-skills).
+            "has_sub_skills": bool(self.sub_skills),
+            "sub_skills_count": len(self.sub_skills),
         }
 
     def to_full_dict(self) -> Dict[str, Any]:
@@ -249,10 +259,17 @@ class SkillRecord:
         Return the full record for the details drawer. Includes the raw
         manifest and SKILL.md frontmatter. ``icon_svg`` is still
         excluded — use ``GET /api/skills/{id}/icon.svg`` to fetch it.
+
+        When the skill has sub-skills, they are embedded here as a list
+        of dicts so the drawer can render the router without a second
+        round-trip to GET /api/skills/{id}/sub-skills. The summary
+        endpoint (``GET /api/skills``) stays lean — it only exposes
+        the counts via ``to_summary_dict``.
         """
         out = self.to_summary_dict()
         out["manifest"] = dict(self.manifest)
         out["frontmatter"] = dict(self.frontmatter)
+        out["sub_skills"] = [dict(sub) for sub in self.sub_skills]
         return out
 
 
@@ -452,6 +469,7 @@ class SkillRegistry:
             package_dir=package_dir,
             status=status,
             is_builtin=is_builtin,
+            sub_skills=tuple(parsed.sub_skills),
         )
 
         self._records[skill_id] = record

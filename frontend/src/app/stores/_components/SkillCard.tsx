@@ -140,6 +140,30 @@ export function SkillCard({
               </span>
             )}
 
+            {/*
+              Router badge — rendered only when the backend reports
+              the skill has at least one sub-skill declared. Uses a
+              distinct violet color (matching the store's convention
+              for composite/derived capabilities) so it is visually
+              separable from the identity badges (BUILT-IN / CUSTOM)
+              and the status badges (ACTIVE / DISABLED / DEPRECATED).
+
+              The count in the badge matches ``sub_skills_count``,
+              which mirrors the length of the on-disk ``sub_skills``
+              array. No fetch is required — the field is present on
+              every ``SkillSummary`` response from ``GET /api/skills``.
+            */}
+            {skill.has_sub_skills && (
+              <span
+                className="px-1.5 py-0.5 rounded text-[10px] font-mono uppercase bg-violet-500/10 text-violet-700 dark:text-violet-300 border border-violet-500/20"
+                title={`This skill routes to ${skill.sub_skills_count} sub-skill${
+                  skill.sub_skills_count === 1 ? "" : "s"
+                }.`}
+              >
+                ROUTER · {skill.sub_skills_count}
+              </span>
+            )}
+
             {!isEnabled && (
               <span className="px-1.5 py-0.5 rounded text-[10px] font-mono uppercase bg-muted text-muted-foreground border border-border">
                 DISABLED

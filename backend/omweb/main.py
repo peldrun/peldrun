@@ -222,6 +222,32 @@ async def lifespan(app: FastAPI):
                 "Skill registry warm-up failed on startup: %s",
                 warm_err,
             )
+
+        # Log the Progressive Disclosure feature flag once at startup
+        # so operators can verify the effective mode from the log
+        # without introspecting environment variables after the fact.
+        #
+        # NOTE: The flag is read on EVERY run inside peldrun_engine.py
+        # (not from a cached module-level constant), so a value change
+        # takes effect on the next chat run without a restart. This
+        # log line reflects the mode at STARTUP time only — if the
+        # env var changes later, subsequent runs use the new value
+        # but this log stays as historical evidence of the original
+        # setting.
+        import os as _os_local
+        _pd_raw = _os_local.getenv("PELDRUN_PROGRESSIVE_DISCLOSURE")
+        _pd_effective = (
+            _pd_raw if _pd_raw is not None else "true (default)"
+        )
+        _pd_enabled = (
+            (_pd_raw or "true").lower() in ("1", "true", "yes")
+        )
+        logger.info(
+            "Skills progressive disclosure: %s "
+            "(PELDRUN_PROGRESSIVE_DISCLOSURE=%s).",
+            "ENABLED" if _pd_enabled else "DISABLED",
+            _pd_effective,
+        )
     except Exception as exc:
         logger.warning(
             "Skill subsystem initialization failed on startup: %s",

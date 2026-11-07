@@ -10,12 +10,17 @@ import {
   ExternalLink,
   FileText,
   Loader2,
+  Network,
   ShieldCheck,
   Sparkles,
   Tag,
   X,
 } from "lucide-react";
-import type { SkillPreview, SkillSummary } from "../_types/store";
+import type {
+  SkillPreview,
+  SkillSummary,
+  SubSkillSummary,
+} from "../_types/store";
 import { getApiUrl } from "../_hooks/useStoreData";
 
 export interface SkillDetailsDrawerProps {
@@ -47,6 +52,12 @@ export function SkillDetailsDrawer({
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [instructionsExpanded, setInstructionsExpanded] = useState(false);
 
+  // Sub-skills state — only populated for router skills. A non-router
+  // skill never triggers a fetch; the section itself is not rendered.
+  const [subSkills, setSubSkills] = useState<SubSkillSummary[]>([]);
+  const [loadingSubSkills, setLoadingSubSkills] = useState(false);
+  const [subSkillsError, setSubSkillsError] = useState<string | null>(null);
+
   // Ref so the fetch effect can cancel in-flight requests when the
   // drawer closes or the user switches to another skill mid-load.
   const abortRef = useRef<AbortController | null>(null);
@@ -60,16 +71,21 @@ export function SkillDetailsDrawer({
     }
 
     // Reset state on every open so switching skills does not leak
-    // the previous skill's preview.
+    // the previous skill's preview OR sub-skills list.
     setPreview(null);
     setPreviewError(null);
     setInstructionsExpanded(false);
     setLoadingPreview(true);
 
+    setSubSkills([]);
+    setSubSkillsError(null);
+    setLoadingSubSkills(Boolean(skill.has_sub_skills));
+
     abortRef.current?.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
 
+    // ── Preview fetch (always) ────────────────────────────────────
     (async () => {
       try {
         const res = await fetch(
@@ -97,6 +113,41 @@ export function SkillDetailsDrawer({
         setLoadingPreview(false);
       }
     })();
+
+    // ── Sub-skills fetch (router skills only) ─────────────────────
+    // Skipped entirely for non-router skills — the flag from the
+    // list response is authoritative and saves one HTTP round-trip
+    // for the ~95% case.
+    if (skill.has_sub_skills) {
+      (async () => {
+        try {
+          const res = await fetch(
+            getApiUrl(
+              `/api/skills/${encodeURIComponent(skill.id)}/sub-skills`
+            ),
+            { signal: ctrl.signal }
+          );
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            const detail =
+              (err?.detail && typeof err.detail === "object"
+                ? err.detail.error
+                : err?.detail) || `HTTP ${res.status}`;
+            throw new Error(detail);
+          }
+          const data = await res.json();
+          const list: SubSkillSummary[] = Array.isArray(data?.sub_skills)
+            ? data.sub_skills
+            : [];
+          setSubSkills(list);
+        } catch (e: any) {
+          if (e?.name === "AbortError") return;
+          setSubSkillsError(e?.message || "Failed to load sub-skills.");
+        } finally {
+          setLoadingSubSkills(false);
+        }
+      })();
+    }
 
     return () => {
       ctrl.abort();
@@ -228,6 +279,87 @@ export function SkillDetailsDrawer({
                 </span>
               )}
             </div>
+
+            {/* ── Sub-skills (router skills only) ─────────────────
+                Rendered only when the skill declares at least one
+                sub-skill. For non-router skills this entire block
+                is skipped, so the drawer layout is unchanged for
+                the ~95% case. */}
+            {skill.has_sub_skills && (
+              <section className="mb-8">
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-xs font-bold text-foreground uppercase tracking-wider flex items-center gap-1.5">
+                    <Network size={13} />
+                    Sub-Skills
+                    <span className="ml-1 px-1.5 py-0.5 rounded text-[10px] font-mono bg-violet-500/10 text-violet-700 dark:text-violet-300 border border-violet-500/20">
+                      {skill.sub_skills_count}
+                    </span>
+                  </h2>
+                  <span className="text-[10px] font-mono text-muted-foreground">
+                    Loaded via <code>load_sub_skill</code>
+                  </span>
+                </div>
+
+                {loadingSubSkills && (
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground py-3">
+                    <Loader2 size={14} className="animate-spin" />
+                    Loading sub-skills…
+                  </div>
+                )}
+
+                {!loadingSubSkills && subSkillsError && (
+                  <div className="text-xs text-destructive p-3 rounded-md border border-destructive/30 bg-destructive/5">
+                    {subSkillsError}
+                  </div>
+                )}
+
+                {!loadingSubSkills && !subSkillsError && subSkills.length > 0 && (
+                  <div className="flex flex-col gap-2">
+                    {subSkills.map((sub) => (
+                      <div
+                        key={sub.id}
+                        className="p-3 rounded-md border border-border bg-muted/20 hover:bg-muted/30 transition"
+                      >
+                        <div className="flex items-center justify-between gap-2 mb-1">
+                          <code className="text-[12px] font-mono font-semibold text-foreground">
+                            {sub.id}
+                          </code>
+                          {sub.capabilities?.exclusive && (
+                            <span
+                              className="px-1.5 py-0.5 rounded text-[9px] font-mono uppercase bg-amber-500/10 text-amber-700 dark:text-amber-400 border border-amber-500/20"
+                              title="Must be loaded alone (exclusive)"
+                            >
+                              EXCLUSIVE
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-xs text-muted-foreground leading-relaxed mb-2">
+                          {sub.description}
+                        </p>
+                        {Array.isArray(sub.triggers) && sub.triggers.length > 0 && (
+                          <div className="flex flex-wrap gap-1">
+                            {sub.triggers.map((trig, i) => (
+                              <span
+                                key={`${trig}-${i}`}
+                                className="px-1.5 py-0.5 rounded text-[10px] font-mono text-muted-foreground bg-background border border-border"
+                              >
+                                {trig}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {!loadingSubSkills && !subSkillsError && subSkills.length === 0 && (
+                  <div className="text-xs text-muted-foreground p-3 rounded-md border border-dashed border-border bg-muted/10">
+                    No sub-skills declared in the manifest.
+                  </div>
+                )}
+              </section>
+            )}
 
             {/* Two-column: About + Metadata */}
             <div className="grid grid-cols-1 md:grid-cols-3 gap-8 mb-8">

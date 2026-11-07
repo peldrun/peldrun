@@ -186,6 +186,40 @@ export interface SkillSummary {
   capabilities: Record<string, unknown>;
   execution: Record<string, unknown>;
   package_dir: string;
+  /**
+   * Router metadata (Progressive Disclosure). ``has_sub_skills`` is
+   * true when the skill's manifest declares a ``sub_skills`` array;
+   * ``sub_skills_count`` mirrors the array length. The frontend uses
+   * these to render the "ROUTER · N" badge on the store card without
+   * a second round-trip to ``GET /api/skills/{id}/sub-skills``.
+   *
+   * Non-router skills (the pre-feature default) always report
+   * ``has_sub_skills: false`` and ``sub_skills_count: 0``.
+   */
+  has_sub_skills: boolean;
+  sub_skills_count: number;
+}
+
+/**
+ * A single sub-skill of a router skill.
+ *
+ * Returned by ``GET /api/skills/{id}/sub-skills`` and embedded inside
+ * ``SkillDetail``. The internal ``instructions_file`` path is
+ * deliberately not exposed — it is a packaging detail and exposing
+ * it would invite manual filesystem tinkering.
+ */
+export interface SubSkillSummary {
+  id: string;
+  description: string;
+  triggers: string[];
+  /**
+   * Reserved per-sub-skill flags. Today only ``exclusive`` is
+   * meaningful: when true, the sub-skill cannot be loaded alongside
+   * another sub-skill of the same parent at the same time.
+   */
+  capabilities: {
+    exclusive?: boolean;
+  };
 }
 
 /**
@@ -194,6 +228,13 @@ export interface SkillSummary {
 export interface SkillDetail extends SkillSummary {
   manifest: Record<string, unknown>;
   frontmatter: Record<string, unknown>;
+  /**
+   * Full sub-skill list for router skills. Always present — empty
+   * list for non-routers. The backend response model
+   * (``omweb.routers.skills.SkillDetailResponse``) declares this as
+   * ``List[SubSkillSummary]`` with a default of ``[]``.
+   */
+  sub_skills: SubSkillSummary[];
 }
 
 /**

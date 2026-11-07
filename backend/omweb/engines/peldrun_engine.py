@@ -18,6 +18,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 from pathlib import Path
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -977,14 +978,38 @@ class PeldrunEngine(ExecutionEngine):
         # Injection point: right before AgentSpec is constructed, so
         # the skill block lands in `spec.system_prompt` — the value
         # Core rebuilds messages from inside `core_executor.execute`.
+        # When progressive disclosure is enabled (default), we inject a
+        # compact Catalog block and expose the three skill tools so the
+        # model can load only the skill bodies it needs. When disabled,
+        # we fall back to the legacy behavior of injecting every
+        # assigned skill's full body — useful as an emergency escape
+        # hatch and as the exact pre-feature behavior.
+        _progressive_disclosure_enabled = os.getenv(
+            "PELDRUN_PROGRESSIVE_DISCLOSURE", "true"
+        ).lower() in ("1", "true", "yes")
+
         _skill_injection = None
         try:
-            from omweb.skills.assignments import resolve_skill_injection
+            if _progressive_disclosure_enabled:
+                from omweb.skills.assignments import (
+                    resolve_skill_injection_catalog,
+                )
 
-            _skill_injection = resolve_skill_injection(
-                agent_id=agent_id,
-                invoked_skill_ids=context.invoked_skills or [],
-            )
+                _skill_injection = resolve_skill_injection_catalog(
+                    agent_id=agent_id,
+                    invoked_skill_ids=context.invoked_skills or [],
+                    user_message=prompt,
+                )
+                _injection_mode = "catalog"
+            else:
+                from omweb.skills.assignments import resolve_skill_injection
+
+                _skill_injection = resolve_skill_injection(
+                    agent_id=agent_id,
+                    invoked_skill_ids=context.invoked_skills or [],
+                )
+                _injection_mode = "full"
+
             if _skill_injection.text:
                 system_prompt = (
                     system_prompt.rstrip()
@@ -993,8 +1018,8 @@ class PeldrunEngine(ExecutionEngine):
                 )
                 print(
                     f"[ENGINE PELDRUN] Injected "
-                    f"{len(_skill_injection.skills)} skill(s) for job "
-                    f"{job_id}: "
+                    f"{len(_skill_injection.skills)} skill(s) via "
+                    f"{_injection_mode} mode for job {job_id}: "
                     f"{[s['id'] for s in _skill_injection.skills]}"
                 )
             for _skill_warn in _skill_injection.warnings:
@@ -1011,6 +1036,129 @@ class PeldrunEngine(ExecutionEngine):
                 job_id,
                 _skill_err,
             )
+
+        # ── Skill tools registration (Progressive Disclosure only) ──
+        # When the catalog is injected, the model MUST call one of the
+        # three skill tools to fetch a body. We construct the adapters
+        # DIRECTLY here (instead of going through resolve_tool_runtime)
+        # because the skill tools are not registered as AdapterSpecs
+        # and do not live under custom_tools_dir — resolve_tool_runtime
+        # would return an adapter with executor=None.
+        #
+        # The wrapper translates our internal {"ok", "content", ...}
+        # return shape into WebToolAdapter's expected
+        # {"output", "is_error", "metadata"} shape. This keeps the skill
+        # tool modules themselves shape-agnostic and testable in
+        # isolation.
+        if _progressive_disclosure_enabled:
+            try:
+                from omweb.adapters.core_adapter import WebToolAdapter
+                from omweb.skills.tools import load_skill as _load_skill_mod
+                from omweb.skills.tools import (
+                    load_sub_skill as _load_sub_skill_mod,
+                )
+                from omweb.skills.tools import (
+                    load_reference as _load_reference_mod,
+                )
+
+                def _wrap_skill_tool_executor(execute_fn):
+                    """Adapt skill tool result shape to WebToolAdapter."""
+
+                    def _executor(**kwargs):
+                        try:
+                            result = execute_fn(**kwargs)
+                        except Exception as exc:  # noqa: BLE001
+                            return {
+                                "output": f"Skill tool error: {exc}",
+                                "is_error": True,
+                                "metadata": {
+                                    "code": "SKILL_TOOL_EXCEPTION",
+                                },
+                            }
+                        if not isinstance(result, dict):
+                            return {
+                                "output": str(result),
+                                "is_error": False,
+                            }
+                        if result.get("ok"):
+                            metadata = {
+                                k: v
+                                for k, v in result.items()
+                                if k != "content"
+                            }
+                            return {
+                                "output": result.get("content", ""),
+                                "is_error": False,
+                                "metadata": metadata,
+                            }
+                        metadata = {
+                            k: v
+                            for k, v in result.items()
+                            if k not in ("error", "code")
+                        }
+                        metadata["code"] = result.get("code", "UNKNOWN")
+                        return {
+                            "output": result.get(
+                                "error", "Skill tool failed."
+                            ),
+                            "is_error": True,
+                            "metadata": metadata,
+                        }
+
+                    return _executor
+
+                def _make_skill_adapter(tool_module):
+                    spec = tool_module.TOOL_SCHEMA["function"]
+                    return WebToolAdapter(
+                        name=spec["name"],
+                        description=spec["description"],
+                        parameters=spec["parameters"],
+                        executor=_wrap_skill_tool_executor(
+                            tool_module.execute
+                        ),
+                        workspace_root=str(ws_path),
+                    )
+
+                _registered_skill_tools: List[str] = []
+                for _tool_module in (
+                    _load_skill_mod,
+                    _load_sub_skill_mod,
+                    _load_reference_mod,
+                ):
+                    _tool_name = _tool_module.TOOL_SCHEMA["function"][
+                        "name"
+                    ]
+                    if _tool_name in resolved_tool_ids:
+                        continue
+                    try:
+                        _adapter = _make_skill_adapter(_tool_module)
+                    except Exception as _adapter_err:  # noqa: BLE001
+                        logger.warning(
+                            "[ENGINE PELDRUN] Failed to build skill tool "
+                            "adapter %r for job %s: %s",
+                            _tool_name,
+                            job_id,
+                            _adapter_err,
+                        )
+                        continue
+                    adapted_core_tools.append(_adapter)
+                    resolved_tool_ids.append(_tool_name)
+                    if _tool_name not in requested_tools:
+                        requested_tools.append(_tool_name)
+                    _registered_skill_tools.append(_tool_name)
+
+                logger.info(
+                    "[ENGINE PELDRUN] Registered skill tools for job %s: %s",
+                    job_id,
+                    _registered_skill_tools,
+                )
+            except Exception as _skill_tool_err:  # noqa: BLE001
+                logger.warning(
+                    "[ENGINE PELDRUN] Failed to register skill tools for "
+                    "job %s: %s",
+                    job_id,
+                    _skill_tool_err,
+                )
 
         specialist_tools_map = _collect_specialist_tool_allowlists(set(available_web_tools.keys()))
 
@@ -1056,6 +1204,18 @@ class PeldrunEngine(ExecutionEngine):
                 list(_skill_injection.warnings)
                 if _skill_injection is not None
                 else []
+            ),
+            # Progressive Disclosure telemetry. Consumed by diagnostics
+            # and the run timeline; not read by Core.
+            "progressive_disclosure": _progressive_disclosure_enabled,
+            "skill_injection_mode": (
+                "catalog" if _progressive_disclosure_enabled else "full"
+            ),
+            "skill_catalog_chars": (
+                len(_skill_injection.text)
+                if _skill_injection is not None
+                and _skill_injection.text
+                else 0
             ),
             # [FIX-MULTIMODAL-PROPAGATE] Forward the multimodal attachment
             # references received from dispatcher.py so that
