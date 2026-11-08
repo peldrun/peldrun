@@ -11,7 +11,7 @@ import {
   Star,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Icon } from "@/components/Icon/Icon";
+import { ProviderBadgeIcon } from "@/components/Icon/ProviderBadgeIcon";
 import type { ProviderPackageCard } from "../hooks/useProviderPackages";
 
 /* -------------------------------------------------------------------------- */
@@ -75,7 +75,21 @@ export function PackageCard({
       <div className="flex items-center justify-between gap-2 flex-wrap border-b border-border/50 pb-2.5">
         <div className="flex items-center gap-2.5 min-w-0 flex-wrap">
           <span className="shrink-0 flex items-center justify-center text-primary">
-            <Icon name={pkg.iconName || "rect"} size={24} title={`${pkg.displayName} logo`} />
+            {/* Unified provider icon renderer.
+                Accepts `pkg.badge` sourced from
+                `provider_connections[].badge` (populated by the backend
+                from `manifest.icon`) and falls back to `pkg.iconName`
+                when the badge is absent — which preserves the exact
+                pre-badge behaviour for packages whose manifest does not
+                declare an `icon` field (e.g. GigaChat at the time of
+                writing). Supports both icon base names ("cloudflare")
+                and inline SVG markup transparently. */}
+            <ProviderBadgeIcon
+              badge={pkg.badge}
+              fallback={pkg.iconName || "rect"}
+              size={24}
+              title={`${pkg.displayName} logo`}
+            />
           </span>
 
           <span className="text-xs font-bold text-foreground truncate">

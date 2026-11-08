@@ -20,6 +20,27 @@ export interface VaultData {
     [key: string]: any;
   };
   scanned_models: string[];
+  /**
+   * Store → Providers connection records. Managed exclusively by the
+   * backend and by `useProviderPackages.saveModelsForPackage()` (which
+   * POSTs directly to `/api/config/vault`).
+   *
+   * CRITICAL: The frontend settings page MUST NEVER include this key in
+   * a `saveVaultToBackend()` payload. Doing so would overwrite the
+   * backend's live value with a stale in-memory snapshot from
+   * `memoryVault` — which is exactly the bug that caused Package
+   * model selections to be silently erased whenever the user clicked
+   * "Save Config" in the sidebar.
+   */
+  provider_connections?: any[];
+  /**
+   * Per-package model selections (Store → Providers). Same lifecycle
+   * and same "never send from frontend" rule as `provider_connections`.
+   */
+  provider_package_models?: Record<
+    string,
+    { savedModels?: string[]; model?: string }
+  >;
 }
 
 /**
@@ -187,15 +208,23 @@ export async function saveVaultToBackend(
   //
   // This guard blocks any POST whose payload has zero models across
   // every source (LM Studio, Ollama, cloud, custom endpoints,
-  // scanned models). Callers that legitimately want to clear the
-  // vault must set `__allowEmptyVault: true` on the partial payload,
-  // which serves as an explicit, auditable opt-out.
+  // scanned models, provider connections, provider package models).
+  // Callers that legitimately want to clear the vault must set
+  // `__allowEmptyVault: true` on the partial payload, which serves as
+  // an explicit, auditable opt-out.
+  //
+  // The `provider_*` fields are included in the check so that a vault
+  // which holds ONLY provider packages (no cloud, no local, no custom)
+  // is correctly recognized as non-empty — otherwise a legitimate
+  // write would be blocked by a false positive.
   const hasAnyContent =
     (merged.lmstudio_vault?.savedModels?.length ?? 0) > 0 ||
     (merged.ollama_vault?.savedModels?.length ?? 0) > 0 ||
     (merged.cloud_vault?.length ?? 0) > 0 ||
     (merged.custom_endpoints?.length ?? 0) > 0 ||
-    (merged.scanned_models?.length ?? 0) > 0;
+    (merged.scanned_models?.length ?? 0) > 0 ||
+    (merged.provider_connections?.length ?? 0) > 0 ||
+    Object.keys(merged.provider_package_models ?? {}).length > 0;
 
   if (!hasAnyContent && !(partial as any).__allowEmptyVault) {
     console.warn(
@@ -220,20 +249,71 @@ export async function saveVaultToBackend(
     );
   }
 
+  // ------------------------------------------------------------------
+  // CRITICAL FIX — send ONLY `partial`, never `merged`.
+  //
+  // The backend route `save_models_vault` uses per-key merge semantics:
+  //
+  //     for key in [...]:
+  //         if key in payload:
+  //             current[key] = payload[key]
+  //
+  // A key NOT present in the payload is left completely untouched.
+  //
+  // The previous implementation sent `merged` (every key from
+  // `memoryVault` folded together with `partial`). That payload
+  // ALWAYS contained `provider_package_models` and
+  // `provider_connections` — sourced from `memoryVault`, which is a
+  // stale in-memory snapshot that is never refreshed by
+  // `useProviderPackages.saveModelsForPackage()` (that hook POSTs
+  // directly to `/api/config/vault`, bypassing this function entirely).
+  //
+  // Concrete failure this fixes:
+  //
+  //   1. App boot → `fetchVault()` populates memoryVault, at which
+  //      point `provider_package_models = {}` (empty).
+  //   2. User saves models for Package A via Store Providers →
+  //      `saveModelsForPackage` POSTs `{ provider_package_models: { A: {...} } }`
+  //      → backend disk is correct, but `memoryVault` still holds
+  //      `provider_package_models = {}`.
+  //   3. User clicks "Save Config" in the sidebar →
+  //      `saveVaultToBackend({ cloud_vault, custom_endpoints, lmstudio_vault, ollama_vault, scanned_models })`.
+  //      The old code sent `merged` including the STALE empty
+  //      `provider_package_models = {}` → backend faithfully applied
+  //      the merge → Package A's models were ERASED FROM DISK.
+  //
+  // By sending only the keys the caller explicitly supplied, the
+  // backend's per-key merge leaves every other key (including
+  // `provider_package_models` and `provider_connections`) intact.
+  // This is the only correct read-modify-write contract for a
+  // per-key-merge endpoint in the presence of multiple write paths.
+  // ------------------------------------------------------------------
+  const payload: Record<string, unknown> = {
+    ...(partial as Record<string, unknown>),
+  };
+  // Strip the guard opt-out flag before sending — it is frontend-only
+  // bookkeeping and must never reach the backend.
+  delete payload.__allowEmptyVault;
+
   const endpoints = getCandidateEndpoints();
   for (const url of endpoints) {
     try {
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(merged),
+        body: JSON.stringify(payload),
       });
       if (res.ok) {
         const result = await res.json();
         if (result.vault) {
-          memoryVault = result.vault;
+          // The backend returns the FULL post-merge vault, so this is
+          // our opportunity to reconcile `memoryVault` (including
+          // `provider_package_models`, which may have been mutated by
+          // another tab since the last `fetchVault`). Always trust
+          // the backend's response over the local optimistic merge.
+          memoryVault = result.vault as VaultData;
           syncLocalStorage(result.vault);
-          return result.vault;
+          return result.vault as VaultData;
         }
         return merged;
       }
@@ -304,7 +384,32 @@ export function debouncedSyncToBackend(delay = 150): void {
   if (syncTimeout) clearTimeout(syncTimeout);
   syncTimeout = setTimeout(() => {
     const current = getLocalVaultFallback();
-    void saveVaultToBackend(current);
+    // ------------------------------------------------------------------
+    // EXPLICIT PARTIAL — do NOT pass `current` wholesale.
+    //
+    // `getLocalVaultFallback()` is a snapshot of localStorage, which
+    // only tracks the five frontend-managed keys (cloud_vault,
+    // custom_endpoints, lmstudio_vault, ollama_vault, scanned_models).
+    //
+    // The backend-managed keys — `provider_connections` and
+    // `provider_package_models` — are NEVER stored in localStorage.
+    // If this function passed `current` directly to
+    // `saveVaultToBackend`, those keys would be `undefined` in the
+    // payload, and any subsequent code path that JSON-stringifies the
+    // payload would either omit them (correct) or include empty
+    // defaults (catastrophic — overwrites live data with `{}`/`[]`).
+    //
+    // Constructing the partial explicitly removes all ambiguity: only
+    // the five keys this function is actually responsible for are
+    // ever transmitted.
+    // ------------------------------------------------------------------
+    void saveVaultToBackend({
+      cloud_vault: current.cloud_vault,
+      custom_endpoints: current.custom_endpoints,
+      lmstudio_vault: current.lmstudio_vault,
+      ollama_vault: current.ollama_vault,
+      scanned_models: current.scanned_models,
+    });
   }, delay);
 }
 

@@ -1,6 +1,6 @@
 {
-  "generatedAt": "2026-10-14T14:26:38.323Z",
-  "count": 139,
+  "generatedAt": "2026-11-08T14:07:47.179Z",
+  "count": 147,
   "icons": [
     "7zip",
     "ai-studio-google",
@@ -12,6 +12,7 @@
     "anthropic-dark",
     "anthropic-light",
     "anthropic-mono",
+    "anthropic-s",
     "anthropic-wordmark",
     "apple-badge",
     "aws-cat-artificial-intelligence",
@@ -33,12 +34,16 @@
     "claude-ai-wordmark",
     "claude-ai-wordmark-dark",
     "claude-ai-wordmark-light",
+    "cloudflare",
+    "cloudflare-mono",
+    "cloudflare-wordmark",
     "csharp",
     "css",
     "css (1)",
     "css-mono",
     "css-new",
     "deepseek",
+    "deepseek-light",
     "discord-badge",
     "duckduckgo",
     "duckduckgo-mono",
@@ -51,6 +56,7 @@
     "gemini-google-color",
     "gemini-google-mono",
     "gigachat",
+    "gigachat-3-ultra",
     "git",
     "git-mono",
     "github",
@@ -62,6 +68,7 @@
     "github-wordmark-light",
     "gmail-2026",
     "google",
+    "google-light",
     "google-mono",
     "google-wordmark",
     "gopher",
@@ -106,6 +113,7 @@
     "ollama-mono",
     "openai-badge",
     "openai-chatgpt",
+    "openai-chatgpt-light",
     "openai-chatgpt-mono",
     "perl",
     "php",
@@ -162,6 +170,9 @@
       "anthropic-mono",
       "anthropic-wordmark"
     ],
+    "anthropic-s": [
+      "anthropic-s"
+    ],
     "apple-badge": [
       "apple-badge"
     ],
@@ -214,6 +225,11 @@
       "claude-ai-wordmark-dark",
       "claude-ai-wordmark-light"
     ],
+    "cloudflare": [
+      "cloudflare",
+      "cloudflare-mono",
+      "cloudflare-wordmark"
+    ],
     "csharp": [
       "csharp"
     ],
@@ -228,7 +244,8 @@
       "css-new"
     ],
     "deepseek": [
-      "deepseek"
+      "deepseek",
+      "deepseek-light"
     ],
     "discord-badge": [
       "discord-badge"
@@ -254,6 +271,9 @@
     "gigachat": [
       "gigachat"
     ],
+    "gigachat-3-ultra": [
+      "gigachat-3-ultra"
+    ],
     "git": [
       "git",
       "git-mono"
@@ -274,6 +294,7 @@
     ],
     "google": [
       "google",
+      "google-light",
       "google-mono",
       "google-wordmark"
     ],
@@ -362,6 +383,7 @@
     ],
     "openai-chatgpt": [
       "openai-chatgpt",
+      "openai-chatgpt-light",
       "openai-chatgpt-mono"
     ],
     "perl": [

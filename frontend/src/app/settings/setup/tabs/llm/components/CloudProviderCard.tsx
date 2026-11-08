@@ -14,8 +14,11 @@ import {
   Zap,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Icon } from "@/components/Icon/Icon";
 import { resolveProviderIcon } from "../constants";
+import {
+  ProviderBadgeIcon,
+  isSvgBadge,
+} from "@/components/Icon/ProviderBadgeIcon";
 import type { CloudProviderCardProps } from "../types";
 
 /* -------------------------------------------------------------------------- */
@@ -53,7 +56,20 @@ export function CloudProviderCard({
   onSetVision,
   onOpenDiscovery,
 }: CloudProviderCardProps) {
-  const iconName = resolveProviderIcon(provider.id || provider.name);
+  // Fallback icon when `provider.badge` is absent. `resolveProviderIcon`
+  // resolves the provider id/name via PROVIDER_ICON_MAP, preserving the
+  // pre-badge behavior exactly — so existing vaults without a `badge`
+  // field render identically to before this change.
+  const fallbackIcon = resolveProviderIcon(provider.id || provider.name);
+
+  // `provider.badge` may hold either an icon name (e.g. "gigachat") or
+  // inline SVG markup (e.g. "<svg xmlns=...>"). `isSvgBadge`
+  // distinguishes the two. We use this flag below to decide whether the
+  // textual badge pill should be rendered at all — showing raw XML
+  // markup inside a `font-mono` pill would produce visible `<svg ...>`
+  // noise, which is precisely the regression this guard prevents.
+  const badgeIsSvg = isSvgBadge(provider.badge);
+
   const status = provider.status;
 
   /* Defensive normalization.
@@ -89,11 +105,11 @@ export function CloudProviderCard({
       <div className="flex items-center justify-between border-b border-border/50 pb-2.5 gap-2 flex-wrap">
         <div className="flex items-center gap-2 min-w-0 flex-wrap">
           <span className="shrink-0 flex items-center justify-center text-primary">
-            <Icon
-              name={iconName}
+            <ProviderBadgeIcon
+              badge={provider.badge}
+              fallback={fallbackIcon}
               size={25}
               title={`${provider.name} logo`}
-             variant="light"
             />
           </span>
 
@@ -101,9 +117,17 @@ export function CloudProviderCard({
             {provider.name}
           </span>
 
-          <span className="text-[9px] px-1.5 py-0.5 rounded-sm bg-muted text-muted-foreground font-mono">
-            {provider.badge}
-          </span>
+          {/* The textual badge pill is rendered ONLY when `badge` is a
+              bare icon name. For inline SVG badges the visual identity
+              is already conveyed by the icon to the left; printing the
+              raw markup would expose XML noise to the user. Empty
+              badges are skipped too, since there is nothing meaningful
+              to show. */}
+          {!badgeIsSvg && provider.badge && (
+            <span className="text-[9px] px-1.5 py-0.5 rounded-sm bg-muted text-muted-foreground font-mono">
+              {provider.badge}
+            </span>
+          )}
 
           {status === "online" && (
             <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-sm border border-emerald-500/20">

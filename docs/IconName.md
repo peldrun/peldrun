@@ -2,8 +2,8 @@
 
 Auto-generated list of all SVG icons in `public/icon/`.
 
-- **Total icons:** 139
-- **Generated at:** 2026-10-14T14:26:38.341Z
+- **Total icons:** 147
+- **Generated at:** 2026-11-08T14:07:47.196Z
 - **Source:** `public/icon/manifest.json`
 
 > ⚠️ This file is generated automatically. Do not edit it by hand.
@@ -19,6 +19,7 @@ Auto-generated list of all SVG icons in `public/icon/`.
 | `ai-studio-google` | default, mono | 2 |
 | `amazon-web-services` | default, dark, light | 3 |
 | `anthropic` | default, dark, light, mono, wordmark | 5 |
+| `anthropic-s` | default | 1 |
 | `apple-badge` | default | 1 |
 | `aws-cat-artificial-intelligence` | default | 1 |
 | `azure-app-service-certificates` | default | 1 |
@@ -35,22 +36,24 @@ Auto-generated list of all SVG icons in `public/icon/`.
 | `circuitpython` | default | 1 |
 | `claude-ai` | default, wordmark | 2 |
 | `claude-ai-wordmark` | dark, light | 2 |
+| `cloudflare` | default, mono, wordmark | 3 |
 | `csharp` | default | 1 |
 | `css` | default, mono | 2 |
 | `css (1)` | default | 1 |
 | `css-new` | default | 1 |
-| `deepseek` | default | 1 |
+| `deepseek` | default, light | 2 |
 | `discord-badge` | default | 1 |
 | `duckduckgo` | default, mono, wordmark | 3 |
 | `essential-ai` | default, color, mono | 3 |
 | `gemini` | default | 1 |
 | `gemini-google` | default, color, mono | 3 |
 | `gigachat` | default | 1 |
+| `gigachat-3-ultra` | default | 1 |
 | `git` | default, mono | 2 |
 | `github` | default, dark, light, mono, wordmark | 5 |
 | `github-wordmark` | dark, light | 2 |
 | `gmail-2026` | default | 1 |
-| `google` | default, mono, wordmark | 3 |
+| `google` | default, light, mono, wordmark | 4 |
 | `gopher` | default | 1 |
 | `html5` | default, mono | 2 |
 | `hugging-face` | default, mono | 2 |
@@ -72,7 +75,7 @@ Auto-generated list of all SVG icons in `public/icon/`.
 | `nvidia` | default, dark, light, mono | 4 |
 | `ollama` | default, dark, light, mono | 4 |
 | `openai-badge` | default | 1 |
-| `openai-chatgpt` | default, mono | 2 |
+| `openai-chatgpt` | default, light, mono | 3 |
 | `perl` | default | 1 |
 | `php` | default | 1 |
 | `postgresql-badge` | default | 1 |
@@ -113,135 +116,143 @@ Auto-generated list of all SVG icons in `public/icon/`.
 | 8 | `anthropic-dark` | anthropic-dark.svg |
 | 9 | `anthropic-light` | anthropic-light.svg |
 | 10 | `anthropic-mono` | anthropic-mono.svg |
-| 11 | `anthropic-wordmark` | anthropic-wordmark.svg |
-| 12 | `apple-badge` | apple-badge.svg |
-| 13 | `aws-cat-artificial-intelligence` | aws-cat-artificial-intelligence.svg |
-| 14 | `azure-app-service-certificates` | azure-app-service-certificates.svg |
-| 15 | `azure-app-service-environments` | azure-app-service-environments.svg |
-| 16 | `azure-app-service-plans` | azure-app-service-plans.svg |
-| 17 | `azure-cdn-profiles` | azure-cdn-profiles.svg |
-| 18 | `bash` | bash.svg |
-| 19 | `bing` | bing.svg |
-| 20 | `brave` | brave.svg |
-| 21 | `brave-mono` | brave-mono.svg |
-| 22 | `bytedance` | bytedance.svg |
-| 23 | `bytedance-mono` | bytedance-mono.svg |
-| 24 | `c-plusplus` | c-plusplus.svg |
-| 25 | `c-sharp` | c-sharp.svg |
-| 26 | `chrome` | chrome.svg |
-| 27 | `circuitpython` | circuitpython.svg |
-| 28 | `claude-ai` | claude-ai.svg |
-| 29 | `claude-ai-wordmark` | claude-ai-wordmark.svg |
-| 30 | `claude-ai-wordmark-dark` | claude-ai-wordmark-dark.svg |
-| 31 | `claude-ai-wordmark-light` | claude-ai-wordmark-light.svg |
-| 32 | `csharp` | csharp.svg |
-| 33 | `css` | css.svg |
-| 34 | `css (1)` | css (1).svg |
-| 35 | `css-mono` | css-mono.svg |
-| 36 | `css-new` | css-new.svg |
-| 37 | `deepseek` | deepseek.svg |
-| 38 | `discord-badge` | discord-badge.svg |
-| 39 | `duckduckgo` | duckduckgo.svg |
-| 40 | `duckduckgo-mono` | duckduckgo-mono.svg |
-| 41 | `duckduckgo-wordmark` | duckduckgo-wordmark.svg |
-| 42 | `essential-ai` | essential-ai.svg |
-| 43 | `essential-ai-color` | essential-ai-color.svg |
-| 44 | `essential-ai-mono` | essential-ai-mono.svg |
-| 45 | `gemini` | gemini.svg |
-| 46 | `gemini-google` | gemini-google.svg |
-| 47 | `gemini-google-color` | gemini-google-color.svg |
-| 48 | `gemini-google-mono` | gemini-google-mono.svg |
-| 49 | `gigachat` | gigachat.svg |
-| 50 | `git` | git.svg |
-| 51 | `git-mono` | git-mono.svg |
-| 52 | `github` | github.svg |
-| 53 | `github-dark` | github-dark.svg |
-| 54 | `github-light` | github-light.svg |
-| 55 | `github-mono` | github-mono.svg |
-| 56 | `github-wordmark` | github-wordmark.svg |
-| 57 | `github-wordmark-dark` | github-wordmark-dark.svg |
-| 58 | `github-wordmark-light` | github-wordmark-light.svg |
-| 59 | `gmail-2026` | gmail-2026.svg |
-| 60 | `google` | google.svg |
-| 61 | `google-mono` | google-mono.svg |
-| 62 | `google-wordmark` | google-wordmark.svg |
-| 63 | `gopher` | gopher.svg |
-| 64 | `html5` | html5.svg |
-| 65 | `html5-mono` | html5-mono.svg |
-| 66 | `hugging-face` | hugging-face.svg |
-| 67 | `hugging-face-mono` | hugging-face-mono.svg |
-| 68 | `ibm` | ibm.svg |
-| 69 | `java` | java.svg |
-| 70 | `javascript` | javascript.svg |
-| 71 | `javascript-mono` | javascript-mono.svg |
-| 72 | `javascript-wordmark` | javascript-wordmark.svg |
-| 73 | `jina-ai` | jina-ai.svg |
-| 74 | `jina-ai (1)` | jina-ai (1).svg |
-| 75 | `jina-ai-mono` | jina-ai-mono.svg |
-| 76 | `jina-ai-mono (1)` | jina-ai-mono (1).svg |
-| 77 | `kotlin` | kotlin.svg |
-| 78 | `liquid` | liquid.svg |
-| 79 | `lm-studio` | lm-studio.svg |
-| 80 | `lm-studio-mono` | lm-studio-mono.svg |
-| 81 | `markdown` | markdown.svg |
-| 82 | `markdown-dark` | markdown-dark.svg |
-| 83 | `markdown-light` | markdown-light.svg |
-| 84 | `markdown-mono` | markdown-mono.svg |
-| 85 | `meta` | meta.svg |
-| 86 | `meta-mono` | meta-mono.svg |
-| 87 | `meta-wordmark` | meta-wordmark.svg |
-| 88 | `microsoft` | microsoft.svg |
-| 89 | `microsoft-badge` | microsoft-badge.svg |
-| 90 | `microsoft-wordmark` | microsoft-wordmark.svg |
-| 91 | `mistral-ai` | mistral-ai.svg |
-| 92 | `mistral-ai-mono` | mistral-ai-mono.svg |
-| 93 | `mistral-ai-wordmark` | mistral-ai-wordmark.svg |
-| 94 | `notion-badge` | notion-badge.svg |
-| 95 | `nvidia` | nvidia.svg |
-| 96 | `nvidia-dark` | nvidia-dark.svg |
-| 97 | `nvidia-light` | nvidia-light.svg |
-| 98 | `nvidia-mono` | nvidia-mono.svg |
-| 99 | `ollama` | ollama.svg |
-| 100 | `ollama-dark` | ollama-dark.svg |
-| 101 | `ollama-light` | ollama-light.svg |
-| 102 | `ollama-mono` | ollama-mono.svg |
-| 103 | `openai-badge` | openai-badge.svg |
-| 104 | `openai-chatgpt` | openai-chatgpt.svg |
-| 105 | `openai-chatgpt-mono` | openai-chatgpt-mono.svg |
-| 106 | `perl` | perl.svg |
-| 107 | `php` | php.svg |
-| 108 | `postgresql-badge` | postgresql-badge.svg |
-| 109 | `powershell` | powershell.svg |
-| 110 | `proton-badge` | proton-badge.svg |
-| 111 | `pyscript` | pyscript.svg |
-| 112 | `python` | python.svg |
-| 113 | `python-mono` | python-mono.svg |
-| 114 | `python-package-index-badge` | python-package-index-badge.svg |
-| 115 | `qwen` | qwen.svg |
-| 116 | `qwen-dark` | qwen-dark.svg |
-| 117 | `qwen-light` | qwen-light.svg |
-| 118 | `rect` | rect.svg |
-| 119 | `ruby` | ruby.svg |
-| 120 | `rust` | rust.svg |
-| 121 | `sass` | sass.svg |
-| 122 | `searxng` | searxng.svg |
-| 123 | `searxng-mono` | searxng-mono.svg |
-| 124 | `svg` | svg.svg |
-| 125 | `swift` | swift.svg |
-| 126 | `tavily` | tavily.svg |
-| 127 | `tavily-color` | tavily-color.svg |
-| 128 | `tavily-mono` | tavily-mono.svg |
-| 129 | `typescript` | typescript.svg |
-| 130 | `typescript-mono` | typescript-mono.svg |
-| 131 | `typescript-wordmark` | typescript-wordmark.svg |
-| 132 | `wordpress` | wordpress.svg |
-| 133 | `wordpress-badge` | wordpress-badge.svg |
-| 134 | `wordpress-mono` | wordpress-mono.svg |
-| 135 | `yandex` | yandex.svg |
-| 136 | `yandex-badge` | yandex-badge.svg |
-| 137 | `yandex-cloud` | yandex-cloud.svg |
-| 138 | `yandex-cloud-mono` | yandex-cloud-mono.svg |
-| 139 | `yandex-mono` | yandex-mono.svg |
+| 11 | `anthropic-s` | anthropic-s.svg |
+| 12 | `anthropic-wordmark` | anthropic-wordmark.svg |
+| 13 | `apple-badge` | apple-badge.svg |
+| 14 | `aws-cat-artificial-intelligence` | aws-cat-artificial-intelligence.svg |
+| 15 | `azure-app-service-certificates` | azure-app-service-certificates.svg |
+| 16 | `azure-app-service-environments` | azure-app-service-environments.svg |
+| 17 | `azure-app-service-plans` | azure-app-service-plans.svg |
+| 18 | `azure-cdn-profiles` | azure-cdn-profiles.svg |
+| 19 | `bash` | bash.svg |
+| 20 | `bing` | bing.svg |
+| 21 | `brave` | brave.svg |
+| 22 | `brave-mono` | brave-mono.svg |
+| 23 | `bytedance` | bytedance.svg |
+| 24 | `bytedance-mono` | bytedance-mono.svg |
+| 25 | `c-plusplus` | c-plusplus.svg |
+| 26 | `c-sharp` | c-sharp.svg |
+| 27 | `chrome` | chrome.svg |
+| 28 | `circuitpython` | circuitpython.svg |
+| 29 | `claude-ai` | claude-ai.svg |
+| 30 | `claude-ai-wordmark` | claude-ai-wordmark.svg |
+| 31 | `claude-ai-wordmark-dark` | claude-ai-wordmark-dark.svg |
+| 32 | `claude-ai-wordmark-light` | claude-ai-wordmark-light.svg |
+| 33 | `cloudflare` | cloudflare.svg |
+| 34 | `cloudflare-mono` | cloudflare-mono.svg |
+| 35 | `cloudflare-wordmark` | cloudflare-wordmark.svg |
+| 36 | `csharp` | csharp.svg |
+| 37 | `css` | css.svg |
+| 38 | `css (1)` | css (1).svg |
+| 39 | `css-mono` | css-mono.svg |
+| 40 | `css-new` | css-new.svg |
+| 41 | `deepseek` | deepseek.svg |
+| 42 | `deepseek-light` | deepseek-light.svg |
+| 43 | `discord-badge` | discord-badge.svg |
+| 44 | `duckduckgo` | duckduckgo.svg |
+| 45 | `duckduckgo-mono` | duckduckgo-mono.svg |
+| 46 | `duckduckgo-wordmark` | duckduckgo-wordmark.svg |
+| 47 | `essential-ai` | essential-ai.svg |
+| 48 | `essential-ai-color` | essential-ai-color.svg |
+| 49 | `essential-ai-mono` | essential-ai-mono.svg |
+| 50 | `gemini` | gemini.svg |
+| 51 | `gemini-google` | gemini-google.svg |
+| 52 | `gemini-google-color` | gemini-google-color.svg |
+| 53 | `gemini-google-mono` | gemini-google-mono.svg |
+| 54 | `gigachat` | gigachat.svg |
+| 55 | `gigachat-3-ultra` | gigachat-3-ultra.svg |
+| 56 | `git` | git.svg |
+| 57 | `git-mono` | git-mono.svg |
+| 58 | `github` | github.svg |
+| 59 | `github-dark` | github-dark.svg |
+| 60 | `github-light` | github-light.svg |
+| 61 | `github-mono` | github-mono.svg |
+| 62 | `github-wordmark` | github-wordmark.svg |
+| 63 | `github-wordmark-dark` | github-wordmark-dark.svg |
+| 64 | `github-wordmark-light` | github-wordmark-light.svg |
+| 65 | `gmail-2026` | gmail-2026.svg |
+| 66 | `google` | google.svg |
+| 67 | `google-light` | google-light.svg |
+| 68 | `google-mono` | google-mono.svg |
+| 69 | `google-wordmark` | google-wordmark.svg |
+| 70 | `gopher` | gopher.svg |
+| 71 | `html5` | html5.svg |
+| 72 | `html5-mono` | html5-mono.svg |
+| 73 | `hugging-face` | hugging-face.svg |
+| 74 | `hugging-face-mono` | hugging-face-mono.svg |
+| 75 | `ibm` | ibm.svg |
+| 76 | `java` | java.svg |
+| 77 | `javascript` | javascript.svg |
+| 78 | `javascript-mono` | javascript-mono.svg |
+| 79 | `javascript-wordmark` | javascript-wordmark.svg |
+| 80 | `jina-ai` | jina-ai.svg |
+| 81 | `jina-ai (1)` | jina-ai (1).svg |
+| 82 | `jina-ai-mono` | jina-ai-mono.svg |
+| 83 | `jina-ai-mono (1)` | jina-ai-mono (1).svg |
+| 84 | `kotlin` | kotlin.svg |
+| 85 | `liquid` | liquid.svg |
+| 86 | `lm-studio` | lm-studio.svg |
+| 87 | `lm-studio-mono` | lm-studio-mono.svg |
+| 88 | `markdown` | markdown.svg |
+| 89 | `markdown-dark` | markdown-dark.svg |
+| 90 | `markdown-light` | markdown-light.svg |
+| 91 | `markdown-mono` | markdown-mono.svg |
+| 92 | `meta` | meta.svg |
+| 93 | `meta-mono` | meta-mono.svg |
+| 94 | `meta-wordmark` | meta-wordmark.svg |
+| 95 | `microsoft` | microsoft.svg |
+| 96 | `microsoft-badge` | microsoft-badge.svg |
+| 97 | `microsoft-wordmark` | microsoft-wordmark.svg |
+| 98 | `mistral-ai` | mistral-ai.svg |
+| 99 | `mistral-ai-mono` | mistral-ai-mono.svg |
+| 100 | `mistral-ai-wordmark` | mistral-ai-wordmark.svg |
+| 101 | `notion-badge` | notion-badge.svg |
+| 102 | `nvidia` | nvidia.svg |
+| 103 | `nvidia-dark` | nvidia-dark.svg |
+| 104 | `nvidia-light` | nvidia-light.svg |
+| 105 | `nvidia-mono` | nvidia-mono.svg |
+| 106 | `ollama` | ollama.svg |
+| 107 | `ollama-dark` | ollama-dark.svg |
+| 108 | `ollama-light` | ollama-light.svg |
+| 109 | `ollama-mono` | ollama-mono.svg |
+| 110 | `openai-badge` | openai-badge.svg |
+| 111 | `openai-chatgpt` | openai-chatgpt.svg |
+| 112 | `openai-chatgpt-light` | openai-chatgpt-light.svg |
+| 113 | `openai-chatgpt-mono` | openai-chatgpt-mono.svg |
+| 114 | `perl` | perl.svg |
+| 115 | `php` | php.svg |
+| 116 | `postgresql-badge` | postgresql-badge.svg |
+| 117 | `powershell` | powershell.svg |
+| 118 | `proton-badge` | proton-badge.svg |
+| 119 | `pyscript` | pyscript.svg |
+| 120 | `python` | python.svg |
+| 121 | `python-mono` | python-mono.svg |
+| 122 | `python-package-index-badge` | python-package-index-badge.svg |
+| 123 | `qwen` | qwen.svg |
+| 124 | `qwen-dark` | qwen-dark.svg |
+| 125 | `qwen-light` | qwen-light.svg |
+| 126 | `rect` | rect.svg |
+| 127 | `ruby` | ruby.svg |
+| 128 | `rust` | rust.svg |
+| 129 | `sass` | sass.svg |
+| 130 | `searxng` | searxng.svg |
+| 131 | `searxng-mono` | searxng-mono.svg |
+| 132 | `svg` | svg.svg |
+| 133 | `swift` | swift.svg |
+| 134 | `tavily` | tavily.svg |
+| 135 | `tavily-color` | tavily-color.svg |
+| 136 | `tavily-mono` | tavily-mono.svg |
+| 137 | `typescript` | typescript.svg |
+| 138 | `typescript-mono` | typescript-mono.svg |
+| 139 | `typescript-wordmark` | typescript-wordmark.svg |
+| 140 | `wordpress` | wordpress.svg |
+| 141 | `wordpress-badge` | wordpress-badge.svg |
+| 142 | `wordpress-mono` | wordpress-mono.svg |
+| 143 | `yandex` | yandex.svg |
+| 144 | `yandex-badge` | yandex-badge.svg |
+| 145 | `yandex-cloud` | yandex-cloud.svg |
+| 146 | `yandex-cloud-mono` | yandex-cloud-mono.svg |
+| 147 | `yandex-mono` | yandex-mono.svg |
 
 ---
 

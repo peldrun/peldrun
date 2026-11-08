@@ -13,7 +13,8 @@ import {
   AlertTriangle,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Icon } from "@/components/Icon/Icon";
+import { ProviderBadgeIcon } from "@/components/Icon/ProviderBadgeIcon";
+import { resolveProviderIcon } from "./llm/constants";
 import { showToast } from "@/components/ui/ToastNotification";
 import type {
   CloudProviderVaultItem,
@@ -51,6 +52,25 @@ interface ProviderConnection {
   enabled?: boolean;
   created_at?: string;
   updated_at?: string;
+  /**
+   * Canonical icon identifier for this provider connection.
+   *
+   * Auto-filled by the backend from `manifest.icon` inside
+   * `save_provider_connection()`. May contain either:
+   *   - An icon base name ("cloudflare", "gigachat", "openai-chatgpt").
+   *   - Inline SVG markup (starts with `<svg`).
+   *
+   * `<ProviderBadgeIcon>` detects the shape automatically — no
+   * `icon_type` flag is required at this layer.
+   *
+   * Optional because:
+   *   - The connection may predate the badge auto-fill feature.
+   *   - The package's manifest may not declare an `icon` field
+   *     (e.g. GigaChat at time of writing).
+   *   - The frontend may be reading a vault snapshot taken before
+   *     the backend populated this field.
+   */
+  badge?: string;
 }
 
 interface VaultData {
@@ -189,7 +209,23 @@ async function probeVaultEndpoint(base: string): Promise<VaultData | null> {
   for (const path of VAULT_PATH_CANDIDATES) {
     const url = `${base}${path}`;
     try {
-      const res = await fetch(url);
+      // CRITICAL: `cache: "no-store"` prevents the browser from serving
+      // a stale cached vault response. Without this directive, the
+      // following sequence silently loses data:
+      //
+      //   1. User opens settings → GET /api/config/vault (empty)
+      //      → browser heuristically caches the empty payload because
+      //      the backend does not send explicit Cache-Control headers.
+      //   2. User saves a package's models in StoreProvidersTab →
+      //      POST /api/config/vault updates the on-disk file.
+      //   3. User switches to ModelBudgetsTab → GET /api/config/vault
+      //      → browser serves the CACHED empty response → the
+      //      newly-selected package models never appear in the budget
+      //      UI, even though they are already persisted on the backend.
+      //
+      // The vault is live mutable state, not a static asset — bypassing
+      // the browser cache is the only correct semantics.
+      const res = await fetch(url, { cache: "no-store" });
       if (!res.ok) continue;
       const data = await res.json();
       /* Backend may return { vault: {...} } or the payload bare */
@@ -210,32 +246,31 @@ async function probeVaultEndpoint(base: string): Promise<VaultData | null> {
 }
 
 /* ============================================================
- * resolveLucideIcon
+ * Provider icon rendering
  *
- * The `badge` field inside models_vault.json is used verbatim
- * as the icon identifier. Whatever string the vault stores for
- * a provider is passed straight to the local SVG inventory:
+ * Icons for every provider group are rendered via the shared
+ * `<ProviderBadgeIcon>` component, which accepts BOTH:
  *
- *   <Icon name="deepseek" />
- *   <Icon name="openai-chatgpt" />
- *   <Icon name="lm-studio" />
- *   <Icon name="gemini-google" />
+ *   1. A `badge` value that may be either:
+ *        - an icon base name ("cloudflare", "gigachat"), OR
+ *        - inline SVG markup (starts with `<svg`).
  *
- * No alias table, no normalisation, no hardcoded mapping —
- * the vault is the single source of truth for provider metadata
- * and its visual identity alike.
+ *   2. A `fallback` icon base name used when `badge` is absent,
+ *      empty, or fails SVG sanitization.
+ *
+ * This replaced the local `ProviderIcon` helper, whose narrow
+ * signature (icon-name string → string → <Icon>) could not render
+ * SVG badges and therefore diverged from `CloudProviderCard` /
+ * `PackageCard` — both of which already use `ProviderBadgeIcon`
+ * after the badge migration.
+ *
+ * `resolveProviderIcon` maps a provider id/name to a bundled icon
+ * base name via `PROVIDER_ICON_MAP`. Using it as the `fallback`
+ * preserves the EXACT pre-migration visual output for every
+ * provider whose vault entry has no `badge` field yet — including
+ * legacy connections created before the badge auto-fill backend
+ * change.
  * ============================================================ */
-function resolveLucideIcon(badge?: string): string {
-  return (badge || "").trim();
-}
-
-function ProviderIcon({ badge, size = 15 }: { badge?: string; size?: number }) {
-  const name = resolveLucideIcon(badge);
-  if (!name) {
-    return <Sparkles size={size} className="text-primary" />;
-  }
-  return <Icon name={name} size={size} />;
-}
 
 /* ============================================================
  * Intelligent multi-tier heuristic to resolve model limits.
@@ -326,9 +361,34 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
       try {
         const base = resolveBackendBase();
 
+        // ------------------------------------------------------------------
+        // CRITICAL: `cache: "no-store"` on every fetch below.
+        //
+        // All three endpoints serve LIVE mutable state that other tabs and
+        // components write to continuously:
+        //
+        //   * /api/config/model-budgets    — edited by THIS tab. A stale
+        //     cache leaves `budgets` state empty, which then makes the next
+        //     "Save All Budgets" click overwrite every previously-edited
+        //     budget with resolver defaults — silent data loss.
+        //
+        //   * /api/config/models-metadata  — rewritten by /fetch-models
+        //     on every "Scan Models" click. A stale cache makes Auto-Detect
+        //     and per-model capability badges read yesterday's metadata.
+        //
+        //   * probeVaultEndpoint already applies `cache: "no-store"`
+        //     internally, so the vault fetch inherits the same guarantee.
+        //
+        // Bypassing the browser cache is the only correct semantics for
+        // endpoints that back user-editable persistent state.
+        // ------------------------------------------------------------------
         const [budgetsRes, metaRes, vaultData] = await Promise.all([
-          fetch(`${base}/api/config/model-budgets`).catch(() => null),
-          fetch(`${base}/api/config/models-metadata`).catch(() => null),
+          fetch(`${base}/api/config/model-budgets`, {
+            cache: "no-store",
+          }).catch(() => null),
+          fetch(`${base}/api/config/models-metadata`, {
+            cache: "no-store",
+          }).catch(() => null),
           probeVaultEndpoint(base),
         ]);
 
@@ -355,7 +415,14 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
 
         /* --- Global config (for default temperature) --- */
         try {
-          const cfgRes = await fetch(`${base}/api/config`);
+          // `cache: "no-store"` mirrors the other fetches above. The
+          // global temperature is edited via ContextBudgetPanel and saved
+          // through POST /api/config. Serving a stale cached value here
+          // would make the per-model "Reset to global default" action
+          // restore an outdated temperature.
+          const cfgRes = await fetch(`${base}/api/config`, {
+            cache: "no-store",
+          });
           if (cfgRes.ok) {
             const cfgData = await cfgRes.json();
             const rawTemp = cfgData?.config?.llm?.temperature;
@@ -449,7 +516,13 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
         apiKey: cp.apiKey || "",
         metadataEndpoint: (cp as any).metadataEndpoint || "",
         badge: cp.badge || "",
-        icon: <ProviderIcon badge={cp.badge} />,
+        icon: (
+          <ProviderBadgeIcon
+            badge={cp.badge}
+            fallback={resolveProviderIcon(cp.id || cp.name)}
+            size={15}
+          />
+        ),
         models: uniqueModels.map((m) => {
           const limits = resolveIntelligentLimits(m, metadataVault);
           return {
@@ -478,7 +551,13 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
           apiKey: lm.apiKey || "",
           metadataEndpoint: (lm as any).metadataEndpoint || "",
           badge: lm.badge || "",
-          icon: <ProviderIcon badge={lm.badge} />,
+          icon: (
+            <ProviderBadgeIcon
+              badge={lm.badge}
+              fallback={resolveProviderIcon("lmstudio")}
+              size={15}
+            />
+          ),
           models: lmModels.map((m) => {
             const limits = resolveIntelligentLimits(m, metadataVault);
             return {
@@ -510,7 +589,13 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
           apiKey: "",
           metadataEndpoint: (ol as any).metadataEndpoint || "",
           badge: ol.badge || "",
-          icon: <ProviderIcon badge={ol.badge} />,
+          icon: (
+            <ProviderBadgeIcon
+              badge={ol.badge}
+              fallback={resolveProviderIcon("ollama")}
+              size={15}
+            />
+          ),
           models: olModels.map((m) => {
             const limits = resolveIntelligentLimits(m, metadataVault);
             return {
@@ -544,7 +629,13 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
         apiKey: ce.apiKey || "",
         metadataEndpoint: (ce as any).metadataEndpoint || "",
         badge,
-        icon: <ProviderIcon badge={badge} />,
+        icon: (
+          <ProviderBadgeIcon
+            badge={badge}
+            fallback={resolveProviderIcon(ce.providerId || ce.id || ce.name)}
+            size={15}
+          />
+        ),
         models: ceModels.map((m) => {
           const limits = resolveIntelligentLimits(m, metadataVault);
           return {
@@ -613,10 +704,26 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
 
       const conn = connectionsByPackage.get(packageId);
       const displayName = conn?.name?.trim() || packageId;
-      // The package id doubles as the badge key; PROVIDER_ICON_MAP
-      // already resolves "gigachat" → "gigachat" and future packages
-      // inherit the same convention.
-      const badge = packageId;
+
+      // Badge resolution priority:
+      //
+      //   1. `conn.badge` — auto-filled by the backend from
+      //      `manifest.icon` inside `save_provider_connection()`.
+      //      Authoritative once a connection exists; supports both
+      //      icon base names and inline SVG markup.
+      //
+      //   2. `packageId` — historical fallback that works when the
+      //      package id coincides with a bundled icon name (which is
+      //      the convention every manifest currently follows). Also
+      //      the safety net for packages whose manifest does not
+      //      declare an `icon` field (e.g. GigaChat).
+      //
+      // Whitespace-only values are normalized to absent: `.trim()`
+      // is applied first, then the truthiness check in `||` treats
+      // an empty string as "no badge". This matches the same
+      // defensiveness applied in `useProviderPackages.reload()`.
+      const connBadge = conn?.badge?.trim();
+      const badge = connBadge || packageId;
 
       groups.push({
         groupId: `provider_package_${packageId}`,
@@ -630,7 +737,13 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
         apiKey: conn?.fields?.api_key?.trim() || "",
         metadataEndpoint: "",
         badge,
-        icon: <ProviderIcon badge={badge} />,
+        icon: (
+          <ProviderBadgeIcon
+            badge={badge}
+            fallback={resolveProviderIcon(packageId)}
+            size={15}
+          />
+        ),
         models: savedModels.map((m) => {
           const limits = resolveIntelligentLimits(m, metadataVault);
           return {

@@ -1,9 +1,9 @@
 {
   "_cache_meta": {
     "schema_version": 1,
-    "fetched_at": 1794049958.5427763,
+    "fetched_at": 1794159572.2768216,
     "source_url": "https://peldrunai.github.io/peldrun-provider-catalog/catalog.json",
-    "item_count": 1
+    "item_count": 2
   },
   "_items": {
     "gigachat": {
@@ -53,6 +53,115 @@
         "cloud"
       ],
       "connection_fields": [],
+      "certificates": []
+    },
+    "cloudflare-ai": {
+      "id": "cloudflare-ai",
+      "name": "Cloudflare Workers AI",
+      "display_name": "Cloudflare AI",
+      "description": "Cloudflare Workers AI provides serverless GPU inference for 50+ open-source models (Llama, Mistral, Qwen, DeepSeek, Kimi, Gemma) on Cloudflare's global network. Billed per neuron; free tier includes 10,000 neurons/day.",
+      "version": "1.0.5",
+      "transport": "native",
+      "features": {
+        "model_discovery": true,
+        "native_streaming": true,
+        "buffered_streaming": true,
+        "tool_calling": true,
+        "parallel_tool_calls": false,
+        "forced_tool_choice": false,
+        "vision": true,
+        "audio": false,
+        "structured_output": true,
+        "usage_reporting": true,
+        "reasoning": true
+      },
+      "permissions": {
+        "network": "connection_endpoint",
+        "secrets": [
+          "connection.api_key"
+        ],
+        "workspace_access": false,
+        "shell_execute": false
+      },
+      "download_url": "https://github.com/peldrunai/peldrun-provider-cloudflare-ai/releases/download/v1.0.5/cloudflare-ai-1.0.5.zip",
+      "checksum_sha256": "b60dafba8c2a77992d8c23aa8dcc9335f4351e466908a4b8083eb5f84bfa85aa",
+      "brand_color": "#F38020",
+      "icon": "cloudflare",
+      "icon_type": "name",
+      "author": "PELDRUN Community",
+      "author_url": "https://github.com/peldrun/peldrun-providers",
+      "homepage": "https://developers.cloudflare.com/workers-ai/",
+      "developer": {
+        "name": "PELDRUN Community",
+        "url": "https://github.com/peldrun/peldrun-providers",
+        "email": null,
+        "avatar_url": null,
+        "github_username": "peldrun",
+        "verified": false
+      },
+      "repository_url": "https://github.com/peldrunai/peldrun-provider-cloudflare-ai",
+      "license": "MIT",
+      "docs_url": "https://developers.cloudflare.com/workers-ai/",
+      "changelog_url": null,
+      "screenshots": [],
+      "tags": [
+        "cloudflare",
+        "workers-ai",
+        "serverless",
+        "llama",
+        "mistral",
+        "qwen",
+        "deepseek",
+        "kimi",
+        "gemma"
+      ],
+      "connection_fields": [
+        {
+          "key": "account_id",
+          "label": "Cloudflare Account ID",
+          "type": "string",
+          "required": true,
+          "default": null,
+          "placeholder": "023e105f4ecef8ad9ca31a8372d0c353",
+          "description": "Find it via `wrangler whoami` or in the Cloudflare dashboard URL (dash.cloudflare.com/<account_id>/...).",
+          "options": null,
+          "visible_if": null,
+          "accept": null,
+          "min_length": null,
+          "max_length": null,
+          "pattern": "^[a-f0-9]{32}$"
+        },
+        {
+          "key": "api_key",
+          "label": "API Token",
+          "type": "password",
+          "required": true,
+          "default": null,
+          "placeholder": null,
+          "description": "Create a token with the 'Workers AI Read' permission at dash.cloudflare.com/profile/api-tokens. Sent as Authorization: Bearer.",
+          "options": null,
+          "visible_if": null,
+          "accept": null,
+          "min_length": null,
+          "max_length": null,
+          "pattern": null
+        },
+        {
+          "key": "base_url",
+          "label": "Cloudflare API Host",
+          "type": "string",
+          "required": true,
+          "default": "api.cloudflare.com",
+          "placeholder": null,
+          "description": "Leave as default. Only change this if you are using a custom proxy.",
+          "options": null,
+          "visible_if": null,
+          "accept": null,
+          "min_length": null,
+          "max_length": null,
+          "pattern": null
+        }
+      ],
       "certificates": []
     }
   }

@@ -816,6 +816,16 @@ class RuntimePermissionEnforcer:
 
         allowed_scheme, allowed_host, allowed_port = self._allowed_parts
 
+        # FIX: Primary allowlist check (was missing).
+        # Without this, no provider can reach its own base_url
+        # unless it also appears in _PROVIDER_EXTRA_HOSTS.
+        if (
+            scheme == allowed_scheme
+            and port == allowed_port
+            and _hosts_are_equivalent(host, allowed_host)
+        ):
+            return  # Allowed by primary allowlist.
+
         # Try the provider's extra allowed hosts BEFORE raising.
         # This is what lets GigaChat reach its OAuth server (a
         # different host:port from the API endpoint).

@@ -2111,6 +2111,68 @@ def save_provider_connection(connection: dict) -> dict:
     if not isinstance(conn.get("fields"), dict):
         conn["fields"] = {}
 
+    # ------------------------------------------------------------------
+    # Auto-populate `badge` from the package manifest icon.
+    #
+    # The `badge` field is the canonical icon name (e.g. "gigachat",
+    # "deepseek", "claude-ai") used by consumers that must render the
+    # provider's logo WITHOUT having access to the package registry or
+    # catalog. Two known consumers:
+    #
+    #   * useProviderPackages → StoreProvidersTab (LLM settings)
+    #   * ModelBudgetsTab     → per-model budget accordion
+    #
+    # Both previously fell back to `provider.id` as the icon name,
+    # which happens to work only when the id matches an entry in the
+    # bundled PROVIDER_ICON_MAP. For future/custom packages whose id
+    # does not coincide with a bundled icon, the card rendered a
+    # placeholder. Persisting the manifest-declared icon in the
+    # connection record removes that limitation permanently.
+    #
+    # Resolution priority:
+    #   1. Explicit `badge` in the payload (frontend override) — wins.
+    #   2. `manifest.icon` from the active version — auto-filled.
+    #   3. Empty string — frontend falls back to `provider.id`.
+    #
+    # All failures are swallowed: a broken/missing manifest MUST NEVER
+    # block the user from saving the connection.
+    # ------------------------------------------------------------------
+    if not conn.get("badge"):
+        try:
+            # Lazy imports to avoid the circular dependency that would
+            # arise at module load time:
+            #   config_rtr.py ← providers.py  (imports load-bearing
+            #   helpers back from this module)
+            from omweb.provider_packages.package_manager import (
+                provider_package_manager as _ppm,
+            )
+            from omweb.routers.store.providers import _try_read_manifest
+
+            pkg_id = conn.get("provider_package_id")
+            if pkg_id:
+                entry = _ppm.get_package(pkg_id)
+                if entry is not None:
+                    manifest = _try_read_manifest(pkg_id, entry.active_version)
+                    icon_value = None
+                    if isinstance(manifest, dict):
+                        icon_value = manifest.get("icon")
+                    elif manifest is not None:
+                        # Defensive: some manifest implementations use
+                        # attribute access instead of dict access.
+                        icon_value = getattr(manifest, "icon", None)
+
+                    if isinstance(icon_value, str):
+                        trimmed = icon_value.strip()
+                        if trimmed:
+                            conn["badge"] = trimmed
+        except Exception as exc:
+            logger.debug(
+                "[save_provider_connection] Could not auto-fill badge "
+                "for package %r: %s",
+                conn.get("provider_package_id"),
+                exc,
+            )
+
     # Fill in defaults.
     conn.setdefault("name", conn["provider_package_id"])
     conn.setdefault("enabled", True)
@@ -2179,6 +2241,27 @@ def save_provider_connection(connection: dict) -> dict:
         # `is_active: false` explicitly must still deactivate.
         if "is_active" not in conn:
             conn["is_active"] = other.get("is_active", False)
+
+        # `badge` was auto-filled above ONLY when the incoming payload
+        # did not include it. Two paths reach this branch with an empty
+        # badge:
+        #   (a) `save_provider_connection` succeeded in reading the
+        #       manifest → `conn["badge"]` is a non-empty string →
+        #       this block is a no-op (the `if not ...` guard fails).
+        #   (b) Manifest read failed (missing file, corrupt JSON,
+        #       package temporarily unavailable) → `conn["badge"]` is
+        #       still empty → without this guard, the update would
+        #       ERASE the badge that was correctly persisted by a
+        #       previous successful save.
+        #
+        # Preserving the existing badge in case (b) is the safer
+        # choice: a stale-but-correct icon is infinitely better than
+        # no icon at all, and the next successful save will refresh
+        # the value from whatever the manifest declares at that time.
+        if not conn.get("badge"):
+            preserved_badge = other.get("badge")
+            if isinstance(preserved_badge, str) and preserved_badge.strip():
+                conn["badge"] = preserved_badge
 
         existing[i] = conn
         replaced = True
