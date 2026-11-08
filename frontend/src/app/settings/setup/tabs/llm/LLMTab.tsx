@@ -7,6 +7,10 @@ import {
   ModelDiscoveryModal,
   type ModelsDiscoverySavePayload,
 } from "../../ModelDiscoveryModal";
+import {
+  SavedModelsManagerModal,
+  type SavedModelsSavePayload,
+} from "./components/SavedModelsManagerModal";
 import { ModelInfoModal } from "@/components/models/ModelInfoModal";
 import {
   fetchServerMetadata,
@@ -190,6 +194,36 @@ export function LLMTab(props: LLMTabProps) {
   const [newOllamaModelInput, setNewOllamaModelInput] = useState("");
   const [infoModalModel, setInfoModalModel] = useState<string | null>(null);
   const [metadataVault, setMetadataVault] = useState<ModelMetadataVault>({});
+
+  /**
+   * Target provider whose saved-models list is currently being managed
+   * via `SavedModelsManagerModal`. Two kinds are handled by this tab:
+   *
+   *   * `"cloud"` — a `CloudProviderVaultItem` from `cloud_vault`.
+   *     Persistence goes through `setCloudProviders` +
+   *     `writeLocalJson(STORAGE_KEYS.cloudVault)` (mirrors the
+   *     `handleSaveDiscovered` path exactly).
+   *
+   *   * `"custom"` — a `CustomEndpoint` from `custom_endpoints`.
+   *     Persistence goes through `custom.applyDiscoveredModels`, which
+   *     already handles the localStorage write internally.
+   *
+   * `"package"` is NOT represented here — packages are managed
+   * exclusively from `StoreProvidersTab`, which owns its own modal
+   * state (see file 6). Keeping the kinds disjoint avoids an
+   * accidental overwrite across the two storage backends
+   * (`cloud_vault` / `custom_endpoints` vs `provider_package_models`).
+   */
+  type SavedModelsManagerTarget = {
+    kind: "cloud" | "custom";
+    id: string;
+    name: string;
+    savedModels: string[];
+    defaultModel?: string;
+  };
+
+  const [savedModelsManagerTarget, setSavedModelsManagerTarget] =
+    useState<SavedModelsManagerTarget | null>(null);
 
   /* -------------------------- Domain hooks ------------------------------ */
 
@@ -624,6 +658,149 @@ export function LLMTab(props: LLMTabProps) {
     [discovery]
   );
 
+  /* -------------------------- Saved Models Manager ---------------------- */
+
+  /**
+   * Open the Saved Models Manager for a cloud provider.
+   *
+   * Normalizes `savedModels` defensively: a legacy vault entry may hold
+   * a non-array value (see `CloudProviderCard.tsx`'s defensive comment).
+   * Passing a non-iterable to `new Set(...)` inside the modal would
+   * throw at render time.
+   */
+  const handleOpenCloudModelsManager = useCallback(
+    (providerId: string) => {
+      const cp = cloudProviders.find((p) => p.id === providerId);
+      if (!cp) return;
+      setSavedModelsManagerTarget({
+        kind: "cloud",
+        id: cp.id,
+        name: cp.name,
+        savedModels: Array.isArray(cp.savedModels) ? cp.savedModels : [],
+        defaultModel: cp.model,
+      });
+    },
+    [cloudProviders]
+  );
+
+  /**
+   * Open the Saved Models Manager for a custom endpoint.
+   *
+   * The endpoint's `defaultModel` is passed as the initial default —
+   * even when `savedModels` does not yet contain it. This mirrors the
+   * `ModelDiscoveryModal` behavior, where `primaryModel` survives even
+   * if the user unchecks it from the saved list.
+   */
+  const handleOpenCustomModelsManager = useCallback(
+    (endpointId: string) => {
+      const ce = customEndpoints.find((c) => c.id === endpointId);
+      if (!ce) return;
+      setSavedModelsManagerTarget({
+        kind: "custom",
+        id: ce.id,
+        name: ce.name,
+        savedModels: Array.isArray(ce.savedModels) ? ce.savedModels : [],
+        defaultModel: ce.defaultModel,
+      });
+    },
+    [customEndpoints]
+  );
+
+  /**
+   * Persist the changes from `SavedModelsManagerModal`.
+   *
+   * Follows the exact same two-phase approach as `handleSaveDiscovered`:
+   *
+   *   1. Update React state (`setCloudProviders` or
+   *      `custom.applyDiscoveredModels`) so the UI reflects the new
+   *      list immediately.
+   *
+   *   2. Mirror the write to localStorage so the "Save Config" button
+   *      in the sidebar (which reads from `cloudProviders` /
+   *      `customEndpoints` state, not from the backend vault) sends
+   *      the updated lists to `models_vault.json` on next click.
+   *
+   * The `savedModels` field is DELIBERATELY allowed to become empty.
+   * Unlike the discovery modal — where "save with zero selections" is
+   * a user error — the manager's "Keep None" action is a legitimate
+   * cleanup: the user is removing every model and keeping only the
+   * `defaultModel` as a placeholder.
+   */
+  const handleSaveSavedModels = useCallback(
+    (payload: SavedModelsSavePayload) => {
+      const target = savedModelsManagerTarget;
+      if (!target) return;
+
+      const selectedModels = Array.isArray(payload.models)
+        ? payload.models
+        : [];
+      const primaryModel = payload.defaultModel;
+
+      if (target.kind === "custom") {
+        /* `applyDiscoveredModels` already persists to localStorage
+           (`STORAGE_KEYS.customEndpoints`) and updates React state.
+           Reusing it keeps the write path identical between discovery
+           and management, eliminating a class of "one saves, the other
+           doesn't" bugs. */
+        custom.applyDiscoveredModels(
+          target.id,
+          selectedModels,
+          primaryModel
+        );
+      } else {
+        /* Cloud providers have no equivalent helper — mirror the
+           `handleSaveDiscovered` cloud branch verbatim to preserve
+           behavioral parity. */
+        setCloudProviders((prev: CloudProviderVaultItem[]) => {
+          const next = prev.map((cp) =>
+            cp.id === target.id
+              ? {
+                  ...cp,
+                  savedModels: selectedModels,
+                  model:
+                    primaryModel ||
+                    (selectedModels.length > 0
+                      ? selectedModels[0]
+                      : cp.model),
+                }
+              : cp
+          );
+
+          try {
+            const stored = JSON.parse(
+              window.localStorage.getItem(STORAGE_KEYS.cloudVault) || "[]"
+            );
+            const updated = stored.map((cp: CloudProviderVaultItem) =>
+              cp.id === target.id
+                ? {
+                    ...cp,
+                    savedModels: selectedModels,
+                    model:
+                      primaryModel ||
+                      (selectedModels.length > 0
+                        ? selectedModels[0]
+                        : cp.model),
+                  }
+                : cp
+            );
+            writeLocalJson(STORAGE_KEYS.cloudVault, updated);
+          } catch {
+            /* Non-fatal: localStorage may be unavailable. */
+          }
+
+          return next;
+        });
+      }
+
+      showToast.success(
+        "Saved Models Updated",
+        `${selectedModels.length} model(s) kept for ${target.name}`
+      );
+      setSavedModelsManagerTarget(null);
+    },
+    [savedModelsManagerTarget, custom, setCloudProviders]
+  );
+
   /* -------------------------- Render ------------------------------------ */
 
   return (
@@ -684,6 +861,7 @@ export function LLMTab(props: LLMTabProps) {
             toggleKey={cloud.toggleKey}
             handleTestCloud={cloud.handleTestCloud}
             onOpenDiscovery={handleOpenDiscovery}
+            onManageModels={handleOpenCloudModelsManager}
           />
         )}
 
@@ -705,6 +883,7 @@ export function LLMTab(props: LLMTabProps) {
             handleSaveCustomEndpoint={custom.handleSaveCustomEndpoint}
             handleDeleteCustomEndpoint={custom.handleDeleteCustomEndpoint}
             onOpenDiscovery={handleOpenDiscovery}
+            onManageCustomModels={handleOpenCustomModelsManager}
           />
         )}
 
@@ -732,6 +911,25 @@ export function LLMTab(props: LLMTabProps) {
         }
         providerId={config.llm.provider}
 />
+
+      {/* Saved Models Manager modal — opens from "Manage" buttons in
+          CloudProvidersTab and CustomEndpointsTab. Rendered before the
+          discovery modal so it appears on top of any open provider
+          card list without overlapping the discovery flow (both use
+          z-50, but React renders them in JSX order; the manager is
+          only mounted when explicitly requested). */}
+      {savedModelsManagerTarget && (
+        <SavedModelsManagerModal
+          isOpen={true}
+          onClose={() => setSavedModelsManagerTarget(null)}
+          providerId={savedModelsManagerTarget.id}
+          providerName={savedModelsManagerTarget.name}
+          providerKind={savedModelsManagerTarget.kind}
+          savedModels={savedModelsManagerTarget.savedModels}
+          defaultModel={savedModelsManagerTarget.defaultModel}
+          onSaveModels={handleSaveSavedModels}
+        />
+      )}
 
       {/* Model discovery modal */}
       {discovery.discoveryTarget && (

@@ -28,6 +28,7 @@ export function CloudProvidersTab({
   toggleKey,
   handleTestCloud,
   onOpenDiscovery,
+  onManageModels,
 }: CloudProvidersTabProps) {
   /* -------------------------- Actions ----------------------------------- */
 
@@ -132,6 +133,12 @@ export function CloudProvidersTab({
             onActivate={() => handleActivate(cp.id)}
             onSetVision={() => handleSetVision(cp.id)}
             onOpenDiscovery={() => handleOpenDiscovery(cp.id)}
+            /* Forward the manager callback bound to this provider's id.
+               Undefined when the parent did not supply one — in which
+               case the card hides the "Manage" button entirely. */
+            onManageModels={
+              onManageModels ? () => onManageModels(cp.id) : undefined
+            }
           />
         );
       })}

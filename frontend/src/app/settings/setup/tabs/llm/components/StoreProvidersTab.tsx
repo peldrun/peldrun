@@ -8,6 +8,10 @@ import {
   ModelDiscoveryModal,
   type ModelsDiscoverySavePayload,
 } from "../../../ModelDiscoveryModal";
+import {
+  SavedModelsManagerModal,
+  type SavedModelsSavePayload,
+} from "./SavedModelsManagerModal";
 import { PackageCard } from "./PackageCard";
 import {
   useProviderPackages,
@@ -70,6 +74,27 @@ export function StoreProvidersTab({
 
   const [scanning, setScanning] = useState<ProviderPackageCard | null>(null);
 
+  /**
+   * Package whose saved-models list is currently being managed via
+   * `SavedModelsManagerModal`.
+   *
+   * Kept strictly separate from `scanning` because the two flows are
+   * orthogonal — and because mixing them would introduce a subtle
+   * bug: both handlers close their own modal state on save, but if
+   * they shared a single `activePackage` variable, a slow discovery
+   * scan finishing during a manager save would clear the wrong
+   * modal. Two independent pieces of state make that impossible by
+   * construction.
+   *
+   * The object stored here is a SNAPSHOT of the `ProviderPackageCard`
+   * at the moment the user clicked "Manage". After a successful save
+   * the modal closes, so any staleness in this snapshot is invisible
+   * to the user — the next click re-reads the current `packages`
+   * array from the hook.
+   */
+  const [managingPackage, setManagingPackage] =
+    useState<ProviderPackageCard | null>(null);
+
   /* ---------------------- Actions ------------------------------------ */
 
   const handleSetPrimary = (pkg: ProviderPackageCard) => {
@@ -114,6 +139,55 @@ export function StoreProvidersTab({
       await saveModelsForPackage(scanning.id, selectedModels, primary);
     } finally {
       setScanning(null);
+    }
+  };
+
+  /**
+   * Persist the changes from `SavedModelsManagerModal` for a Provider
+   * Package.
+   *
+   * Mirrors `handleSaveModels` structurally, but with two deliberate
+   * differences:
+   *
+   *   1. It does NOT need to touch `models_metadata.json`. Capability
+   *      edits (Vision / Tools / Reasoning) travel through the nested
+   *      `ModelInfoModal` → `POST /api/config/models-metadata` — a
+   *      separate, already-established write path that this handler
+   *      must not duplicate.
+   *
+   *   2. Empty `selectedModels` is legitimate here. Unlike the
+   *      discovery modal (where zero selections means "user forgot
+   *      to pick"), the manager's "Keep None" flow is an intentional
+   *      cleanup — the user is removing every model from the package
+   *      (e.g. because the model is no longer available on the
+   *      provider). The card will then fall back to its
+   *      "No models discovered yet" state until the next scan.
+   *
+   * `saveModelsForPackage` performs a read-modify-write against
+   * `/api/config/vault` with `cache: "no-store"`, so concurrent saves
+   * for different packages cannot clobber each other's entries in
+   * `provider_package_models`. The same helper serves both this
+   * handler and `handleSaveModels` — a single write path, one place
+   * to reason about.
+   */
+  const handleSavePackageModels = async (
+    payload: SavedModelsSavePayload
+  ) => {
+    if (!managingPackage) return;
+
+    const selectedModels = Array.isArray(payload.models)
+      ? payload.models
+      : [];
+    const primary = payload.defaultModel || selectedModels[0] || "";
+
+    try {
+      await saveModelsForPackage(
+        managingPackage.id,
+        selectedModels,
+        primary
+      );
+    } finally {
+      setManagingPackage(null);
     }
   };
 
@@ -205,6 +279,17 @@ export function StoreProvidersTab({
             isScanning={scanning?.id === pkg.id}
             onScanModels={() => setScanning(pkg)}
             onSetPrimary={() => handleSetPrimary(pkg)}
+            /* Provide "Manage" only when the package has at least
+               one saved model. `PackageCard` already gates the
+               button on `hasModels`, but passing `undefined` when
+               the list is empty keeps the two components' contract
+               unambiguous — and saves a per-render closure
+               allocation. */
+            onManageModels={
+              pkg.savedModels.length > 0
+                ? () => setManagingPackage(pkg)
+                : undefined
+            }
           />
         ))}
       </div>
@@ -221,6 +306,29 @@ export function StoreProvidersTab({
           providerType=""
           initialSavedModels={scanning.savedModels}
           onSaveModels={handleSaveModels}
+        />
+      )}
+
+      {/* Saved Models Manager modal — opened from the "Manage" button
+          on a package card. Reuses the same nested `ModelInfoModal`
+          flow for capability editing as the discovery modal, so the
+          user's mental model ("open the info icon to edit caps")
+          stays consistent across both flows.
+
+          The modal receives `providerKind="package"` so its header
+          subtitle reads "Package Provider • N saved" and the icon is
+          the `Package` glyph — matching the visual identity already
+          used by `PackageCard`. */}
+      {managingPackage && (
+        <SavedModelsManagerModal
+          isOpen={true}
+          onClose={() => setManagingPackage(null)}
+          providerId={managingPackage.id}
+          providerName={managingPackage.displayName}
+          providerKind="package"
+          savedModels={managingPackage.savedModels}
+          defaultModel={managingPackage.model}
+          onSaveModels={handleSavePackageModels}
         />
       )}
     </motion.div>

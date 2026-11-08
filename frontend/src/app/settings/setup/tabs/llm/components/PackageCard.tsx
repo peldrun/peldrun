@@ -6,6 +6,7 @@ import { motion } from "framer-motion";
 import {
   AlertCircle,
   CheckCircle2,
+  ListChecks,
   Package as PackageIcon,
   RefreshCw,
   Star,
@@ -24,6 +25,20 @@ export interface PackageCardProps {
   isScanning: boolean;
   onScanModels: () => void;
   onSetPrimary: () => void;
+  /**
+   * Optional callback that opens the Saved Models Manager for this
+   * package.
+   *
+   * When omitted, or when the package has zero saved models, the
+   * "Manage" button is not rendered — there is nothing to manage
+   * until the user has run "Scan Models" at least once.
+   *
+   * The handler is wired up by `StoreProvidersTab`, which owns the
+   * modal state and delegates the save to `saveModelsForPackage()`
+   * (persisting into `provider_package_models` in
+   * `backend/data/models_vault.json`).
+   */
+  onManageModels?: () => void;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -53,6 +68,7 @@ export function PackageCard({
   isScanning,
   onScanModels,
   onSetPrimary,
+  onManageModels,
 }: PackageCardProps) {
   const hasModels = pkg.savedModels.length > 0;
   const canSetPrimary =
@@ -173,26 +189,52 @@ export function PackageCard({
 
       {/* ── Actions ────────────────────────────────────────────── */}
       <div className="flex items-center justify-between gap-2 pt-1 flex-wrap">
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={onScanModels}
-          disabled={!pkg.hasActiveConnection || isScanning}
-          className="h-7 px-2.5 text-xs border-border bg-background hover:bg-muted text-foreground cursor-pointer hover:scale-105 transition-transform disabled:hover:scale-100 disabled:opacity-50 flex items-center gap-1.5"
-        >
-          <RefreshCw
-            size={11}
-            className={`text-primary ${isScanning ? "animate-spin" : ""}`}
-          />
-          <span>
-            {isScanning
-              ? "Scanning…"
-              : hasModels
-              ? "Rescan Models"
-              : "Scan Models"}
-          </span>
-        </Button>
+        <div className="flex items-center gap-2 flex-wrap">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={onScanModels}
+            disabled={!pkg.hasActiveConnection || isScanning}
+            className="h-7 px-2.5 text-xs border-border bg-background hover:bg-muted text-foreground cursor-pointer hover:scale-105 transition-transform disabled:hover:scale-100 disabled:opacity-50 flex items-center gap-1.5"
+          >
+            <RefreshCw
+              size={11}
+              className={`text-primary ${isScanning ? "animate-spin" : ""}`}
+            />
+            <span>
+              {isScanning
+                ? "Scanning…"
+                : hasModels
+                ? "Rescan Models"
+                : "Scan Models"}
+            </span>
+          </Button>
+
+          {/* Manage Saved Models — opens SavedModelsManagerModal.
+              Only rendered when both conditions hold:
+                * `onManageModels` callback was provided by the parent
+                  (StoreProvidersTab wires it up).
+                * At least one model is saved (otherwise there is
+                  nothing to manage).
+              The visual intent is deliberately distinct from
+              "Scan Models" — the ListChecks icon signals curation
+              (edit capabilities, remove, pick default) as opposed to
+              discovery (query the provider API for new models). */}
+          {onManageModels && hasModels && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={onManageModels}
+              className="h-7 px-2.5 text-xs border-border bg-background hover:bg-muted text-foreground cursor-pointer hover:scale-105 transition-transform flex items-center gap-1.5"
+              title="Manage, edit capabilities, or remove already-saved models"
+            >
+              <ListChecks size={11} className="text-emerald-600 dark:text-emerald-400" />
+              <span>Manage</span>
+            </Button>
+          )}
+        </div>
 
         <Button
           type="button"

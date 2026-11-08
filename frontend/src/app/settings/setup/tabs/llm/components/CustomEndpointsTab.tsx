@@ -6,6 +6,7 @@ import { motion } from "framer-motion";
 import {
   CheckCircle2,
   ChevronRight,
+  ListChecks,
   Plus,
   RefreshCw,
   Terminal,
@@ -67,6 +68,7 @@ export function CustomEndpointsTab({
   handleSaveCustomEndpoint,
   handleDeleteCustomEndpoint,
   onOpenDiscovery,
+  onManageCustomModels,
 }: CustomEndpointsTabProps) {
   /* -------------------------- Actions ----------------------------------- */
 
@@ -208,6 +210,36 @@ export function CustomEndpointsTab({
                       </span>
                     )}
                   </Button>
+
+                  {/* Manage Saved Models — opens SavedModelsManagerModal
+                      for this endpoint. Only rendered when both hold:
+                        * `onManageCustomModels` was provided by the parent
+                          (`LLMTab` wires it up).
+                        * The endpoint has at least one saved model
+                          (otherwise there is nothing to manage).
+                      The visual intent is deliberately distinct from the
+                      "Scan" button — the ListChecks icon signals
+                      curation (edit capabilities, remove, pick default)
+                      as opposed to discovery (query the endpoint for
+                      brand-new models). */}
+                  {onManageCustomModels &&
+                    ce.savedModels &&
+                    ce.savedModels.length > 0 && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => onManageCustomModels(ce.id)}
+                        className="h-8 px-2.5 text-xs border-border bg-background hover:bg-muted text-foreground cursor-pointer hover:scale-105 transition-transform flex items-center gap-1"
+                        title="Manage, edit capabilities, or remove saved models for this endpoint"
+                      >
+                        <ListChecks
+                          size={11}
+                          className="text-emerald-600 dark:text-emerald-400"
+                        />
+                        <span>Manage</span>
+                      </Button>
+                    )}
 
                   <Button
                     type="button"

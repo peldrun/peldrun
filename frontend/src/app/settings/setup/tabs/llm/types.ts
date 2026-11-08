@@ -233,6 +233,19 @@ export interface CloudProvidersTabProps extends LLMTabProps {
   toggleKey: (id: string) => void;
   handleTestCloud: (providerId: string) => Promise<void>;
   onOpenDiscovery: (target: DiscoveryTarget) => void;
+  /**
+   * Optional callback that opens the Saved Models Manager for a specific
+   * cloud provider.
+   *
+   * When omitted, or when the provider has zero saved models, the
+   * "Manage" button is not rendered — there is nothing to manage until
+   * the user has scanned at least once.
+   *
+   * The handler is wired up by `LLMTab`, which owns the modal state and
+   * persists the resulting model list back into `cloud_vault` via both
+   * `setCloudProviders` (React state) and `writeLocalJson` (localStorage).
+   */
+  onManageModels?: (providerId: string) => void;
 }
 
 export interface CustomEndpointsTabProps extends LLMTabProps {
@@ -244,6 +257,19 @@ export interface CustomEndpointsTabProps extends LLMTabProps {
   handleSaveCustomEndpoint: () => void;
   handleDeleteCustomEndpoint: (id: string) => void;
   onOpenDiscovery: (target: DiscoveryTarget) => void;
+  /**
+   * Optional callback that opens the Saved Models Manager for a specific
+   * custom endpoint.
+   *
+   * When omitted, or when the endpoint has zero saved models, the
+   * "Manage" button is not rendered — there is nothing to manage until
+   * the user has scanned at least once.
+   *
+   * The handler is wired up by `LLMTab`, which owns the modal state and
+   * persists the resulting model list into `custom_endpoints` via
+   * `saveVaultToBackend()`.
+   */
+  onManageCustomModels?: (endpointId: string) => void;
 }
 
 export interface ConnectivityMatrixProps extends LLMTabProps {
@@ -295,4 +321,13 @@ export interface CloudProviderCardProps {
   onActivate: () => void;
   onSetVision: () => void;
   onOpenDiscovery: () => void;
+  /**
+   * Optional callback that opens the Saved Models Manager for this
+   * provider.
+   *
+   * When omitted (or when the provider has zero saved models), the
+   * "Manage" button is not rendered — there is nothing to manage
+   * until at least one model has been discovered via "Scan Models".
+   */
+  onManageModels?: () => void;
 }

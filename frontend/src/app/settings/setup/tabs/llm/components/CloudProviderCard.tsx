@@ -8,6 +8,7 @@ import {
   Eye,
   EyeOff,
   KeyRound,
+  ListChecks,
   RefreshCw,
   ShieldAlert,
   XCircle,
@@ -55,6 +56,7 @@ export function CloudProviderCard({
   onActivate,
   onSetVision,
   onOpenDiscovery,
+  onManageModels,
 }: CloudProviderCardProps) {
   // Fallback icon when `provider.badge` is absent. `resolveProviderIcon`
   // resolves the provider id/name via PROVIDER_ICON_MAP, preserving the
@@ -328,6 +330,30 @@ export function CloudProviderCard({
               </span>
             )}
           </Button>
+
+          {/* Manage Saved Models — opens SavedModelsManagerModal.
+              Only rendered when both conditions hold:
+                * `onManageModels` callback was provided by the parent.
+                * At least one model is saved (otherwise there is
+                  nothing to manage).
+              Visually distinct from "Scan Models" via the ListChecks
+              icon so the user immediately understands the two
+              different intents:
+                * Scan → discover / add NEW models from the provider API.
+                * Manage → curate / edit / remove EXISTING saved models. */}
+          {onManageModels && savedModelsList.length > 0 && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={onManageModels}
+              className="h-7 px-2.5 text-xs border-border bg-card hover:bg-muted text-foreground cursor-pointer hover:scale-105 transition-transform flex items-center gap-1.5"
+              title="Manage, edit capabilities, or remove already-saved models"
+            >
+              <ListChecks size={11} className="text-emerald-600 dark:text-emerald-400" />
+              <span>Manage</span>
+            </Button>
+          )}
         </div>
 
         <span className="text-[10px] text-muted-foreground font-mono">
