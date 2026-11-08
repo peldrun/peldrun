@@ -72,3 +72,18 @@ openpyxl>=3.1.0
 reportlab>=4.2.0
 pypdf>=4.2.0
 pdfplumber>=0.11.0
+
+# ── Document skills (Excel, Word, PowerPoint, CSV, Markdown) ──────────
+# All packages below ship wheels for Windows / macOS / Linux (x86_64 & arm64).
+# No system compiler, no external tools, no manual steps required.
+
+openpyxl>=3.1.5           # .xlsx read + write (pure Python)
+python-docx>=1.1.2        # .docx read + write (pure Python)
+python-pptx>=1.0.2        # .pptx read + write (pure Python)
+pandas>=2.2.3             # CSV, Excel, accounting calculations (wheels for all OS)
+Pillow>=11.0.0            # Image processing (required by openpyxl, docx, pptx)
+
+markdown-it-py>=3.0.0     # Markdown → HTML (pure Python)
+mdit-py-plugins>=0.4.2    # Tables, footnotes, task lists
+
+olefile>=0.47             # Read .doc / .xls metadata only (pure Python)
