@@ -1,4 +1,4 @@
-﻿// frontend/src/components/chat/tool-call-card.tsx
+﻿﻿// frontend/src/components/chat/tool-call-card.tsx
 
 "use client";
 
@@ -12,6 +12,7 @@ import {
   Clock,
   Copy,
   EyeOff,
+  FileText,
   HelpCircle,
   RotateCw,
   Server,
@@ -74,53 +75,19 @@ function buildArgsPreview(
     return "";
   };
 
-  if (key === "bash" || key === "shell" || key === "sh") {
-    const cmd = pick("command", "cmd");
-    return cmd ? `$ ${truncate(cmd, 90)}` : "";
-  }
-  if (key.startsWith("python")) {
-    const code = pick("code", "script", "command");
-    if (!code) return "";
-    return truncate(code.split(/\r?\n/)[0].trim(), 90);
-  }
-  if (key.includes("search")) {
-    const q = pick("query", "q", "search_query");
-    return q ? `"${truncate(q, 80)}"` : "";
-  }
-  if (key.includes("http") || key.includes("fetch")) {
-    const url = pick("url", "endpoint");
-    return url ? truncate(url, 90) : "";
-  }
   if (key.includes("editor")) {
     const cmd = pick("command");
     const path = pick("path", "file", "filename");
     if (cmd && path) return `${cmd} ${truncate(path, 60)}`;
     return path ? truncate(path, 90) : cmd;
   }
-  if (key.includes("file")) {
-    const f = pick("path", "file", "filename");
-    return f ? truncate(f, 90) : "";
-  }
-  if (key.includes("browser")) {
-    return pick("action", "operation");
-  }
-  if (key.includes("human")) {
-    const q = pick("prompt", "question", "query");
-    return q ? `"${truncate(q, 80)}"` : "";
-  }
-  if (key.includes("source_control")) {
-    const action = pick("action");
-    const repo = pick("repo", "repository", "workspace");
-    if (action && repo) return `${action} · ${truncate(repo, 60)}`;
-    return action || (repo ? truncate(repo, 90) : "");
-  }
-  if (key.includes("delegate")) {
-    const target = pick("target_agent_id", "agent_id");
-    const prompt = pick("subtask_prompt", "prompt", "task");
-    if (target && prompt) return `${target} · "${truncate(prompt, 60)}"`;
-    return target || (prompt ? `"${truncate(prompt, 80)}"` : "");
+
+  if (key === "bash" || key === "shell" || key === "sh") {
+    const cmd = pick("command", "cmd");
+    return cmd ? `$ ${truncate(cmd, 90)}` : "";
   }
 
+  // Fallback to first string value
   for (const v of Object.values(args)) {
     if (typeof v === "string" && v.trim()) return truncate(v, 90);
   }
@@ -179,19 +146,6 @@ async function fetchDisabledTools(agentId: string): Promise<Set<string>> {
   }
 }
 
-/**
- * Set of MCP server IDs currently DISABLED for this agent.
- *
- * An MCP tool ``mcp__server__tool`` is considered disabled for the
- * agent when either:
- *   - its server id appears here (user disabled it via AgentMcpModal
- *     → ``disabled_mcp_servers``), OR
- *   - the server's manifest ``status`` is not ``"active"`` (global
- *     toggle from the Extensions section).
- *
- * Both conditions are folded into the returned set so downstream
- * callers only need a single membership check.
- */
 const disabledMcpServersCache = new Map<string, { at: number; servers: Set<string> }>();
 
 async function fetchDisabledMcpServers(agentId: string): Promise<Set<string>> {
@@ -204,10 +158,6 @@ async function fetchDisabledMcpServers(agentId: string): Promise<Set<string>> {
   const disabled = new Set<string>();
   try {
     const base = "";
-
-    // Two sources must be merged:
-    //   1. Per-agent disabled_mcp_servers from agent_settings.json.
-    //   2. Global server status from the extensions registry.
     const [agentMcpRes, allMcpRes] = await Promise.all([
       fetch(`${base}/api/store/agents/${encodeURIComponent(agentId)}/mcp`, { cache: "no-store" }),
       fetch(`${base}/api/mcp/servers`, { cache: "no-store" }),
@@ -237,18 +187,6 @@ async function fetchDisabledMcpServers(agentId: string): Promise<Set<string>> {
   }
 }
 
-/**
- * Cache of MCP server icon data, keyed by server_id.
- *
- * Fetches the server's manifest once (5-minute TTL) to extract its
- * `icon_svg` (preferred) or `icon_url` (fallback). A chat turn can
- * render several tool cards from the same server, so caching is
- * essential to avoid N identical network requests.
- *
- * On any failure, the cache stores an empty object so subsequent
- * calls within the TTL window short-circuit without retrying. The
- * caller falls back to the generic <Server> icon in that case.
- */
 const mcpServerIconCache = new Map<
   string,
   { at: number; data: { icon_svg?: string; icon_url?: string } }
@@ -299,8 +237,6 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
   const [disabled, setDisabled] = useState(false);
   const [copied, setCopied] = useState(false);
   const [manifest, setManifest] = useState<ToolManifest | null>(null);
-  // MCP server icon — populated async; falls back to <Server> icon
-  // when the manifest declares neither `icon_svg` nor `icon_url`.
   const [mcpIcon, setMcpIcon] = useState<{
     icon_svg?: string;
     icon_url?: string;
@@ -308,7 +244,6 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
 
   const mcpInfo = parseMcpToolName(tool.tool);
 
-  // Fetch the real manifest to get display_name or name for non-MCP tools
   useEffect(() => {
     if (mcpInfo.isMcp) return;
     let cancelled = false;
@@ -318,10 +253,6 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
     return () => { cancelled = true; };
   }, [tool.tool, mcpInfo.isMcp]);
 
-  // Fetch the MCP server's icon (svg preferred, url fallback).
-  // Independent of `agentId` — we want the icon visible even when
-  // no agent context is provided (e.g. standalone tool cards in
-  // exports or previews).
   useEffect(() => {
     if (!mcpInfo.isMcp || !mcpInfo.serverId) return;
     let cancelled = false;
@@ -341,24 +272,53 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
   const isFailed = tool.isError || tool.status === "failed";
   const isWaitingInput = tool.status === "waiting_for_input" || tool.requiresInput;
 
-  const preview = buildArgsPreview(tool.tool, tool.args);
-  const outputText = typeof tool.output === "string" ? tool.output : null;
+  // [FIX] Ensure we parse arguments if they arrive as a stringified JSON
+  let parsedArgs: Record<string, any> = {};
+  if (typeof tool.args === "string") {
+    try { parsedArgs = JSON.parse(tool.args); } catch { parsedArgs = { raw: tool.args }; }
+  } else if (tool.args && typeof tool.args === "object") {
+    parsedArgs = tool.args as Record<string, any>;
+  }
+
+  const preview = buildArgsPreview(tool.tool, parsedArgs);
+  const isEditor = (tool.tool || "").toLowerCase().includes("editor");
+
+  // [FIX] Extract the generated code directly from the arguments
+  const fileContent = isEditor ? (parsedArgs.file_text || parsedArgs.new_str || parsedArgs.content) : null;
+
+  // [FIX] Handle output extraction or synthesis
+  let outputText: string | null = null;
+  if (tool.output !== null && tool.output !== undefined) {
+    outputText = typeof tool.output === "string" ? tool.output : JSON.stringify(tool.output, null, 2);
+  }
+
+  // [FIX] Synthesize output if backend didn't send an observation (which happens for file operations)
+  if (!outputText && isEditor) {
+    const cmd = parsedArgs.command;
+    const path = parsedArgs.path || "file";
+    if (cmd === "create") outputText = `File created successfully: ${path}`;
+    else if (cmd === "str_replace") outputText = `File updated successfully: ${path}`;
+    else if (cmd === "view") outputText = `File viewed successfully: ${path}`;
+    else if (cmd === "insert") outputText = `Content inserted successfully: ${path}`;
+    else if (cmd) outputText = `Command '${cmd}' executed successfully on ${path}`;
+  }
+
   const outputSize = outputText ? formatSize(outputText) : "";
   const outputLines = outputText ? countLines(outputText) : 0;
+
+  // Filter out bulky file_text from the JSON view to avoid duplication
+  const displayArgs = { ...parsedArgs };
+  if (displayArgs.file_text) displayArgs.file_text = "<...omitted to avoid duplication...>";
+  if (displayArgs.new_str) displayArgs.new_str = "<...omitted to avoid duplication...>";
 
   useEffect(() => {
     if (!agentId) return;
     let cancelled = false;
     (async () => {
       if (mcpInfo.isMcp && mcpInfo.serverId) {
-        // MCP tool: its disabled-ness depends on the server, not
-        // the tool id itself. Check the merged set that combines
-        // per-agent ``disabled_mcp_servers`` with the server's
-        // global ``status``.
         const disabledServers = await fetchDisabledMcpServers(agentId);
         if (!cancelled) setDisabled(disabledServers.has(mcpInfo.serverId));
       } else {
-        // Standard tool: check ``disabled_tools`` for the tool id.
         const set = await fetchDisabledTools(agentId);
         if (!cancelled) setDisabled(set.has(tool.tool));
       }
@@ -402,7 +362,8 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
         </span>
       );
     }
-    if (outputText) {
+    // Show 'done' if we have output or if it's a file editor that completed
+    if (outputText || (isEditor && tool.status !== "running")) {
       return (
         <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono bg-emerald-500/15 text-emerald-500 border border-emerald-500/30">
           <CheckCircle2 size={10} /><span>done</span>
@@ -414,7 +375,7 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
 
   return (
     <div
-      className={`my-1.5 rounded-lg border text-xs overflow-hidden shadow-peldrun-xs transition-colors ${
+      className={`my-1.5 rounded-lg border text-xs overflow-hidden shadow-sm transition-colors ${
         isRetrying ? "border-amber-500/40 bg-amber-500/5"
         : isFailed ? "border-red-500/40 bg-red-500/5"
         : isWaitingInput ? "border-blue-500/40 bg-blue-500/5"
@@ -430,28 +391,15 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
           <div className="flex-shrink-0 text-foreground">
             {mcpInfo.isMcp ? (
               mcpIcon?.icon_svg ? (
-                // Preferred: inline SVG from the manifest. `currentColor`
-                // is primary so the icon matches the MCP visual language
-                // used elsewhere (ExtensionCard, MCPDetailDrawer). The
-                // SVG is scaled to fill a 16×16 box via arbitrary child
-                // selectors, keeping the card layout stable regardless
-                // of the source SVG's own dimensions.
                 <div
                   className="p-0.5 rounded bg-primary/10 text-primary border border-primary/20 inline-flex items-center justify-center w-5 h-5 overflow-hidden [&>svg]:w-full [&>svg]:h-full [&>svg]:block"
                   dangerouslySetInnerHTML={{ __html: mcpIcon.icon_svg }}
                 />
               ) : mcpIcon?.icon_url ? (
-                // Fallback: external icon URL, same box dimensions.
                 <div className="p-0.5 rounded bg-primary/10 border border-primary/20 inline-flex items-center justify-center w-5 h-5 overflow-hidden">
-                  <img
-                    src={mcpIcon.icon_url}
-                    alt=""
-                    className="w-full h-full object-contain"
-                    loading="lazy"
-                  />
+                  <img src={mcpIcon.icon_url} alt="" className="w-full h-full object-contain" loading="lazy" />
                 </div>
               ) : (
-                // Last resort: generic server icon (current behaviour).
                 <div className="p-0.5 rounded bg-primary/10 text-primary border border-primary/20">
                   <Server size={12} />
                 </div>
@@ -523,10 +471,28 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
             </div>
           )}
 
-          {tool.args && Object.keys(tool.args).length > 0 && (
+          {/* [FIX] Dedicated Code Block for Editor Tools */}
+          {isEditor && typeof fileContent === "string" && fileContent.length > 0 && (
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <div className="text-[9px] font-mono text-emerald-500 uppercase flex items-center gap-1.5">
+                  <FileText size={10} /> Generated Code
+                </div>
+                <span className="text-[9px] font-mono text-muted-foreground">
+                  {fileContent.split("\n").length} lines · {formatSize(fileContent)}
+                </span>
+              </div>
+              <pre className="p-2 rounded-md bg-muted/30 border border-border/50 text-foreground font-mono text-[10px] overflow-x-auto max-h-64 whitespace-pre">
+                {fileContent}
+              </pre>
+            </div>
+          )}
+
+          {/* Parameters Block (filtered to avoid duplication) */}
+          {Object.keys(displayArgs).length > 0 && (
             <div>
               <div className="text-[9px] font-mono text-muted-foreground uppercase mb-1">Parameters</div>
-              <pre className="p-2 rounded-md bg-muted/50 border border-border/50 text-foreground font-mono text-[10px] overflow-x-auto max-h-48">{JSON.stringify(tool.args, null, 2)}</pre>
+              <pre className="p-2 rounded-md bg-muted/50 border border-border/50 text-foreground font-mono text-[10px] overflow-x-auto max-h-48">{JSON.stringify(displayArgs, null, 2)}</pre>
             </div>
           )}
 
@@ -539,7 +505,7 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
             </div>
           )}
 
-          {outputText !== null && outputText !== undefined && (
+          {outputText !== null && outputText !== undefined && outputText.trim() !== "" && (
             <div>
               <div className="flex items-center justify-between mb-1 gap-2">
                 <div className={`text-[9px] font-mono uppercase flex items-center gap-1.5 ${isFailed ? "text-red-500" : "text-emerald-500"}`}>

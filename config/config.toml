@@ -2,7 +2,7 @@
 provider = "lmstudio"
 provider_name = "LM Studio (Local)"
 model = ""
-base_url = "http://100.64.49.193:1235/api/v1/"
+base_url = "http://172.31.160.1:1235/api/v1/"
 api_key = "sk-lm-krfZwsDz:zlnNrWmN20vkBeuArlvQ"
 max_tokens = 8192
 temperature = 0

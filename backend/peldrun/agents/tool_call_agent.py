@@ -1136,61 +1136,29 @@ class ToolCallAgent(BaseAgent):
                 return True
 
             # Safety rail 1 — step ceiling.
-            #
-            # [FIX-NO-DISCARD] If the model produced meaningful text
-            # on its final available step, that text IS the answer.
-            # The pre-fix behavior raised RuntimeError and the
-            # dispatcher discarded the response entirely — the user
-            # saw only an error even though the model had produced a
-            # valid, complete result. Accept the text instead; raise
-            # only when there is genuinely nothing to show.
             max_steps_ceiling = int(
                 getattr(state, "max_steps", None)
                 or getattr(self.config, "max_steps", None)
                 or 30
             )
             if state.current_step >= max_steps_ceiling:
-                if self._final_answer.strip():
-                    logger.warning(
-                        "[FIX-NO-DISCARD] Agent reached max_steps "
-                        "ceiling (%d) with meaningful text (%d "
-                        "chars). Accepting text as final answer "
-                        "instead of raising.",
-                        max_steps_ceiling,
-                        len(self._final_answer),
-                    )
-                    return True
                 raise RuntimeError(
                     f"Agent reached the maximum step ceiling "
-                    f"({max_steps_ceiling}) without producing a "
-                    f"meaningful response."
+                    f"({max_steps_ceiling}) without calling "
+                    f"'terminate'. Task was not completed. Last text: "
+                    f"{(self._final_answer or '')[:200]}"
                 )
 
             # Safety rail 2 — consecutive no-tool responses.
-            #
-            # [FIX-NO-DISCARD] The reminder below (sent after step 1)
-            # gives the model ONE chance to comply. If it still
-            # produces meaningful text on step 2, accept that text —
-            # many models (Gemma, Llama, small local quantized
-            # models) cannot invoke tools reliably, and their text
-            # is their only valid answer. Discarding it serves no
-            # one. Raise only when the response is genuinely empty.
             self._consecutive_no_tool_steps += 1
             if self._consecutive_no_tool_steps >= 2:
-                if self._final_answer.strip():
-                    logger.warning(
-                        "[FIX-NO-DISCARD] Agent produced text "
-                        "without tool calls for %d consecutive "
-                        "steps (%d chars). Accepting text as final "
-                        "answer instead of raising.",
-                        self._consecutive_no_tool_steps,
-                        len(self._final_answer),
-                    )
-                    return True
                 raise RuntimeError(
-                    f"Agent produced no meaningful response for "
+                    f"Agent produced text without tool calls for "
                     f"{self._consecutive_no_tool_steps} consecutive "
-                    f"steps."
+                    f"steps. The model appears to be stuck thinking "
+                    f"out loud without using tools or 'terminate'. "
+                    f"Forcing termination. Last text: "
+                    f"{(self._final_answer or '')[:200]}"
                 )
 
             # Reminder to the model. This becomes part of the

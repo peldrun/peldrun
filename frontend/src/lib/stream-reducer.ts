@@ -186,6 +186,17 @@ export function reduceEvent(state: RunState, event: SSEEnvelope): RunState {
         toolName === "human_input" ||
         Boolean(event.data.requires_input || event.data.requiresInput);
 
+      // [FIX] Parse arguments if they are sent as a stringified JSON
+      const rawArgs = event.data.arguments || event.data.args || {};
+      let parsedArgs = rawArgs;
+      if (typeof rawArgs === "string") {
+        try {
+          parsedArgs = JSON.parse(rawArgs);
+        } catch {
+          parsedArgs = { raw: rawArgs };
+        }
+      }
+
       return {
         ...base,
         status: isHumanAsk ? "waiting_for_input" : base.status,
@@ -197,7 +208,7 @@ export function reduceEvent(state: RunState, event: SSEEnvelope): RunState {
               kind: "tool",
               id: toolCallId,
               tool: toolName,
-              args: event.data.arguments || {},
+              args: parsedArgs,
               startedAt: now,
               output: null,
               durationMs: null,
@@ -276,17 +287,35 @@ export function reduceEvent(state: RunState, event: SSEEnvelope): RunState {
     case "artifact_updated":
     case "artifact_deleted": {
       const op = (event.type.replace("artifact_", "") as any) || "created";
+      const artifactName = event.data.name || event.data.artifact || "artifact";
+      const artifactPath = event.data.relative_path || event.data.path || "";
+      const sizeText = event.data.size_bytes ? ` (${event.data.size_bytes} bytes)` : "";
+
+      // [FIX] If the backend didn't send an 'observation' for this tool,
+      // we synthesize an output message from the artifact event so the user sees the result.
+      const updatedSteps = patchTool(state.steps, stepNum, undefined, stepId, (t) => {
+        if (!t.output || t.output === "") {
+          return {
+            ...t,
+            output: `File ${op}: ${artifactPath}${sizeText}`,
+            status: "completed",
+            isError: false,
+          };
+        }
+        return t;
+      });
+
       return {
         ...base,
-        steps: upsertGroup(state.steps, stepNum, stepId, (g) => ({
+        steps: upsertGroup(updatedSteps, stepNum, stepId, (g) => ({
           ...g,
           items: [
             ...g.items,
             {
               kind: "artifact",
               id: event.data.artifact_id || `art_${now}`,
-              name: event.data.name || event.data.artifact || "artifact",
-              path: event.data.relative_path || event.data.path || "",
+              name: artifactName,
+              path: artifactPath,
               operation: op,
               sizeBytes: event.data.size_bytes,
               revision: event.data.revision,
