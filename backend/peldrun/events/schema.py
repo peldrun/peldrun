@@ -42,6 +42,28 @@ class EventType(str, Enum):
     TOOL_RETRY = "tool_retry"
     TOOL_CALLED = "tool_called"  # Compatibility alias for tool_call
 
+    # [B13 FIX] Canonical terminal event types.
+    #
+    # These are the FUTURE canonical names that ``events/terminal.py``
+    # already anticipates (see its ``_EVENT_VALUE_TO_KIND`` mapping).
+    # They are added to ``EventType`` now so that:
+    #
+    #   1. ``event_type_for_kind(TerminalKind.CANCELLED)`` returns
+    #      ``EventType.CANCELLED`` instead of the historical shim
+    #      ``EventType.RUN_CANCELLED``.
+    #   2. ``EventEmitter.astream_sse`` can recognize both spellings
+    #      and close the SSE socket on cancellation — the exact B13
+    #      SSE bug the execution repair plan documents.
+    #   3. Future code that emits these events has a canonical name,
+    #      so new callers do not accidentally use the RUN_* aliases
+    #      while older code paths slowly migrate.
+    #
+    # The RUN_* aliases above REMAIN for backward compatibility —
+    # historical events stored in ``run_store`` still use those
+    # strings, and ``terminal.py`` recognizes both.
+    CANCELLED = "cancelled"
+    INTERRUPTED = "interrupted"
+
     # Canonical Artifact Lifecycle Events (Phase M2)
     ARTIFACT_CREATED = "artifact_created"
     ARTIFACT_UPDATED = "artifact_updated"
@@ -242,6 +264,14 @@ EVENT_PAYLOAD_MAP: Dict[EventType, type[BaseModel]] = {
     EventType.RUN_STATUS: RunStatusPayload,
     EventType.RUN_COMPLETED: FinalPayload,
     EventType.RUN_CANCELLED: RunStatusPayload,
+    # [B13 FIX] Payload schemas for the canonical terminal events.
+    # Both reuse ``RunStatusPayload`` (which has ``extra="allow"``)
+    # because cancellation and interruption carry the same status
+    # fields: status, reason, run_id, timestamp. Callers that need
+    # richer diagnostics pass them in ``payload.extra`` and they
+    # survive round-trip serialization.
+    EventType.CANCELLED: RunStatusPayload,
+    EventType.INTERRUPTED: RunStatusPayload,
     EventType.STEP_START: StepStartPayload,
     EventType.THOUGHT: ThoughtPayload,
     EventType.AGENT_ACTIVITY: AgentActivityPayload,

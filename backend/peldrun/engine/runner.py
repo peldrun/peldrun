@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from peldrun.engine import lifecycle
+from peldrun.engine.cancellation import cancel_and_drain
 from peldrun.engine.state import ExecutionState, ExecutionStatus, MessageRole
 from peldrun.events.emitter import EventEmitter
 from peldrun.events.schema import EventType
@@ -167,14 +169,40 @@ class AgentRunner:
         try:
             while state.current_step < self.config.max_steps and not is_complete:
                 if self.is_cancelled:
-                    logger.info("Agent run %s cancellation requested by operator.", state.run_id)
-                    state.mark_cancelling(reason="Operator triggered cancellation")
-                    state.mark_cancelled(reason="Operator cancelled run")
-                    await self.emitter.emit_error(
-                        message="Execution cancelled by operator.",
-                        error_type="CancelledError",
-                        recoverable=False,
+                    logger.info(
+                        "Agent run %s cancellation requested by operator.",
+                        state.run_id,
+                    )
+                    # [F.5 FIX] Use the idempotent lifecycle helpers.
+                    # The raw ``state.mark_cancelling()`` /
+                    # ``state.mark_cancelled()`` raise
+                    # ``InvalidStateTransitionError`` when the state
+                    # is already terminal (e.g. a step internally
+                    # marked the state FAILED and this pre-step check
+                    # fires on the next iteration). The lifecycle
+                    # helpers short-circuit cleanly.
+                    lifecycle.mark_cancelling(
+                        state,
+                        reason="Operator triggered cancellation",
+                    )
+                    lifecycle.mark_cancelled(
+                        state,
+                        reason="Operator cancelled run",
+                    )
+                    # [F.5 FIX — B13] Emit the CANCELLED terminal
+                    # event, NOT an ERROR. The pre-fix code called
+                    # ``emit_error()`` here, so:
+                    #   * the UI displayed a red error card instead
+                    #     of a proper "cancelled" state;
+                    #   * ``EventEmitter._last_terminal_kind``
+                    #     recorded FAILED instead of CANCELLED,
+                    #     breaking diagnostics.
+                    # ``emit_cancelled()`` uses the canonical
+                    # ``EventType.CANCELLED`` added in Phase F.
+                    await self.emitter.emit_cancelled(
+                        reason="cancelled_by_operator",
                         step=state.current_step,
+                        message="Execution cancelled by operator.",
                     )
                     break
 
@@ -195,8 +223,30 @@ class AgentRunner:
                     global_start_time += (time.time() - pause_start_time)
 
                 if self.is_cancelled:
-                    state.mark_cancelling(reason="Operator cancelled run during pause")
-                    state.mark_cancelled(reason="Cancelled by operator")
+                    # [F.5 FIX — B13 pause-path] Same as the other two
+                    # cancellation paths: use the idempotent lifecycle
+                    # helpers (which short-circuit on already-terminal
+                    # state) AND emit the CANCELLED terminal event so
+                    # SSE closes. Pre-fix: this path marked the state
+                    # CANCELLED but emitted NOTHING — the user could
+                    # press Pause, then Stop, and the frontend spinner
+                    # would hang forever.
+                    lifecycle.mark_cancelling(
+                        state,
+                        reason="Operator cancelled while paused",
+                    )
+                    lifecycle.mark_cancelled(
+                        state,
+                        reason="Cancelled by operator (during pause)",
+                    )
+                    await self.emitter.emit_cancelled(
+                        reason="cancelled_by_operator",
+                        step=state.current_step,
+                        message=(
+                            "Execution cancelled by operator "
+                            "(while paused)."
+                        ),
+                    )
                     break
 
                 if state.status == ExecutionStatus.PAUSED:
@@ -224,24 +274,79 @@ class AgentRunner:
                 )
                 step_start_time = time.time()
 
+                # [F.5 FIX — B9] Cancellation-aware step wait.
+                #
+                # Pre-fix behavior:
+                #   * ``asyncio.wait_for(asyncio.shield(step_task),
+                #     timeout=1.0)`` wrapped ``step_task`` in TWO
+                #     protective layers PER ITERATION: ``shield``
+                #     (which detaches outer cancellation) and
+                #     ``wait_for`` (which creates an outer future
+                #     wrapper). Each second of a long step leaked
+                #     one wrapper future. A 60s step leaked 60
+                #     futures; a 7-step run leaked ~420.
+                #   * On cancellation, ``step_task.cancel()`` was
+                #     called and the loop ``break``-ed WITHOUT
+                #     awaiting. ``step_task`` continued running in
+                #     the background. ``CoreRuntimeExecutor``'s
+                #     ``finally`` closed provider adapters while
+                #     step_task still referenced them — the exact
+                #     B9 crash class.
+                #
+                # Post-fix:
+                #   * ``asyncio.wait({step_task}, timeout=1.0)``
+                #     creates NO wrapper. No per-iteration leak.
+                #   * On cancellation, ``cancel_and_drain`` awaits
+                #     step_task's actual termination (bounded at 5s)
+                #     before the loop exits. If the task fails to
+                #     drain, the runner logs an error but does NOT
+                #     hang.
                 while not step_task.done():
                     if self.is_cancelled:
-                        step_task.cancel()
+                        # Drain the task before moving on.
+                        drained = await cancel_and_drain(
+                            step_task,
+                            timeout=5.0,
+                            context="runner.step_cancel",
+                        )
+                        if not drained:
+                            logger.error(
+                                "Step task for step %d did not drain "
+                                "within 5s during cancellation. It "
+                                "will continue running in the "
+                                "background; the run cannot be "
+                                "cleanly resumed.",
+                                step_index,
+                            )
                         break
 
                     is_waiting_human = (
-                        state.status in (ExecutionStatus.WAITING_FOR_INPUT, ExecutionStatus.WAITING_FOR_HUMAN)
+                        state.status in (
+                            ExecutionStatus.WAITING_FOR_INPUT,
+                            ExecutionStatus.WAITING_FOR_HUMAN,
+                        )
                     )
 
+                    # [F.5 FIX — B9] ``asyncio.wait`` does not
+                    # create a wrapper future; no per-iteration
+                    # leak.
                     try:
-                        await asyncio.wait_for(asyncio.shield(step_task), timeout=1.0)
-                    except asyncio.TimeoutError:
-                        pass
+                        _done, _pending = await asyncio.wait(
+                            {step_task}, timeout=1.0
+                        )
+                    except Exception as wait_exc:
+                        logger.error(
+                            "asyncio.wait raised while polling "
+                            "step task: %s",
+                            wait_exc,
+                        )
+                        raise
 
-                    if step_task.done():
+                    if _done:
                         break
 
-                    # Suspend normal step timeout while waiting for human input
+                    # Suspend normal step timeout while waiting
+                    # for human input.
                     if is_waiting_human:
                         step_start_time = time.time()
                     else:
@@ -250,17 +355,53 @@ class AgentRunner:
                             self.config.step_timeout_seconds
                             and elapsed_step > self.config.step_timeout_seconds
                         ):
-                            step_task.cancel()
-                            step_timeout_msg = (
-                                f"Step {step_index} exceeded execution timeout of {self.config.step_timeout_seconds}s."
+                            # [F.5 FIX — B9] Drain before failing.
+                            drained = await cancel_and_drain(
+                                step_task,
+                                timeout=5.0,
+                                context="runner.step_timeout",
                             )
-                            state.mark_failed(step_timeout_msg, error_code="STEP_TIMEOUT")
+                            if not drained:
+                                logger.error(
+                                    "Step task for step %d did not "
+                                    "drain within 5s after timeout. "
+                                    "Task is orphaned; the run "
+                                    "cannot be cleanly resumed.",
+                                    step_index,
+                                )
+                            step_timeout_msg = (
+                                f"Step {step_index} exceeded "
+                                f"execution timeout of "
+                                f"{self.config.step_timeout_seconds}s."
+                            )
+                            lifecycle.mark_failed(
+                                state,
+                                step_timeout_msg,
+                                error_code="STEP_TIMEOUT",
+                            )
                             raise TimeoutError(step_timeout_msg)
 
                 if self.is_cancelled:
-                    if not state.is_terminal:
-                        state.mark_cancelling(reason="Operator cancelled step execution")
-                        state.mark_cancelled(reason="Execution cancelled by operator")
+                    # [F.5 FIX — B13] Idempotent marking + emit the
+                    # terminal event. The pre-fix code did
+                    # ``mark_cancelling`` / ``mark_cancelled``
+                    # (raising when already terminal) and emitted
+                    # NOTHING — leaving SSE hanging forever after a
+                    # mid-step cancellation that the user requested
+                    # during the await window.
+                    lifecycle.mark_cancelling(
+                        state,
+                        reason="Operator cancelled step execution",
+                    )
+                    lifecycle.mark_cancelled(
+                        state,
+                        reason="Execution cancelled by operator",
+                    )
+                    await self.emitter.emit_cancelled(
+                        reason="cancelled_by_operator",
+                        step=state.current_step,
+                        message="Execution cancelled by operator.",
+                    )
                     break
 
                 is_complete = await step_task
@@ -277,33 +418,155 @@ class AgentRunner:
 
                 await self.emitter.emit_step_end(step_number=step_index)
 
-            # Post-loop status finalization adhering strictly to Runtime V1 semantics
+            # [F.5 FIX — B13] Post-loop finalization.
+            #
+            # Pre-fix behavior: the successful path only marked the
+            # state COMPLETED without emitting a `FINAL` event. The
+            # peldrun.events layer therefore never saw a terminal
+            # event on success — `EventEmitter._is_terminated` stayed
+            # False, `_last_terminal_kind` stayed None, and any
+            # `astream_sse` iterator hung forever.
+            #
+            # Post-fix: emit `FINAL` explicitly on success, mirroring
+            # the `ERROR`/`CANCELLED` emissions on the other terminal
+            # paths. `emit_final` sets `_is_terminated` via the
+            # Phase F terminal guard, so the peldrun.events layer is
+            # self-consistent.
             if is_complete:
                 if state.status == ExecutionStatus.RUNNING:
-                    state.mark_completed(reason="Agent declared task conclusion")
+                    lifecycle.mark_completed(
+                        state, reason="Agent declared task conclusion"
+                    )
+                # [F.5 FIX] Emit FINAL from the runner itself so
+                # whatever consumes `peldrun.events` sees the
+                # terminal event, regardless of whether the agent
+                # marked the state COMPLETED internally (via
+                # apply_decision) or the runner just did.
+                #
+                # GUARD: only emit when the state is actually
+                # COMPLETED and the emitter has not already emitted
+                # a terminal event for this run. `emit_final` itself
+                # is idempotent via the Phase F terminal guard, but
+                # checking `state.status` avoids a redundant
+                # ``mark_completed`` call that would raise.
+                if state.status == ExecutionStatus.COMPLETED:
+                    await self.emitter.emit_final(
+                        output=state.final_output or "",
+                        step=state.current_step,
+                        deliverables=list(state.deliverables),
+                    )
             elif (
                 state.current_step >= self.config.max_steps
                 and state.status == ExecutionStatus.RUNNING
             ):
-                logger.warning("Agent reached maximum step ceiling (%d) without completing task.", self.config.max_steps)
-                ceiling_msg = f"Execution reached maximum step ceiling ({self.config.max_steps}) without completing task."
-                state.mark_failed(ceiling_msg, error_code="MAX_STEPS_EXCEEDED")
+                logger.warning(
+                    "Agent reached maximum step ceiling (%d) "
+                    "without completing task.",
+                    self.config.max_steps,
+                )
+                ceiling_msg = (
+                    f"Execution reached maximum step ceiling "
+                    f"({self.config.max_steps}) without completing task."
+                )
+                lifecycle.mark_failed(
+                    state,
+                    ceiling_msg,
+                    error_code="MAX_STEPS_EXCEEDED",
+                )
                 await self.emitter.emit_error(
                     message=ceiling_msg,
                     error_type="MaxStepsExceededError",
-                    details={"max_steps": self.config.max_steps, "step": state.current_step},
+                    details={
+                        "max_steps": self.config.max_steps,
+                        "step": state.current_step,
+                    },
                     recoverable=False,
                     step=state.current_step,
                 )
 
+        except asyncio.CancelledError:
+            # [F.5 FIX — B13] Explicit cancellation handler.
+            #
+            # The pre-fix code used a bare ``except Exception`` block,
+            # which does NOT catch ``CancelledError`` in Python 3.8+
+            # (it inherits from ``BaseException``, not ``Exception``).
+            # An outer cancellation — the executor cancelling the
+            # runner task itself — therefore propagated past the
+            # runner without emitting ANY terminal event, and the SSE
+            # stream hung forever.
+            #
+            # Post-fix behavior:
+            #   1. Cancel and drain any in-flight step_task so it
+            #      cannot outlive the runner (extends B9 fix to the
+            #      outer-cancellation path).
+            #   2. Mark the state CANCELLED via the idempotent
+            #      lifecycle helper.
+            #   3. Emit ``EventType.CANCELLED`` so the frontend
+            #      receives a proper cancellation card and the SSE
+            #      loop closes.
+            #   4. Re-raise so the caller (executor) sees the
+            #      cancellation and can build the RunResult with
+            #      status=CANCELLED.
+            if "step_task" in locals() and not step_task.done():
+                try:
+                    await cancel_and_drain(
+                        step_task,
+                        timeout=5.0,
+                        context="runner.outer_cancel",
+                    )
+                except Exception as drain_exc:
+                    logger.error(
+                        "Failed to drain step_task during outer "
+                        "cancellation: %s",
+                        drain_exc,
+                    )
+
+            try:
+                lifecycle.mark_cancelling(
+                    state, reason="Runner task cancelled externally"
+                )
+                lifecycle.mark_cancelled(
+                    state, reason="Runner task cancelled externally"
+                )
+                await self.emitter.emit_cancelled(
+                    reason="runner_cancelled",
+                    step=state.current_step,
+                    message="Execution cancelled.",
+                )
+            except Exception as emit_exc:
+                logger.error(
+                    "Failed to emit CANCELLED during outer "
+                    "cancellation for run %s: %s",
+                    state.run_id,
+                    emit_exc,
+                )
+            raise
+
         except Exception as ex:
-            if not state.is_terminal:
-                state.mark_failed(str(ex), error_code=type(ex).__name__)
-            logger.exception("Unhandled error in AgentRunner for run %s: %s", state.run_id, ex)
+            # [F.5 FIX] Use lifecycle.mark_failed for idempotency.
+            # The raw ``state.mark_failed()`` raises when the state
+            # is already terminal — e.g. when a step internally
+            # marked the state FAILED and then raised, and this
+            # handler now runs on an already-failed state.
+            lifecycle.mark_failed(
+                state,
+                str(ex),
+                error_code=type(ex).__name__,
+            )
+            logger.exception(
+                "Unhandled error in AgentRunner for run %s: %s",
+                state.run_id,
+                ex,
+            )
             await self.emitter.emit_error(
                 message=str(ex),
                 error_type=type(ex).__name__,
-                details={"step": state.current_step, "elapsed": round(time.time() - global_start_time, 2)},
+                details={
+                    "step": state.current_step,
+                    "elapsed": round(
+                        time.time() - global_start_time, 2
+                    ),
+                },
                 recoverable=False,
                 step=state.current_step,
             )

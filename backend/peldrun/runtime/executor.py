@@ -917,6 +917,39 @@ class CoreRuntimeExecutor:
         if not project_rules and isinstance(request.metadata, dict):
             project_rules = request.metadata.get("project_rules")
 
+        # ─────────────────────────────────────────────────────────────
+        # [B14 FIX — Single Execution Authority for Context Assembly]
+        #
+        # This is the ONE AND ONLY place in the entire pipeline that
+        # builds the LLM message list. The engine
+        # (``PeldrunEngine.run``) deliberately does NOT assemble
+        # messages anymore — it forwards only raw inputs
+        # (sidecar, prompt, project_rules, system_prompt) via
+        # ``RunRequest``, and this call materialises the actual
+        # payload the model will see.
+        #
+        # Prior to this fix, both the engine and the executor built
+        # the message list independently, with different
+        # ``include_execution`` flags. Any UI surface that rendered
+        # the engine's copy (via ``run_metadata["context_messages"]``)
+        # showed a different message list from what the model
+        # actually received. That divergence was B14.
+        #
+        # ``include_execution=True`` is the correct value HERE
+        # because this is the agent-mode executor: the model needs
+        # to see the current turn's tool-call telemetry so it can
+        # continue the loop coherently. ``build_context_sidecar``
+        # already strips stale ``current_execution`` blocks when the
+        # turn is not running, so a resumed run cannot see tool
+        # calls the crash invalidated.
+        #
+        # Do NOT add a metadata-based bypass here. If a future
+        # caller wants to pre-build the context, they must pass it
+        # through ``request.metadata["prebuilt_context"]`` under a
+        # dedicated contract — NOT reuse the historical
+        # ``context_messages`` key, whose removal is part of this
+        # fix's guarantee.
+        # ─────────────────────────────────────────────────────────────
         context_mgr = ContextManager()
         assembled_messages, budget_usage = context_mgr.build_messages(
             sidecar=sidecar,
@@ -1231,8 +1264,104 @@ class CoreRuntimeExecutor:
             )
         except asyncio.CancelledError:
             runner.cancel()
-            logger.warning("Execution cancelled for run %s (job %s)", run_id_str, job_id)
-            diag = diagnostics.finalize(status=RunStatus.CANCELLED, failure_reason="Cancelled by operator.")
+            # [F.6 FIX] Respect the state's ACTUAL terminal status
+            # when it already ended before the outer cancellation
+            # arrived.
+            #
+            # Pre-fix behavior: on any ``CancelledError``, this block
+            # unconditionally returned ``RunStatus.CANCELLED`` — even
+            # when the state had already transitioned to FAILED or
+            # COMPLETED internally. Real-world impact
+            # (job_c51fe6d34774): a run failed mid-step, the operator
+            # clicked Stop a moment later, and the executor reported
+            # "CANCELLED" while the state's transition_history showed
+            # FAILED. The UI displayed "Cancelled" but the logs showed
+            # the actual failure — an inconsistency operators had to
+            # reconcile manually.
+            #
+            # Post-fix: check ``initial_state.is_terminal`` before
+            # deciding the response status:
+            #
+            #   * COMPLETED → report COMPLETED (the run finished; the
+            #     cancellation was too late to matter)
+            #   * FAILED    → report FAILED with the original error
+            #   * otherwise → report CANCELLED (standard path)
+            #
+            # The ordering (COMPLETED before FAILED before CANCELLED)
+            # is explicit so the behavior is unambiguous.
+            if initial_state.is_terminal:
+                if initial_state.is_completed:
+                    logger.warning(
+                        "Outer cancellation arrived for run %s, but "
+                        "the state was already COMPLETED. Reporting "
+                        "COMPLETED.",
+                        run_id_str,
+                    )
+                    diag = diagnostics.finalize(
+                        status=RunStatus.COMPLETED,
+                        failure_reason="Cancelled after completion.",
+                    )
+                    return RunResult(
+                        run_id=run_id_str,
+                        job_id=job_id,
+                        status=RunStatus.COMPLETED,
+                        output=initial_state.final_output,
+                        deliverables=list(initial_state.deliverables),
+                        total_steps=initial_state.current_step,
+                        error=None,
+                        error_code=None,
+                        metadata={"diagnostics": diag.model_dump(mode="json")},
+                        created_at=start_time,
+                        completed_at=time.time(),
+                        parent_run_id=parent_run_id,
+                        root_run_id=root_run_id,
+                        delegation_depth=delegation_depth,
+                    )
+                elif initial_state.is_failed:
+                    err = (
+                        initial_state.metadata.get("error")
+                        or "Execution failed before cancellation."
+                    )
+                    logger.warning(
+                        "Outer cancellation arrived for run %s, but "
+                        "the state was already FAILED (%s). "
+                        "Reporting FAILED.",
+                        run_id_str,
+                        err[:100],
+                    )
+                    diag = diagnostics.finalize(
+                        status=RunStatus.FAILED,
+                        failure_reason=err,
+                    )
+                    return RunResult(
+                        run_id=run_id_str,
+                        job_id=job_id,
+                        status=RunStatus.FAILED,
+                        output=initial_state.final_output,
+                        deliverables=list(initial_state.deliverables),
+                        total_steps=initial_state.current_step,
+                        error=err,
+                        error_code=initial_state.metadata.get(
+                            "error_code", "RUNTIME_ERROR"
+                        ),
+                        metadata={"diagnostics": diag.model_dump(mode="json")},
+                        created_at=start_time,
+                        completed_at=time.time(),
+                        parent_run_id=parent_run_id,
+                        root_run_id=root_run_id,
+                        delegation_depth=delegation_depth,
+                    )
+
+            # Standard cancellation path — the state was NOT terminal.
+            logger.warning(
+                "Execution cancelled for run %s (job %s)",
+                run_id_str,
+                job_id,
+            )
+            diag = diagnostics.finalize(
+                status=RunStatus.CANCELLED,
+                failure_reason="Cancelled by operator.",
+            )
             return RunResult(
                 run_id=run_id_str,
                 job_id=job_id,

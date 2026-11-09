@@ -1143,6 +1143,49 @@ class AsyncLLMClient:
                     start_time=start_time,
                 )
 
+            # ------------------------------------------------------------------
+            # [E.1 FIX — INCOMPLETE_STREAM detection]
+            #
+            # Historical behavior: whenever a stream was interrupted
+            # AFTER at least one token had arrived, control fell
+            # through to the LLMResponse builder below. The partial
+            # content was returned as if it were a complete response,
+            # with ``finish_reason`` defaulted to ``"stop"`` at the
+            # return site. The caller (``ToolCallAgent.think``) had no
+            # way to distinguish "the model decided to stop" from
+            # "the connection died after 200 tokens", so a retry
+            # re-streamed the same prefix and the UI showed it twice.
+            # That was the B8 surface.
+            #
+            # Post-fix: a stream that received non-zero content but
+            # was then interrupted raises a labelled RuntimeError.
+            # ``ToolCallAgent.think`` catches this, recognises the
+            # failure, and discards the previous attempt's UI output
+            # before retrying. No duplicate text is possible.
+            #
+            # Zero-token interruptions are handled above by the
+            # non-streaming fallback — those carry no partial content
+            # to discard, so silently replacing them is safe.
+            # ------------------------------------------------------------------
+            if stream_interrupted and (
+                accumulated_content
+                or accumulated_reasoning
+                or accumulated_tool_calls
+            ):
+                _partial_chars = (
+                    len("".join(accumulated_content))
+                    + len("".join(accumulated_reasoning))
+                )
+                raise RuntimeError(
+                    f"INCOMPLETE_STREAM: Stream from '{chosen_model}' "
+                    f"was interrupted after receiving {_partial_chars} "
+                    f"chars of partial output (no terminal "
+                    f"finish_reason marker). The provider connection "
+                    f"was lost mid-response. The caller MUST treat "
+                    f"this as a failure and discard any partial "
+                    f"content already streamed to the UI."
+                )
+
             total_latency_ms = (time.time() - start_time) * 1000.0
             ttft_ms = (first_token_at - start_time) * 1000.0 if first_token_at else total_latency_ms
 
@@ -1306,6 +1349,23 @@ class AsyncLLMClient:
         accumulated_reasoning = []
         captured_usage: Optional[TokenUsage] = None
 
+        # [E.1b FIX — terminal marker tracking]
+        #
+        # Historical behavior: the ``stream()`` method yielded a final
+        # ``StreamChunk`` with ``finish_reason="stop"`` regardless of
+        # whether the provider had ever sent a real finish_reason
+        # chunk. On providers that silently drop the connection
+        # mid-stream (LM Studio ejecting a model, Ollama crash,
+        # network black-hole), the consumer saw "stop" and treated
+        # the truncated response as complete.
+        #
+        # Post-fix: we track whether ANY chunk carried a
+        # ``finish_reason``. If the stream ends without one, the
+        # terminal StreamChunk uses ``finish_reason="incomplete"`` so
+        # callers (StreamNormalizer, ToolCallAgent.think) can
+        # distinguish real completion from silent truncation.
+        saw_finish_reason: bool = False
+
         stream_resp = await self.client.chat.completions.create(**call_kwargs)
 
         # [FIX-G.2] Wrap the entire async-for in a try/except so that
@@ -1364,6 +1424,8 @@ class AsyncLLMClient:
                         )
 
                 finish_reason = getattr(first_choice, "finish_reason", None)
+                if finish_reason:
+                    saw_finish_reason = True
 
                 yield StreamChunk(
                     content_delta=content_delta,
@@ -1402,7 +1464,35 @@ class AsyncLLMClient:
                 reasoning_text=full_reas,
                 model=chosen_model,
             )
+
+            # [E.1b FIX — do not falsely label truncation as "stop"]
+            #
+            # When the provider stream ends WITHOUT ever sending a
+            # finish_reason chunk, we have no evidence that the
+            # response is complete. Silently emitting "stop" would
+            # tell the consumer "the model finished normally", which
+            # is wrong: the model may have been mid-sentence when the
+            # connection dropped.
+            #
+            # ``finish_reason="incomplete"`` is the honest signal.
+            # Consumers (StreamNormalizer, ToolCallAgent) can then
+            # decide whether to retry, surface a warning, or accept
+            # the partial content. The value is stable — it is NOT
+            # an OpenAI finish_reason and must not be passed through
+            # to providers.
+            if saw_finish_reason:
+                _terminal_reason = "stop"
+            else:
+                _terminal_reason = "incomplete"
+                logger.warning(
+                    "[LLM CLIENT] stream() for '%s' ended without a "
+                    "terminal finish_reason chunk. Emitting "
+                    "finish_reason='incomplete' so callers can "
+                    "distinguish truncation from completion.",
+                    chosen_model,
+                )
+
             yield StreamChunk(
-                finish_reason="stop",
+                finish_reason=_terminal_reason,
                 usage=final_usage,
             )

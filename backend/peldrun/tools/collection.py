@@ -13,13 +13,29 @@ from typing import Any, Dict, List, Optional, Union
 
 from peldrun.tools.base import BaseTool, ToolResult
 from peldrun.tools.contract import ToolExecutionPolicy, ToolRuntime
+from peldrun.tools.execution_manager import ExecutionManager
+from peldrun.tools.execution_result import ToolExecutionResult
 
 
 class ToolCollection:
     """Manages a collection of ToolRuntime / BaseTool instances for tool-calling agents."""
 
-    def __init__(self, tools: Optional[List[Union[ToolRuntime, BaseTool]]] = None) -> None:
+    def __init__(
+        self,
+        tools: Optional[List[Union[ToolRuntime, BaseTool]]] = None,
+        execution_manager: Optional[ExecutionManager] = None,
+    ) -> None:
         self._tools: Dict[str, Union[ToolRuntime, BaseTool]] = {}
+        # [C.2 FIX] Optional dependency injection. A fresh
+        # ExecutionManager is cheap to construct (it holds zero mutable
+        # state), so the default is to create one per collection. Callers
+        # that need a shared manager — e.g., a manager with a bound
+        # registry for cross-name resolution — pass it explicitly.
+        self._execution_manager: ExecutionManager = (
+            execution_manager
+            if execution_manager is not None
+            else ExecutionManager()
+        )
         if tools:
             for tool in tools:
                 self.add_tool(tool)
@@ -74,10 +90,157 @@ class ToolCollection:
                 })
         return schemas
 
+    async def aexecute_with_result(
+        self,
+        name: str,
+        arguments: Any = None,
+        *,
+        tool_call_id: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
+        run_id: Optional[str] = None,
+    ) -> ToolExecutionResult:
+        """
+        Execute a tool by name and return a canonical ``ToolExecutionResult``.
+
+        [C.2 FIX — B5 + B6] The historical ``execute()`` method returns
+        a raw ``ToolResult``, which lacks the ``status`` / ``outcome``
+        fields the termination evaluator (B3) and the runtime executor
+        need to decide whether a run is complete. This new method is
+        the correct entry point for the agent loop: it delegates to
+        ``ExecutionManager``, which enforces the ``ToolExecutionResult``
+        contract:
+
+          * exit_code is aligned with status (B4);
+          * sync-only tools are offloaded to a worker thread so the
+            event loop is never frozen (B6);
+          * a per-call timeout produces ``.timeout()`` with the
+            canonical exit code 124;
+          * terminate metadata invariants are enforced at the boundary.
+
+        The legacy ``execute()`` is preserved verbatim for backward
+        compatibility. External tools and tests that rely on the raw
+        ``ToolResult`` shape are unaffected.
+
+        Retries
+        -------
+        This method does NOT retry. Retry semantics live in
+        ``ToolCallAgent.act()`` — the agent decides whether a given
+        failure is retriable based on the tool's
+        ``ToolExecutionPolicy``, emits ``TOOL_RETRY`` events with
+        attempt counts and delays, and applies backoff. A manager-level
+        retry loop would duplicate that logic and lose the agent's
+        visibility into each attempt.
+
+        Parameters
+        ----------
+        name
+            The registered tool name.
+        arguments
+            Arguments for the tool: dict, JSON-encoded string, or
+            anything else (treated as ``{}`` after best-effort parse).
+            Matches ``execute()`` semantics exactly.
+        tool_call_id
+            Correlation id (typically the originating ``ToolCall.id``).
+            Forwarded to the result so callers can pair it with the
+            assistant message that emitted the call.
+        timeout_seconds
+            Optional outer timeout. When ``None``, the tool's own
+            ``execution_policy.timeout_seconds`` governs (via
+            ``ExecutionManager._resolve_timeout``). For a ``BaseTool``,
+            its ``aexecute()`` ALSO applies its own inner timeout — the
+            outer wrapper is a safety net for adapters that do not.
+        run_id
+            Optional. Forwarded to ``ExecutionManager`` for log
+            enrichment.
+
+        Returns
+        -------
+        ToolExecutionResult
+            NEVER raises. Resolution failures, argument-parse failures,
+            timeouts, cancellations, and unexpected exceptions all
+            produce a well-formed ``ToolExecutionResult``.
+        """
+        # ------------------------------------------------------------------
+        # 1. Resolve the tool by name.
+        # ------------------------------------------------------------------
+        tool = self.get_tool(name)
+        if tool is None:
+            available = sorted(self._tools.keys())
+            return ToolExecutionResult.failure(
+                tool_name=name,
+                tool_call_id=tool_call_id,
+                error=(
+                    f"Tool '{name}' not found in ToolCollection. "
+                    f"Available tools: "
+                    f"{', '.join(available) if available else '(none)'}."
+                ),
+                exit_code=1,
+                metadata={"available_tools": available},
+            )
+
+        # ------------------------------------------------------------------
+        # 2. Parse arguments — matches ``execute()`` semantics exactly.
+        #    Three shapes are recognized:
+        #
+        #      * str   — JSON-encoded (returns empty dict for "")
+        #      * dict  — used verbatim
+        #      * None  — treated as {}
+        #      * other — treated as {} (defensive: never crash on
+        #                unexpected input, matching execute()).
+        # ------------------------------------------------------------------
+        parsed_args: Dict[str, Any]
+        if isinstance(arguments, str):
+            try:
+                parsed_args = (
+                    json.loads(arguments) if arguments.strip() else {}
+                )
+            except json.JSONDecodeError as exc:
+                return ToolExecutionResult.failure(
+                    tool_name=name,
+                    tool_call_id=tool_call_id,
+                    error=f"Failed to parse arguments as JSON: {exc}",
+                    exit_code=1,
+                    metadata={"error_type": "JSONDecodeError"},
+                )
+        elif isinstance(arguments, dict):
+            parsed_args = arguments
+        elif arguments is None:
+            parsed_args = {}
+        else:
+            # Unknown shape — same degradation as execute(). Do NOT
+            # raise: a caller that passed a malformed argument object
+            # should see a well-formed failure result, not an exception.
+            parsed_args = {}
+
+        # ------------------------------------------------------------------
+        # 3. Delegate to ExecutionManager.
+        #
+        # Passing ``tool_name=name`` explicitly (rather than relying on
+        # the manager to read ``tool.name``) guarantees the returned
+        # ``ToolExecutionResult.tool_name`` matches what the caller
+        # requested — even if a registered adapter stores its name under
+        # a different attribute (e.g. a wrapper class that overrides
+        # ``__getattr__`` for proxying).
+        # ------------------------------------------------------------------
+        return await self._execution_manager.execute(
+            tool,
+            parsed_args,
+            tool_name=name,
+            tool_call_id=tool_call_id,
+            timeout_seconds=timeout_seconds,
+            run_id=run_id,
+        )
+
     async def execute(self, name: str, arguments: Any) -> ToolResult:
         """
         Execute a tool single invocation attempt by name, standardizing arguments
         and delegating to the tool runtime instance.
+
+        [LEGACY] This method is preserved unchanged for backward
+        compatibility. New callers — in particular the agent loop
+        (``ToolCallAgent.act``) after C.3 — MUST use
+        ``aexecute_with_result`` instead, which returns the canonical
+        ``ToolExecutionResult`` contract.
         """
         tool = self.get_tool(name)
         if not tool:

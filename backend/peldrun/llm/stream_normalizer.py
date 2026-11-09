@@ -176,6 +176,36 @@ class StreamNormalizer:
         pending_usage: Optional[TokenUsage] = None
         pending_provider_metadata: Optional[Dict[str, Any]] = None
         last_tool_signature: Dict[int, Dict[str, Any]] = {}
+
+        # [E.3 FIX — B8] Truncation detection state.
+        #
+        # Two independent flags track whether the stream actually
+        # completed properly. The pre-E.3 code relied on a bare
+        # ``except StopAsyncIteration: break`` which silently treated
+        # every premature end as a normal completion because the
+        # accumulator's ``finish_reason or "stop"`` fallback produced
+        # a "stop" marker that ``ToolCallAgent.think`` accepted as
+        # final. Real-world impact: a provider that drops the
+        # connection after 200 tokens would surface as "task
+        # completed" with truncated output. This is the exact B8
+        # scenario in the native-adapter path.
+        #
+        #   ``saw_message_complete``
+        #       True only after a MESSAGE_COMPLETE event was
+        #       processed. The MESSAGE_COMPLETE branch already
+        #       yields a terminal chunk and returns, so this flag is
+        #       defense-in-depth against a future refactor that
+        #       changes ``return`` to ``break``.
+        #
+        #   ``saw_any_payload``
+        #       True after at least one content / reasoning /
+        #       tool-call fragment was emitted. Distinguishes
+        #       "truncated after partial output" (recoverable —
+        #       emit ``incomplete``) from "empty stream that never
+        #       produced anything" (unrecoverable — raise).
+        saw_message_complete: bool = False
+        saw_any_payload: bool = False
+
         # [FIX-DOUBLE-ARGS] Track which tool-call indexes have already
         # emitted incremental TOOL_CALL_DELTA fragments during this
         # stream. If deltas were emitted, the accumulator already has
@@ -222,7 +252,69 @@ class StreamNormalizer:
                         ),
                     )
                 except StopAsyncIteration:
-                    break
+                    # [E.3 FIX — B8] Classify how the stream ended.
+                    #
+                    # The historical code did a bare ``break`` here.
+                    # That silently treated every premature end as a
+                    # successful completion because the accumulator's
+                    # ``finish_reason or "stop"`` fallback produced a
+                    # "stop" marker that ``ToolCallAgent.think``
+                    # accepted as final. The three-way classification
+                    # below closes that gap:
+                    #
+                    #   1. ``saw_message_complete == True``
+                    #      The MESSAGE_COMPLETE branch already yielded
+                    #      the terminal chunk and ``return``ed, so we
+                    #      should never reach here in that case. Kept
+                    #      for defense in depth against future refactors
+                    #      that might change ``return`` to ``break``.
+                    #
+                    #   2. ``saw_any_payload == True``
+                    #      Stream truncated AFTER producing partial
+                    #      output. We emit a synthetic terminal chunk
+                    #      with ``finish_reason="incomplete"`` so the
+                    #      accumulator records the truncation. Then
+                    #      ``ToolCallAgent.think`` sees the marker,
+                    #      raises ``INCOMPLETE_STREAM``, and the retry
+                    #      loop discards the partial text via RESET
+                    #      (see E.2 in ``tool_call_agent.py``).
+                    #
+                    #   3. Neither flag set
+                    #      The adapter ended with zero output and no
+                    #      completion marker. Raise so ``think`` treats
+                    #      it as a genuine failure and retries with a
+                    #      fresh attempt. This matches the pre-M7
+                    #      ``AsyncLLMClient.chat_completion`` behavior
+                    #      of raising when the stream died before any
+                    #      token arrived.
+                    if saw_message_complete:
+                        break
+
+                    if saw_any_payload:
+                        logger.warning(
+                            "[E.3] Adapter stream ended without "
+                            "MESSAGE_COMPLETE after %d event(s). "
+                            "Emitting finish_reason='incomplete' so "
+                            "ToolCallAgent.think can retry with a "
+                            "fresh attempt_id.",
+                            event_count,
+                        )
+                        yield StreamChunk(
+                            finish_reason="incomplete",
+                            usage=pending_usage,
+                            raw=pending_provider_metadata,
+                        )
+                        break
+
+                    raise RuntimeError(
+                        f"INCOMPLETE_STREAM: adapter stream ended "
+                        f"after {event_count} event(s) with no "
+                        f"content, no reasoning, no tool calls, and "
+                        f"no MESSAGE_COMPLETE marker. The provider "
+                        f"dropped the connection or crashed before "
+                        f"producing any output. The caller MUST "
+                        f"retry with a fresh attempt."
+                    )
                 except asyncio.TimeoutError:
                     waited = (
                         first_chunk_timeout
@@ -255,6 +347,12 @@ class StreamNormalizer:
                 if event_type == StreamEventType.CONTENT_DELTA:
                     piece = event.content_delta
                     if isinstance(piece, str) and piece:
+                        # [E.3] Track that at least one payload
+                        # fragment was emitted so the truncation
+                        # classifier in the StopAsyncIteration handler
+                        # knows the stream was "truncated mid-content"
+                        # rather than "empty stream".
+                        saw_any_payload = True
                         if on_chunk is not None:
                             result = on_chunk(piece)
                             if asyncio.iscoroutine(result):
@@ -268,6 +366,12 @@ class StreamNormalizer:
                 if event_type == StreamEventType.REASONING_DELTA:
                     piece = event.reasoning_delta
                     if isinstance(piece, str) and piece:
+                        # [E.3] Same truncation-tracking rationale
+                        # as CONTENT_DELTA above. A stream that
+                        # produced only reasoning before the connection
+                        # dropped is still truncated — the model may
+                        # have been mid-thought when it stopped.
+                        saw_any_payload = True
                         if on_thought_chunk is not None:
                             result = on_thought_chunk(piece)
                             if asyncio.iscoroutine(result):
@@ -291,6 +395,8 @@ class StreamNormalizer:
                         "id": tool_id,
                         "name": tool_name,
                     }
+                    # [E.3] A tool call has begun — payload-bearing.
+                    saw_any_payload = True
                     yield StreamChunk(
                         tool_call_deltas=[
                             DeltaToolCall(
@@ -357,6 +463,9 @@ class StreamNormalizer:
                     # streamed the full JSON via deltas).
                     _tool_call_deltas_emitted.add(index)
 
+                    # [E.3] Tool-call delta — payload-bearing.
+                    saw_any_payload = True
+
                     # Emit even when ``piece`` is empty — this carries
                     # the tool name to the accumulator on the very
                     # first delta.
@@ -415,6 +524,8 @@ class StreamNormalizer:
                     args_complete = event.tool_arguments_complete
                     if args_complete is None:
                         continue
+                    # [E.3] Tool-call completion — payload-bearing.
+                    saw_any_payload = True
                     # Serialize as JSON so the consumer's existing
                     # DeltaToolCall accumulation logic (which joins
                     # string fragments) reconstructs the correct
@@ -478,6 +589,10 @@ class StreamNormalizer:
                 # and the accumulated usage.
                 # ---------------------------------------------------
                 if event_type == StreamEventType.MESSAGE_COMPLETE:
+                    # [E.3] Mark the stream as properly completed so
+                    # the StopAsyncIteration classifier does NOT
+                    # treat the subsequent iterator end as truncation.
+                    saw_message_complete = True
                     pending_finish_reason = event.finish_reason or "stop"
                     if event.usage is not None:
                         pending_usage = event.usage
@@ -663,13 +778,33 @@ class _ResponseAccumulator:
                 model=model,
             )
 
+        # [E.3 FIX — B8 defense-in-depth] The historical fallback was
+        # ``self.finish_reason or "stop"``. When the normalizer failed
+        # to emit a terminal chunk (bug, unexpected event ordering,
+        # future refactor that removes the StopAsyncIteration handler),
+        # the accumulator silently labeled truncated output as
+        # "completed normally". ``ToolCallAgent.think`` then accepted
+        # partial text as the final answer.
+        #
+        # The new fallback is ``"incomplete"`` — the honest signal.
+        # If MESSAGE_COMPLETE was properly received, the accumulator
+        # already has a non-None ``finish_reason`` (either the
+        # adapter's real value or the "stop" default applied inside
+        # the MESSAGE_COMPLETE branch), so ``or "incomplete"`` never
+        # fires. It only fires when the normalizer's own truncation
+        # classifier was bypassed — a bug we want surfaced, not
+        # masked.
+        #
+        # Consumers react to "incomplete" the same way they react to
+        # "stop": ``LLMResponse.finish_reason == "incomplete"`` triggers
+        # the E.2 retry path in ``ToolCallAgent.think``.
         return LLMResponse(
             content=content_text,
             reasoning=reasoning_text,
             reasoning_content=reasoning_text,
             thought=reasoning_text,
             tool_calls=tool_calls,
-            finish_reason=self.finish_reason or "stop",
+            finish_reason=self.finish_reason or "incomplete",
             usage=usage,
             model=model,
             raw=self.provider_metadata,

@@ -25,6 +25,15 @@ from typing import Any, Dict, List, Optional, Union
 import uuid
 
 from peldrun.agents.base import AgentConfig, BaseAgent
+from peldrun.agents.message_guard import rebuild_for_llm
+from peldrun.agents.termination import (
+    apply_decision,
+    evaluate as evaluate_termination,
+)
+from peldrun.context.projection import (
+    ContextProjection,
+    ProjectionConfig,
+)
 from peldrun.engine.state import ExecutionState, ExecutionStatus, MessageRole
 from peldrun.events.emitter import EventEmitter
 from peldrun.events.schema import EventType, PeldrunEvent
@@ -32,6 +41,7 @@ from peldrun.llm.client import LLMResponse, ToolCall
 from peldrun.tools.base import ToolResult
 from peldrun.tools.collection import ToolCollection
 from peldrun.tools.contract import ToolExecutionPolicy
+from peldrun.tools.execution_result import ToolExecutionResult
 
 logger = logging.getLogger("peldrun.agents.tool_call_agent")
 
@@ -313,16 +323,47 @@ class ToolCallAgent(BaseAgent):
         return ToolExecutionPolicy(max_attempts=1, retryable=False, side_effects=True)
 
     def _sync_messages_from_state(self, state: ExecutionState) -> None:
-        """Synchronize in-memory message history from ExecutionState messages."""
+        """
+        Synchronize the in-memory message history from ExecutionState.
+
+        [B1 FIX] Every code path now routes through
+        ``message_guard.rebuild_for_llm``, which guarantees that the
+        system prompt is the FIRST message of the assembled LLM
+        payload. The pre-fix branch that simply copied
+        ``state.messages`` verbatim silently DROPPED the system
+        prompt whenever the state was non-empty, which meant the
+        model ran without any operational instructions from step 2
+        onward.
+
+        Both branches also produce identical message shapes now —
+        ``[system, user, ...]`` — so downstream code that inspects
+        ``self.messages`` (diagnostics, replay, projection) never
+        has to special-case "did the state have messages or not?".
+
+        The guard is idempotent: calling this method twice in a row
+        produces the same message list, and calling it after the
+        state has been mutated with new tool observations still
+        keeps the system prompt at index 0.
+        """
         if state.messages:
-            self.messages = [msg.to_llm_dict() for msg in state.messages]
+            # The state already carries a conversation. Route its
+            # messages through the guard so the system prompt is
+            # prepended (or reinstated) even when the historical
+            # message list does not begin with one.
+            self.messages = rebuild_for_llm(
+                [msg.to_llm_dict() for msg in state.messages],
+                self.system_prompt,
+            )
         else:
-            self.messages = [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": state.task_prompt or "Start task."},
-            ]
+            # Initial synchronization: seed the state with the
+            # task, then route through the same guard so both
+            # branches converge on the identical shape.
             state.add_message(role=MessageRole.SYSTEM, content=self.system_prompt)
             state.add_message(role=MessageRole.USER, content=state.task_prompt or "Start task.")
+            self.messages = rebuild_for_llm(
+                [msg.to_llm_dict() for msg in state.messages],
+                self.system_prompt,
+            )
 
     async def think(self, step: int) -> LLMResponse:
         """
@@ -374,6 +415,54 @@ class ToolCallAgent(BaseAgent):
             if self.state and not self.state.messages:
                 self.state.add_message(role=MessageRole.SYSTEM, content=self.system_prompt)
                 self.state.add_message(role=MessageRole.USER, content=prompt_text)
+
+        # [D FIX — B7] Build the LLM-facing message list from the
+        # authoritative ExecutionState via ContextProjection.
+        #
+        # Pre-Phase-D behavior: ``think()`` used ``self.messages``
+        # directly. On a context-overflow error, it built a local
+        # ``compact_msgs`` list, retried with it, and then DISCARDED
+        # the result. On the next ``think()`` call the full
+        # (uncompacted) history was reloaded, and the same overflow
+        # recurred. Every step paid the 400-error + compact-retry
+        # penalty; long runs never converged on a stable view.
+        #
+        # Post-fix: ``ContextProjection.build`` reads state.messages
+        # (the audit trail — never mutated), estimates token cost,
+        # and returns a deterministic, budget-aware view. When the
+        # conversation exceeds the budget, the SAME compacted view
+        # is produced on every subsequent think() call until the
+        # conversation shrinks. Compaction is no longer a one-shot
+        # retry artifact.
+        #
+        # The budget resolves in this order:
+        #   1. ``budget_override`` (none here)
+        #   2. ``state.metadata["context_budget"]["effective_limit"]``
+        #      (set by CoreRuntimeExecutor)
+        #   3. ``ProjectionConfig`` fallback:
+        #      fallback_max_tokens - fallback_max_output_tokens
+        #      = 8192 - 2048 = 6144 tokens (~24 KB of text)
+        #
+        # The system prompt is enforced at the projection boundary
+        # (via message_guard internally), so this call also satisfies
+        # the B1 invariant without a separate rebuild_for_llm step
+        # for the LLM input path.
+        projection = ContextProjection()
+        projection_result = projection.build(
+            self.state, self.system_prompt
+        )
+        llm_messages = projection_result.messages
+
+        if projection_result.stats.was_compacted:
+            logger.info(
+                "Projection compacted before LLM call: %s",
+                projection_result.stats.summary(),
+            )
+        else:
+            logger.debug(
+                "Projection: %s",
+                projection_result.stats.summary(),
+            )
 
         effort_val = getattr(getattr(self.llm, "config", None), "reasoning_effort", None)
         extra_call_params: Dict[str, Any] = {}
@@ -444,6 +533,12 @@ class ToolCallAgent(BaseAgent):
         _streamed_content_any = False
         _streamed_thought_any = False
         _last_flush = time.monotonic()
+        # [E.2 FIX — B8] Per-attempt correlation id. Every CHUNK and
+        # THOUGHT event carries this so the frontend can distinguish
+        # text from different retry attempts. Reassigned at the top
+        # of each retry loop iteration; the initial value is only a
+        # placeholder for the first attempt.
+        _attempt_id: str = uuid.uuid4().hex[:12]
 
         def _should_flush(buf: List[str], force: bool) -> bool:
             if not buf:
@@ -457,7 +552,7 @@ class ToolCallAgent(BaseAgent):
             )
 
         async def _flush_content(force: bool = False) -> None:
-            nonlocal _last_flush, _streamed_content_any
+            nonlocal _last_flush, _streamed_content_any, _attempt_id
             if not _should_flush(_content_buffer, force):
                 return
             payload_text = "".join(_content_buffer)
@@ -473,6 +568,11 @@ class ToolCallAgent(BaseAgent):
                         "text": payload_text,
                         "content": payload_text,
                         "is_delta": True,
+                        # [E.2] Attempt correlation — the frontend
+                        # uses this to discard stale attempt text
+                        # when a RESET event arrives for a newer
+                        # attempt_id.
+                        "attempt_id": _attempt_id,
                     },
                 )
             except Exception as flush_err:
@@ -481,7 +581,7 @@ class ToolCallAgent(BaseAgent):
                 )
 
         async def _flush_thought(force: bool = False) -> None:
-            nonlocal _last_flush, _streamed_thought_any
+            nonlocal _last_flush, _streamed_thought_any, _attempt_id
             if not _should_flush(_thought_buffer, force):
                 return
             payload_text = "".join(_thought_buffer)
@@ -496,6 +596,8 @@ class ToolCallAgent(BaseAgent):
                         "thought": payload_text,
                         "content": payload_text,
                         "is_delta": True,
+                        # [E.2] Attempt correlation.
+                        "attempt_id": _attempt_id,
                     },
                 )
             except Exception as flush_err:
@@ -506,6 +608,51 @@ class ToolCallAgent(BaseAgent):
         async def _flush_all(force: bool = False) -> None:
             await _flush_content(force=force)
             await _flush_thought(force=force)
+
+        async def _emit_reset_events(reason: str) -> None:
+            """Emit RESET markers on both streaming channels.
+
+            [E.2 FIX — B8] Called before each retry attempt and before
+            a final raise. The ``reset: True`` flag tells the frontend
+            to discard whatever it accumulated for this channel since
+            the last non-reset event. Without this, retrying after a
+            mid-stream failure would APPEND the new attempt's tokens
+            on top of the failed attempt's visible text — the exact
+            duplication B8 documented.
+
+            The ``attempt_id`` field still provides correlation when
+            the frontend does not (yet) honor ``reset``: the frontend
+            can ignore events whose ``attempt_id`` no longer matches
+            the most recent one it has seen. Both mechanisms are
+            independent and complementary.
+
+            Emission failures are swallowed. A broken emitter must
+            never prevent the retry or the final raise from running.
+            """
+            try:
+                await self._emit(
+                    EventType.CHUNK,
+                    step=step,
+                    payload={
+                        "reset": True,
+                        "attempt_id": _attempt_id,
+                        "reason": reason,
+                    },
+                )
+            except Exception:
+                pass
+            try:
+                await self._emit(
+                    EventType.THOUGHT,
+                    step=step,
+                    payload={
+                        "reset": True,
+                        "attempt_id": _attempt_id,
+                        "reason": reason,
+                    },
+                )
+            except Exception:
+                pass
 
         async def _on_chunk(delta_text: str) -> None:
             """Content-token callback — user-visible output.
@@ -538,12 +685,36 @@ class ToolCallAgent(BaseAgent):
             await _flush_thought(force=True)
 
         async def _call_llm(msgs: List[Dict[str, Any]]) -> LLMResponse:
+            """
+            Invoke the underlying LLM client.
+
+            [B2 FIX] The ``temperature`` parameter is deliberately NOT
+            passed from this layer. Sampling temperature is part of
+            the run's ``GenerationConfig`` (built from
+            ``AgentSpec.temperature`` — which itself resolves from
+            ``active_llm["temperature"]``, and that in turn comes from
+            ``models_budget.json`` / ``config.toml``). Passing a
+            hardcoded value here — as the pre-fix code did, with
+            ``temperature=0.2`` — silently overrode the user's
+            per-model configuration on every step.
+
+            When the bridge (``_ToolCallAgentBridge``) is in use, the
+            ``kwargs.get("temperature")`` check inside
+            ``_build_request`` correctly sees ``None`` and leaves the
+            base request's ``generation.temperature`` untouched.
+            When a legacy client is in use, the same behavior applies:
+            the client falls back to its own configuration instead of
+            receiving a foreign override.
+
+            ``on_chunk`` / ``on_thought_chunk`` remain wired through
+            because they are per-call streaming callbacks, not
+            model configuration.
+            """
             if hasattr(self.llm, "generate"):
                 return await self.llm.generate(
                     messages=msgs,
                     tools=tools_schema if tools_schema else None,
                     tool_choice="auto",
-                    temperature=0.2,
                     on_chunk=_on_chunk,
                     on_thought_chunk=_on_thought_chunk,
                     **extra_call_params,
@@ -553,7 +724,6 @@ class ToolCallAgent(BaseAgent):
                     messages=msgs,
                     tools=tools_schema if tools_schema else None,
                     tool_choice="auto",
-                    temperature=0.2,
                     on_chunk=_on_chunk,
                     on_thought_chunk=_on_thought_chunk,
                     **extra_call_params,
@@ -562,7 +732,6 @@ class ToolCallAgent(BaseAgent):
                 return await self.llm.chat_complete(
                     messages=msgs,
                     tools=tools_schema if tools_schema else None,
-                    temperature=0.2,
                     on_chunk=_on_chunk,
                     on_thought_chunk=_on_thought_chunk,
                     **extra_call_params,
@@ -573,18 +742,81 @@ class ToolCallAgent(BaseAgent):
         max_llm_attempts = 3
         last_llm_exc: Optional[Exception] = None
 
+        # [D FIX — B7 continued] ``llm_messages`` is the projection
+        # output built above. Retries update it by rebuilding the
+        # projection with a tighter ProjectionConfig — never by
+        # manipulating the message list by hand. This keeps
+        # compaction deterministic across retries and across steps.
         for llm_attempt in range(1, max_llm_attempts + 1):
+            # [E.2 FIX — B8] Per-attempt streaming state.
+            #
+            # A fresh ``_attempt_id`` is generated for every retry.
+            # Every CHUNK and THOUGHT event emitted during THIS
+            # attempt carries that id, so the frontend can
+            # distinguish text from this attempt vs. a previous one.
+            #
+            # The buffers are cleared so the fallback logic at the
+            # bottom of think() correctly reflects whether THIS
+            # attempt streamed. Without this reset,
+            # ``_streamed_content_any`` would remain True from a
+            # previous attempt and suppress the non-streaming
+            # fallback CHUNK that a compact-retry path needs.
+            _attempt_id = uuid.uuid4().hex[:12]
+            _is_retry = llm_attempt > 1
+
+            _content_buffer.clear()
+            _thought_buffer.clear()
+            _streamed_content_any = False
+            _streamed_thought_any = False
+
+            # Before a retry, discard whatever partial content the
+            # frontend displayed for the failed attempt. Without this,
+            # the retry's text would append to the failed attempt's
+            # visible text — the duplication B8 documented.
+            if _is_retry:
+                logger.info(
+                    "Retrying LLM call (attempt %d/%d). Emitting "
+                    "RESET before new attempt_id=%s.",
+                    llm_attempt,
+                    max_llm_attempts,
+                    _attempt_id,
+                )
+                await _emit_reset_events(reason="retry")
+
             try:
-                response = await _call_llm(self.messages)
+                response = await _call_llm(llm_messages)
+
+                # [E.2 FIX — E.1 signal surface]
+                #
+                # An ``incomplete`` finish_reason means the stream
+                # ended without a terminal marker (see E.1 in
+                # ``llm/client.py``). The partial content the provider
+                # generated is already visible on the UI (via
+                # ``_on_chunk`` -> ``_flush_content``). Accepting it
+                # as the final response would silently complete the
+                # task on truncated output. Convert to a retryable
+                # failure so the retry loop discards the partial text
+                # and re-streams cleanly.
+                if getattr(response, "finish_reason", None) == "incomplete":
+                    raise RuntimeError(
+                        f"INCOMPLETE_STREAM: LLM returned "
+                        f"finish_reason='incomplete' on attempt "
+                        f"{llm_attempt}/{max_llm_attempts}. The "
+                        f"provider stream ended without a terminal "
+                        f"marker; the partial output cannot be "
+                        f"trusted as the final response."
+                    )
+
                 break
             except Exception as exc:
                 last_llm_exc = exc
                 err_str = str(exc).lower()
 
-                # [FIX-OOM-FAST-FAIL] Out-of-memory is never retryable.
-                # A second attempt consumes additional memory before the
-                # original allocation is freed, making OOM strictly
-                # worse. Propagate immediately with a clear message.
+                # [FIX-OOM-FAST-FAIL] Out-of-memory is never
+                # retryable. A second attempt consumes additional
+                # memory before the original allocation is freed,
+                # making OOM strictly worse. Propagate immediately
+                # with a clear message.
                 if _is_oom_error(exc):
                     logger.error(
                         "LLM OOM detected on attempt %d (%s). Raising "
@@ -592,70 +824,81 @@ class ToolCallAgent(BaseAgent):
                         llm_attempt,
                         exc,
                     )
+                    # [E.2] Clear the UI before raising so the user
+                    # does not see stale partial content from a
+                    # failed attempt.
+                    await _emit_reset_events(reason="fatal_oom")
                     raise
 
-                if "terminated" in err_str or "context" in err_str or "400" in err_str or "maximum context" in err_str:
-                    # [FIX-AGGRESSIVE-COMPACTION] Previous compaction kept
-                    # 6 trailing messages (up to 3 tool observations). For
-                    # a web_search loop that means 3 × 4 KB = 12 KB of
-                    # observations survive — often still too much to fit.
-                    # Keep only 3 trailing messages and truncate any tool
-                    # observation inside the window to 800 chars.
+                # [E.2] INCOMPLETE_STREAM is a distinct signal from
+                # the E.1 fix in llm/client.py. It means the provider
+                # sent partial content but the connection dropped
+                # before the terminal marker. It is retryable — a
+                # transient network stall is often the cause — and
+                # requires a RESET before the retry so the UI does
+                # not accumulate partial output across attempts.
+                is_incomplete_stream = (
+                    "incomplete_stream" in err_str
+                    or "incomplete stream" in err_str
+                )
+                if is_incomplete_stream:
+                    logger.warning(
+                        "INCOMPLETE_STREAM detected on attempt "
+                        "%d/%d. Partial content will be discarded "
+                        "and the call retried with a fresh "
+                        "attempt_id.",
+                        llm_attempt,
+                        max_llm_attempts,
+                    )
+
+                if (
+                    "terminated" in err_str
+                    or "context" in err_str
+                    or "400" in err_str
+                    or "maximum context" in err_str
+                ):
+                    # [D FIX — B7] Context compaction path.
+                    # Unchanged from Phase D except for the
+                    # incomplete-stream check after the retry, which
+                    # ensures a successful-but-truncated compact
+                    # response is also treated as a failure.
                     logger.warning(
                         "Provider rejected full context (%s). "
-                        "Aggressively compacting on attempt %d.",
+                        "Rebuilding projection with tighter config "
+                        "on attempt %d.",
                         exc,
                         llm_attempt,
                     )
-                    # [FIX-COMPACTION-OVERLAP] The naive
-                    # ``[:2] + [-3:]`` slices overlap whenever
-                    # ``len(self.messages) <= 4``, producing a
-                    # "compacted" list that is LARGER than the
-                    # original — each message appears twice. That
-                    # guaranteed the retry would ALSO fail with the
-                    # same 400, and two consecutive duplicate requests
-                    # were visible in the LM Studio server log at
-                    # 22:08:40.
-                    #
-                    # Fix: compute non-overlapping head + tail slices.
-                    # ``head_count + tail_count <= len(messages)`` is
-                    # guaranteed by construction, so no message is
-                    # ever included twice.
-                    #
-                    # Examples:
-                    #   len=2  [sys, user]              -> [sys, user]
-                    #   len=3  [sys, user, asst]        -> [sys, user, asst]
-                    #   len=4  [sys, user, asst, tool]  -> [sys, user, asst, tool]
-                    #   len=10 [sys, user, ... 8 more]  -> [sys, user, m7, m8, m9]
-                    tail_count = min(3, len(self.messages))
-                    head_count = min(2, max(0, len(self.messages) - tail_count))
-                    compact_msgs = (
-                        list(self.messages[:head_count])
-                        + list(self.messages[-tail_count:])
+                    tighter_config = ProjectionConfig(
+                        keep_recent_units=3,
+                        keep_first_user=True,
+                        keep_last_user=True,
+                        compaction_threshold_ratio=0.85,
                     )
-                    # Strip any leading ``tool`` message from the tail
-                    # slice. Some providers reject a tool message that
-                    # does not follow an assistant turn with
-                    # ``tool_calls``.
-                    while (
-                        len(compact_msgs) > head_count + 1
-                        and compact_msgs[head_count].get("role") == "tool"
-                    ):
-                        compact_msgs.pop(head_count)
-
-                    for cmsg in compact_msgs:
-                        if cmsg.get("role") == "tool":
-                            c = cmsg.get("content", "")
-                            if isinstance(c, str) and len(c) > 800:
-                                cmsg["content"] = c[:640] + "... [truncated on compaction]"
-
-                    if not compact_msgs or not any(m.get("role") == "user" for m in compact_msgs):
-                        compact_msgs = [
-                            {"role": "system", "content": self.system_prompt},
-                            {"role": "user", "content": (self.state.task_prompt if self.state else "") or "Proceed with task."},
-                        ]
+                    projection_result = projection.build(
+                        self.state,
+                        self.system_prompt,
+                        config_override=tighter_config,
+                    )
+                    llm_messages = projection_result.messages
+                    logger.info(
+                        "Aggressive projection retry: %s",
+                        projection_result.stats.summary(),
+                    )
                     try:
-                        response = await _call_llm(compact_msgs)
+                        response = await _call_llm(llm_messages)
+
+                        # [E.2] Same incomplete check as above — a
+                        # compact retry that ends mid-stream is not a
+                        # valid response either.
+                        if getattr(response, "finish_reason", None) == "incomplete":
+                            raise RuntimeError(
+                                f"INCOMPLETE_STREAM: LLM returned "
+                                f"finish_reason='incomplete' after "
+                                f"compaction on attempt "
+                                f"{llm_attempt}/{max_llm_attempts}."
+                            )
+
                         break
                     except Exception as compact_exc:
                         last_llm_exc = compact_exc
@@ -666,10 +909,37 @@ class ToolCallAgent(BaseAgent):
                                 llm_attempt,
                                 compact_exc,
                             )
+                            await _emit_reset_events(
+                                reason="fatal_oom_compaction"
+                            )
                             raise
 
+                        # A more aggressive projection still failed.
+                        # If the error is transient, fall through to
+                        # the transient-retry branch below; otherwise
+                        # raise the compact attempt's exception.
+                        compact_err_str = str(compact_exc).lower()
+                        compact_is_incomplete = (
+                            "incomplete_stream" in compact_err_str
+                            or "incomplete stream" in compact_err_str
+                        )
+                        if not (
+                            compact_is_incomplete
+                            or "429" in compact_err_str
+                            or "rate limit" in compact_err_str
+                            or "timeout" in compact_err_str
+                            or "502" in compact_err_str
+                            or "503" in compact_err_str
+                            or "connection" in compact_err_str
+                        ):
+                            await _emit_reset_events(
+                                reason="final_failure_compaction"
+                            )
+                            raise last_llm_exc
+
                 is_transient = (
-                    "429" in err_str
+                    is_incomplete_stream
+                    or "429" in err_str
                     or "rate limit" in err_str
                     or "timeout" in err_str
                     or "502" in err_str
@@ -678,10 +948,20 @@ class ToolCallAgent(BaseAgent):
                 )
                 if is_transient and llm_attempt < max_llm_attempts:
                     delay = 1.5 * llm_attempt
-                    logger.warning("Transient LLM error on attempt %d (%s). Retrying in %.1fs...", llm_attempt, exc, delay)
+                    logger.warning(
+                        "Transient LLM error on attempt %d (%s). "
+                        "Retrying in %.1fs...",
+                        llm_attempt,
+                        exc,
+                        delay,
+                    )
                     await asyncio.sleep(delay)
                     continue
 
+                # [E.2] Final failure — clear the UI before raising
+                # so no partial content remains visible from a
+                # failed attempt.
+                await _emit_reset_events(reason="final_failure")
                 raise last_llm_exc
 
         # ──────────────────────────────────────────────────────────────
@@ -702,6 +982,10 @@ class ToolCallAgent(BaseAgent):
                     "thought": thought_val,
                     "content": thought_val,
                     "is_delta": False,
+                    # [E.2] The fallback lands in the same attempt as
+                    # the final response — carry the id so the
+                    # frontend can keep it.
+                    "attempt_id": _attempt_id,
                 },
             )
 
@@ -718,13 +1002,74 @@ class ToolCallAgent(BaseAgent):
                     "text": response.content,
                     "content": response.content,
                     "is_delta": False,
+                    # [E.2] Same correlation rationale as above.
+                    "attempt_id": _attempt_id,
                 },
             )
 
         return response
 
-    async def act(self, step: int, tool_calls: List[ToolCall]) -> List[str]:
-        observations: List[str] = []
+    async def act(
+        self, step: int, tool_calls: List[ToolCall]
+    ) -> List[ToolExecutionResult]:
+        """
+        Execute all tool calls emitted by the LLM and return their
+        canonical results.
+
+        [C.3 FIX — B5 + B6] The historical return type was ``List[str]``:
+        a plain-text observation per tool call. ``step()`` had no
+        structured way to know whether a tool succeeded or failed, so
+        it fell back to inspecting tool NAMES — which produced the B3
+        bug (a failed ``terminate`` still ended the run). The new
+        return type is ``List[ToolExecutionResult]``, whose elements
+        carry ``status``, ``outcome``, ``exit_code``, ``error``, and
+        ``tool_call_id``. The termination evaluator (C.4) consumes
+        these results directly.
+
+        Execution path
+        --------------
+        Every tool invocation flows through
+        ``ToolCollection.aexecute_with_result`` -> ``ExecutionManager``:
+
+          * synchronous tools are offloaded to a worker thread (B6);
+          * timeouts become ``status="timeout"`` with ``exit_code=124``;
+          * tool-level exceptions become ``status="failure"``;
+          * run-level cancellation propagates as ``CancelledError``.
+
+        Retry semantics
+        ---------------
+        The agent (this method) is the ONLY retry layer. For each tool
+        call, up to ``policy.max_attempts`` attempts are made. Between
+        attempts, ``policy.is_retry_permitted`` decides whether to
+        continue, ``policy.compute_delay`` computes the backoff, and a
+        ``TOOL_RETRY`` event is emitted with the attempt number. Non-
+        retriable failures break the loop immediately.
+
+        Human tools (``ask_human``, ``human_input``) get a 600-second
+        default timeout so the user has ample time to respond.
+        """
+        results: List[ToolExecutionResult] = []
+
+        # Resolve the collection that carries ``aexecute_with_result``.
+        # ``self.tool_collection`` may be a ``ToolCollection`` (which
+        # implements the method directly) or a ``ToolRegistry`` (which
+        # wraps one as ``._collection``).
+        tools_obj = (
+            getattr(self, "tool_registry", None)
+            or getattr(self, "tool_collection", None)
+            or getattr(self, "tools", None)
+        )
+        collection = (
+            getattr(tools_obj, "_collection", tools_obj)
+            if tools_obj is not None
+            else None
+        )
+        if collection is None or not hasattr(collection, "aexecute_with_result"):
+            logger.error(
+                "act(): no tool collection with aexecute_with_result "
+                "is available; returning empty results."
+            )
+            return []
 
         for call in tool_calls:
             tool_name = call.name
@@ -743,17 +1088,17 @@ class ToolCallAgent(BaseAgent):
                 if not args.get("request_id"):
                     args["request_id"] = f"req_{uuid.uuid4().hex[:12]}"
                 if self.state is not None:
-                    self.state.mark_waiting_for_input(reason="Agent invoked interactive human tool")
+                    self.state.mark_waiting_for_input(
+                        reason="Agent invoked interactive human tool"
+                    )
 
             policy = self._get_tool_policy(tool_name)
-            tool_inst = self._resolve_tool_instance(tool_name)
 
-            final_output_str = ""
-            final_attempt = 1
-            is_success = False
+            final_result: Optional[ToolExecutionResult] = None
+            attempts_made = 0
 
             for attempt in range(1, policy.max_attempts + 1):
-                final_attempt = attempt
+                attempts_made = attempt
 
                 await self._emit(
                     EventType.TOOL_CALL,
@@ -766,155 +1111,224 @@ class ToolCallAgent(BaseAgent):
                     },
                 )
 
-                output_str = ""
-                has_error = False
-                attempt_exc: Optional[Exception] = None
+                # Human tools get a long default timeout; other tools
+                # use the policy's configured value.
+                if is_human_tool:
+                    call_timeout: Optional[float] = float(
+                        args.get("timeout_seconds") or 600.0
+                    )
+                else:
+                    call_timeout = policy.timeout_seconds
 
-                if tool_inst is not None:
-                    timeout_limit = (
-                        float(args.get("timeout_seconds") or 600.0)
-                        if is_human_tool
-                        else policy.timeout_seconds
+                try:
+                    result = await collection.aexecute_with_result(
+                        tool_name,
+                        args,
+                        tool_call_id=call_id,
+                        timeout_seconds=call_timeout,
+                    )
+                except asyncio.CancelledError:
+                    if is_human_tool and self.state is not None:
+                        self.state.mark_failed(
+                            "Human interaction cancelled.",
+                            error_code="CANCELLED",
+                        )
+                    raise
+                except Exception as exc:
+                    # ``aexecute_with_result`` is documented to never
+                    # raise, but a custom collection could violate that
+                    # contract. Degrade to a structured failure so the
+                    # agent continues instead of crashing the run.
+                    logger.exception(
+                        "act(): aexecute_with_result raised for '%s'.",
+                        tool_name,
+                    )
+                    result = ToolExecutionResult.failure(
+                        tool_name=tool_name,
+                        tool_call_id=call_id,
+                        error=f"Tool execution raised: {exc}",
+                        exit_code=1,
                     )
 
-                    try:
-                        res: Any
-
-                        async def _execute_underlying() -> Any:
-                            if hasattr(tool_inst, "aexecute") and callable(tool_inst.aexecute):
-                                return await tool_inst.aexecute(**args)
-                            elif hasattr(tool_inst, "_arun") and callable(tool_inst._arun):
-                                return await tool_inst._arun(**args)
-                            elif hasattr(tool_inst, "execute") and callable(tool_inst.execute):
-                                fn = tool_inst.execute
-                                if inspect.iscoroutinefunction(fn):
-                                    return await fn(**args)
-                                else:
-                                    r = fn(**args)
-                                    return (await r) if inspect.isawaitable(r) else r
-                            else:
-                                return ToolResult(
-                                    output=f"Tool '{tool_name}' has no executable entrypoint.",
-                                    exit_code=1,
-                                    is_error=True,
-                                )
-
-                        if timeout_limit and timeout_limit > 0:
-                            res = await asyncio.wait_for(_execute_underlying(), timeout=timeout_limit)
-                        else:
-                            res = await _execute_underlying()
-
-                        if isinstance(res, ToolResult):
-                            if res.is_error:
-                                has_error = True
-                                output_str = res.error or str(res.output) or f"Error executing tool '{tool_name}'"
-                            else:
-                                output_str = str(res.output) if res.output is not None else ""
-                        elif isinstance(res, dict) and "output" in res:
-                            output_str = str(res.get("output", ""))
-                            has_error = bool(res.get("is_error", False))
-                        else:
-                            output_str = str(res)
-
-                    except (asyncio.TimeoutError, TimeoutError) as t_err:
-                        attempt_exc = t_err
-                        has_error = True
-                        output_str = f"Tool '{tool_name}' timed out after {timeout_limit}s."
-
-                    except asyncio.CancelledError as cancel_err:
-                        if is_human_tool and self.state is not None:
-                            self.state.mark_failed("Human interaction cancelled.", error_code="CANCELLED")
-                        raise cancel_err
-
-                    except Exception as ex:
-                        attempt_exc = ex
-                        has_error = True
-                        output_str = f"Error executing tool '{tool_name}': {str(ex)}"
-                else:
-                    has_error = True
-                    output_str = f"Error: Tool '{tool_name}' not found in active collection."
+                final_result = result
 
                 if is_human_tool and self.state is not None:
-                    self.state.mark_running(reason="Human interaction resolved")
+                    self.state.mark_running(
+                        reason="Human interaction resolved"
+                    )
 
-                final_output_str = output_str
+                # Compose the observation text used for state history
+                # and retry error messages.
+                if result.is_success:
+                    observation_text = (
+                        str(result.output)
+                        if result.output is not None
+                        else ""
+                    )
+                else:
+                    observation_text = (
+                        result.error
+                        or (
+                            str(result.output)
+                            if result.output is not None
+                            else ""
+                        )
+                        or f"Tool '{tool_name}' failed."
+                    )
 
                 if self.state is not None:
                     self.state.record_tool_execution(
-                        tool_name=tool_name,
+                        tool_name=result.tool_name or tool_name,
                         arguments=args,
-                        output=output_str,
-                        exit_code=1 if has_error else 0,
-                        is_error=has_error,
-                        tool_call_id=call_id,
+                        output=observation_text,
+                        exit_code=result.exit_code,
+                        is_error=not result.is_success,
+                        tool_call_id=result.tool_call_id or call_id,
                         attempt=attempt,
                     )
 
-                if not has_error:
-                    is_success = True
+                if result.is_success:
                     break
 
-                can_retry = policy.is_retry_permitted(current_attempt=attempt, error=attempt_exc)
-                if can_retry:
-                    delay = policy.compute_delay(attempt + 1)
+                # Tool-level cancellation is not retriable. Run-level
+                # cancellation was already handled by the except block
+                # above; this branch covers a tool that returned a
+                # "cancelled" result of its own volition.
+                if result.status == "cancelled":
                     logger.warning(
-                        "Tool '%s' failed on attempt %d/%d (%s). Retrying in %.1fs...",
+                        "Tool '%s' returned status='cancelled'; "
+                        "not retrying.",
+                        tool_name,
+                    )
+                    break
+
+                # Synthesize a representative exception so the retry
+                # policy's transient-error heuristics (timeout, ...)
+                # continue to fire. For non-timeout failures we pass
+                # ``None`` — matching the pre-C.3 fallback behavior
+                # where attempt_exc was left unset for non-exception
+                # failures.
+                retry_error: Optional[BaseException] = None
+                if result.status == "timeout":
+                    retry_error = asyncio.TimeoutError(
+                        result.error or f"Tool '{tool_name}' timed out."
+                    )
+
+                can_retry = policy.is_retry_permitted(
+                    current_attempt=attempt, error=retry_error
+                )
+                if not can_retry or attempt >= policy.max_attempts:
+                    logger.info(
+                        "Tool '%s' failure on attempt %d is "
+                        "non-retryable or attempts exhausted.",
                         tool_name,
                         attempt,
-                        policy.max_attempts,
-                        output_str[:80],
-                        delay,
                     )
-
-                    await self._emit(
-                        EventType.TOOL_RETRY,
-                        step=step,
-                        payload={
-                            "tool_name": tool_name,
-                            "tool_call_id": call_id,
-                            "attempt": attempt + 1,
-                            "max_attempts": policy.max_attempts,
-                            "error": output_str,
-                            "delay_seconds": delay,
-                        },
-                    )
-
-                    if self.state is not None and self.state.status == ExecutionStatus.RUNNING:
-                        self.state.mark_retrying(reason=f"Retrying tool '{tool_name}' (attempt {attempt + 1})")
-
-                    if delay > 0:
-                        await asyncio.sleep(delay)
-
-                    if self.state is not None and self.state.status == ExecutionStatus.RETRYING:
-                        self.state.mark_running(reason=f"Resumed execution for tool retry (attempt {attempt + 1})")
-                else:
-                    logger.info("Tool '%s' failure on attempt %d is non-retryable. Concluding attempts.", tool_name, attempt)
                     break
 
+                delay = policy.compute_delay(attempt + 1)
+                logger.warning(
+                    "Tool '%s' failed on attempt %d/%d (%s). "
+                    "Retrying in %.1fs...",
+                    tool_name,
+                    attempt,
+                    policy.max_attempts,
+                    observation_text[:80],
+                    delay,
+                )
+
+                await self._emit(
+                    EventType.TOOL_RETRY,
+                    step=step,
+                    payload={
+                        "tool_name": tool_name,
+                        "tool_call_id": call_id,
+                        "attempt": attempt + 1,
+                        "max_attempts": policy.max_attempts,
+                        "error": observation_text,
+                        "delay_seconds": delay,
+                    },
+                )
+
+                if (
+                    self.state is not None
+                    and self.state.status == ExecutionStatus.RUNNING
+                ):
+                    self.state.mark_retrying(
+                        reason=(
+                            f"Retrying tool '{tool_name}' "
+                            f"(attempt {attempt + 1})"
+                        )
+                    )
+
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+                if (
+                    self.state is not None
+                    and self.state.status == ExecutionStatus.RETRYING
+                ):
+                    self.state.mark_running(
+                        reason=(
+                            f"Resumed execution for tool retry "
+                            f"(attempt {attempt + 1})"
+                        )
+                    )
+
+            # Every tool_call iteration always sets final_result at
+            # least once (policy.max_attempts >= 1 is invariant).
+            assert final_result is not None, (
+                f"act(): final_result not set for tool '{tool_name}'"
+            )
+
+            # Compose the observation payload for SSE and history.
+            if final_result.is_success:
+                final_observation_text = (
+                    str(final_result.output)
+                    if final_result.output is not None
+                    else ""
+                )
+            else:
+                final_observation_text = (
+                    final_result.error
+                    or (
+                        str(final_result.output)
+                        if final_result.output is not None
+                        else ""
+                    )
+                    or f"Tool '{tool_name}' failed."
+                )
+
+            # Emit the OBSERVATION event. The full structured result
+            # is embedded as ``result`` so downstream consumers (UI,
+            # audit, replay) can render status/exit_code/artifacts.
             await self._emit(
                 EventType.OBSERVATION,
                 step=step,
                 payload={
-                    "tool_name": tool_name,
-                    "output": final_output_str,
-                    "tool_call_id": call_id,
-                    "attempt": final_attempt,
-                    "is_error": not is_success,
+                    "tool_name": final_result.tool_name or tool_name,
+                    "output": final_observation_text,
+                    "tool_call_id": final_result.tool_call_id or call_id,
+                    "attempt": attempts_made,
+                    "status": final_result.status,
+                    "outcome": final_result.outcome,
+                    "exit_code": final_result.exit_code,
+                    "is_error": not final_result.is_success,
+                    "duration_ms": final_result.duration_ms,
+                    "result": final_result.to_dict(),
                 },
             )
 
-            # [FIX-OBSERVATION-TRUNCATION] Truncate large observations
-            # before storing in the conversation history. The full output
-            # is already in ``state.tool_history`` (via record_tool_execution
-            # above) and in the SSE event above, so nothing is lost from
-            # the audit / UI view. Only what the LLM re-sends each step is
-            # capped, preventing a single web_search from consuming 5+ KB
-            # of context per subsequent step.
-            _truncated_observation = _truncate_observation(tool_name, final_output_str)
+            # Conversation history stores the TRUNCATED observation
+            # string. The full result stays in ``state.tool_history``
+            # (via record_tool_execution) and in the SSE event above.
+            _truncated_observation = _truncate_observation(
+                tool_name, final_observation_text
+            )
 
             self.messages.append({
                 "role": "tool",
-                "tool_call_id": call_id,
+                "tool_call_id": final_result.tool_call_id or call_id,
                 "name": tool_name,
                 "content": _truncated_observation,
             })
@@ -924,12 +1338,12 @@ class ToolCallAgent(BaseAgent):
                     role=MessageRole.TOOL,
                     content=_truncated_observation,
                     name=tool_name,
-                    tool_call_id=call_id,
+                    tool_call_id=final_result.tool_call_id or call_id,
                 )
 
-            observations.append(final_output_str)
+            results.append(final_result)
 
-        return observations
+        return results
 
     async def step(self, state: ExecutionState, emitter: EventEmitter) -> bool:
         self.state = state
@@ -1133,6 +1547,38 @@ class ToolCallAgent(BaseAgent):
                     "calls — accepting as final answer "
                     "(provider disabled tools for image inputs)."
                 )
+                state.mark_completed(output=self._final_answer)
+                return True
+
+            # [SOFT-COMPLETION] Conversational turn: no tool has been
+            # invoked during this ENTIRE run. The model's text
+            # response IS the final answer (e.g. the user said
+            # "Hello" and the model replied "Hello!" with no tools
+            # involved). This is the most common path for simple
+            # chat-style interactions routed through agent mode and
+            # must produce a clean COMPLETED, never an error card.
+            #
+            # Distinguishing this from "model forgot to terminate
+            # after using tools" is exactly why we check
+            # ``state.tool_history`` — a non-empty tool history
+            # proves tools were used and the reminder path applies;
+            # an empty history means the model was never expected to
+            # use tools in the first place.
+            _any_tool_executed = bool(
+                getattr(state, "tool_history", None)
+            )
+            if not _any_tool_executed:
+                logger.info(
+                    "Conversational completion on step %d "
+                    "(no prior tool usage). Accepting text-only "
+                    "response as the final answer.",
+                    state.current_step,
+                )
+                state.metadata["completion_kind"] = "soft_text"
+                state.metadata["completion_reason"] = (
+                    "no_tool_used_conversational_turn"
+                )
+                state.mark_completed(output=self._final_answer)
                 return True
 
             # Safety rail 1 — step ceiling.
@@ -1142,24 +1588,48 @@ class ToolCallAgent(BaseAgent):
                 or 30
             )
             if state.current_step >= max_steps_ceiling:
-                raise RuntimeError(
-                    f"Agent reached the maximum step ceiling "
-                    f"({max_steps_ceiling}) without calling "
-                    f"'terminate'. Task was not completed. Last text: "
-                    f"{(self._final_answer or '')[:200]}"
+                # [SOFT-COMPLETION] Step ceiling reached without a
+                # successful ``terminate``. The model produced text
+                # but did not close the task. Instead of surfacing a
+                # raw RuntimeError to the user (which looks like an
+                # app crash), soft-complete with the accumulated
+                # text. The user sees the model's last output and
+                # can decide whether to retry with a stronger model
+                # or clearer instruction.
+                logger.warning(
+                    "Reached step ceiling %d without calling "
+                    "'terminate' after prior tool usage. "
+                    "Soft-completing with the accumulated text.",
+                    max_steps_ceiling,
                 )
+                state.metadata["completion_kind"] = "soft_text"
+                state.metadata["completion_reason"] = (
+                    "step_ceiling_reached"
+                )
+                state.mark_completed(output=self._final_answer)
+                return True
 
             # Safety rail 2 — consecutive no-tool responses.
             self._consecutive_no_tool_steps += 1
             if self._consecutive_no_tool_steps >= 2:
-                raise RuntimeError(
-                    f"Agent produced text without tool calls for "
-                    f"{self._consecutive_no_tool_steps} consecutive "
-                    f"steps. The model appears to be stuck thinking "
-                    f"out loud without using tools or 'terminate'. "
-                    f"Forcing termination. Last text: "
-                    f"{(self._final_answer or '')[:200]}"
+                # [SOFT-COMPLETION] Two consecutive text-only steps
+                # after tool usage. This is either (a) the model
+                # describing the outcome in prose without calling
+                # terminate, or (b) a genuine text loop. In both
+                # cases, the user benefits from seeing the text
+                # rather than an error card. Soft-complete.
+                logger.warning(
+                    "Model produced text without tool calls for %d "
+                    "consecutive steps after prior tool usage. "
+                    "Soft-completing with the accumulated text.",
+                    self._consecutive_no_tool_steps,
                 )
+                state.metadata["completion_kind"] = "soft_text"
+                state.metadata["completion_reason"] = (
+                    "consecutive_text_only_steps"
+                )
+                state.mark_completed(output=self._final_answer)
+                return True
 
             # Reminder to the model. This becomes part of the
             # conversation history (state.messages + self.messages),
@@ -1220,13 +1690,66 @@ class ToolCallAgent(BaseAgent):
             tool_calls=tool_calls_payload,
         )
 
-        observations = await self.act(step=self.current_step, tool_calls=response.tool_calls)
+        results = await self.act(step=self.current_step, tool_calls=response.tool_calls)
 
-        has_terminated = any(tc.name.lower() in ("terminate", "done") for tc in response.tool_calls)
-        if has_terminated:
-            self._final_answer = response.content or (observations[-1] if observations else "Task completed via termination tool.")
+        # [C.4 FIX — B3] The termination decision is now based on the
+        # STRUCTURED results returned by ``act()``, not on the tool
+        # names the LLM emitted. A tool named "terminate" that failed
+        # to execute (unknown registration, invalid arguments, tool-
+        # level exception, timeout) is no longer accepted as a
+        # successful completion. The evaluator enforces the full
+        # metadata contract:
+        #
+        #   * ``metadata.terminated`` must be True
+        #   * ``metadata.status`` must be "success" or "failure"
+        #   * for status="success", the tool call itself must have
+        #     succeeded (is_success == True)
+        #
+        # When the terminate call is malformed, the evaluator returns
+        # ``should_terminate=False`` with a ``rejection_reason``. The
+        # task continues, the model sees the rejection in the
+        # observation history, and can retry with a valid call.
+        decision = evaluate_termination(results, state)
+
+        if decision.should_terminate:
+            # Determine the displayable final answer. Priority:
+            #   1. The terminate tool's own output (authoritative —
+            #      the model explicitly designated it as the closing
+            #      message).
+            #   2. The model's response.content (context around the
+            #      terminate call, often useful for the user).
+            #   3. The failure reason (for terminate:failure with no
+            #      output).
+            #   4. A generic closing message.
+            if decision.final_output:
+                self._final_answer = decision.final_output
+            elif response.content:
+                self._final_answer = response.content
+            elif decision.failure_reason:
+                self._final_answer = decision.failure_reason
+            else:
+                self._final_answer = "Task execution finished."
+
+            # Pre-set final_output so the failure path (which does
+            # not set it inside mark_failed) still reports a
+            # meaningful message to the user. apply_decision overrides
+            # it on the success path with the same value.
             state.final_output = self._final_answer
+
+            # The lifecycle module performs the FSM transition
+            # (COMPLETED for success, FAILED for terminate:failure).
+            apply_decision(
+                state, decision, default_success_output=self._final_answer
+            )
             return True
+
+        if decision.was_rejected:
+            logger.warning(
+                "[C.4] Terminate call rejected: %s. Continuing the "
+                "loop so the model can correct the call or make more "
+                "progress.",
+                decision.rejection_reason,
+            )
 
         return False
 
@@ -1235,8 +1758,123 @@ class ToolCallAgent(BaseAgent):
             self.state = ExecutionState(task_prompt="Default task", workspace_root=str(self.workspace_dir))
         return not (await self.step(state=self.state, emitter=self.emitter))
 
+    def _reset_run_state(self) -> None:
+        """
+        Reset all per-run agent state to its construction-time defaults.
+
+        [B15 FIX] Prior to this reset, ``ToolCallAgent`` instances
+        accumulated state across consecutive ``run_task()`` calls,
+        producing the exact failure modes documented in session 7 of
+        the PELDRUN execution repair plan:
+
+          * ``_recent_call_signatures`` retained the previous run's
+            tool signatures. The loop detector interpreted them as
+            "the current run is repeating the same tool call" and
+            raised a false positive on the very first step of the
+            new run.
+
+          * ``_consecutive_no_tool_steps`` was not zeroed. A fresh
+            run whose first step produced a text-only response was
+            immediately classified as "the model is stuck thinking
+            out loud" and aborted before any real work could
+            happen.
+
+          * ``_final_answer`` and ``self.messages`` carried the
+            previous run's data. When the next run's first step
+            produced no content, the fallback path returned the
+            PREVIOUS task's answer as if it were the new task's
+            result.
+
+          * ``self.state`` and ``self.current_step`` were left
+            dangling, so any diagnostic, event, or retry classifier
+            that read them before the first ``step()`` saw stale
+            step indices.
+
+        Called at the start of every ``run_task()`` invocation.
+        ``arun()`` delegates to ``run_task()``, so both public entry
+        points inherit the reset.
+
+        Configuration is NOT reset
+        --------------------------
+        ``self.system_prompt``, ``self.config``, ``self.llm``,
+        ``self.tool_registry``, ``self.tool_collection``,
+        ``self.emitter``, and ``self.workspace_dir`` are all config,
+        not per-run state. Reusing an agent object across tasks is
+        expected to preserve configuration. Callers who want full
+        per-run isolation of the emitter (fresh terminal-event
+        registry, fresh SSE queue) must construct a new agent with a
+        new ``EventEmitter`` — that is a caller concern, not this
+        method's.
+
+        Not covered here
+        ----------------
+        ``self.emitter._is_terminated`` is not reset. The emitter's
+        terminated flag is set once a FINAL / ERROR / CANCELLED event
+        has been emitted; a second run on the same emitter will
+        silently drop its own terminal event because the flag is
+        already True. This is a known limitation of the current
+        emitter, tracked in the plan under B13 and Phase F. The
+        proper fix belongs to ``EventEmitter.astream_sse`` (Phase F)
+        and is orthogonal to B15's counter-reset scope.
+        """
+        self.messages = []
+        self.current_step = 1
+        self._final_answer = ""
+        self._recent_call_signatures = []
+        self._consecutive_no_tool_steps = 0
+        self.state = None
+
+        # [B15 REMNANT — DIAGNOSTIC ONLY] Warn when this reset is
+        # happening on an agent whose emitter has already terminated
+        # a previous run. Phase F added ``EventEmitter.reset_for_new_run()``,
+        # but the agent does NOT call it automatically — doing so would
+        # silently change the emitter's run_id and break callers that
+        # rely on the executor-managed run_id (see ``executor.py``,
+        # which creates a fresh emitter per run and never reuses one).
+        #
+        # The correct policy depends on the calling context:
+        #
+        #   * Executor path (``CoreRuntimeExecutor.execute``):
+        #     a fresh emitter is created per run → no reset needed.
+        #
+        #   * Direct path (``agent.run_task()`` called twice on the
+        #     same agent without an external emitter manager):
+        #     the caller MUST invoke
+        #     ``self.emitter.reset_for_new_run(new_run_id)`` BEFORE
+        #     the second ``run_task()`` call. This warning surfaces
+        #     the omission so users do not silently lose the second
+        #     run's terminal event (B13 symptom).
+        #
+        # The warning is intentionally non-fatal: an emitter with
+        # ``_is_terminated=True`` still emits non-terminal events
+        # (STEP_START, THOUGHT, CHUNK, ...), so a run would proceed
+        # up to the terminal event and then appear to hang. Logging
+        # the risk is the least-invasive way to surface it.
+        if getattr(self.emitter, "_is_terminated", False):
+            logger.warning(
+                "Agent reset with an EventEmitter that is already "
+                "terminated. The next run's terminal event (FINAL / "
+                "ERROR / CANCELLED) will be SILENTLY DROPPED unless "
+                "the caller invokes "
+                "``emitter.reset_for_new_run(new_run_id)`` first. "
+                "This warning exists because B13 manifests here: "
+                "agent reuse with a shared emitter loses the second "
+                "run's completion."
+            )
+
     async def run_task(self, prompt: str, max_steps: int = 30) -> str:
         from peldrun.engine.runner import AgentRunner, RunnerConfig
+
+        # [B15 FIX] Reset per-run state before each invocation. The
+        # reset covers messages, counters, in-memory step index, and
+        # cached final answer — everything that must not leak from
+        # one task to the next on the same agent object. This makes
+        # ``agent.run_task(task1)`` followed by
+        # ``agent.run_task(task2)`` behave as if ``task2`` had been
+        # executed by a freshly constructed agent, except that
+        # configuration (system prompt, LLM binding, tool registry,
+        # workspace, emitter) is preserved.
+        self._reset_run_state()
 
         runner_config = RunnerConfig(max_steps=max_steps)
         runner = AgentRunner(agent=self, emitter=self.emitter, config=runner_config)

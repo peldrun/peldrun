@@ -27,7 +27,17 @@ import uuid
 from .base import EngineRunContext, ExecutionEngine
 
 # Core Public Boundary Imports
-from peldrun.context.builder import ContextManager
+#
+# [B14 FIX] ``ContextManager`` is intentionally NOT imported here.
+# PeldrunEngine no longer assembles the LLM message list — that is
+# the sole responsibility of ``CoreRuntimeExecutor.execute`` (see
+# ``peldrun/runtime/executor.py``). Building it here as well caused
+# the historical "two context builds" drift (B14): the engine used
+# ``include_execution=False`` while the executor used
+# ``include_execution=True``, producing a metadata preview that
+# diverged from what the model actually saw. The engine now passes
+# ONLY raw inputs (prompt, sidecar, project_rules, system_prompt)
+# and lets the executor be the single source of truth.
 from peldrun.context.generative_ui import build_generative_ui_prompt
 from peldrun.context.sidecar import build_context_sidecar
 from peldrun.events.schema import EventType, PeldrunEvent
@@ -471,17 +481,61 @@ class PeldrunEngine(ExecutionEngine):
 
         # Manifest system_prompt is authoritative. The engine only adds
         # operational guidance common to all agents.
+        # [SOFT-COMPLETION DIRECTIVE] Balanced termination contract.
+        #
+        # The original directive here ("Printing questions as plain text
+        # without a tool call terminates execution") was factually wrong
+        # after Phase C: a text-only response does NOT end the task, it
+        # triggers a reminder and (after retries) a confusing FAILED
+        # state. See ``tool_call_agent.step`` for the runtime behavior.
+        #
+        # The FIRST revision attempt ("Every successful response MUST
+        # include a terminate call") was ALSO wrong: it made the model
+        # terminate after individual tool results, ending multi-step
+        # tasks prematurely. That is worse than the original bug.
+        #
+        # This directive is the balanced middle ground:
+        #
+        #   * terminate is required to complete the TASK, not each STEP;
+        #   * after a successful tool call, the model must CONTINUE, not
+        #     terminate — explicitly stated in rule 4;
+        #   * for purely conversational inputs (greeting, simple
+        #     question), a text-only reply is the correct answer and the
+        #     runtime accepts it as completion (see the
+        #     ``_any_tool_executed`` branch in ``tool_call_agent.step``);
+        #   * the framework trusts the model's choice: if it terminates
+        #     early on a complex task, that is a model quality issue,
+        #     not a framework failure — we do not second-guess.
         system_prompt = (
             f"{base_system_prompt}\n\n"
             f"[OPERATIONAL DIRECTIVE]\n"
-            f"1. Autonomous Loop Contract: You run inside an automated agent loop. "
-            f"If you need to ask the user questions or wait for input, invoke the "
-            f"'ask_human' tool. Printing questions as plain text without a tool "
-            f"call terminates execution.\n"
-            f"2. Task Scope Sovereignty: Satisfy the user's objective faithfully. "
-            f"Do not invent a need to create files or write code unless commanded.\n"
-            f"3. Tool Selection: Use the tools best suited to each step. The list "
-            f"of available tools is defined by your manifest."
+            f"1. Termination Contract: You run inside an automated "
+            f"agent loop. Call the 'terminate' tool ONLY when the "
+            f"ENTIRE user task is fully completed (or has failed and "
+            f"cannot proceed). 'terminate' signals TASK completion, "
+            f"NOT step completion.\n"
+            f"   • Task-complete: summarize the deliverable AND call "
+            f"terminate(status=\"success\", message=\"<summary>\") in "
+            f"the SAME response.\n"
+            f"   • Task-failure: call terminate(status=\"failure\", "
+            f"message=\"<specific reason>\").\n"
+            f"   • Simple greeting or conversational reply (no tools "
+            f"needed): just reply with the text. The runtime treats "
+            f"a text-only response as the final answer when no tools "
+            f"have been used — no terminate call is required.\n"
+            f"2. Human Interaction: To ask the user a question or wait "
+            f"for input, invoke the 'ask_human' tool. Do NOT print the "
+            f"question as plain text.\n"
+            f"3. Task Scope Sovereignty: Satisfy the user's objective "
+            f"faithfully. Do not invent a need to create files or "
+            f"write code unless commanded.\n"
+            f"4. Iterative Progress: After each successful tool call, "
+            f"CONTINUE to the next step. Do NOT call 'terminate' after "
+            f"individual tool results. Only call 'terminate' when the "
+            f"whole task is done (see rule 1).\n"
+            f"5. Tool Selection: Use the tools best suited to each "
+            f"step. The list of available tools is defined by your "
+            f"manifest."
         )
 
         project_rules = (
@@ -511,36 +565,44 @@ class PeldrunEngine(ExecutionEngine):
                 storage_root=project_manager.storage_dir,
             )
 
-        # 2. Assemble Sanitized Prompt Context via ContextManager
-        context_mgr = ContextManager(default_system_prompt=system_prompt)
-        # `include_execution=False` intentionally excludes the
-        # previous turn's execution telemetry from the initial
-        # context. `build_context_sidecar` sets
-        # `sidecar.current_execution` to `None` once the latest turn
-        # is no longer "running" (see
-        # `sidecar.extract_conversation_and_execution`), so the flag
-        # is a no-op for the common case. When the process was
-        # killed mid-turn and `current_execution` still holds stale
-        # data, hiding it prevents the agent from reasoning about
-        # tool calls that the restart already invalidated. Do not
-        # flip this to True without also gating on
-        # `sidecar.current_execution.status == "running"` — otherwise
-        # stale execution state would leak into every new turn.
-        context_messages, context_usage = context_mgr.build_messages(
-            sidecar=sidecar,
-            current_user_message=prompt,
-            system_prompt=system_prompt,
-            project_rules=project_rules,
-            include_execution=False,
-        )
-
-        effective_context_tokens = context_usage.get("total_tokens", context_usage.get("total", 0))
-
+        # 2. Context assembly is DEFERRED to CoreRuntimeExecutor.
+        #
+        # [B14 FIX] Prior to this change, PeldrunEngine built the LLM
+        # message list here (via ``ContextManager.build_messages``)
+        # AND forwarded it in ``run_metadata["context_messages"]``,
+        # while ``CoreRuntimeExecutor.execute`` ALSO built its own
+        # list from the same sidecar/prompt/project_rules. The two
+        # builds used different ``include_execution`` flags
+        # (False here, True in the executor), so any UI surface that
+        # rendered the metadata copy showed a different message list
+        # from what the model actually received. This was B14 in the
+        # execution repair plan.
+        #
+        # The executor is now the SOLE context builder. This method
+        # forwards only the raw inputs it already has:
+        #
+        #   * ``run_request.prompt``               — the user's task
+        #   * ``run_request.context_sidecar``      — sidecar object
+        #   * ``run_request.project_rules``        — rules block
+        #   * ``run_request.agent_spec.system_prompt`` — system directive
+        #
+        # ``CoreRuntimeExecutor.execute`` calls
+        # ``ContextManager.build_messages`` exactly once with
+        # ``include_execution=True``, logs the resulting budget, and
+        # hands the list to ``ToolCallAgent``. There is no second
+        # build anywhere in the pipeline.
+        #
+        # The observability log line below is preserved for
+        # operators, but it now records what the ENGINE is passing
+        # to the executor (input sizes), not a duplicated build.
         logger.info(
-            "[CONTEXT HARDENING] Assembled %d context messages for job %s (Tokens: %s)",
-            len(context_messages),
+            "[CONTEXT DEFERRED] Engine will delegate context assembly "
+            "to CoreRuntimeExecutor for job %s "
+            "(prompt=%d chars, project_rules=%d chars, sidecar=%s).",
             job_id,
-            effective_context_tokens,
+            len(prompt or ""),
+            len(project_rules or ""),
+            "present" if sidecar is not None else "absent",
         )
 
         # 3. Resolve custom Web tools to adapt into Core tools
@@ -1158,8 +1220,13 @@ class PeldrunEngine(ExecutionEngine):
             "session_dir": str(session_dir),
             "project_rules": project_rules,
             "sidecar": sidecar,
-            "context_messages": context_messages,
-            "context_usage": context_usage,
+            # [B14 FIX] ``context_messages`` and ``context_usage`` are
+            # NOT set here. The executor assembles them internally
+            # from the raw inputs above (sidecar + prompt +
+            # system_prompt + project_rules) and logs the resulting
+            # budget in its own diagnostic event. Shipping a
+            # pre-built list in metadata would re-introduce the
+            # duplicate-build drift this change eliminates.
             "authorized_tools": list(requested_tools),
             "resolved_custom_tools": list(resolved_tool_ids),
             "specialist_tools": specialist_tools_map,
