@@ -176,6 +176,30 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
         llm_override["reasoning_effort"] = req.reasoning_effort.strip()
     if req.is_reasoning_model is not None:
         llm_override["is_reasoning_model"] = req.is_reasoning_model
+    # [FIX-INVOKED-SKILLS] Forward explicit ``/<skill_id>`` invocations
+    # from the chat composer. The frontend strips the ``/skill_id`` token
+    # from the prompt after the user selects it from the typeahead menu,
+    # and sends the resolved ID(s) here as ``invoked_skills``. Without
+    # this block, the field arrives in the HTTP body but is silently
+    # discarded — ``llm_override`` never carries it to the dispatcher,
+    # so ``EngineRunContext.invoked_skills`` stays ``[]`` and the skill
+    # is never injected.
+    #
+    # Normalize each entry: strip whitespace, drop empties, deduplicate
+    # while preserving order. The dispatcher re-normalizes defensively.
+    if req.invoked_skills:
+        _normalized_skills: list[str] = []
+        _seen_skill_ids: set[str] = set()
+        for _raw_sid in req.invoked_skills:
+            if not isinstance(_raw_sid, str):
+                continue
+            _sid = _raw_sid.strip()
+            if not _sid or _sid in _seen_skill_ids:
+                continue
+            _seen_skill_ids.add(_sid)
+            _normalized_skills.append(_sid)
+        if _normalized_skills:
+            llm_override["invoked_skills"] = _normalized_skills
     # Forward structured file references selected by the user via the `@` menu.
     if req.context_refs:
         llm_override["context_refs"] = [

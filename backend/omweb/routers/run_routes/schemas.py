@@ -153,6 +153,19 @@ class RunRequest(BaseModel):
     # independent and do not conflict.
     attachments: Optional[List[AttachmentRef]] = None
 
+    # [FIX-INVOKED-SKILLS] Explicit ``/<skill_id>`` invocations from the
+    # chat composer. The frontend strips the ``/skill_id`` token from the
+    # prompt after the user selects it from the typeahead menu, and sends
+    # the resolved canonical ID(s) here. The dispatcher forwards them to
+    # ``EngineRunContext.invoked_skills``; the engine merges them with the
+    # agent's assigned skills at prompt-injection time.
+    #
+    # Without this field the list is silently discarded by Pydantic's
+    # default ``extra="ignore"`` behaviour, which is why every skill
+    # invocation from the typeahead menu appeared to have no effect on
+    # the run.
+    invoked_skills: Optional[List[str]] = None
+
     # Extensibility for Pause / Resume and Checkpoint Interruption Resumption
     checkpoint_id: Optional[str] = None
     resume_from_checkpoint: Optional[bool] = False

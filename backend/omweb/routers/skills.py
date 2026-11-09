@@ -47,10 +47,6 @@ from omweb.skills.catalog import (
     SkillCatalogItem,
     get_skill_catalog,
 )
-from omweb.skills.catalog import (
-    SkillCatalogItem,
-    get_skill_catalog,
-)
 from omweb.skills.manager import skill_manager
 from omweb.skills.registry import SkillRecord
 

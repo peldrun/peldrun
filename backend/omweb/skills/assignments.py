@@ -511,16 +511,27 @@ def resolve_skill_injection_catalog(
     only the bodies it needs.
 
     Pool of candidates:
-        ALL enabled non-deprecated skills, NOT just the agent's
-        assigned ones. This is the core of Progressive Disclosure —
-        the catalog exposes the full toolkit so the model can pick the
-        right tool regardless of static assignment.
+        ONLY the agent's assigned skills PLUS any skill the user
+        explicitly invoked via ``/<skill-id>`` in this turn. The
+        candidate pool NEVER includes arbitrary enabled skills that
+        were not granted through one of those two channels.
 
-        Invoked skills (via ``/<skill-id>``) are ALWAYS included in the
-        catalog regardless of their BM25 score, because the user chose
-        them explicitly. When the BM25 pool is empty (no user message,
-        BM25 disabled, or all scores below ``min_score``), the invoked
-        skills alone populate the catalog.
+        This is a deliberate departure from an earlier version that
+        pulled ALL enabled skills and let BM25 decide relevance. That
+        design had two problems:
+            * An assigned skill whose description did not match the
+              current prompt was silently dropped from the catalog —
+              contradicting the operator's expectation that
+              assignment means "always available".
+            * A non-assigned skill could appear in the catalog purely
+              because BM25 scored it highly on the current prompt —
+              leaking the existence of skills the operator never
+              authorized for this agent.
+
+        BM25 still runs (when ``use_bm25`` is True and
+        ``user_message`` is non-empty), but only as an ORDERING
+        heuristic WITHIN the granted set. It cannot add or remove
+        skills from the catalog — only reorder them by relevance.
 
     Args:
         agent_id:           The agent whose assignment channel to
@@ -561,11 +572,44 @@ def resolve_skill_injection_catalog(
         source_by_id[normalized] = "invoked"
         invoked_set.add(normalized)
 
-    # ── 2. Candidate pool (all enabled, non-deprecated) ───────────
-    all_enabled = skill_registry.list_skills(
-        include_disabled=False,
-        include_deprecated=False,
-    )
+    # ── 2. Candidate pool (assigned + invoked ONLY) ───────────────
+    #
+    # The pre-fix pool was ALL enabled skills in the registry, which
+    # meant assigned-but-unmatched skills never appeared (BM25 dropped
+    # them) and non-assigned skills appeared for any matching prompt.
+    # Both behaviors are wrong:
+    #
+    #   * An assigned skill MUST appear regardless of the prompt.
+    #   * A non-assigned skill MUST NOT appear unless the user
+    #     explicitly invoked it with ``/<skill_id>``.
+    #
+    # The pool below mirrors ``resolve_skill_injection``: only skills
+    # the operator granted (assignment channel) or the user invoked
+    # (invocation channel) are eligible. BM25 becomes a re-ordering
+    # heuristic within the granted set, not a discovery mechanism.
+    if not source_by_id:
+        return SkillInjection(text="", skills=[], warnings=[])
+
+    all_enabled: List[SkillRecord] = []
+    for _sid in source_by_id.keys():
+        _rec = skill_registry.get_skill(_sid)
+        if _rec is None:
+            warnings.append(
+                f"Granted skill {_sid!r} is not installed; skipping."
+            )
+            continue
+        if not _rec.enabled:
+            warnings.append(
+                f"Granted skill {_sid!r} is disabled; skipping."
+            )
+            continue
+        if _rec.is_deprecated:
+            warnings.append(
+                f"Granted skill {_sid!r} is deprecated; skipping."
+            )
+            continue
+        all_enabled.append(_rec)
+
     if not all_enabled:
         return SkillInjection(text="", skills=[], warnings=warnings)
 
@@ -588,14 +632,18 @@ def resolve_skill_injection_catalog(
     else:
         selected = list(all_enabled)
 
-    # ── 4. Always include invoked skills ──────────────────────────
-    # A skill the user explicitly invoked must appear in the catalog
-    # even if BM25 dropped it (short description, unusual query, or
-    # an empty candidate pool). We iterate over the FULL pool so that
-    # an invoked skill missing from `selected` is re-added in place.
+    # ── 4. Include ALL granted skills (not just BM25 top-k) ──────
+    # Every skill in ``all_enabled`` is authorized (assigned or
+    # invoked). BM25 may have dropped some via ``top_k`` when the
+    # granted set is larger than ``top_k``, or returned an empty list
+    # when the prompt has no keyword overlap. Re-add them here so
+    # the operator's full assignment is always honoured and invoked
+    # skills always appear. BM25 still controls ORDER (most relevant
+    # first), which helps the model prioritize when scanning the
+    # catalog.
     selected_ids = {s.id for s in selected}
     for skill in all_enabled:
-        if skill.id in invoked_set and skill.id not in selected_ids:
+        if skill.id not in selected_ids:
             selected.append(skill)
             selected_ids.add(skill.id)
 

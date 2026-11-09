@@ -802,36 +802,7 @@ class PeldrunEngine(ExecutionEngine):
                 )
             system_prompt = system_prompt.rstrip() + _access_block
 
-        # ── Inject MCP access hint into system prompt ─────────────
-        # Some models (e.g. GigaChat) hallucinate and refuse to use
-        # MCP tools if they see a past "Authentication Required" error
-        # in the conversation history. This block explicitly informs
-        # the model that it has active, working access to these servers.
-        _authenticated_mcp_servers = []
-        if target_mcp_servers:
-            from omweb.extensions.chat_mcp_auth import get_chat_mcp_auth_store
-            from omweb.extensions.mcp_auth_state import manifest_needs_auth
 
-            _auth_store = get_chat_mcp_auth_store()
-            for srv in target_mcp_servers:
-                s_id = srv.get("id")
-                if not s_id:
-                    continue
-                mode = _auth_store.get_mode(chat_id, s_id)
-                # It is "authenticated" if the user made a choice OR
-                # if the server doesn't actually need auth.
-                if mode in ("custom", "use_global", "ephemeral") or not manifest_needs_auth(srv):
-                    _authenticated_mcp_servers.append(srv.get("name") or s_id)
-
-        if _authenticated_mcp_servers:
-            system_prompt = system_prompt.rstrip() + (
-                "\n\n[MCP SERVER ACCESS]\n"
-                "You have active, authenticated access to the following MCP servers: "
-                + ", ".join(_authenticated_mcp_servers)
-                + ".\n"
-                "Use their tools freely to accomplish the user's task. "
-                "Do NOT refuse to use them or claim you lack access."
-            )
 
         # Discover tools from every target server CONCURRENTLY. A
         # serial loop here contributed N × probe-timeout to the total

@@ -1410,6 +1410,35 @@ async def run_instrumented(
                 f"for job {job_id}: {invoked_skills}"
             )
 
+    # [SKILL INVOCATION CHANNEL — DESIGN NOTE]
+    # ----------------------------------------
+    # ``invoked_skills`` is populated EXCLUSIVELY by the frontend via
+    # the composer's ``/`` typeahead menu. The authoritative flow is:
+    #
+    #   1. User selects ``/code_review`` from the composer popup.
+    #   2. The frontend strips the token from the prompt and adds
+    #      ``code_review`` to ``llm_override["invoked_skills"]``.
+    #   3. ``RunRequest.invoked_skills`` (see schemas.py) accepts it.
+    #   4. ``start_run.py`` copies it to ``llm_override``.
+    #   5. This dispatcher pops it into ``EngineRunContext.invoked_skills``
+    #      (see the block above).
+    #   6. ``omweb.skills.assignments.resolve_skill_injection*`` merges
+    #      it with the agent's assigned skills.
+    #
+    # The dispatcher deliberately does NOT parse the prompt for
+    # ``/skill_id`` tokens. Two reasons:
+    #
+    #   (a) The frontend strips the token from the prompt before
+    #       sending, so the token is not reliably present here.
+    #   (b) The prompt may carry a ``[Context: In previous turn, user
+    #       asked: '/code_review ...']`` prefix. Scanning the whole
+    #       prompt would re-inject that skill on every subsequent
+    #       turn — an infinite "sticky invocation" bug.
+    #
+    # If a caller bypasses the composer (raw API call, scripted test),
+    # it MUST pass ``invoked_skills`` explicitly. Silent prompt parsing
+    # would be ambiguous and unsafe.
+
     toml_cfg = read_active_toml_config()
     active_llm = dict(toml_cfg.get("llm", {}))
     if llm_override:
