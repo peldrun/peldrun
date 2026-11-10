@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 from pydantic import BaseModel, Field
 
 from peldrun.tools.base import BaseTool, ToolResult
+from peldrun.tools.contract import ToolExecutionContext
 
 
 class ShellParameters(BaseModel):
@@ -77,6 +78,7 @@ class IsolatedShellTool(BaseTool):
         self,
         command: str,
         timeout: Optional[float] = None,
+        context: Optional[ToolExecutionContext] = None,
         **kwargs: Any,
     ) -> ToolResult:
         """
@@ -92,6 +94,7 @@ class IsolatedShellTool(BaseTool):
         self,
         command: str,
         timeout: Optional[float] = None,
+        context: Optional[ToolExecutionContext] = None,
         **kwargs: Any,
     ) -> ToolResult:
         # M7.9: explicit timeout wins; otherwise fall back to settings.
@@ -115,24 +118,59 @@ class IsolatedShellTool(BaseTool):
                 stderr=asyncio.subprocess.PIPE,
             )
 
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=timeout_val,
-                )
-            except asyncio.TimeoutError:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-                return ToolResult(
-                    output="",
-                    error=f"Command execution timed out after {timeout_val} seconds.",
-                    exit_code=124,
-                )
+            if context is not None:
+                stdout_chunks = []
+                stderr_chunks = []
 
-            stdout_str = stdout.decode("utf-8", errors="replace").strip()
-            stderr_str = stderr.decode("utf-8", errors="replace").strip()
+                async def _read_stream(stream, chunks, stream_name):
+                    while True:
+                        chunk = await stream.read(4096)
+                        if not chunk:
+                            break
+                        text = chunk.decode("utf-8", errors="replace")
+                        chunks.append(text)
+                        await context.emit_output(text, stream=stream_name)
+
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            _read_stream(process.stdout, stdout_chunks, "stdout"),
+                            _read_stream(process.stderr, stderr_chunks, "stderr"),
+                            process.wait()
+                        ),
+                        timeout=timeout_val
+                    )
+                    stdout_str = "".join(stdout_chunks).strip()
+                    stderr_str = "".join(stderr_chunks).strip()
+                except asyncio.TimeoutError:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    return ToolResult(
+                        output="",
+                        error=f"Command execution timed out after {timeout_val} seconds.",
+                        exit_code=124,
+                    )
+            else:
+                try:
+                    stdout, stderr = await asyncio.wait_for(
+                        process.communicate(),
+                        timeout=timeout_val,
+                    )
+                except asyncio.TimeoutError:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    return ToolResult(
+                        output="",
+                        error=f"Command execution timed out after {timeout_val} seconds.",
+                        exit_code=124,
+                    )
+
+                stdout_str = stdout.decode("utf-8", errors="replace").strip()
+                stderr_str = stderr.decode("utf-8", errors="replace").strip()
 
             # M7.9: truncate to settings.max_output_chars when configured.
             # Applied per stream so a large stdout does not hide the tail

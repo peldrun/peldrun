@@ -37,6 +37,44 @@ class SSEEventType(str, Enum):
     TOOL_CALL = "tool_call"
     TOOL_CALLED = "tool_called"  # Compatibility alias
     TOOL_RETRY = "tool_retry"    # Centralized retry event
+
+    # Tool Output Streaming Events (opt-in, see TOOL_OUTPUT_STREAMING flag)
+    #
+    # Emitted by the runtime WHILE a tool is executing, between the
+    # TOOL_CALL that started it and the OBSERVATION that closes it.
+    # Both events carry `tool_call_id` so the frontend can patch the
+    # correct tool card even when several tools run concurrently.
+    #
+    # TOOL_OUTPUT   -- raw stdout/stderr chunks. The frontend appends
+    #                  `chunk` to the card's `liveOutput` buffer and
+    #                  splits it into `liveStreams[stream]`. Ordering
+    #                  is guaranteed per (tool_call_id, attempt) via
+    #                  the `sequence` field; duplicates after an SSE
+    #                  reconnect are dropped by the reducer.
+    #
+    # TOOL_PROGRESS -- structured progress update (current/total/
+    #                  phase/message). Rendered as a progress bar,
+    #                  NOT appended to the text area. Uses the same
+    #                  sequence/attempt contract.
+    #
+    # Neither event is terminal: the tool's final output and status
+    # still arrive via OBSERVATION. The frontend keeps both
+    # `liveOutput` (streamed) and `output` (final) side by side; the
+    # two fields are independent.
+    #
+    # Payload shapes:
+    #   TOOL_OUTPUT:   {tool_call_id, tool_name, stream,
+    #                   chunk, sequence, attempt}
+    #   TOOL_PROGRESS: {tool_call_id, tool_name, chunk,
+    #                   sequence, attempt,
+    #                   current?, total?, phase?}
+    #
+    # When PELDRUN_ENABLE_TOOL_OUTPUT_STREAMING is off (default),
+    # neither event is ever emitted and existing subscribers are
+    # unaffected.
+    TOOL_OUTPUT = "tool_output"
+    TOOL_PROGRESS = "tool_progress"
+
     OBSERVATION = "observation"
 
     # Artifact Lifecycle Events (Phase M2 Push Streaming)

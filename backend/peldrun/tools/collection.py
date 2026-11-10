@@ -12,7 +12,11 @@ import json
 from typing import Any, Dict, List, Optional, Union
 
 from peldrun.tools.base import BaseTool, ToolResult
-from peldrun.tools.contract import ToolExecutionPolicy, ToolRuntime
+from peldrun.tools.contract import (
+    ToolExecutionContext,
+    ToolExecutionPolicy,
+    ToolRuntime,
+)
 from peldrun.tools.execution_manager import ExecutionManager
 from peldrun.tools.execution_result import ToolExecutionResult
 
@@ -98,6 +102,7 @@ class ToolCollection:
         tool_call_id: Optional[str] = None,
         timeout_seconds: Optional[float] = None,
         run_id: Optional[str] = None,
+        context: Optional[ToolExecutionContext] = None,
     ) -> ToolExecutionResult:
         """
         Execute a tool by name and return a canonical ``ToolExecutionResult``.
@@ -152,6 +157,15 @@ class ToolCollection:
         run_id
             Optional. Forwarded to ``ExecutionManager`` for log
             enrichment.
+        context
+            Optional streaming context. When supplied AND the target
+            tool declares an explicit ``context`` parameter on its
+            ``_arun`` / ``aexecute`` entrypoint, the manager forwards
+            the context to the tool so it can publish intermediate
+            output via ``await context.emit_output(...)`` (or
+            ``context.emit_output_sync(...)`` for sync tools). When
+            ``None``, no context is created and the tool runs exactly
+            as before -- the feature is fully opt-in.
 
         Returns
         -------
@@ -229,6 +243,7 @@ class ToolCollection:
             tool_call_id=tool_call_id,
             timeout_seconds=timeout_seconds,
             run_id=run_id,
+            context=context,
         )
 
     async def execute(self, name: str, arguments: Any) -> ToolResult:

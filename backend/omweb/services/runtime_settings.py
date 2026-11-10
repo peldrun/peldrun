@@ -179,6 +179,17 @@ class TimeoutSettings(BaseModel):
     )
 
 
+class FeaturesSettings(BaseModel):
+    """Optional features and experimental capabilities."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enable_tool_output_streaming: Optional[bool] = Field(
+        default=None,
+        description="Enable streaming of tool outputs (stdout/stderr) directly to the UI.",
+    )
+
+
 class RuntimeSettingsDocument(BaseModel):
     """Root document persisted to ``runtime_settings.json``.
 
@@ -195,6 +206,7 @@ class RuntimeSettingsDocument(BaseModel):
     timeouts: TimeoutSettings = Field(default_factory=TimeoutSettings)
     cleanup: CleanupSettings = Field(default_factory=CleanupSettings)
     streaming: StreamingSettings = Field(default_factory=StreamingSettings)
+    features: FeaturesSettings = Field(default_factory=FeaturesSettings)
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +229,16 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
         "flush_interval_seconds": 0.05,
         "flush_chars": 20,
     },
+    "features": {
+        # Enabled by default: Tool Output Streaming ships ON so users
+        # see live tool output (bash, python_execute, subprocess, ...)
+        # without having to discover the toggle. Operators who prefer
+        # the legacy "wait for the full result" behavior can disable
+        # it from Runtime Settings → Features. The value here is the
+        # HARDCODED DEFAULT — only consulted when neither
+        # runtime_settings.json nor the env var override it.
+        "enable_tool_output_streaming": True,
+    },
 }
 
 # Mapping (section, key) → env var name. Empty string = no env override.
@@ -234,6 +256,9 @@ ENV_VARS: Dict[str, Dict[str, str]] = {
     "streaming": {
         "flush_interval_seconds": "PELDRUN_STREAM_FLUSH_INTERVAL",
         "flush_chars": "PELDRUN_STREAM_FLUSH_CHARS",
+    },
+    "features": {
+        "enable_tool_output_streaming": "PELDRUN_ENABLE_TOOL_OUTPUT_STREAMING",
     },
 }
 
@@ -290,6 +315,7 @@ _CASTERS: Dict[Tuple[str, str], Callable[[Any], Any]] = {
     ("cleanup", "max_age_hours"): _cast_float,
     ("streaming", "flush_interval_seconds"): _cast_float,
     ("streaming", "flush_chars"): _cast_int,
+    ("features", "enable_tool_output_streaming"): _cast_bool,
 }
 
 
@@ -531,6 +557,7 @@ __all__ = [
     "RuntimeSettingsDocument",
     "StreamingSettings",
     "TimeoutSettings",
+    "FeaturesSettings",
     "get_effective_snapshot",
     "load_document",
     "reset_document",

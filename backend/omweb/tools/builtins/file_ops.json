@@ -1,0 +1,158 @@
+{
+  "id": "file_ops",
+  "name": "File Operations",
+  "display_name": "File Operations",
+  "description": "Perform safe file operations inside the project workspace. Supported actions: 'read' (reads file text), 'write' (creates/overwrites file), 'append' (adds text to file), 'list' (lists directory items), 'exists' (checks existence), and 'delete' (removes a file).",
+  "category": "system",
+  "subcategory": "file-io",
+  "tags": ["filesystem", "files", "read", "write", "append", "delete", "list", "workspace", "storage"],
+  "capabilities": ["filesystem_read", "filesystem_write", "workspace_scoped", "stateful"],
+  "safety_level": "safe",
+  "is_builtin": true,
+  "is_enabled": true,
+
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+  "signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+
+  "license": "proprietary",
+  "license_url": "https://peldrun.ai/license",
+
+  "version": "1.0.0",
+  "release_date": "2025-01-15",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "changelog_url": "https://peldrun.ai/tools/file_ops/changelog",
+
+  "short_description": "Safe, workspace-scoped file operations: read, write, append, list, exists, and delete.",
+  "store_description": "Built-in file operations tool that provides low-level filesystem interactions strictly bounded within the active workspace root. It supports reading file text, creating or overwriting files, appending text, listing directory contents, checking existence, and deleting files or empty directories. It enforces a strict sandbox to prevent directory traversal and supports configurable size limits and overwrite policies.",
+  "homepage": "https://peldrun.ai/tools/file_ops",
+  "docs_url": "https://docs.peldrun.ai/tools/file_ops",
+  "demo_url": null,
+  "screenshots": [],
+  "icon": "icons/file_ops.svg",
+
+  "pricing": "free",
+  "supported_languages": ["en", "ar"],
+  "i18n": {
+    "ar": {
+      "display_name": "عمليات الملفات",
+      "short_description": "عمليات ملفات آمنة داخل مساحة العمل: قراءة، كتابة، إضافة، عرض، التحقق من الوجود، وحذف."
+    }
+  },
+
+  "settings": {
+    "enabled": true,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "max_file_size_kb": {
+          "type": "integer",
+          "minimum": 16,
+          "maximum": 51200,
+          "default": 2048,
+          "description": "Maximum allowed file size in kilobytes. Writing files larger than this will be rejected."
+        },
+        "overwrite_policy": {
+          "type": "string",
+          "enum": ["allow", "reject", "version"],
+          "default": "allow",
+          "description": "Behavior when writing to an existing file: 'allow' (overwrite), 'reject' (return error), or 'version' (create file_v2.txt, file_v3.txt, etc.)."
+        },
+        "default_encoding": {
+          "type": "string",
+          "enum": ["utf-8", "utf-16", "latin-1"],
+          "default": "utf-8",
+          "description": "Default character encoding used for read/write/append operations when the caller omits the 'encoding' parameter."
+        }
+      },
+      "additionalProperties": false
+    },
+    "defaults": {
+      "max_file_size_kb": 2048,
+      "overwrite_policy": "allow",
+      "default_encoding": "utf-8"
+    },
+    "required": []
+  },
+
+  "permissions": ["filesystem:workspace_read", "filesystem:workspace_write"],
+  "network_access": false,
+  "allowed_schemes": [],
+  "requires_api_key": false,
+  "required_env_vars": [],
+  "sandbox": true,
+  "filesystem_access": "workspace_only",
+  "rate_limit": {
+    "requests": 240,
+    "window_seconds": 60
+  },
+
+  "timeout_seconds": 30,
+  "concurrency": 1,
+  "runtime": "builtin",
+  "entry_point": "file_ops.handler",
+  "dependencies": [],
+
+  "examples": [
+    {
+      "input": { "action": "read", "path": "README.md" },
+      "output_preview": "# Project Title\n\nThis is the project description..."
+    },
+    {
+      "input": { "action": "write", "path": "notes.txt", "content": "Hello World" },
+      "output_preview": "Successfully written 11 characters to 'notes.txt'."
+    },
+    {
+      "input": { "action": "append", "path": "notes.txt", "content": " - updated" },
+      "output_preview": "Successfully appended 10 characters to 'notes.txt'."
+    },
+    {
+      "input": { "action": "list", "path": "src/" },
+      "output_preview": "[{\"name\": \"main.py\", \"type\": \"file\", \"size_bytes\": 1024}, {\"name\": \"utils\", \"type\": \"dir\", \"size_bytes\": 0}]"
+    },
+    {
+      "input": { "action": "exists", "path": "config.json" },
+      "output_preview": "{ \"exists\": true, \"is_file\": true, \"is_dir\": false }"
+    },
+    {
+      "input": { "action": "delete", "path": "temp.txt" },
+      "output_preview": "Successfully deleted 'temp.txt'."
+    }
+  ],
+  "usage_notes": "Paths must be relative to the workspace root. Any attempt to traverse outside (e.g. '../') is blocked. For editing specific lines of code inside an existing file, prefer 'str_replace_editor'. Use 'delete' with caution; it permanently removes the file or empty directory from the workspace.",
+
+  "deprecated": false,
+  "deprecation_message": null,
+  "replaces": [],
+  "replaced_by": null,
+
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": ["read", "write", "append", "list", "exists", "delete"],
+        "description": "Filesystem action to perform."
+      },
+      "path": {
+        "type": "string",
+        "description": "Relative file or directory path within the workspace (e.g. 'src/main.py', 'data/')."
+      },
+      "content": {
+        "type": "string",
+        "description": "Text content required when action is 'write' or 'append'."
+      },
+      "encoding": {
+        "type": "string",
+        "description": "Optional character encoding (utf-8, utf-16, latin-1). Defaults to the tool's configured encoding."
+      }
+    },
+    "required": ["action", "path"]
+  }
+}

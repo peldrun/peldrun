@@ -27,6 +27,7 @@ import type {
 // hook's job is now purely to project events into ChatContainer's
 // local UI state (steps, finalResult, humanQuery, ...).
 import { runStreamManager } from "@/lib/run-stream-manager";
+import { useToolStreamBuffer } from "@/lib/use-tool-stream-buffer";
 
 /**
  * Metadata for an MCP server that requires credentials before it can
@@ -161,6 +162,55 @@ export function useSseStream(params: UseSseStreamParams) {
     paramsRef.current = params;
   }, [params]);
 
+  // -----------------------------------------------------------------
+  // Tool Output Streaming: per-chunk batching.
+  //
+  // `useToolStreamBuffer` accumulates raw chunks in a ref and flushes
+  // them ONCE per animation frame (~60 Hz cap). This prevents a full
+  // `setSteps` re-render for every chunk (30-60/s per tool) while
+  // keeping the visual experience fluid. See the hook's docstring for
+  // the full rationale.
+  //
+  // The callback appends the flushed text to the matching
+  // `tool_call` step's `liveOutput` and `liveStreams`. The stream
+  // value is narrowed to the three backend-legal channels so the
+  // indexed assignment is type-safe; an unexpected value falls back
+  // to "stdout".
+  //
+  // Chunks arriving for a `toolCallId` that has no matching step are
+  // silently dropped. In practice this cannot happen because the
+  // backend emits TOOL_CALL before any TOOL_OUTPUT, and the manager
+  // delivers events in order — but the guard prevents a latent crash
+  // if that invariant is ever violated.
+  // -----------------------------------------------------------------
+  const { push: pushToolOutputStream, flush: flushToolOutputStream } =
+    useToolStreamBuffer((toolCallId, text, stream) => {
+      const validStream: "stdout" | "stderr" | "output" =
+        stream === "stderr"
+          ? "stderr"
+          : stream === "output"
+          ? "output"
+          : "stdout";
+      paramsRef.current.setSteps((prev) => {
+        const idx = prev.findIndex(
+          (s) => s.type === "tool_call" && s.toolCallId === toolCallId,
+        );
+        if (idx === -1) return prev;
+        const target = prev[idx];
+        const prevStreams = target.liveStreams || {};
+        const next = [...prev];
+        next[idx] = {
+          ...target,
+          liveOutput: (target.liveOutput || "") + text,
+          liveStreams: {
+            ...prevStreams,
+            [validStream]: (prevStreams[validStream] || "") + text,
+          },
+        };
+        return next;
+      });
+    });
+
   const closeStream = useCallback(() => {
     // Drop the local subscription. This does NOT disconnect the
     // manager from the SSE stream — the manager owns the connection
@@ -222,7 +272,8 @@ export function useSseStream(params: UseSseStreamParams) {
       type: StepEvent["type"],
       content: any,
       stepNum = 1,
-      toolName?: string
+      toolName?: string,
+      toolCallId?: string
     ) => {
       const cleanContent = safeRender(content);
       const cleanTool = toolName ? safeRender(toolName) : undefined;
@@ -237,6 +288,7 @@ export function useSseStream(params: UseSseStreamParams) {
           type,
           content: cleanContent,
           toolName: cleanTool,
+          toolCallId,
           timestamp: new Date().toLocaleTimeString(),
         },
       ]);
@@ -393,9 +445,19 @@ export function useSseStream(params: UseSseStreamParams) {
           );
         }
 
+        // Correlate the local StepEvent with the backend's tool_call_id
+        // so that streamed TOOL_OUTPUT chunks (which arrive keyed by
+        // tool_call_id) can be appended to THIS step. Without this,
+        // the live output would have no step to land on and would be
+        // silently dropped by the buffer's flush callback.
+        const toolCallId =
+          payload.data?.tool_call_id ||
+          payload.data?.toolCallId ||
+          undefined;
+
         // Store the parsed object when available so chat-thread can re-hydrate
         // input_type and options without needing to re-parse.
-        appendStep("tool_call", parsedArgs || rawArgs, step, name);
+        appendStep("tool_call", parsedArgs || rawArgs, step, name, toolCallId);
         ctx.setExpandedSteps((prev) => ({ ...prev, [`active-${step}`]: true }));
 
         logEntry(
@@ -419,7 +481,75 @@ export function useSseStream(params: UseSseStreamParams) {
         }
         appendStep("tool_call", payload.data, step, "ask_human");
         ctx.setExpandedSteps((prev) => ({ ...prev, [`active-${step}`]: true }));
+      } else if (eventType === "tool_output") {
+        // ─── Tool Output Streaming: raw stdout/stderr chunk ─────────
+        //
+        // Emitted WHILE a tool is executing. Accumulated by
+        // `useToolStreamBuffer` and flushed at most once per animation
+        // frame to avoid a re-render per chunk.
+        //
+        // Deduplication and attempt separation are handled by the
+        // reducer in `lib/stream-reducer.ts` (which updates `ToolPair`
+        // in `stream-store`). The local `StepEvent[]` state handled
+        // here mirrors that behavior with a simpler contract:
+        // `useToolStreamBuffer` already coalesces per key, and the
+        // `runStreamManager` delivers each event once per successful
+        // SSE connection.
+        const outToolCallId =
+          payload.data?.tool_call_id || payload.data?.toolCallId;
+        const outStream = String(payload.data?.stream || "stdout");
+        const outChunk = String(payload.data?.chunk || "");
+        if (outToolCallId && outChunk) {
+          pushToolOutputStream(outToolCallId, outStream, outChunk);
+        }
+      } else if (eventType === "tool_progress") {
+        // ─── Tool Output Streaming: structured progress update ─────
+        //
+        // Progress updates are low-frequency (typically < 1 Hz per
+        // tool) and carry small payloads, so they are applied
+        // synchronously without batching. Batching a handful of
+        // progress events per second through rAF would add latency
+        // for no measurable benefit.
+        const progToolCallId =
+          payload.data?.tool_call_id || payload.data?.toolCallId;
+        if (progToolCallId) {
+          const progressPayload = {
+            current:
+              typeof payload.data?.current === "number"
+                ? payload.data.current
+                : undefined,
+            total:
+              typeof payload.data?.total === "number"
+                ? payload.data.total
+                : undefined,
+            phase:
+              typeof payload.data?.phase === "string"
+                ? payload.data.phase
+                : undefined,
+            message:
+              typeof payload.data?.chunk === "string"
+                ? payload.data.chunk
+                : typeof payload.data?.message === "string"
+                ? payload.data.message
+                : undefined,
+          };
+          ctx.setSteps((prev) =>
+            prev.map((s) => {
+              if (s.type === "tool_call" && s.toolCallId === progToolCallId) {
+                return { ...s, progress: progressPayload };
+              }
+              return s;
+            })
+          );
+        }
       } else if (eventType === "observation") {
+        // Ensure any chunks buffered in the last animation frame land
+        // in the tool_call step BEFORE the observation is appended.
+        // Without this, the observation would commit first and the
+        // final live chunk would appear AFTER it — breaking the
+        // visual ordering the user expects.
+        flushToolOutputStream();
+
         const raw = payload.data?.output ?? "Execution completed.";
         const observationTool =
           payload.data?.tool_name ||
@@ -485,6 +615,12 @@ export function useSseStream(params: UseSseStreamParams) {
         }
         ctx.fetchJobFiles(jobId);
       } else if (eventType === "final" || eventType === "done") {
+        // Flush any pending tool-output chunks before composing the
+        // final result. This guarantees no chunks are lost if the
+        // tool's last write happened in the same frame as the final
+        // event.
+        flushToolOutputStream();
+
         /**
          * Do not unconditionally clear humanQuery here. If the final event
          * was produced because the ask_human tool timed out, we keep the
@@ -754,6 +890,9 @@ export function useSseStream(params: UseSseStreamParams) {
           );
         }
       } else if (eventType === "error") {
+        // Flush pending chunks so the user sees the last output
+        // before the error card renders.
+        flushToolOutputStream();
         ctx.setHumanQuery(null);
         const errText = payload.data?.message ?? "Execution error encountered.";
         ctx.setFinalResult(safeRender(errText));

@@ -370,6 +370,34 @@ def _resolve_mcp_env_optional(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Tool Output Streaming feature flag
+# ---------------------------------------------------------------------------
+def _is_tool_output_streaming_enabled() -> bool:
+    """
+    Return True when the Tool Output Streaming feature is enabled.
+
+    Reads directly from the runtime settings store (managed by the UI),
+    falling back to the environment variable only if the store is
+    unavailable.
+
+    Defense in depth: ``tool_call_agent`` also reads this flag (once at
+    agent construction time). When the flag is off, the agent does not
+    even create the streaming context -- so these events never reach
+    the engine. The engine's own check is a second line of defense
+    that catches the case where the flag was toggled between agent
+    construction and this run's start: the events are produced by the
+    agent but dropped here, keeping the frontend consistent with the
+    operator's expressed intent.
+    """
+    try:
+        from omweb.services.runtime_settings import resolve
+        return bool(resolve("features", "enable_tool_output_streaming"))
+    except Exception:
+        raw = os.environ.get("PELDRUN_ENABLE_TOOL_OUTPUT_STREAMING", "").strip().lower()
+        return raw in ("1", "true", "yes", "on")
+
+
 class PeldrunEngine(ExecutionEngine):
     """Isolated Web execution adapter powered by local PELDRUN Core."""
 
@@ -418,6 +446,18 @@ class PeldrunEngine(ExecutionEngine):
         provider_name = context.provider_name
         project_dir = context.project_dir
         chat_id = context.chat_id or f"chat_{job_id}"
+
+        # Tool Output Streaming: read once at run start (see the helper's
+        # docstring for why we do not read this per-event). When disabled,
+        # TOOL_OUTPUT / TOOL_PROGRESS events are dropped at this layer even
+        # if a producer emits them anyway -- defense in depth against the
+        # agent's own feature flag.
+        streaming_enabled = _is_tool_output_streaming_enabled()
+        logger.info(
+            "[ENGINE PELDRUN] Tool output streaming for job %s: %s",
+            job_id,
+            "enabled" if streaming_enabled else "disabled",
+        )
 
         # Use get_effective_agent so user-saved settings from the Store
         # settings modal (max_steps) are merged into the manifest before
@@ -1547,6 +1587,75 @@ class PeldrunEngine(ExecutionEngine):
                         data=tool_call_payload,
                     ),
                 )
+
+            elif event.type == getattr(EventType, "TOOL_OUTPUT", None):
+                # Opt-in streaming: raw stdout/stderr chunks emitted by
+                # tools that opted into the streaming contract. Forwarded
+                # verbatim to the frontend, which appends them to the
+                # matching tool card's live-output buffer.
+                #
+                # The payload shape mirrors the ToolOutputPayload schema
+                # in peldrun.events.schema. Every field is forwarded as-
+                # is; only `seq` (the SSE envelope sequence) and `model`
+                # (informational) are added by this layer. Duplicate
+                # filtering after an SSE reconnect is the frontend's
+                # responsibility -- the reducer drops chunks whose
+                # `sequence` is <= the last one it processed.
+                #
+                # The engine-level `streaming_enabled` check is defense
+                # in depth: the agent should never emit these events when
+                # the flag is off, but if it does (e.g. the flag was
+                # flipped mid-run), dropping here keeps the frontend
+                # consistent with the configured behavior.
+                if streaming_enabled:
+                    payload = event.payload if isinstance(event.payload, dict) else {}
+                    await dispatch_event(
+                        job_id,
+                        SSEEvent(
+                            type=SSEEventType.TOOL_OUTPUT,
+                            step=curr_step,
+                            data={
+                                "tool_call_id": payload.get("tool_call_id", ""),
+                                "tool_name": payload.get("tool_name", ""),
+                                "stream": payload.get("stream", "stdout"),
+                                "chunk": payload.get("chunk", ""),
+                                "sequence": payload.get("sequence", 0),
+                                "attempt": payload.get("attempt", 1),
+                                "seq": event_seq,
+                                "model": model_name,
+                            },
+                        ),
+                    )
+
+            elif event.type == getattr(EventType, "TOOL_PROGRESS", None):
+                # Opt-in structured progress updates. Same envelope and
+                # deduplication contract as TOOL_OUTPUT, but the payload
+                # carries current/total/phase instead of `stream`.
+                # `stream` is deliberately omitted: for progress events
+                # the discriminator is the event type itself, and
+                # including `stream="progress"` would duplicate that
+                # information in a place the frontend does not read.
+                if streaming_enabled:
+                    payload = event.payload if isinstance(event.payload, dict) else {}
+                    await dispatch_event(
+                        job_id,
+                        SSEEvent(
+                            type=SSEEventType.TOOL_PROGRESS,
+                            step=curr_step,
+                            data={
+                                "tool_call_id": payload.get("tool_call_id", ""),
+                                "tool_name": payload.get("tool_name", ""),
+                                "chunk": payload.get("chunk", ""),
+                                "sequence": payload.get("sequence", 0),
+                                "attempt": payload.get("attempt", 1),
+                                "current": payload.get("current"),
+                                "total": payload.get("total"),
+                                "phase": payload.get("phase"),
+                                "seq": event_seq,
+                                "model": model_name,
+                            },
+                        ),
+                    )
 
             elif event.type == EventType.ASK_HUMAN:
                 payload = event.payload if isinstance(event.payload, dict) else {}

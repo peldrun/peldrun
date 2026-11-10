@@ -76,6 +76,10 @@ interface TimeoutValues {
   total_timeout_seconds: number;
 }
 
+interface FeaturesValues {
+  enable_tool_output_streaming: boolean;
+}
+
 interface SettingsSchemaField {
   label: string;
   type: "boolean" | "number" | "url" | "password";
@@ -97,21 +101,25 @@ interface RuntimeSettingsResponse {
     timeouts: TimeoutValues;
     cleanup: CleanupValues;
     streaming: StreamingValues;
+    features: FeaturesValues;
   };
   sources: {
     timeouts: Record<string, SourceTier>;
     cleanup: Record<string, SourceTier>;
     streaming: Record<string, SourceTier>;
+    features: Record<string, SourceTier>;
   };
   defaults: {
     timeouts: TimeoutValues;
     cleanup: CleanupValues;
     streaming: StreamingValues;
+    features: FeaturesValues;
   };
   schema: {
     timeouts: Record<string, SettingsSchemaField>;
     cleanup: Record<string, SettingsSchemaField>;
     streaming: Record<string, SettingsSchemaField>;
+    features: Record<string, SettingsSchemaField>;
   };
   env_vars: Record<string, Record<string, string>>;
 }
@@ -445,21 +453,25 @@ export default function RuntimeSettingsPage() {
     timeouts: TimeoutValues;
     cleanup: CleanupValues;
     streaming: StreamingValues;
+    features: FeaturesValues;
   } | null>(null);
   const [sources, setSources] = useState<{
     timeouts: Record<string, SourceTier>;
     cleanup: Record<string, SourceTier>;
     streaming: Record<string, SourceTier>;
+    features: Record<string, SourceTier>;
   } | null>(null);
   const [schema, setSchema] = useState<{
     timeouts: Record<string, SettingsSchemaField>;
     cleanup: Record<string, SettingsSchemaField>;
     streaming: Record<string, SettingsSchemaField>;
+    features: Record<string, SettingsSchemaField>;
   } | null>(null);
   const [defaults, setDefaults] = useState<{
     timeouts: TimeoutValues;
     cleanup: CleanupValues;
     streaming: StreamingValues;
+    features: FeaturesValues;
   } | null>(null);
 
   const [loading, setLoading] = useState(true);
@@ -511,22 +523,30 @@ export default function RuntimeSettingsPage() {
             ),
             flush_chars: Number(data.values.streaming.flush_chars),
           },
+          features: {
+            enable_tool_output_streaming: Boolean(
+              data.values.features?.enable_tool_output_streaming ?? true
+            ),
+          },
         };
         setValues(initial);
         setSources({
           timeouts: data.sources.timeouts,
           cleanup: data.sources.cleanup,
           streaming: data.sources.streaming,
+          features: data.sources.features || {},
         });
         setSchema({
           timeouts: data.schema.timeouts,
           cleanup: data.schema.cleanup,
           streaming: data.schema.streaming,
+          features: data.schema.features || {},
         });
         setDefaults({
           timeouts: data.defaults.timeouts,
           cleanup: data.defaults.cleanup,
           streaming: data.defaults.streaming,
+          features: data.defaults.features || { enable_tool_output_streaming: true },
         });
         lastSnapshotRef.current = JSON.stringify(initial);
         setLoadError(null);
@@ -669,6 +689,7 @@ export default function RuntimeSettingsPage() {
       timeouts: TimeoutValues;
       cleanup: CleanupValues;
       streaming: StreamingValues;
+      features: FeaturesValues;
     }) => {
       if (hasValidationErrors) {
         setSaveErrorMsg(Object.values(validationErrors)[0]);
@@ -685,6 +706,7 @@ export default function RuntimeSettingsPage() {
             timeouts: payload.timeouts,
             cleanup: payload.cleanup,
             streaming: payload.streaming,
+            features: payload.features,
           }),
         });
         if (!res.ok) {
@@ -696,6 +718,7 @@ export default function RuntimeSettingsPage() {
           timeouts: fresh.sources.timeouts,
           cleanup: fresh.sources.cleanup,
           streaming: fresh.sources.streaming,
+          features: fresh.sources.features || {},
         });
         setSaveState("saved");
         setLastSavedAt(new Date());
@@ -860,12 +883,18 @@ export default function RuntimeSettingsPage() {
           ),
           flush_chars: Number(data.values.streaming.flush_chars),
         },
+        features: {
+          enable_tool_output_streaming: Boolean(
+            data.values.features?.enable_tool_output_streaming ?? true
+          ),
+        },
       };
       setValues(fresh);
       setSources({
         timeouts: data.sources.timeouts,
         cleanup: data.sources.cleanup,
         streaming: data.sources.streaming,
+        features: data.sources.features || {},
       });
       lastSnapshotRef.current = JSON.stringify(fresh);
       setSaveState("idle");
@@ -910,6 +939,15 @@ export default function RuntimeSettingsPage() {
     <K extends keyof StreamingValues>(key: K, value: StreamingValues[K]) => {
       setValues((prev) =>
         prev ? { ...prev, streaming: { ...prev.streaming, [key]: value } } : prev
+      );
+    },
+    []
+  );
+
+  const updateFeatures = useCallback(
+    <K extends keyof FeaturesValues>(key: K, value: FeaturesValues[K]) => {
+      setValues((prev) =>
+        prev ? { ...prev, features: { ...prev.features, [key]: value } } : prev
       );
     },
     []
@@ -1275,6 +1313,43 @@ export default function RuntimeSettingsPage() {
               source={sources?.streaming.flush_chars ?? "default"}
               error={validationErrors["streaming.flush_chars"]}
               unit="chars"
+            />
+          </div>
+        </motion.div>
+
+        {/* Features section */}
+        <motion.div
+          {...FADE_UP}
+          transition={{ ...FADE_UP.transition, delay: 0.35 }}
+          className="relative p-5 rounded-md bg-gigbg shadow-sm space-y-5"
+        >
+          <div className="pointer-events-none absolute top-0 left-0 right-0 h-[2px] rounded-t-md bg-gradient-to-r from-transparent via-emerald-500/60 to-transparent" />
+
+          <div className="flex items-center gap-3">
+            <div className="p-2 rounded bg-emerald-500/10">
+              <Zap size={16} className="text-emerald-500" />
+            </div>
+            <div>
+              <h3 className="text-md text-black dark:text-white font-semibold font-heading uppercase tracking-wider">
+                Features
+              </h3>
+              <p className="text-[11px] text-muted-foreground">
+                Optional features and experimental capabilities
+              </p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 gap-3">
+            <BooleanField
+              id="feature-tool-output-streaming"
+              label={schema?.features.enable_tool_output_streaming?.label ?? "Enable Tool Output Streaming"}
+              description={
+                schema?.features.enable_tool_output_streaming?.description ??
+                "Stream live stdout/stderr from executing tools directly to the UI."
+              }
+              value={Boolean(values.features.enable_tool_output_streaming)}
+              onChange={(v) => updateFeatures("enable_tool_output_streaming", v)}
+              source={sources?.features.enable_tool_output_streaming ?? "default"}
             />
           </div>
         </motion.div>

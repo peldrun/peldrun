@@ -67,6 +67,10 @@ class SettingsPatchRequest(BaseModel):
         default=None,
         description="Partial updates for the streaming section.",
     )
+    features: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Partial updates for the features section.",
+    )
 
 
 # Field metadata consumed by the frontend's generic renderer.
@@ -163,6 +167,17 @@ _SETTINGS_SCHEMA: Dict[str, Dict[str, Dict[str, Any]]] = {
             "description": (
                 "Minimum buffered characters before an SSE flush. "
                 "Effective on the next think() call."
+            ),
+        },
+    },
+    "features": {
+        "enable_tool_output_streaming": {
+            "label": "Enable Tool Output Streaming",
+            "type": "boolean",
+            "description": (
+                "Stream live stdout/stderr from executing tools directly to the UI. "
+                "When enabled, tools like bash will show output in real-time instead "
+                "of waiting for completion."
             ),
         },
     },

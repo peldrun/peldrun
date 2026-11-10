@@ -19,6 +19,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 from pathlib import Path
 import time
 from typing import Any, Dict, List, Optional, Union
@@ -41,6 +42,7 @@ from peldrun.llm.client import LLMResponse, ToolCall
 from peldrun.tools.base import ToolResult
 from peldrun.tools.collection import ToolCollection
 from peldrun.tools.contract import ToolExecutionPolicy
+from peldrun.tools.execution_manager import ToolExecutionContextImpl
 from peldrun.tools.execution_result import ToolExecutionResult
 
 logger = logging.getLogger("peldrun.agents.tool_call_agent")
@@ -137,6 +139,30 @@ def _truncate_observation(tool_name: str, output: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Tool Output Streaming feature flag
+# ---------------------------------------------------------------------------
+def _is_tool_output_streaming_enabled() -> bool:
+    """
+    Return True when the Tool Output Streaming feature is enabled.
+
+    Controlled by the ``PELDRUN_ENABLE_TOOL_OUTPUT_STREAMING`` env var.
+    Default is False: the feature is opt-in and must be explicitly
+    enabled by an operator.
+
+    This is the emergency kill-switch: turning the env var off
+    disables ALL streaming at the next agent construction without
+    touching code or restarting other subsystems. Only values that
+    unambiguously signal intent are accepted as truthy — the exact
+    strings "1", "true", "yes", and "on", case-insensitive. Everything
+    else (including unset) is False.
+    """
+    raw = os.environ.get(
+        "PELDRUN_ENABLE_TOOL_OUTPUT_STREAMING", ""
+    ).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 class ToolCallAgent(BaseAgent):
     """
     Autonomous ReAct agent executing real tool invocations on concrete tool instances.
@@ -206,6 +232,13 @@ class ToolCallAgent(BaseAgent):
         # models (Nemotron, R1, QwQ, o1-style) to produce intermediate
         # text mid-task without being misclassified as "task complete".
         self._consecutive_no_tool_steps: int = 0
+        # [TOOL-OUTPUT-STREAMING] Feature flag read once at construction
+        # time. Reading once (instead of per-call) makes an individual
+        # run's behavior consistent even if an operator edits the env
+        # var mid-execution. The flag is a deployment concern, NOT
+        # per-run state, so ``_reset_run_state`` deliberately does not
+        # touch it.
+        self._streaming_enabled: bool = _is_tool_output_streaming_enabled()
 
     @property
     def name(self) -> str:
@@ -1009,6 +1042,60 @@ class ToolCallAgent(BaseAgent):
 
         return response
 
+    async def _drain_output_queue(
+        self,
+        queue: "asyncio.Queue[Optional[Dict[str, Any]]]",
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        step: int,
+    ) -> None:
+        """
+        Consume streamed chunks from a tool's output queue and emit them
+        as SSE events.
+
+        Terminates when the sentinel (``None``) is received. The caller
+        is responsible for enqueueing the sentinel in a ``finally``
+        block, which guarantees the drain task exits even when the
+        tool raised.
+
+        Event mapping
+        -------------
+        Chunks whose ``stream == "progress"`` are emitted as
+        ``TOOL_PROGRESS`` (structured progress update rendered as a
+        progress bar in the frontend). Everything else is emitted as
+        ``TOOL_OUTPUT`` (raw stdout/stderr chunks appended to the tool
+        card's live output buffer).
+
+        Error handling
+        --------------
+        Any failure during event emission is logged and swallowed. A
+        broken emitter must never prevent the tool from completing;
+        the tool's own result (returned via ``aexecute_with_result``)
+        is already authoritative. Losing a mid-flight progress event
+        is acceptable; failing the tool is not.
+        """
+        while True:
+            item = await queue.get()
+            if item is None:
+                return
+            try:
+                stream = item.get("stream", "output")
+                event_type = (
+                    EventType.TOOL_PROGRESS
+                    if stream == "progress"
+                    else EventType.TOOL_OUTPUT
+                )
+                await self._emit(event_type, step=step, payload=item)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to emit streamed tool output for '%s' "
+                    "(call=%s): %s",
+                    tool_name,
+                    tool_call_id,
+                    exc,
+                )
+
     async def act(
         self, step: int, tool_calls: List[ToolCall]
     ) -> List[ToolExecutionResult]:
@@ -1120,12 +1207,72 @@ class ToolCallAgent(BaseAgent):
                 else:
                     call_timeout = policy.timeout_seconds
 
+                # ----------------------------------------------------------
+                # Tool Output Streaming (opt-in via feature flag)
+                #
+                # When enabled AND the tool is not interactive, a
+                # per-(call, attempt) ToolExecutionContextImpl is
+                # created and backed by an asyncio.Queue. A dedicated
+                # drain task consumes the queue and translates each
+                # item into a TOOL_OUTPUT or TOOL_PROGRESS event.
+                #
+                # When the flag is off (the default) OR the tool is
+                # interactive, ``context=None`` is passed and behavior
+                # is byte-for-byte identical to the pre-feature
+                # baseline. This is the "do no harm" guarantee.
+                #
+                # Interactive tools (ask_human / human_input) are
+                # excluded unconditionally: they block waiting for
+                # user input, produce no meaningful mid-flight
+                # output, and wrapping them in a queue+drain task
+                # would waste overhead on every HITL round-trip.
+                # ----------------------------------------------------------
+                streaming_ctx: Optional[ToolExecutionContextImpl] = None
+                output_queue: Optional[
+                    "asyncio.Queue[Optional[Dict[str, Any]]]"
+                ] = None
+                drain_task: Optional[asyncio.Task] = None
+
+                if self._streaming_enabled and not is_human_tool:
+                    try:
+                        output_queue = asyncio.Queue()
+                        streaming_ctx = ToolExecutionContextImpl(
+                            tool_call_id=call_id,
+                            tool_name=tool_name,
+                            attempt=attempt,
+                            queue=output_queue,
+                        )
+                        drain_task = asyncio.create_task(
+                            self._drain_output_queue(
+                                output_queue,
+                                tool_call_id=call_id,
+                                tool_name=tool_name,
+                                step=step,
+                            )
+                        )
+                    except Exception as ctx_err:
+                        # Streaming initialization failure must NOT
+                        # prevent the tool from running. Degrade to
+                        # the non-streaming path and log the cause.
+                        logger.warning(
+                            "act(): failed to initialize tool output "
+                            "streaming for '%s' (call=%s): %s. "
+                            "Falling back to non-streaming execution.",
+                            tool_name,
+                            call_id,
+                            ctx_err,
+                        )
+                        streaming_ctx = None
+                        output_queue = None
+                        drain_task = None
+
                 try:
                     result = await collection.aexecute_with_result(
                         tool_name,
                         args,
                         tool_call_id=call_id,
                         timeout_seconds=call_timeout,
+                        context=streaming_ctx,
                     )
                 except asyncio.CancelledError:
                     if is_human_tool and self.state is not None:
@@ -1149,6 +1296,41 @@ class ToolCallAgent(BaseAgent):
                         error=f"Tool execution raised: {exc}",
                         exit_code=1,
                     )
+                finally:
+                    # Signal the drain task to stop and wait (bounded)
+                    # for its natural exit BEFORE the OBSERVATION event
+                    # for this attempt is dispatched later in the loop.
+                    # This guarantees the frontend sees the ordering:
+                    #
+                    #     TOOL_CALL -> TOOL_OUTPUT... -> OBSERVATION
+                    #
+                    # Failure of the drain cleanup is non-fatal: the
+                    # tool result has already been computed above and
+                    # nothing in this block may alter it. The
+                    # ``except BaseException`` deliberately swallows
+                    # CancelledError as well — the original in-flight
+                    # exception (if any) from the try block continues
+                    # to propagate once the finally block exits.
+                    if output_queue is not None:
+                        try:
+                            output_queue.put_nowait(None)
+                        except Exception:
+                            pass
+                    if drain_task is not None and not drain_task.done():
+                        try:
+                            # 2s is comfortably larger than the drain
+                            # task's natural work (it just reads a
+                            # queue and emits events), but tight enough
+                            # that a pathological drain cannot hang
+                            # the agent.
+                            await asyncio.wait_for(
+                                drain_task, timeout=2.0
+                            )
+                        except BaseException:
+                            try:
+                                drain_task.cancel()
+                            except BaseException:
+                                pass
 
                 final_result = result
 

@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 from pydantic import BaseModel, Field
 
 from peldrun.tools.base import BaseTool, ToolResult
+from peldrun.tools.contract import ToolExecutionContext
 
 
 class ShellExecArgs(BaseModel):
@@ -116,6 +117,7 @@ class ShellExecTool(BaseTool):
         command: str,
         timeout: Optional[float] = None,
         working_subdir: Optional[str] = None,
+        context: Optional[ToolExecutionContext] = None,
         **kwargs: Any,
     ) -> ToolResult:
         """
@@ -222,24 +224,60 @@ class ShellExecTool(BaseTool):
                 env=proc_env,
             )
 
-            try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=timeout_val
-                )
-            except asyncio.TimeoutError:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                return ToolResult(
-                    output=f"Shell command execution timed out after {timeout_val} seconds.",
-                    exit_code=1,
-                    is_error=True,
-                )
+            if context is not None:
+                stdout_chunks = []
+                stderr_chunks = []
 
-            stdout_str = stdout_bytes.decode("utf-8", errors="replace").strip()
-            stderr_str = stderr_bytes.decode("utf-8", errors="replace").strip()
+                async def _read_stream(stream, chunks, stream_name):
+                    while True:
+                        # read(4096) is non-blocking and cross-platform safe
+                        chunk = await stream.read(4096)
+                        if not chunk:
+                            break
+                        text = chunk.decode("utf-8", errors="replace")
+                        chunks.append(text)
+                        await context.emit_output(text, stream=stream_name)
+
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            _read_stream(proc.stdout, stdout_chunks, "stdout"),
+                            _read_stream(proc.stderr, stderr_chunks, "stderr"),
+                            proc.wait()
+                        ),
+                        timeout=timeout_val
+                    )
+                    stdout_str = "".join(stdout_chunks).strip()
+                    stderr_str = "".join(stderr_chunks).strip()
+                except asyncio.TimeoutError:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    return ToolResult(
+                        output=f"Shell command execution timed out after {timeout_val} seconds.",
+                        exit_code=1,
+                        is_error=True,
+                    )
+            else:
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        proc.communicate(),
+                        timeout=timeout_val
+                    )
+                except asyncio.TimeoutError:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    return ToolResult(
+                        output=f"Shell command execution timed out after {timeout_val} seconds.",
+                        exit_code=1,
+                        is_error=True,
+                    )
+
+                stdout_str = stdout_bytes.decode("utf-8", errors="replace").strip()
+                stderr_str = stderr_bytes.decode("utf-8", errors="replace").strip()
 
             is_err = proc.returncode != 0
             combined_output = stdout_str if stdout_str else stderr_str
@@ -272,7 +310,7 @@ class ShellExecTool(BaseTool):
                 is_error=True,
             )
 
-    async def execute(self, command: str, timeout: Optional[float] = None, **kwargs: Any) -> ToolResult:
+    async def execute(self, command: str, timeout: Optional[float] = None, context: Optional[ToolExecutionContext] = None, **kwargs: Any) -> ToolResult:
         """Public alias maintaining backward compatibility.
 
         The previous signature declared ``timeout=60.0``, which meant

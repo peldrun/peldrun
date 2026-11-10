@@ -16,6 +16,7 @@ import {
   HelpCircle,
   RotateCw,
   Server,
+  Terminal,
   XCircle,
 } from "lucide-react";
 import type { ToolPair } from "@/lib/types";
@@ -306,6 +307,46 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
   const outputSize = outputText ? formatSize(outputText) : "";
   const outputLines = outputText ? countLines(outputText) : 0;
 
+  // -----------------------------------------------------------------
+  // Tool Output Streaming: render helpers.
+  //
+  // `hasLiveOutput` is true when the backend streamed at least one
+  // non-empty chunk for this tool. When false (the default state
+  // when the feature flag is off), the card renders exactly as it
+  // did before this feature shipped.
+  //
+  // `progressPercent` is only computed when both counters are present
+  // and `total > 0`. Progress events can carry a phase-only payload
+  // (e.g. `{phase: "downloading"}` with no numeric counters); in that
+  // case `progressPercent` stays null and only the phase label is
+  // rendered.
+  // -----------------------------------------------------------------
+  const hasLiveOutput = Boolean(
+    tool.liveOutput && tool.liveOutput.length > 0,
+  );
+  const liveOutputLines = hasLiveOutput ? countLines(tool.liveOutput) : 0;
+  const liveOutputSize = hasLiveOutput ? formatSize(tool.liveOutput) : "";
+
+  const progressPercent =
+    tool.progress &&
+    typeof tool.progress.current === "number" &&
+    typeof tool.progress.total === "number" &&
+    tool.progress.total > 0
+      ? Math.max(
+          0,
+          Math.min(
+            100,
+            Math.round((tool.progress.current / tool.progress.total) * 100),
+          ),
+        )
+      : null;
+
+  const hasProgress =
+    Boolean(tool.progress) &&
+    (progressPercent !== null ||
+      Boolean(tool.progress?.phase) ||
+      Boolean(tool.progress?.message));
+
   // Filter out bulky file_text from the JSON view to avoid duplication
   const displayArgs = { ...parsedArgs };
   if (displayArgs.file_text) displayArgs.file_text = "<...omitted to avoid duplication...>";
@@ -493,6 +534,87 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
             <div>
               <div className="text-[9px] font-mono text-muted-foreground uppercase mb-1">Parameters</div>
               <pre className="p-2 rounded-md bg-muted/50 border border-border/50 text-foreground font-mono text-[10px] overflow-x-auto max-h-48">{JSON.stringify(displayArgs, null, 2)}</pre>
+            </div>
+          )}
+
+          {/* Tool Output Streaming — structured progress bar.
+              Rendered above the live output so it stays visible while
+              the user scrolls through the text. Skipped entirely when
+              `tool.progress` is undefined (the default when streaming
+              is disabled). */}
+          {hasProgress && tool.progress && (
+            <div className="flex items-center gap-2 text-[10px] font-mono">
+              {progressPercent !== null && (
+                <>
+                  <div className="flex-1 h-1 rounded bg-border overflow-hidden">
+                    <div
+                      className="h-full bg-primary transition-all"
+                      style={{ width: `${progressPercent}%` }}
+                    />
+                  </div>
+                  <span className="text-foreground whitespace-nowrap">
+                    {progressPercent}%
+                  </span>
+                </>
+              )}
+              <span className="text-muted-foreground whitespace-nowrap">
+                {tool.progress.phase && (
+                  <span className="uppercase">{tool.progress.phase}</span>
+                )}
+                {tool.progress.message && (
+                  <span> — {tool.progress.message}</span>
+                )}
+              </span>
+            </div>
+          )}
+
+          {/* Tool Output Streaming — raw stdout/stderr chunks captured
+              while the tool was executing.
+
+              This section is INDEPENDENT of `tool.output` (populated by
+              the observation event). Per the streaming contract, the
+              observation does NOT clear `liveOutput`: it is kept as
+              the historical record of what the user watched stream in.
+              When both are present and identical, showing both is
+              intentional — one is "what streamed" and the other is
+              "the tool's designated final result", and they are not
+              necessarily the same (a shell command's stdout and its
+              designated output often differ).
+
+              stderr is rendered in red below stdout when both exist.
+              This loses the exact byte-level interleaving of the two
+              channels but preserves the color distinction, which is
+              the most actionable signal for the user. The exact
+              interleaved order is preserved in `liveOutput`. */}
+          {hasLiveOutput && (
+            <div>
+              <div className="flex items-center justify-between mb-1 gap-2">
+                <div className="text-[9px] font-mono text-primary uppercase flex items-center gap-1.5">
+                  <Terminal size={10} />
+                  <span>
+                    Live Output
+                    {tool.status === "running" ? " (streaming)" : ""}
+                  </span>
+                </div>
+                <span className="text-[9px] font-mono text-muted-foreground">
+                  {liveOutputLines} line{liveOutputLines === 1 ? "" : "s"} ·{" "}
+                  {liveOutputSize}
+                </span>
+              </div>
+              <pre className="p-2 rounded-md bg-muted/30 border border-border/50 text-foreground font-mono text-[10px] whitespace-pre-wrap leading-relaxed overflow-x-auto max-h-56">
+                {tool.liveStreams?.stderr ? (
+                  <>
+                    {tool.liveStreams.stdout && (
+                      <span>{tool.liveStreams.stdout}</span>
+                    )}
+                    <span className="text-red-500">
+                      {tool.liveStreams.stderr}
+                    </span>
+                  </>
+                ) : (
+                  tool.liveOutput
+                )}
+              </pre>
             </div>
           )}
 

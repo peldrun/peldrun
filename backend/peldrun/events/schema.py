@@ -42,6 +42,27 @@ class EventType(str, Enum):
     TOOL_RETRY = "tool_retry"
     TOOL_CALLED = "tool_called"  # Compatibility alias for tool_call
 
+    # Tool Output Streaming Events (opt-in)
+    #
+    # Emitted by ToolCallAgent.act() WHILE a tool is running, in
+    # parallel with the tool's own execution. Both events carry a
+    # `tool_call_id` so the frontend can patch the correct card in
+    # the timeline even when several tools run concurrently.
+    #
+    # TOOL_OUTPUT   -- raw stdout/stderr chunks; appended to the
+    #                  live output buffer of the matching tool card.
+    # TOOL_PROGRESS -- structured progress update (current/total/
+    #                  phase/message); rendered as a progress bar,
+    #                  NOT appended to the text area.
+    #
+    # These events are ADDITIVE. The tool's final output and status
+    # still arrive via the existing OBSERVATION event; TOOL_OUTPUT
+    # and TOOL_PROGRESS do not replace it. The frontend is expected
+    # to keep both: `liveOutput` (accumulated from TOOL_OUTPUT) and
+    # `output` (from OBSERVATION) are two separate fields.
+    TOOL_OUTPUT = "tool_output"
+    TOOL_PROGRESS = "tool_progress"
+
     # [B13 FIX] Canonical terminal event types.
     #
     # These are the FUTURE canonical names that ``events/terminal.py``
@@ -155,6 +176,75 @@ class ToolRetryPayload(BaseModel):
     max_attempts: int = 3
     error: str = ""
     delay_seconds: float = 0.0
+
+
+class ToolOutputPayload(BaseModel):
+    """
+    Payload for a single streamed output chunk.
+
+    Emitted WHILE a tool is running, in parallel with the tool's own
+    execution. The frontend appends ``chunk`` to the ``liveOutput``
+    field of the matching tool card (identified by ``tool_call_id``),
+    preserving the separation between ``stdout`` and ``stderr`` in the
+    ``liveStreams`` map.
+
+    Ordering contract
+    -----------------
+    ``sequence`` is 1-based and strictly monotonic PER tool call. The
+    frontend reducer drops any chunk whose ``sequence`` is less than
+    or equal to the last one it processed, which provides
+    at-least-once delivery under SSE reconnects: after a reconnect the
+    client replays from ``last_seen_sequence + 1`` and duplicates are
+    discarded at the reducer boundary.
+
+    Retry semantics
+    ---------------
+    ``attempt`` is 1-based and identifies which retry attempt produced
+    the chunk. When a tool fails and is retried, the new attempt's
+    ``sequence`` counter restarts at 1. The frontend detects the
+    ``attempt`` change and clears the previous attempt's visible text
+    before appending the new one, so failed attempts never bleed into
+    the successful one.
+    """
+    model_config = ConfigDict(extra="allow")
+    tool_call_id: str = ""
+    tool_name: str = ""
+    # "progress" is deliberately excluded here: that discriminator
+    # routes to the separate TOOL_PROGRESS event type. An unexpected
+    # "progress" value inside a TOOL_OUTPUT payload would indicate an
+    # emitter bug, and validation should surface it rather than
+    # silently accept it.
+    stream: Literal["stdout", "stderr", "output"] = "stdout"
+    chunk: str = ""
+    sequence: int = 0
+    attempt: int = 1
+
+
+class ToolProgressPayload(BaseModel):
+    """
+    Payload for a structured progress update.
+
+    Unlike ``ToolOutputPayload``, this carries a machine-readable
+    percentage (``current``/``total``), an optional phase label
+    (``"downloading"``, ``"extracting"``, ...), and an optional
+    message. The frontend renders these as a progress bar rather than
+    appending to the text area, so the two event types are visually
+    independent.
+
+    The ``chunk`` field mirrors ``message`` for consistency with the
+    unified ``ToolOutputChunk`` wire shape; tools that only produce
+    progress call ``context.emit_progress(message=...)`` and the
+    consumer builds the chunk from that.
+    """
+    model_config = ConfigDict(extra="allow")
+    tool_call_id: str = ""
+    tool_name: str = ""
+    chunk: str = ""
+    sequence: int = 0
+    attempt: int = 1
+    current: Optional[int] = None
+    total: Optional[int] = None
+    phase: Optional[str] = None
 
 
 class ObservationPayload(BaseModel):
@@ -278,6 +368,8 @@ EVENT_PAYLOAD_MAP: Dict[EventType, type[BaseModel]] = {
     EventType.TOOL_CALL: ToolCallPayload,
     EventType.TOOL_CALLED: ToolCallPayload,
     EventType.TOOL_RETRY: ToolRetryPayload,
+    EventType.TOOL_OUTPUT: ToolOutputPayload,
+    EventType.TOOL_PROGRESS: ToolProgressPayload,
     EventType.OBSERVATION: ObservationPayload,
     EventType.STEP_END: StepEndPayload,
     EventType.FINAL: FinalPayload,
@@ -486,6 +578,8 @@ __all__ = [
     "AgentActivityPayload",
     "ToolCallPayload",
     "ToolRetryPayload",
+    "ToolOutputPayload",
+    "ToolProgressPayload",
     "ObservationPayload",
     "StepEndPayload",
     "FinalPayload",

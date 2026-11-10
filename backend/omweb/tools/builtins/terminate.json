@@ -1,0 +1,116 @@
+{
+  "id": "terminate",
+  "name": "Terminate Task",
+  "display_name": "Terminate Task",
+  "category": "system",
+  "subcategory": "task-lifecycle",
+  "tags": ["terminate", "end-task", "complete", "finish", "lifecycle"],
+  "capabilities": ["stateful", "lifecycle", "no_side_effects"],
+  "description": "Signals that the current task is complete (success) or has failed (failure). This is the ONLY way to end an agent task cleanly. Call this tool when the user's objective is fully met, or when the task cannot proceed.",
+  "safety_level": "safe",
+  "is_builtin": true,
+  "is_enabled": true,
+  "read_only": false,
+
+  "author": {
+    "name": "PELDRUN Team",
+    "url": "https://peldrun.ai",
+    "email": "support@peldrun.ai"
+  },
+  "publisher_id": "org.peldrun.official",
+  "trust": "verified",
+  "signature": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+
+  "license": "proprietary",
+  "license_url": "https://peldrun.ai/license",
+
+  "version": "1.0.0",
+  "release_date": "2025-01-15",
+  "stability": "stable",
+  "min_app_version": "2.4.0",
+  "changelog_url": "https://peldrun.ai/tools/terminate/changelog",
+
+  "short_description": "Signal task completion or failure to end the agent loop cleanly.",
+  "store_description": "Built-in task-lifecycle tool that signals the agent's current task has reached a terminal state. Call with status='success' when the user's objective is fully met; call with status='failure' when the task cannot proceed. This is the ONLY supported way to terminate an agent task. The agent loop will not end on plain text responses — a terminate call is required.",
+  "homepage": "https://peldrun.ai/tools/terminate",
+  "docs_url": "https://docs.peldrun.ai/tools/terminate",
+  "demo_url": null,
+  "screenshots": [],
+  "icon": "icons/terminate.svg",
+
+  "pricing": "free",
+  "supported_languages": ["en", "ar"],
+  "i18n": {
+    "ar": {
+      "display_name": "Terminate Task",
+      "short_description": "Signal task completion or failure to end the agent loop."
+    }
+  },
+
+  "settings": {
+    "enabled": true,
+    "schema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "defaults": {},
+    "required": []
+  },
+
+  "permissions": [],
+  "network_access": false,
+  "requires_api_key": false,
+  "required_env_vars": [],
+  "sandbox": false,
+  "filesystem_access": "none",
+  "rate_limit": {
+    "requests": 120,
+    "window_seconds": 60
+  },
+
+  "timeout_seconds": 5,
+  "concurrency": 1,
+  "runtime": "builtin",
+  "entry_point": "terminate.handler",
+  "dependencies": [],
+
+  "examples": [
+    {
+      "input": {
+        "status": "success",
+        "message": "Square plot created and saved as square.png."
+      },
+      "output_preview": "Task terminated with status: success"
+    },
+    {
+      "input": {
+        "status": "failure",
+        "message": "matplotlib not installed; cannot create the plot."
+      },
+      "output_preview": "Task terminated with status: failure"
+    }
+  ],
+  "usage_notes": "Call this tool exactly once at the very end of the task. For multi-step tasks, do NOT call terminate after individual tool results — only call it when the WHOLE task is complete. For purely conversational replies (greetings, simple questions), text-only responses are acceptable WITHOUT calling terminate.",
+
+  "deprecated": false,
+  "deprecation_message": null,
+  "replaces": [],
+  "replaced_by": null,
+
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "status": {
+        "type": "string",
+        "enum": ["success", "failure"],
+        "description": "The final status of the task. Use 'success' when the user's objective has been fully met. Use 'failure' when the task cannot be completed."
+      },
+      "message": {
+        "type": "string",
+        "description": "Summary or final message describing the result. Shown verbatim to the user as the task's closing message."
+      }
+    },
+    "required": ["status"]
+  }
+}

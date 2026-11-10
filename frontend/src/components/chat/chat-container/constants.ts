@@ -38,6 +38,21 @@ export const SSE_EVENT_TYPES = [
   "chunk",
   "tool_called",
   "tool_retry",
+
+  // Tool Output Streaming (opt-in, backend-flagged).
+  //
+  // Both events are emitted WHILE a tool is executing, between its
+  // TOOL_CALL and its OBSERVATION. They are non-terminal and carry
+  // `tool_call_id` so the reducer and the timeline can patch the
+  // correct tool card even when several tools run concurrently.
+  //
+  // The `runStreamManager` reads this list to register per-event
+  // listeners on the EventSource. Adding the two entries here is the
+  // ONLY change required for the manager to start forwarding them
+  // into `stream-store` and to `use-sse-stream` subscribers.
+  "tool_output",
+  "tool_progress",
+
   "observation",
 
   // Artifact lifecycle

@@ -164,11 +164,42 @@ class _ToolCallAgentBridge:
                     enabled=True, mode=ReasoningMode.ADAPTIVE,
                 )
 
+        # [FIX-TOOL-CHOICE-REQUIRED] Force the model to emit a real
+        # tool call instead of writing code/prose that just DESCRIBES
+        # a tool invocation.
+        #
+        # Background: the caller (ToolCallAgent.think) passes
+        # ``tool_choice="auto"`` unconditionally. On strong models
+        # (GPT-4o, Claude) that is fine — "auto" plus a clean system
+        # prompt almost always produces a proper function call. On
+        # weaker models (Gemma, GigaChat, small local models) "auto"
+        # frequently results in the model printing a shell command or
+        # a JSON tool payload as PLAIN TEXT. The user then sees code
+        # on screen while nothing executes.
+        #
+        # Engineering fix: when the caller supplies tools, ALWAYS use
+        # ``required`` (= ``any``). This is the OpenAI / Anthropic /
+        # Gemini native mechanism for "you MUST call one of these
+        # tools in this turn". The model cannot fall back to free
+        # text as long as at least one tool is present. When no tools
+        # exist (pure conversational turn), we still pass ``auto`` so
+        # the model is free to reply with text.
+        #
+        # We respect an explicit caller override (``tool_choice !=
+        # "auto"``) so callers that intentionally want free-form
+        # replies still get them. Only the default ``auto`` is
+        # upgraded.
+        has_tools = bool(tools)
+        if has_tools and (tool_choice is None or tool_choice == "auto"):
+            effective_tool_choice = "required"
+        else:
+            effective_tool_choice = tool_choice or "auto"
+
         return self._base_request.model_copy(
             update={
                 "messages": messages,
                 "tools": tools or [],
-                "tool_choice": ToolChoiceSpec(mode=tool_choice or "auto"),
+                "tool_choice": ToolChoiceSpec(mode=effective_tool_choice),
                 "generation": gen,
                 "reasoning": reasoning,
             }

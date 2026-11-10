@@ -9,6 +9,8 @@ export type ServerEventName =
   | "tool_call"
   | "tool_called"
   | "tool_retry"
+  | "tool_output"
+  | "tool_progress"
   | "observation"
   | "step_end"
   | "ask_human"
@@ -93,6 +95,20 @@ export interface ImageResultsPayload {
   estimated_cost_usd: number;
 }
 
+/**
+ * Structured progress snapshot published via `TOOL_PROGRESS` events.
+ *
+ * Rendered as a progress bar in the tool card, NOT appended to the
+ * text area. `message` mirrors the wire-level `chunk` field so callers
+ * can render a status line without inspecting `phase` / `current`.
+ */
+export interface ToolProgress {
+  current?: number;
+  total?: number;
+  phase?: string;
+  message?: string;
+}
+
 export interface ToolPair {
   kind: "tool";
   id: string;
@@ -109,6 +125,75 @@ export interface ToolPair {
   retryDelay?: number;
   requiresInput?: boolean;
   requestId?: string;
+
+  // -----------------------------------------------------------------
+  // Tool Output Streaming (opt-in, gated by
+  // PELDRUN_ENABLE_TOOL_OUTPUT_STREAMING on the backend).
+  //
+  // These fields are populated ONLY when the backend feature flag is
+  // enabled and the tool opted into the streaming contract. When the
+  // feature is off (the default), every field below remains
+  // `undefined` and the tool card renders exactly as before.
+  //
+  // The final tool result still arrives via the `output` field above
+  // (from the OBSERVATION event). `liveOutput` is a SEPARATE record of
+  // what the user watched stream in; per the streaming contract, it
+  // is NEVER cleared when the observation arrives.
+  // -----------------------------------------------------------------
+
+  /**
+   * Accumulated raw stdout + stderr chunks, in arrival order.
+   * Kept even after the observation arrives, as the historical
+   * record of what the user saw during execution.
+   */
+  liveOutput?: string;
+
+  /**
+   * Per-channel views of `liveOutput`. Useful for rendering stdout
+   * and stderr with different visual styling (e.g. red for stderr).
+   * `stdout` and `stderr` are independent accumulators; they do NOT
+   * necessarily sum to `liveOutput` when the two channels interleave.
+   *
+   * The `output` channel mirrors the third value of the backend's
+   * `Literal["stdout", "stderr", "output"]` in
+   * `ToolExecutionContext.emit_output`. It exists for tools whose
+   * output has no process-stream semantics (e.g. an HTTP fetch
+   * emitting a response body). Rendering can treat it like `stdout`
+   * — it is kept separate so callers who care about the distinction
+   * can honor it.
+   *
+   * The explicit three-key shape (rather than `Record<string, string>`)
+   * is deliberate: it gives the reducer exhaustive type safety on
+   * the stream discriminator and prevents typo-driven silent drops
+   * (e.g. `"stderror"`).
+   */
+  liveStreams?: {
+    stdout?: string;
+    stderr?: string;
+    output?: string;
+  };
+
+  /**
+   * Highest `sequence` processed for this tool call. Used by the
+   * reducer to reject duplicate or stale chunks after an SSE
+   * reconnect: any chunk whose `sequence` is <= this value is
+   * silently dropped.
+   */
+  outputSequence?: number;
+
+  /**
+   * Highest `attempt` processed for this tool call. When a tool
+   * retries, the new attempt's `sequence` counter restarts at 1; the
+   * reducer compares `attempt` first so that retry output does not
+   * blend with the failed attempt's visible text.
+   */
+  lastAttempt?: number;
+
+  /**
+   * Latest structured progress update (from `TOOL_PROGRESS` events).
+   * Undefined until the first progress chunk arrives.
+   */
+  progress?: ToolProgress;
 }
 
 export interface ThoughtItem {

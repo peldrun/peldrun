@@ -120,9 +120,20 @@ import asyncio
 import inspect
 import json
 import logging
+import threading
 import time
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Union,
+)
 
+from peldrun.tools.contract import ToolExecutionContext
 from peldrun.tools.execution_result import (
     ToolExecutionResult,
     derive_outcome,
@@ -458,6 +469,202 @@ def _enforce_terminate_invariant(
 
 
 # ---------------------------------------------------------------------------
+# Concrete ToolExecutionContext implementation
+# ---------------------------------------------------------------------------
+
+
+class ToolExecutionContextImpl:
+    """
+    Concrete implementation of :class:`ToolExecutionContext`.
+
+    Lifecycle
+    ---------
+    One instance is created by the agent loop for each
+    ``(tool_call_id, attempt)`` pair. The agent owns the backing
+    ``asyncio.Queue`` and drains it in a background task, translating
+    each item into a ``TOOL_OUTPUT`` or ``TOOL_PROGRESS`` SSE event.
+
+    The context is a write-only view for the tool; the agent is the
+    sole reader of the queue. This separation keeps the tool agnostic
+    about event dispatch and the agent agnostic about how the tool
+    produces its chunks.
+
+    Thread safety
+    -------------
+    Two method families:
+
+    * ``async emit_output`` / ``async emit_progress`` -- for async tools
+      running on the main event loop. They enqueue via
+      ``queue.put_nowait`` directly.
+
+    * ``emit_output_sync`` / ``emit_progress_sync`` -- for synchronous
+      tools offloaded to a worker thread via ``asyncio.to_thread``. They
+      enqueue via ``loop.call_soon_threadsafe`` so the queue is mutated
+      only from the main loop thread.
+
+    Both families share a lock-protected sequence counter, so the
+    ``sequence`` field is strictly monotonic even when a sync tool
+    interleaves async sub-calls (which can happen when a sync tool
+    internally spawns its own async runtime).
+
+    Best-effort semantics
+    ---------------------
+    Per the ``ToolExecutionContext`` contract, ``emit_output`` and
+    ``emit_progress`` MUST NOT raise. If the queue is full (bounded
+    queue with a slow consumer) or the loop has shut down, the chunk is
+    silently dropped. Losing a progress tick is always preferable to
+    failing a running tool.
+
+    The sync family additionally swallows ``RuntimeError`` from
+    ``call_soon_threadsafe`` -- that exception fires when the loop is
+    already closed (run cancelled, process shutting down), which is
+    again a "drop the chunk" situation, not a tool failure.
+    """
+
+    def __init__(
+        self,
+        tool_call_id: str,
+        tool_name: str,
+        attempt: int,
+        queue: "asyncio.Queue[Optional[Dict[str, Any]]]",
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+    ) -> None:
+        self.tool_call_id = tool_call_id
+        self.tool_name = tool_name
+        self.attempt = attempt
+        self._queue = queue
+        # Capture the loop eagerly so a later ``emit_output_sync`` call
+        # from a worker thread can still schedule onto it via
+        # ``call_soon_threadsafe``. When no loop is running (e.g. the
+        # context is constructed in a unit test with no event loop),
+        # ``_loop`` is None and the sync emits become silent no-ops.
+        if loop is not None:
+            self._loop: Optional[asyncio.AbstractEventLoop] = loop
+        else:
+            try:
+                self._loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self._loop = None
+        self._seq: int = 0
+        self._seq_lock = threading.Lock()
+
+    # -- Internal -----------------------------------------------------
+
+    def _next_seq(self) -> int:
+        with self._seq_lock:
+            self._seq += 1
+            return self._seq
+
+    def _build_chunk(self, chunk: str, stream: str) -> Dict[str, Any]:
+        return {
+            "tool_call_id": self.tool_call_id,
+            "tool_name": self.tool_name,
+            "stream": stream,
+            "chunk": chunk,
+            "sequence": self._next_seq(),
+            "attempt": self.attempt,
+        }
+
+    def _build_progress(
+        self,
+        *,
+        current: Optional[int],
+        total: Optional[int],
+        phase: Optional[str],
+        message: Optional[str],
+    ) -> Dict[str, Any]:
+        payload = self._build_chunk(message or "", "progress")
+        payload["current"] = current
+        payload["total"] = total
+        payload["phase"] = phase
+        return payload
+
+    # -- Async path (for async tools) --------------------------------
+
+    async def emit_output(
+        self,
+        chunk: str,
+        *,
+        stream: Literal["stdout", "stderr", "output"] = "stdout",
+    ) -> None:
+        try:
+            self._queue.put_nowait(self._build_chunk(chunk, stream))
+        except asyncio.QueueFull:
+            # Bounded queue -- drop rather than block the tool.
+            pass
+
+    async def emit_progress(
+        self,
+        *,
+        current: Optional[int] = None,
+        total: Optional[int] = None,
+        phase: Optional[str] = None,
+        message: Optional[str] = None,
+    ) -> None:
+        payload = self._build_progress(
+            current=current,
+            total=total,
+            phase=phase,
+            message=message,
+        )
+        try:
+            self._queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            pass
+
+    # -- Sync path (for sync tools running in a worker thread) -------
+
+    def emit_output_sync(
+        self,
+        chunk: str,
+        *,
+        stream: Literal["stdout", "stderr", "output"] = "stdout",
+    ) -> None:
+        """
+        Thread-safe emit for synchronous tools.
+
+        Sync tools run inside ``asyncio.to_thread``'s worker thread,
+        where ``await`` is not available. This method provides the same
+        semantics as ``emit_output`` but is a plain function that
+        schedules the enqueue on the main event loop.
+        """
+        if self._loop is None:
+            return
+        try:
+            self._loop.call_soon_threadsafe(
+                self._queue.put_nowait,
+                self._build_chunk(chunk, stream),
+            )
+        except RuntimeError:
+            # Loop already closed -- run was cancelled or is shutting
+            # down. Drop the chunk silently; the tool itself is
+            # unaffected.
+            pass
+
+    def emit_progress_sync(
+        self,
+        *,
+        current: Optional[int] = None,
+        total: Optional[int] = None,
+        phase: Optional[str] = None,
+        message: Optional[str] = None,
+    ) -> None:
+        """Thread-safe variant of :meth:`emit_progress`."""
+        if self._loop is None:
+            return
+        payload = self._build_progress(
+            current=current,
+            total=total,
+            phase=phase,
+            message=message,
+        )
+        try:
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, payload)
+        except RuntimeError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Manager
 # ---------------------------------------------------------------------------
 
@@ -501,6 +708,7 @@ class ExecutionManager:
         tool_call_id: Optional[str] = None,
         timeout_seconds: Optional[float] = None,
         run_id: Optional[str] = None,
+        context: Optional[ToolExecutionContext] = None,
     ) -> ToolExecutionResult:
         """
         Execute a single tool instance and return its canonical result.
@@ -527,6 +735,15 @@ class ExecutionManager:
             ``default_timeout_seconds``. ``None`` disables the timeout.
         run_id
             Optional. Only used for log enrichment.
+        context
+            Optional streaming context. When supplied AND the tool's
+            chosen entrypoint declares an explicit ``context``
+            parameter, the manager forwards the context to the tool
+            so it can publish intermediate output via
+            ``await context.emit_output(...)`` (or the sync variants
+            for sync tools). When ``None``, no context is created and
+            the tool runs exactly as before -- the feature is fully
+            opt-in.
 
         Returns
         -------
@@ -591,6 +808,7 @@ class ExecutionManager:
                 timeout_seconds=effective_timeout,
                 tool_name=resolved_name,
                 run_id=run_id,
+                context=context,
             )
         except asyncio.TimeoutError:
             elapsed_ms = int((time.monotonic() - started_at) * 1000)
@@ -680,6 +898,7 @@ class ExecutionManager:
         tool_call_id: Optional[str] = None,
         timeout_seconds: Optional[float] = None,
         run_id: Optional[str] = None,
+        context: Optional[ToolExecutionContext] = None,
     ) -> ToolExecutionResult:
         """
         Resolve a tool by name from the registry and execute it.
@@ -687,6 +906,9 @@ class ExecutionManager:
         Equivalent to ``execute(self._registry.get(name), ...)``. A
         resolution failure produces a ``ToolExecutionResult.failure()``
         with a clear "not found" message — never raises.
+
+        ``context`` is forwarded to ``execute`` unchanged; see that
+        method for the full opt-in streaming semantics.
         """
         if self._registry is None:
             return ToolExecutionResult.failure(
@@ -720,6 +942,7 @@ class ExecutionManager:
             tool_call_id=tool_call_id,
             timeout_seconds=timeout_seconds,
             run_id=run_id,
+            context=context,
         )
 
     async def execute_many(
@@ -949,6 +1172,30 @@ class ExecutionManager:
     # Internals — invocation with timeout + sync offload
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _callable_accepts_context(callable_obj: Any) -> bool:
+        """
+        Return True if ``callable_obj`` declares an explicit
+        ``context`` parameter in its signature.
+
+        A method whose only context-related hook is ``**kwargs`` is NOT
+        considered opt-in: forwarding ``context`` into ``**kwargs``
+        would leak it into the tool's domain arguments (the exact class
+        of bug this signature check is designed to avoid). This mirrors
+        ``BaseTool._arun_accepts_context`` and must remain consistent
+        with it -- both layers guard the same boundary.
+        """
+        try:
+            sig = inspect.signature(callable_obj)
+        except (TypeError, ValueError):
+            return False
+        if "context" not in sig.parameters:
+            return False
+        param = sig.parameters["context"]
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return False
+        return True
+
     async def _invoke(
         self,
         *,
@@ -958,6 +1205,7 @@ class ExecutionManager:
         timeout_seconds: Optional[float],
         tool_name: str,
         run_id: Optional[str],
+        context: Optional[ToolExecutionContext] = None,
     ) -> Any:
         """
         Invoke the tool, honoring ``callable_kind``.
@@ -968,6 +1216,14 @@ class ExecutionManager:
 
         When ``timeout_seconds`` is set, the entire invocation (sync
         or async) is wrapped in ``asyncio.wait_for``.
+
+        Context forwarding
+        ------------------
+        When ``context`` is not None AND ``callable_obj`` declares an
+        explicit ``context`` parameter, the context is injected into
+        the kwargs before invocation. Otherwise the call proceeds
+        untouched -- legacy tools see the exact same kwargs they always
+        received.
 
         Known limitation for sync tools with timeout
         --------------------------------------------
@@ -989,13 +1245,19 @@ class ExecutionManager:
             ``_arun``; this outer timeout is a safety net for
             third-party tools that do not.
         """
+        # Build the effective kwargs: base arguments plus context when
+        # the target callable explicitly opts in.
+        call_kwargs: Dict[str, Any] = dict(args)
+        if context is not None and self._callable_accepts_context(callable_obj):
+            call_kwargs["context"] = context
+
         if callable_kind == "async":
-            coro = callable_obj(**args)
+            coro = callable_obj(**call_kwargs)
         else:
             # Sync offload. ``to_thread`` schedules the callable on
             # the default executor; the event loop is free to serve
             # other coroutines while the worker runs.
-            coro = asyncio.to_thread(callable_obj, **args)
+            coro = asyncio.to_thread(callable_obj, **call_kwargs)
 
         if timeout_seconds is not None and timeout_seconds > 0:
             return await asyncio.wait_for(coro, timeout=timeout_seconds)
@@ -1035,6 +1297,7 @@ def is_terminating_tool(tool_name: str) -> bool:
 __all__ = [
     "ExecutionManager",
     "ToolCallSpec",
+    "ToolExecutionContextImpl",
     "ToolRef",
     "is_terminating_tool",
 ]

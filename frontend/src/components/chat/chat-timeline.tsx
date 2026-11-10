@@ -22,7 +22,7 @@ import {
   parseMcpToolName,
   fetchMcpServerIcon,
 } from "@/components/chat/tool-call-card";
-import type { ImageResultItem } from "@/lib/types";
+import type { ImageResultItem, ToolProgress } from "@/lib/types";
 
 export interface StepEvent {
   id: string;
@@ -45,6 +45,56 @@ export interface StepEvent {
   imageProvider?: string;
   /** Original query for the image search — only for image_results. */
   imageQuery?: string;
+
+  // -----------------------------------------------------------------
+  // Tool Output Streaming (opt-in)
+  //
+  // Populated only when the backend feature flag
+  // PELDRUN_ENABLE_TOOL_OUTPUT_STREAMING is enabled AND the tool
+  // opted into the streaming contract. When the flag is off (the
+  // default), all four fields below stay undefined and the tool
+  // card renders exactly as before.
+  //
+  // These fields live on `StepEvent` (not on `ToolPair`) because
+  // this timeline receives its events directly from `use-sse-stream`
+  // rather than from `stream-store`. `stream-store.ToolPair` carries
+  // the equivalent fields — see `lib/types.ts` — but the two
+  // representations are intentionally decoupled so that changes to
+  // one path cannot break the other.
+  // -----------------------------------------------------------------
+
+  /**
+   * Correlates this StepEvent with the backend's `tool_call_id`.
+   * Required so that TOOL_OUTPUT / TOOL_PROGRESS events — which
+   * arrive keyed by `tool_call_id` — can be routed to the correct
+   * step. Set once, when the `tool_call` event is appended.
+   */
+  toolCallId?: string;
+
+  /**
+   * Accumulated raw stdout + stderr text. Appended in arrival order
+   * as TOOL_OUTPUT chunks stream in. Kept after the observation
+   * arrives: it is the historical record of what the user watched
+   * during execution and is NOT cleared.
+   */
+  liveOutput?: string;
+
+  /**
+   * Per-channel views of `liveOutput`. Same three-key shape as
+   * `ToolPair.liveStreams` in `lib/types.ts`, mirroring the
+   * backend's `Literal["stdout", "stderr", "output"]`.
+   */
+  liveStreams?: {
+    stdout?: string;
+    stderr?: string;
+    output?: string;
+  };
+
+  /**
+   * Latest structured progress update (from TOOL_PROGRESS events).
+   * Rendered as a progress bar, NOT appended to the text area.
+   */
+  progress?: ToolProgress;
 }
 
 interface ChatTimelineProps {
@@ -110,8 +160,33 @@ function TimelineToolCall({ evt }: { evt: StepEvent }) {
   // Format the raw JSON string into a clean readable string
   const displayContent = formatToolArgs(evt.toolName, evt.content);
 
+  // -----------------------------------------------------------------
+  // Tool Output Streaming: display helpers.
+  //
+  // `hasLiveOutput` guards the pre-block so it is not rendered when
+  // streaming produced no chunks (the default state when the backend
+  // feature flag is off).
+  //
+  // `progressPercent` is computed only when both `current` and
+  // `total` are finite and `total > 0`. This avoids divide-by-zero
+  // and "NaN%" rendering when a tool emits a phase-only progress
+  // event (e.g. `{phase: "downloading"}` with no counters).
+  // -----------------------------------------------------------------
+  const hasLiveOutput = Boolean(evt.liveOutput && evt.liveOutput.length > 0);
+  const progress = evt.progress;
+  const progressPercent =
+    progress &&
+    typeof progress.current === "number" &&
+    typeof progress.total === "number" &&
+    progress.total > 0
+      ? Math.max(
+          0,
+          Math.min(100, Math.round((progress.current / progress.total) * 100)),
+        )
+      : null;
+
   return (
-    <div className="flex items-start gap-2 p-2.5 rounded-sm bg-custom border border-border text-foreground font-mono text-xs">
+    <div className="flex flex-wrap items-start gap-2 p-2.5 rounded-sm bg-custom border border-border text-foreground font-mono text-xs">
       <div className="mt-0.5 flex-shrink-0 text-foreground">
         {mcpInfo.isMcp ? (
           mcpIcon?.icon_svg ? (
@@ -152,10 +227,55 @@ function TimelineToolCall({ evt }: { evt: StepEvent }) {
           />
         )}
       </div>
-      <div className="truncate">
+      <div className="truncate flex-1 min-w-0">
         <span className="font-extrabold text-black mr-1">{label}: </span>
         <span className="text-muted-foreground">{displayContent}</span>
       </div>
+
+      {/* Progress bar — only rendered when a TOOL_PROGRESS event has
+          been received. Placed above the live output so the bar stays
+          visible while the text scrolls. */}
+      {progress &&
+        (progressPercent !== null ||
+          progress.phase ||
+          progress.message) && (
+          <div className="basis-full flex items-center gap-2 text-[10px] pt-1">
+            {progressPercent !== null && (
+              <div className="flex-1 h-1 rounded bg-border overflow-hidden">
+                <div
+                  className="h-full bg-primary transition-all"
+                  style={{ width: `${progressPercent}%` }}
+                />
+              </div>
+            )}
+            <span className="text-muted-foreground whitespace-nowrap">
+              {progress.phase ||
+                (progressPercent !== null ? `${progressPercent}%` : "")}
+              {progress.message ? ` — ${progress.message}` : ""}
+            </span>
+          </div>
+        )}
+
+      {/* Live output — raw chunks accumulated from TOOL_OUTPUT events.
+          `basis-full` forces it onto its own row in the flex-wrap
+          container. When stderr is present, it is rendered in red
+          below stdout; this loses the exact interleaving of the two
+          channels but preserves the color distinction, which is the
+          most actionable information for the user. */}
+      {hasLiveOutput && (
+        <pre className="basis-full p-1.5 rounded bg-muted/30 border border-border/40 text-[10px] text-foreground whitespace-pre-wrap max-h-40 overflow-y-auto break-words">
+          {evt.liveStreams?.stderr ? (
+            <>
+              {evt.liveStreams.stdout && (
+                <span>{evt.liveStreams.stdout}</span>
+              )}
+              <span className="text-red-500">{evt.liveStreams.stderr}</span>
+            </>
+          ) : (
+            evt.liveOutput
+          )}
+        </pre>
+      )}
     </div>
   );
 }
@@ -349,7 +469,31 @@ function areGroupedStepsEqual(
         ea.type !== eb.type ||
         ea.content !== eb.content ||
         ea.toolName !== eb.toolName ||
-        ea.step !== eb.step
+        ea.step !== eb.step ||
+        // -----------------------------------------------------------------
+        // Tool Output Streaming fields.
+        //
+        // These checks are mandatory for the memo to remain correct
+        // during streaming: the historical fields above never change
+        // while a tool runs, so without the live fields the memo
+        // would skip every re-render and the user would see nothing
+        // until the observation arrives — defeating the entire
+        // streaming feature.
+        //
+        // `liveStreams` is compared field-by-field rather than by
+        // reference: the reducer rebuilds the object on every chunk,
+        // so a reference check would always fail and force a full
+        // re-render on every event, negating the batching done by
+        // `useToolStreamBuffer`.
+        // -----------------------------------------------------------------
+        ea.liveOutput !== eb.liveOutput ||
+        ea.liveStreams?.stdout !== eb.liveStreams?.stdout ||
+        ea.liveStreams?.stderr !== eb.liveStreams?.stderr ||
+        ea.liveStreams?.output !== eb.liveStreams?.output ||
+        ea.progress?.current !== eb.progress?.current ||
+        ea.progress?.total !== eb.progress?.total ||
+        ea.progress?.phase !== eb.progress?.phase ||
+        ea.progress?.message !== eb.progress?.message
       ) {
         return false;
       }

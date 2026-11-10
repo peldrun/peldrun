@@ -239,6 +239,151 @@ export function reduceEvent(state: RunState, event: SSEEnvelope): RunState {
       };
     }
 
+    // ==========================================
+    // Tool Output Streaming — raw stdout/stderr
+    // ==========================================
+    //
+    // Emitted WHILE a tool is executing (between its TOOL_CALL and
+    // OBSERVATION). Each event carries a `sequence` (monotonic per
+    // attempt, starting at 1) and an `attempt` (1-based retry index).
+    //
+    // Processing order matters:
+    //
+    //   1. Drop stale attempts first. After a retry, chunks from the
+    //      previous attempt must not interleave with the new one's,
+    //      even if the transport delivers them out of order.
+    //   2. If `attempt` is NEW, clear the previous attempt's visible
+    //      text (`liveOutput` / `liveStreams`) and start fresh. This
+    //      is what guarantees a failed attempt's output does not
+    //      bleed into the successful one.
+    //   3. If `attempt` is the same (or first event), drop duplicates
+    //      using `sequence`. This is the at-least-once delivery fix:
+    //      after an SSE reconnect that replays a few chunks, the
+    //      reducer silently skips the repeats.
+    //   4. Append and update the sequence / attempt high-water marks.
+    //
+    // The live stream is deliberately kept INDEPENDENT of the final
+    // `output` field (populated by OBSERVATION). Observation does
+    // NOT clear `liveOutput`: the user watched that text stream in
+    // and it stays visible as the historical record of the run.
+    case "tool_output": {
+      const toolCallId = event.data.tool_call_id || event.data.toolCallId;
+      if (!toolCallId) return base;
+
+      // Narrow the wire-level `stream` string to the exact union that
+      // both the backend's `Literal` and `ToolPair.liveStreams` agree
+      // on. Any unexpected value falls back to "stdout" so a rogue
+      // emitter cannot introduce a fourth key into `liveStreams`
+      // (which TypeScript would reject at the indexing site below).
+      const rawStream = String(event.data.stream || "stdout");
+      const stream: "stdout" | "stderr" | "output" =
+        rawStream === "stderr"
+          ? "stderr"
+          : rawStream === "output"
+          ? "output"
+          : "stdout";
+
+      const chunk = String(event.data.chunk || "");
+      const sequence = typeof event.data.sequence === "number" ? event.data.sequence : 0;
+      const attempt = typeof event.data.attempt === "number" ? event.data.attempt : 1;
+
+      if (!chunk) return base;
+
+      return {
+        ...base,
+        steps: patchTool(state.steps, stepNum, toolCallId, stepId, (t) => {
+          // (1) Stale attempt — drop.
+          if (typeof t.lastAttempt === "number" && attempt < t.lastAttempt) {
+            return t;
+          }
+          // (2) New attempt — reset the visible buffer.
+          if (typeof t.lastAttempt === "number" && attempt > t.lastAttempt) {
+            return {
+              ...t,
+              liveOutput: chunk,
+              liveStreams: { [stream]: chunk },
+              outputSequence: sequence,
+              lastAttempt: attempt,
+            };
+          }
+          // (3) Same attempt — dedupe by sequence.
+          if (
+            typeof t.outputSequence === "number" &&
+            sequence <= t.outputSequence
+          ) {
+            return t;
+          }
+          // (4) Append.
+          const prevStreams = t.liveStreams || {};
+          return {
+            ...t,
+            liveOutput: (t.liveOutput || "") + chunk,
+            liveStreams: {
+              ...prevStreams,
+              [stream]: (prevStreams[stream] || "") + chunk,
+            },
+            outputSequence: sequence,
+            lastAttempt: attempt,
+          };
+        }),
+      };
+    }
+
+    // ==========================================
+    // Tool Output Streaming — structured progress
+    // ==========================================
+    //
+    // Same sequence/attempt contract as `tool_output`, but the payload
+    // carries `current` / `total` / `phase` instead of a raw chunk.
+    // Rendered as a progress bar, NOT appended to the text area.
+    //
+    // `outputSequence` is SHARED with `tool_output` because both
+    // events are emitted by the same context object and share a
+    // single monotonic counter. Splitting the dedup state into two
+    // fields would create an inconsistent window: a progress chunk
+    // with sequence=5 would be accepted, then a stdout chunk with
+    // sequence=4 would be appended out of order. Sharing the counter
+    // prevents that.
+    case "tool_progress": {
+      const toolCallId = event.data.tool_call_id || event.data.toolCallId;
+      if (!toolCallId) return base;
+
+      const sequence = typeof event.data.sequence === "number" ? event.data.sequence : 0;
+      const attempt = typeof event.data.attempt === "number" ? event.data.attempt : 1;
+      const current = typeof event.data.current === "number" ? event.data.current : undefined;
+      const total = typeof event.data.total === "number" ? event.data.total : undefined;
+      const phase = typeof event.data.phase === "string" ? event.data.phase : undefined;
+      const message =
+        typeof event.data.chunk === "string"
+          ? event.data.chunk
+          : typeof event.data.message === "string"
+          ? event.data.message
+          : undefined;
+
+      return {
+        ...base,
+        steps: patchTool(state.steps, stepNum, toolCallId, stepId, (t) => {
+          // Stale attempt — drop.
+          if (typeof t.lastAttempt === "number" && attempt < t.lastAttempt) {
+            return t;
+          }
+          // Sequence dedupe (shared with tool_output).
+          if (
+            typeof t.outputSequence === "number" &&
+            sequence <= t.outputSequence
+          ) {
+            return t;
+          }
+          return {
+            ...t,
+            progress: { current, total, phase, message },
+            outputSequence: sequence,
+            lastAttempt: attempt,
+          };
+        }),
+      };
+    }
+
     case "observation": {
       const toolCallId = event.data.tool_call_id || event.data.toolCallId;
       const isError = Boolean(event.data.is_error || event.data.isError);
