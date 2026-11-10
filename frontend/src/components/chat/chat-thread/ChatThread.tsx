@@ -1,3 +1,5 @@
+//frontend\src\components\chat\chat-thread\ChatThread.tsx
+
 "use client";
 
 /**
@@ -10,13 +12,14 @@
  *    final deliverable when the current run completes.
  *  - Detects a pending human-in-the-loop tool call and mounts the
  *    interactive `HumanInputCard` accordingly.
- *  - Exposes lifecycle actions (Regenerate, Pause, Resume).
+ *  - Exposes lifecycle actions (Regenerate).
  *
  * All state is passed in from the parent; this component is a pure
  * presentational shell that delegates to focused sub-components.
  */
 
 import React, { useEffect, useRef } from "react";
+import { Bot } from "lucide-react";
 import { ChatTimeline, StepEvent } from "../chat-timeline";
 import { ChatDeliverable } from "../chat-deliverable";
 import { DelegationApprovalCard } from "../DelegationApprovalCard";
@@ -90,16 +93,10 @@ export function ChatThread({
   onApproveDelegation,
   onRejectDelegation,
   onCancelSubtask,
-  // Pause/Resume were removed in Phase H — no LLM provider supports
-  // true streaming pause. These props are no longer destructured
-  // (unused → compile error under `noUnusedParameters`).
   onRegenerate,
   onOpenReview,
 }: ChatThreadProps) {
   const activePromptAnchorRef = useRef<HTMLDivElement | null>(null);
-
-
-
 
   // Auto-scroll to the active prompt anchor when a new prompt is submitted.
   useEffect(() => {
@@ -140,11 +137,11 @@ export function ChatThread({
 
   const activeOperation = extractOperationFromSteps(activeStepsList);
 
-  //: The final result is surfaced separately as `<ChatDeliverable>`.
-  //: Some backends also emit the same content as an observation
-  //: event in the last step, which causes the final message to
-  //: render twice: once inside the timeline, once inside the
-  //: deliverable. Filter that observation out of the timeline.
+  // The final result is surfaced separately as `<ChatDeliverable>`.
+  // Some backends also emit the same content as an observation
+  // event in the last step, which causes the final message to
+  // render twice: once inside the timeline, once inside the
+  // deliverable. Filter that observation out of the timeline.
   const finalResultTrimmed =
     typeof finalResult === "string" ? finalResult.trim() : "";
 
@@ -211,8 +208,27 @@ export function ChatThread({
           </div>
         )}
 
-        {/* Active Stepper (Agent Mode) — rendered FIRST so the user
-            sees the search work that produced the images. */}
+        {/* Active Turn Identity Header (Model Name & Metadata) */}
+        {submittedPrompt && (
+          <div className="flex items-center justify-between text-xs text-muted-foreground pt-1 pb-2">
+            <div className="flex items-center gap-1.5 font-medium text-foreground">
+              <Bot size={15} className="text-primary shrink-0" />
+              <span className="font-semibold text-xs font-mono">{activeModelName}</span>
+              {execMode === "agent" && (
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary border border-primary/20 font-mono">
+                  Agent
+                </span>
+              )}
+              {sessionTimestamp && (
+                <span className="text-[10px] text-muted-foreground font-normal">
+                  ({sessionTimestamp})
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Active Stepper (Agent Mode) — rendered below the header */}
         {execMode === "agent" &&
           Object.keys(filteredGroupedSteps).length > 0 && (
             <ChatTimeline
@@ -277,17 +293,6 @@ export function ChatThread({
           />
         )}
 
-        {/* Live Running Indicator.
-            Pause was removed in Phase H — no LLM provider supports
-            true streaming pause, so the button was misleading. Stop
-            (available in ChatSubHeader) is the only lifecycle control. */}
-        {status === "running" && !isHumanWaiting && activeApprovalList.length === 0 && (
-          <LiveStatusIndicator
-            message={getLiveStatusMessage()}
-            elapsedSeconds={elapsedSeconds}
-          />
-        )}
-
         {/* Deliverable for Completed / Current Turn */}
         {finalResult && (
           <ChatDeliverable
@@ -309,11 +314,23 @@ export function ChatThread({
             costUsd={costUsd}
             latencyMs={latencyMs}
             tokensPerSecond={tokensPerSecond}
+            hideHeader={true}
             onRegenerate={
               status !== "running" && onRegenerate
                 ? () => onRegenerate(-1)
                 : undefined
             }
+          />
+        )}
+
+        {/* Live Running Indicator — pinned to the bottom of the active thread.
+            Pause was removed in Phase H — no LLM provider supports
+            true streaming pause, so the button was misleading. Stop
+            (available in ChatSubHeader) is the only lifecycle control. */}
+        {status === "running" && !isHumanWaiting && activeApprovalList.length === 0 && (
+          <LiveStatusIndicator
+            message={getLiveStatusMessage()}
+            elapsedSeconds={elapsedSeconds}
           />
         )}
 

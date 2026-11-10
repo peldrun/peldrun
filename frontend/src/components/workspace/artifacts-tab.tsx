@@ -1,17 +1,17 @@
 ﻿"use client";
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import { 
-  Package, 
-  RefreshCw, 
-  Download, 
-  ExternalLink, 
-  ZoomIn, 
-  ZoomOut, 
-  Maximize2, 
-  X, 
-  FileText, 
-  Image as ImageIcon, 
+import {
+  Package,
+  RefreshCw,
+  Download,
+  ExternalLink,
+  ZoomIn,
+  ZoomOut,
+  Maximize2,
+  X,
+  FileText,
+  Image as ImageIcon,
   Video as VideoIcon,
   RotateCcw,
   Eye
@@ -69,7 +69,7 @@ export function ArtifactsTab({ jobId, activeJobId, chatId, selectedFile }: Artif
     try {
       let jobFilesList: ArtifactFile[] = [];
       let res = await fetch(`/api/chats/${encodeURIComponent(effectiveTarget)}/files?t=${Date.now()}`, { cache: "no-store" });
-      
+
       if (!res.ok) {
         res = await fetch(`/api/run/jobs/${encodeURIComponent(effectiveTarget)}/files?t=${Date.now()}`, { cache: "no-store" });
       }
@@ -145,12 +145,12 @@ export function ArtifactsTab({ jobId, activeJobId, chatId, selectedFile }: Artif
   };
 
   return (
-    <div className="flex flex-col h-full w-full bg-custom font-sans overflow-hidden">
+    <div className="flex flex-col h-full w-full bg-darkest font-sans overflow-hidden">
       {/* Header Bar */}
-      <div className="h-10 border-b border-border bg-card/60 backdrop-blur-sm px-4 flex items-center justify-between shrink-0 text-xs">
+      <div className="h-10 border-b border-darkest bg-dark backdrop-blur-sm px-4 flex items-center justify-between shrink-0 text-xs">
         <div className="flex items-center gap-2 min-w-0">
           <Package className="w-4 h-4 text-peldrun-accent shrink-0" />
-          <span className="font-semibold text-foreground">Media Artifacts</span>
+          <span className="font-semibold text-[#ccc]">Media Artifacts</span>
           <span className="px-1.5 py-0.2 rounded text-[10px] bg-muted text-muted-foreground font-mono">
             {files.length}
           </span>
@@ -158,28 +158,28 @@ export function ArtifactsTab({ jobId, activeJobId, chatId, selectedFile }: Artif
 
         <div className="flex items-center gap-2">
           {/* Filter Pills */}
-          <div className="flex items-center gap-1 bg-muted/40 p-0.5 rounded-md border border-border/40 text-[11px]">
+          <div className="flex items-center gap-1 bg-darkest p-0.5 rounded-md border border-darkest text-[11px]">
             <button
               onClick={() => setFilter("all")}
-              className={`px-2 py-0.5 rounded transition ${filter === "all" ? "bg-card text-foreground shadow-xs font-medium" : "text-muted-foreground hover:text-foreground"}`}
+              className={`px-2 py-0.5 rounded transition ${filter === "all" ? "bg-dark text-[#fff] shadow-xs font-medium" : "text-muted-foreground hover:text-[#fff]"}`}
             >
               All
             </button>
             <button
               onClick={() => setFilter("images")}
-              className={`px-2 py-0.5 rounded transition ${filter === "images" ? "bg-card text-foreground shadow-xs font-medium" : "text-muted-foreground hover:text-foreground"}`}
+              className={`px-2 py-0.5 rounded transition ${filter === "images" ? "bg-dark text-[#fff] shadow-xs font-medium" : "text-muted-foreground hover:text-[#fff]"}`}
             >
               Images
             </button>
             <button
               onClick={() => setFilter("videos")}
-              className={`px-2 py-0.5 rounded transition ${filter === "videos" ? "bg-card text-foreground shadow-xs font-medium" : "text-muted-foreground hover:text-foreground"}`}
+              className={`px-2 py-0.5 rounded transition ${filter === "videos" ? "bg-dark text-[#fff] shadow-xs font-medium" : "text-muted-foreground hover:text-[#fff]"}`}
             >
               Videos
             </button>
             <button
               onClick={() => setFilter("docs")}
-              className={`px-2 py-0.5 rounded transition ${filter === "docs" ? "bg-card text-foreground shadow-xs font-medium" : "text-muted-foreground hover:text-foreground"}`}
+              className={`px-2 py-0.5 rounded transition ${filter === "docs" ? "bg-dark text-[#fff] shadow-xs font-medium" : "text-muted-foreground hover:text-[#fff]"}`}
             >
               PDFs
             </button>
@@ -200,10 +200,10 @@ export function ArtifactsTab({ jobId, activeJobId, chatId, selectedFile }: Artif
       <div className="flex-1 overflow-y-auto p-4 md:p-6">
         {filteredFiles.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-center p-8 text-muted-foreground">
-            <div className="w-12 h-12 rounded-2xl bg-card border border-border flex items-center justify-center text-peldrun-accent mb-3 shadow-peldrun-sm">
-              <Package size={24} />
+            <div className="w-12 h-12 rounded-2xl bg-[#00000052] flex items-center justify-center text-peldrun-accent mb-3 shadow-peldrun-sm">
+              <Package size={60} />
             </div>
-            <div className="font-semibold text-sm text-foreground mb-1">No Media Deliverables in this Session</div>
+            <div className="font-semibold text-sm text-[#fff] mb-1">No Media Deliverables in this Session</div>
             <p className="max-w-xs text-xs text-muted-foreground leading-relaxed">
               Generated images (.png, .jpg), videos (.mp4), and PDF reports will populate here. Source code and scripts are available in the Files tab.
             </p>
@@ -251,7 +251,7 @@ export function ArtifactsTab({ jobId, activeJobId, chatId, selectedFile }: Artif
                     )}
 
                     {isImg && (
-                      <div 
+                      <div
                         onClick={() => {
                           setSelectedImage(file);
                           setZoomLevel(1);
@@ -369,13 +369,13 @@ export function ArtifactsTab({ jobId, activeJobId, chatId, selectedFile }: Artif
             </div>
           </div>
 
-          <div 
+          <div
             className="flex-1 overflow-auto flex items-center justify-center p-6 cursor-zoom-out"
             onClick={(e) => {
               if (e.target === e.currentTarget) setSelectedImage(null);
             }}
           >
-            <div 
+            <div
               style={{ transform: `scale(${zoomLevel})`, transition: "transform 0.15s ease-out" }}
               className="max-w-4xl max-h-[85vh] select-none shadow-2xl rounded-lg overflow-hidden bg-white/5 border border-white/10"
               onClick={(e) => e.stopPropagation()}

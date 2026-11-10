@@ -61,6 +61,12 @@
     --setbg:  0  0% 94.12%;
 
 
+    --darkest: 0 0% 9.8%;
+    --dark: 0 0% 15.69%;
+    --light: 0 0% 42.35%;
+    --lightest: 0 0% 57.65%;
+
+
     --font-sans: 'DM Sans', sans-serif;
     --font-serif: 'Libre Baskerville', serif;
     --font-arabic: 'Cairo', sans-serif;

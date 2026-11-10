@@ -1,4 +1,6 @@
-﻿"use client";
+﻿//frontend\src\components\chat\chat-deliverable.tsx
+
+"use client";
 
 import React from "react";
 import { FileText, ExternalLink, Activity, Check, Copy, Bot, AlertCircle, RotateCcw, PlayCircle } from "lucide-react";
@@ -27,6 +29,7 @@ interface ChatDeliverableProps {
   latencyMs?: number | null;
   tokensPerSecond?: number | null;
   onRegenerate?: (turnIndex?: number) => void;
+  hideHeader?: boolean;
 }
 
 export function ChatDeliverable({
@@ -50,21 +53,22 @@ export function ChatDeliverable({
   latencyMs,
   tokensPerSecond,
   onRegenerate,
+  hideHeader = false,
 }: ChatDeliverableProps) {
   const copyId = typeof turnIndex === "number" ? `turn-res-${turnIndex}` : "final-result";
 
-  //: Hide dot-prefixed paths (`.git/…`, `.peldrun/…`, `.env`,
-  //: `.gitignore`, …) from the user-facing deliverables list.
-  //: These paths are implementation details of the workspace — they
-  //: are not what the agent "produced" for the user, and they pollute
-  //: the deliverable card with dozens of internal Git files (hooks,
-  //: objects, refs, …) that bury the actual deliverables.
-  //:
-  //: The workspace panel (Files tab) still shows them in full, so the
-  //: user can inspect the Git internals when needed.
-  //:
-  //: The check splits on both POSIX and Windows separators so that
-  //: paths from either side of the stack are treated uniformly.
+  // Hide dot-prefixed paths (`.git/…`, `.peldrun/…`, `.env`,
+  // `.gitignore`, …) from the user-facing deliverables list.
+  // These paths are implementation details of the workspace — they
+  // are not what the agent "produced" for the user, and they pollute
+  // the deliverable card with dozens of internal Git files (hooks,
+  // objects, refs, …) that bury the actual deliverables.
+  //
+  // The workspace panel (Files tab) still shows them in full, so the
+  // user can inspect the Git internals when needed.
+  //
+  // The check splits on both POSIX and Windows separators so that
+  // paths from either side of the stack are treated uniformly.
   const visibleProducedFiles = (producedFiles || []).filter((f) => {
     const raw = f.path || f.name || "";
     if (!raw) return false;
@@ -89,19 +93,21 @@ export function ChatDeliverable({
 
   return (
     <div className="space-y-3 font-sans">
-      {/* 1. Assistant Identity Header */}
-      <div className="flex items-center justify-between text-xs text-muted-foreground pt-1">
-        <div className="flex items-center gap-1.5 font-medium text-foreground">
-          <Bot size={15} className="text-primary shrink-0" />
-          <span className="font-semibold text-xs font-mono">{modelName}</span>
-          {execMode === "agent" && (
-            <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary border border-primary/20 font-mono">
-              Agent
-            </span>
-          )}
-          {timestamp && <span className="text-[10px] text-muted-foreground font-normal">({timestamp})</span>}
+      {/* 1. Assistant Identity Header (conditionally hidden based on prop) */}
+      {!hideHeader && (
+        <div className="flex items-center justify-between text-xs text-muted-foreground pt-1">
+          <div className="flex items-center gap-1.5 font-medium text-foreground">
+            <Bot size={15} className="text-primary shrink-0" />
+            <span className="font-semibold text-xs font-mono">{modelName}</span>
+            {execMode === "agent" && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary border border-primary/20 font-mono">
+                Agent
+              </span>
+            )}
+            {timestamp && <span className="text-[10px] text-muted-foreground font-normal">({timestamp})</span>}
+          </div>
         </div>
-      </div>
+      )}
 
       {/* 2. Primary Response.
           On failure/stop, this block is intentionally hidden: the

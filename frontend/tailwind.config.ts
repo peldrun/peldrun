@@ -96,6 +96,11 @@ const config: Config = {
         storbg:"hsl(var(--storbg))",
         setbg: "hsl(var(--setbg))",
 
+        darkest: "hsl(var(--darkest))",
+        dark: "hsl(var(--dark))",
+        light: "hsl(var(--light))",
+        lightest: "hsl(var(--lightest))",
+
 
 
 

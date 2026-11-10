@@ -1,8 +1,9 @@
 ﻿"use client";
 
 import React, { useState, useEffect, useCallback, useMemo } from "react";
-import { Monitor, RefreshCw, ExternalLink, Code2, Sparkles, FileText, Image as ImageIcon, AlignLeft } from "lucide-react";
+import { Code, RefreshCw, ExternalLink, Code2, Sparkles, FileText, Image as ImageIcon, AlignLeft } from "lucide-react";
 import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
+import { Icon } from '@/components/Icon/Icon';
 
 export interface PreviewTabProps {
   jobId?: string | null;
@@ -184,17 +185,17 @@ useEffect(() => {
     return `${baseTag}${processed}`;
   }, [rawContent, isHtml, effectiveFile, effectiveJobId, refreshKey]);
 
-  if (!effectiveFile || !isPreviewable || (!rawContent && !loading)) {
+  if (!effectiveFile || !isPreviewable || !rawContent) {
     return (
-      <div className="flex flex-col items-center justify-center h-full w-full bg-custom text-muted-foreground p-8 select-none font-sans">
+      <div className="flex flex-col items-center justify-center h-full w-full bg-darkest text[#fff] p-8 select-none font-sans">
         <div className="flex flex-col items-center max-w-sm text-center space-y-4">
-          <div className="p-4 rounded-2xl bg-card border border-border shadow-peldrun-md relative">
+          <div className="p-4 rounded-2xl bg-[#000] relative bg-opacity-5">
             <Code2 className="w-10 h-10 text-peldrun-accent" />
             <Sparkles className="w-4 h-4 text-peldrun-accent absolute top-2 right-2 animate-pulse" />
           </div>
           <div>
-            <h3 className="text-sm font-semibold font-heading text-foreground">Sandbox Standby</h3>
-            <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
+            <h3 className="text-sm font-semibold font-heading text-[#fff]">Sandbox Standby</h3>
+            <p className="text-xs text-[#eee] mt-1 leading-relaxed">
               Live web applications (.html, .svg), Markdown documents (.md), and plain text files (.txt) will render here in real time.
             </p>
           </div>
@@ -214,17 +215,20 @@ useEffect(() => {
     : `/api/files/raw/${encodeURI(effectiveFile)}`;
 
   const renderBadge = () => {
-    if (isHtml) return <span className="px-1.5 py-0.5 rounded text-[10px] bg-peldrun-success/15 text-peldrun-success border border-peldrun-success/30 font-mono">HTML App</span>;
-    if (isMarkdown) return <span className="px-1.5 py-0.5 rounded text-[10px] bg-primary/15 text-primary border border-primary/30 font-mono">Markdown</span>;
+    if (isHtml) return <span className="iconname-html">
+    <Icon name="html" size={15} /> </span>;
+    if (isMarkdown) return <span className="iconname-markdown">
+      <Icon name="markdown" size={15} /> </span>;
     if (isTxt) return <span className="px-1.5 py-0.5 rounded text-[10px] bg-peldrun-warning/15 text-peldrun-warning border border-peldrun-warning/30 font-mono">Plain Text</span>;
-    if (isSvg) return <span className="px-1.5 py-0.5 rounded text-[10px] bg-peldrun-info/15 text-peldrun-info border border-peldrun-info/30 font-mono">Vector SVG</span>;
+    if (isSvg) return <span className="iconname-svg">
+    <Icon name="svg" size={15} /> </span>;
     return <span className="px-1.5 py-0.5 rounded text-[10px] bg-muted text-muted-foreground font-mono">Preview</span>;
   };
 
   return (
     <div className="flex flex-col h-full w-full bg-custom overflow-hidden font-sans">
-      <div className="h-10 border-b border-border bg-card/60 backdrop-blur-sm px-4 flex items-center justify-between shrink-0 text-xs">
-        <div className="flex items-center gap-2 text-foreground min-w-0">
+      <div className="h-10 border-b border-darkest bg-dark backdrop-blur-sm px-4 flex items-center justify-between shrink-0 text-xs">
+        <div className="flex items-center gap-2 text-[#eee] min-w-0">
           {isMarkdown ? (
             <FileText className="w-4 h-4 text-primary shrink-0" />
           ) : isTxt ? (
@@ -232,10 +236,11 @@ useEffect(() => {
           ) : isSvg ? (
             <ImageIcon className="w-4 h-4 text-peldrun-info shrink-0" />
           ) : (
-            <Monitor className="w-4 h-4 text-peldrun-accent shrink-0" />
+            <Code className="w-4 h-4 text-[#ccc] shrink-0" />
           )}
-          <span className="font-mono text-xs font-medium truncate max-w-[200px]">{effectiveFile}</span>
           {renderBadge()}
+          <span className="font-mono text-xs font-medium truncate max-w-[200px]">{effectiveFile}</span>
+
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
@@ -262,6 +267,13 @@ useEffect(() => {
       </div>
 
       <div className="flex-1 w-full h-full relative overflow-hidden bg-background">
+        {loading && rawContent && (
+          <div className="absolute top-3 right-3 z-20 flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-card/90 backdrop-blur-sm border border-border shadow-peldrun-sm text-[11px] text-muted-foreground pointer-events-none select-none">
+            <RefreshCw className="w-3 h-3 animate-spin text-peldrun-accent" />
+            <span>Refreshing...</span>
+          </div>
+        )}
+
         {isMarkdown && (
           <div className="w-full h-full overflow-y-auto p-6 md:p-8 bg-card/40">
             <div className="max-w-3xl mx-auto rounded-sm border border-border/80 bg-card p-6 shadow-peldrun-sm">
@@ -282,9 +294,10 @@ useEffect(() => {
 
         {isSvg && (
           <div className="w-full h-full flex items-center justify-center p-8 bg-slate-950/40 overflow-auto">
-            <div
-              className="max-w-full max-h-full flex items-center justify-center p-4 rounded-sm border border-border/60 bg-card shadow-peldrun-md"
-              dangerouslySetInnerHTML={{ __html: rawContent }}
+            <img
+              src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(rawContent)}`}
+              alt={effectiveFile || "SVG Preview"}
+              className="max-w-full max-h-full object-contain rounded-sm border border-border/60 bg-card shadow-peldrun-md"
             />
           </div>
         )}

@@ -195,7 +195,7 @@ export function FilesTab({ onSelectFile, onOpenFile, activeJobId }: FilesTabProp
 
           return (
             <li key={item.path} className="text-xs">
-              <div className="flex items-center justify-between p-1 rounded hover:bg-muted/50 group transition">
+              <div className="flex items-center justify-between p-1 rounded hover:bg-[#000] group transition">
                 <div
                   className="flex items-center gap-1.5 truncate cursor-pointer flex-1"
                   onClick={() => {
@@ -223,10 +223,10 @@ export function FilesTab({ onSelectFile, onOpenFile, activeJobId }: FilesTabProp
                   ) : (
                     <>
                       <span className="w-3" />
-                      <FileText size={14} className="text-primary shrink-0" />
-                      <span className="truncate text-foreground/90">{item.name}</span>
+                      <FileText size={14} className="text-gray-400 shrink-0" />
+                      <span className="truncate text-[#fff]">{item.name}</span>
                       {item.size !== undefined && (
-                        <span className="text-[10px] text-muted-foreground ml-1">
+                        <span className="text-[10px] text-[#ccc] ml-1">
                           ({(item.size / 1024).toFixed(1)} KB)
                         </span>
                       )}
@@ -239,14 +239,14 @@ export function FilesTab({ onSelectFile, onOpenFile, activeJobId }: FilesTabProp
                     <a
                       href={`/api/files/download?path=${encodeURIComponent(item.path)}`}
                       download
-                      className="p-1 text-muted-foreground hover:text-foreground"
+                      className="p-1 text-[#eee] hover:text-[#eee]"
                       title="Download"
                     >
                       <Download size={12} />
                     </a>
                     <button
                       onClick={() => handleDelete(item.path)}
-                      className="p-1 text-muted-foreground hover:text-destructive"
+                      className="p-1 text-[#eee] hover:text-[#eee]"
                       title="Delete"
                     >
                       <Trash2 size={12} />
@@ -268,17 +268,17 @@ export function FilesTab({ onSelectFile, onOpenFile, activeJobId }: FilesTabProp
   };
 
   return (
-    <div className="flex flex-col h-full bg-background text-foreground font-sans text-xs">
-      <div className="flex items-center justify-between p-3 border-b border-border bg-card/40 backdrop-blur-sm">
+    <div className="flex flex-col h-full bg-darkest text-[#fff] font-sans text-xs">
+      <div className="flex items-center justify-between p-3 border-b border-[#000] bg-dark backdrop-blur-sm">
         <div className="flex items-center gap-2">
-          <span className="font-semibold text-xs tracking-wider text-muted-foreground font-mono">
+          <span className="font-semibold text-xs tracking-wider text-[#eee]font-mono">
             WORKSPACE FILES
           </span>
           <button
             onClick={() => setFilterCurrentOnly(!filterCurrentOnly)}
             className={`px-1.5 py-0.5 rounded text-[10px] flex items-center gap-1 transition cursor-pointer font-sans ${
               filterCurrentOnly
-                ? "bg-primary/20 text-primary border border-primary/40 font-medium"
+                ? "bg-black text-rby border border-rb font-medium"
                 : "bg-muted text-muted-foreground hover:text-foreground"
             }`}
             title="Toggle between current task deliverables and global workspace"
