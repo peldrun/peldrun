@@ -8,6 +8,7 @@ import { useAppStorage } from "@/hooks/use-app-storage";
 import { useProviderBadge } from "@/lib/providerBadge";
 import { ProviderModelBadge } from "./chat-thread/ProviderModelBadge";
 import { resolveFileCategory } from "./chat-thread/utils";
+import { ChatReasoningPanel } from "./chat-thread/ChatReasoningPanel";
 import { UsageBadgeGroup } from "@/components/chat/UsageBadges";
 import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
 
@@ -49,6 +50,21 @@ interface ChatDeliverableProps {
   tokensPerSecond?: number | null;
   onRegenerate?: (turnIndex?: number) => void;
   hideHeader?: boolean;
+  /**
+   * Optional reasoning text rendered BETWEEN the identity header and
+   * the primary response.
+   *
+   * Used by HistoricalTurn to place the Reasoning panel in the same
+   * visual position as the live turn:
+   *
+   *   ChatThread (live):   Badge → Reasoning → Deliverable
+   *   HistoricalTurn:      Deliverable { Header → Reasoning → Content }
+   *
+   * When undefined, nothing is rendered. Live turns pass this prop
+   * as undefined because ChatThread already renders the panel
+   * externally (before the deliverable).
+   */
+  reasoningContent?: string;
 }
 
 export function ChatDeliverable({
@@ -74,6 +90,7 @@ export function ChatDeliverable({
   tokensPerSecond,
   onRegenerate,
   hideHeader = false,
+  reasoningContent,
 }: ChatDeliverableProps) {
   const copyId = typeof turnIndex === "number" ? `turn-res-${turnIndex}` : "final-result";
 
@@ -141,6 +158,24 @@ export function ChatDeliverable({
             timestamp={timestamp}
           />
         </div>
+      )}
+
+      {/* 1b. Reasoning panel — rendered BELOW the identity header
+          and ABOVE the primary response.
+
+          This matches the visual order used by ChatThread for the
+          live turn (Badge → Reasoning → Deliverable). Without this
+          placement, HistoricalTurn would render the panel ABOVE
+          the header, which looked broken.
+
+          The `!hideHeader` guard is defensive: when the header is
+          suppressed (i.e., ChatThread's live call), the caller is
+          expected to render the panel itself before this component. */}
+      {!hideHeader && reasoningContent && reasoningContent.trim() !== "" && (
+        <ChatReasoningPanel
+          thoughtContent={reasoningContent}
+          isRunning={false}
+        />
       )}
 
       {/* 2. Primary Response.

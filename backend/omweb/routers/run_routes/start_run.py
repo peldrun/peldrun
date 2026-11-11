@@ -845,6 +845,7 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
                                     or existing_chat.get("provider")
                                     or _ext_provider
                                 ),
+                                "mode": existing_chat.get("mode", "agent"),
                                 "usage": existing_chat.get("usage"),
                             })
         else:
@@ -875,6 +876,7 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
                             or existing_chat.get("provider")
                             or _ext_provider
                         ),
+                        "mode": existing_chat.get("mode", "agent"),
                         "usage": existing_chat.get("usage"),
                     })
 

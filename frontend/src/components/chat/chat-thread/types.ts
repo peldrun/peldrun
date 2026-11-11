@@ -97,6 +97,12 @@ export interface ChatTurn {
    */
   provider?: string | null;
   mode?: "agent" | "chat";
+  /**
+   * Accumulated reasoning text for this turn (Chat mode only).
+   * Persisted so the "Reasoning" panel survives when the turn
+   * is moved to history after a new message is sent.
+   */
+  chatReasoningText?: string;
   usage?: {
     cost_usd: number;
     latency_ms: number;

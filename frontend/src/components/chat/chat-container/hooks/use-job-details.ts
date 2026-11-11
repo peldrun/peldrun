@@ -104,6 +104,7 @@ interface UseJobDetailsParams {
   onChatLoaded?: (snapshot: {
     provider: string | null;
     model: string | null;
+    mode?: "agent" | "chat";
   }) => void;
   setStatus: (s: ChatStatus) => void;
   setFinalResult: (r: string | null) => void;
@@ -238,7 +239,7 @@ export function useJobDetails(params: UseJobDetailsParams) {
       // session's authoritative values. Only invoked when at least
       // one value is present so legacy sessions with no provider
       // metadata do not clear an in-flight ref.
-      if (data.provider_name || data.model) {
+      if (data.provider_name || data.model || data.mode) {
         p.onChatLoaded?.({
           provider:
             typeof data.provider_name === "string"
@@ -246,6 +247,10 @@ export function useJobDetails(params: UseJobDetailsParams) {
               : null,
           model:
             typeof data.model === "string" ? data.model : null,
+          mode:
+            data.mode === "agent" || data.mode === "chat"
+              ? data.mode
+              : undefined,
         });
       }
       if (data.status) p.setStatus(data.status);
@@ -288,6 +293,33 @@ export function useJobDetails(params: UseJobDetailsParams) {
                 ev.content.trim() !== "" || Boolean(ev.toolName)
             );
 
+            // Reconstruct reasoning text from persisted events,
+            // REGARDLESS of `t.mode`.
+            //
+            // `t.mode` is unreliable in legacy sessions (missing
+            // entirely) and in some edge cases may be stamped
+            // incorrectly. The presence of `thought` events is the
+            // only definitive evidence that reasoning was captured.
+            // A turn that carries thoughts will display the panel;
+            // a turn with none will simply skip it.
+            let hydratedReasoningText: string | undefined = undefined;
+            {
+              const reasoningParts: string[] = [];
+              (t.events || []).forEach((ev: any) => {
+                if (ev.type !== "thought") return;
+                const raw =
+                  ev.data?.thought ??
+                  ev.data?.delta ??
+                  ev.data?.content;
+                if (typeof raw === "string" && raw) {
+                  reasoningParts.push(raw);
+                }
+              });
+              if (reasoningParts.length > 0) {
+                hydratedReasoningText = reasoningParts.join("");
+              }
+            }
+
             return {
               id: t.job_id || `turn-${idx}`,
               jobId: t.job_id || "",
@@ -324,6 +356,22 @@ export function useJobDetails(params: UseJobDetailsParams) {
                 t.mode === "agent" || t.mode === "chat"
                   ? t.mode
                   : undefined,
+              // [REGRESSION-FIX] Attach the reconstructed reasoning
+              // text to the ChatTurn so HistoricalTurn can render
+              // the Reasoning panel after a page reload.
+              //
+              // Root cause of the "reasoning panel disappears after
+              // F5" regression: `hydratedReasoningText` was computed
+              // a few lines above but never returned as part of the
+              // turn object. The field was therefore `undefined` for
+              // every historical turn, and HistoricalTurn's rendering
+              // guard `turn.chatReasoningText && turn.chatReasoningText.trim()`
+              // always failed.
+              //
+              // The CURRENT (last) turn was unaffected because it is
+              // rendered by ChatThread from `data.events` (via
+              // `setChatReasoningText`), not from this map.
+              chatReasoningText: hydratedReasoningText,
               producedFiles: t.produced_files,
               attachedFiles: t.attachedFiles || undefined,
               usage: t.usage || undefined,
@@ -435,7 +483,16 @@ export function useJobDetails(params: UseJobDetailsParams) {
         // needed here because we're building a single string, not an
         // array of Steps). Deltas already include whitespace tokens
         // that preserve word boundaries.
-        if (data.mode === "chat" && p.setChatReasoningText) {
+        // Reconstruct reasoning text for the CURRENT turn,
+        // REGARDLESS of `data.mode`.
+        //
+        // Same rationale as the per-turn reconstruction above:
+        // `data.mode` is not a reliable signal. We use it only to
+        // know when to explicitly CLEAR stale state for chat-mode
+        // sessions that genuinely produced no thoughts. For any
+        // events that contain thought deltas, we always restore
+        // them so the panel survives a reload.
+        if (p.setChatReasoningText) {
           const reasoningParts: string[] = [];
           data.events.forEach((ev: any) => {
             if (ev.type !== "thought") return;
@@ -447,10 +504,13 @@ export function useJobDetails(params: UseJobDetailsParams) {
               reasoningParts.push(raw);
             }
           });
-          // Always reset first — this clears any stale state from a
-          // previously open chat (the hook can be called multiple
-          // times as the user navigates between sessions).
-          p.setChatReasoningText(reasoningParts.join(""));
+          if (reasoningParts.length > 0) {
+            p.setChatReasoningText(reasoningParts.join(""));
+          } else if (data.mode === "chat") {
+            // No thoughts AND explicitly chat mode — clear any
+            // stale state from a previously opened session.
+            p.setChatReasoningText("");
+          }
         }
       }
 

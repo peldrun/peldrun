@@ -80,8 +80,36 @@ export function HistoricalTurn({
   activeProvider,
   onRegenerate,
 }: HistoricalTurnProps) {
-  const turnMode = turn.mode || (turn.steps && turn.steps.length > 0 ? "agent" : "chat");
+  // Determine mode from ACTUAL evidence, not from the (possibly stale)
+  // `mode` field. Presence of tool_call/observation events is the
+  // definitive signal that a turn executed in agent mode; absence
+  // means it behaved like a chat turn (or an agent turn that never
+  // called any tool — visually identical for our purposes).
+  //
+  // `turn.mode` is still consulted as a secondary signal so that an
+  // agent turn with zero tool calls still gets its "Agent" badge,
+  // but it can NO LONGER force a chat turn to hide its reasoning
+  // panel. This was the root cause of "Reasoning panel disappears
+  // when a new message is sent": the backend sometimes saved `mode`
+  // as "agent" for turns that actually ran in chat mode, so the old
+  // `turnMode === "chat"` gate skipped the panel.
+  const hasToolCalls = Boolean(
+    turn.steps?.some(
+      (s) => s.type === "tool_call" || s.type === "observation"
+    )
+  );
+  const turnMode: "agent" | "chat" = hasToolCalls
+    ? "agent"
+    : (turn.mode === "agent" ? "agent" : "chat");
   const isAgentTurn = turnMode === "agent";
+
+  // Show reasoning panel whenever reasoning text exists and there
+  // are NO tool calls in the turn. This is more robust than gating
+  // on `turnMode === "chat"` because it does not depend on the
+  // `mode` field, which is missing from legacy sessions and may be
+  // incorrect in some edge cases.
+  const showReasoning =
+    !hasToolCalls && Boolean(turn.chatReasoningText?.trim());
 
   // Resolve the provider/model snapshots for THIS turn.
   //
@@ -172,6 +200,9 @@ export function HistoricalTurn({
           // historical turns would keep re-labelling themselves with
           // whatever provider the user picks in EngineSelector.
           providerName={turnProvider}
+          reasoningContent={
+            showReasoning ? turn.chatReasoningText : undefined
+          }
           timestamp={turn.timestamp}
           tokensUsed={turn.tokensUsed}
           costUsd={turn.usage?.cost_usd}

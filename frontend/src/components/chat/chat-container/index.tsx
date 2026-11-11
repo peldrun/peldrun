@@ -336,6 +336,10 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
   // run of a session, they hold the current active* values.
   const runStartProviderRef = useRef<string | null>(activeProvider);
   const runStartModelRef = useRef<string | null>(activeModelName);
+  // Capture the execution mode (agent/chat) at the start of each run,
+  // so the turn is archived with the mode it was ACTUALLY executed in,
+  // even if the user switches modes before sending the next message.
+  const runStartModeRef = useRef<"agent" | "chat">(execMode);
 
   // Tracks the safety-net timer created by handleStopTask. Declared
   // here (not further down) because it is referenced by the status
@@ -400,9 +404,10 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     // current turn's header keeps showing the provider that actually
     // produced it (even if the user has since changed the EngineSelector
     // or reloaded the page).
-    onChatLoaded: ({ provider, model }) => {
+    onChatLoaded: ({ provider, model, mode }) => {
       if (provider) runStartProviderRef.current = provider;
       if (model) runStartModelRef.current = model;
+      if (mode) runStartModeRef.current = mode;
     },
     setStatus,
     setFinalResult,
@@ -1009,6 +1014,20 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
             // HistoricalTurn falls back to the currently-active
             // provider for pre-upgrade turns.
             provider: archivedProvider ?? undefined,
+            // Persist the mode for the "Agent" badge and — more
+            // importantly — ALWAYS preserve the reasoning text.
+            //
+            // We intentionally DO NOT gate on
+            // `runStartModeRef.current === "chat"`. The `mode` ref
+            // can become stale (mode toggled by user right before
+            // send), and even a "chat-like" agent turn without tool
+            // calls deserves to keep its reasoning visible after
+            // archival. HistoricalTurn's display logic is what
+            // ultimately decides whether to render the panel:
+            //   * has tool calls  → timeline (no reasoning panel)
+            //   * no tool calls   → reasoning panel (if text exists)
+            mode: runStartModeRef.current,
+            chatReasoningText: chatReasoningText || undefined,
             usage:
               tokensUsed.total > 0
                 ? ({
@@ -1035,12 +1054,15 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         ]);
       }
 
-      // Snapshot the CURRENT provider/model for the run we are about
-      // to start. This is what will be archived when THIS new run
-      // completes (in a future handleStartTask / handleRegenerate
-      // call).
+      // Snapshot the CURRENT provider/model/mode for the run we are
+      // about to start.
+      // We use `effectiveMode` here (not `execMode`) because `execMode`
+      // might still hold the previous value if the user just toggled
+      // the mode and immediately sent a message. `effectiveMode`
+      // represents the exact mode sent to the backend.
       runStartProviderRef.current = activeProvider;
       runStartModelRef.current = activeModelName;
+      runStartModeRef.current = effectiveMode as "agent" | "chat";
 
       setInputValue("");
       setLandingAttachedFiles([]);
@@ -1165,6 +1187,11 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       connectStream,
       setProducedFiles,
       setElapsedSeconds,
+      // Required so handleStartTask reads the LATEST reasoning text
+      // when archiving the previous turn. Without it, the closure
+      // captures "" from the initial state and every archived turn
+      // ends up with an empty reasoning panel.
+      chatReasoningText,
     ]
   );
 
@@ -1248,6 +1275,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         // selected NOW") and mirrors handleStartTask's behavior.
         runStartProviderRef.current = activeProvider;
         runStartModelRef.current = activeModelName;
+        runStartModeRef.current = execMode;
 
         const targetChatId = activeChatId;
         const effectiveMode = execMode;
@@ -1335,6 +1363,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         // only field preserved from the original turn (targetTurn.mode).
         runStartProviderRef.current = activeProvider;
         runStartModelRef.current = activeModelName;
+        runStartModeRef.current = targetTurn.mode || execMode;
 
         const targetChatId = activeChatId;
         const effectiveMode = targetTurn.mode || execMode;
@@ -1569,11 +1598,18 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
             humanAnswer={humanAnswer}
             setHumanAnswer={setHumanAnswer}
             onSendHumanAnswer={handleSendHumanAnswer}
-            execMode={execMode}
+            // Use the mode of the LAST RUN (not the user's current
+            // selection) to render the current turn. This ensures the
+            // Agent timeline / Chat reasoning panel stay attached to
+            // the turn that actually produced them, even after the
+            // user toggles the mode for the next message.
+            execMode={runStartModeRef.current}
             activeGroupedSteps={
-              execMode === "agent" ? groupStepEvents(steps) : {}
+              runStartModeRef.current === "agent" ? groupStepEvents(steps) : {}
             }
-            chatReasoningText={chatReasoningText}
+            chatReasoningText={
+              runStartModeRef.current === "chat" ? chatReasoningText : ""
+            }
             currentStepNum={currentStepNum}
             status={threadStatus}
             elapsedSeconds={elapsedSeconds}
