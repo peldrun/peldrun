@@ -89,6 +89,18 @@ interface UseSseStreamParams {
   setPendingApprovals: React.Dispatch<
     React.SetStateAction<Record<string, DelegationApprovalRequest>>
   >;
+  /**
+   * [CHAT-REASONING] Dedicated reasoning-text setter for Chat mode.
+   *
+   * Chat mode does NOT use the step-based timeline: reasoning is a
+   * single continuous stream rendered in a dedicated collapsible
+   * panel (like DeepSeek-R1's "Thinking…" block). This setter
+   * receives every thought delta verbatim; the consumer feeds it into
+   * `ChatThread` as a single string.
+   *
+   * Optional so agent-only consumers remain unaffected.
+   */
+  setChatReasoningText?: React.Dispatch<React.SetStateAction<string>>;
   fetchJobFiles: (jobId: string) => void;
 
   /**
@@ -384,6 +396,49 @@ export function useSseStream(params: UseSseStreamParams) {
           ctx.setFinalResult((prev) => (prev ? prev + delta : delta));
         }
       } else if (eventType === "thought") {
+        // [CHAT-REASONING] Chat mode uses a dedicated reasoning
+        // channel — NOT the step-based timeline. Chat mode has a
+        // single continuous thought stream followed by a single
+        // answer; representing it via the agent's `steps[]` array
+        // (which is rendered only by ChatTimeline in agent mode) is
+        // the wrong model and silently loses the reasoning in the
+        // UI because `activeGroupedSteps` is `{}` in chat mode.
+        //
+        // In chat mode we route every thought delta to
+        // `setChatReasoningText` and RETURN EARLY — never touching
+        // `steps[]`. This gives us:
+        //   * Completely independent reasoning display
+        //     (ChatReasoningPanel) that mirrors DeepSeek-R1's
+        //     collapsible "Thinking…" block.
+        //   * No per-token step allocation, no groupStepEvents
+        //     reducer work, no agent-mode artifacts.
+        //
+        // The `reset` sentinel (emitted before each retry)
+        // clears the accumulated reasoning, exactly like the
+        // agent-mode reset clears the trailing thought steps.
+        if (ctx.execMode === "chat" && ctx.setChatReasoningText) {
+          if (payload.data?.reset === true) {
+            ctx.setChatReasoningText("");
+            return;
+          }
+          const isDelta = Boolean(payload.data?.is_delta);
+          const raw =
+            payload.data?.delta ??
+            payload.data?.thought ??
+            payload.data?.content ??
+            payload.data;
+          const rendered = safeRender(raw);
+          if (!rendered) return;
+          if (isDelta) {
+            ctx.setChatReasoningText((prev) => prev + rendered);
+          } else {
+            // A non-delta emission carries the complete text — replace
+            // rather than append.
+            ctx.setChatReasoningText(rendered);
+          }
+          return;
+        }
+
         // [FIX-THOUGHT-RESET] Discard the failed attempt's reasoning
         // before processing a new attempt's first thought delta. The
         // backend sends a reset event with no `thought` field before

@@ -105,6 +105,17 @@ export interface ChatThreadProps {
   onSendHumanAnswer: (customAnswer?: string) => void;
   execMode: "agent" | "chat";
   activeGroupedSteps: Record<number, StepEvent[]>;
+
+  /**
+   * [CHAT-REASONING] Dedicated reasoning text for Chat mode.
+   *
+   * Chat mode does NOT use the step-based timeline (`activeGroupedSteps`
+   * is always `{}` in that mode). Reasoning is delivered as a single
+   * continuous string that feeds `ChatReasoningPanel`. Agent mode
+   * leaves this `undefined` and uses `activeGroupedSteps` instead.
+   */
+  chatReasoningText?: string;
+
   currentStepNum: number;
   /**
    * Canonical run status. ChatThread's conditional rendering only

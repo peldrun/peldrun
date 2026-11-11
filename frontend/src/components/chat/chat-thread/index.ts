@@ -20,6 +20,7 @@ export { UserMessageBubble } from "./UserMessageBubble";
 export { AttachedFileCard } from "./AttachedFileCard";
 export { HumanInputCard } from "./HumanInputCard";
 export { LiveStatusIndicator } from "./LiveStatusIndicator";
+export { ChatReasoningPanel } from "./ChatReasoningPanel";
 
 // Hooks
 export { useHumanToolDetection } from "./useHumanToolDetection";

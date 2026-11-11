@@ -72,6 +72,14 @@ interface UseJobDetailsParams {
   setTokensUsed: React.Dispatch<React.SetStateAction<TokenUsage>>;
   setCurrentUsageMetrics: (m: UsageMetrics | null) => void;
   setSteps: React.Dispatch<React.SetStateAction<StepEvent[]>>;
+  /**
+   * [CHAT-REASONING] Reconstructs the dedicated reasoning stream for
+   * Chat mode after a page refresh. Chat mode does not use `steps[]`,
+   * so a naive replay would leave the reasoning panel empty even
+   * though the persisted events carry the full thought stream.
+   * Optional so agent-only consumers remain unaffected.
+   */
+  setChatReasoningText?: React.Dispatch<React.SetStateAction<string>>;
   setCurrentStepNum: (n: number) => void;
   currentStepNumRef: React.MutableRefObject<number>;
   fetchJobFiles: (jobId: string) => void;
@@ -319,6 +327,34 @@ export function useJobDetails(params: UseJobDetailsParams) {
         if (maxStep > 0) {
           p.setCurrentStepNum(maxStep);
           p.currentStepNumRef.current = maxStep;
+        }
+
+        // [CHAT-REASONING] For chat mode, reconstruct the reasoning
+        // stream from the persisted events. Chat mode has no `steps`
+        // timeline in the UI, so without this the reasoning panel
+        // would appear empty after a page refresh — even though the
+        // events clearly contain hundreds of thought deltas.
+        //
+        // We concatenate the deltas verbatim (no mergeConsecutiveThoughts
+        // needed here because we're building a single string, not an
+        // array of Steps). Deltas already include whitespace tokens
+        // that preserve word boundaries.
+        if (data.mode === "chat" && p.setChatReasoningText) {
+          const reasoningParts: string[] = [];
+          data.events.forEach((ev: any) => {
+            if (ev.type !== "thought") return;
+            const raw =
+              ev.data?.thought ??
+              ev.data?.delta ??
+              ev.data?.content;
+            if (typeof raw === "string" && raw) {
+              reasoningParts.push(raw);
+            }
+          });
+          // Always reset first — this clears any stale state from a
+          // previously open chat (the hook can be called multiple
+          // times as the user navigates between sessions).
+          p.setChatReasoningText(reasoningParts.join(""));
         }
       }
 

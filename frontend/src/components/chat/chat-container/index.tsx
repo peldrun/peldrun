@@ -127,6 +127,15 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     Record<string, DelegationApprovalRequest>
   >({});
 
+  // [CHAT-REASONING] Dedicated reasoning stream for Chat mode.
+  //
+  // Chat mode does NOT use the step-based timeline at all: reasoning
+  // is a single continuous stream displayed in a dedicated
+  // collapsible panel (like DeepSeek-R1's "Thinking…" block). This
+  // state is completely isolated from the agent-mode `steps` array
+  // and avoids the groupStepEvents reducer on every token.
+  const [chatReasoningText, setChatReasoningText] = useState<string>("");
+
   // Payload of the in-flight MCP authentication request, or null when
   // no modal is open. Populated by the SSE handler when the backend
   // emits `mcp_auth_required` (see use-sse-stream.ts). Cleared either
@@ -337,6 +346,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     setSelectedFileForEditor,
     setActiveChildRuns,
     setPendingApprovals,
+    setChatReasoningText,
     fetchJobFiles,
     // Opens the per-chat MCP auth modal. The SSE handler calls this
     // before closing the stream, so we still get the payload even
@@ -358,6 +368,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     setTokensUsed,
     setCurrentUsageMetrics,
     setSteps,
+    setChatReasoningText,
     setCurrentStepNum,
     currentStepNumRef,
     fetchJobFiles,
@@ -509,6 +520,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     setSourceControlDefaultMode("browse");
     setActiveChildRuns({});
     setPendingApprovals({});
+    setChatReasoningText("");
     setMcpAuthRequiredPayload(null);
     router.push("/chat");
   }, [
@@ -967,6 +979,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       setSessionTimestamp(new Date().toLocaleString());
       setActiveChildRuns({});
       setPendingApprovals({});
+      setChatReasoningText("");
 
       try {
         let storedOverride = {};
@@ -1144,6 +1157,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         setSessionTimestamp(new Date().toLocaleString());
         setActiveChildRuns({});
         setPendingApprovals({});
+        setChatReasoningText("");
 
         const targetChatId = activeChatId;
         const effectiveMode = execMode;
@@ -1223,6 +1237,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         setSessionTimestamp(new Date().toLocaleString());
         setActiveChildRuns({});
         setPendingApprovals({});
+        setChatReasoningText("");
 
         const targetChatId = activeChatId;
         const effectiveMode = targetTurn.mode || execMode;
@@ -1456,6 +1471,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
             activeGroupedSteps={
               execMode === "agent" ? groupStepEvents(steps) : {}
             }
+            chatReasoningText={chatReasoningText}
             currentStepNum={currentStepNum}
             status={threadStatus}
             elapsedSeconds={elapsedSeconds}

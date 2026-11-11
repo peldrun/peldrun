@@ -28,6 +28,7 @@ import { UserMessageBubble } from "./UserMessageBubble";
 import { HistoricalTurn } from "./HistoricalTurn";
 import { HumanInputCard } from "./HumanInputCard";
 import { LiveStatusIndicator } from "./LiveStatusIndicator";
+import { ChatReasoningPanel } from "./ChatReasoningPanel";
 import { useHumanToolDetection } from "./useHumanToolDetection";
 import type { ChatThreadProps } from "./types";
 
@@ -69,6 +70,7 @@ export function ChatThread({
   onSendHumanAnswer,
   execMode,
   activeGroupedSteps,
+  chatReasoningText: chatReasoningTextProp,
   currentStepNum,
   status,
   elapsedSeconds,
@@ -132,6 +134,18 @@ export function ChatThread({
         !s.content.startsWith("Step ") &&
         !s.content.startsWith("terminate(")
     );
+
+  // [CHAT-REASONING] The reasoning stream is provided directly by
+  // ChatContainer as a dedicated prop. Chat mode does NOT use the
+  // step-based timeline at all — `activeGroupedSteps` is `{}` in
+  // chat mode (see ChatContainer's `activeGroupedSteps` prop), so
+  // deriving the reasoning from `activeStepsList` would always yield
+  // an empty string.
+  //
+  // The state lives in ChatContainer (populated by use-sse-stream's
+  // `setChatReasoningText`), which isolates it from the agent-mode
+  // `steps` array and keeps the two modes completely independent.
+  const chatReasoningText = chatReasoningTextProp || "";
 
   const activeApprovalList = Object.values(pendingApprovals || {});
 
@@ -241,6 +255,20 @@ export function ChatThread({
               toggleStep={toggleStep}
             />
           )}
+
+        {/* [CHAT-REASONING] Reasoning trace in Chat mode.
+            Rendered above the deliverable bubble so the user sees the
+            model "thinking out loud" while it works, then the answer
+            below. Auto-expands during streaming, auto-collapses 1.5s
+            after completion (one final look), and is manually
+            re-openable. Only rendered in chat mode — agent mode uses
+            ChatTimeline instead. */}
+        {execMode === "chat" && chatReasoningText.trim() && (
+          <ChatReasoningPanel
+            thoughtContent={chatReasoningText}
+            isRunning={status === "running"}
+          />
+        )}
 
         {/* Image galleries are injected into the final answer's
             `result_text` as an ``image_gallery`` markdown block by
