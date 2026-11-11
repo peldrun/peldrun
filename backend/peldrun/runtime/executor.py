@@ -240,13 +240,24 @@ class _ToolCallAgentBridge:
         # (which would pass them as unknown kwargs to the compiled payload).
         on_chunk = kwargs.pop("on_chunk", None)
         on_thought_chunk = kwargs.pop("on_thought_chunk", None)
+        # [TOOL_CALL_STARTING] Early tool-call signal. Fired by the
+        # StreamNormalizer the moment the provider emits its first
+        # tool-call delta, several seconds before the arguments JSON
+        # is complete. ToolCallAgent uses this to emit a
+        # TOOL_CALL_STARTING event so the frontend can show a
+        # "preparing <tool_name>…" placeholder during the wait.
+        on_tool_call_start = kwargs.pop("on_tool_call_start", None)
         # ``stream`` is used by AsyncLLMClient historically. Strip it
         # here because streaming is chosen by the presence of callbacks.
         kwargs.pop("stream", None)
 
         request = self._build_request(messages, tools, tool_choice, **kwargs)
 
-        if on_chunk is not None or on_thought_chunk is not None:
+        if (
+            on_chunk is not None
+            or on_thought_chunk is not None
+            or on_tool_call_start is not None
+        ):
             from peldrun.llm.stream_normalizer import collect_response
 
             return await collect_response(
@@ -258,6 +269,7 @@ class _ToolCallAgentBridge:
                 messages=messages,
                 on_chunk=on_chunk,
                 on_thought_chunk=on_thought_chunk,
+                on_tool_call_start=on_tool_call_start,
             )
 
         return await self._adapter.generate(request)

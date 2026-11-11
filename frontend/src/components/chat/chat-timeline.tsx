@@ -2,7 +2,7 @@
 
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   BrainCircuit,
   Terminal,
@@ -11,6 +11,7 @@ import {
   Server,
 } from "lucide-react";
 import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
+import { CodeBlock } from "@/components/chat/code-block";
 import { ToolIcon } from "@/app/stores/_components/ToolIcon";
 import {
   resolveToolLabel,
@@ -95,6 +96,17 @@ export interface StepEvent {
    * Rendered as a progress bar, NOT appended to the text area.
    */
   progress?: ToolProgress;
+
+  /**
+   * [TOOL_CALL_STARTING] True while the framework is still
+   * streaming the arguments JSON. When true, the tool card renders
+   * a compact "⏳ preparing…" placeholder (no content, no args, no
+   * code block) so the user sees activity during the multi-second
+   * wait. The same StepEvent is updated in place (isPending: false)
+   * when the complete `tool_call` arrives — no re-mount, no
+   * flicker.
+   */
+  isPending?: boolean;
 }
 
 interface ChatTimelineProps {
@@ -107,7 +119,13 @@ interface ChatTimelineProps {
   toggleStep: (key: string) => void;
 }
 
-function TimelineToolCall({ evt }: { evt: StepEvent }) {
+function TimelineToolCall({
+  evt,
+  isToolCompleted = false,
+}: {
+  evt: StepEvent;
+  isToolCompleted?: boolean;
+}) {
   const [manifest, setManifest] = useState<ToolManifest | null>(null);
   // MCP server icon — same caching contract as ToolCallCard.
   // Populated async; falls back to <Server> icon when the manifest
@@ -159,6 +177,78 @@ function TimelineToolCall({ evt }: { evt: StepEvent }) {
 
   // Format the raw JSON string into a clean readable string
   const displayContent = formatToolArgs(evt.toolName, evt.content);
+
+  // -----------------------------------------------------------------
+  // File-write visibility (verifiability).
+  // -----------------------------------------------------------------
+  const rawArgs = evt.content;
+  let parsedArgs: Record<string, any> = {};
+  try {
+    parsedArgs = typeof rawArgs === "string" ? JSON.parse(rawArgs) : rawArgs || {};
+  } catch {
+    parsedArgs = {};
+  }
+
+  const toolKey = (evt.toolName || "").toLowerCase();
+  let writtenContent: string | null = null;
+  let writtenLabel: string | null = null;
+  let writtenLanguage = "text";
+  const command = String(parsedArgs.command || parsedArgs.action || "").toLowerCase();
+  const filePath = String(parsedArgs.path || parsedArgs.file_path || "").toLowerCase();
+
+  if (toolKey.includes("editor") && command === "create") {
+    writtenContent = parsedArgs.file_text ?? null;
+    writtenLabel = "Created File Content";
+  } else if (toolKey.includes("editor") && command === "str_replace") {
+    writtenContent = parsedArgs.new_str ?? null;
+    writtenLabel = "Applied Replacement";
+  } else if (toolKey.includes("editor") && command === "insert") {
+    writtenContent = parsedArgs.new_str ?? null;
+    writtenLabel = "Inserted Text";
+  } else if (toolKey === "file_ops" && (command === "write" || command === "append")) {
+    writtenContent = parsedArgs.content ?? null;
+    writtenLabel = command === "write" ? "Written Content" : "Appended Content";
+  } else if (toolKey === "file_saver") {
+    writtenContent = parsedArgs.content ?? null;
+    writtenLabel = "File Content";
+  }
+
+  if (filePath.endsWith(".html")) writtenLanguage = "html";
+  else if (filePath.endsWith(".css")) writtenLanguage = "css";
+  else if (filePath.endsWith(".js")) writtenLanguage = "javascript";
+  else if (filePath.endsWith(".json")) writtenLanguage = "json";
+  else if (filePath.endsWith(".py")) writtenLanguage = "python";
+
+  // -----------------------------------------------------------------
+  // Sub-accordion state for the written file content.
+  //
+  // UX contract:
+  //   • Opens automatically when the tool call first appears.
+  //   • Stays open while the tool is executing (isToolCompleted=false).
+  //   • Auto-closes 5s after the tool completes (observation arrives),
+  //     giving the user enough time to scan the file.
+  //   • After auto-close, the user can re-open it with a click.
+  //   • A single auto-close per mount — if the user re-opens it
+  //     manually, we never auto-close it again.
+  //
+  // The accordion survives re-renders because ChatTimeline is memoized
+  // and the sub-component keeps its own state.
+  // -----------------------------------------------------------------
+  const [isContentExpanded, setIsContentExpanded] = useState(true);
+  const hasAutoClosedRef = useRef(false);
+
+  useEffect(() => {
+    if (!writtenContent || !writtenLabel) return;
+    if (!isToolCompleted) return;
+    if (hasAutoClosedRef.current) return;
+
+    const timer = setTimeout(() => {
+      setIsContentExpanded(false);
+      hasAutoClosedRef.current = true;
+    }, 5000);
+
+    return () => clearTimeout(timer);
+  }, [writtenContent, writtenLabel, isToolCompleted]);
 
   // -----------------------------------------------------------------
   // Tool Output Streaming: display helpers.
@@ -229,8 +319,72 @@ function TimelineToolCall({ evt }: { evt: StepEvent }) {
       </div>
       <div className="truncate flex-1 min-w-0">
         <span className="font-extrabold text-black mr-1">{label}: </span>
-        <span className="text-muted-foreground">{displayContent}</span>
+        {evt.isPending ? (
+          <span className="inline-flex items-center gap-1.5 text-amber-500">
+            <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+            <span className="text-[10px]">preparing…</span>
+          </span>
+        ) : (
+          <span className="text-muted-foreground">{displayContent}</span>
+        )}
       </div>
+
+      {/* Sub-accordion: Written File Content.
+          Auto-opens when the file content first appears; auto-closes
+          once the tool completes (after a 5s grace period). The user
+          can always re-open it with a click.
+          Hidden entirely while `isPending` — the content has not
+          arrived yet. */}
+      {!evt.isPending && writtenContent && writtenLabel && (
+        <div className="basis-full mt-2 border border-border/40 rounded-md overflow-hidden bg-background/40">
+          <button
+            type="button"
+            onClick={() => {
+              setIsContentExpanded((v) => !v);
+              // User manually toggled — freeze the auto-close forever.
+              hasAutoClosedRef.current = true;
+            }}
+            className="w-full flex items-center justify-between px-2.5 py-1.5 hover:bg-muted/40 transition-colors cursor-pointer text-[10px] font-mono"
+          >
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="text-emerald-500 font-semibold uppercase whitespace-nowrap">
+                ▸ {writtenLabel}
+              </span>
+              <span className="text-muted-foreground normal-case whitespace-nowrap">
+                ({writtenContent.length} chars)
+              </span>
+              {!isToolCompleted && (
+                <span className="inline-flex items-center gap-1 text-amber-500 whitespace-nowrap">
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                  <span className="text-[9px]">executing…</span>
+                </span>
+              )}
+              {isToolCompleted && (
+                <span className="inline-flex items-center gap-1 text-emerald-500 whitespace-nowrap">
+                  <span className="text-[9px]">✓ done</span>
+                </span>
+              )}
+            </div>
+            <span className="text-muted-foreground flex-shrink-0 ml-2">
+              {isContentExpanded ? (
+                <ChevronDown size={12} />
+              ) : (
+                <ChevronRight size={12} />
+              )}
+            </span>
+          </button>
+
+          {isContentExpanded && (
+            <div className="p-2 border-t border-border/40">
+              <CodeBlock
+                code={writtenContent}
+                language={writtenLanguage}
+                filename={parsedArgs.path || parsedArgs.file_path}
+              />
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Progress bar — only rendered when a TOOL_PROGRESS event has
           been received. Placed above the live output so the bar stays
@@ -367,7 +521,30 @@ function ChatTimelineInner({
                     )}
 
                     {evt.type === "tool_call" && evt.toolName && (
-                      <TimelineToolCall evt={evt} />
+                      <TimelineToolCall
+                        evt={evt}
+                        isToolCompleted={
+                          // [FIX-EXECUTING-STUCK] Force-complete when the
+                          // run is over. `isRunning` is a prop from the
+                          // parent that is `false` once the run reaches
+                          // any terminal state (completed, failed,
+                          // cancelled). Without this guard, a missing
+                          // observation event leaves the card stuck on
+                          // "executing…" forever even after the run
+                          // finished successfully.
+                          //
+                          // The `stepEvents.some(...)` check remains
+                          // the primary signal during the run itself,
+                          // because `isRunning` is `true` until the
+                          // whole pipeline finishes.
+                          !isRunning ||
+                          stepEvents.some(
+                            (e) =>
+                              e.type === "observation" &&
+                              (!e.toolName || e.toolName === evt.toolName)
+                          )
+                        }
+                      />
                     )}
 
                     {evt.type === "observation" && (
@@ -493,7 +670,13 @@ function areGroupedStepsEqual(
         ea.progress?.current !== eb.progress?.current ||
         ea.progress?.total !== eb.progress?.total ||
         ea.progress?.phase !== eb.progress?.phase ||
-        ea.progress?.message !== eb.progress?.message
+        ea.progress?.message !== eb.progress?.message ||
+        // [TOOL_CALL_STARTING] The pending → real transition must
+        // re-render so the "preparing…" indicator is replaced by
+        // the actual args/content. Without this check, React.memo
+        // would treat the StepEvent as unchanged and the pending
+        // placeholder would linger indefinitely.
+        ea.isPending !== eb.isPending
       ) {
         return false;
       }

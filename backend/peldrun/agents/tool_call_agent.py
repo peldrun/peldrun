@@ -717,6 +717,37 @@ class ToolCallAgent(BaseAgent):
             _thought_buffer.append(delta_text)
             await _flush_thought(force=True)
 
+        async def _on_tool_call_start(tool_name: str, tool_call_id: str) -> None:
+            """Tool-call-start callback — fires the moment the model
+            begins emitting a tool call.
+
+            This is the FIRST signal that a tool invocation is
+            happening. The arguments JSON is still being streamed at
+            this point (typically 5-20 seconds before it is complete).
+            We emit ``TOOL_CALL_STARTING`` so the frontend can show a
+            "preparing <tool_name>…" placeholder instead of a silent
+            blank step.
+
+            The real ``TOOL_CALL`` event will arrive later, once the
+            JSON is fully assembled by the framework. The frontend
+            replaces the placeholder at that point.
+            """
+            try:
+                await self._emit(
+                    EventType.TOOL_CALL_STARTING,
+                    step=step,
+                    payload={
+                        "tool_name": tool_name,
+                        "tool_call_id": tool_call_id,
+                    },
+                )
+            except Exception as emit_err:
+                logger.debug(
+                    "Failed to emit TOOL_CALL_STARTING for '%s': %s",
+                    tool_name,
+                    emit_err,
+                )
+
         async def _call_llm(msgs: List[Dict[str, Any]]) -> LLMResponse:
             """
             Invoke the underlying LLM client.
@@ -750,6 +781,7 @@ class ToolCallAgent(BaseAgent):
                     tool_choice="auto",
                     on_chunk=_on_chunk,
                     on_thought_chunk=_on_thought_chunk,
+                    on_tool_call_start=_on_tool_call_start,
                     **extra_call_params,
                 )
             elif hasattr(self.llm, "chat_completion"):
@@ -759,6 +791,7 @@ class ToolCallAgent(BaseAgent):
                     tool_choice="auto",
                     on_chunk=_on_chunk,
                     on_thought_chunk=_on_thought_chunk,
+                    on_tool_call_start=_on_tool_call_start,
                     **extra_call_params,
                 )
             elif hasattr(self.llm, "chat_complete"):
@@ -767,6 +800,7 @@ class ToolCallAgent(BaseAgent):
                     tools=tools_schema if tools_schema else None,
                     on_chunk=_on_chunk,
                     on_thought_chunk=_on_thought_chunk,
+                    on_tool_call_start=_on_tool_call_start,
                     **extra_call_params,
                 )
             else:

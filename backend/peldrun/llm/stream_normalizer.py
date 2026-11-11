@@ -106,6 +106,10 @@ _INTER_CHUNK_TIMEOUT_SECONDS: float = float(
 
 ContentCallback = Callable[[str], Any]
 ThoughtCallback = Callable[[str], Any]
+# Called once per tool call, AS SOON AS the provider emits the first
+# tool-call delta (before the arguments JSON is complete).
+# Signature: (tool_name: str, tool_call_id: str) -> Awaitable[None]
+ToolCallStartCallback = Callable[[str, str], Any]
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +137,7 @@ class StreamNormalizer:
         *,
         on_chunk: Optional[ContentCallback] = None,
         on_thought_chunk: Optional[ThoughtCallback] = None,
+        on_tool_call_start: Optional[ToolCallStartCallback] = None,
     ) -> AsyncIterator[StreamChunk]:
         """
         Convert an event stream to ``StreamChunk`` and fire the
@@ -160,7 +165,10 @@ class StreamNormalizer:
             ``on_chunk``.
         """
         async for chunk in self._normalize_impl(
-            events, on_chunk=on_chunk, on_thought_chunk=on_thought_chunk
+            events,
+            on_chunk=on_chunk,
+            on_thought_chunk=on_thought_chunk,
+            on_tool_call_start=on_tool_call_start,
         ):
             yield chunk
 
@@ -170,6 +178,7 @@ class StreamNormalizer:
         *,
         on_chunk: Optional[ContentCallback],
         on_thought_chunk: Optional[ThoughtCallback],
+        on_tool_call_start: Optional[ToolCallStartCallback] = None,
     ) -> AsyncIterator[StreamChunk]:
         # State accumulated across events.
         pending_finish_reason: Optional[str] = None
@@ -205,6 +214,13 @@ class StreamNormalizer:
         #       produced anything" (unrecoverable — raise).
         saw_message_complete: bool = False
         saw_any_payload: bool = False
+
+        # [TOOL_CALL_STARTING] Track which tool_call indexes have
+        # already fired the "on_tool_call_start" callback. Each tool
+        # call fires the callback exactly ONCE (the first time we see
+        # its TOOL_CALL_START or TOOL_CALL_DELTA event), so the
+        # frontend doesn't get duplicate "preparing…" indicators.
+        _fired_tool_call_start: Set[int] = set()
 
         # [FIX-DOUBLE-ARGS] Track which tool-call indexes have already
         # emitted incremental TOOL_CALL_DELTA fragments during this
@@ -395,6 +411,25 @@ class StreamNormalizer:
                         "id": tool_id,
                         "name": tool_name,
                     }
+                    # [TOOL_CALL_STARTING] Fire the callback so the
+                    # frontend can show "preparing <tool_name>…" while
+                    # the arguments JSON is still being streamed. Fired
+                    # once per index to avoid duplicates.
+                    if (
+                        on_tool_call_start is not None
+                        and index not in _fired_tool_call_start
+                        and tool_name
+                    ):
+                        _fired_tool_call_start.add(index)
+                        try:
+                            result = on_tool_call_start(tool_name, tool_id)
+                            if asyncio.iscoroutine(result):
+                                await result
+                        except Exception as cb_err:
+                            logger.debug(
+                                "on_tool_call_start callback error: %s",
+                                cb_err,
+                            )
                     # [E.3] A tool call has begun — payload-bearing.
                     saw_any_payload = True
                     yield StreamChunk(
@@ -435,6 +470,33 @@ class StreamNormalizer:
                         if event.tool_index is not None
                         else 0
                     )
+
+                    # [TOOL_CALL_STARTING] Defensive: some providers
+                    # (LM Studio in some versions) skip TOOL_CALL_START
+                    # and emit only TOOL_CALL_DELTA. Fire the callback
+                    # here if it hasn't fired yet for this index.
+                    if (
+                        on_tool_call_start is not None
+                        and index not in _fired_tool_call_start
+                        and event.tool_name
+                    ):
+                        _fired_tool_call_start.add(index)
+                        _defensive_id = (
+                            event.tool_call_id
+                            or f"call_{uuid.uuid4().hex[:8]}"
+                        )
+                        try:
+                            result = on_tool_call_start(
+                                event.tool_name, _defensive_id
+                            )
+                            if asyncio.iscoroutine(result):
+                                await result
+                        except Exception as cb_err:
+                            logger.debug(
+                                "on_tool_call_start callback error "
+                                "(defensive path): %s",
+                                cb_err,
+                            )
 
                     # Capture id/name from this event — first arrival
                     # wins (later deltas carry None for both).
@@ -869,6 +931,7 @@ async def collect_response(
     messages: Optional[List[Dict[str, Any]]] = None,
     on_chunk: Optional[ContentCallback] = None,
     on_thought_chunk: Optional[ThoughtCallback] = None,
+    on_tool_call_start: Optional[ToolCallStartCallback] = None,
 ) -> LLMResponse:
     """
     Collect an event stream into a full ``LLMResponse`` while also
@@ -895,7 +958,10 @@ async def collect_response(
     """
     accumulator = _ResponseAccumulator()
     async for chunk in _default_normalizer.normalize(
-        events, on_chunk=on_chunk, on_thought_chunk=on_thought_chunk
+        events,
+        on_chunk=on_chunk,
+        on_thought_chunk=on_thought_chunk,
+        on_tool_call_start=on_tool_call_start,
     ):
         accumulator.consume(chunk)
     return accumulator.finalize(model=model, messages=messages)

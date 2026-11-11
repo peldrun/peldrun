@@ -42,6 +42,24 @@ class EventType(str, Enum):
     TOOL_RETRY = "tool_retry"
     TOOL_CALLED = "tool_called"  # Compatibility alias for tool_call
 
+    # Tool Call Starting Event (before the JSON payload is complete)
+    #
+    # Emitted by ToolCallAgent.think() as soon as the LLM provider
+    # produces its FIRST tool-call delta — i.e., BEFORE the arguments
+    # JSON has been fully streamed. This lets the frontend show a
+    # "preparing <tool_name>…" indicator during the multi-second
+    # window between "model decided to call a tool" and "JSON is
+    # complete, real TOOL_CALL event fires".
+    #
+    # Payload shape:
+    #   { "tool_name": "str_replace_editor",
+    #     "tool_call_id": "call_abc123" }
+    #
+    # This is NOT a replacement for TOOL_CALL — it's an EARLIER signal.
+    # The real TOOL_CALL arrives when the JSON is complete, and the
+    # frontend replaces the "loading" placeholder with the real card.
+    TOOL_CALL_STARTING = "tool_call_starting"
+
     # Tool Output Streaming Events (opt-in)
     #
     # Emitted by ToolCallAgent.act() WHILE a tool is running, in
@@ -176,6 +194,24 @@ class ToolRetryPayload(BaseModel):
     max_attempts: int = 3
     error: str = ""
     delay_seconds: float = 0.0
+
+
+class ToolCallStartingPayload(BaseModel):
+    """
+    Payload for the ``TOOL_CALL_STARTING`` event.
+
+    Fired the moment the LLM provider produces its first tool-call
+    delta — typically several seconds before the arguments JSON is
+    complete. The frontend uses this to render a "preparing tool…"
+    indicator so the user sees activity during what would otherwise
+    be a silent wait.
+
+    Deliberately minimal: only the identity fields needed for the
+    placeholder. The real payload arrives later via ``TOOL_CALL``.
+    """
+    model_config = ConfigDict(extra="allow")
+    tool_name: str = ""
+    tool_call_id: str = ""
 
 
 class ToolOutputPayload(BaseModel):
@@ -367,6 +403,7 @@ EVENT_PAYLOAD_MAP: Dict[EventType, type[BaseModel]] = {
     EventType.AGENT_ACTIVITY: AgentActivityPayload,
     EventType.TOOL_CALL: ToolCallPayload,
     EventType.TOOL_CALLED: ToolCallPayload,
+    EventType.TOOL_CALL_STARTING: ToolCallStartingPayload,
     EventType.TOOL_RETRY: ToolRetryPayload,
     EventType.TOOL_OUTPUT: ToolOutputPayload,
     EventType.TOOL_PROGRESS: ToolProgressPayload,
@@ -577,6 +614,7 @@ __all__ = [
     "ThoughtPayload",
     "AgentActivityPayload",
     "ToolCallPayload",
+    "ToolCallStartingPayload",
     "ToolRetryPayload",
     "ToolOutputPayload",
     "ToolProgressPayload",

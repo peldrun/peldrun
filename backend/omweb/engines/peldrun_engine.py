@@ -1588,6 +1588,36 @@ class PeldrunEngine(ExecutionEngine):
                     ),
                 )
 
+            elif event.type == getattr(EventType, "TOOL_CALL_STARTING", None):
+                # [TOOL_CALL_STARTING] Early signal that the model has
+                # begun emitting a tool call. The arguments JSON is
+                # still being streamed at this point (typically
+                # 5-20 seconds before it is complete). Forwarding this
+                # immediately lets the frontend display a
+                # "⏳ preparing <tool_name>…" placeholder so the user
+                # sees activity during what would otherwise be a
+                # silent wait.
+                #
+                # This is NOT a replacement for TOOL_CALL — the real
+                # event arrives later, once the framework has
+                # assembled the complete tool_call payload. The
+                # frontend replaces the pending placeholder at that
+                # point.
+                payload = event.payload if isinstance(event.payload, dict) else {}
+                await dispatch_event(
+                    job_id,
+                    SSEEvent(
+                        type=SSEEventType.TOOL_CALL_STARTING,
+                        step=curr_step,
+                        data={
+                            "tool_name": str(payload.get("tool_name", "")),
+                            "tool_call_id": str(payload.get("tool_call_id", "")),
+                            "seq": event_seq,
+                            "model": model_name,
+                        },
+                    ),
+                )
+
             elif event.type == getattr(EventType, "TOOL_OUTPUT", None):
                 # Opt-in streaming: raw stdout/stderr chunks emitted by
                 # tools that opted into the streaming contract. Forwarded

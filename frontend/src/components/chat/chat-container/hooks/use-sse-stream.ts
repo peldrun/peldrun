@@ -153,6 +153,18 @@ export function useSseStream(params: UseSseStreamParams) {
   const collectedImagesProviderRef = useRef<string>("");
 
   /**
+   * [TOOL_CALL_STARTING] Tracks tool_call_ids for which a "pending"
+   * placeholder has already been appended to the timeline. When the
+   * real `tool_call` event arrives with the same id, we replace the
+   * pending step in place instead of appending a duplicate.
+   *
+   * Cleared on every fresh connection (see connectStream). A new run
+   * may reuse the same step indices but never the same tool_call_ids
+   * (they are UUID-derived on the backend).
+   */
+  const pendingToolCallsRef = useRef<Set<string>>(new Set());
+
+  /**
    * Mirror of the latest `params` object. Handlers read from this ref so they
    * always observe the freshest state setters without forcing the callback
    * itself to change identity.
@@ -263,6 +275,9 @@ export function useSseStream(params: UseSseStreamParams) {
       collectedImagesRef.current = [];
       collectedImagesQueryRef.current = "";
       collectedImagesProviderRef.current = "";
+      // [TOOL_CALL_STARTING] Clear pending tool-call ids so a fresh
+      // run does not inherit stale ids from the previous run.
+      pendingToolCallsRef.current.clear();
 
       /** Convenience accessor for the freshest params snapshot. */
       const p = () => paramsRef.current;
@@ -411,6 +426,53 @@ export function useSseStream(params: UseSseStreamParams) {
           }
         }
         if (payload.data?.tokens) ctx.setTokensUsed(payload.data.tokens);
+      } else if (eventType === "tool_call_starting") {
+        // ─── Early tool-call signal ────────────────────────────────
+        //
+        // Fired the moment the model begins emitting a tool call.
+        // The JSON arguments are still streaming at this point
+        // (5-20 seconds for a typical file-creation payload). We
+        // append a PLACEHOLDER step with `isPending: true` so the
+        // timeline renders "⏳ preparing <tool>…" immediately.
+        //
+        // When the real `tool_call` event arrives with the same
+        // `tool_call_id`, the placeholder is REPLACED in place —
+        // no duplicate, no re-mount, no flicker.
+        const startingToolName = String(payload.data?.tool_name || "");
+        const startingToolCallId = String(payload.data?.tool_call_id || "");
+        if (!startingToolName || !startingToolCallId) {
+          return;
+        }
+
+        // Idempotency: skip if we already appended a pending
+        // placeholder for this id. `pendingToolCallsRef` is cleared
+        // when the real tool_call arrives, so a repeated starting
+        // event after that point cannot happen for the same id.
+        if (pendingToolCallsRef.current.has(startingToolCallId)) {
+          return;
+        }
+        pendingToolCallsRef.current.add(startingToolCallId);
+
+        p().setSteps((prev) => [
+          ...prev,
+          {
+            id: `pending-${startingToolCallId}-${Date.now()}`,
+            step,
+            type: "tool_call",
+            content: "",
+            toolName: startingToolName,
+            toolCallId: startingToolCallId,
+            isPending: true,
+            timestamp: new Date().toLocaleTimeString(),
+          },
+        ]);
+        ctx.setExpandedSteps((prev) => ({
+          ...prev,
+          [`active-${step}`]: true,
+        }));
+        logEntry(
+          `[${logTimestamp}] [TOOL_CALL_STARTING] ${startingToolName}…`
+        );
       } else if (normalizedType === "tool_call") {
         const name =
           payload.data?.tool_name ||
@@ -455,9 +517,87 @@ export function useSseStream(params: UseSseStreamParams) {
           payload.data?.toolCallId ||
           undefined;
 
-        // Store the parsed object when available so chat-thread can re-hydrate
-        // input_type and options without needing to re-parse.
-        appendStep("tool_call", parsedArgs || rawArgs, step, name, toolCallId);
+        // [TOOL_CALL_STARTING] Match the real tool_call to its pending
+        // placeholder. Two-step matching strategy:
+        //
+        //   1. Exact id match — the clean case where the backend used
+        //      the same tool_call_id for both the starting signal and
+        //      the completed event.
+        //
+        //   2. Name fallback — required because the LLM provider often
+        //      generates a fresh id per attempt. When the model
+        //      abandons a tool call and starts a new one with the
+        //      SAME tool name (e.g. retries `create index.html`),
+        //      the backend's `tool_call_starting` signal fires with
+        //      an id that will never appear again. Without the
+        //      fallback, the abandoned placeholder lingers forever
+        //      as "(tool call was interrupted before arguments
+        //      arrived)".
+        //
+        // We prefer exact id match; only if none is found do we scan
+        // for a pending placeholder with the same tool name in the
+        // current step. Both are cheap O(N) operations over the
+        // local StepEvent[] state (typically < 50 entries).
+        const renderedContent = safeRender(parsedArgs || rawArgs);
+        let replaced = false;
+        p().setSteps((prev) => {
+          // Attempt 1: exact id match.
+          let idx = -1;
+          if (toolCallId) {
+            idx = prev.findIndex(
+              (s) =>
+                s.type === "tool_call" &&
+                s.isPending &&
+                s.toolCallId === toolCallId,
+            );
+          }
+
+          // Attempt 2: name fallback (same step, same tool name).
+          if (idx === -1 && name) {
+            idx = prev.findIndex(
+              (s) =>
+                s.type === "tool_call" &&
+                s.isPending &&
+                s.toolName === name &&
+                s.step === step,
+            );
+          }
+
+          if (idx !== -1) {
+            replaced = true;
+            if (toolCallId) {
+              pendingToolCallsRef.current.delete(toolCallId);
+            }
+            const next = [...prev];
+            next[idx] = {
+              ...next[idx],
+              content: renderedContent,
+              isPending: false,
+              toolCallId: toolCallId ?? next[idx].toolCallId,
+            };
+            return next;
+          }
+
+          // No placeholder to replace — append a fresh step.
+          return [
+            ...prev,
+            {
+              id: `${Date.now()}-${Math.random()}`,
+              step,
+              type: "tool_call",
+              content: renderedContent,
+              toolName: name || undefined,
+              toolCallId,
+              timestamp: new Date().toLocaleTimeString(),
+            },
+          ];
+        });
+        if (replaced && toolCallId) {
+          // Successfully paired the completed event with a pending
+          // placeholder; remove the old id from the tracking set so
+          // it can never match again.
+          pendingToolCallsRef.current.delete(toolCallId);
+        }
         ctx.setExpandedSteps((prev) => ({ ...prev, [`active-${step}`]: true }));
 
         logEntry(
@@ -550,6 +690,24 @@ export function useSseStream(params: UseSseStreamParams) {
         // visual ordering the user expects.
         flushToolOutputStream();
 
+        // [TOOL_CALL_STARTING] Close any orphaned pending placeholders
+        // in this step. An observation means at least one tool
+        // finished executing, so any "preparing…" placeholder that
+        // never received its completed tool_call was abandoned by
+        // the model. Leaving them visible confuses the user (they
+        // see "preparing…" for tools that never ran).
+        p().setSteps((prev) =>
+          prev.map((s) =>
+            s.isPending && s.step === step
+              ? {
+                  ...s,
+                  isPending: false,
+                  content: "(not completed — model did not finalize this call)",
+                }
+              : s,
+          ),
+        );
+
         const raw = payload.data?.output ?? "Execution completed.";
         const observationTool =
           payload.data?.tool_name ||
@@ -620,6 +778,21 @@ export function useSseStream(params: UseSseStreamParams) {
         // tool's last write happened in the same frame as the final
         // event.
         flushToolOutputStream();
+
+        // [TOOL_CALL_STARTING] Remove any orphaned pending
+        // placeholders entirely. The model abandoned them, so showing
+        // "(tool call was interrupted before arguments arrived)" adds
+        // noise without useful information. Removing them yields a
+        // clean timeline.
+        //
+        // Note: we FILTER (remove) rather than convert to a "failed"
+        // state because the model produced these starting signals but
+        // never completed the tool call — there is no user-actionable
+        // information to convey. If the model needs to try again, it
+        // will emit a NEW tool_call with a fresh id, which the user
+        // will see as a fresh card.
+        pendingToolCallsRef.current.clear();
+        p().setSteps((prev) => prev.filter((s) => !s.isPending));
 
         /**
          * Do not unconditionally clear humanQuery here. If the final event
@@ -893,6 +1066,11 @@ export function useSseStream(params: UseSseStreamParams) {
         // Flush pending chunks so the user sees the last output
         // before the error card renders.
         flushToolOutputStream();
+
+        // [TOOL_CALL_STARTING] Remove orphaned pending placeholders on
+        // error as well. Same rationale as the `final` handler above.
+        pendingToolCallsRef.current.clear();
+        p().setSteps((prev) => prev.filter((s) => !s.isPending));
         ctx.setHumanQuery(null);
         const errText = payload.data?.message ?? "Execution error encountered.";
         ctx.setFinalResult(safeRender(errText));

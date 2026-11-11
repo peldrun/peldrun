@@ -36,6 +36,23 @@ class SSEEventType(str, Enum):
     CHUNK = "chunk"
     TOOL_CALL = "tool_call"
     TOOL_CALLED = "tool_called"  # Compatibility alias
+
+    # Early tool-call indicator.
+    #
+    # Fired by the agent the moment the LLM provider emits its FIRST
+    # tool-call delta — that is, BEFORE the arguments JSON is fully
+    # streamed. The typical gap is 5-20 seconds (the time the model
+    # spends producing a 5-10 KB JSON payload). During that gap the
+    # user previously saw nothing; now they see a
+    # "⏳ preparing <tool_name>…" placeholder inside the active step.
+    #
+    # Non-terminal. The frontend replaces the placeholder with the
+    # real TOOL_CALL card once the JSON is complete.
+    #
+    # Payload shape:
+    #   { "tool_name": "...", "tool_call_id": "...", "seq": int, "model": "..." }
+    TOOL_CALL_STARTING = "tool_call_starting"
+
     TOOL_RETRY = "tool_retry"    # Centralized retry event
 
     # Tool Output Streaming Events (opt-in, see TOOL_OUTPUT_STREAMING flag)

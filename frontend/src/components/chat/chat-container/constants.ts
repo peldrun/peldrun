@@ -35,6 +35,12 @@ export const SSE_EVENT_TYPES = [
   "step_end",
   "thought",
   "tool_call",
+
+  // Early signal fired the moment the model begins emitting a
+  // tool-call. The arguments JSON is still being streamed; the
+  // frontend uses this to render a "preparing…" placeholder.
+  "tool_call_starting",
+
   "chunk",
   "tool_called",
   "tool_retry",
