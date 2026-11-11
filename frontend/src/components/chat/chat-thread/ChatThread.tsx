@@ -88,6 +88,8 @@ export function ChatThread({
   chatScrollBottomRef,
   activeModelName = "Assistant",
   activeProvider,
+  currentTurnProvider,
+  currentTurnModel,
   tokensUsed,
   costUsd,
   latencyMs,
@@ -102,15 +104,25 @@ export function ChatThread({
 }: ChatThreadProps) {
   const activePromptAnchorRef = useRef<HTMLDivElement | null>(null);
 
-  // `activeProvider` is provided as a prop by ChatContainer (which
-  // reads it from useAppStorage("active_provider") at the container
-  // level). Centralizing the read there guarantees that every
-  // consumer in the tree — ChatThread's header, HistoricalTurn, and
-  // ChatDeliverable — sees the same value within a single render
-  // pass. Previously this component read the value independently,
-  // which meant ChatContainer and ChatThread could momentarily see
-  // different values during a selector change.
-  const providerBadge = useProviderBadge(activeProvider);
+  // Two distinct provider values flow into this component:
+  //
+  //   * `activeProvider` — the user's CURRENT EngineSelector selection
+  //     (from useAppStorage). Passed down to HistoricalTurn as the
+  //     fallback for pre-upgrade turns that lack a per-turn snapshot.
+  //
+  //   * `currentTurnProvider` — the snapshot captured when the current
+  //     run STARTED (from ChatContainer's `runStartProviderRef`). Used
+  //     for the CURRENT turn's header, so the label does NOT change
+  //     just because the user picked a different engine for the NEXT
+  //     message. Falls back to `activeProvider` when undefined (for
+  //     external consumers that do not track the snapshot).
+  //
+  // Using the run-start snapshot for the current turn header matches
+  // ChatGPT / Claude behavior: past messages keep their original
+  // model label, while new selections only apply to future messages.
+  const displayProvider = currentTurnProvider ?? activeProvider;
+  const displayModel = currentTurnModel ?? activeModelName;
+  const displayProviderBadge = useProviderBadge(displayProvider);
 
   // Auto-scroll to the active prompt anchor when a new prompt is submitted.
   useEffect(() => {
@@ -239,9 +251,9 @@ export function ChatThread({
         {submittedPrompt && (
           <div className="flex items-center justify-between text-xs text-muted-foreground pt-1 pb-2">
             <ProviderModelBadge
-              providerName={activeProvider}
-              modelName={activeModelName}
-              providerBadge={providerBadge}
+              providerName={displayProvider}
+              modelName={displayModel}
+              providerBadge={displayProviderBadge}
               execMode={execMode}
               timestamp={sessionTimestamp}
             />

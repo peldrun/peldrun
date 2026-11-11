@@ -89,6 +89,22 @@ interface UseJobDetailsParams {
    * and the existing global value is preserved.
    */
   setActiveProvider?: (p: string) => void;
+  /**
+   * Called after a chat is loaded from the backend. Provides the
+   * authoritative provider/model of the LAST turn in the loaded
+   * session (from session.json), so the caller can sync its per-turn
+   * snapshot refs and keep the current turn's header showing the
+   * correct provider after a reload.
+   *
+   * Without this, a page reload leaves `runStartProviderRef` at the
+   * mount-time value while `activeProvider` is overwritten with
+   * `data.provider_name` — the current turn header would then show
+   * whichever value happened to win.
+   */
+  onChatLoaded?: (snapshot: {
+    provider: string | null;
+    model: string | null;
+  }) => void;
   setStatus: (s: ChatStatus) => void;
   setFinalResult: (r: string | null) => void;
   setSessionTimestamp: (t: string) => void;
@@ -217,6 +233,20 @@ export function useJobDetails(params: UseJobDetailsParams) {
       // selection changes.
       if (data.provider_name && typeof data.provider_name === "string") {
         p.setActiveProvider?.(data.provider_name);
+      }
+      // Sync the caller's per-turn snapshot refs with the loaded
+      // session's authoritative values. Only invoked when at least
+      // one value is present so legacy sessions with no provider
+      // metadata do not clear an in-flight ref.
+      if (data.provider_name || data.model) {
+        p.onChatLoaded?.({
+          provider:
+            typeof data.provider_name === "string"
+              ? data.provider_name
+              : null,
+          model:
+            typeof data.model === "string" ? data.model : null,
+        });
       }
       if (data.status) p.setStatus(data.status);
       if (data.result) p.setFinalResult(safeRender(data.result));

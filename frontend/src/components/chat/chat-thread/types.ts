@@ -164,6 +164,25 @@ export interface ChatThreadProps {
    * forwarded to HistoricalTurn / ChatDeliverable.
    */
   activeProvider?: string;
+  /**
+   * Provider snapshot for the CURRENT turn (the run that produced the
+   * last submitted prompt).
+   *
+   * Unlike `activeProvider` (the user's current EngineSelector
+   * selection), this value reflects the provider that ACTUALLY served
+   * the run. It is captured at run START time by ChatContainer's
+   * `runStartProviderRef`, so switching the EngineSelector mid-turn
+   * does NOT relabel the current turn.
+   *
+   * Falls back to `activeProvider` when undefined (external consumers
+   * that do not track per-turn snapshots).
+   */
+  currentTurnProvider?: string;
+  /**
+   * Model snapshot for the current turn. Same rationale as
+   * `currentTurnProvider`.
+   */
+  currentTurnModel?: string;
   tokensUsed?: { input: number; output: number; total: number };
   costUsd?: number | null;
   latencyMs?: number | null;

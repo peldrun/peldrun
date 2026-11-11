@@ -396,6 +396,14 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     setExecMode,
     setActiveModelName,
     setActiveProvider,
+    // Sync the per-turn snapshot refs from the loaded chat, so the
+    // current turn's header keeps showing the provider that actually
+    // produced it (even if the user has since changed the EngineSelector
+    // or reloaded the page).
+    onChatLoaded: ({ provider, model }) => {
+      if (provider) runStartProviderRef.current = provider;
+      if (model) runStartModelRef.current = model;
+    },
     setStatus,
     setFinalResult,
     setSessionTimestamp,
@@ -1593,11 +1601,17 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
             // ChatThreadProps.activeModelName is `string | undefined`
             // (optional). Coerce null to undefined at the boundary.
             activeModelName={activeModelName ?? undefined}
-            // Same for provider — used by ChatThread / HistoricalTurn
-            // as the fallback when a turn does not carry its own
-            // `provider` field (pre-upgrade turns, or the very first
-            // turn before any archive has happened).
+            // `activeProvider` / `activeModelName` = the user's CURRENT
+            // EngineSelector selection. Used by HistoricalTurn as the
+            // fallback for pre-upgrade turns that lack a snapshot.
             activeProvider={activeProvider ?? undefined}
+            // `currentTurnProvider` / `currentTurnModel` = the snapshot
+            // captured when the CURRENT run started. Used by
+            // ChatThread's current turn header, so switching the
+            // EngineSelector mid-turn does NOT relabel the turn that is
+            // already displayed.
+            currentTurnProvider={runStartProviderRef.current ?? undefined}
+            currentTurnModel={runStartModelRef.current ?? undefined}
             chatScrollBottomRef={chatScrollBottomRef}
             tokensUsed={tokensUsed}
             costUsd={currentCostUsd}
