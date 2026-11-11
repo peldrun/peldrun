@@ -30,6 +30,22 @@ from peldrun.events.schema import EventType
 logger = logging.getLogger("peldrun.engine.runner")
 
 
+class CheckpointPersistenceError(RuntimeError):
+    """Raised when the durable checkpoint cannot be persisted to disk.
+
+    [P1-8 FIX — Durable checkpointing]
+    Wraps the underlying I/O exception (disk full, permission denied,
+    read-only filesystem, corrupted temp dir, ...) so the runner's
+    outer error handler can mark the run FAILED with a clear
+    ``error_code`` (the class name) and a descriptive message.
+
+    Per the P0-1 contract, ``CheckpointManager.asave_checkpoint``
+    raises on disk-write failure and never returns a phantom
+    checkpoint whose disk copy is missing or truncated. The runner
+    treats the raised exception as a hard failure after one retry.
+    """
+
+
 @runtime_checkable
 class StepExecutableAgent(Protocol):
     """Protocol defining the interface required for agents executed by AgentRunner."""
@@ -74,6 +90,20 @@ class AgentRunner:
         self.config = config or RunnerConfig()
         self._cancel_requested = asyncio.Event()
         self._pause_requested = asyncio.Event()
+        # [P1-8 FIX — Durable checkpointing]
+        # Lazily constructed in ``run()`` once the effective
+        # ``workspace_root`` is known. The manager writes atomic
+        # disk snapshots and mirrors them into the durable RunStore,
+        # so ``RecoveryManager.plan_resume`` can see them after a
+        # crash/restart.
+        #
+        # ``None`` means either:
+        #   * ``config.enable_checkpointing=False`` — disabled; or
+        #   * ``run()`` was called without a workspace root; or
+        #   * ``CheckpointManager.ainitialize`` failed (read-only
+        #     filesystem, permission denied, ...) — logged at ERROR.
+        # In every ``None`` case, ``_persist_checkpoint`` is a no-op.
+        self._checkpoint_manager: Optional[Any] = None
 
     def cancel(self) -> None:
         """Signal execution cancellation at the next step boundary."""
@@ -118,6 +148,80 @@ class AgentRunner:
             "metadata": metadata,
         }
 
+    async def _persist_checkpoint(
+        self,
+        state: ExecutionState,
+        label: str,
+    ) -> None:
+        """Persist a checkpoint to disk + DB, honoring config.
+
+        [P1-8 FIX — Durable checkpointing]
+        The historical implementation only called
+        ``state.create_checkpoint()`` (in-memory). The in-memory
+        snapshot is inspected by callers within the same process but
+        is LOST on crash/restart — which left ``RecoveryManager``
+        unable to offer a Resume button and made
+        ``POST /runs/{id}/resume`` return 409 ``not_found``.
+
+        Post-fix behavior:
+
+          * Persist via ``CheckpointManager.asave_checkpoint``, which
+            performs an atomic disk write (temp -> fsync ->
+            ``os.replace``) and mirrors the checkpoint into the
+            durable RunStore so ``RecoveryManager.plan_resume`` can
+            see it after a crash.
+
+          * On first failure, retry once after 100ms. Transient
+            disk-full races are common when a parallel process
+            (e.g. the temp artifact cleaner) is releasing bytes.
+
+          * On second failure, wrap in ``CheckpointPersistenceError``
+            and raise. The runner's outer exception handler marks
+            the state FAILED with a clear message, so the user knows
+            the run cannot be reliably resumed. This honors the
+            P0-1 contract that a phantom checkpoint must never be
+            reported as success.
+
+          * When ``self._checkpoint_manager is None`` (checkpointing
+            disabled, no workspace root, or init failure), this
+            method is a strict no-op — identical to the pre-fix
+            behavior.
+        """
+        if self._checkpoint_manager is None:
+            return
+
+        try:
+            await self._checkpoint_manager.asave_checkpoint(
+                state, label=label
+            )
+            return
+        except Exception as first_exc:
+            logger.warning(
+                "Checkpoint persistence failed at step %d for run "
+                "%s (attempt 1/2); retrying in 100ms: %s",
+                state.current_step,
+                state.run_id,
+                first_exc,
+            )
+            await asyncio.sleep(0.1)
+
+        try:
+            await self._checkpoint_manager.asave_checkpoint(
+                state, label=label
+            )
+        except Exception as final_exc:
+            logger.exception(
+                "Checkpoint persistence failed at step %d for run "
+                "%s (attempt 2/2): %s",
+                state.current_step,
+                state.run_id,
+                final_exc,
+            )
+            raise CheckpointPersistenceError(
+                f"Checkpoint persistence failed at step "
+                f"{state.current_step} after retry: {final_exc}"
+            ) from final_exc
+
     async def run(
         self,
         task_prompt: str,
@@ -157,6 +261,58 @@ class AgentRunner:
 
         self._cancel_requested.clear()
         self._pause_requested.clear()
+
+        # [P1-8 FIX — Durable checkpointing]
+        # Lazily initialize the CheckpointManager once the effective
+        # workspace root is known. Runs with
+        # ``enable_checkpointing=False`` (or without a workspace
+        # root) skip this entirely — the run behaves exactly as
+        # before the fix (legacy in-memory checkpoint only).
+        #
+        # Initialization failure is non-fatal: we log at ERROR level
+        # so operators can see the missing durability guarantee, but
+        # the run continues (degraded, not crashed). This mirrors
+        # the philosophy of the startup recovery sweep: a broken
+        # subsystem must never prevent the primary operation from
+        # proceeding.
+        if self.config.enable_checkpointing:
+            _ws_root = (
+                getattr(state, "workspace_root", None)
+                or workspace_root
+                or None
+            )
+            if _ws_root:
+                try:
+                    from peldrun.engine.checkpoint import (
+                        CheckpointManager,
+                    )
+
+                    self._checkpoint_manager = CheckpointManager(
+                        workspace_root=_ws_root
+                    )
+                    await self._checkpoint_manager.ainitialize()
+                    logger.info(
+                        "Durable checkpointing enabled for run %s "
+                        "(workspace=%s, interval=%d)",
+                        state.run_id,
+                        _ws_root,
+                        self.config.checkpoint_interval,
+                    )
+                except Exception as ckpt_init_exc:
+                    logger.error(
+                        "Failed to initialize CheckpointManager for "
+                        "run %s; durable checkpointing DISABLED for "
+                        "this run: %s",
+                        state.run_id,
+                        ckpt_init_exc,
+                    )
+                    self._checkpoint_manager = None
+            else:
+                logger.info(
+                    "Durable checkpointing skipped for run %s: "
+                    "no workspace_root provided.",
+                    state.run_id,
+                )
 
         # Enforce formal FSM transition to RUNNING
         state.mark_running(reason="Starting agent execution loop")
@@ -214,6 +370,17 @@ class AgentRunner:
                             state.mark_paused(reason="Operator requested pause")
                             if self.config.enable_checkpointing:
                                 state.create_checkpoint()
+                                # [P1-8 FIX] Persist the pause
+                                # checkpoint durably so a crash
+                                # while paused can be resumed from
+                                # the pause boundary.
+                                await self._persist_checkpoint(
+                                    state,
+                                    label=(
+                                        f"pause_at_step_"
+                                        f"{state.current_step}"
+                                    ),
+                                )
                             await self.emitter.emit_snapshot(
                                 self._build_snapshot_payload(state, {"event_action": "paused"})
                             )
@@ -415,6 +582,17 @@ class AgentRunner:
                     and (step_index % self.config.checkpoint_interval == 0)
                 ):
                     state.create_checkpoint()
+                    # [P1-8 FIX] Persist the step checkpoint durably
+                    # so that (a) RecoveryManager can resume from it
+                    # after a crash and (b) the RunStore reflects the
+                    # last successfully completed step. Disk failures
+                    # are surfaced via ``_persist_checkpoint`` (which
+                    # re-raises after a retry) and marked FAILED by
+                    # the outer handler.
+                    await self._persist_checkpoint(
+                        state,
+                        label=f"step_{step_index}",
+                    )
 
                 await self.emitter.emit_step_end(step_number=step_index)
 

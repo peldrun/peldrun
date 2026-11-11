@@ -144,14 +144,34 @@ async def lifespan(app: FastAPI):
     try:
         from omweb.services.recovery import recover_orphaned_sessions
 
-        _recovery_report = recover_orphaned_sessions()
+        # [P0-6 FIX — Await the now-async recovery sweep]
+        #
+        # ``recover_orphaned_sessions`` became an ``async def`` when
+        # the RecoveryManager wiring landed (P0 Item 6). Calling it
+        # without ``await`` returns a coroutine that never runs and
+        # produces a ``RuntimeWarning: coroutine was never awaited``
+        # at GC time — the sweep would silently never execute, so
+        # every orphaned run would remain in its stale ``running``
+        # state forever. The ``await`` is load-bearing.
+        #
+        # The sweep now consults ``RecoveryManager.plan_resume`` for
+        # every orphan and reports the count of runs that are
+        # genuinely resumable, so the log line distinguishes
+        # "recovered to interrupted, nothing to resume" from
+        # "recovered to interrupted, N runs ready for /resume".
+        _recovery_report = await recover_orphaned_sessions()
+        _resumable_count = int(
+            _recovery_report.get("resumable_count", 0)
+        )
         if _recovery_report.get("interrupted"):
             logger.warning(
-                "Session recovery promoted %d orphaned session(s) to "
-                "'interrupted' out of %d scanned (previous process likely "
-                "crashed or was forcibly terminated).",
+                "Session recovery: promoted %d orphaned session(s) "
+                "out of %d scanned (%d resumable via POST /resume); "
+                "previous process likely crashed or was forcibly "
+                "terminated.",
                 _recovery_report["interrupted"],
                 _recovery_report["scanned"],
+                _resumable_count,
             )
         elif _recovery_report.get("skipped_unreadable") or _recovery_report.get(
             "errors"

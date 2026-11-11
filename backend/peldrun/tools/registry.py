@@ -46,8 +46,27 @@ class ToolRegistry:
             elif hasattr(tool, "workspace_root"):
                 setattr(tool, "workspace_root", workspace_root)
 
-    def register(self, tool: Union[ToolRuntime, BaseTool]) -> None:
-        """Register a tool instance and apply workspace boundaries."""
+    def register(
+        self,
+        tool: Union[ToolRuntime, BaseTool],
+        *,
+        force: bool = False,
+    ) -> None:
+        """
+        Register a tool instance and apply workspace boundaries.
+
+        [P1-10 FIX — Support force-forwarding]
+        The optional ``force`` keyword is forwarded to
+        ``ToolCollection.add_tool`` to override a name collision when
+        the caller intentionally wants to replace an existing
+        registration (e.g. a bundle update). Without this parameter,
+        the collision guard in ``add_tool`` would raise
+        ``ValueError`` at any re-registration site, breaking the
+        bundle-update flow that legitimately reuses a tool name.
+
+        See ``ToolCollection.add_tool`` for the full rationale of
+        why the collision guard exists.
+        """
         if self.workspace_root:
             if hasattr(tool, "workspace_root") and getattr(tool, "workspace_root") is None:
                 if hasattr(tool, "set_workspace") and callable(tool.set_workspace):
@@ -57,7 +76,7 @@ class ToolRegistry:
                 else:
                     setattr(tool, "workspace_root", self.workspace_root)
 
-        self._collection.add_tool(tool)
+        self._collection.add_tool(tool, force=force)
         logger.debug("Registered tool '%s' into Core ToolRegistry", tool.name)
 
     def unregister(self, name: str) -> Optional[Union[ToolRuntime, BaseTool]]:

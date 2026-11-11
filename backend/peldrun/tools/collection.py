@@ -9,6 +9,7 @@ with unified execution policies and structured ToolResult conversions.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict, List, Optional, Union
 
 from peldrun.tools.base import BaseTool, ToolResult
@@ -19,6 +20,9 @@ from peldrun.tools.contract import (
 )
 from peldrun.tools.execution_manager import ExecutionManager
 from peldrun.tools.execution_result import ToolExecutionResult
+
+
+logger = logging.getLogger("peldrun.tools.collection")
 
 
 class ToolCollection:
@@ -44,8 +48,52 @@ class ToolCollection:
             for tool in tools:
                 self.add_tool(tool)
 
-    def add_tool(self, tool: Union[ToolRuntime, BaseTool]) -> None:
-        """Register a tool or adapter instance in the collection."""
+    def add_tool(
+        self,
+        tool: Union[ToolRuntime, BaseTool],
+        *,
+        force: bool = False,
+    ) -> None:
+        """
+        Register a tool or adapter instance in the collection.
+
+        [P1-10 FIX — Collision detection]
+        The historical implementation wrote
+        ``self._tools[tool.name] = tool`` unconditionally, silently
+        overwriting any previously-registered tool with the same name.
+        That produced a class of "phantom" bugs the user could not
+        diagnose: a bundle update, a plugin install, or a double
+        ``ToolRegistry.register`` call could replace the tool the
+        user selected with a different class — no warning, no log,
+        no exception.
+
+        Post-fix behavior (three explicit cases):
+
+          * **Identical object identity** — no-op. Callers that
+            re-register the SAME instance are safe (idempotent).
+          * **Different class instance with the same name** — raises
+            ``ValueError`` with a message naming both classes, so the
+            bug surfaces at the call site instead of as a mysterious
+            behavior change at runtime.
+          * **``force=True``** — overwrite with a WARNING log entry
+            so the collision remains visible in the audit trail.
+            This is the escape hatch for a deliberate replacement
+            (e.g. a migration that swaps in a newer implementation).
+        """
+        existing = self._tools.get(tool.name)
+        if existing is not None and existing is not tool:
+            existing_class = type(existing).__name__
+            new_class = type(tool).__name__
+            message = (
+                f"Tool name collision: '{tool.name}' is already "
+                f"registered as {existing_class}; refusing to "
+                f"overwrite with {new_class}. Pass force=True to "
+                f"override deliberately, or register the new tool "
+                f"under a distinct name."
+            )
+            if not force:
+                raise ValueError(message)
+            logger.warning(message + " (force=True; overwriting)")
         self._tools[tool.name] = tool
 
     def get_tool(self, name: str) -> Optional[Union[ToolRuntime, BaseTool]]:

@@ -442,28 +442,40 @@ def _enforce_terminate_invariant(
         )
 
     if requested == "success" and result.is_failure:
+        # [P2 FIX — B4-R]
+        # The historical implementation promoted a failure to a
+        # success here, silently completing the run on a broken
+        # terminate. See "B4-R" in the PELDRUN execution repair plan.
+        #
+        # The actual ``is_failure`` signal is authoritative. Coercing
+        # to success would let ``TerminateTool(status="success")``
+        # overwrite the real tool outcome whenever the tool call
+        # itself failed -- exactly the class of silent recovery the
+        # plan forbids.
+        #
+        # The diagnostic metadata and warning remain so operators
+        # can see the mismatch in logs and in the result without
+        # any silent state change.
         note = (
-            "Coerced to success by ExecutionManager because "
-            "metadata.status='success' but the raw tool call "
-            "reported a failure. The failure is preserved in "
-            "metadata.raw_error for diagnostics."
+            "Tool reported metadata.status='success' but the raw "
+            "call failed. NOT coerced to success (B4-R). The "
+            "actual failure is preserved; see metadata.raw_error."
         )
         new_meta = dict(metadata)
         new_meta["coercion_note"] = note
         new_meta["raw_error"] = result.error
         logger.warning(
-            "B4 inverse coercion: tool '%s' returned failure with "
-            "metadata.status='success'; promoting to success result.",
+            "B4-R: tool '%s' claimed status='success' but the raw "
+            "call failed (%s). Returning the ACTUAL failure; not "
+            "coercing to success.",
             result.tool_name,
+            result.error or "no error message",
         )
-        return ToolExecutionResult.success(
-            tool_name=result.tool_name,
-            tool_call_id=result.tool_call_id,
-            output=result.output,
-            artifacts=list(result.artifacts),
-            metadata=new_meta,
-            duration_ms=result.duration_ms,
-        )
+        # Attach diagnostic metadata without changing the outcome.
+        # Downstream consumers (TerminationEvaluator, ToolCallAgent
+        # .step) receive the true result.
+        result.metadata = new_meta
+        return result
 
     return result
 

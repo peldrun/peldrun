@@ -556,6 +556,15 @@ class OpenAINativeAdapter:
         active_tools: Dict[int, Dict[str, Any]] = {}
         captured_usage: Optional[TokenUsage] = None
         finish_reason: Optional[str] = None
+        # [P2-18 FIX — Terminal marker tracking]
+        # Same pattern as P1-13 in ollama_native.py / lmstudio_native.py.
+        # OpenAI's Chat Completions streaming contract requires every
+        # well-formed stream to end with a chunk whose ``finish_reason``
+        # is set. If the loop exits WITHOUT observing one, the stream
+        # was truncated (network drop, provider crash, mid-SSE cut).
+        # Emitting ``finish_reason="stop"`` in that case silently
+        # reports truncation as success.
+        saw_finish_reason: bool = False
 
         try:
             async for chunk in stream:
@@ -649,6 +658,8 @@ class OpenAINativeAdapter:
                 chunk_finish = getattr(first, "finish_reason", None)
                 if chunk_finish:
                     finish_reason = chunk_finish
+                    # [P2-18 FIX] Terminal marker observed.
+                    saw_finish_reason = True
 
         except asyncio.CancelledError:
             # Cancel propagation — close the stream and re-raise.
@@ -687,11 +698,35 @@ class OpenAINativeAdapter:
                 sequence=seq,
             )
 
-        # Final message complete.
+        # [P2-18 FIX — Honest terminal marker]
+        # The pre-fix code emitted ``finish_reason=finish_reason or "stop"``
+        # even when no ``finish_reason`` was ever observed. That
+        # silently reported truncated streams as "completed", so
+        # consumers (StreamNormalizer, ToolCallAgent) accepted
+        # partial output as final and never retried.
+        #
+        # Post-fix:
+        #   * saw_finish_reason=True  → emit the real reason, or
+        #     "stop" when a provider sent an empty string.
+        #   * saw_finish_reason=False → emit "incomplete" so
+        #     ToolCallAgent.think retries via its INCOMPLETE_STREAM
+        #     path (see E.1 in llm/client.py).
+        if saw_finish_reason:
+            _effective_finish_reason = finish_reason or "stop"
+        else:
+            _effective_finish_reason = "incomplete"
+            logger.warning(
+                "[P2-18] OpenAI Chat Completions stream ended "
+                "WITHOUT a terminal finish_reason (model=%s). "
+                "Emitting finish_reason='incomplete' so consumers "
+                "can retry with a fresh attempt.",
+                compiled.model,
+            )
+
         seq += 1
         yield LLMStreamEvent(
             type=StreamEventType.MESSAGE_COMPLETE,
-            finish_reason=finish_reason or "stop",
+            finish_reason=_effective_finish_reason,
             usage=captured_usage,
             sequence=seq,
         )
@@ -950,6 +985,13 @@ class OpenAINativeAdapter:
         active_tools: Dict[str, Dict[str, Any]] = {}
         captured_usage: Optional[TokenUsage] = None
         finish_reason: Optional[str] = None
+        # [P2-18 FIX — Terminal marker tracking]
+        # The Responses API's terminal marker is the
+        # ``response.completed`` event. If we never observe it, the
+        # stream was truncated mid-response and we must not claim
+        # success. Identical concern to the Chat Completions path
+        # above, different wire format.
+        saw_terminal_marker: bool = False
 
         try:
             async for event in stream:
@@ -1038,10 +1080,31 @@ class OpenAINativeAdapter:
                 elif event_type == "response.completed":
                     response_obj = getattr(event, "response", None)
                     if response_obj is not None:
-                        captured_usage = _convert_responses_usage(
-                            getattr(response_obj, "usage", None)
+                        # [P2-18 FIX] Terminal marker observed.
+                        saw_terminal_marker = True
+                        # [P2-18 FIX — Dict-or-object tolerance]
+                        # The real OpenAI SDK returns an
+                        # attribute-bearing Pydantic object, but
+                        # proxies, wrappers, and test doubles may
+                        # hand back a plain dict. Accept both
+                        # shapes so the status check works
+                        # regardless. Without this, a dict input
+                        # silently produces ``finish_reason=None``
+                        # and the stream is misclassified as
+                        # truncated even though it completed.
+                        _resp_usage = (
+                            response_obj.get("usage")
+                            if isinstance(response_obj, dict)
+                            else getattr(response_obj, "usage", None)
                         )
-                        status = getattr(response_obj, "status", None)
+                        captured_usage = _convert_responses_usage(
+                            _resp_usage
+                        )
+                        status = (
+                            response_obj.get("status")
+                            if isinstance(response_obj, dict)
+                            else getattr(response_obj, "status", None)
+                        )
                         if status == "completed":
                             finish_reason = "stop"
                         elif status == "incomplete":
@@ -1097,10 +1160,31 @@ class OpenAINativeAdapter:
                 sequence=seq,
             )
 
+        # [P2-18 FIX — Honest terminal marker, trust-the-marker]
+        # The presence of ``response.completed`` is sufficient proof
+        # that the stream ended cleanly. ``finish_reason`` might
+        # still be None when the SDK omitted ``status`` (or when a
+        # proxy returned a partial dict) — in that case we MUST
+        # default to "stop", not "incomplete". The historical
+        # ``saw_terminal_marker AND finish_reason`` conjunction
+        # incorrectly reported cleanly-terminated streams as
+        # truncated whenever the status field was unhelpful.
+        if saw_terminal_marker:
+            _effective_finish_reason = finish_reason or "stop"
+        else:
+            _effective_finish_reason = "incomplete"
+            logger.warning(
+                "[P2-18] OpenAI Responses stream ended WITHOUT "
+                "a 'response.completed' event (model=%s). "
+                "Emitting finish_reason='incomplete' so consumers "
+                "can retry with a fresh attempt.",
+                compiled.model,
+            )
+
         seq += 1
         yield LLMStreamEvent(
             type=StreamEventType.MESSAGE_COMPLETE,
-            finish_reason=finish_reason or "stop",
+            finish_reason=_effective_finish_reason,
             usage=captured_usage,
             sequence=seq,
         )

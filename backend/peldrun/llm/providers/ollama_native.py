@@ -382,6 +382,22 @@ class OllamaNativeAdapter:
         seq = 0
         captured_usage: Optional[TokenUsage] = None
         finish_reason: Optional[str] = None
+        # [P1-13 FIX — Terminal marker tracking]
+        # The historical implementation emitted MESSAGE_COMPLETE
+        # unconditionally after the NDJSON loop, even if the
+        # provider stream terminated WITHOUT ever sending a
+        # ``done: true`` chunk. That produced the same silent
+        # "truncation reported as success" bug that
+        # ``AsyncLLMClient.stream`` and ``StreamNormalizer``
+        # already guard against — but on the native Ollama path,
+        # where the earlier fixes do not reach.
+        #
+        # This flag tracks whether the provider sent the
+        # terminal marker. It is set to True ONLY inside the
+        # ``if chunk.get("done")`` branch, immediately before
+        # ``break``. After the loop, MESSAGE_COMPLETE uses it to
+        # pick the honest ``finish_reason``.
+        saw_terminal_marker: bool = False
 
         try:
             async with self._http.stream(
@@ -484,6 +500,14 @@ class OllamaNativeAdapter:
                     # Terminal chunk.
                     # ---------------------------------------------------
                     if chunk.get("done"):
+                        # [P1-13 FIX] Mark that the provider sent
+                        # the terminal marker. This is the ONLY
+                        # place in the loop that sets it, so the
+                        # post-loop check has a hard guarantee:
+                        # if ``saw_terminal_marker`` is False, the
+                        # stream ended WITHOUT ``done: true`` — it
+                        # was truncated, not completed.
+                        saw_terminal_marker = True
                         # Capture usage from the terminal chunk.
                         prompt_count = chunk.get("prompt_eval_count")
                         eval_count = chunk.get("eval_count")
@@ -558,10 +582,45 @@ class OllamaNativeAdapter:
                 sequence=seq,
             )
 
+        # [P1-13 FIX — Honest terminal marker]
+        # The historical implementation emitted
+        # ``finish_reason=finish_reason or "stop"`` even when the
+        # provider never sent ``done: true``. That silently reported
+        # a truncated stream as a normal completion, so consumers
+        # (ToolCallAgent, Direct Chat) accepted partial output as
+        # final and never retried.
+        #
+        # Post-fix:
+        #   * If ``saw_terminal_marker`` is True — the provider
+        #     explicitly signalled completion via ``done: true``.
+        #     Emit the accumulated finish_reason (default "stop").
+        #   * If False — the stream ended without ``done: true``
+        #     (network drop, provider crash, partial NDJSON). Emit
+        #     ``finish_reason="incomplete"`` so downstream code can
+        #     distinguish truncation from completion and retry via
+        #     ``StreamNormalizer`` / ``ToolCallAgent.think``.
+        #
+        # ``StreamEventType.MESSAGE_COMPLETE`` is still emitted in
+        # both cases — this preserves the invariant that every
+        # well-formed stream terminates with a single
+        # MESSAGE_COMPLETE event. Only the ``finish_reason`` value
+        # becomes truthful.
+        if saw_terminal_marker:
+            _effective_finish_reason = finish_reason or "stop"
+        else:
+            _effective_finish_reason = "incomplete"
+            logger.warning(
+                "[P1-13] Ollama stream ended WITHOUT a terminal "
+                "'done: true' chunk (model=%s). Emitting "
+                "finish_reason='incomplete' so consumers can retry "
+                "with a fresh attempt.",
+                compiled.model,
+            )
+
         seq += 1
         yield LLMStreamEvent(
             type=StreamEventType.MESSAGE_COMPLETE,
-            finish_reason=finish_reason or "stop",
+            finish_reason=_effective_finish_reason,
             usage=captured_usage,
             sequence=seq,
         )

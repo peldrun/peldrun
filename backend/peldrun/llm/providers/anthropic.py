@@ -118,6 +118,28 @@ _MIN_THINKING_BUDGET = 1024
 _DEFAULT_THINKING_BUDGET = 4000
 
 
+#: [P1-12 FIX — Output reserve]
+#: Minimum number of tokens that must remain available for the
+#: model's actual response AFTER the thinking budget has been
+#: allocated. The historical code only enforced
+#: ``budget < max_tokens``, which permits cases like
+#: ``max_tokens=1500, budget=1400`` where only 100 tokens remain
+#: for output — the model spends its entire allowance on internal
+#: reasoning and returns an empty or truncated response with NO
+#: warning.
+#:
+#: ``1024`` matches the minimum extended-thinking budget. It gives
+#: the model enough room for a useful answer while keeping the
+#: reasoning allowance meaningful. When the caller's
+#: ``max_tokens`` cannot accommodate both a minimum thinking budget
+#: AND this reserve (i.e. ``max_tokens < MIN_THINKING_BUDGET +
+#: MIN_OUTPUT_RESERVE = 2048``), extended thinking is DISABLED —
+#: sending a thinking budget that leaves no room for output would
+#: produce the exact silent-empty-response failure this constant
+#: exists to prevent.
+_MIN_OUTPUT_RESERVE = 1024
+
+
 # ---------------------------------------------------------------------------
 # Adapter profile
 # ---------------------------------------------------------------------------
@@ -993,22 +1015,78 @@ class AnthropicAdapter:
             return {"type": "adaptive"}, None
 
         if rtype == "enabled":
+            # [P1-12 FIX — Budget reserve enforcement]
+            #
+            # The historical logic enforced only ``budget <
+            # max_tokens``. That allowed cases where the thinking
+            # budget consumed almost the entire output allowance,
+            # leaving too few tokens for the model's actual answer.
+            # Real-world symptom: the run bills for reasoning
+            # tokens, the user sees "thinking..." in the UI, and
+            # the response comes back empty with NO error message
+            # — the model exhausted ``max_tokens`` on internal
+            # reasoning.
+            #
+            # Post-fix invariants (in order):
+            #
+            #   1. Budget must be an int >= _MIN_THINKING_BUDGET.
+            #      Anything else is normalized to the default (4000).
+            #
+            #   2. The caller's ``max_tokens`` MUST be large enough
+            #      to fit both a minimum thinking budget AND the
+            #      output reserve. When
+            #      ``max_tokens < _MIN_THINKING_BUDGET + _MIN_OUTPUT_RESERVE``,
+            #      extended thinking is DISABLED entirely (returns
+            #      ``(None, None)``). Sending a thinking block under
+            #      these limits guarantees an unusable response.
+            #
+            #   3. The final budget is capped at
+            #      ``max_tokens - _MIN_OUTPUT_RESERVE`` so the
+            #      response ALWAYS has at least 1024 tokens of room,
+            #      even if the caller requested a larger budget.
+            #
+            # Every adjustment is logged at INFO (no silent
+            # truncation) so operators can diagnose budget-related
+            # failures from the log alone.
+            _min_required_max_tokens = (
+                _MIN_THINKING_BUDGET + _MIN_OUTPUT_RESERVE
+            )
+
+            if max_tokens < _min_required_max_tokens:
+                logger.warning(
+                    "Anthropic adapter: extended thinking DISABLED. "
+                    "max_tokens=%d cannot accommodate "
+                    "_MIN_THINKING_BUDGET=%d + "
+                    "_MIN_OUTPUT_RESERVE=%d (=%d minimum). "
+                    "Sending a thinking budget under these limits "
+                    "would guarantee an empty or truncated "
+                    "response. Increase max_tokens to >= %d to "
+                    "enable thinking.",
+                    max_tokens,
+                    _MIN_THINKING_BUDGET,
+                    _MIN_OUTPUT_RESERVE,
+                    _min_required_max_tokens,
+                    _min_required_max_tokens,
+                )
+                return None, None
+
             budget = reasoning.get("budget_tokens")
             if not isinstance(budget, int) or budget < _MIN_THINKING_BUDGET:
                 budget = _DEFAULT_THINKING_BUDGET
 
-            # Ensure budget < max_tokens with a 1024-token reserve for
-            # the actual response.
-            if max_tokens <= _MIN_THINKING_BUDGET:
-                logger.debug(
-                    "Skipping thinking: max_tokens (%d) too small for "
-                    "budget (%d).",
+            # Enforce the output reserve as a hard upper bound.
+            _max_allowed_budget = max_tokens - _MIN_OUTPUT_RESERVE
+            if budget > _max_allowed_budget:
+                logger.info(
+                    "Anthropic adapter: thinking budget capped from "
+                    "%d to %d (max_tokens=%d - output reserve=%d) "
+                    "so the model has room to answer.",
+                    budget,
+                    _max_allowed_budget,
                     max_tokens,
-                    _MIN_THINKING_BUDGET,
+                    _MIN_OUTPUT_RESERVE,
                 )
-                return None, None
-            if budget >= max_tokens:
-                budget = max(_MIN_THINKING_BUDGET, max_tokens - _MIN_THINKING_BUDGET)
+                budget = _max_allowed_budget
 
             return {"type": "enabled", "budget_tokens": budget}, None
 

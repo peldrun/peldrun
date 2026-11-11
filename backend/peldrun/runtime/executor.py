@@ -59,6 +59,7 @@ from peldrun.llm.request import (
 )
 from peldrun.runtime.contract import BudgetExceededError, RunRequest, RunResult, RunStatus
 from peldrun.runtime.diagnostics import DiagnosticsCollector
+from peldrun.runtime.ports import AgentRegistryPort, NullAgentRegistryPort
 from peldrun.runtime.pricing_store import get_pricing_store
 from peldrun.runtime.usage_store import LLMInvocationRecord, get_usage_store
 from peldrun.tools.builtins.delegate_tool import DelegateTool
@@ -306,10 +307,32 @@ class CoreRuntimeExecutor:
         request: RunRequest,
         event_listener: Optional[EventListener] = None,
         custom_tools: Optional[List[Any]] = None,
+        restored_state: Optional[ExecutionState] = None,
     ) -> RunResult:
         """
         Execute an autonomous agent task adhering strictly to canonical RunRequest.
         Orchestrates ContextManager assembly, LLM client, tool execution, telemetry, and durable token persistence.
+
+        Parameters
+        ----------
+        request
+            Canonical invocation request. For a resumed run,
+            ``request.prompt`` should carry the ORIGINAL prompt that is
+            already present in ``restored_state.messages`` -- the
+            executor does NOT re-add it.
+        event_listener
+            Optional async listener subscribed to every PeldrunEvent.
+        custom_tools
+            Optional additional tools to register for this run.
+        restored_state
+            When provided, this is a RESUMED run (typically built by
+            ``RecoveryManager.plan_resume`` or read from
+            ``CheckpointManager.arestore_state``). The executor skips
+            context assembly and uses ``restored_state`` verbatim as
+            the ``initial_state`` handed to ``AgentRunner``. The
+            state's persisted ``messages``, ``current_step``, and
+            tool-call history are the single source of truth; the
+            executor does NOT rebuild them from the request.
         """
         job_id = request.job_id
         run_id_str = str(request.run_id)
@@ -338,47 +361,64 @@ class CoreRuntimeExecutor:
 
         # 2. Initialize EventEmitter and bind event listener with durable queue tracking
         emitter = EventEmitter(run_id=run_id_str)
+
+        # [P2 FIX — ResourceMonitor optional hook]
+        # The historical ``_telemetry_event_interceptor`` (below)
+        # imported ``omweb.services.resource_monitor_service``
+        # inline and drove span creation directly. That violated the
+        # Core/OMWeb boundary (fixed in P0 Item 2). The monitor now
+        # subscribes to the same emitter events from OUTSIDE Core.
+        #
+        # The bridge below is the contract:
+        #   * ``request.metadata["resource_monitor_hook"]`` must be a
+        #     synchronous callable that accepts one ``PeldrunEvent``.
+        #   * ``omweb`` supplies it via ``start_run.py`` /
+        #     ``peldrun_engine`` after constructing the run request.
+        #   * When absent, ``emitter`` has no extra subscriber and
+        #     the run behaves exactly as before the P2 fix.
+        #
+        # The hook is called SYNCHRONOUSLY (not awaited). Resource
+        # monitoring is telemetry-only; it must NEVER block or slow
+        # the agent loop. Any exception raised by the hook is
+        # swallowed so a broken monitor cannot fail a run.
+        _monitor_hook = (
+            request.metadata.get("resource_monitor_hook")
+            if isinstance(request.metadata, dict)
+            else None
+        )
+        if callable(_monitor_hook):
+            def _monitor_bridge(evt: PeldrunEvent) -> None:
+                try:
+                    _monitor_hook(evt)
+                except Exception as _mon_exc:  # noqa: BLE001
+                    logger.debug(
+                        "Resource monitor hook failed for %s: %s",
+                        run_id_str,
+                        _mon_exc,
+                    )
+            emitter.subscribe_all(_monitor_bridge)
+
         main_loop = asyncio.get_running_loop()
 
         active_tool_calls: Dict[str, str] = {}
-        active_span_ids: Dict[str, str] = {}
         pending_listener_futures: Set[Any] = set()
 
         def _telemetry_event_interceptor(evt: PeldrunEvent) -> None:
             if hasattr(evt, "step") and isinstance(evt.step, int) and evt.step > 0:
                 diagnostics.set_step(evt.step)
 
-            # --- Resource Monitor Span Tracking (best-effort, decoupled) ---
-            try:
-                from omweb.services.resource_monitor_service import get_resource_monitor_service
-                from omweb.resource_monitor.models import SpanType, SpanStatus
-
-                monitor = get_resource_monitor_service()
-
-                if evt.type in (EventType.TOOL_CALL, getattr(EventType, "TOOL_CALLED", None)):
-                    t_name = str(evt.payload.get("tool_name") or evt.payload.get("tool") or "tool")
-                    span_id = f"span_{uuid.uuid4().hex[:12]}"
-                    monitor.start_span(
-                        span_id=span_id,
-                        run_id=job_id,
-                        target_name=t_name,
-                        span_type=SpanType.TOOL_CALL,
-                    )
-                    active_span_ids[t_name] = span_id
-
-                elif evt.type in (EventType.OBSERVATION, getattr(EventType, "TOOL_COMPLETED", None)):
-                    t_name = str(evt.payload.get("tool_name") or evt.payload.get("tool") or "")
-                    span_id = active_span_ids.pop(t_name, None)
-                    if not span_id and active_span_ids:
-                        span_id = active_span_ids.pop(list(active_span_ids.keys())[-1])
-
-                    if span_id:
-                        is_err = bool(evt.payload.get("error"))
-                        status = SpanStatus.FAILED if is_err else SpanStatus.COMPLETED
-                        monitor.end_span(span_id=span_id, status=status)
-            except Exception:
-                # Never let monitoring break execution
-                pass
+            # [P0-2 FIX — Core/OMWeb boundary]
+            # The historical implementation imported
+            # ``omweb.services.resource_monitor_service`` here and drove
+            # the resource monitor's span lifecycle directly from the
+            # core executor. That violated the plan's architecture rule
+            # that ``peldrun`` must not depend on ``omweb``.
+            #
+            # The omweb layer now subscribes to the same emitter events
+            # (TOOL_CALL / OBSERVATION) from its own side and manages
+            # span tracking there. The executor is provider-neutral and
+            # remains importable in isolation (unit tests, CLI tools,
+            # headless runs).
 
             # --- Diagnostics Collector Tracking (existing) ---
             if evt.type in (EventType.TOOL_CALL, getattr(EventType, "TOOL_CALLED", None)):
@@ -423,6 +463,32 @@ class CoreRuntimeExecutor:
         )
 
         if can_delegate:
+            # [P2 FIX — AgentRegistryPort wiring]
+            # The historical coordinator constructor omitted
+            # ``agent_registry``, which caused the coordinator to fall
+            # through to ``parent_request.agent_spec.tools`` whenever
+            # it needed to resolve a specialist's authorized tool
+            # allowlist. That fallback is correct but coarse: it uses
+            # the parent's tools verbatim instead of the specialist's
+            # own manifest, so a researcher's tools leak into a
+            # coder's child run and vice versa.
+            #
+            # The registry is injected via ``request.metadata`` so
+            # that the omweb layer (which owns the real registry) can
+            # supply it without executor.py importing omweb. When
+            # absent (unit tests, headless runs, CLI invocations),
+            # ``NullAgentRegistryPort`` is used — the coordinator's
+            # fallback path then runs exactly as before.
+            _agent_registry: AgentRegistryPort = (
+                request.metadata.get("agent_registry")
+                if isinstance(request.metadata, dict)
+                and isinstance(
+                    request.metadata.get("agent_registry"),
+                    AgentRegistryPort,
+                )
+                else NullAgentRegistryPort()
+            )
+
             coordinator = MultiAgentCoordinator(
                 parent_emitter=emitter,
                 workspace_root=ws_root,
@@ -430,6 +496,7 @@ class CoreRuntimeExecutor:
                 default_max_steps=int(spec.max_steps),
                 execute_fn=self.execute,
                 parent_request=request,
+                agent_registry=_agent_registry,
             )
             delegate_tool = DelegateTool(
                 coordinator=coordinator,
@@ -1173,98 +1240,164 @@ class CoreRuntimeExecutor:
                     _mm_exc,
                 )
 
-        initial_state = ExecutionState(
-            run_id=run_id_str,
-            task_prompt=request.prompt,
-            agent_name=agent.name,
-            max_steps=spec.max_steps,
-            workspace_root=ws_root,
-            metadata={
-                "run_id": run_id_str,
+        # [P0-2 FIX — Resume path]
+        # When ``restored_state`` is supplied the executor MUST NOT
+        # rebuild context from the request: the persisted state already
+        # carries the full message history, tool results, and progress.
+        # Rebuilding would duplicate the original user prompt and lose
+        # the completed steps. The Runner rehydrates ``agent.messages``
+        # from ``state.messages`` at each step, so ``restored_state`` IS
+        # the source of truth on resume.
+        if restored_state is not None:
+            if str(restored_state.run_id) != run_id_str:
+                logger.error(
+                    "restored_state.run_id (%s) does not match "
+                    "request.run_id (%s). Using restored_state verbatim; "
+                    "downstream lineage tracking may be inconsistent.",
+                    restored_state.run_id,
+                    run_id_str,
+                )
+            initial_state = restored_state
+            # Enrich metadata with the CURRENT run's context (job_id
+            # can change if the operator resumed under a different
+            # session). Preserve every field the checkpoint carried so
+            # that nothing the original run recorded is lost.
+            initial_state.metadata.update({
                 "job_id": job_id,
                 "parent_run_id": parent_run_id,
                 "root_run_id": root_run_id,
                 "delegation_depth": delegation_depth,
-                "request_metadata": request.metadata,
-                "reasoning_effort": resolved_effort,
-                "context_budget": budget_usage,
-            },
-        )
-
-        for msg in assembled_messages:
-            role_str = str(msg.get("role", "user")).lower()
-            if role_str == "system":
-                role_enum = MessageRole.SYSTEM
-            elif role_str == "assistant":
-                role_enum = MessageRole.ASSISTANT
-            else:
-                role_enum = MessageRole.USER
-
-            _raw_content = msg.get("content", "")
-
-            # [FIX-MULTIMODAL-STATE] Preserve the full multimodal payload
-            # in ``ExecutionState.messages`` too — NOT just in
-            # ``agent.messages``. The AgentRunner uses
-            # ``initial_state.messages`` as the source of truth for each
-            # LLM call: it rehydrates ``agent.messages`` from
-            # ``state.messages`` at the start of every step. If we
-            # flatten here, the model loses the ``image_url`` parts
-            # entirely and reports that it cannot see any image, while
-            # chat mode (which bypasses ExecutionState) works correctly.
-            #
-            # Trade-off:
-            #   * Checkpoints for image turns become larger (base64 image
-            #     data is serialized into the checkpoint JSON). This is
-            #     bounded — checkpoints are overwritten each step, and
-            #     turns with images are typically single-LLM-call runs.
-            #   * If ``add_message`` type-checks content as ``str`` and
-            #     rejects the multimodal list, we fall back to the
-            #     flattened summary so the run still proceeds. A warning
-            #     is logged so the failure is diagnosable.
-            if isinstance(_raw_content, list):
-                try:
-                    initial_state.add_message(
-                        role=role_enum, content=_raw_content
-                    )
-                    logger.info(
-                        "[FIX-MULTIMODAL-STATE] Preserved %d multimodal "
-                        "part(s) in ExecutionState for role=%s (job=%s)",
-                        len(_raw_content),
-                        role_enum.value,
-                        job_id,
-                    )
-                    continue
-                except (TypeError, ValueError, AttributeError) as state_add_err:
-                    logger.warning(
-                        "[FIX-MULTIMODAL-STATE] ExecutionState rejected "
-                        "multimodal content for job %s: %s — falling "
-                        "back to flattened summary (model will NOT "
-                        "receive image parts this turn).",
-                        job_id,
-                        state_add_err,
-                    )
-
-                # Fallback: flatten with a clear marker.
-                _text_fragments = [
-                    str(_p.get("text", ""))
-                    for _p in _raw_content
-                    if isinstance(_p, dict)
-                    and _p.get("type") == "text"
-                    and _p.get("text")
-                ]
-                _img_count = sum(
-                    1
-                    for _p in _raw_content
-                    if isinstance(_p, dict) and _p.get("type") == "image_url"
+                "resumed": True,
+            })
+            logger.info(
+                "Resuming run %s from restored_state at step %d with "
+                "%d persisted message(s). Context assembly skipped.",
+                run_id_str,
+                initial_state.current_step,
+                len(initial_state.messages or []),
+            )
+            # Best-effort pre-rehydration of ``agent.messages`` from
+            # the restored state. The Runner also rehydrates per step,
+            # but pre-populating avoids a blank first-call frame if the
+            # Runner reads ``agent.messages`` before its own rehydration
+            # runs. Failure here is not fatal: the Runner's rehydration
+            # will still fire on the first step.
+            try:
+                _restored_msgs = list(initial_state.messages or [])
+                _rehydrated = []
+                for _m in _restored_msgs:
+                    if isinstance(_m, dict):
+                        _role = _m.get("role", "user")
+                        _content = _m.get("content", "")
+                    else:
+                        _role_obj = getattr(_m, "role", "user")
+                        _role = (
+                            _role_obj.value
+                            if hasattr(_role_obj, "value")
+                            else str(_role_obj)
+                        )
+                        _content = getattr(_m, "content", "")
+                    _rehydrated.append({"role": _role, "content": _content})
+                agent.messages = _rehydrated
+            except Exception as rehydrate_err:
+                logger.warning(
+                    "Could not pre-rehydrate agent.messages from "
+                    "restored_state (Runner will rehydrate per step): %s",
+                    rehydrate_err,
                 )
-                _flattened = " ".join(_text_fragments)
-                if _img_count > 0:
-                    _flattened += f" [{_img_count} image(s) attached]"
-                initial_state.add_message(role=role_enum, content=_flattened)
-            else:
-                initial_state.add_message(role=role_enum, content=str(_raw_content))
+        else:
+            initial_state = ExecutionState(
+                run_id=run_id_str,
+                task_prompt=request.prompt,
+                agent_name=agent.name,
+                max_steps=spec.max_steps,
+                workspace_root=ws_root,
+                metadata={
+                    "run_id": run_id_str,
+                    "job_id": job_id,
+                    "parent_run_id": parent_run_id,
+                    "root_run_id": root_run_id,
+                    "delegation_depth": delegation_depth,
+                    "request_metadata": request.metadata,
+                    "reasoning_effort": resolved_effort,
+                    "context_budget": budget_usage,
+                },
+            )
 
-        agent.messages = [dict(m) for m in assembled_messages]
+            for msg in assembled_messages:
+                role_str = str(msg.get("role", "user")).lower()
+                if role_str == "system":
+                    role_enum = MessageRole.SYSTEM
+                elif role_str == "assistant":
+                    role_enum = MessageRole.ASSISTANT
+                else:
+                    role_enum = MessageRole.USER
+
+                _raw_content = msg.get("content", "")
+
+                # [FIX-MULTIMODAL-STATE] Preserve the full multimodal payload
+                # in ``ExecutionState.messages`` too — NOT just in
+                # ``agent.messages``. The AgentRunner uses
+                # ``initial_state.messages`` as the source of truth for each
+                # LLM call: it rehydrates ``agent.messages`` from
+                # ``state.messages`` at the start of every step. If we
+                # flatten here, the model loses the ``image_url`` parts
+                # entirely and reports that it cannot see any image, while
+                # chat mode (which bypasses ExecutionState) works correctly.
+                #
+                # Trade-off:
+                #   * Checkpoints for image turns become larger (base64 image
+                #     data is serialized into the checkpoint JSON). This is
+                #     bounded — checkpoints are overwritten each step, and
+                #     turns with images are typically single-LLM-call runs.
+                #   * If ``add_message`` type-checks content as ``str`` and
+                #     rejects the multimodal list, we fall back to the
+                #     flattened summary so the run still proceeds. A warning
+                #     is logged so the failure is diagnosable.
+                if isinstance(_raw_content, list):
+                    try:
+                        initial_state.add_message(
+                            role=role_enum, content=_raw_content
+                        )
+                        logger.info(
+                            "[FIX-MULTIMODAL-STATE] Preserved %d multimodal "
+                            "part(s) in ExecutionState for role=%s (job=%s)",
+                            len(_raw_content),
+                            role_enum.value,
+                            job_id,
+                        )
+                        continue
+                    except (TypeError, ValueError, AttributeError) as state_add_err:
+                        logger.warning(
+                            "[FIX-MULTIMODAL-STATE] ExecutionState rejected "
+                            "multimodal content for job %s: %s — falling "
+                            "back to flattened summary (model will NOT "
+                            "receive image parts this turn).",
+                            job_id,
+                            state_add_err,
+                        )
+
+                    # Fallback: flatten with a clear marker.
+                    _text_fragments = [
+                        str(_p.get("text", ""))
+                        for _p in _raw_content
+                        if isinstance(_p, dict)
+                        and _p.get("type") == "text"
+                        and _p.get("text")
+                    ]
+                    _img_count = sum(
+                        1
+                        for _p in _raw_content
+                        if isinstance(_p, dict) and _p.get("type") == "image_url"
+                    )
+                    _flattened = " ".join(_text_fragments)
+                    if _img_count > 0:
+                        _flattened += f" [{_img_count} image(s) attached]"
+                    initial_state.add_message(role=role_enum, content=_flattened)
+                else:
+                    initial_state.add_message(role=role_enum, content=str(_raw_content))
+
+            agent.messages = [dict(m) for m in assembled_messages]
 
         # 7. Configure Runner Lifecycle with explicit total_timeout_seconds propagation
         runner_config = RunnerConfig(

@@ -495,24 +495,34 @@ class GoogleGenAIAdapter:
                 for part in parts:
                     text_val = getattr(part, "text", None)
                     if isinstance(text_val, str) and text_val:
+                        # [FIX-THOUGHT-STREAM] Gemini 2.5+ thinking
+                        # models mark reasoning parts with
+                        # ``thought=True``. The pre-fix code yielded
+                        # every text part as ``CONTENT_DELTA`` and
+                        # then had a no-op ``pass`` for the thought
+                        # branch -- leaking chain-of-thought text
+                        # into the user-facing response and dropping
+                        # the reasoning trace entirely.
+                        #
+                        # Post-fix: check the flag FIRST and route
+                        # to the correct channel. This matches the
+                        # non-streaming path
+                        # (``_convert_generate_response``) which
+                        # already splits thought parts into
+                        # ``reasoning_parts`` vs ``content_parts``.
                         seq += 1
-                        yield LLMStreamEvent(
-                            type=StreamEventType.CONTENT_DELTA,
-                            content_delta=text_val,
-                            sequence=seq,
-                        )
-
-                    # Thinking parts (Gemini 2.5+ surfaces reasoning as
-                    # a distinct part flag).
-                    if getattr(part, "thought", False):
-                        # Some SDK versions put thinking in
-                        # `part.text` with `thought=True`; others use a
-                        # separate field. We re-emit as reasoning_delta
-                        # since the text is already yielded above.
-                        # To avoid duplication, we skip re-yielding.
-                        # This branch exists for future SDK versions
-                        # that split the fields.
-                        pass
+                        if getattr(part, "thought", False):
+                            yield LLMStreamEvent(
+                                type=StreamEventType.REASONING_DELTA,
+                                reasoning_delta=text_val,
+                                sequence=seq,
+                            )
+                        else:
+                            yield LLMStreamEvent(
+                                type=StreamEventType.CONTENT_DELTA,
+                                content_delta=text_val,
+                                sequence=seq,
+                            )
 
                     # Function calls — Google sends them complete.
                     fn_call = getattr(part, "function_call", None)

@@ -7,6 +7,7 @@ pluggable transport layers, and seamless compatibility with BaseTool and ToolReg
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import uuid
@@ -133,6 +134,65 @@ class MCPClient:
         self._session_id: Optional[str] = None
         self._initialized: bool = False
         self._init_lock = asyncio.Lock()
+
+        # [P1-16 FIX — Server fingerprint]
+        # Stable hash of every connection parameter that affects MCP
+        # session identity. ``_ensure_initialized`` compares the
+        # CURRENT fingerprint against this value on every call; a
+        # mismatch invalidates the cached session and forces a fresh
+        # handshake.
+        self._server_fingerprint: str = self._compute_server_fingerprint()
+
+    def _compute_server_fingerprint(self) -> str:
+        """
+        Compute a stable SHA-256 fingerprint (24-char hex) of all
+        connection parameters that affect the MCP session identity.
+
+        Included: server_url, auth_token, client_cert, ca_bundle,
+        transport class name, http_transport class name.
+
+        Excluded (do not affect session identity): timeout.
+
+        Deterministic across processes and restarts.
+        """
+        payload = "|".join([
+            str(self.server_url or ""),
+            str(self.auth_token or ""),
+            str(self._client_cert or ""),
+            str(self._ca_bundle or ""),
+            type(self.transport).__name__ if self.transport else "",
+            type(self._http_transport).__name__ if self._http_transport else "",
+        ])
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+    @property
+    def server_fingerprint(self) -> str:
+        """Stable fingerprint of the CURRENT configuration."""
+        return self._server_fingerprint
+
+    async def invalidate_session(self, reason: str = "") -> None:
+        """
+        Force the next request to re-initialize the MCP session.
+
+        Idempotent. Acquires ``_init_lock`` so it never races with an
+        in-flight handshake. Safe to call from any coroutine.
+        """
+        async with self._init_lock:
+            if reason:
+                logger.info(
+                    "MCP session invalidated for '%s': %s",
+                    self.server_url,
+                    reason,
+                )
+            if self._client is not None and not self._client.is_closed:
+                try:
+                    await self._client.aclose()
+                except Exception:
+                    pass
+            self._client = None
+            self._session_id = None
+            self._initialized = False
+            self._server_fingerprint = self._compute_server_fingerprint()
 
     async def _get_client(self) -> httpx.AsyncClient:
         """
@@ -317,6 +377,34 @@ class MCPClient:
         must not block on a response.
         """
         async with self._init_lock:
+            # [P1-16 FIX — Fingerprint-based session invalidation]
+            # If any connection parameter that affects session
+            # identity changed since the last successful init
+            # (server_url, auth_token, cert, ca_bundle, transport
+            # class), invalidate the cached session and force a
+            # fresh handshake below. This is the passive safety
+            # net for callers that mutate ``client.server_url``
+            # in place.
+            _current_fp = self._compute_server_fingerprint()
+            if _current_fp != self._server_fingerprint:
+                logger.info(
+                    "MCP connection config changed for '%s' "
+                    "(fingerprint %s -> %s); invalidating session "
+                    "and reinitializing.",
+                    self.server_url,
+                    self._server_fingerprint[:8],
+                    _current_fp[:8],
+                )
+                if self._client is not None and not self._client.is_closed:
+                    try:
+                        await self._client.aclose()
+                    except Exception:
+                        pass
+                self._client = None
+                self._session_id = None
+                self._initialized = False
+                self._server_fingerprint = _current_fp
+
             if self._initialized:
                 return
 
@@ -406,8 +494,22 @@ class MCPClient:
                     f"MCP initialize failed: {http_err}"
                 ) from http_err
 
-    async def _send_jsonrpc_request(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Dispatch a JSON-RPC 2.0 compliant request payload."""
+    async def _send_jsonrpc_request(
+        self,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        _retry_on_session_loss: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Dispatch a JSON-RPC 2.0 compliant request payload.
+
+        On 401/404 when a session is already established, the server
+        likely restarted and forgot our Mcp-Session-Id. Invalidates
+        the session and retries ONCE with a fresh handshake.
+        ``_retry_on_session_loss=False`` on the retry prevents
+        infinite loops against a genuinely broken server.
+        """
         if self.transport is not None:
             return await self.transport.asend_request(method, params)
 
@@ -438,6 +540,38 @@ class MCPClient:
                 json=payload,
                 headers=extra_headers,
             )
+
+            # [P1-16 FIX — Session loss auto-recovery]
+            # A 401/404 on a request that carried a session ID
+            # almost always means the server restarted and no
+            # longer recognises our session. Detect it BEFORE
+            # ``raise_for_status`` so we can recover.
+            if (
+                response.status_code in (401, 404)
+                and self._session_id is not None
+                and _retry_on_session_loss
+            ):
+                logger.warning(
+                    "MCP session lost on '%s' (HTTP %d); "
+                    "invalidating and retrying once with a fresh "
+                    "handshake.",
+                    self.server_url,
+                    response.status_code,
+                )
+                self._session_id = None
+                self._initialized = False
+                if self._client is not None and not self._client.is_closed:
+                    try:
+                        await self._client.aclose()
+                    except Exception:
+                        pass
+                    self._client = None
+                return await self._send_jsonrpc_request(
+                    method,
+                    params,
+                    _retry_on_session_loss=False,
+                )
+
             response.raise_for_status()
 
             # Capture a session ID that arrives on any response, not

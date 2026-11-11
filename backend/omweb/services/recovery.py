@@ -167,54 +167,193 @@ def _collect_session_files() -> List[Path]:
     return paths
 
 
-def _patch_index_interrupted(chat_ids: List[str]) -> None:
+def _patch_index_statuses(status_by_id: Dict[str, str]) -> None:
     """
-    Update the persisted ``index.json`` entries for the given chat ids
-    so the sidebar reflects the recovery without requiring a full
-    reindex pass.
+    Update the persisted ``index.json`` entries for the given
+    identifiers, mapping each to its new status string.
 
-    Only the ``status`` field is modified. Every other field is
-    preserved verbatim. The write is atomic via
+    Generalisation of the historical ``_patch_index_interrupted``
+    helper. Recovery may now resolve a session to ``interrupted``,
+    ``cancelled``, or the actual terminal status reported by
+    RecoveryManager (``completed`` / ``failed`` / ``cancelled``), so
+    the patch helper accepts a per-id status instead of hard-coding
+    ``"interrupted"``.
+
+    Keys in ``status_by_id`` may be either chat ids or job ids; a
+    matching chat row is updated by either. Only the ``status`` and
+    ``updated_at`` fields are touched. The write is atomic via
     ``project_manager._write_index``.
     """
+    if not status_by_id:
+        return
+
     idx = project_manager._read_index()
     chats = idx.get("chats", [])
     if not isinstance(chats, list):
         return
 
-    target = set(chat_ids)
     changed = False
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
     for c in chats:
         if not isinstance(c, dict):
             continue
-        if c.get("id") in target or c.get("job_id") in target:
-            if c.get("status") != "interrupted":
-                c["status"] = "interrupted"
-                c["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                changed = True
+        cid = c.get("id")
+        jid = c.get("job_id")
+        new_status = status_by_id.get(cid) or status_by_id.get(jid)
+        if new_status and c.get("status") != new_status:
+            c["status"] = new_status
+            c["updated_at"] = now_str
+            changed = True
 
     if changed:
         project_manager._write_index(idx)
 
 
-def recover_orphaned_sessions() -> Dict[str, Any]:
+async def _enrich_recovery_plans(
+    orphan_job_ids: List[str],
+) -> Dict[str, Dict[str, Any]]:
     """
-    Scan every persisted ``session.json`` and promote orphaned runs to
-    ``interrupted``.
+    Ask RecoveryManager whether each orphan can actually be resumed.
+
+    For each job_id, calls ``RecoveryManager.plan_resume(job_id)`` and
+    returns a compact dictionary that captures the essential facts
+    needed by the write-back pass:
+
+        {
+            "resumable":      bool,
+            "reason":         str,   # RecoveryReason.value
+            "reason_text":    str,   # human-readable elaboration
+            "next_step":      int,   # step to resume from
+            "has_checkpoint": bool,
+            "actual_status":  Optional[str],  # state.status.value
+        }
+
+    Returns an empty dict when RecoveryManager is unavailable (import
+    error, DB construction error, or an unexpectedly empty registry).
+    Every per-run failure is caught, logged at WARNING, and reported
+    as ``resumable=False`` so the caller keeps the historical
+    "interrupted" behavior for that run.
+
+    This helper is deliberately isolated from the write-back pass:
+    a bug in RecoveryManager never prevents us from promoting orphaned
+    sessions to ``interrupted``, which is the primary safety net.
+    """
+    if not orphan_job_ids:
+        return {}
+
+    try:
+        from peldrun.runtime.recovery_manager import RecoveryManager
+        from peldrun.runtime.store import get_run_store
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "RecoveryManager unavailable for startup sweep: %s", exc
+        )
+        return {}
+
+    try:
+        store = get_run_store()
+        manager = RecoveryManager(persistence=store)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Could not construct RecoveryManager: %s", exc
+        )
+        return {}
+
+    results: Dict[str, Dict[str, Any]] = {}
+    for job_id in orphan_job_ids:
+        if not job_id:
+            continue
+        try:
+            plan = await manager.plan_resume(job_id)
+            actual_status: Optional[str] = None
+            if plan.state is not None:
+                state_status = plan.state.status
+                actual_status = (
+                    state_status.value
+                    if hasattr(state_status, "value")
+                    else str(state_status)
+                )
+            results[job_id] = {
+                "resumable": bool(plan.resumable),
+                "reason": (
+                    plan.reason.value
+                    if plan.reason is not None
+                    else "unknown"
+                ),
+                "reason_text": plan.reason_text or "",
+                "next_step": int(plan.next_step or 0),
+                "has_checkpoint": plan.latest_checkpoint is not None,
+                "actual_status": actual_status,
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "plan_resume failed for run %r: %s", job_id, exc
+            )
+            results[job_id] = {
+                "resumable": False,
+                "reason": "plan_error",
+                "reason_text": f"plan_resume raised: {exc}",
+                "next_step": 0,
+                "has_checkpoint": False,
+                "actual_status": None,
+            }
+
+    return results
+
+
+async def recover_orphaned_sessions() -> Dict[str, Any]:
+    """
+    Scan every persisted ``session.json`` and reconcile orphaned runs.
 
     An "orphaned" run is a session whose ``status`` is non-terminal but
     for which no live task is registered in ``ACTIVE_JOB_TASKS`` under
     any of its known aliases (``chat_id``, ``job_id``).
 
+    For each orphan the function now does two things:
+
+      1. **Promotes it to a terminal status** (same as before, with a
+         smarter mapping — see below).
+      2. **Enriches it with a RecoveryManager plan** so the UI can
+         offer a Resume button when the run is actually resumable.
+         A ``resumable`` boolean and (when True) a ``recovery_info``
+         block are persisted to ``session.json``.
+
+    Final status mapping
+    --------------------
+    The status written to ``session.json`` is derived from the plan
+    reason, defaulting to the historical ``"interrupted"``:
+
+      * ``already_terminal`` + a known ``actual_status``
+          -> use the state's own terminal status (``completed`` /
+             ``failed`` / ``cancelled``). The session was already
+             finished; the previous ``"interrupted"`` label was
+             inaccurate.
+      * ``cancelled_by_operator``
+          -> ``"cancelled"``. A cancellation was requested before
+             the crash; honoring operator intent is safer than
+             marking the run as interrupted.
+      * anything else (including ``not_found``, ``plan_error``,
+        ``resumable_*``)
+          -> ``"interrupted"``. Matches the pre-existing behavior.
+
+    **Breaking change**: this function is now ``async def``. Callers
+    MUST ``await`` it. A caller that invokes it without ``await``
+    receives a coroutine object that never runs — Python emits a
+    ``RuntimeWarning: coroutine was never awaited`` at GC time, which
+    is the only signal of the missing ``await``. The startup wiring
+    in ``omweb/main.py`` (lifespan) must be updated accordingly.
+
     Returns a report dictionary:
 
         {
             "scanned":               int,   # session.json files examined
-            "interrupted":           int,   # sessions promoted
+            "interrupted":           int,   # sessions promoted (any terminal status)
+            "resumable_count":       int,   # subset that can be resumed
             "skipped_alive":         int,   # live task found; left alone
             "skipped_terminal":      int,   # already terminal
             "skipped_unreadable":    int,   # parse errors
             "interrupted_sessions":  [ ... ],   # up to 50 entries
+            "resumable_sessions":    [ ... ],   # up to 50 entries
             "errors":                [ ... ],
         }
 
@@ -240,19 +379,24 @@ def recover_orphaned_sessions() -> Dict[str, Any]:
     report: Dict[str, Any] = {
         "scanned": 0,
         "interrupted": 0,
+        "resumable_count": 0,
         "skipped_alive": 0,
         "skipped_terminal": 0,
         "skipped_unreadable": 0,
         "interrupted_sessions": [],
+        "resumable_sessions": [],
         "errors": [],
     }
 
     session_files = _collect_session_files()
     report["scanned"] = len(session_files)
 
-    touched_chat_ids: List[str] = []
     now_str = time.strftime("%Y-%m-%d %H:%M:%S")
 
+    # ------------------------------------------------------------------
+    # Pass 1 — collect orphans.
+    # ------------------------------------------------------------------
+    orphans: List[Dict[str, Any]] = []
     for session_file in session_files:
         try:
             raw = session_file.read_text(encoding="utf-8")
@@ -277,14 +421,10 @@ def recover_orphaned_sessions() -> Dict[str, Any]:
         chat_id = str(data.get("id") or session_file.parent.name)
         job_id = str(data.get("job_id") or "")
 
-        # Terminal sessions are already in their final form.
         if status not in _NON_TERMINAL_STATUSES:
             report["skipped_terminal"] += 1
             continue
 
-        # A live task means the run is genuinely in progress. ``start_run.py``
-        # registers the task under both the canonical job id and the chat id,
-        # so either key is authoritative.
         live_task = (
             ACTIVE_JOB_TASKS.get(chat_id)
             or (ACTIVE_JOB_TASKS.get(job_id) if job_id else None)
@@ -293,31 +433,121 @@ def recover_orphaned_sessions() -> Dict[str, Any]:
             report["skipped_alive"] += 1
             continue
 
-        # Orphaned. Promote to interrupted.
-        data["status"] = "interrupted"
+        orphans.append({
+            "session_file": session_file,
+            "data": data,
+            "chat_id": chat_id,
+            "job_id": job_id,
+            "previous_status": status,
+        })
+
+    # ------------------------------------------------------------------
+    # Pass 2 — enrich with RecoveryManager plans.
+    #
+    # A failure here is non-fatal: plan_map stays empty and Pass 3
+    # falls back to the historical "interrupted" default for every
+    # orphan, preserving the pre-P0-Item-6 behavior end-to-end.
+    # ------------------------------------------------------------------
+    plan_map: Dict[str, Dict[str, Any]] = {}
+    if orphans:
+        try:
+            plan_map = await _enrich_recovery_plans(
+                [o["job_id"] for o in orphans if o["job_id"]]
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "RecoveryManager enrichment failed; falling back to "
+                "interrupted-only sweep: %s",
+                exc,
+            )
+            plan_map = {}
+
+    # ------------------------------------------------------------------
+    # Pass 3 — write back.
+    # ------------------------------------------------------------------
+    touched_statuses: Dict[str, str] = {}
+
+    for orphan in orphans:
+        session_file = orphan["session_file"]
+        data = orphan["data"]
+        chat_id = orphan["chat_id"]
+        job_id = orphan["job_id"]
+        previous_status = orphan["previous_status"]
+        plan_info = plan_map.get(job_id, {}) if job_id else {}
+
+        reason_value = plan_info.get("reason", "")
+        final_status = "interrupted"
+        is_resumable = False
+
+        if (
+            reason_value == "already_terminal"
+            and plan_info.get("actual_status")
+        ):
+            # The state was already in a terminal status before the
+            # crash. Reporting "interrupted" would contradict the
+            # persisted audit trail.
+            final_status = str(plan_info["actual_status"])
+        elif reason_value == "cancelled_by_operator":
+            # Operator intent takes precedence.
+            final_status = "cancelled"
+        elif plan_info.get("resumable"):
+            is_resumable = True
+
+        data["status"] = final_status
         data["updated_at"] = now_str
+        data["resumable"] = is_resumable
+        if is_resumable:
+            data["recovery_info"] = {
+                "reason": reason_value,
+                "next_step": int(plan_info.get("next_step") or 0),
+                "has_checkpoint": bool(
+                    plan_info.get("has_checkpoint", False)
+                ),
+            }
+        else:
+            # Clear any stale recovery_info from a previous sweep.
+            data.pop("recovery_info", None)
+
         try:
             _atomic_write_json(session_file, data)
         except Exception as exc:
             report["errors"].append({
                 "file": str(session_file),
-                "error": f"Failed to persist interrupted status: {exc}",
+                "error": f"Failed to persist recovery status: {exc}",
             })
             continue
 
         report["interrupted"] += 1
+        if is_resumable:
+            report["resumable_count"] += 1
+            if len(report["resumable_sessions"]) < 50:
+                report["resumable_sessions"].append({
+                    "chat_id": chat_id,
+                    "job_id": job_id,
+                    "previous_status": previous_status,
+                    "recovery_reason": reason_value,
+                    "next_step": int(plan_info.get("next_step") or 0),
+                })
+
         if len(report["interrupted_sessions"]) < 50:
             report["interrupted_sessions"].append({
                 "chat_id": chat_id,
                 "job_id": job_id,
-                "previous_status": status,
+                "previous_status": previous_status,
+                "final_status": final_status,
+                "resumable": is_resumable,
             })
-        touched_chat_ids.append(chat_id)
 
-    # Patch index.json once at the end.
-    if touched_chat_ids:
+        touched_statuses[chat_id] = final_status
+        if job_id:
+            touched_statuses[job_id] = final_status
+
+    # ------------------------------------------------------------------
+    # Pass 4 — patch index.json once at the end.
+    # ------------------------------------------------------------------
+    if touched_statuses:
         try:
-            _patch_index_interrupted(touched_chat_ids)
+            _patch_index_statuses(touched_statuses)
         except Exception as exc:
             report["errors"].append({
                 "file": "<index.json>",
@@ -325,9 +555,11 @@ def recover_orphaned_sessions() -> Dict[str, Any]:
             })
 
     logger.info(
-        "Session recovery: scanned=%d interrupted=%d alive=%d terminal=%d unreadable=%d errors=%d",
+        "Session recovery: scanned=%d interrupted=%d resumable=%d "
+        "alive=%d terminal=%d unreadable=%d errors=%d",
         report["scanned"],
         report["interrupted"],
+        report["resumable_count"],
         report["skipped_alive"],
         report["skipped_terminal"],
         report["skipped_unreadable"],

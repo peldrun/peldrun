@@ -45,6 +45,7 @@ from peldrun.runtime.contract import (
     RunResult,
     WorkspaceContext,
 )
+from peldrun.runtime.ports import AgentRegistryPort
 from peldrun.runtime.store import RunStore, get_run_store
 
 logger = logging.getLogger("peldrun.agents.multi.coordinator")
@@ -77,6 +78,7 @@ class MultiAgentCoordinator:
         parent_request: Optional[RunRequest] = None,
         run_store: Optional[RunStore] = None,
         tool_resolver: Optional[ToolResolverCallable] = None,
+        agent_registry: Optional[AgentRegistryPort] = None,
     ) -> None:
         self.parent_emitter = parent_emitter
         self.workspace_root = workspace_root
@@ -87,6 +89,25 @@ class MultiAgentCoordinator:
         self._parent_request = parent_request
         self._run_store = run_store or get_run_store()
         self._tool_resolver = tool_resolver
+        # [P1-14 FIX — Core/OMWeb boundary]
+        # The historical implementation imported
+        # ``omweb.agents.registry.agent_registry`` inline inside
+        # ``_resolve_authorized_child_tool_ids`` to discover a
+        # specialist's tool allowlist. That direct import coupled
+        # Core to the Web layer and broke the plan's dependency
+        # rule. ``agent_registry`` is now injected:
+        #
+        #   * When provided → used as the authoritative source of
+        #     agent manifests.
+        #   * When ``None`` → the registry lookup is skipped; the
+        #     coordinator falls through to the parent request's
+        #     ``agent_spec.tools`` (which is always populated for
+        #     any run that reached this coordinator).
+        #
+        # The Web layer wires a real ``AgentRegistryPort`` via
+        # ``CoreRuntimeExecutor.execute``. Core-only deployments
+        # (unit tests, CLI tools) pass ``None`` and keep working.
+        self._agent_registry: Optional[AgentRegistryPort] = agent_registry
         self._specialists: Dict[str, Union[StepExecutableAgent, BaseAgent]] = {}
         self._factories: Dict[str, Callable[[], StepExecutableAgent]] = {}
         self._specialist_tools: Dict[str, List[str]] = {}
@@ -234,20 +255,42 @@ class MultiAgentCoordinator:
                     str(getattr(t, "name", t)).strip() for t in agent_tools
                 ]
 
-        # 5. Platform Agent Registry lookup for known specialists (e.g. deep_researcher)
-        if raw_candidates is None:
+        # 5. Agent registry lookup via the injected AgentRegistryPort.
+        #
+        # [P1-14 FIX — Core/OMWeb boundary]
+        # The historical implementation imported
+        # ``omweb.agents.registry.agent_registry`` inline. That
+        # coupled Core to the Web layer, breaking the plan's
+        # dependency rule. The port below is injected at
+        # construction time (see ``__init__``); when absent (e.g.
+        # stateless sub-agents, isolated tests), the lookup is
+        # skipped and the coordinator falls through to the parent
+        # ``agent_spec.tools`` fallback (block 6).
+        if raw_candidates is None and self._agent_registry is not None:
             try:
-                from omweb.agents.registry import agent_registry  # type: ignore[import-not-found]
-
-                for getter_name in ("get_agent", "get"):
-                    getter = getattr(agent_registry, getter_name, None)
-                    if callable(getter):
-                        manifest = getter(specialist_key) or getter(task.target_agent_id)
-                        if isinstance(manifest, dict) and isinstance(manifest.get("tools"), list):
-                            raw_candidates = [str(t).strip() for t in manifest["tools"]]
-                            break
-            except Exception:
-                pass
+                manifest = self._agent_registry.get_agent(specialist_key)
+                if manifest is None:
+                    # Some registries key specialists by their
+                    # canonical target_agent_id rather than the
+                    # normalized specialist_key.
+                    manifest = self._agent_registry.get_agent(
+                        task.target_agent_id
+                    )
+                if (
+                    isinstance(manifest, dict)
+                    and isinstance(manifest.get("tools"), list)
+                ):
+                    raw_candidates = [
+                        str(t).strip() for t in manifest["tools"]
+                    ]
+            except Exception as reg_err:  # noqa: BLE001
+                # A registry failure must never block delegation.
+                # The fallback (parent tools) is always available.
+                logger.debug(
+                    "AgentRegistryPort.get_agent failed for %r: %s",
+                    specialist_key,
+                    reg_err,
+                )
 
         # 6. Fallback to parent AgentSpec.tools if defined
         if raw_candidates is None and self._parent_request and self._parent_request.agent_spec:
@@ -355,27 +398,24 @@ class MultiAgentCoordinator:
             except TypeError:
                 return list(self._tool_resolver(authorized_tool_ids, child_ws_path))
 
-        # 2. Canonical Web-to-Core adapter resolver
-        try:
-            from omweb.adapters.core_adapter_parts.resolve_tool_runtime import (  # type: ignore[import-not-found]
-                resolve_authorized_tools,
-            )
+        # [P1-14 FIX — Core/OMWeb boundary]
+        # The historical implementation imported
+        # ``omweb.adapters.core_adapter_parts.resolve_tool_runtime``
+        # here as a middle fallback. That coupled Core to the Web
+        # layer and duplicated the resolution logic. It is removed.
+        #
+        # Resolution now flows:
+        #   1. ``self._tool_resolver`` (injected callable — the Web
+        #      layer wires ``resolve_authorized_tools`` here when it
+        #      wants full platform resolution).
+        #   2. Pure-core builtin fallback (below), which handles the
+        #      common tool IDs without any external dependency.
+        #
+        # Deployments that need the full platform resolver MUST
+        # provide ``tool_resolver`` at coordinator construction —
+        # that is exactly what ``CoreRuntimeExecutor.execute`` does.
 
-            resolved = resolve_authorized_tools(
-                authorized_tool_ids=authorized_tool_ids,
-                workspace_root=child_ws_path,
-                run_id=child_run_id,
-                job_id=child_job_id,
-                chat_id=chat_id,
-                project_id=project_id,
-                search_config=search_config,
-            )
-            if resolved:
-                return resolved
-        except Exception as adapter_exc:
-            logger.debug("Web adapter child tool resolution fallback notice: %s", adapter_exc)
-
-        # 3. Pure peldrun-core builtin fallback (for standalone Core unit/integration tests)
+        # 2. Pure peldrun-core builtin fallback (for standalone Core unit/integration tests)
         core_tools: List[Any] = []
         ws_str = str(child_ws_path)
         for tid in authorized_tool_ids:
@@ -481,8 +521,27 @@ class MultiAgentCoordinator:
             )
         )
 
-        # 3. Poll durable store for resolution with low-latency polling
-        poll_interval = 0.05
+        # 3. Poll durable store for resolution with exponential backoff.
+        #
+        # [P2 FIX — Approval polling backoff]
+        # The historical implementation polled every 50 ms (20 req/s
+        # per pending delegation). On a parent run with multiple
+        # concurrent delegations, that traffic saturated the SQLite
+        # ``human_requests`` table with read transactions and caused
+        # write-lock contention for unrelated updates.
+        #
+        # The fix keeps the FIRST poll at 50 ms so a user who
+        # approves within one second sees the child start almost
+        # immediately, then exponentially backs off to a 1-second
+        # ceiling. That reduces the steady-state traffic by ~95%
+        # while preserving sub-second responsiveness for the common
+        # quick-approval case.
+        #
+        # A user who takes 30 s to approve now consumes ~30 reads
+        # instead of ~600 — and the child still starts within ~1 s
+        # of their click.
+        _POLL_INTERVALS_S = (0.05, 0.1, 0.2, 0.4, 0.8, 1.0)
+        poll_idx = 0
         deadline = time.time() + timeout_seconds
 
         while time.time() < deadline:
@@ -525,7 +584,15 @@ class MultiAgentCoordinator:
 
                 return is_ok, edited_inst
 
-            await asyncio.sleep(poll_interval)
+            # [P2 FIX] Exponential backoff. The interval at index
+            # ``poll_idx`` is used for the sleep AFTER this iteration;
+            # the index is clamped to the last entry so subsequent
+            # sleeps stay at the 1s ceiling. First sleep stays 50ms.
+            _sleep_seconds = _POLL_INTERVALS_S[
+                min(poll_idx, len(_POLL_INTERVALS_S) - 1)
+            ]
+            poll_idx += 1
+            await asyncio.sleep(_sleep_seconds)
 
         logger.warning("Approval request %s expired after %s seconds.", approval_id, timeout_seconds)
         return False, task.instruction
@@ -593,6 +660,25 @@ class MultiAgentCoordinator:
                 )
 
         # 3. Enforce Branching Ceiling (max_child_runs)
+        #
+        # [P2 FIX — child_run_count release]
+        # The historical implementation incremented
+        # ``_child_run_count`` on admission but NEVER decremented
+        # it, regardless of the child's outcome. After
+        # ``max_child_runs`` delegations — successful, failed,
+        # cancelled, or crashed — the counter stayed saturated and
+        # every subsequent delegation returned
+        # ``CHILD_RUN_LIMIT_EXCEEDED`` for the rest of the parent
+        # run, even though all prior children had long since
+        # finished.
+        #
+        # The fix wraps the ENTIRE work after the counter increment
+        # in a try/finally that decrements unconditionally. Every
+        # return path (success, failure, cancellation, early exit)
+        # now releases the slot. The concurrency semaphore already
+        # handles the parallel-limit case; the branch counter is a
+        # cumulative limit and needs the release-on-finish
+        # semantics.
         max_allowed_children = budget.max_child_runs if budget else 3
         async with self._lock:
             if self._child_run_count >= max_allowed_children:
@@ -613,6 +699,64 @@ class MultiAgentCoordinator:
                     duration_seconds=round(time.time() - start_time, 3),
                 )
             self._child_run_count += 1
+
+        try:
+            return await self._delegate_inner(
+                task=task,
+                child_run_id=child_run_id,
+                specialist_key=specialist_key,
+                budget=budget,
+                parent_id_str=parent_id_str,
+                root_id_str=root_id_str,
+                start_time=start_time,
+            )
+        finally:
+            # Always release the slot, regardless of outcome.
+            async with self._lock:
+                self._child_run_count = max(
+                    0, self._child_run_count - 1
+                )
+            logger.debug(
+                "Delegation slot released (active children: %d)",
+                self._child_run_count,
+            )
+
+    async def _delegate_inner(
+        self,
+        *,
+        task: DelegatedTask,
+        child_run_id: Any,
+        specialist_key: str,
+        budget: Any,
+        parent_id_str: str,
+        root_id_str: str,
+        start_time: float,
+    ) -> DelegationResult:
+        """
+        Body of ``delegate()`` after the branch-ceiling admission.
+
+        Extracted so that ``delegate()`` can wrap the entire body in
+        a ``try/finally`` that releases ``_child_run_count`` without
+        duplicating the decrement across the ~15 return paths inside
+        this method.
+        """
+        # 4. Acquire Concurrency Semaphore
+        async with self._concurrency_semaphore:
+            child_agent = self._resolve_specialist_instance(specialist_key)
+            if not child_agent and self._execute_fn is None:
+                err_msg = f"Target specialist agent '{task.target_agent_id}' could not be cleanly initialized."
+                logger.error(err_msg)
+                return DelegationResult(
+                    task_id=task.task_id,
+                    child_run_id=child_run_id,
+                    parent_run_id=task.parent_run_id,
+                    root_run_id=task.root_run_id or task.parent_run_id,
+                    success=False,
+                    status=DelegationStatus.FAILED,
+                    error=err_msg,
+                    error_code="SPECIALIST_INITIALIZATION_FAILED",
+                    duration_seconds=round(time.time() - start_time, 3),
+                )
 
         # 4. Acquire Concurrency Semaphore
         async with self._concurrency_semaphore:

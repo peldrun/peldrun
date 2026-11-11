@@ -21,11 +21,13 @@ import asyncio
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, Tuple
 import uuid
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import status as http_status
 
 from omweb.agent_bridge import (
     job_scoped_artifacts,
@@ -33,7 +35,7 @@ from omweb.agent_bridge import (
     run_instrumented,
 )
 from omweb.job_manager import job_manager
-from omweb.project_manager import project_manager
+from omweb.project_manager import project_manager, _atomic_write_json
 
 from .schemas import RunRequest
 from .state import (
@@ -43,6 +45,25 @@ from .state import (
     JOB_TO_CHAT_ID,
 )
 from .utils import resolve_chat
+
+# [P0-7] Resume endpoint dependencies. The recovery manager and the
+# core executor are imported at module level (not inside the endpoint)
+# so that a broken import fails loudly at startup, not at first use.
+# The core RunRequest alias avoids the name collision with the API-layer
+# ``RunRequest`` imported above from ``.schemas``.
+from peldrun.engine.state import ExecutionState
+from peldrun.runtime.contract import (
+    AgentSpec as CoreAgentSpec,
+    RunRequest as CoreRunRequest,
+    WorkspaceContext as CoreWorkspaceContext,
+)
+from peldrun.runtime.executor import core_executor
+from peldrun.runtime.recovery_manager import (
+    RecoveryManager,
+    RecoveryPlan,
+    RecoveryReason,
+)
+from peldrun.runtime.store import get_run_store
 
 logger = logging.getLogger("omweb.routers.run_routes.start_run")
 
@@ -101,6 +122,328 @@ def _project_attachments_for_turn(attachments: Any) -> list:
             projected["height"] = height
         result.append(projected)
     return result
+
+
+# ---------------------------------------------------------------------------
+# [P0-7] Resume endpoint helpers
+# ---------------------------------------------------------------------------
+
+
+def _collect_all_session_files() -> list[Path]:
+    """
+    Return every ``session.json`` path under both supported layouts.
+
+    Mirrors ``omweb.services.recovery._collect_session_files`` (which
+    is not importable across modules without triggering the recovery
+    service's lazy import cycle). Duplicating the ~15-line scan is
+    preferable to weaving a new public API into the recovery service
+    for a single caller.
+    """
+    paths: list[Path] = []
+
+    chats_dir = project_manager.chats_dir
+    if chats_dir.exists():
+        for chat_dir in chats_dir.iterdir():
+            if not chat_dir.is_dir():
+                continue
+            sf = chat_dir / "session.json"
+            if sf.is_file():
+                paths.append(sf)
+
+    projects_dir = project_manager.projects_dir
+    if projects_dir.exists():
+        for proj_dir in projects_dir.iterdir():
+            if not proj_dir.is_dir():
+                continue
+            proj_chats = proj_dir / "chats"
+            if not proj_chats.exists():
+                continue
+            for chat_dir in proj_chats.iterdir():
+                if not chat_dir.is_dir():
+                    continue
+                sf = chat_dir / "session.json"
+                if sf.is_file():
+                    paths.append(sf)
+
+    return paths
+
+
+def _find_session_by_run_id(run_id: str) -> tuple[Path | None, dict | None]:
+    """
+    Locate the ``session.json`` whose ``id`` or ``job_id`` matches
+    ``run_id``.
+
+    Returns ``(path, data)`` on success and ``(None, None)`` when no
+    match is found. Both keys (chat_id, job_id) are accepted because
+    the HTTP contract allows the client to call ``/resume`` with
+    either — a user copying the job id from the UI should not be
+    rejected because the session is keyed by chat id.
+    """
+    if not run_id:
+        return (None, None)
+
+    # Fast path: direct directory hit.
+    for base in (project_manager.chats_dir,):
+        if base.exists():
+            candidate = base / run_id / "session.json"
+            if candidate.is_file():
+                try:
+                    return (candidate, json.loads(candidate.read_text(encoding="utf-8")))
+                except Exception:
+                    return (None, None)
+
+    # Slow path: scan for job_id match.
+    for sf in _collect_all_session_files():
+        try:
+            data = json.loads(sf.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("id") == run_id or data.get("job_id") == run_id:
+            return (sf, data)
+    return (None, None)
+
+
+def _build_resume_request(
+    state: ExecutionState,
+    plan: RecoveryPlan,
+    session_file: Path,
+) -> CoreRunRequest | None:
+    """
+    Reconstruct a core ``RunRequest`` for a resumed run.
+
+    The state carries the authoritative message history and progress;
+    the request carries identity, workspace, and LLM configuration.
+    Every field the executor requires is populated from
+    ``session.json`` (for identity + LLM config) and the restored
+    state (for agent identity + system prompt fallback).
+
+    Returns ``None`` on any error so the caller can report
+    ``REQUEST_BUILD_FAILED`` instead of proceeding with a half-built
+    request.
+    """
+    try:
+        data = json.loads(session_file.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        logger.error("resume: could not read session.json: %s", exc)
+        return None
+
+    chat_id = str(data.get("id") or state.run_id)
+    project_id = str(data.get("project_id") or "default_project")
+    job_id = str(data.get("job_id") or state.run_id)
+    prompt = str(data.get("prompt") or state.task_prompt or "")
+    agent_id = str(data.get("agent_id") or state.agent_name or "peldrun")
+
+    # Extract the system prompt from the restored state. The state's
+    # messages were built at run creation and are the authoritative
+    # record of what the model saw; a stale session.json copy would
+    # diverge if the agent definition was edited since.
+    system_prompt = ""
+    for msg in (state.messages or []):
+        if isinstance(msg, dict):
+            role_raw = msg.get("role", "user")
+            content = msg.get("content", "")
+        else:
+            role_raw = getattr(msg, "role", "user")
+            content = getattr(msg, "content", "")
+        role_str = (
+            role_raw.value if hasattr(role_raw, "value") else str(role_raw or "")
+        ).lower()
+        if role_str == "system":
+            system_prompt = content if isinstance(content, str) else ""
+            break
+
+    try:
+        files_dir = project_manager.get_chat_files_dir(chat_id, project_id)
+        files_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("resume: could not resolve workspace root: %s", exc)
+        return None
+
+    llm_config: Dict[str, Any] = {
+        "model": data.get("model") or "default",
+        "provider": data.get("provider") or "openai",
+        "provider_name": (
+            data.get("provider_name")
+            or data.get("provider")
+            or "openai"
+        ),
+    }
+    if "reasoning_effort" in data:
+        llm_config["reasoning_effort"] = data["reasoning_effort"]
+    if "attachments" in data:
+        llm_config["attachments"] = data["attachments"]
+
+    try:
+        return CoreRunRequest(
+            run_id=str(state.run_id),
+            job_id=job_id,
+            prompt=prompt,
+            agent_spec=CoreAgentSpec(
+                id=agent_id,
+                name=str(state.agent_name or agent_id),
+                system_prompt=system_prompt,
+                max_steps=int(state.max_steps or 30),
+            ),
+            workspace=CoreWorkspaceContext(
+                workspace_id=chat_id,
+                root_path=str(files_dir),
+                chat_id=chat_id,
+                project_id=project_id,
+            ),
+            llm_config=llm_config,
+            step_timeout_seconds=120.0,
+            total_timeout_seconds=None,
+            metadata={
+                "resumed_from": "resume_endpoint",
+                "recovery_reason": (
+                    plan.reason.value if plan.reason else "unknown"
+                ),
+                "next_step": plan.next_step,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("resume: could not construct RunRequest: %s", exc)
+        return None
+
+
+async def _execute_resume_flow(
+    run_id: str,
+    session_file: Path,
+    chat_id: str,
+    job_id: str,
+) -> None:
+    """
+    Background task: run ``RecoveryManager.resume_run`` end-to-end,
+    then persist the terminal outcome into ``session.json``.
+
+    Two responsibilities:
+
+      1. Bridge the executor's ``restored_state`` parameter to the
+         ``resume_run`` contract. ``resume_run`` only passes a
+         ``RunRequest`` to ``executor_fn``; we capture the state via
+         the request_builder closure so the wrapper can forward it to
+         ``core_executor.execute(..., restored_state=state)``.
+
+      2. Write the terminal status, result, and (on success) the
+         cleared ``resumable`` flag back into ``session.json``. The
+         SSE consumer continues to read ``ACTIVE_JOB_EVENTS`` for
+         live events; ``session.json`` is the durable record.
+    """
+    captured: Dict[str, Any] = {}
+
+    def _request_builder(
+        state: ExecutionState, plan: RecoveryPlan
+    ) -> CoreRunRequest | None:
+        captured["state"] = state
+        return _build_resume_request(state, plan, session_file)
+
+    async def _executor_fn(request: CoreRunRequest):
+        return await core_executor.execute(
+            request,
+            event_listener=_make_event_listener(job_id),
+            restored_state=captured.get("state"),
+        )
+
+    try:
+        store = get_run_store()
+        manager = RecoveryManager(persistence=store)
+        outcome = await manager.resume_run(
+            run_id=run_id,
+            executor_fn=_executor_fn,
+            request_builder=_request_builder,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("resume: resume_run raised for %s: %s", run_id, exc)
+        _finalize_session_file(
+            session_file,
+            status="failed",
+            result="",
+            error=f"resume_run raised: {exc}",
+        )
+        return
+
+    # ------------------------------------------------------------------
+    # Persist outcome to session.json.
+    # ------------------------------------------------------------------
+    if outcome.success and outcome.result is not None:
+        result = outcome.result
+        status_value = (
+            result.status.value
+            if hasattr(result.status, "value")
+            else str(result.status)
+        )
+        _finalize_session_file(
+            session_file,
+            status=status_value,
+            result=result.output or "",
+            error=result.error,
+        )
+        logger.info(
+            "resume: %s completed with status=%s", run_id, status_value
+        )
+    else:
+        _finalize_session_file(
+            session_file,
+            status="failed",
+            result="",
+            error=outcome.error_message
+            or outcome.reason_text
+            or f"resume failed: {outcome.reason.value}",
+        )
+        logger.warning(
+            "resume: %s failed (%s): %s",
+            run_id,
+            outcome.reason.value,
+            outcome.error_message or outcome.reason_text,
+        )
+
+
+def _finalize_session_file(
+    session_file: Path,
+    *,
+    status: str,
+    result: str,
+    error: str | None,
+) -> None:
+    """Atomic-update session.json after a resume attempt."""
+    try:
+        data = json.loads(session_file.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        logger.error("resume: cannot finalize session.json: %s", exc)
+        return
+    if not isinstance(data, dict):
+        return
+    data["status"] = status
+    data["result"] = result
+    if error:
+        data["error"] = error
+    else:
+        data.pop("error", None)
+    data["resumable"] = False
+    data.pop("recovery_info", None)
+    data["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        _atomic_write_json(session_file, data)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("resume: atomic write failed: %s", exc)
+
+
+def _make_event_listener(job_id: str):
+    """
+    Build an event listener that appends to the SSE buffer for this
+    run. Mirrors the pattern ``run_instrumented`` uses internally.
+    """
+    async def _listener(event) -> None:
+        try:
+            buf = ACTIVE_JOB_EVENTS.get(job_id)
+            if buf is not None:
+                buf.append(event)
+        except Exception:
+            pass
+
+    return _listener
 
 
 @router.post("")
@@ -544,10 +887,186 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
         "agent_id": effective_agent,
         "reasoning_effort": llm_override.get("reasoning_effort"),
         "generative_ui_enabled": bool(req.generative_ui and req.generative_ui.get("enabled")),
-        # Diagnostic: confirms the backend received and forwarded the
-        # multimodal attachment references. The frontend uses this to
-        # distinguish "attachment rejected upstream" from "attachment
-        # accepted but resolved to zero images by the engine" when
-        # debugging. Never part of any downstream contract.
         "attachments_count": len(llm_override.get("attachments") or []),
+    }
+
+
+@router.post("/{run_id}/resume", status_code=http_status.HTTP_202_ACCEPTED)
+async def resume_run_endpoint(run_id: str):
+    """
+    Resume an interrupted run from its last checkpoint.
+
+    Fire-and-forget: returns ``202 Accepted`` immediately after
+    scheduling the background resume task, then streams progress
+    through the normal SSE channel. The durable outcome is written
+    to ``session.json`` when the task completes.
+
+    Responses
+    ---------
+    202 Accepted
+        The run is resumable and a background task has been scheduled.
+   400 Bad Request
+        ``run_id`` is empty.
+   404 Not Found
+        No session matches ``run_id``.
+   409 Conflict
+        The session exists but is not resumable. The response body
+        carries ``reason`` describing why (``already_terminal``,
+        ``cancelled_by_operator``, ``no_checkpoint``,
+        ``concurrent_resume``, ...).
+    """
+    if not run_id:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="run_id is required.",
+        )
+
+    session_file, data = _find_session_by_run_id(run_id)
+    if session_file is None or data is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Run '{run_id}' was not found.",
+        )
+
+    # Verify the session is in a resumable state per the startup sweep.
+    # The startup sweep is authoritative: it consults RecoveryManager
+    # and only sets ``resumable=true`` when plan_resume() returned a
+    # resumable plan. Bypassing that flag would risk double-executing
+    # side effects if the state changed since the sweep.
+    if not data.get("resumable", False):
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail={
+                "error": "not_resumable",
+                "reason": data.get("status", "unknown"),
+                "message": (
+                    f"Run '{run_id}' is not resumable. Current status: "
+                    f"{data.get('status', 'unknown')}. The startup "
+                    f"recovery sweep did not mark this run as "
+                    f"resumable."
+                ),
+            },
+        )
+
+    if data.get("status") not in ("interrupted", "waiting_for_input"):
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail={
+                "error": "not_resumable",
+                "reason": f"status={data.get('status')}",
+                "message": (
+                    f"Run '{run_id}' has status "
+                    f"'{data.get('status')}', which cannot be "
+                    f"resumed. Only 'interrupted' and "
+                    f"'waiting_for_input' runs support resume."
+                ),
+            },
+        )
+
+    # Re-run plan_resume now. The startup sweep's ``resumable`` flag
+    # can be stale if the state changed since (e.g. another operator
+    # already answered a HITL, or the checkpoint was deleted). The
+    # manager re-plans under its per-run lock, so this is safe.
+    try:
+        store = get_run_store()
+        manager = RecoveryManager(persistence=store)
+        plan = await manager.plan_resume(run_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("resume: plan_resume failed for %s: %s", run_id, exc)
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Could not plan resume for '{run_id}': {exc}",
+        ) from exc
+
+    if not plan.resumable:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail={
+                "error": "not_resumable",
+                "reason": plan.reason.value,
+                "message": plan.reason_text or plan.reason.value,
+            },
+        )
+
+    chat_id = str(data.get("id") or run_id)
+    job_id = str(data.get("job_id") or run_id)
+
+    # Idempotency: refuse to double-schedule a run whose task is
+    # already alive. The manager's own lock prevents the actual
+    # concurrency, but catching it here gives the caller a precise
+    # ``409 concurrent_resume`` instead of a background failure
+    # they would have to discover from the logs.
+    existing_task = ACTIVE_JOB_TASKS.get(job_id) or ACTIVE_JOB_TASKS.get(chat_id)
+    if existing_task is not None:
+        done_fn = getattr(existing_task, "done", None)
+        if callable(done_fn) and not done_fn():
+            raise HTTPException(
+                status_code=http_status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "concurrent_resume",
+                    "reason": "task_already_running",
+                    "message": (
+                        f"Run '{run_id}' already has an active task."
+                    ),
+                },
+            )
+
+    # Schedule the background resume. The task registers itself in
+    # ACTIVE_JOB_TASKS under both keys so the SSE endpoint and the
+    # cancel endpoint can find it.
+    resume_task = asyncio.create_task(
+        _execute_resume_flow(
+            run_id=run_id,
+            session_file=session_file,
+            chat_id=chat_id,
+            job_id=job_id,
+        )
+    )
+    ACTIVE_JOB_TASKS[job_id] = resume_task
+    if chat_id != job_id:
+        ACTIVE_JOB_TASKS[chat_id] = resume_task
+
+    def _cleanup_task(_):
+        ACTIVE_JOB_TASKS.pop(job_id, None)
+        ACTIVE_JOB_TASKS.pop(chat_id, None)
+
+    resume_task.add_done_callback(_cleanup_task)
+
+    # Register with ResourceMonitor so the run appears in the
+    # resource dashboard for its lifetime.
+    try:
+        from omweb.services.resource_monitor_service import (
+            get_resource_monitor_service,
+        )
+
+        get_resource_monitor_service().create_run(
+            run_id=job_id,
+            job_id=job_id,
+            chat_id=chat_id,
+            agent_id=str(data.get("agent_id") or "peldrun"),
+            engine_type=str(data.get("mode") or "agent"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "resume: resource monitor registration failed: %s", exc
+        )
+
+    logger.info(
+        "resume: scheduled for run=%s job=%s chat=%s reason=%s next_step=%d",
+        run_id,
+        job_id,
+        chat_id,
+        plan.reason.value,
+        plan.next_step,
+    )
+
+    return {
+        "run_id": run_id,
+        "job_id": job_id,
+        "chat_id": chat_id,
+        "status": "resuming",
+        "resume_reason": plan.reason.value,
+        "next_step": int(plan.next_step or 0),
+        "has_checkpoint": plan.latest_checkpoint is not None,
+        "pending_hitl": len(plan.pending_human_requests),
     }

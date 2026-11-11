@@ -783,8 +783,69 @@ class NullWorkspacePort:
 
 
 # ---------------------------------------------------------------------------
+# Port 5: AgentRegistryPort
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class AgentRegistryPort(Protocol):
+    """
+    Abstract contract for agent manifest lookup.
+
+    [P1-14 FIX — Core/OMWeb boundary]
+    The multi-agent coordinator used to import
+    ``omweb.agents.registry.agent_registry`` directly, violating the
+    plan's architecture rule that ``peldrun`` must not depend on
+    ``omweb``. This port is the injected abstraction that replaces
+    the direct import.
+
+    Only one method is needed today: ``get_agent``, which returns the
+    manifest dict for an agent identifier. Manifests carry, at
+    minimum, ``{"id": str, "tools": List[str], ...}``. The coordinator
+    consumes ``manifest["tools"]`` to build a child's authorized
+    tool allowlist.
+
+    Callers that have no registry available (stateless sub-agents,
+    unit tests, headless runs) pass ``None`` — the coordinator skips
+    the registry lookup and falls through to other tool-resolution
+    strategies (parent tools, specialist tools, etc.).
+    """
+
+    def get_agent(self, agent_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Return the manifest dict for ``agent_id``, or ``None`` if
+        the agent is unknown.
+
+        Must NEVER raise for a missing agent — return ``None``. Only
+        genuine I/O errors (registry file unreadable, DB down, ...)
+        may raise, and callers are expected to catch them and treat
+        as "no manifest available".
+        """
+        ...
+
+
+class NullAgentRegistryPort:
+    """
+    An ``AgentRegistryPort`` that knows about no agents.
+
+    Every ``get_agent`` returns ``None``. This is the correct backend
+    for contexts that genuinely have no registry (stateless
+    sub-agents, isolated unit tests, CLI invocations that don't load
+    the platform's agent definitions).
+    """
+
+    def get_agent(self, agent_id: str) -> Optional[Dict[str, Any]]:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Convenience constructors
 # ---------------------------------------------------------------------------
+
+
+def null_agent_registry() -> NullAgentRegistryPort:
+    """Return a fresh ``NullAgentRegistryPort``. Cheap to instantiate."""
+    return NullAgentRegistryPort()
 
 
 def null_persistence() -> NullPersistencePort:
@@ -805,17 +866,20 @@ def null_workspace() -> NullWorkspacePort:
 __all__ = [
     # Answer type alias
     "HumanAnswer",
-    # The four ports
+    # The ports
     "PersistencePort",
     "ToolResolverPort",
     "HumanInputPort",
     "WorkspacePort",
+    "AgentRegistryPort",
     # Null implementations
     "NullPersistencePort",
     "NullHumanInputPort",
     "NullWorkspacePort",
+    "NullAgentRegistryPort",
     # Convenience constructors
     "null_persistence",
     "null_human_input",
     "null_workspace",
+    "null_agent_registry",
 ]

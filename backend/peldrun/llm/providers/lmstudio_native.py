@@ -438,6 +438,21 @@ class LMStudioNativeAdapter:
         # Track tool-call accumulation by index (OpenAI-shaped deltas).
         active_tools: Dict[int, Dict[str, Any]] = {}
 
+        # [P1-13 FIX — Terminal marker tracking]
+        # The historical implementation emitted MESSAGE_COMPLETE
+        # unconditionally after the SSE loop, even if the
+        # provider stream terminated WITHOUT ``data: [DONE]``.
+        # That silently reported truncation as success on the
+        # native LM Studio path, mirroring the exact bug that
+        # P1-13 also fixes in ``ollama_native.py``.
+        #
+        # Set True ONLY inside the ``data_str == "[DONE]"``
+        # branch, immediately before ``break``. Any other exit
+        # path (network drop, httpx cancellation, malformed
+        # SSE) leaves it False → post-loop logic emits
+        # ``finish_reason="incomplete"``.
+        saw_terminal_marker: bool = False
+
         try:
             async with self._http.stream(
                 "POST",
@@ -468,6 +483,14 @@ class LMStudioNativeAdapter:
 
                     data_str = line[len("data:"):].strip()
                     if data_str == "[DONE]":
+                        # [P1-13 FIX] Mark that the provider sent
+                        # the terminal marker. This is the ONLY
+                        # place in the loop that sets it, so the
+                        # post-loop check has a hard guarantee:
+                        # if ``saw_terminal_marker`` is False, the
+                        # stream ended WITHOUT ``[DONE]`` — it
+                        # was truncated, not completed.
+                        saw_terminal_marker = True
                         break
                     if not data_str:
                         continue
@@ -689,10 +712,37 @@ class LMStudioNativeAdapter:
                 sequence=seq,
             )
 
+        # [P1-13 FIX — Honest terminal marker]
+        # See ``ollama_native.py`` for the full rationale. The
+        # invariant is identical: ``finish_reason`` reflects
+        # whether the provider actually signaled completion via
+        # ``data: [DONE]``, NOT whether the loop happened to exit
+        # (which it does on any exception, timeout, or drop).
+        #
+        # Note: LM Studio's ``stats.stop_reason`` (when present)
+        # is already mapped above; the fallback chain is:
+        #   1. ``[DONE]`` present + mapped ``stats.stop_reason``
+        #      → real reason (e.g. "stop", "length", "tool_calls").
+        #   2. ``[DONE]`` present, no stats → accumulated
+        #      ``finish_reason`` from choices[0], else "stop".
+        #   3. ``[DONE]`` absent → "incomplete" regardless of
+        #      anything else.
+        if saw_terminal_marker:
+            _effective_finish_reason = finish_reason or "stop"
+        else:
+            _effective_finish_reason = "incomplete"
+            logger.warning(
+                "[P1-13] LM Studio stream ended WITHOUT a terminal "
+                "'[DONE]' marker (model=%s). Emitting "
+                "finish_reason='incomplete' so consumers can retry "
+                "with a fresh attempt.",
+                compiled.model,
+            )
+
         seq += 1
         yield LLMStreamEvent(
             type=StreamEventType.MESSAGE_COMPLETE,
-            finish_reason=finish_reason or "stop",
+            finish_reason=_effective_finish_reason,
             usage=captured_usage,
             provider_metadata=(
                 {"stats": captured_stats}
