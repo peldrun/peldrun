@@ -75,6 +75,7 @@ import {
   togglePinChat,
   toggleArchiveChat,
   categorizeChatTimeBucket,
+  parseChatDate,
   Project,
   ChatSession,
 } from "@/lib/chatsApi";
@@ -217,13 +218,21 @@ export function Sidebar() {
 
   const standaloneChats = useMemo(
     () =>
-      orderedSessions.filter((c) => {
-        const pid = c.project_id;
-        const isProjectChat = pid && pid !== DEFAULT_PROJECT_ID && pid !== "";
-        if (isProjectChat) return false;
-        if (c.is_archived) return false;
-        return true;
-      }),
+      orderedSessions
+        .filter((c) => {
+          const pid = c.project_id;
+          const isProjectChat = pid && pid !== DEFAULT_PROJECT_ID && pid !== "";
+          if (isProjectChat) return false;
+          if (c.is_archived) return false;
+          return true;
+        })
+        .sort((a, b) => {
+          // Sort by latest interaction (updated_at) descending.
+          // Falls back to created_at for legacy sessions.
+          const timeA = parseChatDate(a.updated_at || a.created_at).getTime();
+          const timeB = parseChatDate(b.updated_at || b.created_at).getTime();
+          return timeB - timeA;
+        }),
     [orderedSessions]
   );
 
@@ -240,7 +249,8 @@ export function Sidebar() {
   const pastWeekChats = useMemo(
     () =>
       nonPinnedChats.filter(
-        (c) => categorizeChatTimeBucket(c.created_at) !== "older"
+        (c) =>
+          categorizeChatTimeBucket(c.updated_at || c.created_at) !== "older"
       ),
     [nonPinnedChats]
   );
@@ -253,7 +263,8 @@ export function Sidebar() {
   const olderChats = useMemo(
     () =>
       nonPinnedChats.filter(
-        (c) => categorizeChatTimeBucket(c.created_at) === "older"
+        (c) =>
+          categorizeChatTimeBucket(c.updated_at || c.created_at) === "older"
       ),
     [nonPinnedChats]
   );
@@ -933,7 +944,15 @@ function ProjectSessionsSection({
     setVisibleLimit(10);
   }, [projectId]);
 
-  const allSessions = projectSessions ?? [];
+  const allSessions = useMemo(() => {
+    const sessions = projectSessions ?? [];
+    return [...sessions].sort((a, b) => {
+      const timeA = parseChatDate(a.updated_at || a.created_at).getTime();
+      const timeB = parseChatDate(b.updated_at || b.created_at).getTime();
+      return timeB - timeA;
+    });
+  }, [projectSessions]);
+
   const visibleSessions = allSessions.slice(0, visibleLimit);
   const canLoadMoreLocally = visibleLimit < allSessions.length;
   const canLoadMoreFromServer = hasMore;
