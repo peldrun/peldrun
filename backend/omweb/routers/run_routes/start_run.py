@@ -124,6 +124,52 @@ def _project_attachments_for_turn(attachments: Any) -> list:
     return result
 
 
+def _extract_provider_model_from_events(existing_chat: dict) -> tuple:
+    """
+    Extract the (provider, model) pair that produced the PREVIOUS turn
+    from its own ``events`` array.
+
+    Why this exists
+    ---------------
+    ``session.json``'s top-level ``provider_name`` / ``model`` fields
+    are NOT reliable at archival time: multiple writers rewrite the
+    document (``save_chat_session``, ``sync_sidecar``, per-turn
+    accounting, ...) and some of them use a fixed schema that drops
+    unknown fields. By the time the NEXT run archives the PREVIOUS
+    turn, the top-level snapshot may already be gone.
+
+    The ``events`` array, in contrast, is immutable once the run
+    completes:
+      * A successful turn ends with a ``final`` event carrying
+        ``data.provider`` / ``data.model``.
+      * A failed turn ends with an ``error`` event carrying the same
+        fields (as of the ``[FIX-PROVIDER-IN-ERROR]`` change in
+        ``dispatcher.py``).
+
+    Returns ``(provider, model)``, either half potentially None.
+    """
+    if not isinstance(existing_chat, dict):
+        return (None, None)
+
+    top_events = existing_chat.get("events")
+    if isinstance(top_events, list) and top_events:
+        for ev in reversed(top_events):
+            if not isinstance(ev, dict):
+                continue
+            ev_type = str(ev.get("type", "")).lower()
+            if ev_type not in ("final", "error"):
+                continue
+            data = ev.get("data")
+            if not isinstance(data, dict):
+                continue
+            provider = data.get("provider")
+            model = data.get("model")
+            if provider or model:
+                return (provider, model)
+
+    return (None, None)
+
+
 # ---------------------------------------------------------------------------
 # [P0-7] Resume endpoint helpers
 # ---------------------------------------------------------------------------
@@ -778,6 +824,9 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
                     prev_ev = existing_chat.get("events", [])
                     if prev_p and (prev_r or prev_ev):
                         if not turns or turns[-1].get("job_id") != prev_jid:
+                            _ext_provider, _ext_model = (
+                                _extract_provider_model_from_events(existing_chat)
+                            )
                             turns.append({
                                 "job_id": prev_jid,
                                 "prompt": prev_p,
@@ -787,7 +836,15 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
                                 "created_at": existing_chat.get("updated_at") or existing_chat.get("created_at"),
                                 "produced_files": job_scoped_artifacts.get(prev_jid, []),
                                 "attachedFiles": prev_attached_files,
-                                "model": existing_chat.get("model"),
+                                "model": (
+                                    existing_chat.get("model")
+                                    or _ext_model
+                                ),
+                                "provider": (
+                                    existing_chat.get("provider_name")
+                                    or existing_chat.get("provider")
+                                    or _ext_provider
+                                ),
                                 "usage": existing_chat.get("usage"),
                             })
         else:
@@ -797,6 +854,9 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
             prev_ev = existing_chat.get("events", [])
             if prev_p and (prev_r or prev_ev):
                 if not turns or turns[-1].get("job_id") != prev_jid:
+                    _ext_provider, _ext_model = (
+                        _extract_provider_model_from_events(existing_chat)
+                    )
                     turns.append({
                         "job_id": prev_jid,
                         "prompt": prev_p,
@@ -806,7 +866,15 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
                         "created_at": existing_chat.get("updated_at") or existing_chat.get("created_at"),
                         "produced_files": job_scoped_artifacts.get(prev_jid, []),
                         "attachedFiles": prev_attached_files,
-                        "model": existing_chat.get("model"),
+                        "model": (
+                            existing_chat.get("model")
+                            or _ext_model
+                        ),
+                        "provider": (
+                            existing_chat.get("provider_name")
+                            or existing_chat.get("provider")
+                            or _ext_provider
+                        ),
                         "usage": existing_chat.get("usage"),
                     })
 

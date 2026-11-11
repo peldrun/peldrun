@@ -1939,7 +1939,14 @@ async def run_instrumented(
             SSEEvent(
                 type=SSEEventType.ERROR,
                 step=1,
-                data={"message": err_msg, "model": model_name},
+                data={
+                    "message": err_msg,
+                    "model": model_name,
+                    # Same rationale as in run_direct_chat: persist
+                    # the provider so failure turns can be attributed
+                    # correctly after a page refresh.
+                    "provider": provider_name,
+                },
             ),
         )
     finally:
@@ -2953,7 +2960,17 @@ async def run_direct_chat(
             SSEEvent(
                 type=SSEEventType.ERROR,
                 step=1,
-                data={"message": err_msg, "model": model_name},
+                data={
+                    "message": err_msg,
+                    "model": model_name,
+                    # [FIX-PROVIDER-IN-ERROR]
+                    # Include the provider so turn archival can recover
+                    # it from the turn's own events when the top-level
+                    # session fields have been wiped by a downstream
+                    # writer. Mirrors the `final` event's payload shape,
+                    # which already carries `provider`.
+                    "provider": provider_name,
+                },
             ),
         )
     finally:

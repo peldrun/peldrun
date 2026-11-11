@@ -295,6 +295,22 @@ async def get_job_detail(job_id: str):
         "created_at": chat.get("created_at"),
         "agent_id": chat.get("agent_id", "peldrun"),
         "model": chat.get("model"),
+        # Top-level provider that produced the MOST RECENT run of
+        # this chat. Used by use-job-details.ts to re-sync the
+        # frontend's `activeProvider` selection when a chat is
+        # opened (or re-opened after a refresh), so the CURRENT
+        # turn's identity header matches the provider that actually
+        # produced it — not whatever provider the user happened to
+        # select in another chat. Historical turns use their own
+        # per-turn `provider` snapshot (see turns[].provider).
+        #
+        # Both keys are exposed for the same reason the archival
+        # logic uses both: legacy sessions may only have `provider`
+        # (written by older code before `provider_name` was
+        # introduced), and the frontend needs a single readable
+        # value regardless of which shape is on disk.
+        "provider_name": chat.get("provider_name") or chat.get("provider"),
+        "provider": chat.get("provider"),
         "mode": chat.get("mode", "agent"),
         "produced_files": resolved_files,
         "generative_ui": chat.get("generative_ui"),

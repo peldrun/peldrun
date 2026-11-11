@@ -83,6 +83,19 @@ export interface ChatTurn {
   producedFiles?: { name: string; path: string }[];
   attachedFiles?: AttachedUserFile[];
   model?: string;
+  /**
+   * Provider that produced this turn.
+   *
+   * Captured at run START time (see ChatContainer's
+   * `runStartProviderRef`) so that even if the user changes the
+   * active provider later via EngineSelector, historical turns
+   * continue to display the provider that actually generated them.
+   *
+   * `null` / `undefined` on turns that predate this field — the
+   * consumer (`HistoricalTurn`) falls back to the currently-active
+   * provider for backward compatibility.
+   */
+  provider?: string | null;
   mode?: "agent" | "chat";
   usage?: {
     cost_usd: number;
@@ -140,6 +153,17 @@ export interface ChatThreadProps {
   getLiveStatusMessage: () => string;
   chatScrollBottomRef: React.RefObject<HTMLDivElement | null>;
   activeModelName?: string;
+  /**
+   * Currently-selected provider display name (from useAppStorage
+   * `active_provider`). Used as the FALLBACK provider when rendering
+   * a historical turn whose `provider` field is `null` / `undefined`
+   * (i.e., a turn created before the provider-capture feature was
+   * introduced). The active turn always displays this value directly.
+   *
+   * Passed down by ChatContainer; consumed by ChatThread and
+   * forwarded to HistoricalTurn / ChatDeliverable.
+   */
+  activeProvider?: string;
   tokensUsed?: { input: number; output: number; total: number };
   costUsd?: number | null;
   latencyMs?: number | null;

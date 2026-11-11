@@ -34,6 +34,18 @@ export interface HistoricalTurnProps {
   showRawTrace: boolean;
   setShowRawTrace: (val: boolean) => void;
   activeModelName: string;
+  /**
+   * Currently-active provider display name (from ChatContainer's
+   * `useAppStorage("active_provider")`).
+   *
+   * Used ONLY as a fallback when `turn.provider` is null/undefined —
+   * i.e., for historical turns created before the provider-snapshot
+   * feature was introduced. Newer turns carry their own `provider`
+   * field captured at run START time, so we always display the
+   * provider that actually produced the turn regardless of any later
+   * EngineSelector change.
+   */
+  activeProvider?: string;
   onRegenerate?: (turnIndex: number, turn: ChatTurn) => void;
 }
 
@@ -65,10 +77,32 @@ export function HistoricalTurn({
   showRawTrace,
   setShowRawTrace,
   activeModelName,
+  activeProvider,
   onRegenerate,
 }: HistoricalTurnProps) {
   const turnMode = turn.mode || (turn.steps && turn.steps.length > 0 ? "agent" : "chat");
   const isAgentTurn = turnMode === "agent";
+
+  // Resolve the provider/model snapshots for THIS turn.
+  //
+  // `turn.provider` / `turn.model` are captured at run START time in
+  // ChatContainer (see `runStartProviderRef` / `runStartModelRef`), so
+  // they reflect the selection that ACTUALLY produced this turn —
+  // even if the user has since changed the active provider/model via
+  // EngineSelector. Falling back to the current active values only
+  // when the snapshot is missing covers:
+  //
+  //   * Turns created before the snapshot feature existed (pre-upgrade
+  //     sessions loaded from disk).
+  //   * The very first turn of a session, before any archive has
+  //     populated the refs.
+  //
+  // Using `||` (not `??`) preserves the existing behavior for
+  // `turn.model`: an empty string is treated the same as `null` /
+  // `undefined`, so a genuinely-empty model name never wins over the
+  // current selection.
+  const turnProvider = turn.provider || activeProvider;
+  const turnModel = turn.model || activeModelName;
 
   const isTurnRawTrace = Boolean(
     turn.finalResult &&
@@ -131,7 +165,13 @@ export function HistoricalTurn({
           execMode={isAgentTurn ? "agent" : "chat"}
           showRawTrace={showRawTrace}
           setShowRawTrace={setShowRawTrace}
-          modelName={turn.model || activeModelName}
+          modelName={turnModel}
+          // Explicit provider for THIS turn. ChatDeliverable uses it
+          // instead of the currently-active provider (which it would
+          // otherwise read from useAppStorage). Without this prop,
+          // historical turns would keep re-labelling themselves with
+          // whatever provider the user picks in EngineSelector.
+          providerName={turnProvider}
           timestamp={turn.timestamp}
           tokensUsed={turn.tokensUsed}
           costUsd={turn.usage?.cost_usd}

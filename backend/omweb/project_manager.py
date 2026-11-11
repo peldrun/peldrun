@@ -392,6 +392,48 @@ class ProjectManager:
             "turns": existing_turns,
         }
 
+        # ------------------------------------------------------------------
+        # [FIX-PRESERVE-UNKNOWN-FIELDS]
+        #
+        # Preserve every field that lives in the current session.json but
+        # is NOT part of the canonical schema above. The primary callers
+        # (start_run.py's enrichment block, dispatcher's accounting path)
+        # attach extra fields to the document — `provider_name`, `model`,
+        # `provider`, `reasoning_effort`, `attachments`, `generative_ui`,
+        # `resumable`, etc. Without this guard, every subsequent call to
+        # save_chat_session (from any code path — job completion, sidecar
+        # sync, recovery, restart) would silently erase those fields.
+        #
+        # This was the root cause of "all historical turns show the
+        # last-used provider after a page refresh": the enrichment wrote
+        # `provider_name` on the top-level document, but the next
+        # save_chat_session call wiped it, so turn archival saw `None`
+        # and stored `provider: null` in `turns[]`.
+        #
+        # Merge order — existing fields are the base, the freshly-built
+        # canonical dict overrides them. This means:
+        #   * New writes to `turns`, `status`, `result`, `usage_summary`
+        #     still land authoritatively.
+        #   * Extra fields survive untouched.
+        #   * Fields explicitly set to `None` by the caller still override
+        #     (they are present in the dict with a None value).
+        # ------------------------------------------------------------------
+        existing_full: Optional[Dict[str, Any]] = None
+        if session_file.exists():
+            try:
+                loaded_existing = json.loads(
+                    session_file.read_text(encoding="utf-8")
+                )
+                if isinstance(loaded_existing, dict):
+                    existing_full = loaded_existing
+            except Exception:
+                existing_full = None
+
+        if existing_full is not None:
+            merged_session: Dict[str, Any] = dict(existing_full)
+            merged_session.update(session_data)
+            session_data = merged_session
+
         # Atomic writes for session and events files
         _atomic_write_json(session_file, session_data)
         _atomic_write_json(events_file, final_events)

@@ -20,6 +20,8 @@
 
 import React, { useEffect, useRef } from "react";
 import { Bot } from "lucide-react";
+import { Icon } from "@/components/Icon/Icon";
+import { useProviderBadge } from "@/lib/providerBadge";
 import { ChatTimeline, StepEvent } from "../chat-timeline";
 import { ChatDeliverable } from "../chat-deliverable";
 import { DelegationApprovalCard } from "../DelegationApprovalCard";
@@ -86,6 +88,7 @@ export function ChatThread({
   getLiveStatusMessage,
   chatScrollBottomRef,
   activeModelName = "Assistant",
+  activeProvider,
   tokensUsed,
   costUsd,
   latencyMs,
@@ -99,6 +102,16 @@ export function ChatThread({
   onOpenReview,
 }: ChatThreadProps) {
   const activePromptAnchorRef = useRef<HTMLDivElement | null>(null);
+
+  // `activeProvider` is provided as a prop by ChatContainer (which
+  // reads it from useAppStorage("active_provider") at the container
+  // level). Centralizing the read there guarantees that every
+  // consumer in the tree — ChatThread's header, HistoricalTurn, and
+  // ChatDeliverable — sees the same value within a single render
+  // pass. Previously this component read the value independently,
+  // which meant ChatContainer and ChatThread could momentarily see
+  // different values during a selector change.
+  const providerBadge = useProviderBadge(activeProvider);
 
   // Auto-scroll to the active prompt anchor when a new prompt is submitted.
   useEffect(() => {
@@ -202,6 +215,7 @@ export function ChatThread({
               showRawTrace={showRawTrace}
               setShowRawTrace={setShowRawTrace}
               activeModelName={activeModelName}
+              activeProvider={activeProvider}
               onRegenerate={onRegenerate}
             />
           </div>
@@ -226,8 +240,17 @@ export function ChatThread({
         {submittedPrompt && (
           <div className="flex items-center justify-between text-xs text-muted-foreground pt-1 pb-2">
             <div className="flex items-center gap-1.5 font-medium text-foreground">
-              <Bot size={15} className="text-primary shrink-0" />
-              <span className="font-semibold text-xs font-mono">{activeModelName}</span>
+              {providerBadge ? (
+                <Icon name={providerBadge} size={16} />
+              ) : (
+                <Bot size={15} className="text-primary shrink-0" />
+              )}
+              {activeProvider && (
+                <span className="font-semibold text-xs font-mono text-primary truncate max-w-[140px]">
+                  {activeProvider}:
+                </span>
+              )}
+              <span className="font-semibold text-xs font-mono theAgent truncate max-w-[180px]">{activeModelName}</span>
               {execMode === "agent" && (
                 <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary border border-primary/20 font-mono">
                   Agent

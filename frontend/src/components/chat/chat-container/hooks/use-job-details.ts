@@ -65,6 +65,30 @@ interface UseJobDetailsParams {
   setSelectedAgentId: (id: string) => void;
   setExecMode: (m: any) => void;
   setActiveModelName: (m: string) => void;
+  /**
+   * Sync the frontend's active-provider selection from the chat's
+   * persisted `provider_name` field when a chat is loaded.
+   *
+   * WHY this exists (mirrors `setActiveModelName` exactly):
+   *
+   *   `activeProvider` in ChatContainer is sourced from the GLOBAL
+   *   `useAppStorage("active_provider")` slot. Without this sync,
+   *   switching to a different chat (or refreshing) leaves the
+   *   current turn's identity header showing whatever provider the
+   *   user last selected ANYWHERE — not the one that produced THIS
+   *   chat's most recent run.
+   *
+   *   Historical turns are unaffected: they read their own
+   *   per-turn `provider` snapshot from `session.json` (see the
+   *   turns[] mapping below), so they always display the provider
+   *   that actually generated them.
+   *
+   * The setter is optional to keep the hook usable from any future
+   * consumer that does not subscribe to `active_provider` (e.g. a
+   * read-only history viewer). When omitted, the sync is a no-op
+   * and the existing global value is preserved.
+   */
+  setActiveProvider?: (p: string) => void;
   setStatus: (s: ChatStatus) => void;
   setFinalResult: (r: string | null) => void;
   setSessionTimestamp: (t: string) => void;
@@ -179,6 +203,21 @@ export function useJobDetails(params: UseJobDetailsParams) {
       if (data.agent_id) p.setSelectedAgentId(data.agent_id);
       if (data.mode) p.setExecMode(data.mode);
       if (data.model) p.setActiveModelName(data.model);
+      // Sync the active provider from the persisted session so the
+      // CURRENT turn's identity header matches the provider that
+      // actually produced it. Falls through silently when either
+      // the backend did not expose `provider_name` (pre-fix
+      // sessions) or the caller did not supply a setter (read-only
+      // consumers).
+      //
+      // Historical turns are NOT affected by this assignment: their
+      // provider comes from `t.provider` on each turn object (see
+      // the turns[] mapping below), which was captured at run
+      // archive time and is therefore immune to any later global
+      // selection changes.
+      if (data.provider_name && typeof data.provider_name === "string") {
+        p.setActiveProvider?.(data.provider_name);
+      }
       if (data.status) p.setStatus(data.status);
       if (data.result) p.setFinalResult(safeRender(data.result));
       p.setSessionTimestamp(
@@ -228,6 +267,33 @@ export function useJobDetails(params: UseJobDetailsParams) {
               finalResult: safeRender(t.result),
               status: t.status || "completed",
               model: t.model,
+              // Provider snapshot captured by the backend at turn
+              // archival time (see start_run.py → turns.append({...
+              // "provider": existing_chat.get("provider_name") ...})).
+              //
+              // This is what keeps each historical turn displaying
+              // the provider that ACTUALLY produced it, even when
+              // the user has since switched to a different provider.
+              //
+              // `||` normalizes three inputs to `undefined`:
+              //   * `undefined`        → field was never set (pre-fix
+              //                          sessions on disk).
+              //   * `null`             → backend explicitly cleared it.
+              //   * empty string ""    → legacy session that saved a
+              //                          blank provider_name.
+              // HistoricalTurn then falls back to `activeProvider` in
+              // exactly those cases, preserving the pre-fix behavior
+              // for old data without ever masking a valid provider.
+              provider: t.provider || undefined,
+              // Optional mode field. HistoricalTurn already infers
+              // `mode` from step count when this is undefined, so this
+              // is a pass-through improvement only — it does not
+              // change behavior for sessions where the backend does
+              // not persist `mode` per turn.
+              mode:
+                t.mode === "agent" || t.mode === "chat"
+                  ? t.mode
+                  : undefined,
               producedFiles: t.produced_files,
               attachedFiles: t.attachedFiles || undefined,
               usage: t.usage || undefined,

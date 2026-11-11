@@ -4,6 +4,9 @@
 
 import React from "react";
 import { FileText, ExternalLink, Activity, Check, Copy, Bot, AlertCircle, RotateCcw, PlayCircle } from "lucide-react";
+import { Icon } from "@/components/Icon/Icon";
+import { useAppStorage } from "@/hooks/use-app-storage";
+import { useProviderBadge } from "@/lib/providerBadge";
 import { resolveFileCategory } from "./chat-thread/utils";
 import { UsageBadgeGroup } from "@/components/chat/UsageBadges";
 import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
@@ -23,6 +26,22 @@ interface ChatDeliverableProps {
   showRawTrace: boolean;
   setShowRawTrace: (show: boolean) => void;
   modelName?: string;
+  /**
+   * Display name of the provider that produced this deliverable.
+   *
+   * Preferred over reading `useAppStorage("active_provider")`
+   * internally because:
+   *   * Historical turns need their OWN provider snapshot
+   *     (`turn.provider`), not whatever the user has selected NOW.
+   *   * Live turns (rendered by ChatThread with `hideHeader={true}`)
+   *     do not show the header at all, so the field is unused there
+   *     — but keeping it optional makes the component safe for any
+   *     future call site.
+   *
+   * When `undefined`, the component falls back to the currently-active
+   * provider (legacy behavior, preserved for backward compatibility).
+   */
+  providerName?: string;
   timestamp?: string;
   tokensUsed?: { input?: number; output?: number; total?: number };
   costUsd?: number | null;
@@ -47,6 +66,7 @@ export function ChatDeliverable({
   showRawTrace,
   setShowRawTrace,
   modelName = "Assistant",
+  providerName,
   timestamp,
   tokensUsed,
   costUsd,
@@ -56,6 +76,23 @@ export function ChatDeliverable({
   hideHeader = false,
 }: ChatDeliverableProps) {
   const copyId = typeof turnIndex === "number" ? `turn-res-${turnIndex}` : "final-result";
+
+  // Resolve provider name + badge icon for THIS deliverable.
+  //
+  // Priority:
+  //   1. `providerName` prop — the turn's own snapshot. Set by
+  //      HistoricalTurn using `turn.provider ?? activeProvider`,
+  //      which is the provider that ACTUALLY produced the turn.
+  //   2. `useAppStorage("active_provider")` — the currently-active
+  //      provider. Used as a last-resort fallback for call sites
+  //      that do not (yet) pass the prop, preserving backward
+  //      compatibility with any external consumer.
+  //
+  // The badge is resolved from whichever of the two wins, so the
+  // icon and the label always refer to the SAME provider.
+  const [activeProviderFallback] = useAppStorage("active_provider");
+  const resolvedProviderName = providerName ?? activeProviderFallback;
+  const providerBadge = useProviderBadge(resolvedProviderName);
 
   // Hide dot-prefixed paths (`.git/…`, `.peldrun/…`, `.env`,
   // `.gitignore`, …) from the user-facing deliverables list.
@@ -97,8 +134,17 @@ export function ChatDeliverable({
       {!hideHeader && (
         <div className="flex items-center justify-between text-xs text-muted-foreground pt-1">
           <div className="flex items-center gap-1.5 font-medium text-foreground">
-            <Bot size={15} className="text-primary shrink-0" />
-            <span className="font-semibold text-xs font-mono">{modelName}</span>
+            {providerBadge ? (
+              <Icon name={providerBadge} size={16} />
+            ) : (
+              <Bot size={15} className="text-primary shrink-0" />
+            )}
+            {resolvedProviderName && (
+              <span className="font-semibold text-xs font-mono text-primary truncate max-w-[140px]">
+                {resolvedProviderName}:
+              </span>
+            )}
+            <span className="font-semibold text-xs font-mono Agent truncate max-w-[180px]">{modelName}</span>
             {execMode === "agent" && (
               <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary border border-primary/20 font-mono">
                 Agent
