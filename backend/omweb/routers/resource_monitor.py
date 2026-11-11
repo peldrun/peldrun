@@ -158,30 +158,6 @@ async def get_run_timeline(
 
 
 @router.get(
-    "/runs/{run_id}/timeline",
-    response_model=Dict[str, Any],
-    summary="Get complete timeline for a specific run",
-)
-async def get_run_timeline(
-    run_id: str,
-    service: ResourceMonitorService = Depends(get_resource_monitor_service),
-) -> Dict[str, Any]:
-    """Retrieve run metadata, granular execution spans, and bounded timeseries for detailed analysis."""
-    run_data = service.get_run_timeline(run_id)
-    if not run_data:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Execution run '{run_id}' not found",
-        )
-
-    return {
-        "run": run_data["run"].model_dump(),
-        "spans": [s.model_dump() for s in run_data["spans"]],
-        "timeseries": [p.model_dump() for p in run_data["timeseries"]],
-    }
-
-
-@router.get(
     "/timeseries",
     response_model=TimeseriesResponse,
     summary="Query downsampled timeseries telemetry",

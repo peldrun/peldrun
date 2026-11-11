@@ -454,47 +454,6 @@ class ResourceMonitorService:
             "timeseries": points,
         }
 
-    def get_run_timeline(self, run_id: str) -> Optional[Dict[str, Any]]:
-        """Retrieve execution run details, spans, and timeseries bounded by run lifecycle."""
-        run_data = self.get_run(run_id)
-        if not run_data:
-            return None
-
-        run = run_data["run"]
-        spans = run_data["spans"]
-
-        start_epoch_ms = 0
-        end_epoch_ms = 0
-
-        try:
-            if run.started_at:
-                start_dt = datetime.fromisoformat(run.started_at)
-                start_epoch_ms = int(start_dt.timestamp() * 1000)
-
-            if run.ended_at:
-                end_dt = datetime.fromisoformat(run.ended_at)
-                end_epoch_ms = int(end_dt.timestamp() * 1000)
-            else:
-                # If the run is still active, use current time to get up-to-date telemetry
-                end_epoch_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        except Exception:
-            pass
-
-        points = []
-        if start_epoch_ms > 0 and end_epoch_ms >= start_epoch_ms:
-            # 1-second resolution is precise enough for a single run's duration
-            points = self._repo.query_timeseries(
-                from_epoch_ms=start_epoch_ms,
-                to_epoch_ms=end_epoch_ms,
-                resolution_seconds=1,
-            )
-
-        return {
-            "run": run,
-            "spans": spans,
-            "timeseries": points,
-        }
-
     def query_timeseries(
         self,
         from_epoch_ms: int,

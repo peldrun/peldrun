@@ -436,6 +436,16 @@ class PeldrunEngine(ExecutionEngine):
         from omweb.project_manager import project_manager
         from omweb.sse_events import SSEEvent, SSEEventType, dispatch_event
         from omweb.tools.registry import tool_registry as web_tool_registry
+        # [RESOURCE-MONITOR-FIX] Lazy imports so that a broken monitor
+        # subsystem can never prevent the engine from starting. All
+        # uses below are wrapped in try/except as defense in depth.
+        from omweb.resource_monitor.models import (
+            SpanStatus as _SpanStatus,
+            SpanType as _SpanType,
+        )
+        from omweb.services.resource_monitor_service import (
+            get_resource_monitor_service as _get_monitor_service,
+        )
 
         job_id = context.job_id
         run_id_str = str(uuid.uuid4())
@@ -458,6 +468,48 @@ class PeldrunEngine(ExecutionEngine):
             job_id,
             "enabled" if streaming_enabled else "disabled",
         )
+
+        # [RESOURCE-MONITOR-FIX] Acquire the monitor service and mark
+        # the run RUNNING. The run was already registered in PENDING
+        # by start_run.py; without this call the transition to RUNNING
+        # never happens and no spans can be attached to it, which is
+        # the root cause of "No tool calls recorded for this run".
+        #
+        # Failure modes are handled per-stage so that a transient
+        # error in one stage does not disable the others:
+        #   * get_service fails  -> _monitor is None (all uses skip)
+        #   * start_run fails    -> _monitor kept alive (span/terminal
+        #                           calls may still succeed and are
+        #                           independently try/except'd)
+        _monitor = None
+        try:
+            _monitor = _get_monitor_service()
+        except Exception as _get_exc:
+            logger.warning(
+                "[RESOURCE-MONITOR] get_service failed for job %s: %s",
+                job_id,
+                _get_exc,
+            )
+            _monitor = None
+
+        # [RESOURCE-MONITOR-FIX] Run lifecycle transitions
+        # (start/complete/fail/cancel) are owned by the dispatcher
+        # (`omweb.agent_bridge_parts.dispatcher._safe_monitor_*_run`)
+        # which wraps this engine and also covers the chat-only path
+        # (`run_direct_chat`). Do NOT duplicate those calls here: a
+        # second `start_run` re-captures the baseline RSS from a
+        # later point, hiding the first phase of memory growth.
+        #
+        # This engine owns ONLY span lifecycle:
+        #   start_span(TOOL_CALL) on TOOL_CALL events,
+        #   end_span(COMPLETED|FAILED) on OBSERVATION events.
+
+        # [RESOURCE-MONITOR-FIX] Active tool-call spans keyed by the
+        # event's tool_call_id, with tool_name as fallback. Used to
+        # close the correct span when the matching OBSERVATION event
+        # arrives, including cases where one step invokes multiple
+        # tools (parallel tool calls).
+        _active_tool_spans: Dict[str, str] = {}
 
         # Use get_effective_agent so user-saved settings from the Store
         # settings modal (max_steps) are merged into the manifest before
@@ -1550,6 +1602,40 @@ class PeldrunEngine(ExecutionEngine):
                     else str(arguments)
                 )
 
+                # [RESOURCE-MONITOR-FIX] Open an ExecutionSpanModel for
+                # this tool call. The corresponding end_span call fires
+                # on the matching OBSERVATION event below. The span ID
+                # is stored under tool_call_id (primary) and tool_name
+                # (fallback) so parallel tool calls in one step close
+                # correctly even when providers omit either field.
+                _tc_id = str(event.payload.get("tool_call_id") or "")
+                if _monitor is not None:
+                    try:
+                        _span_id = f"span_{uuid.uuid4().hex[:12]}"
+                        _monitor.start_span(
+                            span_id=_span_id,
+                            run_id=job_id,
+                            target_name=tool_name,
+                            span_type=_SpanType.TOOL_CALL,
+                        )
+                        _span_key = _tc_id or tool_name
+                        _active_tool_spans[_span_key] = _span_id
+                        if _tc_id and _tc_id != tool_name:
+                            # Also index by tool_name as secondary key
+                            # so an OBSERVATION that carries only the
+                            # name can still close the right span.
+                            _active_tool_spans.setdefault(
+                                tool_name, _span_id
+                            )
+                    except Exception as _sp_exc:
+                        logger.debug(
+                            "[RESOURCE-MONITOR] start_span failed for "
+                            "tool %s (job %s): %s",
+                            tool_name,
+                            job_id,
+                            _sp_exc,
+                        )
+
                 is_human_ask = tool_name in ("ask_human", "human_input")
                 tool_call_payload: Dict[str, Any] = {
                     "name": tool_name,
@@ -1889,6 +1975,65 @@ class PeldrunEngine(ExecutionEngine):
                             "for job %s: %s",
                             job_id,
                             _img_exc,
+                        )
+
+                # [RESOURCE-MONITOR-FIX] Close the tool-call span that
+                # was opened on the matching TOOL_CALL event. Lookup
+                # order:
+                #   1. tool_call_id from the payload (exact match)
+                #   2. tool_name from the payload (works for peldrun
+                #      versions that only send the name)
+                #   3. the oldest pending span (last-resort safety net
+                #      so a provider that omits both fields cannot leak
+                #      spans forever)
+                if _monitor is not None:
+                    try:
+                        _obs_tc_id = str(
+                            event.payload.get("tool_call_id") or ""
+                        )
+                        _span_id = None
+                        _match_key = None
+                        if _obs_tc_id and _obs_tc_id in _active_tool_spans:
+                            _match_key = _obs_tc_id
+                            _span_id = _active_tool_spans.get(_obs_tc_id)
+                        elif (
+                            observation_tool
+                            and observation_tool in _active_tool_spans
+                        ):
+                            _match_key = observation_tool
+                            _span_id = _active_tool_spans.get(
+                                observation_tool
+                            )
+                        elif _active_tool_spans:
+                            _match_key = next(iter(_active_tool_spans))
+                            _span_id = _active_tool_spans.get(_match_key)
+
+                        if _span_id is not None:
+                            _monitor.end_span(
+                                span_id=_span_id,
+                                status=(
+                                    _SpanStatus.FAILED
+                                    if is_tool_error
+                                    else _SpanStatus.COMPLETED
+                                ),
+                            )
+                            # Remove every key that maps to this span
+                            # so the secondary tool_name index cannot
+                            # double-close it on the next observation.
+                            _stale_keys = [
+                                k
+                                for k, v in _active_tool_spans.items()
+                                if v == _span_id
+                            ]
+                            for _k in _stale_keys:
+                                _active_tool_spans.pop(_k, None)
+                    except Exception as _ep_exc:
+                        logger.debug(
+                            "[RESOURCE-MONITOR] end_span failed for "
+                            "tool %s (job %s): %s",
+                            observation_tool or "<unknown>",
+                            job_id,
+                            _ep_exc,
                         )
 
                 await dispatch_event(

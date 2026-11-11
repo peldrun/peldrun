@@ -331,13 +331,48 @@ async def _execute_resume_flow(
          SSE consumer continues to read ``ACTIVE_JOB_EVENTS`` for
          live events; ``session.json`` is the durable record.
     """
+    # [RESOURCE-MONITOR-FIX] Acquire the monitor service and transition
+    # the run PENDING -> RUNNING before the executor starts. Without
+    # this, the row stays PENDING forever and no TOOL_CALL spans can
+    # attach — the exact "No tool calls recorded" symptom in resume.
+    _monitor = None
+    try:
+        from omweb.services.resource_monitor_service import (
+            get_resource_monitor_service as _get_monitor,
+        )
+        _monitor = _get_monitor()
+        _monitor.start_run(job_id)
+    except Exception as _mon_err:
+        logger.warning(
+            "resume: monitor start_run failed for job %s: %s",
+            job_id,
+            _mon_err,
+        )
+        _monitor = None
+
     captured: Dict[str, Any] = {}
 
     def _request_builder(
         state: ExecutionState, plan: RecoveryPlan
     ) -> CoreRunRequest | None:
         captured["state"] = state
-        return _build_resume_request(state, plan, session_file)
+        req = _build_resume_request(state, plan, session_file)
+        # [RESOURCE-MONITOR-FIX] Attach the passive monitor hook so
+        # the executor emits TOOL_CALL spans even though this flow
+        # bypasses PeldrunEngine entirely. The hook is synchronous
+        # and exception-safe by contract (see ``_make_monitor_hook``).
+        if req is not None and _monitor is not None:
+            try:
+                req.metadata["resource_monitor_hook"] = (
+                    _make_monitor_hook(_monitor, job_id)
+                )
+            except Exception as _hook_err:
+                logger.debug(
+                    "resume: monitor hook attach failed for job %s: %s",
+                    job_id,
+                    _hook_err,
+                )
+        return req
 
     async def _executor_fn(request: CoreRunRequest):
         return await core_executor.execute(
@@ -362,11 +397,17 @@ async def _execute_resume_flow(
             result="",
             error=f"resume_run raised: {exc}",
         )
+        # [RESOURCE-MONITOR-FIX] Mark the run FAILED so it cannot
+        # remain stuck in RUNNING after an unexpected crash.
+        if _monitor is not None:
+            try:
+                _monitor.fail_run(
+                    job_id, error_message=f"resume_run raised: {exc}"
+                )
+            except Exception:
+                pass
         return
 
-    # ------------------------------------------------------------------
-    # Persist outcome to session.json.
-    # ------------------------------------------------------------------
     if outcome.success and outcome.result is not None:
         result = outcome.result
         status_value = (
@@ -380,18 +421,49 @@ async def _execute_resume_flow(
             result=result.output or "",
             error=result.error,
         )
+        # [RESOURCE-MONITOR-FIX] Dispatch the correct terminal
+        # transition based on the executor's reported status.
+        if _monitor is not None:
+            try:
+                if status_value == "completed":
+                    _monitor.complete_run(job_id)
+                elif status_value == "cancelled":
+                    _monitor.cancel_run(job_id)
+                else:
+                    _monitor.fail_run(
+                        job_id,
+                        error_message=(
+                            result.error or "Resumed run failed."
+                        ),
+                    )
+            except Exception as _term_err:
+                logger.debug(
+                    "resume: monitor terminal transition failed for "
+                    "job %s: %s",
+                    job_id,
+                    _term_err,
+                )
         logger.info(
             "resume: %s completed with status=%s", run_id, status_value
         )
     else:
+        _failure_err = (
+            outcome.error_message
+            or outcome.reason_text
+            or f"resume failed: {outcome.reason.value}"
+        )
         _finalize_session_file(
             session_file,
             status="failed",
             result="",
-            error=outcome.error_message
-            or outcome.reason_text
-            or f"resume failed: {outcome.reason.value}",
+            error=_failure_err,
         )
+        # [RESOURCE-MONITOR-FIX] Mark the run FAILED.
+        if _monitor is not None:
+            try:
+                _monitor.fail_run(job_id, error_message=_failure_err)
+            except Exception:
+                pass
         logger.warning(
             "resume: %s failed (%s): %s",
             run_id,
@@ -444,6 +516,103 @@ def _make_event_listener(job_id: str):
             pass
 
     return _listener
+
+
+def _make_monitor_hook(monitor_service, run_id: str):
+    """
+    Build a synchronous ``resource_monitor_hook`` for the resumed run.
+
+    The returned callable is handed to ``CoreRuntimeExecutor.execute``
+    via ``request.metadata["resource_monitor_hook"]``. The executor
+    subscribes it to the emitter and calls it for every
+    ``PeldrunEvent`` synchronously (never awaits it). Any exception
+    is swallowed by the executor's own bridge — but we still guard
+    internally so a single malformed event cannot disable monitoring
+    for the whole run.
+
+    The hook mirrors the span-tracking logic used in
+    ``peldrun_engine._process_single_core_event`` for TOOL_CALL /
+    OBSERVATION only. It intentionally ignores every other event type
+    because the resume flow does not need SSE dispatch (the frontend
+    polls ``session.json``, not the SSE buffer, for resumed runs).
+
+    Span keys: tool_call_id (primary), tool_name (secondary). Using
+    two keys lets a matching OBSERVATION close the right span even
+    when the provider omits one of the two fields.
+    """
+    from omweb.resource_monitor.models import (
+        SpanStatus as _SpanStatus,
+        SpanType as _SpanType,
+    )
+
+    _active_spans: Dict[str, str] = {}
+
+    def _hook(evt) -> None:
+        try:
+            from peldrun.events.schema import EventType as _ET
+        except Exception:
+            return
+
+        etype = getattr(evt, "type", None)
+        payload = getattr(evt, "payload", {}) or {}
+
+        try:
+            if etype == _ET.TOOL_CALL or etype == getattr(
+                _ET, "TOOL_CALLED", None
+            ):
+                tool_name = str(
+                    payload.get("tool_name")
+                    or payload.get("tool")
+                    or "tool"
+                )
+                tc_id = str(payload.get("tool_call_id") or "")
+                span_id = f"span_{uuid.uuid4().hex[:12]}"
+                monitor_service.start_span(
+                    span_id=span_id,
+                    run_id=run_id,
+                    target_name=tool_name,
+                    span_type=_SpanType.TOOL_CALL,
+                )
+                _active_spans[tc_id or tool_name] = span_id
+                if tc_id and tc_id != tool_name:
+                    _active_spans.setdefault(tool_name, span_id)
+
+            elif etype == _ET.OBSERVATION or etype == getattr(
+                _ET, "TOOL_COMPLETED", None
+            ):
+                is_err = bool(payload.get("error"))
+                obs_tool = str(payload.get("tool_name") or "")
+                obs_tc_id = str(payload.get("tool_call_id") or "")
+
+                span_id = None
+                if obs_tc_id and obs_tc_id in _active_spans:
+                    span_id = _active_spans[obs_tc_id]
+                elif obs_tool and obs_tool in _active_spans:
+                    span_id = _active_spans[obs_tool]
+                elif _active_spans:
+                    span_id = next(iter(_active_spans.values()))
+
+                if span_id:
+                    monitor_service.end_span(
+                        span_id=span_id,
+                        status=(
+                            _SpanStatus.FAILED
+                            if is_err
+                            else _SpanStatus.COMPLETED
+                        ),
+                    )
+                    stale_keys = [
+                        k for k, v in _active_spans.items()
+                        if v == span_id
+                    ]
+                    for k in stale_keys:
+                        _active_spans.pop(k, None)
+        except Exception:
+            # Never let a monitor failure propagate — a telemetry hook
+            # that crashes the run defeats the entire point.
+            pass
+
+    return _hook
 
 
 @router.post("")
