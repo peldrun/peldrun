@@ -30,6 +30,7 @@ import {
 } from "lucide-react";
 
 import { Icon } from '@/components/Icon/Icon';
+import { getFileIconName } from "@/lib/file-icon-mapper";
 // ---------------------------------------------------------------------------
 // Public props
 // ---------------------------------------------------------------------------
@@ -46,41 +47,111 @@ export interface CodeBlockProps {
 // ---------------------------------------------------------------------------
 
 const LANGUAGE_ALIASES: Record<string, string> = {
+  // Python
   py: "python",
   python: "python",
+  pyi: "python",
+  pyw: "python",
+  // JavaScript / TypeScript family
   js: "javascript",
   javascript: "javascript",
+  mjs: "javascript",
+  cjs: "javascript",
+  jsx: "jsx",
   ts: "typescript",
   typescript: "typescript",
-  jsx: "jsx",
+  mts: "typescript",
+  cts: "typescript",
   tsx: "tsx",
+  // Markup / templates
   html: "markup",
+  htm: "markup",
+  html5: "markup",
   xml: "markup",
   svg: "markup",
+  vue: "markup",
+  svelte: "markup",
+  // Styles
   css: "css",
+  scss: "css",
+  sass: "css",
+  less: "css",
+  // Data / config
   json: "json",
+  json5: "json",
+  jsonc: "json",
+  yaml: "yaml",
+  yml: "yaml",
+  toml: "toml",
+  ini: "ini",
+  env: "bash",
+  // Shells
   sh: "bash",
   bash: "bash",
   shell: "bash",
   zsh: "bash",
+  fish: "bash",
   powershell: "bash",
   ps1: "bash",
+  bat: "bash",
+  cmd: "bash",
+  // Databases
   sql: "sql",
-  yaml: "yaml",
-  yml: "yaml",
+  graphql: "graphql",
+  gql: "graphql",
+  // Docs
   md: "markdown",
   markdown: "markdown",
+  mdx: "markdown",
+  rst: "markdown",
+  // Systems
   rust: "rust",
   rs: "rust",
   go: "go",
   c: "c",
+  h: "c",
   cpp: "cpp",
+  cc: "cpp",
+  cxx: "cpp",
+  hpp: "cpp",
+  // JVM / .NET
   java: "java",
+  kt: "kotlin",
+  kts: "kotlin",
   kotlin: "kotlin",
+  scala: "scala",
+  cs: "csharp",
+  csharp: "csharp",
+  fs: "fsharp",
+  vb: "vb",
+  // Mobile / Apple
   swift: "swift",
+  m: "objectivec",
+  mm: "objectivec",
+  // Web backend
   php: "php",
-  ruby: "ruby",
   rb: "ruby",
+  ruby: "ruby",
+  // Other languages
+  lua: "lua",
+  pl: "perl",
+  r: "r",
+  jl: "julia",
+  dart: "dart",
+  ex: "elixir",
+  exs: "elixir",
+  erl: "erlang",
+  hs: "haskell",
+  ml: "ocaml",
+  zig: "zig",
+  sol: "solidity",
+  // Infra
+  tf: "hcl",
+  hcl: "hcl",
+  dockerfile: "docker",
+  // Misc fallback
+  txt: "text",
+  log: "text",
 };
 
 const EXTENSION_MAP: Record<string, string> = {
@@ -130,6 +201,10 @@ export function CodeBlock({
   const displayLang = (language || "TEXT").toUpperCase();
   const fileExt = EXTENSION_MAP[normalizedLang] || "txt";
   const defaultFilename = filename || `snippet.${fileExt}`;
+  // Resolve the language/tool icon once from the filename. Falls back to
+  // null when the file is unrecognized, in which case the header renders
+  // the generic FileCode icon (see JSX below).
+  const headerIcon = getFileIconName(defaultFilename);
 
   const handleCopy = async () => {
     if (!cleanCode) return;
@@ -197,12 +272,10 @@ export function CodeBlock({
         <div className="flex items-center gap-2 truncate">
           {normalizedLang === "bash" ? (
             <Terminal size={13} className="text-primary flex-shrink-0" />
+          ) : headerIcon ? (
+            <Icon name={headerIcon} size={18} />
           ) : (
-
-             <span className="text-[10px] font-mono uppercase">
-               <Icon name={displayLang} size={20} />
-             </span>
-
+            <FileCode size={13} className="text-primary flex-shrink-0" />
           )}
 
 

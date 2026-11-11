@@ -11,6 +11,8 @@
 import React, { useEffect, useState, useMemo } from "react";
 import { Folder, FolderOpen, FileText, Download, Trash2, RefreshCw, Filter, ChevronRight, ChevronDown } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Icon } from "@/components/Icon/Icon";
+import { getFileIconName } from "@/lib/file-icon-mapper";
 
 interface FileItem {
   name: string;
@@ -100,21 +102,29 @@ export function FilesTab({ onSelectFile, onOpenFile, activeJobId }: FilesTabProp
   const [taskFiles, setTaskFiles] = useState<FileItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [filterCurrentOnly, setFilterCurrentOnly] = useState(true);
-  const [collapsedDirs, setCollapsedDirs] = useState<Set<string>>(new Set());
+  // User-driven expand/collapse overrides. Any directory not present in
+  // this map falls back to the name-based default computed in
+  // isDirCollapsedByDefault(): dot-directories are collapsed, others open.
+  const [dirOverrides, setDirOverrides] = useState<Map<string, boolean>>(new Map());
 
   const handleItemClick = (path: string) => {
     if (onSelectFile) onSelectFile(path);
     if (onOpenFile) onOpenFile(path);
   };
 
-  const toggleDir = (dirPath: string) => {
-    setCollapsedDirs((prev) => {
-      const next = new Set(prev);
-      if (next.has(dirPath)) {
-        next.delete(dirPath);
-      } else {
-        next.add(dirPath);
-      }
+  // Resolves the effective collapsed state for a directory node.
+  // Explicit user overrides win; otherwise:
+  //   - dot-directories (e.g. .git, .cache, .venv) default to collapsed
+  //   - all other directories default to expanded
+  const isDirCollapsedByDefault = (item: FileItem): boolean => {
+    if (dirOverrides.has(item.path)) return dirOverrides.get(item.path)!;
+    return item.name.startsWith(".");
+  };
+
+  const toggleDir = (dirPath: string, currentlyCollapsed: boolean) => {
+    setDirOverrides((prev) => {
+      const next = new Map(prev);
+      next.set(dirPath, !currentlyCollapsed);
       return next;
     });
   };
@@ -191,7 +201,11 @@ export function FilesTab({ onSelectFile, onOpenFile, activeJobId }: FilesTabProp
     return (
       <ul className="space-y-0.5 select-none">
         {items.map((item) => {
-          const isDirCollapsed = collapsedDirs.has(item.path);
+          const isDirCollapsed = isDirCollapsedByDefault(item);
+          // Resolve the language/tool-specific icon for files. Returns
+          // null for directories and unrecognized files, in which case
+          // we fall back to the generic FileText icon below.
+          const fileIconName = item.isDir ? null : getFileIconName(item.path);
 
           return (
             <li key={item.path} className="text-xs">
@@ -200,7 +214,7 @@ export function FilesTab({ onSelectFile, onOpenFile, activeJobId }: FilesTabProp
                   className="flex items-center gap-1.5 truncate cursor-pointer flex-1"
                   onClick={() => {
                     if (item.isDir) {
-                      toggleDir(item.path);
+                      toggleDir(item.path, isDirCollapsed);
                     } else {
                       handleItemClick(item.path);
                     }
@@ -223,7 +237,15 @@ export function FilesTab({ onSelectFile, onOpenFile, activeJobId }: FilesTabProp
                   ) : (
                     <>
                       <span className="w-3" />
-                      <FileText size={14} className="text-gray-400 shrink-0" />
+                      {fileIconName ? (
+                        <Icon
+                          name={fileIconName}
+                          size={14}
+                          className="shrink-0"
+                        />
+                      ) : (
+                        <FileText size={14} className="text-gray-400 shrink-0" />
+                      )}
                       <span className="truncate text-[#fff]">{item.name}</span>
                       {item.size !== undefined && (
                         <span className="text-[10px] text-[#ccc] ml-1">

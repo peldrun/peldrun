@@ -11,7 +11,6 @@ import {
   Download,
   ExternalLink,
   Eye,
-  Code2,
   HardDrive,
   Sparkles,
   Layers,
@@ -19,14 +18,14 @@ import {
   FileCode,
   FileText,
   Image as ImageIcon,
-  Copy,
-  Check,
   X,
   AlertTriangle,
   Maximize2
 } from "lucide-react";
 
 import { Icon } from '@/components/Icon/Icon';
+import { getFileIconName } from "@/lib/file-icon-mapper";
+import { CodeBlock } from "@/components/chat/code-block";
 
 import { Button } from "@/components/ui/button";
 
@@ -75,6 +74,19 @@ interface ExplorerItem {
 // 50 files or 5000.
 const ARTIFACTS_PAGE_SIZE = 24;
 
+// [ICONS] Resolves the language/tool icon for a filename using the shared
+// file-icon-mapper. Falls back to the generic lucide File icon when the
+// extension is not recognized, so callers can always render the result
+// directly without a null check. Kept at module scope so it is created
+// once, not on every render of the artifact grid or the explorer table.
+function FileTypeIcon({ name, size }: { name: string; size: number }) {
+  const iconName = getFileIconName(name);
+  if (iconName) {
+    return <Icon name={iconName} size={size} className="shrink-0" />;
+  }
+  return <File size={size} className="text-muted-foreground shrink-0" />;
+}
+
 export default function StorageArtifactsHubPage() {
   const [activeMainTab, setActiveMainTab] = useState<"artifacts" | "storage">("artifacts");
   const [artifactCategory, setArtifactCategory] = useState<"all" | "images" | "files" | "links">("all");
@@ -97,7 +109,6 @@ export default function StorageArtifactsHubPage() {
   // Modals state
   const [lightboxImg, setLightboxImg] = useState<{ url: string; name: string } | null>(null);
   const [codeModal, setCodeModal] = useState<{ name: string; content: string; lang: string } | null>(null);
-  const [copiedCode, setCopiedCode] = useState(false);
   const [confirmModal, setConfirmModal] = useState<{
     isOpen: boolean;
     title: string;
@@ -621,11 +632,15 @@ export default function StorageArtifactsHubPage() {
                   const isCode = item.type === "code" || item.type === "markdown" || item.type === "data";
                   const rawUrl = `/api/files/raw?path=${encodeURIComponent(item.path)}`;
                   const meta = getLanguageMeta(item.name);
+                  // Resolved once per card. Passed straight into <Icon />;
+                  // null means unrecognized, so we fall back to FileCode
+                  // (see the code-preview block below).
+                  const fileIconName = getFileIconName(item.name);
 
                   return (
                     <div
                       key={item.path}
-                      className="group flex flex-col rounded-xl border border-border bg-card hover:border-primary/50 transition-all shadow-sm overflow-hidden"
+                      className="group flex flex-col justify-between rounded-xl border border-border bg-muted hover:border-primary/50 transition-all shadow-sm overflow-hidden"
                     >
                       {/* Image Preview Card */}
                       {isImage && (
@@ -667,41 +682,49 @@ export default function StorageArtifactsHubPage() {
                       {/* Code / Text File Preview Card */}
                       {isCode && (
                         <div
-                          onClick={() => handleOpenCodeModal(item.path, item.name, meta.label)}
-                          className="h-32 p-3 bg-muted/20 border-b border-border cursor-pointer flex flex-col justify-between group-hover:bg-muted/30 transition"
+                          onClick={() =>
+                            handleOpenCodeModal(
+                              item.path,
+                              item.name,
+                              item.name.split(".").pop() || "text"
+                            )
+                          }
+                          className="h-32 p-3 bg-muted/20 cursor-pointer flex flex-col justify-between group-hover:bg-muted/30 transition"
                         >
                           <div className="flex items-center justify-between">
-                            <span className={`text-[10px]`}>
-
-                              <Icon name={meta.label} size={20} />
-
-                            </span>
+                            {fileIconName ? (
+                              <Icon name={fileIconName} size={50} />
+                            ) : (
+                              <FileCode size={20} className="text-primary" />
+                            )}
                             <Eye size={13} className="text-muted-foreground group-hover:text-primary transition" />
                           </div>
-                          <div className="font-mono text-[11px] text-muted-foreground line-clamp-3 bg-background/50 p-2 rounded border border-border/50">
+                          <div className="font-mono text-[11px] text-[#ccc] line-clamp-3 bg-darkest p-2 rounded border border-border/50">
                             Click to inspect source code and syntax...
                           </div>
                         </div>
                       )}
 
                       {/* Details & Actions */}
-                      <div className="p-3 flex items-center justify-between gap-2">
+                      <div className="p-3 flex items-center justify-between gap-2 bg-darkest text-[#ffffff]">
                         <div className="min-w-0 flex items-center gap-2">
-                          {isImage ? (
-                            <ImageIcon size={15} className="text-cyan-400 shrink-0" />
+                          {fileIconName ? (
+                            <Icon name={fileIconName} size={8} className="shrink-0" />
+                          ) : isImage ? (
+                            <ImageIcon size={8} className="text-cyan-400 shrink-0" />
                           ) : isHtml ? (
-                            <Globe size={15} className="text-orange-400 shrink-0" />
+                            <Globe size={8} className="text-orange-400 shrink-0" />
                           ) : (
-                            <FileCode size={15} className="text-primary shrink-0" />
+                            <FileCode size={8} className="text-primary shrink-0" />
                           )}
                           <div className="truncate">
-                            <div className="text-xs font-mono font-medium text-foreground truncate" title={item.name}>
+                            <div className="text-xs font-mono font-medium text-[#ffffff] truncate" title={item.name}>
                               {item.name}
                             </div>
-                            <div className="flex items-center gap-2 text-[10px] text-muted-foreground font-mono">
+                            <div className="flex items-center gap-2 text-[10px] text-[#eee] font-mono">
                               <span>{formatSize(item.size)}</span>
                               {item.origin && (
-                                <span className="px-1.5 py-0.2 rounded bg-muted border border-border text-[9px]">
+                                <span className="px-1.5 py-0.2 rounded bg-amber-200/20  text-[9px]">
                                   {item.origin}
                                 </span>
                               )}
@@ -713,7 +736,7 @@ export default function StorageArtifactsHubPage() {
                           <button
                             type="button"
                             onClick={() => openInWindowsExplorer(item.path)}
-                            className="p-1.5 rounded-md hover:bg-muted text-muted-foreground hover:text-amber-500 transition cursor-pointer"
+                            className="p-1.5  text-muted-foreground hover:text-amber-500 transition cursor-pointer"
                             title="Reveal in Windows Explorer"
                           >
                             <FolderOpen size={13} />
@@ -724,7 +747,7 @@ export default function StorageArtifactsHubPage() {
                               href={rawUrl}
                               target="_blank"
                               rel="noreferrer"
-                              className="p-1.5 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground transition"
+                              className="p-1.5 text-muted-foreground hover:text-foreground transition"
                               title="Open live view in new tab"
                             >
                               <ExternalLink size={13} />
@@ -734,7 +757,7 @@ export default function StorageArtifactsHubPage() {
                           <a
                             href={`/api/files/download?path=${encodeURIComponent(item.path)}`}
                             download={item.name}
-                            className="p-1.5 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground transition"
+                            className="p-1.5 text-muted-foreground hover:text-peldrun-accent transition"
                             title="Download file"
                           >
                             <Download size={13} />
@@ -922,7 +945,7 @@ export default function StorageArtifactsHubPage() {
                           {item.is_dir ? (
                             <Folder size={15} className="text-amber-500 shrink-0" />
                           ) : (
-                            <File size={15} className="text-muted-foreground shrink-0" />
+                            <FileTypeIcon name={item.name} size={15} />
                           )}
                           <span className="truncate max-w-md">{item.name}</span>
                         </td>
@@ -999,7 +1022,10 @@ export default function StorageArtifactsHubPage() {
         </div>
       )}
 
-      {/* 6. CODE MODAL */}
+      {/* 6. CODE MODAL — delegates rendering to the shared CodeBlock
+          component so the file viewer inherits Prism syntax highlighting,
+          line numbers, copy/download/sandbox actions, and long-snippet
+          collapsing without duplicating any of that logic here. */}
       {codeModal && (
         <div
           className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-200"
@@ -1009,37 +1035,32 @@ export default function StorageArtifactsHubPage() {
             className="w-full max-w-4xl max-h-[85vh] bg-card border border-border rounded-xl shadow-2xl flex flex-col overflow-hidden"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center justify-between px-5 py-3 border-b border-border bg-muted/40">
-              <div className="flex items-center gap-2">
-                <Code2 size={16} className="text-primary" />
-                <span className="font-mono text-xs font-semibold text-foreground">{codeModal.name}</span>
-                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-primary/10 text-primary border border-primary/20">
-                  {codeModal.lang}
+            <div className="flex items-center justify-between px-5 py-2.5 border-b border-border bg-muted/40 shrink-0">
+              <div className="flex items-center gap-2 min-w-0">
+                {getFileIconName(codeModal.name) ? (
+                  <Icon name={getFileIconName(codeModal.name)!} size={16} />
+                ) : (
+                  <FileCode size={16} className="text-primary shrink-0" />
+                )}
+                <span className="font-mono text-xs font-semibold text-foreground truncate">
+                  {codeModal.name}
                 </span>
               </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => {
-                    navigator.clipboard.writeText(codeModal.content);
-                    setCopiedCode(true);
-                    setTimeout(() => setCopiedCode(false), 2000);
-                  }}
-                  className="px-2.5 py-1 text-xs rounded bg-muted hover:bg-muted/80 text-foreground border border-border flex items-center gap-1.5 cursor-pointer transition"
-                >
-                  {copiedCode ? <Check size={13} className="text-emerald-500" /> : <Copy size={13} />}
-                  <span>{copiedCode ? "Copied!" : "Copy"}</span>
-                </button>
-                <button
-                  onClick={() => setCodeModal(null)}
-                  className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer"
-                >
-                  <X size={16} />
-                </button>
-              </div>
+              <button
+                onClick={() => setCodeModal(null)}
+                className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer shrink-0"
+                title="Close"
+              >
+                <X size={16} />
+              </button>
             </div>
 
-            <div className="flex-1 overflow-auto p-4 bg-background/95 font-mono text-xs leading-relaxed text-foreground select-all">
-              <pre>{codeModal.content}</pre>
+            <div className="flex-1 overflow-auto p-2">
+              <CodeBlock
+                code={codeModal.content}
+                language={codeModal.lang}
+                filename={codeModal.name}
+              />
             </div>
           </div>
         </div>
