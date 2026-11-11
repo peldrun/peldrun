@@ -65,7 +65,7 @@ export function ChatReasoningPanel({
   const charCount = thoughtContent.length;
 
   return (
-    <div className="border border-border/60 rounded-lg overflow-hidden bg-card/30">
+    <div className="border border-transparent rounded-md overflow-hidden bg-card/30 hover:border-muted hover:shadow-sm">
       <button
         type="button"
         onClick={() => {
@@ -73,7 +73,7 @@ export function ChatReasoningPanel({
           // Manual toggle freezes the auto-collapse forever.
           hasAutoCollapsedRef.current = true;
         }}
-        className="w-full flex items-center justify-between px-3.5 py-2 hover:bg-muted/40 transition-colors cursor-pointer text-xs"
+        className="w-full flex items-center justify-between px-3.5 py-2 border-muted/60 hover:bg-muted/90 transition-colors cursor-pointer text-xs"
       >
         <div className="flex items-center gap-2 min-w-0">
           <BrainCircuit size={14} className="text-peldrun-accent shrink-0" />

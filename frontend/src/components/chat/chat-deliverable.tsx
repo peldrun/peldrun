@@ -146,7 +146,7 @@ export function ChatDeliverable({
   const hasUsage = Boolean(tokensUsed && tokensUsed.total && tokensUsed.total > 0);
 
   return (
-    <div className="space-y-3 font-sans">
+    <div className="space-y-3 font-sans group/msg">
       {/* 1. Assistant Identity Header (conditionally hidden based on prop) */}
       {!hideHeader && (
         <div className="flex items-center justify-between text-xs text-muted-foreground pt-1">
@@ -362,7 +362,7 @@ export function ChatDeliverable({
       )}
 
       {/* 6. Bottom Action Toolbar */}
-      <div className="flex items-center justify-between gap-2 pt-2 text-xs">
+      <div className="flex items-center justify-between gap-2 pt-2 text-xs opacity-0 group-hover/msg:opacity-100 focus-within:opacity-100 transition-opacity duration-200">
         <div className="flex items-center">
           {hasUsage && (
             <UsageBadgeGroup
