@@ -6,12 +6,34 @@ Signals successful or failed termination of the agent execution loop.
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 from typing import Any, Dict, Optional
 from pydantic import BaseModel, Field
 
 from peldrun.tools.base import BaseTool, ToolResult
 from peldrun.tools.contract import ToolExecutionPolicy
+
+logger = logging.getLogger("peldrun.tools.builtins.terminate")
+
+# Detects the exact tool-call syntax that a confused model may
+# accidentally place inside the ``message`` argument. The pattern
+# matches (optionally with a leading "call ") "terminate(" or "done("
+# at the very start of the string.
+#
+# This guard is intentionally narrow:
+#   * It is anchored with ``^`` so a legitimate message like
+#     "The task will terminate(...) once complete" is NOT rejected —
+#     only a message that *starts* with the tool-call syntax is.
+#   * It is case-insensitive so ``Terminate(`` and ``TERMINATE(`` are
+#     caught.
+#   * It permits optional leading whitespace so model output that
+#     begins with a newline is still caught.
+_TOOL_CALL_SYNTAX_RE = re.compile(
+    r"^\s*(?:call\s+)?(?:terminate|done)\s*\(",
+    re.IGNORECASE,
+)
 
 
 class TerminateArgs(BaseModel):
@@ -161,6 +183,35 @@ class TerminateTool(BaseTool):
         cleaned_message = (
             str(message).strip() if message is not None else ""
         )
+
+        # Reject malformed messages that are literally the tool-call
+        # syntax the model is supposed to be INVOKING, not copying
+        # into its argument.
+        #
+        # Real-world failure mode:
+        #   A small or confused model (or a model recovering from an
+        #   INCOMPLETE_STREAM) sometimes emits:
+        #
+        #       terminate(status="success", message="
+        #
+        #   as the VALUE of the ``message`` parameter itself, instead
+        #   of a human-readable summary. Passing that string straight
+        #   through to the user surfaces garbage in the final answer
+        #   bubble and visually wipes out the real content the model
+        #   streamed earlier in the turn.
+        #
+        # Policy: discard the malformed value and fall through to the
+        # default summary. This is non-destructive — the tool still
+        # terminates with the requested status, so the lifecycle is
+        # preserved; only the display text is sanitized.
+        if cleaned_message and _TOOL_CALL_SYNTAX_RE.match(cleaned_message):
+            logger.warning(
+                "TerminateTool received tool-call syntax as the "
+                "'message' argument (%r). Discarding it and using "
+                "the default summary instead.",
+                cleaned_message[:120],
+            )
+            cleaned_message = ""
 
         if normalized == "success":
             final_msg = cleaned_message or (

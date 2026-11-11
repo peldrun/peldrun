@@ -192,6 +192,133 @@ def _extract_provider_from_observation(text: str) -> Optional[str]:
     return m.group("provider").strip() if m else None
 
 
+# ---------------------------------------------------------------------------
+# Tool-call leak detection
+# ---------------------------------------------------------------------------
+#
+# A "tool-call leak" occurs when the model emits the SYNTAX of a tool
+# call as PLAIN TEXT in the final response, instead of invoking the
+# tool. This happens most often with:
+#
+#   * Small or quantized models that confuse the "I should call
+#     terminate" intent with "I should write 'terminate(...)' as my
+#     message."
+#   * Models recovering from an INCOMPLETE_STREAM: the retry path in
+#     ``ToolCallAgent`` may produce only a partial tool-call fragment
+#     as ``response.content``.
+#   * Models that hallucinate the ``terminate`` tool before it is
+#     registered and fall back to echoing the syntax.
+#
+# The result of the leak is that ``run_result.output`` contains
+# something like:
+#
+#     terminate(status="success", message="
+#
+# or
+#
+#     done()
+#
+# — which is not a human-readable answer, and which visually REPLACES
+# the real content the model streamed earlier in the turn.
+#
+# The regex below is intentionally conservative:
+#   * Anchored with ``^`` — only a response that STARTS with the
+#     syntax is flagged. A legitimate answer that happens to mention
+#     "call terminate(...) at the end" is not affected.
+#   * Length-capped at 500 chars — a real answer that starts with the
+#     tool name and continues with 2KB of prose is not flagged. Only
+#     short leaks (which are always malformed fragments) are caught.
+#   * Case-insensitive so ``TERMINATE(`` / ``Terminate(`` also match.
+#   * The ``done`` alternative is included for backward compatibility
+#     with the pre-B3 name.
+_TOOL_CALL_LEAK_RE = _re.compile(
+    r"^\s*(?:call\s+)?(?:terminate|done)\s*\(",
+    _re.IGNORECASE,
+)
+
+# Maximum length of a string that can still be classified as a
+# tool-call leak. Longer strings are assumed to be prose (a real
+# answer that happens to start with the tool name).
+_TOOL_CALL_LEAK_MAX_LEN = 500
+
+
+def _looks_like_tool_call_leak(text: Optional[str]) -> bool:
+    """Return True if ``text`` looks like leaked tool-call syntax.
+
+    See the module-level comment above for the full rationale, the
+    failure modes this detector closes, and the reasons for each
+    constraint in the regex.
+    """
+    if not text or not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if len(stripped) > _TOOL_CALL_LEAK_MAX_LEN:
+        return False
+    return bool(_TOOL_CALL_LEAK_RE.match(stripped))
+
+
+# ---------------------------------------------------------------------------
+# Trailing tool-call leak stripper
+# ---------------------------------------------------------------------------
+#
+# A DIFFERENT failure mode from the one `_looks_like_tool_call_leak`
+# addresses: the model writes a full, useful summary, THEN appends a
+# trailing "Now calling terminate as requested." sentence followed by
+# a JSON code block, THEN separately invokes the tool as a real call.
+#
+# This is the exact shape GigaChat-3-Pro produces when the model
+# transitions from "answering" mode to "calling a tool" mode. The
+# JSON block is not actionable — the real tool call already happened —
+# but if it leaks into the final answer bubble, the user sees raw
+# JSON at the bottom of an otherwise-good response.
+#
+# Observed shape:
+#
+#     All three files have been created in the current directory:
+#     ... (a real, useful summary) ...
+#
+#     Now calling terminate as requested.
+#
+#     ```json
+#     {
+#       "status": "success",
+#       "message": "..."
+#     }
+#     ```
+#
+# The regex is INTENTIONALLY narrow: it requires the "Now calling /
+# invoking / using <tool> [as requested]" preface. A legitimate answer
+# that happens to end with a JSON code block (e.g. "Here is the JSON
+# schema we use:\n```json\n{...}\n```") is NOT touched — there is no
+# "Now calling..." sentence preceding it.
+_TRAILING_TOOL_CALL_BLOCK_RE = _re.compile(
+    r"\n+\s*"
+    r"(?:Now\s+(?:I\s+(?:will|am\s+going\s+to)\s+)?"
+    r"(?:calling|invoking|using)|"
+    r"Calling|Invoking|Using)\s+[\w.]+\s+"
+    r"(?:as\s+requested\.?|now\.?)?\s*"
+    r"```(?:json)?\s*\{[^`]*?\}\s*```\s*$",
+    _re.IGNORECASE | _re.DOTALL,
+)
+
+
+def _strip_trailing_tool_call_block(text: Optional[str]) -> str:
+    """Remove a trailing "Now calling X..." + JSON block from ``text``.
+
+    Returns ``text`` unchanged (after rstrip) when the pattern is not
+    present, so a legitimate answer that happens to end with a JSON
+    example cannot be corrupted.
+
+    See the regex comment above for the exact shape this targets.
+    """
+    if not text or not isinstance(text, str):
+        return text or ""
+    stripped = _TRAILING_TOOL_CALL_BLOCK_RE.sub("", text)
+    return stripped.rstrip()
+
+
 def _collect_specialist_tool_allowlists(
     enabled_tool_ids: Set[str],
 ) -> Dict[str, List[str]]:
@@ -1518,8 +1645,60 @@ class PeldrunEngine(ExecutionEngine):
                 # ``latest_meaningful_thought`` rather than replacing it —
                 # otherwise a fallback final message derived from this
                 # variable would end up being the last single token.
-                raw_thought = event.payload.get("thought", "")
-                is_delta = bool(event.payload.get("is_delta"))
+                _thought_payload = (
+                    event.payload
+                    if isinstance(event.payload, dict)
+                    else {}
+                )
+
+                # [FIX-THOUGHT-RESET] Handle the retry-reset sentinel
+                # emitted by ``ToolCallAgent._emit_reset_events()``
+                # BEFORE each retry attempt. Mirrors the CHUNK handler
+                # above (Fix 2). The reset event carries no ``thought``
+                # field, so the historical code dropped it on the
+                # ``should_emit`` gate — leaving both the backend
+                # accumulator and the frontend buffer with the failed
+                # attempt's text.
+                #
+                # Consequences of dropping the reset on this channel:
+                #   * ``latest_meaningful_thought`` kept the failed
+                #     attempt's reasoning. When CHUNK also produced no
+                #     content (the common INCOMPLETE_STREAM recovery
+                #     path), the fallback final answer was synthesized
+                #     from this STALE reasoning — showing the user
+                #     partial output from a request that errored.
+                #   * The frontend reasoning panel kept the failed
+                #     attempt's text visible, then appended the retry's
+                #     deltas on top → duplicated reasoning in the UI.
+                #
+                # New behavior: clear the accumulator locally AND
+                # forward the reset to the frontend so both sides
+                # restart from a clean slate, matching the CHUNK
+                # channel contract.
+                if _thought_payload.get("reset"):
+                    latest_meaningful_thought = ""
+                    await dispatch_event(
+                        job_id,
+                        SSEEvent(
+                            type=SSEEventType.THOUGHT,
+                            step=curr_step,
+                            data={
+                                "reset": True,
+                                "attempt_id": _thought_payload.get(
+                                    "attempt_id"
+                                ),
+                                "reason": _thought_payload.get(
+                                    "reason", ""
+                                ),
+                                "seq": event_seq,
+                                "model": model_name,
+                            },
+                        ),
+                    )
+                    return
+
+                raw_thought = _thought_payload.get("thought", "")
+                is_delta = bool(_thought_payload.get("is_delta"))
                 thought_text = str(raw_thought)
 
                 # For deltas: keep whitespace-only fragments.
@@ -1534,7 +1713,40 @@ class PeldrunEngine(ExecutionEngine):
                             (latest_meaningful_thought or "") + thought_text
                         )
                     else:
-                        latest_meaningful_thought = thought_text
+                        # [FIX-THOUGHT-NON-DELTA-OVERWRITE] A non-delta
+                        # THOUGHT is a one-shot emission (the agent's
+                        # fallback for the reasoning channel, or a
+                        # ``STEP_PROGRESS`` event forwarded through
+                        # this handler). The historical code assigned
+                        # it unconditionally, which let a short
+                        # fallback fragment wipe a large accumulated
+                        # reasoning trace.
+                        #
+                        # This parallels the CHUNK channel's Fix 2 and
+                        # uses the same rule: only accept the
+                        # replacement when the incoming text is at
+                        # least as long as what we already have, or
+                        # when the accumulator is empty. A shorter
+                        # replacement is almost always stale noise
+                        # from a failed attempt.
+                        if (
+                            not latest_meaningful_thought
+                            or len(thought_text)
+                            >= len(latest_meaningful_thought)
+                        ):
+                            latest_meaningful_thought = thought_text
+                        else:
+                            logger.info(
+                                "[ENGINE PELDRUN] Rejecting non-delta "
+                                "THOUGHT for job %s: %d chars would "
+                                "overwrite %d chars of already-"
+                                "accumulated reasoning (preview: %r).",
+                                job_id,
+                                len(thought_text),
+                                len(latest_meaningful_thought),
+                                thought_text[:80],
+                            )
+                            return
 
                     await dispatch_event(
                         job_id,
@@ -1556,14 +1768,69 @@ class PeldrunEngine(ExecutionEngine):
                 # user-visible output. Dispatched as SSEEventType.CHUNK
                 # so the frontend renders it in the main response bubble
                 # (finalResult) instead of the reasoning panel.
+                _chunk_payload = (
+                    event.payload
+                    if isinstance(event.payload, dict)
+                    else {}
+                )
+
+                # [FIX-CHUNK-RESET] Handle the retry-reset sentinel
+                # emitted by ``ToolCallAgent._emit_reset_events()``
+                # BEFORE each retry attempt.
+                #
+                # The historical handler dropped this event entirely:
+                # the reset payload has no ``delta`` / ``text`` /
+                # ``content`` field, so ``delta_text`` was "" and the
+                # entire branch was skipped. Two consequences:
+                #
+                #   1. ``accumulated_content`` retained the failed
+                #      attempt's text. When the retry produced a
+                #      shorter / partial / malformed response, the
+                #      accumulated buffer contained a STALE + FRESH
+                #      concatenation that was neither attempt in
+                #      isolation — corrupt text.
+                #
+                #   2. The frontend never saw the reset, so its local
+                #      buffer kept the failed attempt's text visible.
+                #      If the retry also streamed content, the user
+                #      saw DUPLICATE text (failed attempt + retry
+                #      attempt) in the same bubble.
+                #
+                # New behavior: clear the accumulator locally AND
+                # forward the reset to the frontend so both sides
+                # restart from a clean slate. The ``attempt_id`` is
+                # preserved so the frontend can correlate the new
+                # attempt's chunks with the reset marker.
+                if _chunk_payload.get("reset"):
+                    accumulated_content = ""
+                    await dispatch_event(
+                        job_id,
+                        SSEEvent(
+                            type=SSEEventType.CHUNK,
+                            step=curr_step,
+                            data={
+                                "reset": True,
+                                "attempt_id": _chunk_payload.get(
+                                    "attempt_id"
+                                ),
+                                "reason": _chunk_payload.get(
+                                    "reason", ""
+                                ),
+                                "seq": event_seq,
+                                "model": model_name,
+                            },
+                        ),
+                    )
+                    return
+
                 raw_delta = (
-                    event.payload.get("delta")
-                    or event.payload.get("text")
-                    or event.payload.get("content")
+                    _chunk_payload.get("delta")
+                    or _chunk_payload.get("text")
+                    or _chunk_payload.get("content")
                     or ""
                 )
                 delta_text = str(raw_delta)
-                is_delta = bool(event.payload.get("is_delta"))
+                is_delta = bool(_chunk_payload.get("is_delta"))
                 if delta_text:
                     # Accumulate into `accumulated_content` so the final
                     # message reflects the streamed response even when
@@ -1571,9 +1838,63 @@ class PeldrunEngine(ExecutionEngine):
                     # the agent terminates via the `terminate` tool
                     # without echoing the accumulated content back).
                     if is_delta:
-                        accumulated_content = accumulated_content + delta_text
+                        accumulated_content = (
+                            accumulated_content + delta_text
+                        )
                     else:
-                        accumulated_content = delta_text
+                        # [FIX-NON-DELTA-OVERWRITE] A non-delta CHUNK
+                        # is the agent's non-streaming fallback: the
+                        # provider never streamed, so the agent emits
+                        # the entire ``response.content`` in one shot.
+                        #
+                        # The historical ``accumulated_content =
+                        # delta_text`` unconditionally REPLACED the
+                        # accumulator. That is correct when the
+                        # accumulator is empty (nothing was streamed —
+                        # this IS the answer). It is catastrophic when:
+                        #
+                        #   * the previous attempt streamed a LARGE
+                        #     answer (accumulator non-empty), AND
+                        #   * the retry produced a SHORT / malformed
+                        #     ``response.content`` (e.g. a bare
+                        #     tool-call echo like
+                        #     'terminate(status="success", message="').
+                        #
+                        # Real-world failure mode (job_4bc33f8fd493
+                        # class): a large streamed answer was visible
+                        # to the user, a retry fired, the retry's
+                        # ``response.content`` contained only the
+                        # tool-call fragment, and the fallback CHUNK
+                        # overwrote the entire user-visible answer
+                        # with that garbage. The user lost the answer
+                        # they had already watched being generated.
+                        #
+                        # Rule: only accept the replacement when the
+                        # incoming text is at least as long as what we
+                        # already accumulated, OR when the accumulator
+                        # is empty. A SHORTER fallback is almost always
+                        # stale noise from a failed attempt — reject it
+                        # at both the backend (do not update
+                        # ``accumulated_content``) AND the frontend (do
+                        # not dispatch), so the two sides stay in sync.
+                        if (
+                            not accumulated_content
+                            or len(delta_text) >= len(accumulated_content)
+                        ):
+                            accumulated_content = delta_text
+                        else:
+                            logger.info(
+                                "[ENGINE PELDRUN] Rejecting non-delta "
+                                "CHUNK for job %s: %d chars would "
+                                "overwrite %d chars of already-"
+                                "accumulated content (preview: %r).",
+                                job_id,
+                                len(delta_text),
+                                len(accumulated_content),
+                                delta_text[:80],
+                            )
+                            return
+
                     await dispatch_event(
                         job_id,
                         SSEEvent(
@@ -2389,7 +2710,22 @@ class PeldrunEngine(ExecutionEngine):
         # reasoning channel is empty, so falling back to it would
         # produce either an empty message or a stray reasoning
         # fragment. `accumulated_content` is the authoritative source.
-        streamed_fallback = accumulated_content or latest_meaningful_thought
+        # [FIX-STRIP-TRAILING-TOOL-CALL] Remove a trailing
+        # "Now calling <tool> as requested" + JSON block that some
+        # models (notably GigaChat-3-Pro) append AFTER writing a
+        # useful summary, right before invoking the tool for real.
+        #
+        # Without this strip, when the branch logic below prefers
+        # `streamed_fallback` over `agent_output` (which is exactly
+        # the fix for the "answer was wiped" bug), the user would
+        # see the JSON block at the bottom of the final bubble. The
+        # block is noise — the real tool call already happened.
+        #
+        # The strip is applied BEFORE `sanitize_final_result_text`
+        # so the fallback argument passed to that helper is clean.
+        streamed_fallback = _strip_trailing_tool_call_block(
+            accumulated_content or latest_meaningful_thought
+        )
         agent_output = sanitize_final_result_text(
             run_result.output, streamed_fallback
         )
@@ -2402,15 +2738,26 @@ class PeldrunEngine(ExecutionEngine):
             "task completed successfully",
             "task completed.",
             "task execution finished with status: success.",
+            "task execution finished with status: failure",
+            "task terminated with status: failure",
             "done",
             "task complete",
             "completed",
+            "success",
+            "ok",
         }
         _normalized = (agent_output or "").strip().lower()
         agent_output_is_meaningful = bool(
             agent_output
             and agent_output.strip()
             and _normalized not in _GENERIC_STRINGS
+            # [FIX-TOOL-CALL-LEAK] Reject tool-call syntax that leaked
+            # into ``run_result.output`` instead of being invoked.
+            # Without this check, a fallback path that surfaces a
+            # malformed ``terminate(status="success", message="``
+            # would win over a large streamed answer that the user
+            # already watched being generated.
+            and not _looks_like_tool_call_leak(agent_output)
         )
 
         # [FIX-ACCUMULATED-CONTENT-FALLBACK] The pre-fix logic discarded
@@ -2433,9 +2780,63 @@ class PeldrunEngine(ExecutionEngine):
             streamed_fallback
             and streamed_fallback.strip()
             and _streamed_normalized not in _GENERIC_STRINGS
+            # [FIX-TOOL-CALL-LEAK] Same rationale as the agent_output
+            # side: a streamed buffer that ends up containing only the
+            # tool-call fragment must not be selected as the final
+            # answer. It would appear as garbage in the deliverable
+            # bubble.
+            and not _looks_like_tool_call_leak(streamed_fallback)
         )
 
-        if agent_output_is_meaningful:
+        # [FIX-PRESERVE-STREAMED] Precedence rules when BOTH sources
+        # produced meaningful text:
+        #
+        #   * If the streamed content is clearly richer than the
+        #     terminate summary (>= 1.5x length), prefer the streamed
+        #     content. The user WATCHED it being generated during the
+        #     run — replacing it with a shorter terminate confirmation
+        #     looks like the answer shrank on completion.
+        #
+        #   * Otherwise, prefer the terminate summary. It is clean,
+        #     concise, and deliberately chosen by the model as the
+        #     closing message. When the two are roughly equivalent,
+        #     the shorter / cleaner one is the better UX.
+        #
+        # Real-world failure mode this fixes (job_d8f686c39f15 class):
+        #   Step 4 streamed a ~700-char summary through CHUNK events
+        #   that the user watched appear in real time. Step 5 then
+        #   invoked terminate with a ~130-char recap. The pre-fix
+        #   logic always preferred `agent_output` (the terminate
+        #   message), silently discarding the 700-char answer the
+        #   user had just finished reading. Visually the answer
+        #   "shrank" on completion, which looked like a data-loss bug.
+        if agent_output_is_meaningful and streamed_is_meaningful:
+            streamed_len = len((streamed_fallback or "").strip())
+            agent_len = len((agent_output or "").strip())
+            if streamed_len >= agent_len * 1.5:
+                result_text = streamed_fallback
+                logger.info(
+                    "[ENGINE PELDRUN] Preferring streamed content "
+                    "(%d chars) over terminate summary (%d chars) "
+                    "for job %s — preserving the richer answer the "
+                    "user watched being generated.",
+                    streamed_len,
+                    agent_len,
+                    job_id,
+                )
+            else:
+                result_text = agent_output
+                logger.info(
+                    "[ENGINE PELDRUN] Using terminate summary "
+                    "(%d chars) over streamed content (%d chars) "
+                    "for job %s — the two are roughly equivalent, "
+                    "and the terminate message is the model's "
+                    "chosen closing text.",
+                    agent_len,
+                    streamed_len,
+                    job_id,
+                )
+        elif agent_output_is_meaningful:
             # The agent produced a meaningful message. Keep it as the
             # final result.
             result_text = agent_output
@@ -2471,9 +2872,39 @@ class PeldrunEngine(ExecutionEngine):
             )
         else:
             # Neither the agent nor the streamed content produced
-            # meaningful text. Keep the raw (possibly generic) output
-            # so the user at least sees the run completed.
-            result_text = agent_output
+            # meaningful text, and there are no deliverables. This is
+            # the "everything empty" corner case.
+            #
+            # Historical behavior: surface whatever ``agent_output``
+            # held — even a malformed tool-call fragment. The user
+            # then saw ``terminate(status="success", message="`` as
+            # the entire answer, which is exactly the failure this
+            # fix set out to eliminate.
+            #
+            # New behavior:
+            #   * If the retained text is a tool-call leak, replace it
+            #     with an honest diagnostic so the user understands
+            #     the run completed but produced no readable output.
+            #   * Otherwise preserve the raw text for backward
+            #     compatibility — some agents legitimately terminate
+            #     with a bare string like "done", and replacing it
+            #     with a synthetic message would be a regression.
+            if _looks_like_tool_call_leak(agent_output):
+                logger.warning(
+                    "[ENGINE PELDRUN] Detected tool-call leak in the "
+                    "final output for job %s: %r. Replacing with a "
+                    "diagnostic message.",
+                    job_id,
+                    (agent_output or "")[:120],
+                )
+                result_text = (
+                    "### Execution completed\n\n"
+                    "The agent finished the task but produced no "
+                    "readable output. Check the raw trace for "
+                    "details, or regenerate the response."
+                )
+            else:
+                result_text = agent_output
 
         # Inject any collected image results as an ``image_gallery``
         # markdown block. MarkdownRenderer turns this into an inline

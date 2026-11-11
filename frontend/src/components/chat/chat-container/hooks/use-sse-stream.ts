@@ -358,6 +358,23 @@ export function useSseStream(params: UseSseStreamParams) {
       if (eventType === "step_start") {
         logEntry(`[${logTimestamp}] [STEP] Step ${step} started`);
       } else if (eventType === "chunk") {
+        // [FIX-CHUNK-RESET] Discard the previous attempt's text before
+        // processing a new attempt's first chunk. The backend sends a
+        // reset event (`{reset: true, attempt_id, reason}`) before
+        // each retry. Without this branch, the retry's content would
+        // be APPENDED to the failed attempt's text — producing
+        // duplicate or corrupted output in the deliverable bubble.
+        //
+        // Resetting to `null` (not `""`) is deliberate: the
+        // `ChatDeliverable` component renders nothing when
+        // `finalResult` is `null`, so the user sees a clean slate
+        // until the retry starts streaming again. An empty string
+        // would render an empty styled block.
+        if (payload.data?.reset === true) {
+          ctx.setFinalResult(null);
+          return;
+        }
+
         const delta =
           payload.data?.delta ??
           payload.data?.text ??
@@ -367,6 +384,41 @@ export function useSseStream(params: UseSseStreamParams) {
           ctx.setFinalResult((prev) => (prev ? prev + delta : delta));
         }
       } else if (eventType === "thought") {
+        // [FIX-THOUGHT-RESET] Discard the failed attempt's reasoning
+        // before processing a new attempt's first thought delta. The
+        // backend sends a reset event with no `thought` field before
+        // each retry. The historical code fell through to the
+        // `shouldProcess` gate, where `rendered.trim() === ""` caused
+        // the event to be silently dropped — leaving the failed
+        // attempt's thought steps visible in the timeline. When the
+        // retry then streamed new reasoning, the historical
+        // `prev[prev.length - 1].type === "thought"` branch appended
+        // to the FAILED attempt's content instead of starting a new
+        // step.
+        //
+        // The fix removes the trailing thought steps in the CURRENT
+        // step. Thought steps from earlier completed steps are kept —
+        // only the current step's reasoning is being restarted.
+        if (payload.data?.reset === true) {
+          ctx.setSteps((prev) => {
+            const next = [...prev];
+            // Pop trailing thought steps belonging to THIS step.
+            // A thought from a previous step (different `step`
+            // number) or a non-thought step (tool_call, observation,
+            // …) acts as a fence — we stop popping there so we do
+            // not corrupt completed history.
+            while (
+              next.length > 0 &&
+              next[next.length - 1].type === "thought" &&
+              next[next.length - 1].step === step
+            ) {
+              next.pop();
+            }
+            return next;
+          });
+          return;
+        }
+
         const isDelta = Boolean(payload.data?.is_delta);
         const raw =
           payload.data?.delta ??

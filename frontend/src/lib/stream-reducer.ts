@@ -127,7 +127,45 @@ export function reduceEvent(state: RunState, event: SSEEnvelope): RunState {
         steps: upsertGroup(state.steps, stepNum, stepId, (g) => ({ ...g, startedAt: now })),
       };
 
-    case "thought":
+    case "thought": {
+      // [FIX-THOUGHT-RESET] Handle the retry-reset sentinel emitted
+      // by the backend BEFORE each retry attempt. The reset event has
+      // no ``thought`` / ``content`` field, so the historical code
+      // would (a) NOT clear the failed attempt's reasoning, AND
+      // (b) append a new ``ThoughtItem`` with ``text=""`` on every
+      // reset — producing a trail of empty bubbles in the timeline.
+      //
+      // The reset must REMOVE the failed attempt's thought items from
+      // the current step so a retry's reasoning starts fresh. Thought
+      // items from earlier COMPLETED steps are preserved because the
+      // reset only fires for the CURRENT step (the backend correlates
+      // resets with the active attempt).
+      if (event.data.reset === true) {
+        const targetId = getGroupId(stepNum, stepId);
+        return {
+          ...base,
+          steps: state.steps.map((g) => {
+            if (g.id !== targetId && g.step !== stepNum) return g;
+            return {
+              ...g,
+              items: g.items.filter((i) => i.kind !== "thought"),
+            };
+          }),
+        };
+      }
+
+      // [FIX-THOUGHT-EMPTY] Reject events that carry no thought text.
+      // The historical code appended an empty ``ThoughtItem`` for
+      // every such event (resets being the most common case, but any
+      // whitespace-only or missing-field event hit the same bug).
+      // Empty items render as empty bubbles and inflate the item
+      // count shown in the step header.
+      const thoughtText =
+        (typeof event.data.thought === "string" && event.data.thought) ||
+        (typeof event.data.content === "string" && event.data.content) ||
+        "";
+      if (!thoughtText) return base;
+
       return {
         ...base,
         steps: upsertGroup(state.steps, stepNum, stepId, (g) => ({
@@ -137,12 +175,13 @@ export function reduceEvent(state: RunState, event: SSEEnvelope): RunState {
             {
               kind: "thought",
               id: eventId || `th_${stepNum}_${g.items.length}`,
-              text: event.data.thought || event.data.content || "",
+              text: thoughtText,
               at: now,
             } satisfies ThoughtItem,
           ],
         })),
       };
+    }
 
     // Streaming content delta from agent mode (EventType.CHUNK).
     // Accumulated into `finalAnswer` so the deliverable bubble renders
@@ -158,6 +197,28 @@ export function reduceEvent(state: RunState, event: SSEEnvelope): RunState {
     //      bubble showed either nothing or an unrelated reasoning
     //      fragment.
     case "chunk": {
+      // [FIX-CHUNK-RESET] Handle the retry-reset sentinel emitted by
+      // the backend BEFORE each retry attempt. The reset payload has
+      // no ``delta`` / ``text`` / ``content`` field — the historical
+      // code therefore skipped it entirely (``if (!delta) return base``)
+      // and left ``finalAnswer`` with the failed attempt's text. When
+      // the retry subsequently streamed a shorter or malformed
+      // response, the reducer APPENDED it on top of the stale text,
+      // producing a corrupted concatenation that was neither attempt
+      // in isolation.
+      //
+      // The reset must clear ``finalAnswer`` so the retry starts from
+      // a clean slate. ``attempt_id`` is preserved for diagnostics —
+      // a future reducer extension could correlate chunks to their
+      // originating attempt without a second reset check.
+      if (event.data.reset === true) {
+        return {
+          ...base,
+          status: "running",
+          finalAnswer: "",
+        };
+      }
+
       const delta =
         event.data.delta || event.data.text || event.data.content || "";
       if (!delta) return base;
