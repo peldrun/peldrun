@@ -218,7 +218,7 @@ export function FilesTab({ onSelectFile, onOpenFile, activeJobId }: FilesTabProp
                       ) : (
                         <FolderOpen size={14} className="text-amber-400 shrink-0" />
                       )}
-                      <span className="font-semibold text-foreground truncate">{item.name}</span>
+                      <span className="font-semibold text-amber-100 truncate">{item.name}</span>
                     </>
                   ) : (
                     <>
@@ -298,7 +298,19 @@ export function FilesTab({ onSelectFile, onOpenFile, activeJobId }: FilesTabProp
           <RefreshCw size={12} className={loading ? "animate-spin text-primary" : ""} />
         </Button>
       </div>
-      <div className="flex-1 overflow-y-auto p-3 font-mono">{renderTree(hierarchicalTree)}</div>
+      {/* Loading state: shown while the initial fetch (or a refresh that
+          empties the tree) is in flight. Reuses the same RefreshCw icon
+          and theme tokens already present in the file — no new styles. */}
+      <div className="flex-1 overflow-y-auto p-3 font-mono">
+        {loading && hierarchicalTree.length === 0 ? (
+          <div className="flex flex-col items-center justify-center gap-2 py-12 text-xs text-muted-foreground select-none">
+            <RefreshCw size={18} className="animate-spin text-primary" />
+            <span>Loading files...</span>
+          </div>
+        ) : (
+          renderTree(hierarchicalTree)
+        )}
+      </div>
     </div>
   );
 }
