@@ -19,9 +19,8 @@
  */
 
 import React, { useEffect, useRef } from "react";
-import { Bot } from "lucide-react";
-import { Icon } from "@/components/Icon/Icon";
 import { useProviderBadge } from "@/lib/providerBadge";
+import { ProviderModelBadge } from "./ProviderModelBadge";
 import { ChatTimeline, StepEvent } from "../chat-timeline";
 import { ChatDeliverable } from "../chat-deliverable";
 import { DelegationApprovalCard } from "../DelegationApprovalCard";
@@ -239,29 +238,13 @@ export function ChatThread({
         {/* Active Turn Identity Header (Model Name & Metadata) */}
         {submittedPrompt && (
           <div className="flex items-center justify-between text-xs text-muted-foreground pt-1 pb-2">
-            <div className="flex items-center gap-1.5 font-medium text-foreground">
-              {providerBadge ? (
-                <Icon name={providerBadge} size={16} />
-              ) : (
-                <Bot size={15} className="text-primary shrink-0" />
-              )}
-              {activeProvider && (
-                <span className="font-semibold text-xs font-mono text-primary truncate max-w-[140px]">
-                  {activeProvider}:
-                </span>
-              )}
-              <span className="font-semibold text-xs font-mono theAgent truncate max-w-[180px]">{activeModelName}</span>
-              {execMode === "agent" && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary border border-primary/20 font-mono">
-                  Agent
-                </span>
-              )}
-              {sessionTimestamp && (
-                <span className="text-[10px] text-muted-foreground font-normal">
-                  ({sessionTimestamp})
-                </span>
-              )}
-            </div>
+            <ProviderModelBadge
+              providerName={activeProvider}
+              modelName={activeModelName}
+              providerBadge={providerBadge}
+              execMode={execMode}
+              timestamp={sessionTimestamp}
+            />
           </div>
         )}
 

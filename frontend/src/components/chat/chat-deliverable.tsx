@@ -3,10 +3,10 @@
 "use client";
 
 import React from "react";
-import { FileText, ExternalLink, Activity, Check, Copy, Bot, AlertCircle, RotateCcw, PlayCircle } from "lucide-react";
-import { Icon } from "@/components/Icon/Icon";
+import { FileText, ExternalLink, Activity, Check, Copy, AlertCircle, RotateCcw, PlayCircle } from "lucide-react";
 import { useAppStorage } from "@/hooks/use-app-storage";
 import { useProviderBadge } from "@/lib/providerBadge";
+import { ProviderModelBadge } from "./chat-thread/ProviderModelBadge";
 import { resolveFileCategory } from "./chat-thread/utils";
 import { UsageBadgeGroup } from "@/components/chat/UsageBadges";
 import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
@@ -133,25 +133,13 @@ export function ChatDeliverable({
       {/* 1. Assistant Identity Header (conditionally hidden based on prop) */}
       {!hideHeader && (
         <div className="flex items-center justify-between text-xs text-muted-foreground pt-1">
-          <div className="flex items-center gap-1.5 font-medium text-foreground">
-            {providerBadge ? (
-              <Icon name={providerBadge} size={16} />
-            ) : (
-              <Bot size={15} className="text-primary shrink-0" />
-            )}
-            {resolvedProviderName && (
-              <span className="font-semibold text-xs font-mono text-primary truncate max-w-[140px]">
-                {resolvedProviderName}:
-              </span>
-            )}
-            <span className="font-semibold text-xs font-mono Agent truncate max-w-[180px]">{modelName}</span>
-            {execMode === "agent" && (
-              <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary border border-primary/20 font-mono">
-                Agent
-              </span>
-            )}
-            {timestamp && <span className="text-[10px] text-muted-foreground font-normal">({timestamp})</span>}
-          </div>
+          <ProviderModelBadge
+            providerName={resolvedProviderName}
+            modelName={modelName}
+            providerBadge={providerBadge}
+            execMode={execMode}
+            timestamp={timestamp}
+          />
         </div>
       )}
 
