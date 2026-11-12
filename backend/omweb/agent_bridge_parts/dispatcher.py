@@ -1839,6 +1839,7 @@ async def run_instrumented(
             query=prompt,
             chat_id=chat_id,
             project_id=project_id,
+            user_id="default",
             run_id=job_id,
         )
         if _retrieved is not None and not _retrieved.is_empty:
@@ -2465,16 +2466,15 @@ async def run_direct_chat(
                 query=prompt,
                 chat_id=chat_id,
                 project_id=project_id,
+                user_id="default",
                 run_id=job_id,
             )
             if _retrieved is not None and not _retrieved.is_empty:
-                logger.info(
-                    "[BRIDGE DIRECT CHAT] Memory retrieved for job "
-                    "%s: %d entries, %d tokens (router=%s).",
-                    job_id,
-                    len(_retrieved.memories),
-                    _retrieved.used_tokens,
-                    _retrieved.router_decision,
+                print(
+                    f"[BRIDGE DIRECT CHAT] Memory retrieved for job "
+                    f"{job_id}: {len(_retrieved.memories)} entries, "
+                    f"{_retrieved.used_tokens} tokens "
+                    f"(router={_retrieved.router_decision})."
                 )
             memory_context = _retrieved
         except Exception as _mem_err:

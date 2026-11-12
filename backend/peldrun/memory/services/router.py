@@ -194,10 +194,18 @@ _GREETING_PATTERN: Final[re.Pattern[str]] = re.compile(
 #: The alternatives cover the three languages symmetrically.
 _DIRECTED_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"(?:"
-    r"remember|recall|do\s+you\s+know|did\s+(?:we|I)|"  # English
-    r"what\s+(?:did\s+we|was\s+the)|"
-    r"تذكر|تتذكر|هل\s+تذكر|ما\s+القرار|ما\s+قررنا|"  # Arabic
-    r"помнишь|помните|что\s+мы|какое\s+решение"  # Russian
+    # English — recall/remember verbs
+    r"remember|recall|do\s+you\s+know|did\s+(?:we|I)|"
+    r"what\s+(?:did\s+we|was\s+the|is\s+my|are\s+my|do\s+I)|"
+    r"who\s+am\s+I|who\s+is\s+the\s+user|"
+    r"my\s+(?:name|role|preferences?|background)|"
+    # Arabic — recall verbs + identity questions
+    r"تذكر|تتذكر|هل\s+تذكر|ما\s+القرار|ما\s+قررنا|"
+    r"من\s+أنا|ما\s+اسمي|ماذا\s+تعرف\s+عني|"
+    r"ما\s+دوري|ما\s+خلفيتي|"
+    # Russian — recall verbs + identity
+    r"помнишь|помните|что\s+мы|какое\s+решение|"
+    r"кто\s+я|как\s+меня\s+зовут|что\s+ты\s+обо\s+мне\s+знаешь"
     r")",
     re.IGNORECASE,
 )

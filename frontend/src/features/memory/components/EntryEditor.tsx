@@ -102,6 +102,17 @@ export interface EntryEditorProps {
   entry?: MemoryEntry;
 
   /**
+   * Optional pre-fill text for the content field in CREATE mode.
+   *
+   * Ignored in edit mode (`entry.content` takes precedence). Used
+   * by the "Save to memory" action attached to a chat message,
+   * where the user's message becomes the initial content of a
+   * new memory entry. `null` / `undefined` leaves the field empty
+   * (the pre-existing behavior).
+   */
+  initialContent?: string;
+
+  /**
    * The scope for a NEW entry. Ignored in edit mode (the
    * entry's own scope is used, and the scope is immutable).
    */
@@ -126,6 +137,7 @@ export function EntryEditor({
   onOpenChange,
   mode,
   entry,
+  initialContent,
   scope,
   onSaved,
 }: EntryEditorProps) {
@@ -164,7 +176,7 @@ export function EntryEditor({
       setTags([...entry.tags]);
       setIsPinned(entry.is_pinned);
     } else {
-      setContent('');
+      setContent(initialContent ?? '');
       setMemoryType(MemoryType.SEMANTIC);
       setImportance(DEFAULT_IMPORTANCE);
       setTags([]);
@@ -174,7 +186,7 @@ export function EntryEditor({
     // Focus content after paint.
     const handle = setTimeout(() => contentRef.current?.focus(), 0);
     return () => clearTimeout(handle);
-  }, [open, mode, entry]);
+  }, [open, mode, entry, initialContent]);
 
   // ---- Escape to close -------------------------------------------
   useEffect(() => {

@@ -500,8 +500,23 @@ async def search_endpoint(body: _SearchBody) -> JSONResponse:
             update={"default_limit": body.limit}
         )
         context = await build_memory_context(
-            query=body.query, scope_refs=scope_refs, route=route,
-            provider=service.provider, settings=effective_settings,
+            query=body.query,
+            scope_refs=scope_refs,
+            route=route,
+            provider=service.provider,
+            settings=effective_settings,
+            # The HTTP search endpoint exists PRIMARILY for UI
+            # previews ("what do I have related to this message?").
+            # When FTS returns no keyword matches, showing recent
+            # memories is far more useful than an empty list --
+            # the caller wants to know what memories EXIST, not
+            # just what shares keywords with the query.
+            #
+            # The agent-facing MemorySearchTool deliberately does
+            # NOT set this flag -- strict keyword matching is the
+            # right semantic for the agent's "find what I asked
+            # for" contract.
+            allow_recency_fallback=True,
         )
     except HTTPException:
         raise

@@ -40,6 +40,9 @@ import {
   resolveExecutionDirectives,
   MentionItem,
 } from "./composer/registry/command-registry";
+import { SimilarMemoriesPanel } from "@/features/memory/components/SimilarMemoriesPanel";
+import { useMemoryMode } from "@/features/memory/hooks/useMemoryMode";
+import { SEARCH_MIN_QUERY_LENGTH } from "@/features/memory/lib/constants";
 
 export interface SubmissionAccepted {
   accepted: boolean;
@@ -269,6 +272,36 @@ export function Composer({
   const activeSessionId = chatId || urlChatId;
 
   const [text, setText] = useState("");
+
+  // ---- Memory integration (F8.2) ----------------------------------
+  //
+  // The "similar memories" preview panel and the mode gate both
+  // depend on the memory feature. They live here (not in a
+  // wrapper component) so that:
+  //
+  //   1. `text` is the SAME state the Lexical editor manages via
+  //      `handleEditorChange` -- no duplicated sources of truth,
+  //      no "wait for the other component to catch up" lag.
+  //
+  //   2. The panel searches in CONTEXTUAL mode (`chat_id` +
+  //      `user_id`), NOT explicit (`scope_type`/`scope_id`). The
+  //      distinction matters: the backend treats the two forms
+  //      differently --
+  //
+  //        * explicit scope  -> search ONLY that scope
+  //        * contextual       -> union of user + project + chat
+  //
+  //      The composer should include the user's PERSONAL
+  //      memories (e.g. "User is Mohamed, a programmer"), not
+  //      just entries saved in this chat. Explicit chat scope
+  //      was the original F8.2 implementation, and it was wrong:
+  //      a personal preference saved once never resurfaced in
+  //      new chats. The contextual mode fixes that.
+  //
+  //   3. `useMemoryMode` reads from the `useMemorySettings`
+  //      query already cached by the layout, so no extra
+  //      network traffic is introduced on first render.
+  const { canRead: memoryCanRead } = useMemoryMode();
   const [pendingAttachments, setPendingAttachments] = useState<
     PendingAttachment[]
   >([]);
@@ -1372,6 +1405,28 @@ export function Composer({
             })}
           </div>
         )}
+
+        {/* ============ Similar memories (F8.2) ============
+            Fires a debounced `POST /api/memory/search` with the
+            composer's chat id AND the user id, so the backend
+            searches the union of user:default + chat:<id>
+            (contextual mode). Renders nothing when memory is
+            disabled (the `memoryCanRead` gate) or when the
+            draft is shorter than SEARCH_MIN_QUERY_LENGTH --
+            so the composer stays exactly the same size when
+            memory is off or when the draft is trivial. */}
+        {memoryCanRead &&
+          activeSessionId &&
+          text.trim().length >= SEARCH_MIN_QUERY_LENGTH && (
+            <div className="px-2.5 pt-2">
+              <SimilarMemoriesPanel
+                query={text}
+                chat_id={activeSessionId}
+                user_id="default"
+                limit={3}
+              />
+            </div>
+          )}
 
         <LexicalEditorComponent
           ref={editorRef}

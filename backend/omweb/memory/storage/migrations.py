@@ -277,12 +277,54 @@ def _get_recorded_version(conn: sqlite3.Connection) -> int:
 
 
 def _record_version(conn: sqlite3.Connection, version: int) -> None:
-    """Record ``version`` as applied. Idempotent via INSERT OR IGNORE."""
+    """Record ``version`` as applied. Idempotent via INSERT OR IGNORE.
+
+    Commits IMMEDIATELY after the INSERT so the write transaction
+    does not remain open when ``apply_schema`` returns.
+
+    Why this matters
+    ----------------
+    SQLite permits only ONE writer at a time per database file.
+    An open write transaction on one connection BLOCKS every
+    other connection's attempt to write to the same file --
+    they wait up to ``busy_timeout`` milliseconds, then raise
+    ``database is locked``.
+
+    The scenario this prevents:
+
+      1. FastAPI's lifespan runs on the main thread and opens
+         connection A. ``apply_schema(conn_A)`` runs the DDL
+         (autocommit) and then ``INSERT INTO
+         memory_schema_version`` (which -- without an explicit
+         commit -- starts a write transaction that stays open).
+
+      2. The lifespan continues. Connection A is now stored in
+         the repository's ``_connections`` list for cleanup,
+         still inside that open write transaction.
+
+      3. A request arrives. FastAPI runs the handler on a
+         WORKER thread, which gets connection B from
+         ``threading.local``.
+
+      4. The handler calls ``provider.create(...)``, which does
+         ``with conn_B: conn_B.execute("INSERT INTO memories
+         ...")``. SQLite tries to acquire the write lock --
+         held by conn A's never-committed INSERT -- blocks for
+         30 seconds, then raises ``database is locked``.
+
+    Committing inside ``_record_version`` releases the write
+    lock before ``apply_schema`` returns, so any concurrent
+    writer on any thread can acquire it immediately.
+    """
     conn.execute(
         "INSERT OR IGNORE INTO memory_schema_version "
         "(version, applied_at) VALUES (?, ?)",
         (version, time.time()),
     )
+    # Ensure the write lock is released before returning. A crash
+    # between ``execute`` and ``commit`` re-runs the (idempotent)
+    # INSERT on next startup -- no data loss, no drift.
+    conn.commit()
 
 
 def apply_schema(conn: sqlite3.Connection) -> int:
@@ -386,6 +428,35 @@ def apply_schema(conn: sqlite3.Connection) -> int:
         logger.info(
             "Memory schema migration v%d applied successfully.",
             target_version,
+        )
+
+    # Defense in depth: commit any residual writes.
+    #
+    # ``_record_version`` already commits, but this trailing commit
+    # covers two edge cases:
+    #
+    #   1. A future migration function that adds writes but forgets
+    #      to commit. The trailing commit releases its lock so
+    #      concurrent writers do not time out.
+    #
+    #   2. A migration function that crashes mid-loop AFTER opening
+    #      a transaction. SQLite rolls back on connection close,
+    #      but the connection stays alive in the pool -- the
+    #      trailing commit (which succeeds in this case because
+    #      SQLite allows commit of an empty transaction) normalizes
+    #      the state.
+    #
+    # When no migrations ran (the database was already at
+    # CURRENT_VERSION), there is no pending transaction, and the
+    # commit is a harmless no-op.
+    try:
+        conn.commit()
+    except sqlite3.Error as exc:
+        # A failure to commit here would be caught on the NEXT
+        # operation anyway (still locked). Log and let the caller
+        # surface the error with better context.
+        logger.warning(
+            "Final commit in apply_schema failed: %s", exc
         )
 
     return current_version

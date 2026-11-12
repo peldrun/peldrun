@@ -426,7 +426,35 @@ async def build_memory_context(
     settings: MemorySettings,
     *,
     now: Optional[datetime] = None,
+    allow_recency_fallback: Optional[bool] = None,
 ) -> MemoryContext:
+    """... (docstring unchanged; add param description below) ...
+
+    Parameters
+    ----------
+    allow_recency_fallback
+        Controls the fallback that fetches recent memories when
+        FTS keyword matching returns nothing.
+
+          * ``None`` (default) -- fallback fires only when the
+            route is ``DIRECTED``. This is the correct behavior
+            for the CHAT path: the classifier decided the user
+            asked to recall something, but FTS missed the
+            keywords, so we surface recent memories.
+
+          * ``True`` -- always fallback. Used by the HTTP
+            ``/api/memory/search`` endpoint, whose SEMANTIC INTENT
+            is "show me what's potentially relevant for this
+            message". For a UI preview panel, showing recent
+            memories beats showing an empty list.
+
+          * ``False`` -- never fallback. Reserved for callers
+            that need strict keyword-only semantics (the
+            ``MemorySearchTool`` currently falls in this
+            category by design -- an agent asking "what did we
+            decide about the database?" should NOT get a
+            recent-users list mislabeled as decisions).
+    """
     """Run the full pipeline: search -> rank -> fit -> build context.
 
     Parameters
@@ -593,6 +621,51 @@ async def build_memory_context(
             router_decision=route.decision.value,
             retrieved_at=now,
         )
+
+    # Determine whether the recency fallback should fire. Three
+    # callers, three semantics:
+    #
+    #   * Chat (default None) -- fallback only when router says
+    #     DIRECTED. The classifier already decided the user wants
+    #     recall; FTS missed keywords; recency is the right safety
+    #     net.
+    #
+    #   * /api/memory/search with allow_recency_fallback=True --
+    #     always fallback. The UI panel's intent is "show me
+    #     anything I've got" rather than "strict keyword match".
+    #
+    #   * MemorySearchTool -- never fallback (agent may need to
+    #     report "I found nothing" rather than lie).
+    if allow_recency_fallback is not None:
+        _should_fallback = allow_recency_fallback
+    else:
+        _should_fallback = route.decision == RouteDecision.DIRECTED
+
+    if not candidates and _should_fallback:
+        logger.debug(
+            "build_memory_context: no FTS matches for DIRECTED query %r; "
+            "falling back to recency listing.",
+            query[:100],
+        )
+        try:
+            if hasattr(provider, "search_ranked"):
+                candidates = await provider.search_ranked(
+                    query="",
+                    scope_refs=scope_refs,
+                    limit=limit,
+                )
+            else:
+                entries = await provider.search(
+                    query="",
+                    scope_refs=scope_refs,
+                    limit=limit,
+                )
+                candidates = _assign_positional_relevance(entries)
+        except Exception as exc:
+            logger.warning(
+                "build_memory_context: recency fallback failed: %s", exc
+            )
+            candidates = []
 
     if not candidates:
         logger.debug(

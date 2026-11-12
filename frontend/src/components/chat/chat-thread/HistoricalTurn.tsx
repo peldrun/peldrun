@@ -159,6 +159,7 @@ export function HistoricalTurn({
         copiedSection={copiedSection}
         onCopy={copyText}
         onSelectFile={onSelectFile}
+        chatId={chatId}
       />
 
       {isAgentTurn && turnGrouped && Object.keys(turnGrouped).length > 0 && (

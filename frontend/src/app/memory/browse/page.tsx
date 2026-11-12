@@ -306,8 +306,63 @@ export default function MemoryBrowsePage() {
 
   return (
     <div className="mx-auto grid max-w-6xl grid-cols-1 gap-4 md:grid-cols-[14rem_1fr]">
-      {/* ============ Sidebar ============ */}
-      <aside className="space-y-3">
+      {/* ============ Mobile scope picker ============ */}
+      {/*
+       * On screens narrower than `md`, the vertical sidebar would
+       * push the entry list below the fold: the user opens
+       * `/memory/browse`, sees only the scope names, and must
+       * scroll to find any content. A horizontal, scrollable row
+       * of chips collapses the picker into ~40px of vertical
+       * space, keeping the list visible on first paint.
+       *
+       * The desktop sidebar (below) renders the same information
+       * in the same order, so the mental model does not change
+       * across breakpoints.
+       */}
+      <div className="md:hidden -mx-4 overflow-x-auto px-4 pb-1">
+        <div className="flex min-w-max gap-1.5">
+          <ScopeChip
+            active={
+              activeScope?.scope_type === MemoryScope.USER &&
+              activeScope.scope_id === 'default'
+            }
+            onClick={() =>
+              pickScope({
+                scope_type: MemoryScope.USER,
+                scope_id: 'default',
+              })
+            }
+            icon={User}
+            label={t('scope.userDefault')}
+          />
+          {projectsQuery.isLoading ? (
+            <>
+              {[0, 1, 2].map((i) => (
+                <div
+                  key={i}
+                  className="h-7 w-20 animate-pulse rounded-full bg-muted"
+                />
+              ))}
+            </>
+          ) : (
+            projectScopes.map((ref) => (
+              <ScopeChip
+                key={ref.scope_id}
+                active={
+                  activeScope?.scope_type === ref.scope_type &&
+                  activeScope.scope_id === ref.scope_id
+                }
+                onClick={() => pickScope(ref)}
+                icon={FolderOpen}
+                label={ref.scope_id}
+              />
+            ))
+          )}
+        </div>
+      </div>
+
+      {/* ============ Desktop sidebar ============ */}
+      <aside className="hidden space-y-3 md:block">
         <section>
           <h3 className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
             {t('browse.scopeSidebar.personal')}
@@ -389,6 +444,7 @@ export default function MemoryBrowsePage() {
             onClick={handleCreate}
             disabled={!canWrite || !activeScope}
             title={!canWrite ? t('errors.mode_read_only') : undefined}
+            aria-label={t('browse.empty.action')}
             className={cn(
               'inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground',
               'hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2',
@@ -396,7 +452,7 @@ export default function MemoryBrowsePage() {
             )}
           >
             <Plus size={12} aria-hidden="true" />
-            {t('browse.empty.action')}
+            <span className="hidden sm:inline">{t('browse.empty.action')}</span>
           </button>
         </div>
 
@@ -555,6 +611,48 @@ function ScopeButton({
     >
       <Icon size={11} aria-hidden="true" className="shrink-0" />
       <span className="truncate font-mono">{label}</span>
+    </button>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Mobile scope chip
+// ---------------------------------------------------------------------------
+
+/**
+ * A pill-shaped variant of `ScopeButton` for the mobile
+ * horizontal picker.
+ *
+ * Differences from `ScopeButton`:
+ *
+ *   * Rounded-full vs rounded-md -- reads better in a horizontal
+ *     strip of chips than a list of full-width rows.
+ *   * `whitespace-nowrap` -- a long project id stays on one
+ *     line; the parent container scrolls horizontally rather
+ *     than wrapping to a second row.
+ *   * No `truncate` -- truncating in a chip steals space that
+ *     the parent's horizontal scroll would have provided.
+ *
+ * Same `active` visual language as `ScopeButton` (primary
+ * background at 10% opacity), so the selection state reads
+ * identically across breakpoints.
+ */
+function ScopeChip({ active, onClick, icon: Icon, label }: ScopeButtonProps) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-current={active ? 'true' : undefined}
+      className={cn(
+        'inline-flex shrink-0 items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] transition-colors',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1',
+        active
+          ? 'border-primary/40 bg-primary/10 font-medium text-primary'
+          : 'border-border bg-card text-muted-foreground hover:bg-muted hover:text-foreground',
+      )}
+    >
+      <Icon size={11} aria-hidden="true" className="shrink-0" />
+      <span className="whitespace-nowrap font-mono">{label}</span>
     </button>
   );
 }

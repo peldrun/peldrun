@@ -243,6 +243,7 @@ export function ChatThread({
               copiedSection={copiedSection}
               onCopy={copyText}
               onSelectFile={onSelectFile}
+              chatId={chatId}
             />
           </div>
         )}

@@ -1,11 +1,13 @@
 "use client";
 
 import React from "react";
+import Link from "next/link";
 import { Plus, History, Square, PanelRightClose, PanelRightOpen, GitBranch } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { EngineOption, EngineSelector } from "./engine-selector";
 import { UsageBadgeGroup } from "@/components/chat/UsageBadges";
 import type { ChatUsageSummary } from "@/lib/types";
+import { ModeBadge } from "@/features/memory/components/ModeBadge";
 
 
  // app/layout.tsx أو TopBar.tsx
@@ -133,6 +135,21 @@ export function ChatSubHeader({
       </div>
 
       <div className="flex items-center gap-2.5">
+
+        {/* Memory mode indicator -- tiny pill linking to the
+            memory settings page. Renders a skeleton while the
+            settings query is loading (see ModeBadge), so it
+            never causes a layout shift after mount. Hidden on
+            very narrow screens; the memory page itself always
+            shows the mode in its own header. */}
+        <Link
+          href="/memory/settings"
+          className="hidden sm:inline-flex rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          aria-label="Memory settings"
+          title="Memory settings"
+        >
+          <ModeBadge size="sm" />
+        </Link>
 
         {/* Token & Telemetry Badges Cluster */}
         {/* Single Unified Header Badge */}
