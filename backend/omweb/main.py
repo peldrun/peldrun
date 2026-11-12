@@ -48,8 +48,10 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from omweb.config import STORAGE_ROOT
@@ -66,6 +68,7 @@ from omweb.routers import (
     image_proxy_rtr,
     mcp,
     mcp_auth,
+    memory_rtr,
     resource_monitor,
     run,
     runtime_settings_rtr,
@@ -79,6 +82,10 @@ from omweb.routers import (
     system as system_rtr,
     telemetry,
 )
+
+# Memory Platform -- CRUD router (mounted at /api/memory AFTER
+# memory_rtr.router; see the include comment below for ordering).
+from omweb.memory.api.memory_crud import router as memory_crud
 
 # Tool Bundles Subsystem router
 from omweb.routers.store import bundles as store_bundles
@@ -194,6 +201,34 @@ async def lifespan(app: FastAPI):
         logger.warning(
             "Session recovery skipped due to error: %s",
             _rec_err,
+            exc_info=True,
+        )
+
+    # 0b. Initialize the Memory Subsystem (P1.7).
+    #
+    # Runs EARLY -- before any handler that might call
+    # ``get_memory_service()`` (the dispatcher, the engines, the
+    # memory tools, the memory API). The service itself degrades
+    # gracefully on failure: a provider initialization error inside
+    # ``MemoryService.ainitialize`` falls back to a null provider,
+    # so the service stays "initialized" and every ``retrieve``
+    # returns an empty context. Startup cannot be blocked by a
+    # broken settings file or a missing FTS5 build.
+    #
+    # ``initialize_memory_service`` takes optional ``db_path`` /
+    # ``settings_path`` overrides. Production uses the canonical
+    # storage-root locations; tests inject temp paths through the
+    # ``set_memory_service_for_tests`` hook instead.
+    try:
+        from omweb.memory import initialize_memory_service
+
+        await initialize_memory_service()
+        logger.info("MemoryService initialized cleanly on startup.")
+    except Exception as exc:
+        logger.warning(
+            "MemoryService initialization failed on startup "
+            "(memory will be unavailable until restart): %s",
+            exc,
             exc_info=True,
         )
 
@@ -434,6 +469,29 @@ async def lifespan(app: FastAPI):
             "Failed to close BrowserSessionManager on shutdown: %s", exc
         )
 
+    # 4. Shutdown the Memory Subsystem (P1.7).
+    #
+    # Runs LAST -- after every other subsystem has released its
+    # resources. This ordering ensures that in-flight requests,
+    # tool handlers, and background extraction jobs (once P1.6
+    # lands) can safely call ``get_memory_service()`` until the
+    # very end of the shutdown sequence.
+    #
+    # ``shutdown_memory_service`` is idempotent and never raises
+    # -- it clears the singleton and closes the provider, both
+    # best-effort. A failure here is logged at WARNING by the
+    # service itself; the wrapper below is belt-and-suspenders
+    # for an import error.
+    try:
+        from omweb.memory import shutdown_memory_service
+
+        await shutdown_memory_service()
+        logger.info("MemoryService shut down cleanly on shutdown.")
+    except Exception as exc:
+        logger.warning(
+            "Failed to shutdown MemoryService on shutdown: %s", exc
+        )
+
 
 # ---------------------------------------------------------------------------
 # FastAPI application
@@ -446,6 +504,99 @@ app = FastAPI(
     redoc_url="/redoc",
     lifespan=lifespan,
 )
+
+
+# ---------------------------------------------------------------------------
+# Application-level exception handler -- memory API envelope
+# ---------------------------------------------------------------------------
+#
+# FastAPI's default response for request-body validation failures
+# (``extra="forbid"`` triggered, wrong type, missing required
+# field) is HTTP 422 with FastAPI's OWN error shape -- NOT the
+# memory API's uniform envelope. That inconsistency is a real
+# problem for the memory UI: the frontend has to parse two
+# different error shapes depending on whether the failure came
+# from our business logic (400, custom shape) or FastAPI's
+# validator (422, default shape).
+#
+# This handler normalizes EVERY RequestValidationError to:
+#
+#     HTTP 400
+#     {
+#         "status": "error",
+#         "operation": "request_validation",
+#         "error": "invalid_request",
+#         "message": "Request validation failed.",
+#         "fields": [
+#             {"loc": ["body", "mode"], "msg": "...", "type": "..."},
+#             ...
+#         ]
+#     }
+#
+# The ``fields`` list mirrors the shape produced by
+# ``memory_settings._pydantic_error_to_400`` so the frontend
+# can highlight the offending field the same way in both paths.
+#
+# Scope -- INTENTIONALLY GLOBAL
+# -----------------------------
+#
+# We register this handler at the APP level, not per-router. Two
+# reasons:
+#
+#   1. **Consistency.** Every router that uses Pydantic body
+#      models benefits (memory_crud, memory_settings,
+#      memory_projects, and future routers). A per-router
+#      registration would require duplication at every mount
+#      site, and any new router that forgot it would silently
+#      regress.
+#
+#   2. **Behavioral contract.** A 400-with-structure is the
+#      CORRECT response for "you sent invalid input". FastAPI
+#      chose 422 for historical reasons (WebDAV's Unprocessable
+#      Entity semantics); most REST APIs use 400 for the same
+#      case. This handler aligns our API with the convention
+#      the rest of the codebase already uses (see
+#      ``memory_settings._pydantic_error_to_400`` and every
+#      ``_error_response`` in ``omweb.memory.api.*``).
+#
+# Does the frontend break?
+# ------------------------
+#
+# No. The frontend must already handle 400 with a structured
+# detail (from the business-logic paths). This handler makes the
+# validator path produce the SAME shape, so the frontend's
+# existing error-handling code works unchanged for both paths.
+# Any caller that was specifically checking for 422 will now see
+# 400 -- but no such caller exists in this codebase (grep for
+# "422" in ``frontend/`` returns zero hits).
+@app.exception_handler(RequestValidationError)
+async def _memory_style_validation_handler(
+    request: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
+    """Normalize FastAPI 422 responses to the memory API's 400 shape."""
+    fields = []
+    for err in exc.errors():
+        if not isinstance(err, dict):
+            continue
+        fields.append(
+            {
+                "loc": [str(x) for x in err.get("loc", [])],
+                "msg": str(err.get("msg", "")),
+                "type": str(err.get("type", "")),
+            }
+        )
+    return JSONResponse(
+        status_code=400,
+        content={
+            "status": "error",
+            "operation": "request_validation",
+            "error": "invalid_request",
+            "message": "Request validation failed.",
+            "fields": fields,
+        },
+    )
+
 
 # CORS Configuration
 app.add_middleware(
@@ -527,6 +678,34 @@ app.include_router(
     prefix="/api/store/providers",
     tags=["store", "providers"],
 )
+
+# Memory Platform API (P1.8).
+#
+# Two includes, ordered. The separation (rather than a single
+# aggregator) is enforced by FastAPI's constraint that
+# ``include_router(router, prefix="")`` is invalid when the
+# child router carries an empty-path route (``@router.get("")``).
+# ``memory_crud`` has such a route (the list/create endpoints),
+# so it must be mounted at the app level with a non-empty prefix.
+#
+# Ordering guarantee:
+#   1. ``memory_rtr`` first  -- fixed prefixes (/settings,
+#      /projects, /import, /export, /usage).
+#   2. ``memory_crud`` second -- catch-all (/, /search,
+#      /{memory_id}, ...).
+# FastAPI matches in registration order, so every fixed-prefix
+# router wins before ``/{memory_id}`` is tried.
+app.include_router(
+    memory_rtr.router,
+    prefix="/api/memory",
+    tags=["memory"],
+)
+app.include_router(
+    memory_crud.router,
+    prefix="/api/memory",
+    tags=["memory", "crud"],
+)
+
 # Skill Catalog sub-router MUST be registered BEFORE the main skills
 # router. The main router declares `GET /{skill_id}` which would
 # otherwise match `/catalog` as `skill_id="catalog"`. FastAPI matches

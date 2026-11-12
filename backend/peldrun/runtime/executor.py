@@ -1034,9 +1034,9 @@ class CoreRuntimeExecutor:
         # builds the LLM message list. The engine
         # (``PeldrunEngine.run``) deliberately does NOT assemble
         # messages anymore — it forwards only raw inputs
-        # (sidecar, prompt, project_rules, system_prompt) via
-        # ``RunRequest``, and this call materialises the actual
-        # payload the model will see.
+        # (sidecar, prompt, project_rules, system_prompt, and
+        # memory_context) via ``RunRequest``, and this call
+        # materialises the actual payload the model will see.
         #
         # Prior to this fix, both the engine and the executor built
         # the message list independently, with different
@@ -1053,6 +1053,37 @@ class CoreRuntimeExecutor:
         # turn is not running, so a resumed run cannot see tool
         # calls the crash invalidated.
         #
+        # [P1.5] memory_context forwarding.
+        #
+        # ``request.memory_context`` carries the retrieved memory
+        # block for this turn (produced by the dispatcher via
+        # ``MemoryService.retrieve()`` before constructing the
+        # RunRequest). It is forwarded here so the memory block
+        # lands in the assembled system prompt as Tier 1D.
+        #
+        # For a FRESH run, this is the only injection point --
+        # ``build_messages`` passes the block to
+        # ``fit_all(memory_msgs=...)``, which merges it into the
+        # first system message.
+        #
+        # For a RESUMED run (``restored_state is not None``), the
+        # context assembly below still RUNS -- the ``build_messages``
+        # call is unconditional, matching the pre-P1.5 structure --
+        # but its OUTPUT IS DISCARDED. The restored state's
+        # ``messages`` were built during the original run and
+        # already contain whatever memory block was injected then;
+        # ``initial_state = restored_state`` (in the resume branch
+        # below) makes those the source of truth for the agent.
+        #
+        # Consequence: the ``memory_context`` forwarded here is
+        # effectively ignored on resume. That is the correct
+        # behavior, not a bug. Re-injecting it into
+        # ``restored_state.messages`` would DUPLICATE the memory
+        # block in the prompt. The ``MemoryContext`` transience
+        # contract (memory_context is NEVER persisted) ensures a
+        # resume cannot "remember" the old one, and the executor
+        # intentionally does NOT attempt to reconstruct it.
+        #
         # Do NOT add a metadata-based bypass here. If a future
         # caller wants to pre-build the context, they must pass it
         # through ``request.metadata["prebuilt_context"]`` under a
@@ -1067,15 +1098,24 @@ class CoreRuntimeExecutor:
             system_prompt=spec.system_prompt,
             project_rules=project_rules,
             include_execution=True,
+            memory_context=request.memory_context,
         )
 
+        # [P1.5] The log line now reports ``memory_tokens`` separately
+        # so an operator can see how much of the active prompt budget
+        # was spent on retrieved memory. ``memory_tokens=0`` for the
+        # DISABLED / NO_NEED / empty-result cases -- see
+        # ``TokenBudgetController.fit_all``'s docstring for the
+        # accounting semantics.
         logger.info(
-            "Context assembled for agent job %s (run %s) | model: %s | active tokens: %s / %s",
+            "Context assembled for agent job %s (run %s) | model: %s | "
+            "active tokens: %s / %s (memory: %s)",
             job_id,
             run_id_str,
             model_name,
             budget_usage.get("total_tokens", 0),
             budget_usage.get("effective_limit", 0),
+            budget_usage.get("memory_tokens", 0),
         )
 
         # ─────────────────────────────────────────────────────────────

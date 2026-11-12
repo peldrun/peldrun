@@ -1792,6 +1792,73 @@ async def run_instrumented(
             _plugin_resolve_err,
         )
 
+    # ─────────────────────────────────────────────────────────────
+    # [P1.5] Memory retrieval.
+    #
+    # Called BEFORE constructing the EngineRunContext so the
+    # retrieved context travels with the run request into the
+    # engine and, from there, into ``RunRequest.memory_context``
+    # and finally into ``ContextManager.build_messages``.
+    #
+    # Query choice: ``prompt`` (the ORIGINAL user message), NOT
+    # ``final_prompt`` (which may have 10KB of referenced file
+    # contents prepended). The router's greeting/length heuristics
+    # expect user input; feeding it augmented prose would
+    # misclassify a "hi" as a real query when files were attached
+    # to a greeting.
+    #
+    # Failure handling: ``retrieve`` returns ``None`` on every
+    # failure path (disabled mode, provider unavailable, scope
+    # resolution error). No exception escapes. The engine treats
+    # ``None`` and empty ``MemoryContext`` identically.
+    # ─────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────
+    # [P1.7] Memory retrieval via the process-wide MemoryService.
+    #
+    # Replaces the P1.5 ``MemoryBootstrap`` temporary shim. The
+    # service exposes the same retrieve() signature, so the
+    # surrounding logic is unchanged: the dispatcher still passes
+    # the ORIGINAL prompt (not final_prompt), still treats the
+    # returned context the same way, and still falls back to None
+    # on any unexpected failure.
+    #
+    # Failure handling: ``MemoryService.retrieve`` returns an empty
+    # ``MemoryContext`` (never None) on expected failures -- mode
+    # disabled, empty result, pipeline error. The try/except below
+    # is defense in depth for the one remaining failure mode:
+    # ``get_memory_service()`` raising ``RuntimeError`` if the
+    # FastAPI lifespan hook was not run. That should never happen
+    # in production, but the run must not abort if it does.
+    # ─────────────────────────────────────────────────────────────
+    memory_context = None
+    try:
+        from omweb.memory import get_memory_service
+
+        _mem_service = get_memory_service()
+        _retrieved = await _mem_service.retrieve(
+            query=prompt,
+            chat_id=chat_id,
+            project_id=project_id,
+            run_id=job_id,
+        )
+        if _retrieved is not None and not _retrieved.is_empty:
+            logger.info(
+                "[BRIDGE] Memory retrieved for job %s: %d entries, "
+                "%d tokens (router=%s).",
+                job_id,
+                len(_retrieved.memories),
+                _retrieved.used_tokens,
+                _retrieved.router_decision,
+            )
+        memory_context = _retrieved
+    except Exception as _mem_err:
+        logger.debug(
+            "[BRIDGE] Memory retrieval skipped for job %s: %s",
+            job_id,
+            _mem_err,
+        )
+        memory_context = None
+
     context = EngineRunContext(
         job_id=job_id,
         prompt=final_prompt,
@@ -1805,6 +1872,7 @@ async def run_instrumented(
         context_refs=merged_refs,
         attachments=attachments,
         invoked_skills=invoked_skills,
+        memory_context=memory_context,
     )
 
     try:
@@ -2371,6 +2439,53 @@ async def run_direct_chat(
                 else web_note
             )
 
+        # ─────────────────────────────────────────────────────────────
+        # [P1.5] Memory retrieval (chat mode).
+        #
+        # Same semantics as the agent-mode block in
+        # ``run_instrumented``: ``retrieve`` returns ``None`` on any
+        # failure, and ``build_messages`` treats ``None`` and empty
+        # ``MemoryContext`` identically. Query is the ORIGINAL
+        # ``prompt`` (not ``augmented_prompt``) for the same reason:
+        # the router's heuristics expect user input, not augmented
+        # prose with web-search results appended.
+        # ─────────────────────────────────────────────────────────────
+        # ─────────────────────────────────────────────────────────────
+        # [P1.7] Memory retrieval via MemoryService.
+        #
+        # Same semantics as the agent-mode block. See the comment
+        # there for the failure-mode rationale.
+        # ─────────────────────────────────────────────────────────────
+        memory_context = None
+        try:
+            from omweb.memory import get_memory_service
+
+            _mem_service = get_memory_service()
+            _retrieved = await _mem_service.retrieve(
+                query=prompt,
+                chat_id=chat_id,
+                project_id=project_id,
+                run_id=job_id,
+            )
+            if _retrieved is not None and not _retrieved.is_empty:
+                logger.info(
+                    "[BRIDGE DIRECT CHAT] Memory retrieved for job "
+                    "%s: %d entries, %d tokens (router=%s).",
+                    job_id,
+                    len(_retrieved.memories),
+                    _retrieved.used_tokens,
+                    _retrieved.router_decision,
+                )
+            memory_context = _retrieved
+        except Exception as _mem_err:
+            logger.debug(
+                "[BRIDGE DIRECT CHAT] Memory retrieval skipped for "
+                "job %s: %s",
+                job_id,
+                _mem_err,
+            )
+            memory_context = None
+
         context_mgr = ContextManager()
         messages, budget_usage = context_mgr.build_messages(
             sidecar=sidecar,
@@ -2378,6 +2493,7 @@ async def run_direct_chat(
             system_prompt=chat_system_prompt,
             include_execution=False,
             generative_ui=active_llm.get("generative_ui"),
+            memory_context=memory_context,
         )
         print(
             f"[CONTEXT BUDGET] Enforced limits for {model_name} | "

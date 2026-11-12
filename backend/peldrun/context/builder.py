@@ -25,6 +25,28 @@ from peldrun.context.generative_ui import build_generative_ui_prompt
 from peldrun.context.schema import ContextSidecar, CurrentExecution
 from peldrun.llm.schema import ChatMessage, ContentPart, image_url_part, text_part
 
+# [P1.5] Memory context integration.
+#
+# ``MemoryContext`` is the transient container produced by
+# ``MemoryService.retrieve()`` (P1.7) and carried into this builder
+# via ``RunRequest.memory_context`` -> ``CoreRuntimeExecutor.execute``
+# -> ``build_messages(memory_context=...)``.
+#
+# ``format_memory_context`` is the SINGLE authoritative formatter for
+# the ``[RETRIEVED MEMORY]`` block. It is re-exported from
+# ``peldrun.memory.services`` -- the SAME function used by
+# ``context_builder.build_memory_context`` to compute
+# ``MemoryContext.used_tokens``. Reusing it here (rather than
+# re-implementing the format) is what guarantees the reported
+# ``used_tokens`` matches the actual bytes emitted into the prompt.
+#
+# Circular import check: ``peldrun.memory.domain`` and
+# ``peldrun.memory.services`` depend only on pydantic + stdlib +
+# each other -- neither imports ``peldrun.context`` or
+# ``peldrun.runtime``. Importing them here cannot form a cycle.
+from peldrun.memory.domain import MemoryContext
+from peldrun.memory.services import format_memory_context
+
 if TYPE_CHECKING:
     from peldrun.llm.vision_worker import VisionPerceptionWorker
 
@@ -42,6 +64,7 @@ class ContextManagerProtocol(Protocol):
         project_rules: Optional[str] = None,
         include_execution: bool = True,
         generative_ui: Optional[Dict[str, Any]] = None,
+        memory_context: Optional[MemoryContext] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         ...
 
@@ -102,18 +125,41 @@ class ContextManager:
         project_rules: Optional[str] = None,
         include_execution: bool = True,
         generative_ui: Optional[Dict[str, Any]] = None,
+        memory_context: Optional[MemoryContext] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         """
         Assemble the architectural context tiers in deterministic sequence:
         1. System Directive (Tier 1A)        ┐
-        2. Project Rules (Tier 1B)            ├── Merged into ONE system message
-        3. Generative UI Instructions (1C)   ┘
-        4. Compacted Context Summary (Tier 2)
-        5. Sanitized Recent Dialogue (Tier 3)
-        6. Ongoing Execution Telemetry (Tier 4)
-        7. Current User Input (Tier 5)
+        2. Project Rules (Tier 1B)            │
+        3. Generative UI Instructions (1C)   ├── Merged into ONE system message
+        4. Retrieved Memory (Tier 1D, P1.5)  ┘
+        5. Compacted Context Summary (Tier 2)
+        6. Sanitized Recent Dialogue (Tier 3)
+        7. Ongoing Execution Telemetry (Tier 4)
+        8. Current User Input (Tier 5)
 
-        Engineering note on Tier 1 merging:
+        Tier 1D (memory) placement note
+        --------------------------------
+        The memory block is produced by ``format_memory_context`` from
+        the ``memory_context`` parameter and passed to ``fit_all`` as
+        a SEPARATE ``memory_msgs`` list -- NOT appended to
+        ``system_parts`` here. This lets the fitter report
+        ``memory_tokens`` as a distinct accounting slice (required
+        by P1.9's monitoring) while still merging the block into the
+        FIRST system message before the final prompt is emitted.
+        ``fit_all``'s ``_merge_memory_into_system`` helper owns that
+        merge; this method only supplies the pre-merge pieces.
+
+        Empty / None short-circuit
+        --------------------------
+        An empty ``MemoryContext`` (the NO_NEED / DISABLED / empty-
+        result fast paths -- see ``MemoryContext.is_empty``) or a
+        ``None`` value produces an empty ``memory_msgs`` list.
+        ``fit_all`` then behaves IDENTICALLY to the pre-P1.5 code:
+        no merge, ``memory_tokens == 0``, byte-identical prompt.
+
+        Engineering note on Tier 1 merging
+        ----------------------------------
             Small and medium-sized models (≤ 14B) reliably read only the FIRST
             `system` message in the sequence and treat additional `system` messages
             as ignorable context. Empirically, splitting base directive + OpenUI
@@ -124,6 +170,11 @@ class ContextManager:
             concatenated into a SINGLE system message. This preserves the
             behavior of the disabled (Markdown-only) path while making the
             enabled (OpenUI Lang) path functional across model sizes.
+
+            [P1.5] The memory block (Tier 1D) is subject to the SAME
+            invariant: it merges into the first system message. Do
+            NOT promote it to its own system message without first
+            reading the small-model compatibility note above.
         """
         # ------------------------------------------------------------------
         # Tier 1: Unified System Directive (1A Base + 1B Rules + 1C GenUI)
@@ -209,6 +260,44 @@ class ContextManager:
             current_msgs.append({"role": "user", "content": clean_current_input})
 
         # ------------------------------------------------------------------
+        # Tier 1D: Retrieved Memory (P1.5)
+        # ------------------------------------------------------------------
+        # The memory block is produced by ``format_memory_context`` --
+        # the SAME formatter used by ``build_memory_context`` (P1.4)
+        # to compute ``MemoryContext.used_tokens``. Using it here is
+        # what makes the reported token count authoritative: what the
+        # memory pipeline says it spent is EXACTLY what this builder
+        # adds to the prompt.
+        #
+        # The block is passed to ``fit_all`` in a SEPARATE
+        # ``memory_msgs`` list (not appended to ``system_parts``
+        # earlier) so that ``fit_all`` can report
+        # ``memory_tokens`` as its own accounting slice, then merge
+        # the content into the first system message. See
+        # ``peldrun.context.budget._merge_memory_into_system`` for
+        # the merge mechanics.
+        memory_msgs: List[Dict[str, Any]] = []
+        if memory_context is not None and not memory_context.is_empty:
+            try:
+                memory_block = format_memory_context(memory_context)
+            except Exception as mem_fmt_err:
+                # A formatting failure must NOT abort the run --
+                # memory is an ENHANCEMENT, and the user's prompt
+                # already carries everything else. Log and skip.
+                logger.warning(
+                    "Failed to format memory context (%d entries): %s. "
+                    "Continuing without memory injection.",
+                    len(memory_context.memories),
+                    mem_fmt_err,
+                )
+                memory_block = ""
+            if memory_block:
+                memory_msgs.append({
+                    "role": "system",
+                    "content": memory_block,
+                })
+
+        # ------------------------------------------------------------------
         # Apply Token Budget Controller
         # ------------------------------------------------------------------
         budget_spec = sidecar.budget if sidecar else None
@@ -219,6 +308,7 @@ class ContextManager:
             recent_msgs=recent_msgs,
             exec_msgs=exec_msgs,
             current_msgs=current_msgs,
+            memory_msgs=memory_msgs,
         )
 
         return fitted_messages, usage

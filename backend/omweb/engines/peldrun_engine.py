@@ -1516,6 +1516,18 @@ class PeldrunEngine(ExecutionEngine):
             metadata=run_metadata,
             context_sidecar=sidecar,
             project_rules=project_rules,
+            # [P1.5] Forward the retrieved memory context from the
+            # dispatcher (``EngineRunContext.memory_context``) into
+            # the RunRequest so ``CoreRuntimeExecutor.execute`` can
+            # pass it to ``ContextManager.build_messages`` and the
+            # ``[RETRIEVED MEMORY]`` block lands in the assembled
+            # system prompt.
+            #
+            # ``None`` is the fast path -- memory disabled, NO_NEED
+            # route, empty result, or retrieval failure. The
+            # executor treats it identically to an empty context:
+            # no injection, no crash, no log noise.
+            memory_context=context.memory_context,
             # [FIX-RUNTIME-TIMEOUTS] Prefer the dedicated ``step_timeout``
             # key (populated by dispatcher from /settings/runtime), then
             # fall back to ``timeout`` (legacy behavior: same key drives

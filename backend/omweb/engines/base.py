@@ -14,6 +14,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
+# [P1.5] Memory context type.
+#
+# ``peldrun.memory.domain`` is a Pydantic + stdlib module with no
+# I/O, no storage coupling, and no dependency on ``omweb`` -- the
+# import is cheap and cannot form a runtime cycle. Type-safe
+# storage is preferred over ``Any`` so that a future refactor of
+# ``EngineRunContext`` cannot silently break the dispatcher's
+# contract by passing the wrong shape.
+from peldrun.memory.domain import MemoryContext
+
 
 @dataclass(frozen=True)
 class EngineRunContext:
@@ -63,6 +73,24 @@ class EngineRunContext:
     # Always a list of canonical skill IDs (normalized at the composer
     # boundary, re-normalized defensively in ``assignments``).
     invoked_skills: Optional[List[str]] = None
+
+    # [P1.5] Retrieved memory context for the current turn.
+    #
+    # Produced by the dispatcher via ``MemoryBootstrap.retrieve()``
+    # (P1.5) or ``MemoryService.retrieve()`` (P1.7 -- same signature,
+    # same return type). Consumed by ``PeldrunEngine.run`` which
+    # forwards it to ``RunRequest(memory_context=...)``.
+    #
+    # ``None`` is the fast path and the default: memory is DISABLED,
+    # the NO_NEED route fired, retrieval returned empty, or the
+    # retrieval failed. All four cases produce a prompt that is
+    # bit-for-bit identical to the pre-P1.5 case.
+    #
+    # ``MemoryContext`` is TRANSIENT: never persisted, never
+    # serialized into a checkpoint, never restored on resume. See
+    # ``peldrun.memory.domain.context``'s module docstring for the
+    # full transience contract.
+    memory_context: Optional[MemoryContext] = None
 
 
 @runtime_checkable

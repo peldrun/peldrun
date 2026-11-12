@@ -15,6 +15,24 @@ import uuid
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+# [P1.5] Runtime import for the ``RunRequest.memory_context`` field's
+# type annotation. ``MemoryContext`` is a lightweight domain value
+# object (Pydantic + stdlib only -- no I/O, no storage, no framework
+# coupling), so importing it eagerly here has no measurable cost and
+# no circular-import risk: ``peldrun.memory.domain.context`` does NOT
+# import anything from ``peldrun.runtime``.
+#
+# The eager import is DELIBERATE -- the engineering plan's reference
+# spec suggested a TYPE_CHECKING-guarded import with a quoted forward
+# reference, but that pattern is fragile under
+# ``from __future__ import annotations``: Pydantic v2 would need
+# ``RunRequest.model_rebuild()`` to be called explicitly after
+# ``MemoryContext`` became importable, and no call site in the
+# current tree guarantees that ordering. An eager import makes the
+# annotation resolvable at class-creation time without any
+# external ``model_rebuild()`` coordination.
+from peldrun.memory.domain.context import MemoryContext
+
 
 class RunStatus(str, Enum):
     """
@@ -145,6 +163,40 @@ class RunRequest(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Arbitrary tracing and telemetry headers")
     context_sidecar: Optional[Any] = Field(default=None, description="Context sidecar for multi-turn history assembly")
     project_rules: Optional[str] = Field(default=None, description="Explicit project execution rules")
+    # [P1.5] Retrieved memory context for the current turn.
+    #
+    # Produced by ``dispatcher.run_instrumented`` /
+    # ``dispatcher.run_direct_chat`` calling
+    # ``MemoryService.retrieve(...)`` BEFORE constructing the
+    # ``RunRequest``. Consumed by ``CoreRuntimeExecutor.execute``
+    # (``executor.py``), which forwards it to
+    # ``ContextManager.build_messages(memory_context=...)`` so the
+    # ``[RETRIEVED MEMORY]`` block lands in the assembled system
+    # prompt.
+    #
+    # ``None`` is the DEFAULT and the fast path: it means memory is
+    # DISABLED, the NO_NEED route fired, or retrieval degraded to
+    # empty. A ``None`` value produces a prompt bit-for-bit
+    # identical to the pre-P1.5 no-memory case.
+    #
+    # ``exclude=True`` -- ``MemoryContext`` is TRANSIENT. It lives
+    # only inside the live Python object. It MUST NOT be serialized
+    # into ``ExecutionState``, checkpoints, sidecars, or any
+    # ``model_dump()`` caller. The memory block is rebuilt fresh on
+    # every turn from a fresh retrieval; there is no
+    # "resume-from-old-context" path. See
+    # ``peldrun.memory.domain.context``'s module docstring for the
+    # full transience contract.
+    memory_context: Optional[MemoryContext] = Field(
+        default=None,
+        exclude=True,
+        description=(
+            "Retrieved memory context for this turn. None means "
+            "memory is disabled, the NO_NEED route fired, or "
+            "retrieval degraded to empty. Forwarded by the executor "
+            "to ContextManager.build_messages(); NEVER persisted."
+        ),
+    )
     step_timeout_seconds: Optional[float] = Field(default=120.0, description="Per-step execution deadline")
     total_timeout_seconds: Optional[float] = Field(default=None, description="Global execution deadline ceiling")
 

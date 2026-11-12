@@ -87,6 +87,42 @@ class LLMInvocationRecord(BaseModel):
     parent_run_id: Optional[str] = Field(default=None, description="Parent run ID if this invocation was spawned by a sub-agent")
     root_run_id: Optional[str] = Field(default=None, description="Root run ID of the execution tree")
 
+    # Memory attribution (P1.9)
+    #
+    # Set ONLY on the invocation that actually carried the
+    # ``[RETRIEVED MEMORY]`` block in its prompt -- typically the
+    # FIRST LLM call of a turn. Subsequent invocations of the same
+    # run leave this ``None`` (memory is injected once per turn,
+    # not re-injected on every reasoning step).
+    #
+    # Stored in ``metadata_json`` under key
+    # ``"memory_tokens_used"`` (see ``_sync_record_invocation``)
+    # rather than as a dedicated column. Rationale:
+    #
+    #   * The value is nullable and sparse (only the first
+    #     invocation of a memory-bearing run carries it), so a
+    #     dedicated column would be NULL for the majority of rows
+    #     and would require a schema migration for a mostly-empty
+    #     slot.
+    #   * Per-run aggregates live in ``memory_usage_ledger``
+    #     (see ``omweb.memory.monitoring.memory_usage``). The
+    #     token ledger only needs the per-invocation correlation
+    #     via ``run_id``; the total is already captured elsewhere.
+    #   * Matches the pattern already used for
+    #     ``parent_run_id`` / ``root_run_id``: fields whose
+    #     presence is optional and per-invocation are metadata,
+    #     not columns.
+    memory_tokens_used: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Number of tokens occupied by the [RETRIEVED MEMORY] "
+            "block in this invocation's prompt. Set only on the "
+            "invocation that carried the memory block. "
+            "Correlatable with memory_usage_ledger via run_id."
+        ),
+    )
+
 
 def is_local_endpoint(provider: str, base_url: Optional[str] = None) -> bool:
     """
@@ -258,6 +294,11 @@ class SqliteUsageStore:
             meta_dict["parent_run_id"] = record.parent_run_id
         if record.root_run_id:
             meta_dict["root_run_id"] = record.root_run_id
+        # [P1.9] Memory attribution: persisted in metadata rather
+        # than as a dedicated column. See ``LLMInvocationRecord``
+        # docstring for the rationale on this choice.
+        if record.memory_tokens_used is not None:
+            meta_dict["memory_tokens_used"] = record.memory_tokens_used
         meta_str = json.dumps(meta_dict, ensure_ascii=False)
         with conn:
             cursor = conn.execute(
