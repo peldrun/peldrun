@@ -2,6 +2,8 @@
 import { initReactI18next } from "react-i18next";
 import en from "./locales/en.json";
 import ar from "./locales/ar.json";
+import enMemory from "./locales/en/memory.json";
+import arMemory from "./locales/ar/memory.json";
 
 function resolveInitialLocale(): string {
   if (typeof window !== "undefined") {
@@ -19,11 +21,13 @@ function resolveInitialLocale(): string {
 if (!i18n.isInitialized) {
   i18n.use(initReactI18next).init({
     resources: {
-      en: { translation: en },
-      ar: { translation: ar },
+      en: { translation: en, memory: enMemory },
+      ar: { translation: ar, memory: arMemory },
     },
     lng: resolveInitialLocale(),
     fallbackLng: "en",
+    defaultNS: "translation",
+    ns: ["translation", "memory"],
     interpolation: { escapeValue: false },
   });
 }

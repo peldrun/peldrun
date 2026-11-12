@@ -1,4 +1,5 @@
-﻿import type { Metadata, Viewport } from "next";
+﻿//frontend\src\app\layout.tsx
+import type { Metadata, Viewport } from "next";
 import { DM_Sans, Libre_Baskerville, Cairo } from "next/font/google";
 import { getServerStorageSnapshot } from "@/lib/storage/server";
 import { StorageProvider } from "@/components/providers/storage-provider";
@@ -9,6 +10,7 @@ import { I18nProvider } from "@/components/providers/i18n-provider";
 import { AppShell } from "@/components/layout/app-shell";
 import { AppDataBootstrap } from "@/components/providers/app-data-bootstrap";
 import { ToastContainer } from "@/components/ui/ToastNotification";
+import { QueryProvider } from "@/components/providers/query-provider";
 import Script from "next/script";
 
 import "@/app/globals.css";
@@ -99,6 +101,7 @@ export default async function RootLayout({
         className="min-h-screen bg-background text-foreground font-sans antialiased selection:bg-peldrun-accent selection:text-white"
       >
         <StorageProvider cookieSnapshot={cookieSnapshot}>
+          <QueryProvider>
           <ThemeProvider
             defaultTheme={theme}
             enableSystem
@@ -148,6 +151,7 @@ export default async function RootLayout({
             <ToastContainer />
 
           </ThemeProvider>
+          </QueryProvider>
         </StorageProvider>
       </body>
     </html>

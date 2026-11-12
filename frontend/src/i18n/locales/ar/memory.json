@@ -1,0 +1,576 @@
+{
+  "nav": {
+    "title": "الذاكرة",
+    "dashboard": "نظرة عامة",
+    "browse": "استعراض",
+    "projects": "المشاريع",
+    "settings": "الإعدادات",
+    "import": "استيراد",
+    "export": "تصدير",
+    "usage": "الاستخدام"
+  },
+  "common": {
+    "save": "حفظ",
+    "saveChanges": "حفظ التغييرات",
+    "cancel": "إلغاء",
+    "delete": "حذف",
+    "edit": "تعديل",
+    "close": "إغلاق",
+    "confirm": "تأكيد",
+    "back": "رجوع",
+    "next": "التالي",
+    "done": "تم",
+    "apply": "تطبيق",
+    "reset": "إعادة ضبط",
+    "clear": "مسح",
+    "search": "بحث",
+    "filter": "تصفية",
+    "refresh": "تحديث",
+    "retry": "إعادة المحاولة",
+    "loading": "جارٍ التحميل...",
+    "saving": "جارٍ الحفظ...",
+    "saved": "تم الحفظ",
+    "loadingMore": "جارٍ تحميل المزيد...",
+    "loadMore": "تحميل المزيد",
+    "noMore": "لا مزيد من النتائج",
+    "noResults": "لا نتائج",
+    "empty": "فارغ",
+    "optional": "اختياري",
+    "required": "مطلوب",
+    "yes": "نعم",
+    "no": "لا",
+    "moreActions": "إجراءات إضافية",
+    "viewDetails": "عرض التفاصيل",
+    "copy": "نسخ",
+    "copied": "تم النسخ",
+    "typeToConfirm": "اكتب \"{{token}}\" للتأكيد"
+  },
+  "mode": {
+    "label": "الوضع",
+    "disabled": {
+      "name": "معطّل",
+      "badge": "معطّل",
+      "description": "الذاكرة معطّلة. لا يتم تخزين أو استرجاع أي شيء."
+    },
+    "read_only": {
+      "name": "قراءة فقط",
+      "badge": "قراءة فقط",
+      "description": "يمكن قراءة الذاكرة واسترجاعها، لكن لا يمكن تعديلها."
+    },
+    "read_write": {
+      "name": "قراءة وكتابة",
+      "badge": "قراءة وكتابة",
+      "description": "وصول كامل: قراءة، استرجاع، وتعديل الذكريات."
+    },
+    "enable": "تفعيل الذاكرة",
+    "switchToReadWrite": "التبديل إلى قراءة وكتابة"
+  },
+  "scope": {
+    "user": "شخصية",
+    "project": "مشروع",
+    "chat": "محادثة",
+    "agent": "وكيل",
+    "userDefault": "شخصية (جميع المشاريع)",
+    "scopeType": "نوع النطاق",
+    "scopeId": "معرّف النطاق",
+    "selectScope": "اختر النطاق",
+    "current": "النطاق الحالي"
+  },
+  "type": {
+    "semantic": "حقيقة",
+    "episodic": "حدث",
+    "procedural": "إجراء",
+    "preference": "تفضيل",
+    "decision": "قرار",
+    "label": "النوع"
+  },
+  "status": {
+    "active": "نشطة",
+    "archived": "مؤرشفة",
+    "superseded": "مُستبدلة",
+    "all": "الكل",
+    "label": "الحالة"
+  },
+  "sourceType": {
+    "explicit_user": "محفوظة بواسطتك",
+    "agent_tool": "أداة الوكيل",
+    "extraction": "مُستخرجة تلقائياً",
+    "import": "مُستوردة",
+    "label": "المصدر"
+  },
+  "dashboard": {
+    "title": "نظرة عامة على الذاكرة",
+    "subtitle": "معرفة دائمة متاحة للوكلاء",
+    "kpis": {
+      "runs": "التشغيلات ({{period}})",
+      "tokens": "الرموز المستخدمة ({{period}})",
+      "budgetUtil": "الميزانية المستهلكة",
+      "dropRate": "نسبة الاستبعاد"
+    },
+    "recentActivity": "النشاط الأخير",
+    "recentActivityEmpty": "لا نشاط حديث",
+    "quickActions": "إجراءات سريعة",
+    "quickActionsHint": {
+      "newMemory": "حفظ ذكرى جديدة",
+      "import": "الاستعادة من حزمة",
+      "export": "تنزيل نسخة احتياطية",
+      "usage": "عرض الاستخدام والميزانية"
+    }
+  },
+  "settings": {
+    "title": "إعدادات الذاكرة",
+    "description": "اضبط كيفية تخزين PELDRUN للذاكرة واسترجاعها.",
+    "sections": {
+      "mode": "الوضع",
+      "provider": "الخادم الخلفي للتخزين",
+      "retrieval": "ضبط الاسترجاع",
+      "tokenBudget": "ميزانية الرموز",
+      "autoExtraction": "الاستخراج التلقائي",
+      "projectOverrides": "تخصيصات المشاريع"
+    },
+    "fields": {
+      "provider": "المزوّد",
+      "defaultLimit": "الحد الافتراضي",
+      "minRelevance": "الحد الأدنى للصلة",
+      "boostPinned": "معامل تعزيز المثبتة",
+      "maxTokens": "الحد الأقصى للرموز",
+      "reservedForUserScope": "المحجوز للنطاق الشخصي",
+      "warnThreshold": "عتبة التحذير",
+      "autoExtractionEnabled": "تمكين الاستخراج التلقائي",
+      "autoExtractionMinTurns": "الحد الأدنى للجولات قبل الاستخراج"
+    },
+    "help": {
+      "defaultLimit": "عدد الذكريات التي ينظر فيها الاسترجاع في كل جولة.",
+      "minRelevance": "الذكريات الأقل من هذه الصلة تُستبعد قبل الترتيب.",
+      "boostPinned": "معامل يُطبّق على نتيجة الذكريات المثبتة.",
+      "maxTokens": "حد أقصى للرموز المستهلكة في الذاكرة لكل رسالة.",
+      "reservedForUserScope": "رموز تُحجز لذكرياتك الشخصية. يجب أن تكون ≤ الحد الأقصى.",
+      "warnThreshold": "إظهار تحذير عند تجاوز هذه النسبة من الميزانية.",
+      "autoExtractionMinTurns": "يُتخطى الاستخراج للمحادثات الأقصر من هذا."
+    },
+    "modeWarningDisabled": "تعطيل الذاكرة يوقف الاسترجاع ويمنع كل الكتابات. صفحة الإعدادات تبقى متاحة.",
+    "noChanges": "لا تغييرات لحفظها",
+    "savedToast": "تم حفظ الإعدادات",
+    "projectOverridesEmpty": "لا يوجد مشروع بإعدادات مخصصة بعد.",
+    "projectOverrideNote": "إعدادات هذا المشروع مخصصة وقد تختلف عن الإعدادات العامة.",
+    "addProjectOverride": "إضافة تخصيص للمشروع",
+    "removeProjectOverride": "إزالة التخصيص",
+    "removeOverrideConfirm": "هل تريد إزالة الإعدادات المخصصة لهذا المشروع والعودة إلى الإعدادات العامة؟"
+  },
+  "browse": {
+    "title": "استعراض الذاكرة",
+    "empty": {
+      "title": "لا ذكريات بعد",
+      "description": "الذكريات المحفوظة بواسطة الوكلاء أو بواسطتك ستظهر هنا.",
+      "action": "ذكرى جديدة"
+    },
+    "filters": {
+      "title": "التصفية",
+      "status": "الحالة",
+      "type": "النوع",
+      "pinned": "المثبتة فقط",
+      "clearAll": "مسح كل عوامل التصفية",
+      "importanceMin": "الأدنى"
+    },
+    "results": {
+      "count_zero": "لا ذكريات",
+      "count_one": "ذكرى واحدة",
+      "count_two": "ذكرتان",
+      "count_few": "{{count}} ذكريات",
+      "count_many": "{{count}} ذكرى",
+      "count_other": "{{count}} ذكرى"
+    },
+    "scopeSidebar": {
+      "title": "النطاقات",
+      "personal": "شخصية",
+      "projects": "المشاريع",
+      "chats": "المحادثات",
+      "agents": "الوكلاء"
+    }
+  },
+  "entry": {
+    "fields": {
+      "content": "المحتوى",
+      "importance": "الأهمية",
+      "tags": "الوسوم",
+      "pinned": "مثبتة",
+      "status": "الحالة",
+      "type": "النوع",
+      "scope": "النطاق",
+      "confidence": "الثقة",
+      "createdAt": "أُنشئت",
+      "updatedAt": "آخر تحديث",
+      "lastUsedAt": "آخر استخدام",
+      "expiresAt": "تنتهي في",
+      "provenance": "المصدر"
+    },
+    "importanceLevels": {
+      "low": "منخفضة",
+      "medium": "قياسية",
+      "high": "مرتفعة"
+    },
+    "placeholders": {
+      "content": "اكتب الذكرى...",
+      "tags": "إضافة وسوم...",
+      "tagInput": "اكتب الوسم واضغط Enter"
+    },
+    "actions": {
+      "pin": "تثبيت",
+      "unpin": "إلغاء التثبيت",
+      "promote": "حفظ في الذاكرة الشخصية",
+      "archive": "أرشفة",
+      "delete": "حذف",
+      "edit": "تعديل",
+      "viewAsModelSees": "عرض كما يراها النموذج",
+      "addTag": "إضافة وسم",
+      "removeTag": "إزالة وسم"
+    },
+    "detail": {
+      "title": "تفاصيل الذكرى",
+      "notFound": "لم يتم العثور على هذه الذكرى.",
+      "backToList": "العودة إلى الاستعراض"
+    },
+    "drafts": {
+      "createTitle": "ذكرى جديدة",
+      "editTitle": "تعديل الذكرى",
+      "unsavedChanges": "لديك تغييرات غير محفوظة. هل تريد المغادرة؟"
+    },
+    "delete": {
+      "softTitle": "أرشفة هذه الذكرى؟",
+      "softDescription": "ستُخفى الذكرى من الاسترجاع لكنها ستبقى محفوظة. يمكنك استعادتها لاحقاً.",
+      "hardTitle": "حذف نهائي؟",
+      "hardDescription": "لا يمكن التراجع عن هذا. ستُزال الذكرى من التخزين والبحث.",
+      "hardConfirmLabel": "اكتب DELETE للتأكيد",
+      "hardConfirmPlaceholder": "DELETE",
+      "successSoft": "تمت أرشفة الذكرى",
+      "successHard": "تم حذف الذكرى نهائياً"
+    },
+    "promote": {
+      "title": "حفظ في الذاكرة الشخصية؟",
+      "description": "سيتم نسخ الذكرى إلى نطاقك الشخصي. الأصل يبقى في مكانه.",
+      "sourceLabel": "من",
+      "targetLabel": "إلى",
+      "success": "تم النسخ إلى الذاكرة الشخصية"
+    },
+    "pin": {
+      "success": "تم تثبيت الذكرى",
+      "successUnpin": "تم إلغاء تثبيت الذكرى"
+    },
+    "similar": {
+      "title": "ذكريات مشابهة",
+      "empty": "لا ذكريات مشابهة.",
+      "checking": "جارٍ الفحص...",
+      "budgetDropped_zero": "لا ذكريات مستبعدة للحجم",
+      "budgetDropped_one": "ذكرى واحدة مستبعدة للحجم",
+      "budgetDropped_two": "ذكرتان مستبعدتان للحجم",
+      "budgetDropped_few": "{{count}} ذكريات مستبعدة للحجم",
+      "budgetDropped_many": "{{count}} ذكرى مستبعدة للحجم",
+      "budgetDropped_other": "{{count}} ذكرى مستبعدة للحجم"
+    }
+  },
+  "projects": {
+    "title": "المشاريع التي لديها ذاكرة",
+    "empty": {
+      "title": "لا مشاريع لديها ذاكرة",
+      "description": "تظهر المشاريع هنا بعد أن تحتوي على ذكرى واحدة على الأقل."
+    },
+    "columns": {
+      "name": "المشروع",
+      "total": "الإجمالي",
+      "active": "نشطة",
+      "archived": "مؤرشفة",
+      "superseded": "مُستبدلة",
+      "lastUpdated": "آخر تحديث"
+    },
+    "detail": {
+      "title": "المشروع: {{id}}",
+      "stats": "الإحصاءات",
+      "importanceRange": "نطاق الأهمية",
+      "topTags": "أكثر الوسوم",
+      "typeDistribution": "توزيع الأنواع",
+      "emptyStats": "لا إحصاءات متاحة."
+    },
+    "bulk": {
+      "archiveButton": "أرشفة كل الذكريات",
+      "archiveTitle": "أرشفة كل ذكرى نشطة؟",
+      "archiveDescription": "ستُعلَّم كل الذكريات النشطة في هذا المشروع كمؤرشفة. هذا قابل للتراجع.",
+      "archiveSuccess_one": "تمت أرشفة ذكرى واحدة",
+      "archiveSuccess_other": "تمت أرشفة {{count}} ذكريات",
+      "purgeButton": "حذف كل الذكريات نهائياً",
+      "purgeTitle": "حذف كل الذكريات نهائياً؟",
+      "purgeDescription": "لا يمكن التراجع عن هذا. ستُزال كل ذكرى في هذا المشروع.",
+      "purgeConfirmLabel": "اكتب اسم المشروع للتأكيد",
+      "purgeConfirmPlaceholder": "{{projectId}}",
+      "purgeSuccess_one": "تم حذف ذكرى واحدة نهائياً",
+      "purgeSuccess_other": "تم حذف {{count}} ذكريات نهائياً"
+    }
+  },
+  "import": {
+    "title": "استيراد الذكريات",
+    "description": "استعادة الذكريات من نسخة احتياطية أو الترحيل من نظام آخر.",
+    "steps": {
+      "select": "رفع",
+      "preview": "معاينة",
+      "result": "النتيجة"
+    },
+    "upload": {
+      "dropzone": "اسحب ملفاً هنا أو انقر للاختيار",
+      "acceptedFormats": "يقبل {{formats}}",
+      "sizeLimit": "الحد الأقصى للحجم: {{size}}",
+      "scopeLabel": "الاستيراد إلى",
+      "adapterLabel": "الصيغة",
+      "adapterAuto": "كشف تلقائي",
+      "selectFile": "اختر ملفاً",
+      "fileSelected": "المحدد: {{name}}",
+      "tooLarge": "حجم الملف {{actual}} لكن الحد {{limit}}.",
+      "wrongType": "نوع الملف غير مدعوم. يقبل: {{formats}}.",
+      "emptyFile": "الملف المحدد فارغ."
+    },
+    "preview": {
+      "title": "معاينة الاستيراد",
+      "summary": "سيُنشئ {{create}} ذكرى، ويتخطى {{skip}} مكررة.",
+      "warnings": "التحذيرات ({{count}})",
+      "candidates": "المرشحات",
+      "confirm": "تأكيد الاستيراد",
+      "noCandidates": "لا ذكريات قابلة للاستيراد في هذا الملف.",
+      "back": "اختر ملفاً آخر"
+    },
+    "result": {
+      "title": "اكتمل الاستيراد",
+      "summary": "تم الإنشاء: {{created}}، المتخطاة: {{skipped}}، الأخطاء: {{errors}}.",
+      "errors": "الأخطاء ({{count}})",
+      "viewProject": "عرض المشروع",
+      "importAnother": "استيراد آخر"
+    }
+  },
+  "export": {
+    "title": "تصدير الذكريات",
+    "description": "نزّل حزمة قابلة للنقل تحتوي على ذكريات النطاق المحدد.",
+    "fields": {
+      "scope": "النطاق",
+      "format": "الصيغة",
+      "status": "تضمين",
+      "limit": "الحد الأقصى للذكريات"
+    },
+    "formats": {
+      "zip": "أرشيف مضغوط (.zip)",
+      "json": "ملف JSON (.json)"
+    },
+    "statusOptions": {
+      "active": "النشطة فقط",
+      "all": "الكل (بما فيها المؤرشفة والمُستبدلة)"
+    },
+    "actions": {
+      "download": "تنزيل",
+      "inspect": "معاينة أولاً"
+    },
+    "downloadSuccess": "تم تنزيل {{filename}} ({{count}} ذكرى، {{size}})",
+    "truncated": "تم تقييد التصدير عند {{limit}} ذكرى ({{total}} مطابقة). ضيّق النطاق أو صفّي الحالة لتنزيل البقية.",
+    "inspectPanel": {
+      "title": "معاينة الحزمة",
+      "manifest": "البيان",
+      "entryCount_one": "ذكرى واحدة",
+      "entryCount_other": "{{count}} ذكريات",
+      "firstN": "يُعرض أول {{shown}} من {{total}}"
+    }
+  },
+  "usage": {
+    "title": "لوحة الاستخدام",
+    "description": "استهلاك الرموز واستغلال الميزانية خلال الفترة المحددة.",
+    "period": {
+      "label": "الفترة",
+      "day": "آخر 24 ساعة",
+      "week": "آخر 7 أيام",
+      "month": "آخر 30 يوماً",
+      "all": "كل الأوقات"
+    },
+    "kpis": {
+      "runs": "التشغيلات",
+      "totalTokens": "إجمالي الرموز",
+      "budgetUtil": "الميزانية المستهلكة",
+      "dropRate": "نسبة الاستبعاد",
+      "entriesRetrieved": "المسترجَعة",
+      "entriesUsed": "المستخدمة",
+      "entriesDropped": "المستبعدة"
+    },
+    "breakdown": {
+      "title": "التوزيع حسب {{dimension}}",
+      "dimensions": {
+        "scope": "النطاق",
+        "project": "المشروع",
+        "chat": "المحادثة"
+      }
+    },
+    "timeseries": {
+      "title": "الرموز عبر الوقت",
+      "granularity": {
+        "day": "يومي",
+        "week": "أسبوعي",
+        "month": "شهري"
+      }
+    },
+    "empty": "لا استخدام مسجّل في هذه الفترة.",
+    "budgetWarning": "استغلال الميزانية مرتفع ({{pct}}%). فكّر في رفع ميزانية الرموز أو تضييق النطاقات."
+  },
+  "errors": {
+    "generic": "حدث خطأ ما. أعد المحاولة، أو تواصل مع الدعم إذا استمرت المشكلة.",
+    "withSettings": "الانتقال إلى الإعدادات",
+    "mode_disabled": "الذاكرة معطّلة. فعّلها لتنفيذ هذا الإجراء.",
+    "mode_read_only": "الذاكرة للقراءة فقط. بدّل إلى قراءة وكتابة للتعديل.",
+    "not_found": "لم يتم العثور على العنصر. ربما حُذف.",
+    "MemoryNotFoundError": "لم يتم العثور على العنصر. ربما حُذف.",
+    "scope_required": "حدث خطأ داخلي: نطاق مفقود. يرجى الإبلاغ عن هذا.",
+    "missing_scope_type": "نوع النطاق مفقود.",
+    "missing_scope_id": "معرّف النطاق مفقود.",
+    "invalid_scope_type": "نوع النطاق غير معروف.",
+    "invalid_scope_ref": "مرجع النطاق غير صالح.",
+    "incomplete_scope": "يجب تحديد نوع النطاق ومعرّفه معاً.",
+    "cannot_resolve_scope": "تعذّر تحديد النطاق لهذا الإجراء.",
+    "multiple_scopes_ambiguous": "الطلب يحدد عدة نطاقات. هذا خطأ برمجي.",
+    "no_scopes": "لم يتم تحديد أي نطاق لهذه العملية.",
+    "invalid_target_scope_type": "نوع النطاق الهدف غير صالح.",
+    "invalid_target_scope_id": "معرّف النطاق الهدف غير صالح.",
+    "unsupported_target_scope": "الترقية إلى النطاق الشخصي فقط مدعومة.",
+    "user_scope_requires_explicit": "الذكريات الشخصية يمكن حفظها بواسطتك فقط، لا بواسطة الوكلاء أو الاستيراد.",
+    "forbidden_source_type": "نوع المصدر هذا غير مسموح في هذا المسار. استخدم صفحة الاستيراد.",
+    "invalid_memory_type": "نوع الذكرى غير معروف.",
+    "invalid_status": "عامل تصفية الحالة غير معروف.",
+    "invalid_project_id": "معرّف المشروع غير صالح.",
+    "duplicate": "توجد ذكرى بهذا المحتوى في هذا النطاق بالفعل.",
+    "confirmation_required": "هذه العملية تتطلب تأكيداً صريحاً.",
+    "missing_file": "يرجى اختيار ملف لرفعه.",
+    "file_too_large": "الملف المرفوع يتجاوز حد الحجم.",
+    "missing_source": "لم يتضمن الطلب مصدراً.",
+    "invalid_body": "جسم الطلب غير صالح.",
+    "invalid_encoding": "الملف ليس بترميز UTF-8 صالح.",
+    "invalid_json": "الملف ليس JSON صالحاً.",
+    "invalid_json_shape": "ملف JSON يجب أن يحتوي على كائن.",
+    "unsupported_content_type": "صيغة الرفع غير مدعومة.",
+    "invalid_format": "صيغة التصدير غير معروفة.",
+    "invalid_limit": "قيمة الحد غير صالحة.",
+    "invalid_period": "قيمة الفترة غير معروفة.",
+    "invalid_by": "بُعد التوزيع غير معروف.",
+    "invalid_granularity": "قيمة الدقة الزمنية غير معروفة.",
+    "invalid_settings": "الإعدادات غير صالحة. تحقق من الحقول المميزة.",
+    "empty_update": "لا تغييرات لحفظها.",
+    "empty_override": "لا تغييرات لحفظها.",
+    "nested_overrides": "تخصيصات المشاريع لا يمكن أن تحتوي على تخصيصات متداخلة.",
+    "service_not_initialized": "خدمة الذاكرة لم تبدأ. أعد المحاولة بعد لحظة.",
+    "request_validation": "بعض الحقول غير صالحة. راجع مدخلاتك.",
+    "MemoryValidationError": "الذكرى غير صالحة. تحقق من الحقول المميزة.",
+    "MemoryUnavailableError": "خدمة الذاكرة غير متاحة مؤقتاً. أعد المحاولة قريباً.",
+    "InternalError": "واجهت خدمة الذاكرة خطأً داخلياً.",
+    "NetworkError": "تعذّر الوصول إلى الخادم. تحقق من اتصالك وأعد المحاولة.",
+    "UnknownError": "حدث خطأ غير متوقع.",
+    "ClientError": "تعذّر إكمال الطلب."
+  },
+  "validation": {
+    "required": "هذا الحقل مطلوب.",
+    "tooShort": "يجب أن يكون على الأقل {{min}} حرفاً.",
+    "tooLong": "يجب أن يكون على الأكثر {{max}} حرفاً.",
+    "numberMin": "يجب أن يكون على الأقل {{min}}.",
+    "numberMax": "يجب أن يكون على الأكثر {{max}}.",
+    "notInteger": "يجب أن يكون عدداً صحيحاً.",
+    "invalidType": "نوع القيمة غير صالح.",
+    "invalidMemoryType": "اختر نوع ذكرى صالحاً.",
+    "invalidScopeType": "اختر نوع نطاق صالحاً.",
+    "invalidMode": "اختر وضعاً صالحاً.",
+    "invalidFormat": "اختر صيغة صالحة.",
+    "invalidStatus": "اختر حالة صالحة.",
+    "invalidAdapterId": "اختر محولاً صالحاً.",
+    "tagsTooMany": "لا يمكن تجاوز {{max}} وسماً.",
+    "tagTooLong": "كل وسم يجب أن يكون على الأكثر {{max}} حرفاً.",
+    "tagEmpty": "الوسوم لا يمكن أن تكون فارغة.",
+    "tagDuplicate": "هذا الوسم مضاف بالفعل.",
+    "reservedExceedsMax": "الرموز المحجوزة لا يمكن أن تتجاوز الحد الأقصى.",
+    "contentRequired": "المحتوى مطلوب.",
+    "noFieldsToUpdate": "غيّر حقلاً واحداً على الأقل قبل الحفظ.",
+    "projectIdRequired": "معرّف المشروع مطلوب.",
+    "scopeRequired": "النطاق مطلوب.",
+    "sourceRequired": "وفّر مصدراً للاستيراد.",
+    "fileRequired": "اختر ملفاً للاستيراد."
+  },
+  "dates": {
+    "justNow": "الآن",
+    "minutesAgo_one": "منذ دقيقة",
+    "minutesAgo_two": "منذ دقيقتين",
+    "minutesAgo_few": "منذ {{count}} دقائق",
+    "minutesAgo_many": "منذ {{count}} دقيقة",
+    "minutesAgo_other": "منذ {{count}} دقيقة",
+    "hoursAgo_one": "منذ ساعة",
+    "hoursAgo_two": "منذ ساعتين",
+    "hoursAgo_few": "منذ {{count}} ساعات",
+    "hoursAgo_many": "منذ {{count}} ساعة",
+    "hoursAgo_other": "منذ {{count}} ساعة",
+    "daysAgo_one": "منذ يوم",
+    "daysAgo_two": "منذ يومين",
+    "daysAgo_few": "منذ {{count}} أيام",
+    "daysAgo_many": "منذ {{count}} يوماً",
+    "daysAgo_other": "منذ {{count}} يوم",
+    "weeksAgo_one": "منذ أسبوع",
+    "weeksAgo_two": "منذ أسبوعين",
+    "weeksAgo_few": "منذ {{count}} أسابيع",
+    "weeksAgo_many": "منذ {{count}} أسبوعاً",
+    "weeksAgo_other": "منذ {{count}} أسبوع",
+    "monthsAgo_one": "منذ شهر",
+    "monthsAgo_two": "منذ شهرين",
+    "monthsAgo_few": "منذ {{count}} أشهر",
+    "monthsAgo_many": "منذ {{count}} شهراً",
+    "monthsAgo_other": "منذ {{count}} شهر",
+    "yearsAgo_one": "منذ سنة",
+    "yearsAgo_two": "منذ سنتين",
+    "yearsAgo_few": "منذ {{count}} سنوات",
+    "yearsAgo_many": "منذ {{count}} سنة",
+    "yearsAgo_other": "منذ {{count}} سنة",
+    "never": "أبداً"
+  },
+  "format": {
+    "tokens_zero": "لا رموز",
+    "tokens_one": "رمز واحد",
+    "tokens_two": "رمزان",
+    "tokens_few": "{{count}} رموز",
+    "tokens_many": "{{count}} رمزاً",
+    "tokens_other": "{{count}} رمز",
+    "tokensK": "{{value}} ألف رمز",
+    "tokensM": "{{value}} مليون رمز",
+    "entries_zero": "لا ذكريات",
+    "entries_one": "ذكرى واحدة",
+    "entries_two": "ذكرتان",
+    "entries_few": "{{count}} ذكريات",
+    "entries_many": "{{count}} ذكرى",
+    "entries_other": "{{count}} ذكرى",
+    "percent": "{{value}}٪",
+    "bytes_one": "بايت واحد",
+    "bytes_two": "بايتان",
+    "bytes_few": "{{count}} بايتات",
+    "bytes_many": "{{count}} بايت",
+    "bytes_other": "{{count}} بايت",
+    "kilobytes": "{{value}} كيلوبايت",
+    "megabytes": "{{value}} ميجابايت"
+  },
+  "a11y": {
+    "loadingSpinner": "جارٍ التحميل",
+    "closeDialog": "إغلاق الحوار",
+    "expandRow": "توسيع الصف",
+    "collapseRow": "طي الصف",
+    "sortColumn": "ترتيب حسب {{column}}",
+    "scopeBadge": "النطاق: {{scope}}",
+    "scopeBadgeWithId": "النطاق: {{scope}} {{id}}",
+    "importanceDot": "الأهمية: {{value}}، {{tier}}",
+    "typeBadge": "النوع: {{type}}",
+    "statusBadge": "الحالة: {{status}}",
+    "pinnedIndicator": "مثبتة",
+    "notPinnedIndicator": "غير مثبتة",
+    "importanceSlider": "الأهمية {{value}} من 100",
+    "mainNavigation": "تنقل الذاكرة",
+    "pagination": "التنقل بين الصفحات",
+    "filtersPanel": "عوامل التصفية",
+    "resultsList": "النتائج",
+    "candidateList": "مرشحات الاستيراد",
+    "chart": "مخطط الاستخدام",
+    "budgetBar": "استغلال الميزانية: {{pct}} بالمئة",
+    "selectAllOnPage": "تحديد الكل",
+    "selectEntry": "تحديد الذكرى",
+    "selectedCount": "محدد"
+  }
+}

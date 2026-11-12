@@ -700,8 +700,14 @@ app.include_router(
     prefix="/api/memory",
     tags=["memory"],
 )
+# NOTE: ``memory_crud`` (imported as ``from omweb.memory.api.memory_crud
+# import router as memory_crud``) IS the APIRouter instance -- the
+# ``as memory_crud`` alias bound the router object itself, not the
+# module. Calling ``memory_crud.router`` would try to access an
+# attribute named ``router`` on the APIRouter, which does not exist.
+# Pass ``memory_crud`` directly.
 app.include_router(
-    memory_crud.router,
+    memory_crud,
     prefix="/api/memory",
     tags=["memory", "crud"],
 )

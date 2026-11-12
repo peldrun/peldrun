@@ -1,0 +1,536 @@
+{
+  "nav": {
+    "title": "Memory",
+    "dashboard": "Overview",
+    "browse": "Browse",
+    "projects": "Projects",
+    "settings": "Settings",
+    "import": "Import",
+    "export": "Export",
+    "usage": "Usage"
+  },
+  "common": {
+    "save": "Save",
+    "saveChanges": "Save changes",
+    "cancel": "Cancel",
+    "delete": "Delete",
+    "edit": "Edit",
+    "close": "Close",
+    "confirm": "Confirm",
+    "back": "Back",
+    "next": "Next",
+    "done": "Done",
+    "apply": "Apply",
+    "reset": "Reset",
+    "clear": "Clear",
+    "search": "Search",
+    "filter": "Filter",
+    "refresh": "Refresh",
+    "retry": "Try again",
+    "loading": "Loading...",
+    "saving": "Saving...",
+    "saved": "Saved",
+    "loadingMore": "Loading more...",
+    "loadMore": "Load more",
+    "noMore": "No more results",
+    "noResults": "No results",
+    "empty": "Empty",
+    "optional": "optional",
+    "required": "required",
+    "yes": "Yes",
+    "no": "No",
+    "moreActions": "More actions",
+    "viewDetails": "View details",
+    "copy": "Copy",
+    "copied": "Copied",
+    "typeToConfirm": "Type \"{{token}}\" to confirm"
+  },
+  "mode": {
+    "label": "Mode",
+    "disabled": {
+      "name": "Disabled",
+      "badge": "Disabled",
+      "description": "Memory is off. Nothing is stored or retrieved."
+    },
+    "read_only": {
+      "name": "Read-only",
+      "badge": "Read-only",
+      "description": "Memory can be read and retrieved, but cannot be modified."
+    },
+    "read_write": {
+      "name": "Read & write",
+      "badge": "Read & write",
+      "description": "Full access: read, retrieve, and modify memories."
+    },
+    "enable": "Enable memory",
+    "switchToReadWrite": "Switch to read & write"
+  },
+  "scope": {
+    "user": "Personal",
+    "project": "Project",
+    "chat": "Chat",
+    "agent": "Agent",
+    "userDefault": "Personal (all projects)",
+    "scopeType": "Scope type",
+    "scopeId": "Scope identifier",
+    "selectScope": "Select scope",
+    "current": "Current scope"
+  },
+  "type": {
+    "semantic": "Fact",
+    "episodic": "Event",
+    "procedural": "Procedure",
+    "preference": "Preference",
+    "decision": "Decision",
+    "label": "Type"
+  },
+  "status": {
+    "active": "Active",
+    "archived": "Archived",
+    "superseded": "Superseded",
+    "all": "All",
+    "label": "Status"
+  },
+  "sourceType": {
+    "explicit_user": "Saved by you",
+    "agent_tool": "Agent tool",
+    "extraction": "Auto-extracted",
+    "import": "Imported",
+    "label": "Source"
+  },
+  "dashboard": {
+    "title": "Memory overview",
+    "subtitle": "Durable knowledge available to agents",
+    "kpis": {
+      "runs": "Runs ({{period}})",
+      "tokens": "Tokens used ({{period}})",
+      "budgetUtil": "Budget used",
+      "dropRate": "Drop rate"
+    },
+    "recentActivity": "Recent activity",
+    "recentActivityEmpty": "No recent activity",
+    "quickActions": "Quick actions",
+    "quickActionsHint": {
+      "newMemory": "Save a new memory entry",
+      "import": "Restore from a package",
+      "export": "Download a backup",
+      "usage": "See usage and budget"
+    }
+  },
+  "settings": {
+    "title": "Memory settings",
+    "description": "Configure how PELDRUN stores and retrieves memory.",
+    "sections": {
+      "mode": "Mode",
+      "provider": "Storage backend",
+      "retrieval": "Retrieval tuning",
+      "tokenBudget": "Token budget",
+      "autoExtraction": "Auto extraction",
+      "projectOverrides": "Project overrides"
+    },
+    "fields": {
+      "provider": "Provider",
+      "defaultLimit": "Default limit",
+      "minRelevance": "Minimum relevance",
+      "boostPinned": "Pinned boost",
+      "maxTokens": "Maximum tokens",
+      "reservedForUserScope": "Reserved for user scope",
+      "warnThreshold": "Warning threshold",
+      "autoExtractionEnabled": "Enable auto extraction",
+      "autoExtractionMinTurns": "Minimum turns before extraction"
+    },
+    "help": {
+      "defaultLimit": "How many entries the retrieval considers per turn.",
+      "minRelevance": "Entries below this relevance are dropped before ranking.",
+      "boostPinned": "Multiplier applied to pinned entries' score.",
+      "maxTokens": "Hard limit on tokens spent on memory per prompt.",
+      "reservedForUserScope": "Tokens set aside for your personal memories. Must be ≤ max tokens.",
+      "warnThreshold": "Show a warning when usage exceeds this fraction of the budget.",
+      "autoExtractionMinTurns": "Extraction is skipped for conversations shorter than this."
+    },
+    "modeWarningDisabled": "Disabling memory halts retrieval and stops all writes. The settings page remains accessible.",
+    "noChanges": "No changes to save",
+    "savedToast": "Settings saved",
+    "projectOverridesEmpty": "No projects have custom settings yet.",
+    "projectOverrideNote": "This project's settings are customized and may differ from global defaults.",
+    "addProjectOverride": "Add project override",
+    "removeProjectOverride": "Remove override",
+    "removeOverrideConfirm": "Remove the custom settings for this project and revert to global defaults?"
+  },
+  "browse": {
+    "title": "Browse memory",
+    "empty": {
+      "title": "No memories yet",
+      "description": "Memories saved by agents or by you will appear here.",
+      "action": "New memory"
+    },
+    "filters": {
+      "title": "Filters",
+      "status": "Status",
+      "type": "Type",
+      "pinned": "Pinned only",
+      "clearAll": "Clear all filters",
+      "importanceMin": "Min"
+    },
+    "results": {
+      "count_one": "{{count}} memory",
+      "count_other": "{{count}} memories"
+    },
+    "scopeSidebar": {
+      "title": "Scopes",
+      "personal": "Personal",
+      "projects": "Projects",
+      "chats": "Chats",
+      "agents": "Agents"
+    }
+  },
+  "entry": {
+    "fields": {
+      "content": "Content",
+      "importance": "Importance",
+      "tags": "Tags",
+      "pinned": "Pinned",
+      "status": "Status",
+      "type": "Type",
+      "scope": "Scope",
+      "confidence": "Confidence",
+      "createdAt": "Created",
+      "updatedAt": "Updated",
+      "lastUsedAt": "Last used",
+      "expiresAt": "Expires",
+      "provenance": "Source"
+    },
+    "importanceLevels": {
+      "low": "Low",
+      "medium": "Standard",
+      "high": "High"
+    },
+    "placeholders": {
+      "content": "Write the memory...",
+      "tags": "Add tags...",
+      "tagInput": "Type a tag and press Enter"
+    },
+    "actions": {
+      "pin": "Pin",
+      "unpin": "Unpin",
+      "promote": "Save to personal memory",
+      "archive": "Archive",
+      "delete": "Delete",
+      "edit": "Edit",
+      "viewAsModelSees": "View as model sees",
+      "addTag": "Add tag",
+      "removeTag": "Remove tag"
+    },
+    "detail": {
+      "title": "Memory detail",
+      "notFound": "This memory was not found.",
+      "backToList": "Back to browse"
+    },
+    "drafts": {
+      "createTitle": "New memory",
+      "editTitle": "Edit memory",
+      "unsavedChanges": "You have unsaved changes. Leave anyway?"
+    },
+    "delete": {
+      "softTitle": "Archive this memory?",
+      "softDescription": "The memory will be hidden from retrieval but kept. You can restore it later.",
+      "hardTitle": "Permanently delete?",
+      "hardDescription": "This cannot be undone. The memory will be removed from storage and search.",
+      "hardConfirmLabel": "Type DELETE to confirm",
+      "hardConfirmPlaceholder": "DELETE",
+      "successSoft": "Memory archived",
+      "successHard": "Memory permanently deleted"
+    },
+    "promote": {
+      "title": "Save to personal memory?",
+      "description": "This will COPY the memory into your personal scope. The original stays where it is.",
+      "sourceLabel": "From",
+      "targetLabel": "To",
+      "success": "Copied to personal memory"
+    },
+    "pin": {
+      "success": "Memory pinned",
+      "successUnpin": "Memory unpinned"
+    },
+    "similar": {
+      "title": "Similar memories",
+      "empty": "No similar memories found.",
+      "checking": "Checking...",
+      "budgetDropped_one": "{{count}} memory omitted for size",
+      "budgetDropped_other": "{{count}} memories omitted for size"
+    }
+  },
+  "projects": {
+    "title": "Projects with memory",
+    "empty": {
+      "title": "No projects with memory",
+      "description": "Projects appear here once they have at least one memory entry."
+    },
+    "columns": {
+      "name": "Project",
+      "total": "Total",
+      "active": "Active",
+      "archived": "Archived",
+      "superseded": "Superseded",
+      "lastUpdated": "Last updated"
+    },
+    "detail": {
+      "title": "Project: {{id}}",
+      "stats": "Statistics",
+      "importanceRange": "Importance range",
+      "topTags": "Top tags",
+      "typeDistribution": "Type distribution",
+      "emptyStats": "No statistics available."
+    },
+    "bulk": {
+      "archiveButton": "Archive all memories",
+      "archiveTitle": "Archive every active memory?",
+      "archiveDescription": "All active entries in this project will be marked as archived. This is reversible.",
+      "archiveSuccess": "Archived {{count}} memories",
+      "purgeButton": "Permanently delete all memories",
+      "purgeTitle": "Permanently delete all memories?",
+      "purgeDescription": "This CANNOT be undone. Every memory in this project will be removed.",
+      "purgeConfirmLabel": "Type the project name to confirm",
+      "purgeConfirmPlaceholder": "{{projectId}}",
+      "purgeSuccess": "Permanently deleted {{count}} memories"
+    }
+  },
+  "import": {
+    "title": "Import memories",
+    "description": "Restore memories from a backup or migrate from another system.",
+    "steps": {
+      "select": "Upload",
+      "preview": "Preview",
+      "result": "Result"
+    },
+    "upload": {
+      "dropzone": "Drag a file here, or click to select",
+      "acceptedFormats": "Accepts {{formats}}",
+      "sizeLimit": "Maximum size: {{size}}",
+      "scopeLabel": "Import into",
+      "adapterLabel": "Format",
+      "adapterAuto": "Auto-detect",
+      "selectFile": "Select file",
+      "fileSelected": "Selected: {{name}}",
+      "tooLarge": "File is {{actual}} but the limit is {{limit}}.",
+      "wrongType": "Unsupported file type. Accepts: {{formats}}.",
+      "emptyFile": "The selected file is empty."
+    },
+    "preview": {
+      "title": "Preview import",
+      "summary": "Will create {{create}} entries, skip {{skip}} duplicates.",
+      "warnings": "Warnings ({{count}})",
+      "candidates": "Candidates",
+      "confirm": "Confirm & import",
+      "noCandidates": "No importable entries found in this file.",
+      "back": "Choose a different file"
+    },
+    "result": {
+      "title": "Import complete",
+      "summary": "Created {{created}}, skipped {{skipped}}, errors {{errors}}.",
+      "errors": "Errors ({{count}})",
+      "viewProject": "View project",
+      "importAnother": "Import another"
+    }
+  },
+  "export": {
+    "title": "Export memories",
+    "description": "Download a portable package of the selected scope's memories.",
+    "fields": {
+      "scope": "Scope",
+      "format": "Format",
+      "status": "Include",
+      "limit": "Maximum entries"
+    },
+    "formats": {
+      "zip": "Zip archive (.zip)",
+      "json": "JSON file (.json)"
+    },
+    "statusOptions": {
+      "active": "Active only",
+      "all": "All (including archived and superseded)"
+    },
+    "actions": {
+      "download": "Download",
+      "inspect": "Inspect first"
+    },
+    "downloadSuccess": "Downloaded {{filename}} ({{count}} entries, {{size}})",
+    "truncated": "Export was capped at {{limit}} entries ({{total}} matched). Narrow the scope or status filter to fetch the rest.",
+    "inspectPanel": {
+      "title": "Package preview",
+      "manifest": "Manifest",
+      "entryCount_one": "{{count}} entry",
+      "entryCount_other": "{{count}} entries",
+      "firstN": "Showing first {{shown}} of {{total}}"
+    }
+  },
+  "usage": {
+    "title": "Usage dashboard",
+    "description": "Token consumption and budget utilization across the selected period.",
+    "period": {
+      "label": "Period",
+      "day": "Last 24 hours",
+      "week": "Last 7 days",
+      "month": "Last 30 days",
+      "all": "All time"
+    },
+    "kpis": {
+      "runs": "Runs",
+      "totalTokens": "Total tokens",
+      "budgetUtil": "Budget used",
+      "dropRate": "Drop rate",
+      "entriesRetrieved": "Retrieved",
+      "entriesUsed": "Used",
+      "entriesDropped": "Dropped"
+    },
+    "breakdown": {
+      "title": "Breakdown by {{dimension}}",
+      "dimensions": {
+        "scope": "Scope",
+        "project": "Project",
+        "chat": "Chat"
+      }
+    },
+    "timeseries": {
+      "title": "Tokens over time",
+      "granularity": {
+        "day": "Daily",
+        "week": "Weekly",
+        "month": "Monthly"
+      }
+    },
+    "empty": "No usage recorded in this period.",
+    "budgetWarning": "Budget utilization is high ({{pct}}%). Consider raising the token budget or narrowing scopes."
+  },
+  "errors": {
+    "generic": "Something went wrong. Try again, or contact support if the problem persists.",
+    "withSettings": "Go to settings",
+    "mode_disabled": "Memory is disabled. Enable it to perform this action.",
+    "mode_read_only": "Memory is read-only. Switch to read & write to modify.",
+    "not_found": "The item was not found. It may have been deleted.",
+    "MemoryNotFoundError": "The item was not found. It may have been deleted.",
+    "scope_required": "An internal error occurred: missing scope. Please report this.",
+    "missing_scope_type": "Missing scope type.",
+    "missing_scope_id": "Missing scope identifier.",
+    "invalid_scope_type": "Unknown scope type.",
+    "invalid_scope_ref": "Invalid scope reference.",
+    "incomplete_scope": "Both scope type and scope identifier are required.",
+    "cannot_resolve_scope": "Could not resolve the scope for this action.",
+    "multiple_scopes_ambiguous": "The request specifies multiple scopes. This is a bug.",
+    "no_scopes": "No scopes were resolved for this operation.",
+    "invalid_target_scope_type": "Invalid target scope type.",
+    "invalid_target_scope_id": "Invalid target scope identifier.",
+    "unsupported_target_scope": "Only promotion to personal scope is supported.",
+    "user_scope_requires_explicit": "Personal memories can only be saved by you, not by agents or imports.",
+    "forbidden_source_type": "This source type is not allowed on this endpoint. Use the import page instead.",
+    "invalid_memory_type": "Unknown memory type.",
+    "invalid_status": "Unknown status filter.",
+    "invalid_project_id": "Invalid project identifier.",
+    "duplicate": "A memory with this content already exists in this scope.",
+    "confirmation_required": "This operation requires explicit confirmation.",
+    "missing_file": "Please choose a file to upload.",
+    "file_too_large": "The uploaded file exceeds the size limit.",
+    "missing_source": "The request did not include a source.",
+    "invalid_body": "The request body is not valid.",
+    "invalid_encoding": "The file is not valid UTF-8.",
+    "invalid_json": "The file is not valid JSON.",
+    "invalid_json_shape": "The JSON file must contain an object.",
+    "unsupported_content_type": "The upload format is not supported.",
+    "invalid_format": "Unknown export format.",
+    "invalid_limit": "Invalid limit value.",
+    "invalid_period": "Unknown period value.",
+    "invalid_by": "Unknown breakdown dimension.",
+    "invalid_granularity": "Unknown granularity value.",
+    "invalid_settings": "The settings are not valid. Check the highlighted fields.",
+    "empty_update": "No changes to save.",
+    "empty_override": "No changes to save.",
+    "nested_overrides": "Project overrides cannot contain nested overrides.",
+    "service_not_initialized": "The memory service did not start. Try again in a moment.",
+    "request_validation": "Some fields are invalid. Review your inputs.",
+    "MemoryValidationError": "The memory is not valid. Check the highlighted fields.",
+    "MemoryUnavailableError": "The memory service is temporarily unavailable. Try again shortly.",
+    "InternalError": "The memory service encountered an internal error.",
+    "NetworkError": "Could not reach the server. Check your connection and try again.",
+    "UnknownError": "An unexpected error occurred.",
+    "ClientError": "The request could not be completed."
+  },
+  "validation": {
+    "required": "This field is required.",
+    "tooShort": "Must be at least {{min}} characters.",
+    "tooLong": "Must be at most {{max}} characters.",
+    "numberMin": "Must be at least {{min}}.",
+    "numberMax": "Must be at most {{max}}.",
+    "notInteger": "Must be a whole number.",
+    "invalidType": "Invalid value type.",
+    "invalidMemoryType": "Choose a valid memory type.",
+    "invalidScopeType": "Choose a valid scope type.",
+    "invalidMode": "Choose a valid mode.",
+    "invalidFormat": "Choose a valid format.",
+    "invalidStatus": "Choose a valid status.",
+    "invalidAdapterId": "Choose a valid adapter.",
+    "tagsTooMany": "Cannot exceed {{max}} tags.",
+    "tagTooLong": "Each tag must be at most {{max}} characters.",
+    "tagEmpty": "Tags cannot be empty.",
+    "tagDuplicate": "This tag is already added.",
+    "reservedExceedsMax": "Reserved tokens cannot exceed maximum tokens.",
+    "contentRequired": "Content is required.",
+    "noFieldsToUpdate": "Change at least one field before saving.",
+    "projectIdRequired": "Project identifier is required.",
+    "scopeRequired": "Scope is required.",
+    "sourceRequired": "Provide a source to import.",
+    "fileRequired": "Choose a file to import."
+  },
+  "dates": {
+    "justNow": "just now",
+    "minutesAgo_one": "{{count}} minute ago",
+    "minutesAgo_other": "{{count}} minutes ago",
+    "hoursAgo_one": "{{count}} hour ago",
+    "hoursAgo_other": "{{count}} hours ago",
+    "daysAgo_one": "{{count}} day ago",
+    "daysAgo_other": "{{count}} days ago",
+    "weeksAgo_one": "{{count}} week ago",
+    "weeksAgo_other": "{{count}} weeks ago",
+    "monthsAgo_one": "{{count}} month ago",
+    "monthsAgo_other": "{{count}} months ago",
+    "yearsAgo_one": "{{count}} year ago",
+    "yearsAgo_other": "{{count}} years ago",
+    "never": "Never"
+  },
+  "format": {
+    "tokens_one": "{{count}} token",
+    "tokens_other": "{{count}} tokens",
+    "tokensK": "{{value}}K tokens",
+    "tokensM": "{{value}}M tokens",
+    "entries_one": "{{count}} entry",
+    "entries_other": "{{count}} entries",
+    "percent": "{{value}}%",
+    "bytes_one": "{{count}} byte",
+    "bytes_other": "{{count}} bytes",
+    "kilobytes": "{{value}} KB",
+    "megabytes": "{{value}} MB"
+  },
+  "a11y": {
+    "loadingSpinner": "Loading",
+    "closeDialog": "Close dialog",
+    "expandRow": "Expand row",
+    "collapseRow": "Collapse row",
+    "sortColumn": "Sort by {{column}}",
+    "scopeBadge": "Scope: {{scope}}",
+    "scopeBadgeWithId": "Scope: {{scope}} {{id}}",
+    "importanceDot": "Importance: {{value}}, {{tier}}",    "typeBadge": "Type: {{type}}",
+    "statusBadge": "Status: {{status}}",
+    "pinnedIndicator": "Pinned",
+    "notPinnedIndicator": "Not pinned",
+    "importanceSlider": "Importance {{value}} of 100",
+    "mainNavigation": "Memory navigation",
+    "pagination": "Pagination",
+    "filtersPanel": "Filters",
+    "resultsList": "Results",
+    "candidateList": "Import candidates",
+    "chart": "Usage chart",
+    "budgetBar": "Budget utilization: {{pct}} percent",
+    "selectAllOnPage": "Select all",
+    "selectEntry": "Select entry",
+    "selectedCount": "selected"
+  }
+}
