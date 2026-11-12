@@ -23,6 +23,8 @@ import type { ToolPair } from "@/lib/types";
 import { showToast } from "@/components/ui/ToastNotification";
 import { resolveToolLabel, fetchToolManifest, ToolManifest } from "@/lib/tool-icon-registry";
 import { ToolIcon } from "@/app/stores/_components/ToolIcon";
+import { CodeBlock } from "@/components/chat/code-block";
+import { TerminalBlock } from "@/components/chat/terminal-block";
 
 function truncate(value: unknown, max = 80): string {
   if (typeof value !== "string") return "";
@@ -238,6 +240,37 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
   const [disabled, setDisabled] = useState(false);
   const [copied, setCopied] = useState(false);
   const [manifest, setManifest] = useState<ToolManifest | null>(null);
+
+  // [AUTO-EXPAND] Auto-open the card for executable tools so the
+  // code block (Python source or shell command) is immediately
+  // visible without requiring an extra click.
+  //
+  // Rationale:
+  //   * Python and shell commands are the PRIMARY payload of their
+  //     cards — hiding them behind a click adds friction that
+  //     `str_replace_editor` does not impose.
+  //   * The auto-expand runs ONCE on mount. If the user manually
+  //     collapses the card afterwards, we do NOT re-open it (the
+  //     user's choice wins).
+  //   * Non-executable tools (`terminate`, `http_fetch`, `ask_human`,
+  //     `str_replace_editor`) keep the historical collapsed-by-default
+  //     behavior. Only Python and shell commands are auto-expanded.
+  useEffect(() => {
+    const lower = (tool.tool || "").toLowerCase();
+    const isExecutable =
+      lower.includes("python") ||
+      lower === "bash" ||
+      lower === "shell" ||
+      lower === "shell_exec" ||
+      lower === "powershell" ||
+      lower === "pwsh" ||
+      lower === "cmd" ||
+      lower === "sh";
+    if (isExecutable) {
+      setIsOpen(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Only on mount — ignores tool.tool changes after mount.
   const [mcpIcon, setMcpIcon] = useState<{
     icon_svg?: string;
     icon_url?: string;
@@ -286,6 +319,35 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
 
   // [FIX] Extract the generated code directly from the arguments
   const fileContent = isEditor ? (parsedArgs.file_text || parsedArgs.new_str || parsedArgs.content) : null;
+
+  // [NEW] Detect Python and Shell tools to render dedicated blocks.
+  //
+  //   * python_execute sends its source in `code`.
+  //   * bash / shell_exec / powershell send their command in `command`.
+  //
+  // When either payload is present we render a dedicated, richer block
+  // (CodeBlock for Python, TerminalBlock for shells) INSTEAD of leaving
+  // the code buried inside the generic Parameters JSON.
+  const _toolLower = (tool.tool || "").toLowerCase();
+  const isPythonTool = _toolLower.includes("python");
+  const isShellTool =
+    _toolLower === "bash" ||
+    _toolLower === "shell" ||
+    _toolLower === "shell_exec" ||
+    _toolLower === "powershell" ||
+    _toolLower === "pwsh" ||
+    _toolLower === "cmd" ||
+    _toolLower === "sh";
+
+  const executableCode: string | null = isPythonTool
+    ? typeof parsedArgs.code === "string"
+      ? parsedArgs.code
+      : null
+    : isShellTool
+    ? typeof parsedArgs.command === "string"
+      ? parsedArgs.command
+      : null
+    : null;
 
   // [FIX] Handle output extraction or synthesis
   let outputText: string | null = null;
@@ -351,6 +413,17 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
   const displayArgs = { ...parsedArgs };
   if (displayArgs.file_text) displayArgs.file_text = "<...omitted to avoid duplication...>";
   if (displayArgs.new_str) displayArgs.new_str = "<...omitted to avoid duplication...>";
+  // [NEW] Also hide `code` / `command` when the payload is rendered
+  // in a dedicated block above, so the same source does not appear
+  // twice (once in the block, once in the raw JSON view).
+  if (executableCode) {
+    if (typeof displayArgs.code === "string") {
+      displayArgs.code = "<...omitted to avoid duplication...>";
+    }
+    if (typeof displayArgs.command === "string") {
+      displayArgs.command = "<...omitted to avoid duplication...>";
+    }
+  }
 
   useEffect(() => {
     if (!agentId) return;
@@ -527,6 +600,27 @@ export function ToolCallCard({ tool, agentId }: ToolCallCardProps) {
                 {fileContent}
               </pre>
             </div>
+          )}
+
+          {/* [NEW] Python code — rendered via the shared CodeBlock.
+              The component provides syntax highlighting, line numbers,
+              copy / download / sandbox actions, and collapse-for-long
+              behaviour identical to the editor block. */}
+          {isPythonTool && typeof executableCode === "string" && executableCode.length > 0 && (
+            <CodeBlock
+              code={executableCode}
+              language="python"
+              filename="script.py"
+            />
+          )}
+
+          {/* [NEW] Shell command — rendered via TerminalBlock, a
+              Windows-Terminal / PowerShell-inspired container.
+              The shell kind (PowerShell / cmd / bash) is auto-detected
+              from the command content so the label and theme match
+              what actually ran on the host. */}
+          {isShellTool && typeof executableCode === "string" && executableCode.length > 0 && (
+            <TerminalBlock command={executableCode} shell="auto" />
           )}
 
           {/* Parameters Block (filtered to avoid duplication) */}

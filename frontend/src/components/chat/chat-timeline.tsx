@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
 import { CodeBlock } from "@/components/chat/code-block";
+import { TerminalBlock } from "@/components/chat/terminal-block";
 import { ToolIcon } from "@/app/stores/_components/ToolIcon";
 import {
   resolveToolLabel,
@@ -135,6 +136,42 @@ function TimelineToolCall({
     icon_url?: string;
   } | null>(null);
 
+  // [PENDING-TIMER] Live elapsed-seconds counter while the model
+  // is still streaming the tool call's JSON arguments.
+  //
+  // Background:
+  //   Between the `tool_call_starting` event (placeholder appears)
+  //   and the `tool_call` event (full arguments arrive), the model
+  //   is streaming the arguments JSON. On slow providers (GigaChat,
+  //   local models) this window is 5-20 seconds of silence.
+  //
+  //   Without a live counter the user sees "preparing…" with no
+  //   indication of progress, which reads as "the app is frozen".
+  //   A ticking "(5s)" makes the wait feel bounded and expected.
+  //
+  //   The timer starts ONCE per mount (via pendingStartRef) and
+  //   stops automatically when `evt.isPending` flips to false.
+  const [pendingElapsed, setPendingElapsed] = useState(0);
+  const pendingStartRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (evt.isPending) {
+      if (pendingStartRef.current === null) {
+        pendingStartRef.current = Date.now();
+      }
+      const id = setInterval(() => {
+        if (pendingStartRef.current !== null) {
+          setPendingElapsed(
+            Math.floor((Date.now() - pendingStartRef.current) / 1000),
+          );
+        }
+      }, 1000);
+      return () => clearInterval(id);
+    } else {
+      pendingStartRef.current = null;
+      setPendingElapsed(0);
+    }
+  }, [evt.isPending]);
+
   // Detect MCP tool ids (mcp__server__tool) so we can route the
   // icon lookup to the correct endpoint:
   //   - MCP tool        → /api/mcp/servers/{server_id} (manifest)
@@ -212,6 +249,32 @@ function TimelineToolCall({
     writtenContent = parsedArgs.content ?? null;
     writtenLabel = "File Content";
   }
+
+  // [NEW] Detect Python and Shell tools to render their source/command
+  // in dedicated blocks below. Kept in sync with the equivalent logic
+  // in ToolCallCard so both render paths produce identical UX.
+  //
+  //   * python_execute sends its source in `code`.
+  //   * bash / shell_exec / powershell send their command in `command`.
+  const isPythonTool = toolKey.includes("python");
+  const isShellTool =
+    toolKey === "bash" ||
+    toolKey === "shell" ||
+    toolKey === "shell_exec" ||
+    toolKey === "powershell" ||
+    toolKey === "pwsh" ||
+    toolKey === "cmd" ||
+    toolKey === "sh";
+
+  const executableCode: string | null = isPythonTool
+    ? typeof parsedArgs.code === "string"
+      ? parsedArgs.code
+      : null
+    : isShellTool
+    ? typeof parsedArgs.command === "string"
+      ? parsedArgs.command
+      : null
+    : null;
 
   if (filePath.endsWith(".html")) writtenLanguage = "html";
   else if (filePath.endsWith(".css")) writtenLanguage = "css";
@@ -322,7 +385,14 @@ function TimelineToolCall({
         {evt.isPending ? (
           <span className="inline-flex items-center gap-1.5 text-amber-500">
             <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
-            <span className="text-[10px]">preparing…</span>
+            <span className="text-[10px]">
+              preparing…
+              {pendingElapsed > 0 && (
+                <span className="text-amber-400/70 ml-1">
+                  ({pendingElapsed}s)
+                </span>
+              )}
+            </span>
           </span>
         ) : (
           <span className="text-muted-foreground">{displayContent}</span>
@@ -383,6 +453,57 @@ function TimelineToolCall({
               />
             </div>
           )}
+        </div>
+      )}
+
+      {/* [NEW] Python source — rendered via the shared CodeBlock
+          (syntax highlighting, line numbers, copy/download/sandbox
+          actions, and collapse-for-long behavior). Fully visible
+          by default so the user does not need to click twice.
+
+          `basis-full` forces the block onto its own row inside the
+          parent flex-wrap container, matching the writtenContent
+          block above. */}
+      {isPythonTool &&
+        typeof executableCode === "string" &&
+        executableCode.length > 0 && (
+          <div className="basis-full">
+            <CodeBlock
+              code={executableCode}
+              language="python"
+              filename="script.py"
+            />
+          </div>
+        )}
+
+      {/* [NEW] Shell command — rendered via TerminalBlock (Windows
+          Terminal / PowerShell-inspired container). The shell kind is
+          auto-detected from the command content so the label and theme
+          match what actually ran. Same `basis-full` rationale. */}
+      {isShellTool &&
+        typeof executableCode === "string" &&
+        executableCode.length > 0 && (
+          <div className="basis-full">
+            <TerminalBlock command={executableCode} shell="auto" />
+          </div>
+        )}
+
+      {/* [PENDING-SKELETON] Skeleton placeholder while the model is
+          still streaming the tool call's JSON arguments.
+          Renders four animated bars that mimic the shape of a code
+          block, so the user sees "content is loading" instead of a
+          blank area during the 5-20s wait on slow providers.
+          Hidden as soon as `evt.isPending` becomes false — the real
+          CodeBlock / TerminalBlock replaces it. */}
+      {evt.isPending && (
+        <div className="basis-full mt-2 p-2 rounded-md bg-muted/20 border border-border/40 animate-pulse">
+          <div className="space-y-1.5">
+            <div className="h-2 rounded bg-muted/60 w-3/4" />
+            <div className="h-2 rounded bg-muted/60 w-full" />
+            <div className="h-2 rounded bg-muted/60 w-5/6" />
+            <div className="h-2 rounded bg-muted/60 w-2/3" />
+            <div className="h-2 rounded bg-muted/60 w-1/2" />
+          </div>
         </div>
       )}
 
