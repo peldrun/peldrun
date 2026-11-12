@@ -1,3 +1,4 @@
+#backend\peldrun\tools\builtins\shell_exec.py
 """
 PELDRUN Core Shell Execution Tool.
 Executes shell commands strictly bounded within the project workspace,
@@ -487,6 +488,51 @@ class ShellExecTool(BaseTool):
 
             is_err = proc.returncode != 0
             combined_output = stdout_str if stdout_str else stderr_str
+
+            # [FIX-EMPTY-OUTPUT-SUCCESS] Emit a descriptive success or
+            # failure message when the command produced NO output.
+            #
+            # Background:
+            #   Many Unix commands are intentionally silent on success:
+            #   `mkdir`, `rm -f`, `mv`, `cp`, `touch`, `chmod`, `ln`,
+            #   `git add`, `git checkout`, and many more. For these
+            #   commands `stdout_str` and `stderr_str` are BOTH empty,
+            #   so the pre-fix code returned:
+            #
+            #       ToolResult(output="", exit_code=0, is_error=False)
+            #
+            #   The OBSERVATION event then carried `output: ""`, which
+            #   small / quantized models (GigaChat-2-Max, Gemma, Phi)
+            #   frequently misread as "the command failed silently" or
+            #   "nothing happened". Observed real-world symptom: the
+            #   agent retried `mkdir "my app"` two or three times and
+            #   then reported a tool failure, even though the directory
+            #   had already been created successfully on the first try.
+            #
+            #   A short factual message resolves the ambiguity without
+            #   inventing information: it states exactly what happened
+            #   (the process ran to completion and exited with code N)
+            #   and nothing more. The agent can then proceed confidently
+            #   to the next step.
+            #
+            # The failure side is covered symmetrically: a command that
+            # exits non-zero WITHOUT producing output (e.g. the `false`
+            # builtin, or `grep` finding no match) also gets a clear
+            # message. Without it, the LLM sees an empty output plus an
+            # error flag and sometimes concludes the tool itself broke
+            # instead of "the command ran and returned a non-zero exit
+            # status" — a critical distinction for retry logic.
+            if not combined_output:
+                if is_err:
+                    combined_output = (
+                        f"Command exited with code {proc.returncode} "
+                        f"and produced no output."
+                    )
+                else:
+                    combined_output = (
+                        f"Command executed successfully with no "
+                        f"output (exit code {proc.returncode})."
+                    )
 
             # 6. Truncate to settings.max_output_chars (safety net).
             if (

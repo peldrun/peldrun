@@ -188,10 +188,40 @@ class IsolatedShellTool(BaseTool):
                         + f"\n... [stderr truncated to {limit} chars]"
                     )
 
+            # [FIX-EMPTY-OUTPUT-SUCCESS] Mirror of the fix in
+            # ``shell_exec.py``: emit a descriptive message when the
+            # command produced neither stdout nor stderr.
+            #
+            # Silently-successful commands (``mkdir``, ``rm -f``, ``mv``,
+            # ``cp``, ``touch``, ``chmod``, ``git add``, ``git checkout``,
+            # and many others) return exit code 0 with empty streams.
+            # Pre-fix, the caller received ``output=""`` which small
+            # models frequently misread as "the command failed" or
+            # "nothing happened" — the same observation-driven failure
+            # mode this fix set out to eliminate for ``bash``.
+            #
+            # Failure side is covered symmetrically so a bare non-zero
+            # exit (e.g. the ``false`` builtin, or ``grep`` with no
+            # match) is self-explanatory in the trace.
+            effective_exit = (
+                process.returncode if process.returncode is not None else 0
+            )
+            if not stdout_str and not stderr_str:
+                if effective_exit == 0:
+                    stdout_str = (
+                        f"Command executed successfully with no "
+                        f"output (exit code {effective_exit})."
+                    )
+                else:
+                    stderr_str = (
+                        f"Command exited with code {effective_exit} "
+                        f"and produced no output."
+                    )
+
             return ToolResult(
                 output=stdout_str,
                 error=stderr_str,
-                exit_code=process.returncode if process.returncode is not None else 0,
+                exit_code=effective_exit,
             )
 
         except Exception as exc:

@@ -201,11 +201,52 @@ async def stream_job_events(job_id: str, after_sequence: int = Query(0, ge=0)):
             )
             raw_dict["content"] = str(content_val)
 
+            # [FIX-TOOL-NAME-RESOLUTION] Resolve the tool name from the
+            # TWO unambiguous field names emitted by `peldrun_engine.py`,
+            # and REMOVE the historical fallback to `name`.
+            #
+            # Background:
+            #   The pre-fix extraction chain was:
+            #
+            #       toolName (camelCase)
+            #         -> data.toolName
+            #         -> raw.name          <-- DANGEROUS
+            #         -> data.name         <-- DANGEROUS
+            #
+            #   Both `name` lookups caused real corruption in the
+            #   persisted `session.json`:
+            #
+            #   1) OBSERVATION events (emitted by `peldrun_engine.py`
+            #      with the snake_case key `tool_name`) were ALWAYS
+            #      resolved to `None` because neither `toolName` nor
+            #      `name` matched. The persisted turn then carried
+            #      `toolName: null` even though the observation
+            #      belonged to a real tool call.
+            #
+            #   2) ARTIFACT_CREATED events (emitted by
+            #      `_sync_and_dispatch_artifacts` with the payload
+            #      key `"name": file_name`) were incorrectly
+            #      resolved to the FILE NAME. The persisted turn
+            #      then carried `toolName: "index.html"`, which is
+            #      not a tool at all and breaks frontend grouping.
+            #
+            # Why removing `name` is safe:
+            #   * Every producer that sets `name` to a TOOL NAME
+            #     (`TOOL_CALL` in `peldrun_engine.py`) ALSO sets
+            #     `toolName` to the exact same value. Dropping
+            #     `name` loses nothing.
+            #   * Every producer that sets `name` to something
+            #     OTHER than a tool name (`ARTIFACT_CREATED`,
+            #     `TOOL_CALL_STARTING` in the future, ...) should
+            #     NOT contribute to `toolName` at all.
+            #
+            # The snake_case `tool_name` is added explicitly so
+            # OBSERVATION events stop losing their attribution.
             tool_name_val = (
                 raw_dict.get("toolName")
                 or data_payload.get("toolName")
-                or raw_dict.get("name")
-                or data_payload.get("name")
+                or raw_dict.get("tool_name")
+                or data_payload.get("tool_name")
                 or ""
             )
             if tool_name_val:

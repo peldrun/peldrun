@@ -2357,6 +2357,42 @@ class PeldrunEngine(ExecutionEngine):
                             _ep_exc,
                         )
 
+                # [FIX-SEQ-COLLISION] Bump the sequence counter one more
+                # time before dispatching the OBSERVATION event.
+                #
+                # Background:
+                #   `_sync_and_dispatch_artifacts` (called a few lines
+                #   above) declares `nonlocal event_seq` and increments
+                #   `event_seq` once for EVERY newly discovered artifact,
+                #   using the incremented value as that artifact's `seq`.
+                #   When at least one artifact was found, `event_seq`
+                #   therefore already equals the `seq` of the LAST
+                #   artifact_created event.
+                #
+                #   Without this extra increment, the OBSERVATION event
+                #   below would carry the SAME `seq` as the last
+                #   artifact_created event. Downstream consumers
+                #   (`streaming.py`) deduplicate by strict `<=`
+                #   comparison against `max_seen_sequence`, so the
+                #   observation would be silently dropped from both the
+                #   SSE stream AND the persisted `session.json`.
+                #
+                # Observed impact before the fix:
+                #   * Tools that create files (`str_replace_editor`,
+                #     `bash` with `touch`, code generators, ...) lost
+                #     their OBSERVATION events entirely.
+                #   * Tools that do NOT touch the filesystem (`mkdir`,
+                #     `curl`, ...) kept theirs, producing the exact
+                #     asymmetry documented in the bug report.
+                #
+                # The increment is unconditional (even when no artifacts
+                # were found) so the observation always has a strictly
+                # greater `seq` than every event dispatched before it in
+                # this handler. A skipped number in the sequence is
+                # harmless: the SSE consumer only requires strict
+                # monotonicity, never density.
+                event_seq += 1
+
                 await dispatch_event(
                     job_id,
                     SSEEvent(
@@ -2365,6 +2401,15 @@ class PeldrunEngine(ExecutionEngine):
                         data={
                             "output": obs_str,
                             "content": obs_str,
+                            # Field name kept as `tool_name` (snake_case)
+                            # because that is the shape produced by every
+                            # other dispatch site in this engine. The
+                            # companion fix in `streaming.py` teaches the
+                            # SSE persister to read `tool_name` directly
+                            # instead of guessing between `toolName` and
+                            # `name` (the latter caused the persisted
+                            # `toolName` to be a filename in
+                            # `artifact_created` events).
                             "tool_name": observation_tool,
                             "is_error": is_tool_error,
                             "error": event.payload.get("error") if is_tool_error else None,
