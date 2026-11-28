@@ -22,6 +22,7 @@ from omweb.services.source_control_facade import (
     SourceControlFacade,
     get_source_control_facade,
 )
+from omweb.projects.project_prompting import MAX_INSTRUCTIONS_CHARS
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +53,23 @@ class ProjectUpdateRequest(BaseModel):
 
     All fields optional. Only fields present in the request body are
     applied; ``name`` still requires at least one character when provided.
+
+    ``project_instructions`` and ``project_instructions_enabled``
+    control the user-authored instruction block that gets appended to
+    the system prompt. Empty string clears the text; ``False``
+    disables injection without discarding the text. ``max_length``
+    mirrors MAX_INSTRUCTIONS_CHARS from
+    ``omweb.projects.project_prompting`` so oversized payloads are
+    rejected with HTTP 422 at the API boundary.
     """
     name: Optional[str] = Field(default=None, min_length=1)
     description: Optional[str] = None
     workspace_path: Optional[str] = None
     workspace_type: Optional[str] = None
+    project_instructions: Optional[str] = Field(
+        default=None, max_length=MAX_INSTRUCTIONS_CHARS
+    )
+    project_instructions_enabled: Optional[bool] = None
 
 
 # ============================================================================

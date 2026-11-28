@@ -45,6 +45,7 @@ from omweb.projects import (
 )
 from omweb.project_manager import project_manager
 from omweb.config import STORAGE_ROOT
+from omweb.projects.project_prompting import MAX_INSTRUCTIONS_CHARS
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -318,11 +319,23 @@ class ProjectUpdateRequest(BaseModel):
     intentionally allows empty strings (the frontend clears the
     description this way). ``name`` requires at least one character
     because an empty name would break sidebar rendering.
+
+    ``project_instructions`` and ``project_instructions_enabled``
+    control the user-authored instruction block that gets appended
+    to the system prompt. An empty string is valid and clears the
+    text; ``False`` disables injection without discarding the text.
+    ``max_length`` mirrors MAX_INSTRUCTIONS_CHARS from
+    ``omweb.projects.project_prompting`` so the API rejects oversized
+    payloads with a 422 before the value reaches the prompt builder.
     """
     name: Optional[str] = Field(default=None, min_length=1)
     description: Optional[str] = None
     workspace_path: Optional[str] = None
     workspace_type: Optional[str] = None
+    project_instructions: Optional[str] = Field(
+        default=None, max_length=MAX_INSTRUCTIONS_CHARS
+    )
+    project_instructions_enabled: Optional[bool] = None
 
 
 @router.patch("/{project_id}")

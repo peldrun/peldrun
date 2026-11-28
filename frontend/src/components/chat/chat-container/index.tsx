@@ -1843,11 +1843,12 @@ export function ChatContainer({
   // A rejected send must never look like a success to the caller;
   // otherwise a form would freeze on "Submitted" for a message that
   // never left.
-  const handleSendPrompt = useCallback(
+  const handleSendPromptImpl = useCallback(
     (prompt: string): boolean => {
       const text = (prompt || "").trim();
       if (!text) return false;
       if (status === "running" || status === "cancelling") {
+        console.warn("[ChatContainer] sendPrompt rejected, status:", status);
         showToast.error(
           "Busy",
           "Wait for the current response to finish before sending another message."
@@ -1864,6 +1865,25 @@ export function ChatContainer({
       return true;
     },
     [status, handleStartTask],
+  );
+
+  // Stable proxy handed to the chat thread (and from there to every card).
+  //
+  // Why it exists: an archived turn is mounted in the SAME render in which
+  // `status` flips to "running" (a new run starts). Anything below that
+  // memoizes or caches the callback it first received keeps a handler whose
+  // closure says "running" forever, so the old buttons answer "Busy" even
+  // when nothing is running. This proxy never changes identity and always
+  // forwards to the newest implementation, so no consumer can hold a stale
+  // `status` or a stale `handleStartTask`. (Same idea as the *Ref mirrors
+  // above that SSE handlers use.)
+  const sendPromptImplRef = useRef(handleSendPromptImpl);
+  useEffect(() => {
+    sendPromptImplRef.current = handleSendPromptImpl;
+  });
+  const handleSendPrompt = useCallback(
+    (prompt: string): boolean => sendPromptImplRef.current(prompt),
+    [],
   );
 
   // --- MCP Authentication Handlers ------------------------------------------

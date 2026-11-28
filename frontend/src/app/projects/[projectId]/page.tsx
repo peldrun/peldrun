@@ -22,6 +22,7 @@ import {
   PanelRightOpen,
   FolderTree,
   ChevronRight,
+  ScrollText,
 } from "lucide-react";
 import { ProjectSourceControlPanel } from "@/features/source-control/components/project-source-control-panel";
 
@@ -450,6 +451,17 @@ export default function ProjectDashboardPage() {
       href: `/projects/${projectId}/source-control`,
       color:
         "text-amber-500 group-hover:bg-amber-500/20",
+    },
+    // NEW: Prompts & Knowledge is a sibling of Settings, not a
+    // section inside it. Kept in Quick Actions so it is reachable
+    // from the dashboard without opening the settings page first.
+    {
+      icon: ScrollText,
+      title: "Prompts & Knowledge",
+      desc: "Instructions and reference files",
+      href: `/projects/${projectId}/prompts`,
+      color:
+        "text-rose-500 group-hover:bg-rose-500/20",
     },
   ];
 

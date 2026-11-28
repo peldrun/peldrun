@@ -26,6 +26,16 @@ import uuid
 
 from .base import EngineRunContext, ExecutionEngine
 
+# Project-scoped prompt blocks (user instructions + knowledge listing).
+# Kept as a lazy module-level import so that a broken project metadata
+# subsystem cannot block the engine from importing. The builders
+# themselves never raise (see project_prompting.py), so this is only
+# about import-time safety.
+from omweb.projects.project_prompting import (
+    append_block,
+    build_project_prompt_blocks,
+)
+
 # Core Public Boundary Imports
 #
 # [B14 FIX] ``ContextManager`` is intentionally NOT imported here.
@@ -824,6 +834,35 @@ class PeldrunEngine(ExecutionEngine):
             "3. Task Conclusion: Ensure all parts of the user request are satisfied "
             "before calling 'terminate'."
         )
+
+        # === Project Instructions + Knowledge Base Injection ===
+        # Injected between the fixed operational directive and the
+        # Generative UI block so that the resulting order is:
+        #   agent prompt > operational directive > user project blocks
+        #   > Generative UI > MCP access > skills.
+        # `project_dir` is already the resolved workspace here (assigned
+        # from `_resolved_ws` earlier in this method), matching the
+        # canonical path that `_get_project_workspace_path` returns, so
+        # the knowledge listing points at the same folder the agent's
+        # file tools will read from.
+        #
+        # The builders never raise: a failure in the knowledge folder
+        # listing is logged by `project_prompting` and the run proceeds
+        # without the block. Empty result (default project, feature
+        # disabled, or no files) leaves `system_prompt` untouched.
+        _project_blocks = build_project_prompt_blocks(
+            _engine_project_id,
+            _project_meta,
+            project_dir,
+            include_knowledge=True,
+        )
+        if _project_blocks:
+            logger.info(
+                "[ENGINE PELDRUN] project prompt blocks injected for %s (%d chars)",
+                _engine_project_id,
+                len(_project_blocks),
+            )
+        system_prompt = append_block(system_prompt, _project_blocks)
 
         # === Generative UI Directive Injection ===
         genui_cfg = active_llm.get("generative_ui") if active_llm else None

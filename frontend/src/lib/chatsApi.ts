@@ -58,6 +58,20 @@ export interface Project {
   workspace_type?: "internal" | "external";
   created_at: string;
   updated_at?: string;
+  /**
+   * User-authored instructions for this project. Injected into the
+   * system prompt on every reply when `project_instructions_enabled`
+   * is `true` and the text is non-empty. Capped server-side at
+   * `MAX_INSTRUCTIONS_CHARS` (8,000 characters) — keep the frontend
+   * textarea limit in sync (see `PROMPTS_MAX_INSTRUCTIONS_CHARS`).
+   */
+  project_instructions?: string;
+  /**
+   * Toggle for the instructions block above. The backend treats any
+   * value other than boolean `true` as disabled, so legacy projects
+   * without this field are unaffected.
+   */
+  project_instructions_enabled?: boolean;
 }
 
 export interface ChatSession {

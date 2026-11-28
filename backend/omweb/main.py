@@ -69,6 +69,7 @@ from omweb.routers import (
     mcp,
     mcp_auth,
     memory_rtr,
+    project_knowledge,
     projects,
     resource_monitor,
     run,
@@ -1094,6 +1095,19 @@ app.include_router(source_control.router)
 # or the path would be double-prefixed. This matches the source_control
 # and resource_monitor router convention.
 app.include_router(projects.router)
+
+# Project Knowledge Base router.
+#
+# NOTE: Like ``projects.router`` above, this router declares its own
+# prefix internally (``/api/projects/{project_id}/knowledge``). Do NOT
+# pass a ``prefix=`` argument here, or the path would be double-
+# prefixed. Registration order does not matter between these two
+# routers because their path patterns do not overlap: FastAPI matches
+# ``/api/projects/{project_id}/knowledge/files`` before it would ever
+# try to interpret ``/knowledge`` as a project_id under the projects
+# router, since ``projects.router`` has no catch-all ``/{project_id}``
+# route with a trailing ``/knowledge`` subpath.
+app.include_router(project_knowledge.router)
 
 # Resource Monitor & Hardware Telemetry router.
 #
